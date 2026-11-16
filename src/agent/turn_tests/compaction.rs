@@ -1608,3 +1608,89 @@ fn apply_compaction_patch_exact_replaces_exactly_the_guarded_range() {
         "the guarded range must be replaced and the tail kept verbatim"
     );
 }
+
+/// Bound for the preflight capture tests (in-process work only).
+const PREFLIGHT_CAPTURE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// The per-provider preflight hands its caller the durable part of what it
+/// did: a summary returns the history before it and right after it (what the
+/// turn engine reports to the session authority), while a degraded switch
+/// that only trims returns nothing (a projection of this request).
+#[tokio::test]
+async fn the_preflight_returns_its_durable_compaction_and_nothing_for_a_trim() {
+    tokio::time::timeout(PREFLIGHT_CAPTURE_DEADLINE, async {
+        let summary_provider =
+            ScriptedProvider::from_text_responses(vec!["## Decisions\n- d\n## Open TODOs\n- t\n## Constraints\n- c"]);
+        let mut summarized = tool_roundtrip_history_fixture(10);
+        let original = summarized.clone();
+        let summary_config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Safeguard,
+            reserve_tokens: 1,
+            keep_recent_messages: 2,
+            memory_flush: false,
+            max_context_tokens: 400,
+            max_context_tokens_explicit: true,
+            os_paging: crate::config::OsPagingConfig::default(),
+        };
+        let (_, durable) = crate::agent::context_preflight::preflight_context_budget_capturing_change(
+            &mut summarized,
+            &summary_provider,
+            "model",
+            &summary_config,
+            crate::agent::turn_context::RequestToolMeasurement::NONE,
+            None,
+            "test_capture_summary",
+        )
+        .await
+        .expect("the summary preflight runs");
+
+        let temp = TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
+        let envelope = RuntimeEnvelope::agent("workspace-capture-trim", "run-capture-trim");
+        let audit = DocumentIngestRuntime::from_envelope(Arc::clone(&memory), &envelope);
+        let unused_provider = ScriptedProvider::from_text_responses(vec!["MODEL_SUMMARY_MUST_NOT_RUN"]);
+        let mut trimmed = tool_roundtrip_history_fixture(10);
+        let trimmed_len = trimmed.len();
+        let (_, trim_only) = crate::agent::context_preflight::preflight_context_budget_capturing_change(
+            &mut trimmed,
+            &unused_provider,
+            "model",
+            &crate::config::AgentCompactionConfig {
+                mode: crate::config::AgentCompactionMode::Switch,
+                ..summary_config.clone()
+            },
+            crate::agent::turn_context::RequestToolMeasurement::NONE,
+            Some(&audit),
+            "test_capture_trim",
+        )
+        .await
+        .expect("the degraded switch preflight runs");
+
+        let (before, compacted) = durable.expect("an applied summary is returned as a durable compaction");
+        assert_eq!(
+            before.len(),
+            original.len(),
+            "the durable compaction's source is the history before the preflight"
+        );
+        assert!(
+            before
+                .iter()
+                .zip(&original)
+                .all(|(left, right)| left.role == right.role && left.content == right.content),
+            "the source is the pre-compaction history message for message"
+        );
+        assert!(
+            compacted
+                .iter()
+                .any(|message| message.content.contains("[Context compacted at")),
+            "the compacted history carries the summary"
+        );
+        assert!(
+            trim_only.is_none(),
+            "a trim without a handoff is not a durable compaction"
+        );
+        assert!(trimmed.len() < trimmed_len, "the degraded switch did trim the view");
+    })
+    .await
+    .expect("the preflight capture test finishes within PREFLIGHT_CAPTURE_DEADLINE");
+}

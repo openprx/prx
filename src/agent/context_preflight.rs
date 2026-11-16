@@ -11,6 +11,7 @@ use crate::agent::history::{history_non_system_start, latest_user_query_index};
 use crate::providers::{ChatMessage, Provider};
 use anyhow::Result;
 
+#[cfg(test)]
 pub(super) async fn preflight_context_budget_before_provider_call(
     history: &mut Vec<ChatMessage>,
     provider: &dyn Provider,
@@ -20,6 +21,26 @@ pub(super) async fn preflight_context_budget_before_provider_call(
     audit: Option<&DocumentIngestRuntime>,
     trigger: &str,
 ) -> Result<ContextBudgetSnapshot> {
+    preflight_context_budget_capturing_change(history, provider, model, config, tool_surface, audit, trigger)
+        .await
+        .map(|(budget, _)| budget)
+}
+
+/// The hard budget preflight before a provider call. When it applied a
+/// summary or handoff, the history before it and right after it (before any
+/// trim, which is this request's projection) are returned with the budget, so
+/// the caller can report the durable compaction to its session authority;
+/// otherwise the second value is `None`. The clones are taken only on the
+/// compaction path.
+pub(super) async fn preflight_context_budget_capturing_change(
+    history: &mut Vec<ChatMessage>,
+    provider: &dyn Provider,
+    model: &str,
+    config: &crate::config::AgentCompactionConfig,
+    tool_surface: crate::agent::turn_context::RequestToolMeasurement,
+    audit: Option<&DocumentIngestRuntime>,
+    trigger: &str,
+) -> Result<(ContextBudgetSnapshot, Option<(Vec<ChatMessage>, Vec<ChatMessage>)>)> {
     // The published tool schemas ride in the same context window as the
     // messages, and the prompt sections compiled from them are appended to the
     // system message after this runs, so the window left for history is the
@@ -49,8 +70,10 @@ pub(super) async fn preflight_context_budget_before_provider_call(
         );
     }
     if !budget.over_hard_limit {
-        return Ok(budget);
+        return Ok((budget, None));
     }
+    let mut before_compaction = history.clone();
+    let mut durable_compaction = None;
 
     // From here something will be removed from history, and with a tool
     // surface larger than the whole window every trim below runs down to its
@@ -76,6 +99,9 @@ pub(super) async fn preflight_context_budget_before_provider_call(
         {
             Ok(applied_replacement_len) => {
                 replacement_len = applied_replacement_len;
+                if applied_replacement_len.is_some() {
+                    durable_compaction = Some((std::mem::take(&mut before_compaction), history.clone()));
+                }
                 if is_switch && applied_replacement_len.is_none() {
                     degraded_reason = Some("handoff_unavailable");
                 }
@@ -84,8 +110,10 @@ pub(super) async fn preflight_context_budget_before_provider_call(
                 if !is_switch {
                     return Err(error);
                 }
+                let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
                 tracing::warn!(
-                    error = %error,
+                    error_len,
+                    error_sha256,
                     trigger,
                     "context switch rollover failed; continuing the turn on a lossy trim"
                 );
@@ -157,7 +185,7 @@ pub(super) async fn preflight_context_budget_before_provider_call(
     } else if restored {
         budget = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
     }
-    Ok(budget)
+    Ok((budget, durable_compaction))
 }
 
 /// The turn's own request, captured before a context-budget removal can take

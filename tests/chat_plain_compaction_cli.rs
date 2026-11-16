@@ -677,20 +677,49 @@ fn script_faulting_first_handoff(fault: Scripted, faulted: std::sync::Arc<std::s
     })
 }
 
+/// [`script_faulting_first_handoff`], except that the first `read` turn that
+/// carries a handoff is answered normally and every call of the next one gets
+/// `fault`: the failed turn then follows a session with enough history after
+/// its handoff for a manual compaction to compact.
+fn script_faulting_second_handoff_turn(
+    fault: Scripted,
+    faulted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Script {
+    let mut base = compaction_script::script();
+    let mut answered_turn: Option<String> = None;
+    let mut faulted_turn: Option<String> = None;
+    Box::new(move |index, request| {
+        let newest = newest_user_text(request);
+        let carries_handoff = compaction_script::handoff_note(request).is_some() && newest.contains("read f");
+        if faulted_turn.as_deref() == Some(newest.as_str())
+            || faulted_turn.is_none() && carries_handoff && answered_turn.as_deref().is_some_and(|turn| turn != newest)
+        {
+            faulted_turn = Some(newest);
+            faulted.store(true, std::sync::atomic::Ordering::SeqCst);
+            return fault.clone();
+        }
+        if answered_turn.is_none() && carries_handoff {
+            answered_turn = Some(newest);
+        }
+        base(index, request)
+    })
+}
+
 /// Drive tool-heavy turns until the faulted request was answered; returns the
-/// number of stored replies at that point.
+/// number of stored replies at that point and the aborted turn's user line.
 fn read_until_faulted(
     sandbox: &Sandbox,
     chat: &mut HeldChat<'_>,
     faulted: &std::sync::atomic::AtomicBool,
     mut replies: usize,
-) -> usize {
+) -> (usize, String) {
     for file in 0..SWITCH_FILLERS {
-        chat.command(&read_line(file));
+        let line = read_line(file);
+        chat.command(&line);
         let started = Instant::now();
         loop {
             if faulted.load(std::sync::atomic::Ordering::SeqCst) {
-                return replies;
+                return (replies, line);
             }
             if assistant_reply_count(&sandbox.workspace) > replies {
                 replies += 1;
@@ -707,12 +736,14 @@ fn read_until_faulted(
 }
 
 /// The ordinary turn after the aborted one sends the compacted view: no cold
-/// prefix, the committed generation-1 handoff, and no second rollover.
+/// prefix, the committed generation-1 handoff, no copy of the aborted
+/// request, and no second rollover; the saved session holds no copy either.
 fn assert_ordinary_turn_after_abort(
     sandbox: &Sandbox,
     server: &LoopbackOpenAi,
     output: &Output,
     handoffs_at_abort: usize,
+    aborted: &str,
 ) {
     assert!(
         !output.stderr.contains("panicked"),
@@ -745,6 +776,17 @@ fn assert_ordinary_turn_after_abort(
             "the ordinary turn's request carries the adopted handoff: {request}"
         );
     }
+    for request in &ordinary {
+        assert!(
+            !request.to_string().contains(aborted),
+            "the ordinary turn's request still carries the aborted request `{aborted}`: {request}"
+        );
+    }
+    let saved = compaction_script::saved_session_turns(&sandbox.workspace);
+    assert!(
+        saved.iter().all(|(_, content)| !content.contains(aborted)),
+        "the saved session holds no copy of the aborted request `{aborted}`: {saved:?}"
+    );
     assert_eq!(
         compaction_script::stored_handoffs(&sandbox.workspace).len(),
         handoffs_at_abort,
@@ -771,7 +813,7 @@ fn an_ordinary_turn_after_a_failed_switched_turn_sends_the_compacted_view() {
     set_window(&sandbox, &server, RECALL_WINDOW_TOKENS);
     let mut chat = HeldChat::spawn(&sandbox, &[]);
     chat.turn(PLANT, 1);
-    let replies = read_until_faulted(&sandbox, &mut chat, &faulted, 1);
+    let (replies, aborted) = read_until_faulted(&sandbox, &mut chat, &faulted, 1);
     let handoffs_at_abort = compaction_script::stored_handoffs(&sandbox.workspace).len();
     // The provider refused the switched turn's call; the next line is ordinary.
     chat.turn(ORDINARY, replies + 1);
@@ -782,7 +824,7 @@ fn an_ordinary_turn_after_a_failed_switched_turn_sends_the_compacted_view() {
         output.stdout,
         output.stderr
     );
-    assert_ordinary_turn_after_abort(&sandbox, &server, &output, handoffs_at_abort);
+    assert_ordinary_turn_after_abort(&sandbox, &server, &output, handoffs_at_abort, &aborted);
 }
 
 /// Longest wait for the cancelled call's connection to close.
@@ -801,7 +843,7 @@ fn an_ordinary_turn_after_a_cancelled_switched_turn_sends_the_compacted_view() {
     set_window(&sandbox, &server, RECALL_WINDOW_TOKENS);
     let mut chat = HeldChat::spawn(&sandbox, &[]);
     chat.turn(PLANT, 1);
-    let replies = read_until_faulted(&sandbox, &mut chat, &faulted, 1);
+    let (replies, aborted) = read_until_faulted(&sandbox, &mut chat, &faulted, 1);
     let handoffs_at_abort = compaction_script::stored_handoffs(&sandbox.workspace).len();
     // The switched turn's call is held open; a single Ctrl-C cancels it.
     chat.interrupt();
@@ -816,7 +858,7 @@ fn an_ordinary_turn_after_a_cancelled_switched_turn_sends_the_compacted_view() {
     chat.turn(ORDINARY, replies + 1);
     let output = chat.exit();
     assert_clean(&output, "a cancelled switched turn then an ordinary turn");
-    assert_ordinary_turn_after_abort(&sandbox, &server, &output, handoffs_at_abort);
+    assert_ordinary_turn_after_abort(&sandbox, &server, &output, handoffs_at_abort, &aborted);
 }
 
 /// The user line whose first call the provider refuses as a context overflow.
@@ -950,6 +992,198 @@ fn an_overflow_recovery_after_the_preflight_is_adopted_by_the_session() {
         compacted_from,
         request_messages - leading_system + 1,
         "/compact compacted the history the ordinary request was built from; stdout: {}",
+        output.stdout
+    );
+}
+
+/// No panic and no unconfirmed history commit in `output`.
+fn assert_settled_exit(output: &Output, label: &str) {
+    assert!(
+        !output.stderr.contains("panicked"),
+        "{label}: a panic on stderr: {}",
+        output.stderr
+    );
+    assert!(
+        !output.stdout.contains("history commit") && !output.stderr.contains("history commit"),
+        "{label}: an unconfirmed history commit; stdout: {}\nstderr: {}",
+        output.stdout,
+        output.stderr
+    );
+}
+
+/// The failed switched turn is settled before anything else reads the
+/// session: an immediate `/compact` compacts (its guard matches the
+/// acknowledged session), the saved session holds no copy of the failed
+/// request, and neither does a restart or a full branch of it.
+#[test]
+fn a_failed_switched_turn_is_settled_before_compact_branch_and_restart() {
+    let sandbox = Sandbox::new();
+    write_filler_files(&sandbox.workspace, SWITCH_FILLERS);
+    let faulted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let server = LoopbackOpenAi::start(
+        MODEL,
+        Some((11, 7)),
+        script_faulting_second_handoff_turn(
+            Scripted::Error {
+                status: 400,
+                message: "scripted refusal of this request".to_owned(),
+            },
+            std::sync::Arc::clone(&faulted),
+        ),
+    );
+    set_window(&sandbox, &server, RECALL_WINDOW_TOKENS);
+    let mut chat = HeldChat::spawn(&sandbox, &[]);
+    chat.turn(PLANT, 1);
+    let (_, aborted) = read_until_faulted(&sandbox, &mut chat, &faulted, 1);
+    chat.command("/compact");
+    let first = chat.exit();
+    // A plain chat with a failed turn exits non-zero; it must not panic or
+    // stop on an unconfirmed history commit.
+    assert_settled_exit(&first, "a failed switched turn then /compact");
+    assert!(
+        first.stdout.contains("Compacted context") && !first.stdout.contains("Compaction refused"),
+        "/compact right after the failed turn compacts; stdout: {}\nstderr: {}",
+        first.stdout,
+        first.stderr
+    );
+    let session_id = current_session_id(&first.stderr);
+    let saved = compaction_script::session_turns(&sandbox.workspace, &session_id);
+    assert!(!saved.is_empty(), "the session was saved");
+    assert!(
+        saved.iter().all(|(_, content)| !content.contains(&aborted)),
+        "the saved session holds no copy of the failed request `{aborted}`: {saved:?}"
+    );
+
+    // Restart, branch the whole session, then an ordinary turn in the branch.
+    let mut resumed = HeldChat::spawn(&sandbox, &["--session", &session_id]);
+    resumed.command(&format!("/branch {}", saved.len()));
+    resumed.command(ORDINARY);
+    let second = resumed.exit();
+    assert_clean(&second, "restart, full branch and an ordinary turn");
+    let branch_id = created_branch_id(&second.stdout);
+    let ordinary: Vec<serde_json::Value> = server
+        .requests()
+        .into_iter()
+        .filter(|request| newest_user_text(request).contains(ORDINARY))
+        .collect();
+    assert!(
+        !ordinary.is_empty(),
+        "the ordinary turn in the branch reached the provider"
+    );
+    for request in &ordinary {
+        assert!(
+            !request.to_string().contains(&aborted),
+            "the branch's request carries the failed request `{aborted}`: {request}"
+        );
+    }
+    let branch = compaction_script::session_turns(&sandbox.workspace, &branch_id);
+    assert!(
+        branch.len() > saved.len(),
+        "the branch saved the full copy plus the ordinary turn: {branch:?}"
+    );
+    assert!(
+        branch.iter().all(|(_, content)| !content.contains(&aborted)),
+        "the branch holds no copy of the failed request `{aborted}`: {branch:?}"
+    );
+}
+
+/// The user line of the multi-round tool turn.
+const MULTI_READ: &str = "MULTI-READ every filler";
+/// Tool rounds of the [`MULTI_READ`] turn before its text reply.
+const MULTI_READ_ROUNDS: usize = 8;
+
+/// The compaction script, except that the [`MULTI_READ`] turn reads one
+/// filler file per provider call for [`MULTI_READ_ROUNDS`] calls, so its
+/// tool output grows the history past the window inside the turn.
+fn script_with_multi_read() -> Script {
+    let mut base = compaction_script::script();
+    let mut rounds = 0;
+    Box::new(move |index, request| {
+        if newest_user_text(request).contains(MULTI_READ) {
+            if rounds < MULTI_READ_ROUNDS {
+                let file = format!("f{rounds}.txt");
+                rounds += 1;
+                return Scripted::tool(
+                    &format!("call-multi-{index}"),
+                    "file_read",
+                    &serde_json::json!({ "path": file }),
+                );
+            }
+            return Scripted::text(compaction_script::NOTED);
+        }
+        base(index, request)
+    })
+}
+
+/// The per-provider preflight inside a tool turn (after tool output grew the
+/// history past the window) trims that request's view, through real HTTP/SSE
+/// and real SQLite. A trim is the projection of one request: the session keeps
+/// every turn, so nothing is lost for a later handoff, and the next ordinary
+/// request is exactly the saved session (the run loop's view never keeps a
+/// change the session does not have).
+#[test]
+fn a_mid_turn_preflight_trim_leaves_the_session_and_the_next_request_in_agreement() {
+    let sandbox = Sandbox::new();
+    write_filler_files(&sandbox.workspace, SWITCH_FILLERS);
+    let server = LoopbackOpenAi::start(MODEL, Some((11, 7)), script_with_multi_read());
+    set_window(&sandbox, &server, compaction_script::SMALL_WINDOW_TOKENS);
+    let mut chat = HeldChat::spawn(&sandbox, &[]);
+    chat.turn(PLANT, 1);
+    chat.turn(MULTI_READ, 2);
+    chat.turn(ORDINARY, 3);
+    let saved = wait_for_saved_ordinary_turn(&sandbox);
+    chat.command("/compact");
+    let output = chat.exit();
+    assert_clean(&output, "a multi-round tool turn then an ordinary turn");
+
+    let requests = server.requests();
+    let multi_sizes: Vec<usize> = requests
+        .iter()
+        .filter(|request| newest_user_text(request).contains(MULTI_READ))
+        .map(|request| request["messages"].to_string().len())
+        .collect();
+    let peak = multi_sizes.iter().copied().max().unwrap_or_default();
+    assert!(
+        multi_sizes.len() > MULTI_READ_ROUNDS / 2 && multi_sizes.last().is_some_and(|last| *last < peak),
+        "the preflight trimmed inside the tool turn (its requests shrank after their peak): {multi_sizes:?}"
+    );
+    assert!(
+        saved
+            .iter()
+            .any(|(_, content)| content.contains(compaction_script::CODENAME)),
+        "the projection trim lost no saved turn: {saved:?}"
+    );
+    let ordinary = requests
+        .iter()
+        .find(|request| newest_user_text(request).contains(ORDINARY))
+        .expect("the ordinary turn reached the provider");
+    let sent: Vec<(String, String)> = ordinary["messages"]
+        .as_array()
+        .expect("request messages")
+        .iter()
+        .filter(|message| message["role"] != "system")
+        .map(|message| {
+            (
+                message["role"].as_str().unwrap_or_default().to_owned(),
+                message_text(message),
+            )
+        })
+        .collect();
+    let expected = &saved[..saved.len() - 1];
+    assert_eq!(
+        sent.len(),
+        expected.len(),
+        "the ordinary request carries exactly the saved turns\nsent: {sent:?}\nsaved: {expected:?}"
+    );
+    for ((sent_role, sent_text), (saved_role, saved_text)) in sent.iter().zip(expected) {
+        assert!(
+            sent_role == saved_role && sent_text.ends_with(saved_text.as_str()),
+            "the ordinary request matches the saved session turn for turn\nsent: {sent:?}\nsaved: {expected:?}"
+        );
+    }
+    assert!(
+        output.stdout.contains("Compacted context") && !output.stdout.contains("Compaction refused"),
+        "/compact reads the same history; stdout: {}",
         output.stdout
     );
 }

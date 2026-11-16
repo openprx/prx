@@ -488,6 +488,16 @@ mod tests {
         assert!(result.issues.iter().any(|issue| issue.kind == SafetyIssueKind::Pii));
     }
 
+    /// Bound for one safety-filter test: the checks are in-memory pattern
+    /// work, so anything near this is a hang.
+    const FILTER_TEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    async fn within_filter_test_deadline(test: impl std::future::Future<Output = ()>) {
+        tokio::time::timeout(FILTER_TEST_DEADLINE, test)
+            .await
+            .expect("the safety-filter test finishes within FILTER_TEST_DEADLINE");
+    }
+
     fn agent_source() -> SourceMetadata {
         SourceMetadata {
             actor: Actor::Agent,
@@ -510,54 +520,60 @@ mod tests {
 
     #[tokio::test]
     async fn a_uuid_cut_by_a_preview_ellipsis_is_not_phone_pii_in_a_session_snapshot() {
-        let filter = MemorySafetyFilter::default();
-        let unicode = session_row("look it up", r#"{"event_ids":["dd098779-5841-4428-bce2-1…"#);
-        let ascii = session_row("look it up", r#"{"event_ids":["dd098779-5841-4428-b..."#);
+        within_filter_test_deadline(async {
+            let filter = MemorySafetyFilter::default();
+            let unicode = session_row("look it up", r#"{"event_ids":["dd098779-5841-4428-bce2-1…"#);
+            let ascii = session_row("look it up", r#"{"event_ids":["dd098779-5841-4428-b..."#);
 
-        assert!(
-            filter.check_session_snapshot(&unicode, &agent_source()).await.passed,
-            "a UUID cut inside its last group by `…` in a preview is an identifier"
-        );
-        assert!(
-            filter.check_session_snapshot(&ascii, &agent_source()).await.passed,
-            "a UUID cut inside a 4-hex group by `...` in a preview is an identifier"
-        );
-        let with_phone = session_row("call 212-555-0199", r#"{"event_ids":["dd098779-5841-4428-bce2-1…"#);
-        assert!(
-            !filter.check_session_snapshot(&with_phone, &agent_source()).await.passed,
-            "a phone number next to a masked preview id is still caught"
-        );
+            assert!(
+                filter.check_session_snapshot(&unicode, &agent_source()).await.passed,
+                "a UUID cut inside its last group by `…` in a preview is an identifier"
+            );
+            assert!(
+                filter.check_session_snapshot(&ascii, &agent_source()).await.passed,
+                "a UUID cut inside a 4-hex group by `...` in a preview is an identifier"
+            );
+            let with_phone = session_row("call 212-555-0199", r#"{"event_ids":["dd098779-5841-4428-bce2-1…"#);
+            assert!(
+                !filter.check_session_snapshot(&with_phone, &agent_source()).await.passed,
+                "a phone number next to a masked preview id is still caught"
+            );
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn pii_inside_a_malformed_uuid_prefix_in_a_preview_is_still_caught() {
-        let filter = MemorySafetyFilter::default();
-        let cases = [
-            ("phone", r#"{"event_ids":["deadbeef-212-555-0199…"#, "phone"),
-            ("identity number", r#"{"event_ids":["deadbeef-123-45-6789…"#, "identity"),
-            (
-                "payment card",
-                r#"{"event_ids":["deadbeef-4111 1111 1111 1111…"#,
-                "payment-card",
-            ),
-        ];
-        for (label, preview, detail) in cases {
-            let result = filter
-                .check_session_snapshot(&session_row("look it up", preview), &agent_source())
-                .await;
-            assert!(
-                !result.passed,
-                "{label}: a malformed UUID prefix in a preview does not hide it"
-            );
-            assert!(
-                result
-                    .issues
-                    .iter()
-                    .any(|issue| issue.kind == SafetyIssueKind::Pii && issue.detail.contains(detail)),
-                "{label}: the PII detector names it: {:?}",
-                result.issues
-            );
-        }
+        within_filter_test_deadline(async {
+            let filter = MemorySafetyFilter::default();
+            let cases = [
+                ("phone", r#"{"event_ids":["deadbeef-212-555-0199…"#, "phone"),
+                ("identity number", r#"{"event_ids":["deadbeef-123-45-6789…"#, "identity"),
+                (
+                    "payment card",
+                    r#"{"event_ids":["deadbeef-4111 1111 1111 1111…"#,
+                    "payment-card",
+                ),
+            ];
+            for (label, preview, detail) in cases {
+                let result = filter
+                    .check_session_snapshot(&session_row("look it up", preview), &agent_source())
+                    .await;
+                assert!(
+                    !result.passed,
+                    "{label}: a malformed UUID prefix in a preview does not hide it"
+                );
+                assert!(
+                    result
+                        .issues
+                        .iter()
+                        .any(|issue| issue.kind == SafetyIssueKind::Pii && issue.detail.contains(detail)),
+                    "{label}: the PII detector names it: {:?}",
+                    result.issues
+                );
+            }
+        })
+        .await;
     }
 
     /// Digit-only groups in a valid UUID-prefix shape read as a phone number.
@@ -565,59 +581,65 @@ mod tests {
 
     #[tokio::test]
     async fn a_uuid_prefix_shape_outside_the_structured_preview_is_not_masked() {
-        let filter = MemorySafetyFilter::default();
-        let in_preview = session_row("look it up", &format!(r#"{{"event_ids":["{DIGIT_PREFIX}"#));
-        let in_user_text = session_row(&format!("my number is {DIGIT_PREFIX}"), r#"{"event_ids":[]}"#);
-        // User-authored turn content that spells out a preview field is
-        // turn content, not tool-call metadata.
-        let spelled_field = session_row(
-            &format!(r#"{{"args_preview":"{DIGIT_PREFIX}"}}"#),
-            r#"{"event_ids":[]}"#,
-        );
+        within_filter_test_deadline(async {
+            let filter = MemorySafetyFilter::default();
+            let in_preview = session_row("look it up", &format!(r#"{{"event_ids":["{DIGIT_PREFIX}"#));
+            let in_user_text = session_row(&format!("my number is {DIGIT_PREFIX}"), r#"{"event_ids":[]}"#);
+            // User-authored turn content that spells out a preview field is
+            // turn content, not tool-call metadata.
+            let spelled_field = session_row(
+                &format!(r#"{{"args_preview":"{DIGIT_PREFIX}"}}"#),
+                r#"{"event_ids":[]}"#,
+            );
 
-        assert!(
-            filter.check_session_snapshot(&in_preview, &agent_source()).await.passed,
-            "the shape inside structured preview metadata is masked as a cut identifier"
-        );
-        assert!(
-            !filter
-                .check_session_snapshot(&in_user_text, &agent_source())
-                .await
-                .passed,
-            "the same shape in user-authored turn text is never masked"
-        );
-        assert!(
-            !filter
-                .check_session_snapshot(&spelled_field, &agent_source())
-                .await
-                .passed,
-            "a literal `args_preview` key inside turn content is never masked"
-        );
+            assert!(
+                filter.check_session_snapshot(&in_preview, &agent_source()).await.passed,
+                "the shape inside structured preview metadata is masked as a cut identifier"
+            );
+            assert!(
+                !filter
+                    .check_session_snapshot(&in_user_text, &agent_source())
+                    .await
+                    .passed,
+                "the same shape in user-authored turn text is never masked"
+            );
+            assert!(
+                !filter
+                    .check_session_snapshot(&spelled_field, &agent_source())
+                    .await
+                    .passed,
+                "a literal `args_preview` key inside turn content is never masked"
+            );
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn a_generic_memory_write_never_gets_the_preview_exception() {
-        let filter = MemorySafetyFilter::default();
-        let user_authored = format!(r#"{{"args_preview":"{DIGIT_PREFIX}"}}"#);
-        let snapshot_shaped = session_row("look it up", &format!(r#"{{"event_ids":["{DIGIT_PREFIX}"#));
+        within_filter_test_deadline(async {
+            let filter = MemorySafetyFilter::default();
+            let user_authored = format!(r#"{{"args_preview":"{DIGIT_PREFIX}"}}"#);
+            let snapshot_shaped = session_row("look it up", &format!(r#"{{"event_ids":["{DIGIT_PREFIX}"#));
 
-        let literal = filter.check(&user_authored, &agent_source()).await;
-        let structured = filter.check(&snapshot_shaped, &agent_source()).await;
+            let literal = filter.check(&user_authored, &agent_source()).await;
+            let structured = filter.check(&snapshot_shaped, &agent_source()).await;
 
-        assert!(
-            !literal.passed
-                && literal
-                    .issues
-                    .iter()
-                    .any(|issue| issue.kind == SafetyIssueKind::Pii && issue.detail.contains("phone")),
-            "a user-authored `args_preview` value keeps the full PII check: {:?}",
-            literal.issues
-        );
-        assert!(
-            !structured.passed,
-            "even a snapshot-shaped document gets the full check outside the snapshot entry point: {:?}",
-            structured.issues
-        );
+            assert!(
+                !literal.passed
+                    && literal
+                        .issues
+                        .iter()
+                        .any(|issue| issue.kind == SafetyIssueKind::Pii && issue.detail.contains("phone")),
+                "a user-authored `args_preview` value keeps the full PII check: {:?}",
+                literal.issues
+            );
+            assert!(
+                !structured.passed,
+                "even a snapshot-shaped document gets the full check outside the snapshot entry point: {:?}",
+                structured.issues
+            );
+        })
+        .await;
     }
 
     #[tokio::test]

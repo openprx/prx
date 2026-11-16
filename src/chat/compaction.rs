@@ -240,7 +240,12 @@ pub(super) async fn run_manual_compact(
             };
         }
         Err(error) => {
-            tracing::warn!(%error, "manual compaction could not read the durable transcript");
+            let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+            tracing::warn!(
+                error_len,
+                error_sha256,
+                "manual compaction could not read the durable transcript"
+            );
             return ManualCompactOutcome::Refused {
                 reason: format!("Compaction unavailable: the durable transcript could not be read ({error})."),
             };
@@ -284,7 +289,7 @@ pub(super) async fn run_manual_compact(
 /// system prompt (if any) followed by the acknowledged turns. Older-turn
 /// enrichment is not carried (R2), so every later acknowledged read describes
 /// exactly the messages this view holds.
-fn provider_view_from_acked(
+pub(super) fn provider_view_from_acked(
     current_view: &[ChatMessage],
     acked: &crate::chat::acked_session::AckedSession,
 ) -> Vec<ChatMessage> {
@@ -482,7 +487,13 @@ pub(super) async fn build_chat_compaction_patch(
     {
         Ok(patch) => patch,
         Err(error) => {
-            tracing::warn!(%error, trigger, "chat summary compaction failed; falling back to deterministic trim");
+            let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+            tracing::warn!(
+                error_len,
+                error_sha256,
+                trigger,
+                "chat summary compaction failed; falling back to deterministic trim"
+            );
             None
         }
     }
@@ -713,7 +724,12 @@ pub(super) async fn persist_legacy_chat_compaction_audit(
     {
         Ok(provenance) => provenance,
         Err(error) => {
-            tracing::debug!(error = %error, "failed to resolve legacy chat compaction MessageEvent provenance");
+            let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+            tracing::debug!(
+                error_len,
+                error_sha256,
+                "failed to resolve legacy chat compaction MessageEvent provenance"
+            );
             None
         }
     };
@@ -772,7 +788,12 @@ pub(super) async fn persist_legacy_chat_compaction_audit(
         )
         .await
     {
-        tracing::debug!(error = %error, "failed to persist legacy chat compaction summary memory");
+        let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+        tracing::debug!(
+            error_len,
+            error_sha256,
+            "failed to persist legacy chat compaction summary memory"
+        );
     }
     let summary_message_event_id = if let Some(provenance) = provenance.as_ref() {
         let raw_payload_json = serde_json::json!({
@@ -821,7 +842,12 @@ pub(super) async fn persist_legacy_chat_compaction_audit(
         {
             Ok(event) => Some(event.event_id),
             Err(error) => {
-                tracing::debug!(error = %error, "failed to append legacy chat compaction summary MessageEvent");
+                let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+                tracing::debug!(
+                    error_len,
+                    error_sha256,
+                    "failed to append legacy chat compaction summary MessageEvent"
+                );
                 None
             }
         }
@@ -865,7 +891,8 @@ pub(super) async fn persist_legacy_chat_compaction_audit(
         })
         .await
     {
-        tracing::debug!(error = %error, "failed to append legacy chat compaction run");
+        let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+        tracing::debug!(error_len, error_sha256, "failed to append legacy chat compaction run");
     }
 }
 
@@ -1014,35 +1041,59 @@ impl crate::agent::turn_contracts::ToolLoopEventSink for InlineCompactionSink {
     }
 }
 
-/// Bring the run loop's provider view up to the acknowledged session after an
-/// inline turn. When the loop compacted during the turn or the acknowledged
-/// compaction epoch moved since `compaction_epoch_at_start`, the view is
-/// rebuilt from the acknowledged snapshot: after a commit with the committed
-/// request in its enriched form (`committed` = `Some(enriched request)`),
-/// after a failure or cancellation without the request. Returns whether it
-/// rebuilt the view.
+/// Bring the run loop's provider view up to the committed session after an
+/// inline turn's commit. When the view changed during the turn other than by
+/// appending (`changed_in_turn`: a reported compaction, or a trim that was the
+/// projection of one request) or the acknowledged compaction epoch moved
+/// since `compaction_epoch_before_preflight` (the preflight's own compaction
+/// included), the view is rebuilt from the
+/// committed snapshot with the committed request in its enriched form
+/// (`committed`). A failed or cancelled turn is settled instead
+/// (`provider_turns::settle_aborted_turn`). Returns whether it rebuilt the view.
 pub(super) fn reconcile_inline_turn(
     history: &mut Vec<ChatMessage>,
     chat_dispatcher: &dispatcher::ChatDispatcher,
-    sink: &InlineCompactionSink,
-    compaction_epoch_at_start: u64,
+    changed_in_turn: bool,
+    compaction_epoch_before_preflight: u64,
     user_input: &str,
-    committed: Option<&ChatMessage>,
+    committed: &ChatMessage,
 ) -> bool {
     let acked = chat_dispatcher.session_reader().acked();
-    if acked.compaction_epoch == compaction_epoch_at_start && !sink.compacted() {
+    if acked.compaction_epoch == compaction_epoch_before_preflight && !changed_in_turn {
         return false;
     }
-    let view = committed.map_or_else(
-        || provider_view_after_compacted_abort(history, &acked, user_input),
-        |enriched| provider_view_after_compacted_commit(history, &acked, user_input, enriched),
-    );
+    let view = provider_view_after_compacted_commit(history, &acked, user_input, committed);
     tracing::info!(
         messages_before = history.len(),
         messages_after = view.len(),
-        committed = committed.is_some(),
-        "inline turn's provider view rebuilt from the acknowledged session after an in-turn compaction"
+        "inline turn's provider view rebuilt from the committed session after a compaction"
     );
     *history = view;
     true
+}
+
+/// The digest of the provider view an inline turn starts from. A turn only
+/// appends to its view, unless it compacted, trimmed or rewrote it; then the
+/// view no longer starts with this prefix and must follow the session again.
+pub(super) struct ViewPrefix {
+    len: usize,
+    hash: String,
+}
+
+impl ViewPrefix {
+    pub(super) fn of(view: &[ChatMessage]) -> Self {
+        Self {
+            len: view.len(),
+            hash: crate::agent::compaction::compaction_patch_guard_for(view, 0, view.len())
+                .map(|guard| guard.replaced_hash)
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Whether `view` changed other than by appending since [`Self::of`].
+    pub(super) fn changed_in(&self, view: &[ChatMessage]) -> bool {
+        view.get(..self.len)
+            .and_then(|prefix| crate::agent::compaction::compaction_patch_guard_for(prefix, 0, prefix.len()))
+            .is_none_or(|guard| guard.replaced_hash != self.hash)
+    }
 }

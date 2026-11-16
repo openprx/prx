@@ -175,9 +175,11 @@ pub(super) async fn apply_os_paging(
             // Soft failure: do NOT mutate history. Returning false lets the
             // caller fall through to legacy compaction (no data lost, no
             // regression on the hot path).
+            let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
             tracing::warn!(
                 document_id = %document_id,
-                error = %error,
+                error_len,
+                error_sha256,
                 "os-paging: eviction failed; deferring to legacy compaction"
             );
             return Ok(false);
@@ -252,7 +254,12 @@ pub(super) async fn recall_context_pages(
     let results = match runtime.memory.search_document_chunks(&principal, query, fetch).await {
         Ok(results) => results,
         Err(error) => {
-            tracing::warn!(error = %error, "os-paging: page recall failed; skipping injection");
+            let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+            tracing::warn!(
+                error_len,
+                error_sha256,
+                "os-paging: page recall failed; skipping injection"
+            );
             return None;
         }
     };

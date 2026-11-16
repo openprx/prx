@@ -503,7 +503,7 @@ pub(super) async fn shutdown_child_sessions_for_exit(
         match ack {
             Ok(crate::chat::acked_session::Ack::Rejected(_)) => {
                 let reason = "exit summary save was rejected";
-                tracing::warn!("{reason}");
+                tracing::warn!("exit summary save was rejected");
                 commits.fail_history_commit(reason);
                 anyhow::bail!("Chat stopped after an unconfirmed history commit: {reason}");
             }

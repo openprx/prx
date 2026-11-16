@@ -368,96 +368,105 @@ async fn legacy_compaction_with_tool_message_uses_persisted_guard_for_reducer() 
 
 #[tokio::test]
 async fn chat_compaction_helper_refuses_a_patch_for_another_source_without_any_change() {
-    let config = crate::config::AgentCompactionConfig::default();
-    let source = vec![
-        ChatMessage::system("sys"),
-        ChatMessage::user("q1"),
-        ChatMessage::assistant("a1"),
-        ChatMessage::user("q2"),
-    ];
-    let mut other_source = source.clone();
-    other_source.insert(1, ChatMessage::user("inserted"));
-    let patch = crate::agent::turn_contracts::CompactionPatch {
-        replacement: vec![ChatMessage::assistant("summary")],
-        append_after: Vec::new(),
-        guard: crate::agent::compaction::compaction_patch_guard_for(&other_source, 1, 3)
-            .expect("test: guard over the other source"),
-    };
-    let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("q2 enriched")];
-    let history_before = history.clone();
-    let (dispatcher, mut action_rx) = dispatcher::ChatDispatcher::new();
-    let commits = dispatcher::TurnCompletionSignal::new();
+    tokio::time::timeout(ACK_TEST_DEADLINE, async {
+        let config = crate::config::AgentCompactionConfig::default();
+        let source = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("q1"),
+            ChatMessage::assistant("a1"),
+            ChatMessage::user("q2"),
+        ];
+        let mut other_source = source.clone();
+        other_source.insert(1, ChatMessage::user("inserted"));
+        let patch = crate::agent::turn_contracts::CompactionPatch {
+            replacement: vec![ChatMessage::assistant("summary")],
+            append_after: Vec::new(),
+            guard: crate::agent::compaction::compaction_patch_guard_for(&other_source, 1, 3)
+                .expect("test: guard over the other source"),
+        };
+        let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("q2 enriched")];
+        let history_before = history.clone();
+        let (dispatcher, mut action_rx) = dispatcher::ChatDispatcher::new();
+        let commits = dispatcher::TurnCompletionSignal::new();
 
-    let outcome = apply_chat_compaction_patch_and_sync(
-        &mut history,
-        &source,
-        Some(ChatMessage::user("q2 enriched")),
-        patch,
-        &config,
-        crate::chat::action::CompactReason::Manual,
-        &dispatcher,
-        &commits,
-    )
-    .await;
+        let outcome = apply_chat_compaction_patch_and_sync(
+            &mut history,
+            &source,
+            Some(ChatMessage::user("q2 enriched")),
+            patch,
+            &config,
+            crate::chat::action::CompactReason::Manual,
+            &dispatcher,
+            &commits,
+        )
+        .await;
 
-    assert!(
-        matches!(outcome, crate::chat::compaction::ManualCompactOutcome::Refused { .. }),
-        "a patch whose guard describes another source must be refused: {outcome:?}"
-    );
-    assert_eq!(
-        history.iter().map(|m| (&m.role, &m.content)).collect::<Vec<_>>(),
-        history_before.iter().map(|m| (&m.role, &m.content)).collect::<Vec<_>>(),
-        "a refused patch must leave the provider view unchanged"
-    );
-    assert!(
-        action_rx.try_recv().is_err(),
-        "a refused patch must not reach the reducer"
-    );
+        assert!(
+            matches!(outcome, crate::chat::compaction::ManualCompactOutcome::Refused { .. }),
+            "a patch whose guard describes another source must be refused: {outcome:?}"
+        );
+        assert_eq!(
+            history.iter().map(|m| (&m.role, &m.content)).collect::<Vec<_>>(),
+            history_before.iter().map(|m| (&m.role, &m.content)).collect::<Vec<_>>(),
+            "a refused patch must leave the provider view unchanged"
+        );
+        assert!(
+            action_rx.try_recv().is_err(),
+            "a refused patch must not reach the reducer"
+        );
+    })
+    .await
+    .expect("the test finishes within ACK_TEST_DEADLINE");
 }
 
 #[tokio::test]
 async fn chat_compaction_helper_replaces_the_plain_request_with_the_enriched_one() {
-    let config = crate::config::AgentCompactionConfig::default();
-    let source = vec![
-        ChatMessage::system("sys"),
-        ChatMessage::user("q1"),
-        ChatMessage::assistant("a1"),
-        ChatMessage::user("q2"),
-    ];
-    let patch = crate::agent::turn_contracts::CompactionPatch {
-        replacement: vec![ChatMessage::assistant("summary")],
-        append_after: Vec::new(),
-        guard: crate::agent::compaction::compaction_patch_guard_for(&source, 1, 3).expect("test: guard over source"),
-    };
-    let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("q2 ENRICHED")];
-    let session_dispatcher = crate::chat::acked_session::TestSessionDispatcher::spawn(
-        std::sync::Arc::new(crate::memory::NoneMemory::new()),
-        crate::chat::acked_session::TestSessionDispatcher::state_with_history(source.clone()),
-    );
+    tokio::time::timeout(ACK_TEST_DEADLINE, async {
+        let config = crate::config::AgentCompactionConfig::default();
+        let source = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("q1"),
+            ChatMessage::assistant("a1"),
+            ChatMessage::user("q2"),
+        ];
+        let patch = crate::agent::turn_contracts::CompactionPatch {
+            replacement: vec![ChatMessage::assistant("summary")],
+            append_after: Vec::new(),
+            guard: crate::agent::compaction::compaction_patch_guard_for(&source, 1, 3)
+                .expect("test: guard over source"),
+        };
+        let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("q2 ENRICHED")];
+        let session_dispatcher = crate::chat::acked_session::TestSessionDispatcher::spawn(
+            std::sync::Arc::new(crate::memory::NoneMemory::new()),
+            crate::chat::acked_session::TestSessionDispatcher::state_with_history(source.clone()),
+        );
 
-    let outcome = apply_chat_compaction_patch_and_sync(
-        &mut history,
-        &source,
-        Some(ChatMessage::user("q2 ENRICHED")),
-        patch,
-        &config,
-        crate::chat::action::CompactReason::ContextOverflow,
-        &session_dispatcher.dispatcher,
-        &session_dispatcher.commits,
-    )
-    .await;
-    session_dispatcher.stop().await;
+        let outcome = apply_chat_compaction_patch_and_sync(
+            &mut history,
+            &source,
+            Some(ChatMessage::user("q2 ENRICHED")),
+            patch,
+            &config,
+            crate::chat::action::CompactReason::ContextOverflow,
+            &session_dispatcher.dispatcher,
+            &session_dispatcher.commits,
+        )
+        .await;
+        session_dispatcher.stop().await;
 
-    assert!(
-        matches!(outcome, crate::chat::compaction::ManualCompactOutcome::Compacted { .. }),
-        "the source patch must apply: {outcome:?}"
-    );
-    let contents: Vec<&str> = history.iter().map(|m| m.content.as_str()).collect();
-    assert_eq!(
-        contents,
-        vec!["sys", "summary", "q2 ENRICHED"],
-        "the provider view is the compacted source with the enriched request replacing the plain one"
-    );
+        assert!(
+            matches!(outcome, crate::chat::compaction::ManualCompactOutcome::Compacted { .. }),
+            "the source patch must apply: {outcome:?}"
+        );
+        let contents: Vec<&str> = history.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            vec!["sys", "summary", "q2 ENRICHED"],
+            "the provider view is the compacted source with the enriched request replacing the plain one"
+        );
+    })
+    .await
+    .expect("the test finishes within ACK_TEST_DEADLINE");
 }
 
 /// Upper bound for one awaited-acknowledgement test.

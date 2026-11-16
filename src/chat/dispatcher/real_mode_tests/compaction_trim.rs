@@ -1171,137 +1171,145 @@ fn tui_preflight_trim_preserves_current_request() {
     }
 }
 
+/// Whole-test bound: everything awaited here is in-process.
+const ROLLOVER_TEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Regression for the `/compact` → switch panic: the guard describes the
 /// 50-message source while the provider view holds only 17 messages. The
 /// rollover must compact the source and rebuild the provider view from it with
 /// the enriched request as its final message, exactly once.
 #[tokio::test]
 async fn redux_rollover_compacts_the_source_and_rebuilds_a_shorter_provider_view() {
-    use crate::providers::traits::{
-        ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions, StreamResult,
-    };
-    use async_trait::async_trait;
-    use futures::stream::{self, BoxStream, StreamExt};
+    tokio::time::timeout(ROLLOVER_TEST_DEADLINE, async {
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
+            StreamResult,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
 
-    const SOURCE_LEN: usize = 50;
-    const PROVIDER_VIEW_LEN: usize = 17;
-    const REQUEST: &str = "current request about the planted fact";
-    const ENRICHMENT: &str =
-        "\n\n[Attached file context from @path mentions]\nENRICHED_ONLY\n[End attached file context]";
+        const SOURCE_LEN: usize = 50;
+        const PROVIDER_VIEW_LEN: usize = 17;
+        const REQUEST: &str = "current request about the planted fact";
+        const ENRICHMENT: &str =
+            "\n\n[Attached file context from @path mentions]\nENRICHED_ONLY\n[End attached file context]";
 
-    struct SummaryProvider;
+        struct SummaryProvider;
 
-    #[async_trait]
-    impl Provider for SummaryProvider {
-        fn capabilities(&self) -> ProviderCapabilities {
-            ProviderCapabilities::default()
+        #[async_trait]
+        impl Provider for SummaryProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+
+            async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+                Ok("ROLLOVER_SUMMARY\n## Decisions\n- d\n## Open TODOs\n- t\n## Constraints\n- c".to_string())
+            }
+
+            async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: Some("unused".into()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+
+            fn stream_chat_with_history(
+                &self,
+                _: &[PMsg],
+                _: &str,
+                _: f64,
+                _: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                stream::iter(vec![Ok(StreamChunk::final_chunk())]).boxed()
+            }
+
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
         }
 
-        async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
-            Ok("ROLLOVER_SUMMARY\n## Decisions\n- d\n## Open TODOs\n- t\n## Constraints\n- c".to_string())
+        let mut source = vec![PMsg::system("sys")];
+        for index in 1..SOURCE_LEN - 1 {
+            let filler = "filler ".repeat(20);
+            source.push(if index % 2 == 1 {
+                PMsg::user(format!("old question {index} {filler}"))
+            } else {
+                PMsg::assistant(format!("old answer {index} {filler}"))
+            });
         }
+        source.push(PMsg::user(REQUEST));
+        assert_eq!(source.len(), SOURCE_LEN, "test fixture: source length");
+        let mut provider_view = vec![PMsg::system("sys")];
+        provider_view.extend(
+            source
+                .iter()
+                .skip(SOURCE_LEN - (PROVIDER_VIEW_LEN - 1))
+                .take(PROVIDER_VIEW_LEN - 2)
+                .cloned(),
+        );
+        provider_view.push(PMsg::user(format!("{REQUEST}{ENRICHMENT}")));
+        assert_eq!(
+            provider_view.len(),
+            PROVIDER_VIEW_LEN,
+            "test fixture: provider view length"
+        );
+        let mut guard_history = source.clone();
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Safeguard,
+            reserve_tokens: 10,
+            keep_recent_messages: 4,
+            memory_flush: false,
+            max_context_tokens: 400,
+            max_context_tokens_explicit: true,
+            ..crate::config::AgentCompactionConfig::default()
+        };
+        let (action_tx, mut action_rx) = mpsc::channel::<Action>(4);
 
-        async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
-            Ok(ChatResponse {
-                text: Some("unused".into()),
-                tool_calls: Vec::new(),
-                reasoning_content: None,
-            })
-        }
+        let outcome = apply_redux_context_rollover(
+            &SummaryProvider,
+            &mut provider_view,
+            &mut guard_history,
+            "model",
+            &config,
+            None,
+            &action_tx,
+            crate::chat::action::CompactReason::ContextOverflow,
+            "test_rollover_shorter_provider_view",
+        )
+        .await
+        .expect("test: a valid source patch must not abort the rollover");
 
-        fn supports_streaming(&self) -> bool {
-            true
-        }
-
-        fn stream_chat_with_history(
-            &self,
-            _: &[PMsg],
-            _: &str,
-            _: f64,
-            _: StreamOptions,
-        ) -> BoxStream<'static, StreamResult<StreamChunk>> {
-            stream::iter(vec![Ok(StreamChunk::final_chunk())]).boxed()
-        }
-
-        async fn warmup(&self) -> anyhow::Result<()> {
-            Ok(())
-        }
-    }
-
-    let mut source = vec![PMsg::system("sys")];
-    for index in 1..SOURCE_LEN - 1 {
-        let filler = "filler ".repeat(20);
-        source.push(if index % 2 == 1 {
-            PMsg::user(format!("old question {index} {filler}"))
-        } else {
-            PMsg::assistant(format!("old answer {index} {filler}"))
-        });
-    }
-    source.push(PMsg::user(REQUEST));
-    assert_eq!(source.len(), SOURCE_LEN, "test fixture: source length");
-    let mut provider_view = vec![PMsg::system("sys")];
-    provider_view.extend(
-        source
+        assert!(
+            outcome.replacement_len.is_some(),
+            "a patch whose guard describes the source must apply: {outcome:?}"
+        );
+        assert!(
+            guard_history.len() < SOURCE_LEN && guard_history.iter().any(|m| m.content.contains("ROLLOVER_SUMMARY")),
+            "the source must be compacted"
+        );
+        let last = provider_view.last().expect("test: provider view is not empty");
+        assert!(
+            last.role == "user" && last.content.contains("ENRICHED_ONLY"),
+            "the provider view's final message must be the enriched request"
+        );
+        let request_count = provider_view
             .iter()
-            .skip(SOURCE_LEN - (PROVIDER_VIEW_LEN - 1))
-            .take(PROVIDER_VIEW_LEN - 2)
-            .cloned(),
-    );
-    provider_view.push(PMsg::user(format!("{REQUEST}{ENRICHMENT}")));
-    assert_eq!(
-        provider_view.len(),
-        PROVIDER_VIEW_LEN,
-        "test fixture: provider view length"
-    );
-    let mut guard_history = source.clone();
-    let config = crate::config::AgentCompactionConfig {
-        mode: crate::config::AgentCompactionMode::Safeguard,
-        reserve_tokens: 10,
-        keep_recent_messages: 4,
-        memory_flush: false,
-        max_context_tokens: 400,
-        max_context_tokens_explicit: true,
-        ..crate::config::AgentCompactionConfig::default()
-    };
-    let (action_tx, mut action_rx) = mpsc::channel::<Action>(4);
-
-    let outcome = apply_redux_context_rollover(
-        &SummaryProvider,
-        &mut provider_view,
-        &mut guard_history,
-        "model",
-        &config,
-        None,
-        &action_tx,
-        crate::chat::action::CompactReason::ContextOverflow,
-        "test_rollover_shorter_provider_view",
-    )
+            .filter(|message| message.content.starts_with(REQUEST))
+            .count();
+        assert_eq!(
+            request_count, 1,
+            "the request must occur exactly once in the provider view"
+        );
+        match action_rx.try_recv() {
+            Ok(Action::HistoryCompactionPatchApplied { .. }) => {}
+            other => panic!("expected the reducer patch after a successful rollover, got {other:?}"),
+        }
+    })
     .await
-    .expect("test: a valid source patch must not abort the rollover");
-
-    assert!(
-        outcome.replacement_len.is_some(),
-        "a patch whose guard describes the source must apply: {outcome:?}"
-    );
-    assert!(
-        guard_history.len() < SOURCE_LEN && guard_history.iter().any(|m| m.content.contains("ROLLOVER_SUMMARY")),
-        "the source must be compacted"
-    );
-    let last = provider_view.last().expect("test: provider view is not empty");
-    assert!(
-        last.role == "user" && last.content.contains("ENRICHED_ONLY"),
-        "the provider view's final message must be the enriched request"
-    );
-    let request_count = provider_view
-        .iter()
-        .filter(|message| message.content.starts_with(REQUEST))
-        .count();
-    assert_eq!(
-        request_count, 1,
-        "the request must occur exactly once in the provider view"
-    );
-    match action_rx.try_recv() {
-        Ok(Action::HistoryCompactionPatchApplied { .. }) => {}
-        other => panic!("expected the reducer patch after a successful rollover, got {other:?}"),
-    }
+    .expect("the test finishes within ROLLOVER_TEST_DEADLINE");
 }

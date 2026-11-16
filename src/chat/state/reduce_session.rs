@@ -120,6 +120,37 @@ impl ChatState {
         ]
     }
 
+    /// `Action::TurnAbortSettled` — the ordered settlement of a failed or
+    /// cancelled turn. The recorded request is removed only while it is the
+    /// trailing answerless user turn (a draft terminal may already have rolled
+    /// it back, and a draftless or already-cancelled turn never had one); the
+    /// session is always saved, so the acknowledged revision and the store
+    /// match the corrected history, including any compaction adopted during
+    /// the turn.
+    pub(super) fn reduce_turn_abort_settled(&mut self, request: Option<String>) -> Vec<Effect> {
+        let request_removed = request.is_some_and(|request| {
+            let stored = crate::agent::turn_contracts::neutralize_reserved_markers(&request);
+            self.session
+                .turns
+                .last()
+                .is_some_and(|turn| turn.role == "user" && turn.content == stored.as_ref())
+                && self.rollback_trailing_answerless_user_turn()
+        });
+        if request_removed {
+            self.ui.turn_count = self.session.turns.len();
+        }
+        vec![
+            Effect::LogTrace {
+                level: tracing::Level::DEBUG,
+                msg: format!(
+                    "TurnAbortSettled request_removed={request_removed} turns={}",
+                    self.session.turns.len()
+                ),
+            },
+            Effect::SaveSession(self.session_commit()),
+        ]
+    }
+
     /// `Action::TurnCommitRequested` — the non-TUI completion commit. The
     /// turn's visible draft (if any) is removed as by `StreamCompleted`; the
     /// session is always saved; a second request for the same task is refused.

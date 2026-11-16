@@ -41,6 +41,14 @@ pub(crate) fn tool_parse_log_digest(input: &str) -> (usize, String) {
     (input.len(), hex)
 }
 
+/// Payload-free identity of an error for the log: the length and digest of
+/// its full display chain ([`tool_parse_log_digest`]). Memory, provider and
+/// storage errors can quote the content they refused (a SQLite trigger's
+/// message, an upstream echo), so the text is never logged.
+pub(crate) fn error_log_digest(error: &(impl std::fmt::Display + ?Sized)) -> (usize, String) {
+    tool_parse_log_digest(&format!("{error:#}"))
+}
+
 /// Tool arguments for the log: every credential-named value replaced and
 /// every string redacted by the one redactor.
 pub(crate) fn redact_sensitive_json_keys(value: &serde_json::Value) -> serde_json::Value {

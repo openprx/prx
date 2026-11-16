@@ -1,6 +1,5 @@
 //! Provider-turn lifecycle: completion events, ordered commit and finalization of per-turn contexts.
 
-#[cfg(feature = "terminal-tui")]
 use super::active_turn::rollback_cancelled_turn_history;
 #[cfg(feature = "terminal-tui")]
 use super::binding;
@@ -1360,34 +1359,36 @@ fn adopt_committed_turn(
     }
 }
 
-/// Bring the run loop's provider view up to the acknowledged session after a
-/// turn that failed or was cancelled. When a compaction was adopted during
-/// the turn (the acknowledged compaction epoch moved since the turn copied
-/// its view), the view is rebuilt from the acknowledged snapshot without the
-/// failed or cancelled request and `true` is returned; otherwise the view is
-/// left to the caller's ordinary failure or cancellation handling and `false`
-/// is returned. Without this, the next turn starts from the pre-compaction
-/// view, resends the replaced cold prefix, and its own start epoch already
-/// includes the compaction, so no later epoch comparison could repair it.
+/// A worker turn that failed or was cancelled: settled in order after the
+/// worker's compactions and terminal action (the reducer never recorded a
+/// worker turn's request, so none is removed), then the provider view follows
+/// the settled revision. The epoch the turn's view was copied at is from
+/// before the worker's detached switch and every in-turn compaction. A failed
+/// settlement is already latched; the run loop's health check stops the chat.
 #[cfg(feature = "terminal-tui")]
-fn reconcile_aborted_turn(
+async fn settle_aborted_worker_turn(
     history: &mut Vec<ChatMessage>,
     chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
-    compaction_epoch_at_start: u64,
-    user_input: &str,
-) -> bool {
-    let acked = chat_dispatcher.session_reader().acked();
-    if acked.compaction_epoch == compaction_epoch_at_start {
-        return false;
+    commits: &dispatcher::TurnCompletionSignal,
+    pending: &PerTurnContext,
+    len_before_user_turn: Option<usize>,
+) {
+    match settle_aborted_turn(chat_dispatcher, commits, None).await {
+        Ok(settled) => {
+            provider_view_after_settled_abort(
+                history,
+                &settled,
+                pending.compaction_epoch_at_start,
+                false,
+                &pending.user_input,
+                len_before_user_turn,
+            );
+        }
+        Err(_) => tracing::error!(
+            task_id = pending.task_id.get(),
+            "failed or cancelled worker turn was not settled; the history commit is latched as failed"
+        ),
     }
-    let view = super::compaction::provider_view_after_compacted_abort(history, &acked, user_input);
-    tracing::info!(
-        messages_before = history.len(),
-        messages_after = view.len(),
-        "provider view rebuilt from the acknowledged snapshot after a compaction in a failed or cancelled turn"
-    );
-    *history = view;
-    true
 }
 
 #[cfg(feature = "terminal-tui")]
@@ -1592,12 +1593,7 @@ async fn finalize_per_turn_context(
                 }
                 tracing::warn!(error = %error, "Failed to commit ordered failed Chat terminal event");
             }
-            reconcile_aborted_turn(
-                history,
-                chat_dispatcher,
-                pending.compaction_epoch_at_start,
-                &pending.user_input,
-            );
+            settle_aborted_worker_turn(history, chat_dispatcher, turn_signal, &pending, None).await;
             let interactive_tui_active = redraw_tx_for_main.is_some();
             if !interactive_tui_active {
                 let _ = terminal.cancel_draft("user", &pending.draft_id).await;
@@ -1644,14 +1640,14 @@ async fn finalize_per_turn_context(
                 tracing::warn!(error = %error, "Failed to commit ordered cancelled Chat terminal event");
             }
             let _ = terminal.cancel_draft("user", &pending.draft_id).await;
-            if !reconcile_aborted_turn(
+            settle_aborted_worker_turn(
                 history,
                 chat_dispatcher,
-                pending.compaction_epoch_at_start,
-                &pending.user_input,
-            ) {
-                rollback_cancelled_turn_history(history, pending.history_len_before_user_turn);
-            }
+                turn_signal,
+                &pending,
+                Some(pending.history_len_before_user_turn),
+            )
+            .await;
             publish_main_queue_status(chat_dispatcher, turn_scheduler);
             publish_provider_worker_status(chat_dispatcher, provider_turn_workers);
         }
@@ -1989,6 +1985,95 @@ pub(super) async fn record_user_turn_at_admission(
         )
         .await
         .map_err(|error| anyhow::anyhow!("Chat stopped after an unconfirmed history commit: {error}"))
+}
+
+/// The acknowledged session as of every action sent before this call: an
+/// awaited no-op (`RedrawRequested`) on the same ordered channel. A turn's
+/// admission reads its start state through it, so a compaction another turn
+/// already sent is never missed by a racing snapshot read. A failed
+/// acknowledgement latches `commits` and is the unconfirmed-commit stop.
+pub(super) async fn acknowledged_session_barrier(
+    chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
+    commits: &crate::chat::dispatcher::TurnCompletionSignal,
+) -> anyhow::Result<crate::chat::acked_session::AckedSession> {
+    match chat_dispatcher
+        .dispatch_awaited(crate::chat::action::Action::RedrawRequested, commits)
+        .await
+        .map_err(|error| anyhow::anyhow!("Chat stopped after an unconfirmed history commit: {error}"))?
+    {
+        crate::chat::acked_session::Ack::Published(acked) | crate::chat::acked_session::Ack::Unchanged(acked) => {
+            Ok(acked)
+        }
+        crate::chat::acked_session::Ack::Rejected(_) => Ok(chat_dispatcher.session_reader().acked()),
+    }
+}
+
+/// Settle a failed or cancelled turn with the session authority, in order
+/// after its terminal action and every in-turn compaction the turn sent:
+/// `TurnAbortSettled` removes the recorded `request` (when the turn recorded
+/// one and it is still the trailing answerless user turn) and saves, and the
+/// acknowledged revision is returned. Then the run loop's provider view
+/// follows that revision ([`provider_view_after_settled_abort`]).
+///
+/// A failed acknowledgement latches `commits` and is returned as the
+/// unconfirmed-commit stop; a refusal (which this action never produces for
+/// a live session) is latched the same way.
+pub(super) async fn settle_aborted_turn(
+    chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
+    commits: &crate::chat::dispatcher::TurnCompletionSignal,
+    request: Option<&str>,
+) -> anyhow::Result<crate::chat::acked_session::AckedSession> {
+    let ack = chat_dispatcher
+        .dispatch_awaited(
+            crate::chat::action::Action::TurnAbortSettled {
+                request: request.map(str::to_owned),
+            },
+            commits,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("Chat stopped after an unconfirmed history commit: {error}"))?;
+    match ack {
+        crate::chat::acked_session::Ack::Published(acked) | crate::chat::acked_session::Ack::Unchanged(acked) => {
+            Ok(acked)
+        }
+        crate::chat::acked_session::Ack::Rejected(_) => {
+            let reason = "the failed or cancelled turn could not be settled";
+            commits.fail_history_commit(reason.to_owned());
+            anyhow::bail!("Chat stopped after an unconfirmed history commit: {reason}")
+        }
+    }
+}
+
+/// The run loop's provider view after a settled failed or cancelled turn.
+/// The aborted request is never kept. When the session was compacted at any
+/// point since before the turn's preflight (`settled` carries a compaction
+/// epoch other than `compaction_epoch_before_preflight`, or the turn itself
+/// reported one), the view is rebuilt from the settled snapshot; otherwise it
+/// is cut back to `len_before_user_turn`, its length before the request
+/// (`None` for a view the request was never pushed to). Returns whether it
+/// rebuilt the view.
+pub(super) fn provider_view_after_settled_abort(
+    history: &mut Vec<crate::providers::ChatMessage>,
+    settled: &crate::chat::acked_session::AckedSession,
+    compaction_epoch_before_preflight: u64,
+    compacted_in_turn: bool,
+    user_input: &str,
+    len_before_user_turn: Option<usize>,
+) -> bool {
+    if settled.compaction_epoch == compaction_epoch_before_preflight && !compacted_in_turn {
+        if let Some(len) = len_before_user_turn {
+            rollback_cancelled_turn_history(history, len);
+        }
+        return false;
+    }
+    let view = super::compaction::provider_view_after_compacted_abort(history, settled, user_input);
+    tracing::info!(
+        messages_before = history.len(),
+        messages_after = view.len(),
+        "provider view rebuilt from the settled snapshot after a compaction in a failed or cancelled turn"
+    );
+    *history = view;
+    true
 }
 
 /// Dispatch a turn's final metered usage (`FinalAggregate`) unconditionally,

@@ -607,7 +607,8 @@ pub(super) fn spawn_line_input_listener(
             .listen_input_sink(crate::runtime::h2_entry::TerminalInputSink::ordinary(input_tx))
             .await
         {
-            tracing::error!("Terminal input loop error: {e}");
+            let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&e);
+            tracing::error!(error_len, error_sha256, "Terminal input loop error");
         }
         stdin_closed.cancel();
     });

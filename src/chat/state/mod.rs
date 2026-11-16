@@ -1348,6 +1348,7 @@ impl ChatState {
                 leading_system_prompt,
             } => self.reduce_session_loaded(session, persist, leading_system_prompt),
             Action::TurnCommitRequested { task_id, draft_id } => self.reduce_turn_commit_requested(task_id, draft_id),
+            Action::TurnAbortSettled { request } => self.reduce_turn_abort_settled(request),
             Action::Awaited { action, .. } => self.reduce(*action),
             Action::SessionSaved { id } => self.reduce_session_saved(id),
             Action::SessionSwitched { id } => self.reduce_session_switched(id),
@@ -1513,7 +1514,7 @@ const fn ui_dirty_for(action: &Action) -> bool {
         }
 
         // Session: SessionLoaded rebuilds history and may force a UI reset; SessionSaved/Switched do not
-        Action::SessionLoaded { .. } | Action::TurnCommitRequested { .. } => true,
+        Action::SessionLoaded { .. } | Action::TurnCommitRequested { .. } | Action::TurnAbortSettled { .. } => true,
         Action::Awaited { action, .. } => ui_dirty_for(action),
         Action::SessionSaved { .. } | Action::SessionSwitched { .. } => false,
         // Record*/compaction writes session.turns/history only. User-visible

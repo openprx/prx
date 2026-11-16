@@ -6,7 +6,8 @@
 //! the user, and a store error the database raises with the sentinel in it.
 //! The sentinel in turn content, title, tool `args_preview`, input, provider
 //! errors and store errors never reaches the captured output; the stored row
-//! is sanitized.
+//! is sanitized. An actual compaction whose audit storage refuses every
+//! write with the sentinel in the database error logs no content either.
 
 use super::*;
 use crate::chat::acked_session::{SessionCommit, SessionPublisher};
@@ -333,6 +334,115 @@ async fn stream_failure_retry_and_store_error_logs_carry_no_free_text() {
     })
     .await
     .expect("stream_failure_retry_and_store_error_logs_carry_no_free_text exceeded DEADLINE");
+}
+
+/// A summarizer whose summary passes the section check.
+struct SentinelSummaryProvider;
+
+#[async_trait::async_trait]
+impl Provider for SentinelSummaryProvider {
+    fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
+        crate::providers::traits::ProviderCapabilities::default()
+    }
+
+    async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+        Ok("## Decisions\n- d\n## Open TODOs\n- t\n## Constraints\n- c".to_owned())
+    }
+
+    async fn chat(
+        &self,
+        _: crate::providers::traits::ChatRequest<'_>,
+        _: &str,
+        _: f64,
+    ) -> anyhow::Result<crate::providers::traits::ChatResponse> {
+        Ok(crate::providers::traits::ChatResponse {
+            text: Some("unused".to_owned()),
+            tool_calls: Vec::new(),
+            reasoning_content: None,
+        })
+    }
+
+    async fn warmup(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// An actual compaction (agent summary compaction, then the chat
+/// compaction's audit) over a real SQLite store whose triggers refuse every
+/// audit write with the sentinel in the database error: the compaction still
+/// succeeds, and its failure lines carry the error's length and digest only.
+#[tokio::test]
+async fn a_compaction_whose_audit_storage_fails_logs_no_stored_content() {
+    tokio::time::timeout(DEADLINE, async {
+        let (logs, _guard) = capture_logs();
+        let (dir, memory) = sqlite_memory();
+        let connection = rusqlite::Connection::open(dir.path().join("memory").join("brain.db"))
+            .expect("test: open the real database");
+        connection
+            .execute_batch(&format!(
+                "CREATE TRIGGER test_refuse_memories BEFORE INSERT ON memories \
+                 BEGIN SELECT RAISE(ABORT, 'refused {SENTINEL}'); END; \
+                 CREATE TRIGGER test_refuse_events BEFORE INSERT ON message_events \
+                 BEGIN SELECT RAISE(ABORT, 'refused {SENTINEL}'); END;"
+            ))
+            .expect("test: install the refusing triggers");
+        let envelope = crate::runtime::envelope::RuntimeEnvelope::agent("workspace-sentinel", "run-sentinel");
+        let audit = crate::agent::document_ingest::DocumentIngestRuntime::from_envelope(Arc::clone(&memory), &envelope);
+        let history = vec![
+            ChatMessage::system("sys"),
+            crate::agent::turn_contracts::inbound_user_message(&format!("old user {SENTINEL} ").repeat(60)),
+            ChatMessage::assistant(format!("old assistant {SENTINEL} ").repeat(60)),
+            crate::agent::turn_contracts::inbound_user_message(&format!("pending user {SENTINEL} ").repeat(60)),
+            ChatMessage::assistant("recent assistant"),
+        ];
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Safeguard,
+            reserve_tokens: 1,
+            keep_recent_messages: 1,
+            memory_flush: false,
+            max_context_tokens: 50,
+            max_context_tokens_explicit: true,
+            os_paging: crate::config::OsPagingConfig::default(),
+        };
+
+        let patch = crate::agent::compaction::build_configurable_compaction_patch(
+            &history,
+            &SentinelSummaryProvider,
+            "model",
+            &config,
+            Some(&audit),
+            "sentinel",
+        )
+        .await
+        .expect("a refused audit write does not fail the compaction");
+        crate::chat::compaction::persist_legacy_chat_compaction_audit(
+            memory.as_ref(),
+            &envelope,
+            &history,
+            &history,
+            crate::chat::compaction::LegacyCompactionTokenMetadata {
+                provider_token_estimate: 1,
+                persisted_token_estimate: 1,
+                enrichment_token_delta: 0,
+            },
+            "sentinel",
+        )
+        .await;
+        let text = logs.text();
+
+        assert!(patch.is_some(), "the summary compaction produced its patch");
+        assert!(
+            text.contains("failed to persist compaction summary memory") && text.contains("error_sha256"),
+            "the agent compaction's refused audit write is logged by length and digest:\n{text}"
+        );
+        assert!(
+            text.contains("failed to persist legacy chat compaction summary memory"),
+            "the chat compaction's refused audit write is logged:\n{text}"
+        );
+        assert_no_sentinel(&text, "compaction audit storage failure");
+    })
+    .await
+    .expect("a_compaction_whose_audit_storage_fails_logs_no_stored_content exceeded DEADLINE");
 }
 
 #[cfg(feature = "terminal-tui")]

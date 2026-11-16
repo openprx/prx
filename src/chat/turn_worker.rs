@@ -1145,38 +1145,45 @@ mod tests {
         );
     }
 
+    /// Whole-test bound: everything awaited here is in-process.
+    const EXIT_TEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
     #[tokio::test]
     async fn execution_exit_is_idempotent_and_a_foreign_lease_leaves_the_worker_untouched() {
-        let (mut registry, id) = running_worker();
-        let task = tokio::spawn(std::future::pending::<()>());
-        registry.attach_execution_handle(id, 10, task.abort_handle()).unwrap();
-        registry.record_execution_started(id, 10).unwrap();
+        tokio::time::timeout(EXIT_TEST_DEADLINE, async {
+            let (mut registry, id) = running_worker();
+            let task = tokio::spawn(std::future::pending::<()>());
+            registry.attach_execution_handle(id, 10, task.abort_handle()).unwrap();
+            registry.record_execution_started(id, 10).unwrap();
 
-        assert!(
-            registry.record_execution_exited(id, 11).is_err(),
-            "an exit for a foreign lease is refused"
-        );
-        let worker = registry.worker(id).unwrap();
-        assert!(
-            worker.execution_lease_active && !worker.execution_exited,
-            "a foreign-lease exit leaves the lease active"
-        );
-        assert!(
-            registry.execution_handle_attached(id),
-            "a foreign-lease exit leaves the handle attached"
-        );
+            assert!(
+                registry.record_execution_exited(id, 11).is_err(),
+                "an exit for a foreign lease is refused"
+            );
+            let worker = registry.worker(id).unwrap();
+            assert!(
+                worker.execution_lease_active && !worker.execution_exited,
+                "a foreign-lease exit leaves the lease active"
+            );
+            assert!(
+                registry.execution_handle_attached(id),
+                "a foreign-lease exit leaves the handle attached"
+            );
 
-        registry.record_execution_exited(id, 10).unwrap();
-        registry.record_execution_exited(id, 10).unwrap();
-        let worker = registry.worker(id).unwrap();
-        assert!(
-            worker.execution_exited && !worker.execution_lease_active,
-            "the matching exit retires the lease, idempotently"
-        );
-        assert!(
-            !registry.execution_handle_attached(id),
-            "the matching exit detaches the handle"
-        );
-        task.abort();
+            registry.record_execution_exited(id, 10).unwrap();
+            registry.record_execution_exited(id, 10).unwrap();
+            let worker = registry.worker(id).unwrap();
+            assert!(
+                worker.execution_exited && !worker.execution_lease_active,
+                "the matching exit retires the lease, idempotently"
+            );
+            assert!(
+                !registry.execution_handle_attached(id),
+                "the matching exit detaches the handle"
+            );
+            task.abort();
+        })
+        .await
+        .expect("the test finishes within EXIT_TEST_DEADLINE");
     }
 }

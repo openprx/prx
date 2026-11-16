@@ -333,7 +333,10 @@ impl TestSessionDispatcher {
         let mut handle = self.handle;
         match tokio::time::timeout(Self::STOP_DEADLINE, &mut handle).await {
             Ok(Ok(_stats)) => {}
-            Ok(Err(error)) => tracing::warn!(error = %error, "test dispatcher join failed"),
+            Ok(Err(error)) => {
+                let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+                tracing::warn!(error_len, error_sha256, "test dispatcher join failed");
+            }
             Err(_) => {
                 handle.abort();
                 panic!("the test dispatcher did not stop within STOP_DEADLINE");

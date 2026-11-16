@@ -36,7 +36,7 @@ use crate::agent::context_paging::{
     apply_os_paging, context_mode_uses_os_paging, inject_recalled_context, recall_context_pages,
 };
 use crate::agent::context_preflight::{
-    RestoredRequestPosition, capture_current_turn_request, preflight_context_budget_before_provider_call,
+    RestoredRequestPosition, capture_current_turn_request, preflight_context_budget_capturing_change,
     restore_current_turn_request,
 };
 use crate::agent::diagnostics::{redact_sensitive_json_keys, scrub_credentials, tool_parse_log_digest};
@@ -466,13 +466,18 @@ async fn run_turn_unguarded(
                 inject_recalled_context(history, recalled);
             }
         }
+        let before = history_before_change(&runtime_adapter, history);
         match apply_os_paging(history, config, document_ingest.as_ref()).await {
             Ok(true) => {
                 crate::agent::idle::beat(crate::agent::idle::ProgressKind::Compaction);
                 tracing::debug!("os-paging: pre-turn eviction applied");
+                report_durable_compaction(&runtime_adapter, before, history, config).await?;
             }
             Ok(false) => {}
-            Err(e) => tracing::warn!("os-paging: pre-turn eviction error (soft): {e}"),
+            Err(error) => {
+                let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+                tracing::warn!(error_len, error_sha256, "os-paging: pre-turn eviction error (soft)");
+            }
         }
     }
 
@@ -486,11 +491,18 @@ async fn run_turn_unguarded(
                 threshold = budget.warning_threshold_tokens,
                 "Pre-turn memory flush: context near limit, running pre-emptive compaction"
             );
-            if let Err(e) =
-                apply_configurable_compaction(history, provider, model, config, document_ingest.as_ref(), "pre_turn")
-                    .await
+            let before = history_before_change(&runtime_adapter, history);
+            match apply_configurable_compaction(history, provider, model, config, document_ingest.as_ref(), "pre_turn")
+                .await
             {
-                tracing::warn!("Pre-turn compaction failed: {e}");
+                Ok(true) => {
+                    report_durable_compaction(&runtime_adapter, before, history, config).await?;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+                    tracing::warn!(error_len, error_sha256, "Pre-turn compaction failed");
+                }
             }
         }
     }
@@ -713,7 +725,11 @@ async fn run_turn_unguarded(
         // entrypoints that pass no compaction config: there is no budget to
         // report there.
         let budgeted_totals: Option<(usize, usize)> = if let Some(config) = compaction_config {
-            let budget = preflight_context_budget_before_provider_call(
+            // A summary or handoff applied here (typically after tool output
+            // grew the history mid-turn) is reported to the session authority
+            // like every durable in-turn compaction; a trim after it is this
+            // request's projection.
+            let (budget, compaction) = preflight_context_budget_capturing_change(
                 history,
                 provider,
                 model,
@@ -723,6 +739,9 @@ async fn run_turn_unguarded(
                 "pre_provider_call",
             )
             .await?;
+            if let Some((before, compacted)) = compaction {
+                report_durable_compaction(&runtime_adapter, Some(before), &compacted, config).await?;
+            }
             Some((
                 budget.used_tokens,
                 estimate_budgeted_request_tokens(budget.measurement(), tool_surface),
@@ -1107,7 +1126,12 @@ async fn run_turn_unguarded(
                     )
                     .await
                 {
-                    tracing::warn!(error = %error, "Failed to persist compiled LLM request context");
+                    let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+                    tracing::warn!(
+                        error_len,
+                        error_sha256,
+                        "Failed to persist compiled LLM request context"
+                    );
                 }
             }
         } else {
@@ -1447,8 +1471,7 @@ async fn run_turn_unguarded(
                     let mut current_request = capture_current_turn_request(history);
                     let mut restore_position = RestoredRequestPosition::AboveEverythingLeftStanding;
                     tracing::warn!("Context overflow detected; running compaction and retrying LLM call");
-                    let mut emitted_exact_patch = false;
-                    let mut inline_patch_source: Option<(Vec<ChatMessage>, usize)> = None;
+                    let mut inline_patch: Option<(Vec<ChatMessage>, Vec<ChatMessage>)> = None;
                     if let Some(config) = compaction_config {
                         let mut before_trim = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
                         let mut degraded_reason = None;
@@ -1549,14 +1572,12 @@ async fn run_turn_unguarded(
                                                 },
                                             )
                                             .await?;
-                                            emitted_exact_patch = true;
                                         }
                                     }
                                 } else {
-                                    // An inline loop with an event sink (chat without a
-                                    // worker) reports the compaction to its session
-                                    // authority once the request is restored below.
-                                    let source_history = runtime_adapter.events.is_some().then(|| history.clone());
+                                    // An inline loop reports the applied patch to its
+                                    // session authority below.
+                                    let before = history_before_change(&runtime_adapter, history);
                                     if let Err(error) = apply_compaction_patch_exact(history, &patch) {
                                         warn_overflow_patch_refused(&error);
                                         restore_position = RestoredRequestPosition::AboveEverythingLeftStanding;
@@ -1568,9 +1589,8 @@ async fn run_turn_unguarded(
                                             tokens_before_compaction,
                                         );
                                         degraded_reason = Some("handoff_unavailable");
-                                    } else {
-                                        inline_patch_source =
-                                            source_history.map(|source| (source, patch.range_start()));
+                                    } else if let Some(before) = before {
+                                        inline_patch = Some((before, history.clone()));
                                     }
                                 }
                             }
@@ -1585,7 +1605,8 @@ async fn run_turn_unguarded(
                                 degraded_reason = Some("handoff_unavailable");
                             }
                             Err(error) => {
-                                tracing::warn!("Overflow retry compaction failed: {error}");
+                                let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+                                tracing::warn!(error_len, error_sha256, "Overflow retry compaction failed");
                                 apply_aggressive_trim(history, config.keep_recent_messages);
                                 degraded_reason = Some("handoff_failed");
                             }
@@ -1596,18 +1617,6 @@ async fn run_turn_unguarded(
                             "overflow_retry",
                             restore_position,
                         );
-                        if let Some(source) = inline_patch_source.take() {
-                            emit_inline_overflow_patch(
-                                &runtime_adapter,
-                                history,
-                                source,
-                                config,
-                                messages_before_compaction,
-                                tokens_before_compaction,
-                            )
-                            .await?;
-                            emitted_exact_patch = true;
-                        }
                         if matches!(config.mode, crate::config::AgentCompactionMode::Switch)
                             && let Some(reason) = degraded_reason
                         {
@@ -1626,7 +1635,16 @@ async fn run_turn_unguarded(
                         apply_aggressive_trim(history, COMPACTION_KEEP_RECENT_MESSAGES);
                         restore_current_turn_request(history, current_request, "overflow_retry", restore_position);
                     }
-                    if !(emitted_exact_patch || runtime_adapter.stream_provider && compaction_config.is_some()) {
+                    // The durable part of the recovery (an inline loop's applied
+                    // handoff or summary; the streaming path published its own
+                    // exact patch above) reaches the session authority. A trim
+                    // fallback is this retry's projection: the session keeps the
+                    // turns a later handoff can still recover. Without a
+                    // compaction config the authority runs its own trim.
+                    if let (Some((before, compacted)), Some(config)) = (inline_patch.take(), compaction_config) {
+                        report_durable_compaction(&runtime_adapter, Some(before), &compacted, config).await?;
+                    }
+                    if compaction_config.is_none() {
                         emit_tool_loop_event(&runtime_adapter, ToolLoopEvent::ContextCompacted).await?;
                     }
                     let made_progress = history.len() < messages_before_compaction
@@ -2164,41 +2182,62 @@ async fn run_turn_unguarded(
     }
 }
 
-/// Report an inline loop's overflow compaction to its event sink as one exact
-/// patch over the pre-compaction history of `(source_history, range_start)`:
-/// the guarded range runs from `range_start` to the end and its replacement
-/// is the compacted view
-/// with the turn's request restored, so the sink sees exactly the history the
-/// retry sends.
-async fn emit_inline_overflow_patch(
+/// The loop's history before a step that may compact it durably, kept only
+/// while a session authority listens (`runtime_adapter.events`), so
+/// [`report_durable_compaction`] can describe the step to it.
+fn history_before_change(
     runtime_adapter: &crate::agent::turn_contracts::ToolLoopRuntimeAdapter,
     history: &[ChatMessage],
-    (source_history, range_start): (Vec<ChatMessage>, usize),
+) -> Option<Vec<ChatMessage>> {
+    runtime_adapter.events.as_ref().map(|_| history.to_vec())
+}
+
+/// Report one durable in-turn compaction (a handoff, a summary or an evicted
+/// page applied by the loop on its own: pre-turn, per-provider preflight,
+/// inline overflow recovery) to the session authority, in order with the
+/// turn's other events: one exact patch whose guarded range is the whole
+/// pre-compaction history `before` and whose replacement is `compacted`.
+/// Lossy trims are not reported: they are the projection of one request, and
+/// the session keeps the turns a later handoff can still recover (the run loop
+/// rebuilds an inline view that diverged from the session after the turn).
+/// Nothing is sent when nobody listens or nothing changed.
+async fn report_durable_compaction(
+    runtime_adapter: &crate::agent::turn_contracts::ToolLoopRuntimeAdapter,
+    before: Option<Vec<ChatMessage>>,
+    compacted: &[ChatMessage],
     config: &crate::config::AgentCompactionConfig,
-    messages_before_compaction: usize,
-    tokens_before_compaction: usize,
 ) -> Result<()> {
-    let guard =
-        crate::agent::compaction::compaction_patch_guard_for(&source_history, range_start, source_history.len())
-            .ok_or_else(|| anyhow::anyhow!("invalid inline overflow compaction patch range"))?;
+    let Some(source_history) = before.filter(|_| runtime_adapter.events.is_some()) else {
+        return Ok(());
+    };
+    let unchanged = source_history.len() == compacted.len()
+        && source_history
+            .iter()
+            .zip(compacted)
+            .all(|(before, after)| before.role == after.role && before.content == after.content);
+    if unchanged {
+        return Ok(());
+    }
+    let guard = crate::agent::compaction::compaction_patch_guard_for(&source_history, 0, source_history.len())
+        .ok_or_else(|| anyhow::anyhow!("invalid in-turn compaction range"))?;
     let patch = crate::agent::turn_contracts::CompactionPatch {
-        replacement: history.iter().skip(range_start).cloned().collect(),
+        replacement: compacted.to_vec(),
         append_after: Vec::new(),
         guard,
     };
     let system_messages =
         |messages: &[ChatMessage]| usize::from(messages.first().is_some_and(|message| message.role == "system"));
-    let used_context_tokens = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD).used_tokens;
+    let used_context_tokens = plan_context_budget(compacted, config, PRE_TURN_FLUSH_THRESHOLD).used_tokens;
     emit_tool_loop_event(
         runtime_adapter,
         ToolLoopEvent::ContextCompactionPatch {
-            turns_before: messages_before_compaction.saturating_sub(system_messages(&source_history)),
+            turns_before: source_history.len().saturating_sub(system_messages(&source_history)),
+            tokens_before: estimate_history_tokens(&source_history),
             source_history,
             patch,
             config: config.clone(),
-            tokens_before: tokens_before_compaction,
-            turns_after: history.len().saturating_sub(system_messages(history)),
-            tokens_after: estimate_history_tokens(history),
+            turns_after: compacted.len().saturating_sub(system_messages(compacted)),
+            tokens_after: estimate_history_tokens(compacted),
             used_context_tokens,
         },
     )

@@ -795,7 +795,12 @@ async fn attach_compaction_event_provenance(
         Ok(None) => {}
         Err(error) => {
             source.source_event_provenance_status = "read_error".to_string();
-            tracing::debug!(error = %error, "failed to resolve compaction MessageEvent provenance");
+            let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+            tracing::debug!(
+                error_len,
+                error_sha256,
+                "failed to resolve compaction MessageEvent provenance"
+            );
         }
     }
 }
@@ -941,7 +946,12 @@ pub(crate) async fn persist_context_switch_degradation(
         // event for the rest of the turn. Duplicate writes are still impossible
         // — the backend is unique on `(workspace_id, idempotency_key)` and the
         // key is derived from the turn.
-        tracing::debug!(error = %error, "failed to append context switch degradation event");
+        let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+        tracing::debug!(
+            error_len,
+            error_sha256,
+            "failed to append context switch degradation event"
+        );
     } else {
         audit
             .degradation_recorded
@@ -997,7 +1007,8 @@ async fn persist_compaction_audit(
         )
         .await
     {
-        tracing::debug!(error = %error, "failed to persist compaction summary memory");
+        let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+        tracing::debug!(error_len, error_sha256, "failed to persist compaction summary memory");
     }
     let summary_message_event_id = if let Some(range) = source.source_event_range.as_ref() {
         let raw_payload_json = serde_json::json!({
@@ -1048,7 +1059,12 @@ async fn persist_compaction_audit(
         {
             Ok(event) => Some(event.event_id),
             Err(error) => {
-                tracing::debug!(error = %error, "failed to append compaction summary MessageEvent");
+                let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+                tracing::debug!(
+                    error_len,
+                    error_sha256,
+                    "failed to append compaction summary MessageEvent"
+                );
                 None
             }
         }
@@ -1097,7 +1113,8 @@ async fn persist_compaction_audit(
         })
         .await
     {
-        tracing::debug!(error = %error, "failed to append compaction run audit");
+        let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+        tracing::debug!(error_len, error_sha256, "failed to append compaction run audit");
     }
 }
 

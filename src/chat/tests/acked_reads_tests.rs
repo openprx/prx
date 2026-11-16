@@ -999,3 +999,155 @@ async fn an_admission_record_the_full_channel_never_accepts_fails_the_turn_once(
     .await
     .expect("an_admission_record_the_full_channel_never_accepts_fails_the_turn_once exceeded its deadline");
 }
+
+/// The request a failed turn recorded at admission.
+const ABORTED_REQUEST: &str = "the request whose provider call failed";
+
+/// Admission record, an in-turn compaction that saves the request, then a
+/// draftless failure: the awaited settlement removes the request, saves and
+/// publishes, so the acknowledged session and the stored row both lose it.
+#[tokio::test]
+async fn a_draftless_failure_after_an_in_turn_compaction_is_settled_saved_and_published() {
+    tokio::time::timeout(DEADLINE, async {
+        let (_dir, memory) = sqlite_memory();
+        let harness = TestSessionDispatcher::spawn(
+            Arc::clone(&memory),
+            TestSessionDispatcher::state_with_history(vec![ChatMessage::system("sys")]),
+        );
+        crate::chat::provider_turns::record_user_turn_at_admission(
+            &harness.dispatcher,
+            &harness.commits,
+            ABORTED_REQUEST,
+        )
+        .await
+        .expect("test: admission recorded");
+        // The in-turn compaction keeps the recorded request and saves it.
+        let source = vec![
+            ChatMessage::system("sys"),
+            crate::agent::turn_contracts::inbound_user_message(ABORTED_REQUEST),
+        ];
+        let guard = crate::agent::compaction::compaction_patch_guard_for(&source, 0, source.len())
+            .expect("test: guard over the reducer history");
+        let compacted = harness
+            .dispatcher
+            .dispatch_awaited(
+                Action::HistoryCompactionPatchApplied {
+                    reason: crate::chat::action::CompactReason::ContextOverflow,
+                    patch: crate::agent::turn_contracts::CompactionPatch {
+                        replacement: source.clone(),
+                        append_after: Vec::new(),
+                        guard,
+                    },
+                    compaction_config: compaction_config(),
+                },
+                &harness.commits,
+            )
+            .await
+            .expect("test: compaction acknowledged");
+        let Ack::Published(after_compaction) = compacted else {
+            panic!("the in-turn compaction publishes a saved revision: {compacted:?}");
+        };
+        let row_after_compaction = stored_row(memory.as_ref(), &after_compaction.session_id).await;
+
+        let settled = crate::chat::provider_turns::settle_aborted_turn(
+            &harness.dispatcher,
+            &harness.commits,
+            Some(ABORTED_REQUEST),
+        )
+        .await;
+        let row_after_settlement = stored_row(memory.as_ref(), &after_compaction.session_id).await;
+        let healthy = harness.commits.ensure_history_commits_healthy();
+        harness.stop().await;
+
+        assert!(
+            row_after_compaction.contains(ABORTED_REQUEST),
+            "the compaction saved the admitted request before the failure"
+        );
+        let settled = settled.expect("the settlement is acknowledged");
+        assert!(
+            settled.revision > after_compaction.revision,
+            "the settlement publishes a newer saved revision"
+        );
+        assert_eq!(
+            settled.compaction_epoch, after_compaction.compaction_epoch,
+            "the settled revision carries the in-turn compaction"
+        );
+        assert!(
+            settled.session.turns.iter().all(|turn| turn.content != ABORTED_REQUEST),
+            "the acknowledged session no longer holds the failed request: {:?}",
+            turn_pairs(&settled.session)
+        );
+        assert!(
+            !row_after_settlement.contains(ABORTED_REQUEST),
+            "the stored row no longer holds the failed request"
+        );
+        assert!(healthy.is_ok(), "nothing is latched: {healthy:?}");
+    })
+    .await
+    .expect("a_draftless_failure_after_an_in_turn_compaction_is_settled_saved_and_published exceeded DEADLINE");
+}
+
+/// A draft terminal that already rolled the request back (as a cancel that
+/// removed the draft never does): the settlement removes nothing more, keeps
+/// the earlier exchange, and still saves the corrected session.
+#[tokio::test]
+async fn a_settlement_after_the_draft_terminal_removes_nothing_more_and_saves() {
+    tokio::time::timeout(DEADLINE, async {
+        let (_dir, memory) = sqlite_memory();
+        let harness = TestSessionDispatcher::spawn(
+            Arc::clone(&memory),
+            TestSessionDispatcher::state_with_history(vec![ChatMessage::system("sys")]),
+        );
+        let dispatch = |action: Action| harness.dispatcher.dispatch_awaited(action, &harness.commits);
+        dispatch(Action::RecordUserTurn("the earlier question".to_owned()))
+            .await
+            .expect("test: earlier question");
+        dispatch(Action::RecordAssistantTurn {
+            task_id: None,
+            content: "the earlier answer".to_owned(),
+        })
+        .await
+        .expect("test: earlier answer");
+        dispatch(Action::RecordUserTurn(ABORTED_REQUEST.to_owned()))
+            .await
+            .expect("test: admission");
+        dispatch(Action::TurnStarted {
+            draft_id: "draft-aborted".to_owned(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+        })
+        .await
+        .expect("test: draft started");
+        dispatch(Action::StreamFailed {
+            draft_id: "draft-aborted".to_owned(),
+            err: "refused".to_owned(),
+            retryable: false,
+        })
+        .await
+        .expect("test: draft failed");
+
+        let settled = crate::chat::provider_turns::settle_aborted_turn(
+            &harness.dispatcher,
+            &harness.commits,
+            Some(ABORTED_REQUEST),
+        )
+        .await;
+        harness.stop().await;
+
+        let settled = settled.expect("the settlement is acknowledged");
+        assert_eq!(
+            turn_pairs(&settled.session),
+            vec![
+                ("user".to_owned(), "the earlier question".to_owned()),
+                ("assistant".to_owned(), "the earlier answer".to_owned()),
+            ],
+            "only the failed request is gone; the earlier exchange stays"
+        );
+        let row = stored_row(memory.as_ref(), &settled.session_id).await;
+        assert!(
+            !row.contains(ABORTED_REQUEST) && row.contains("the earlier answer"),
+            "the stored row is the corrected session"
+        );
+    })
+    .await
+    .expect("a_settlement_after_the_draft_terminal_removes_nothing_more_and_saves exceeded DEADLINE");
+}

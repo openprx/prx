@@ -479,6 +479,14 @@ pub enum Action {
         task_id: crate::chat::turn_scheduler::TurnTaskId,
         draft_id: Option<String>,
     },
+    /// Ordered settlement of a provider turn that failed or was cancelled,
+    /// awaited by the run loop after the turn's terminal action. It removes
+    /// the turn's recorded request while that is still the trailing
+    /// answerless user turn (`request`: the plain request recorded at
+    /// admission; `None` for a turn that never recorded it) and always saves,
+    /// so the acknowledged session and the store hold the corrected history
+    /// together with every in-turn compaction sent before it.
+    TurnAbortSettled { request: Option<String> },
     /// Wrapper for [`crate::chat::dispatcher::ChatDispatcher::dispatch_awaited`]:
     /// the dispatcher reduces `action`, runs its effects, then answers `ticket`.
     Awaited {
@@ -693,6 +701,7 @@ impl Action {
             Self::StreamRetryAttempt { .. } => "StreamRetryAttempt",
             Self::SessionLoaded { .. } => "SessionLoaded",
             Self::TurnCommitRequested { .. } => "TurnCommitRequested",
+            Self::TurnAbortSettled { .. } => "TurnAbortSettled",
             Self::Awaited { action, .. } => action.kind(),
             Self::SessionSaved { .. } => "SessionSaved",
             Self::SessionSwitched { .. } => "SessionSwitched",

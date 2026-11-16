@@ -5,7 +5,7 @@ use super::DELTA_CHANNEL_CAPACITY;
 use super::active_turn::process_active_turn_input_batch;
 use super::active_turn::{
     dispatch_provider_worker_cancel_signal, format_provider_worker_report, is_queue_command, is_workers_command,
-    provider_workers_cancel_output_for_input, rollback_cancelled_turn_history,
+    provider_workers_cancel_output_for_input,
 };
 use super::bootstrap::{chat_model_switch, chat_provider_chain, initial_chat_dispatcher_state, startup_banner};
 #[cfg(feature = "terminal-tui")]
@@ -31,12 +31,14 @@ use super::input_queue::{
 use super::output::{print_fallback_chat_output, render_response, should_resend_on_finalize_failure};
 use super::provider_turns::{
     OrderedCommitTerminal, PROVIDER_TURN_LIFECYCLE_CHANNEL_CAPACITY, ProviderTurnCompletionContext,
-    ProviderTurnCompletionEvent, dispatch_final_usage, dispatch_ordered_provider_turn_commit_and_wait,
-    finish_inline_provider_turn, gate_cancelled_provider_turn_finalization, gate_failed_provider_turn_finalization,
-    inline_provider_turn_payload, mark_provider_turn_completed, provider_turn_visible_admission,
+    ProviderTurnCompletionEvent, acknowledged_session_barrier, dispatch_final_usage,
+    dispatch_ordered_provider_turn_commit_and_wait, finish_inline_provider_turn,
+    gate_cancelled_provider_turn_finalization, gate_failed_provider_turn_finalization, inline_provider_turn_payload,
+    mark_provider_turn_completed, provider_turn_visible_admission, provider_view_after_settled_abort,
     provider_worker_status, publish_provider_worker_status, record_provider_turn_completion_context,
     record_provider_turn_lifecycle_event, record_user_turn_at_admission, register_provider_history_commit_task,
-    register_provider_turn_worker, route_provider_completion_event_and_publish, start_provider_turn_task,
+    register_provider_turn_worker, route_provider_completion_event_and_publish, settle_aborted_turn,
+    start_provider_turn_task,
 };
 #[cfg(feature = "terminal-tui")]
 use super::provider_turns::{
@@ -621,6 +623,9 @@ async fn run_internal(
     let mut defer_visible_input_pop_once = false;
     let mut turn_scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
     let mut history_commit_coordinator = crate::chat::history_commit::HistoryCommitCoordinator::new();
+    // The acknowledged compaction epoch the provider view was last brought up
+    // to at a turn's admission (see the admission barrier below).
+    let mut provider_view_compaction_epoch = chat_session.acked().compaction_epoch;
     let mut provider_turn_workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
     let mut provider_turn_lifecycle_events_open = true;
     let (provider_completion_tx, mut provider_completion_rx) = mpsc::channel::<ProviderTurnCompletionEvent>(64);
@@ -3152,6 +3157,16 @@ Retry with a compatible model: /provider {shown} <model>",
         // Publish only this turn's selected metadata. Previous turns do not
         // grant continued Skill exposure; the prompt builder orders entries.
         let system_prompt = build_runtime_system_prompt(&config, model_name, &selected_skills, native_tools);
+        // An ordered, acknowledged read before this turn builds its sources
+        // and copies its provider view: every action sent before it (another
+        // turn's compaction whose finalization is still pending included) is
+        // applied first, so no turn starts from a view the session already
+        // compacted, and its start epoch is from before its own preflight.
+        let admitted_session = acknowledged_session_barrier(&chat_dispatcher, &turn_signal).await?;
+        if admitted_session.compaction_epoch != provider_view_compaction_epoch {
+            history = super::compaction::provider_view_from_acked(&history, &admitted_session);
+            provider_view_compaction_epoch = admitted_session.compaction_epoch;
+        }
         let persisted_history_for_turn = persisted_history_for_current_turn(&chat_session.session(), &system_prompt, &user_input);
         upsert_leading_system_prompt(&mut history, system_prompt.clone());
         // S2-C Step 4: dual-write SetLeadingSystemPrompt to the reducer — byte-for-byte aligned with
@@ -3170,7 +3185,7 @@ Retry with a compatible model: /provider {shown} <model>",
         // The compaction epoch the provider-side copy reflects; a worker
         // compaction during the turn moves it on (see the finalizer).
         #[cfg(feature = "terminal-tui")]
-        let compaction_epoch_at_start = chat_session.acked().compaction_epoch;
+        let compaction_epoch_at_start = admitted_session.compaction_epoch;
         #[cfg(feature = "terminal-tui")]
         let history_for_provider = {
             let mut history_for_provider = history.clone();
@@ -3990,6 +4005,10 @@ Retry with a compatible model: /provider {shown} <model>",
                         if chat_turn_binding.as_ref().is_some_and(|binding| binding.is_decided()) { return Err(error); }
                         tracing::warn!(error = %error, "Failed to commit shared failed Chat terminal event");
                     }
+                    // The worker's compactions and terminal precede this settlement on the
+                    // action channel; the reducer never recorded a driver turn's request.
+                    let settled = settle_aborted_turn(&chat_dispatcher, &turn_signal, None).await?;
+                    provider_view_after_settled_abort(&mut history, &settled, compaction_epoch_at_start, false, &user_input, None);
                     // The reducer's NotifyHook(Error) has already been sent; do not hooks.emit here
                     // again, to avoid duplicates.
                     #[cfg(feature = "terminal-tui")]
@@ -4037,7 +4056,15 @@ Retry with a compatible model: /provider {shown} <model>",
                     if let Some(ref id) = draft_id {
                         let _ = terminal.cancel_draft("user", id).await;
                     }
-                    rollback_cancelled_turn_history(&mut history, history_len_before_user_turn);
+                    let settled = settle_aborted_turn(&chat_dispatcher, &turn_signal, None).await?;
+                    provider_view_after_settled_abort(
+                        &mut history,
+                        &settled,
+                        compaction_epoch_at_start,
+                        false,
+                        &user_input,
+                        Some(history_len_before_user_turn),
+                    );
                     publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
                     publish_provider_worker_status(&chat_dispatcher, &provider_turn_workers);
                 }
@@ -4046,6 +4073,10 @@ Retry with a compatible model: /provider {shown} <model>",
             continue;
         }
 
+        // The compaction epoch before the preflight: a compaction adopted by
+        // the preflight or during the turn moves it, and every turn end then
+        // rebuilds the provider view from the acknowledged session.
+        let inline_compaction_epoch_before_preflight = admitted_session.compaction_epoch;
         let legacy_budget_config = tool_surface_reserve.reserved_config(&effective_compaction.config);
         let preflight_budget = crate::agent::context_budget::plan_context_budget(
             &history,
@@ -4128,7 +4159,6 @@ Retry with a compatible model: /provider {shown} <model>",
         // view follows the acknowledged session (`reconcile_inline_turn`). The
         // reducer history it guards against holds the recorded request: the
         // acknowledged snapshot already does after an adopted preflight.
-        let inline_compaction_epoch_at_start = chat_session.acked().compaction_epoch;
         let inline_compaction = {
             let mut reducer_source = persisted_history_for_current_turn(&chat_session.session(), &system_prompt, &user_input);
             if preflight_adopted {
@@ -4151,6 +4181,10 @@ Retry with a compatible model: /provider {shown} <model>",
             Arc::clone(&terminal) as Arc<dyn Channel>,
         );
 
+        // The view this turn starts from; a turn that changes it other than by
+        // appending (a compaction, a projection trim, a middleware rewrite)
+        // rebuilds it from the session when it ends.
+        let inline_view_before_turn = super::compaction::ViewPrefix::of(&history);
         // Keep the large trace inline outside the small outcome discriminator.
         let (turn_outcome, successful_trace) = {
             #[cfg(feature = "terminal-tui")]
@@ -4368,20 +4402,20 @@ Retry with a compatible model: /provider {shown} <model>",
             }
         }
 
+        let inline_view_changed = inline_compaction.compacted() || inline_view_before_turn.changed_in(&history);
         // If the turn failed or was cancelled, skip response processing
         let (response, turn_trace) = match turn_outcome {
             TurnOutcome::Success(resp) => (resp, successful_trace.context("successful Chat outcome has no serving trace")?),
             TurnOutcome::Cancelled => {
-                if !super::compaction::reconcile_inline_turn(
+                let settled = settle_aborted_turn(&chat_dispatcher, &turn_signal, Some(&user_input)).await?;
+                provider_view_after_settled_abort(
                     &mut history,
-                    &chat_dispatcher,
-                    &inline_compaction,
-                    inline_compaction_epoch_at_start,
+                    &settled,
+                    inline_compaction_epoch_before_preflight,
+                    inline_view_changed,
                     &user_input,
-                    None,
-                ) {
-                    rollback_cancelled_turn_history(&mut history, history_len_before_user_turn);
-                }
+                    Some(history_len_before_user_turn),
+                );
                 finish_inline_provider_turn(&mut provider_turn_workers, provider_turn_task_id, None);
                 gate_cancelled_provider_turn_finalization(
                     &mut turn_scheduler,
@@ -4395,13 +4429,14 @@ Retry with a compatible model: /provider {shown} <model>",
                 continue;
             }
             TurnOutcome::FailedWithError { err, .. } => {
-                super::compaction::reconcile_inline_turn(
+                let settled = settle_aborted_turn(&chat_dispatcher, &turn_signal, Some(&user_input)).await?;
+                provider_view_after_settled_abort(
                     &mut history,
-                    &chat_dispatcher,
-                    &inline_compaction,
-                    inline_compaction_epoch_at_start,
+                    &settled,
+                    inline_compaction_epoch_before_preflight,
+                    inline_view_changed,
                     &user_input,
-                    None,
+                    Some(history_len_before_user_turn),
                 );
                 finish_inline_provider_turn(&mut provider_turn_workers, provider_turn_task_id, None);
                 gate_failed_provider_turn_finalization(
@@ -4571,15 +4606,16 @@ Retry with a compatible model: /provider {shown} <model>",
             super::compaction::reconcile_inline_turn(
                 &mut history,
                 &chat_dispatcher,
-                &inline_compaction,
-                inline_compaction_epoch_at_start,
+                inline_view_changed,
+                inline_compaction_epoch_before_preflight,
                 &user_input,
-                Some(&history_user_message),
+                &history_user_message,
             );
             if let Some(ref d_id) = draft_id
                 && let Err(e) = terminal.cancel_draft("user", d_id).await
             {
-                tracing::debug!(error = %e, "cancel empty-response draft failed");
+                let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&e);
+                tracing::debug!(error_len, error_sha256, "cancel empty-response draft failed");
             }
             surface_session_message(
                 &chat_dispatcher,
@@ -4693,10 +4729,10 @@ Retry with a compatible model: /provider {shown} <model>",
         super::compaction::reconcile_inline_turn(
             &mut history,
             &chat_dispatcher,
-            &inline_compaction,
-            inline_compaction_epoch_at_start,
+            inline_view_changed,
+            inline_compaction_epoch_before_preflight,
             &user_input,
-            Some(&history_user_message),
+            &history_user_message,
         );
         #[cfg(feature = "terminal-tui")]
         if let Some(tx) = redraw_tx_for_main.as_ref() {

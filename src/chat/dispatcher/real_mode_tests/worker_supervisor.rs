@@ -527,70 +527,81 @@ impl SupervisedTurn {
     }
 }
 
+/// Whole-test bound: everything awaited here is in-process.
+const SUPERVISED_TEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[tokio::test]
 async fn a_panic_after_phase_one_keeps_the_completed_outcome_and_retires_the_lease_once() {
-    let mut turn = SupervisedTurn::new();
-    let (release, released) = tokio::sync::oneshot::channel();
-    let worker = turn.ready_then_panic_worker(released);
-    turn.supervise(worker).await;
-    match turn.phase_one().await {
-        Some(TurnOutcomeKind::Completed { final_text, .. }) => {
-            assert_eq!(final_text, ANSWER, "phase 1 carries the full answer")
+    tokio::time::timeout(SUPERVISED_TEST_DEADLINE, async {
+        let mut turn = SupervisedTurn::new();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let worker = turn.ready_then_panic_worker(released);
+        turn.supervise(worker).await;
+        match turn.phase_one().await {
+            Some(TurnOutcomeKind::Completed { final_text, .. }) => {
+                assert_eq!(final_text, ANSWER, "phase 1 carries the full answer")
+            }
+            other => panic!("phase 1 completes, got {other:?}"),
         }
-        other => panic!("phase 1 completes, got {other:?}"),
-    }
-    release.send(()).expect("worker waiting");
-    turn.run_loop.await_exit(turn.task).await;
-    turn.barrier().await;
-    assert!(
-        turn.run_loop.signal.consume_turn_outcome(turn.task).is_none(),
-        "no failure notified"
-    );
-    turn.assert_no_failure_accepted();
-    turn.run_loop
-        .workers
-        .record_execution_exited(turn.task, LEASE)
-        .expect("a repeated matching exit is idempotent");
-    turn.run_loop.assert_retired(turn.task);
+        release.send(()).expect("worker waiting");
+        turn.run_loop.await_exit(turn.task).await;
+        turn.barrier().await;
+        assert!(
+            turn.run_loop.signal.consume_turn_outcome(turn.task).is_none(),
+            "no failure notified"
+        );
+        turn.assert_no_failure_accepted();
+        turn.run_loop
+            .workers
+            .record_execution_exited(turn.task, LEASE)
+            .expect("a repeated matching exit is idempotent");
+        turn.run_loop.assert_retired(turn.task);
+    })
+    .await
+    .expect("the test finishes within SUPERVISED_TEST_DEADLINE");
 }
 
 #[tokio::test]
 async fn a_panic_after_phase_two_keeps_the_committed_outcome_and_retires_the_lease_once() {
-    let mut turn = SupervisedTurn::new();
-    let (release, released) = tokio::sync::oneshot::channel();
-    let worker = turn.ready_then_panic_worker(released);
-    turn.supervise(worker).await;
-    assert!(
-        matches!(turn.phase_one().await, Some(TurnOutcomeKind::Completed { .. })),
-        "phase 1 completes before the late panic"
-    );
-    dispatch_ordered_provider_turn_commit_and_wait(
-        &turn.dispatcher,
-        &turn.run_loop.signal,
-        turn.task,
-        OrderedCommitTerminal::StreamCompleted {
-            draft_id: DRAFT,
-            reasoning: "",
-        },
-        REQUEST,
-        ANSWER,
-        false,
-        true,
-    )
+    tokio::time::timeout(SUPERVISED_TEST_DEADLINE, async {
+        let mut turn = SupervisedTurn::new();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let worker = turn.ready_then_panic_worker(released);
+        turn.supervise(worker).await;
+        assert!(
+            matches!(turn.phase_one().await, Some(TurnOutcomeKind::Completed { .. })),
+            "phase 1 completes before the late panic"
+        );
+        dispatch_ordered_provider_turn_commit_and_wait(
+            &turn.dispatcher,
+            &turn.run_loop.signal,
+            turn.task,
+            OrderedCommitTerminal::StreamCompleted {
+                draft_id: DRAFT,
+                reasoning: "",
+            },
+            REQUEST,
+            ANSWER,
+            false,
+            true,
+        )
+        .await
+        .expect("phase 2 commit acknowledged");
+        release.send(()).expect("worker waiting");
+        turn.run_loop.await_exit(turn.task).await;
+        turn.barrier().await;
+        assert!(
+            turn.run_loop.signal.consume_turn_outcome(turn.task).is_none(),
+            "no failure notified"
+        );
+        assert!(
+            turn.run_loop.signal.history_commit_acknowledged(turn.task),
+            "the commit stays acknowledged"
+        );
+        turn.assert_no_failure_accepted();
+    })
     .await
-    .expect("phase 2 commit acknowledged");
-    release.send(()).expect("worker waiting");
-    turn.run_loop.await_exit(turn.task).await;
-    turn.barrier().await;
-    assert!(
-        turn.run_loop.signal.consume_turn_outcome(turn.task).is_none(),
-        "no failure notified"
-    );
-    assert!(
-        turn.run_loop.signal.history_commit_acknowledged(turn.task),
-        "the commit stays acknowledged"
-    );
-    turn.assert_no_failure_accepted();
+    .expect("the test finishes within SUPERVISED_TEST_DEADLINE");
 }
 
 #[tokio::test]
@@ -634,54 +645,58 @@ async fn an_aborted_worker_is_retired_without_a_failure() {
 
 #[tokio::test]
 async fn metered_usage_is_recorded_while_a_duplicate_terminal_is_refused() {
-    let mut turn = SupervisedTurn::new();
-    let (release, released) = tokio::sync::oneshot::channel();
-    let worker = turn.ready_then_panic_worker(released);
-    turn.supervise(worker).await;
-    assert!(
-        matches!(turn.phase_one().await, Some(TurnOutcomeKind::Completed { .. })),
-        "phase 1 completes before the late panic"
-    );
-    // Usage reaches the task slot even though it was registered after phase 1.
-    turn.run_loop.signal.register_turn(turn.task, DRAFT);
-    let actions = turn.dispatcher.sender();
-    actions
-        .send(Action::StreamUsageMetered {
-            draft_id: DRAFT.to_owned(),
-            usage: TokenUsage {
-                prompt_tokens: Some(40),
-                completion_tokens: Some(2),
-                total_tokens: Some(42),
-                source: TokenUsageSource::Reported,
-                ..TokenUsage::default()
+    tokio::time::timeout(SUPERVISED_TEST_DEADLINE, async {
+        let mut turn = SupervisedTurn::new();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let worker = turn.ready_then_panic_worker(released);
+        turn.supervise(worker).await;
+        assert!(
+            matches!(turn.phase_one().await, Some(TurnOutcomeKind::Completed { .. })),
+            "phase 1 completes before the late panic"
+        );
+        // Usage reaches the task slot even though it was registered after phase 1.
+        turn.run_loop.signal.register_turn(turn.task, DRAFT);
+        let actions = turn.dispatcher.sender();
+        actions
+            .send(Action::StreamUsageMetered {
+                draft_id: DRAFT.to_owned(),
+                usage: TokenUsage {
+                    prompt_tokens: Some(40),
+                    completion_tokens: Some(2),
+                    total_tokens: Some(42),
+                    source: TokenUsageSource::Reported,
+                    ..TokenUsage::default()
+                },
+            })
+            .await
+            .expect("action channel open");
+        for duplicate in [
+            Action::ProviderTurnReadyForCommit {
+                draft_id: DRAFT.to_owned(),
+                final_text: "a second terminal".to_owned(),
+                reasoning: String::new(),
             },
-        })
-        .await
-        .expect("action channel open");
-    for duplicate in [
-        Action::ProviderTurnReadyForCommit {
-            draft_id: DRAFT.to_owned(),
-            final_text: "a second terminal".to_owned(),
-            reasoning: String::new(),
-        },
-        Action::StreamFailed {
-            draft_id: DRAFT.to_owned(),
-            err: "a late failure".to_owned(),
-            retryable: false,
-        },
-    ] {
-        actions.send(duplicate).await.expect("action channel open");
-    }
-    turn.barrier().await;
-    assert!(
-        turn.run_loop.signal.consume_turn_outcome(turn.task).is_none(),
-        "duplicate terminals are refused"
-    );
-    let usage = turn.run_loop.signal.consume_turn_usage(turn.task);
-    assert_eq!(usage.total_tokens, Some(42), "metered usage is recorded");
-    release.send(()).expect("worker waiting");
-    turn.run_loop.await_exit(turn.task).await;
-    turn.assert_no_failure_accepted();
+            Action::StreamFailed {
+                draft_id: DRAFT.to_owned(),
+                err: "a late failure".to_owned(),
+                retryable: false,
+            },
+        ] {
+            actions.send(duplicate).await.expect("action channel open");
+        }
+        turn.barrier().await;
+        assert!(
+            turn.run_loop.signal.consume_turn_outcome(turn.task).is_none(),
+            "duplicate terminals are refused"
+        );
+        let usage = turn.run_loop.signal.consume_turn_usage(turn.task);
+        assert_eq!(usage.total_tokens, Some(42), "metered usage is recorded");
+        release.send(()).expect("worker waiting");
+        turn.run_loop.await_exit(turn.task).await;
+        turn.assert_no_failure_accepted();
+    })
+    .await
+    .expect("the test finishes within SUPERVISED_TEST_DEADLINE");
 }
 
 /// Bound on phase 2 after a cancel between the phases; far below the

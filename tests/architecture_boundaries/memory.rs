@@ -26,6 +26,9 @@ const ALLOWED_BRAIN_DB_OPENS_OUTSIDE_SQLITE_REPOSITORY: &[&str] = &[
     // proving every save failure reaches the history-commit latch and that store errors are never logged.
     "src/chat/tests/acked_reads_tests.rs::refuse_session_row_writes::rusqlite::Connection::open(workspace.join(\"memory\").join(\"brain.db\")).expect(\"test: open the real database\");",
     "src/chat/dispatcher/real_mode_tests/log_sentinel.rs::stream_failure_retry_and_store_error_logs_carry_no_free_text::let connection = rusqlite::Connection::open(dir.path().join(\"memory\").join(\"brain.db\"))",
+    // Test-only (PR #207 r4): refusing triggers make an actual compaction's audit writes fail with the
+    // sentinel in the database error, proving compaction error logs carry no stored content.
+    "src/chat/dispatcher/real_mode_tests/log_sentinel.rs::a_compaction_whose_audit_storage_fails_logs_no_stored_content::let connection = rusqlite::Connection::open(dir.path().join(\"memory\").join(\"brain.db\"))",
     // Test-only: inspect the real tables to prove erasure leaves a tombstone and no transport digest (AUTH-02-1b).
     "src/runtime/ingress_recovery/authority_tests.rs::db::rusqlite::Connection::open(workspace.join(\"memory\").join(\"brain.db\")).expect(\"brain.db\")",
     "src/chat/tests/legacy_chat_compaction_audit_tests.rs::legacy_chat_compaction_downgrades_fidelity_when_event_provenance_is_unavailable::let conn = rusqlite::Connection::open(tmp.path().join(\"memory\").join(\"brain.db\")).unwrap();",

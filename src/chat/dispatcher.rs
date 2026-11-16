@@ -2552,7 +2552,9 @@ impl ReasoningProgressBatcher {
 /// The reducer owns completed text turns. The pending request is committed by
 /// the ordered turn owner, and native call/result envelopes belong only to the
 /// live worker. Remove those by position/representation, never by matching Q's
-/// text: an older turn may contain identical input.
+/// text: an older turn may contain identical input. Only the leading system
+/// prompt is kept: a system message the loop inserted later (recalled context
+/// pages) is a per-request projection, not session history.
 pub(super) fn reducer_history_from_compacted_worker(
     history: &[crate::providers::ChatMessage],
 ) -> Vec<crate::providers::ChatMessage> {
@@ -2563,6 +2565,7 @@ pub(super) fn reducer_history_from_compacted_worker(
         .filter(|(index, message)| {
             if Some(*index) == pending
                 || message.role == "tool"
+                || message.role == "system" && *index > 0
                 || message.role == "user" && crate::agent::turn_contracts::is_loop_written_user_note(&message.content)
             {
                 return false;
