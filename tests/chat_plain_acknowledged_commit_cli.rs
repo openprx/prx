@@ -337,3 +337,51 @@ fn trace_logging_carries_no_session_content() {
     assert!(!output.stderr.contains(SENTINEL), "the sentinel reached stderr");
     assert!(!chat_log.contains(SENTINEL), "the sentinel reached chat.log");
 }
+
+/// Make SQLite refuse every write of a session row that records an
+/// interrupted background session, i.e. only the exit summary.
+fn refuse_exit_summary_writes(sandbox: &Sandbox) {
+    let connection =
+        rusqlite::Connection::open(sandbox.workspace.join("memory/brain.db")).expect("test: open the real database");
+    connection
+        .execute_batch(
+            "CREATE TRIGGER test_refuse_exit_insert BEFORE INSERT ON memories \
+             WHEN NEW.content LIKE '%\"interrupted\"%' \
+             BEGIN SELECT RAISE(ABORT, 'test: the database refuses the exit summary'); END;
+             CREATE TRIGGER test_refuse_exit_update BEFORE UPDATE ON memories \
+             WHEN NEW.content LIKE '%\"interrupted\"%' \
+             BEGIN SELECT RAISE(ABORT, 'test: the database refuses the exit summary'); END;",
+        )
+        .expect("test: install the refusing triggers");
+}
+
+#[test]
+fn an_exit_summary_the_store_refuses_fails_the_exit() {
+    let sandbox = Sandbox::new();
+    let _server = serve(&sandbox, Box::new(|_, _| Scripted::text("noted")));
+    let mut running = spawn_plain(&sandbox);
+    running.send("hello");
+    wait_for_saved_turns(&sandbox, 2);
+    refuse_exit_summary_writes(&sandbox);
+    // A live background shell is interrupted at exit; its summary is the
+    // only write the database refuses.
+    running.send("/shell sleep 30");
+    let output = finish(running);
+    assert!(
+        !output.status.success(),
+        "a refused exit summary fails the exit; stdout: {}\nstderr: {}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        output.stderr.contains("unconfirmed history commit"),
+        "the typed stop error is reported; stderr: {}",
+        output.stderr
+    );
+    assert!(!output.stderr.contains("panicked"), "stderr: {}", output.stderr);
+    assert!(
+        output.stdout.contains("Started background shell"),
+        "the background shell was running at exit; stdout: {}",
+        output.stdout
+    );
+}

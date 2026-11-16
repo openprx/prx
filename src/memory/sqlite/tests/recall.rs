@@ -1249,8 +1249,21 @@ fn session_snapshot_json(user_text: &str) -> String {
     .to_string()
 }
 
+/// Bound on the whole snapshot entry-point test: its real SQLite stores and
+/// reads finish in milliseconds, so a stall fails instead of hanging.
+const SNAPSHOT_TEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[tokio::test]
 async fn only_the_session_snapshot_entry_point_masks_a_cut_preview_id() {
+    tokio::time::timeout(
+        SNAPSHOT_TEST_DEADLINE,
+        only_the_session_snapshot_entry_point_masks_a_cut_preview_id_body(),
+    )
+    .await
+    .expect("the snapshot entry-point test finishes within SNAPSHOT_TEST_DEADLINE");
+}
+
+async fn only_the_session_snapshot_entry_point_masks_a_cut_preview_id_body() {
     let (_tmp, mem) = temp_sqlite();
     let snapshot = session_snapshot_json("look it up");
 

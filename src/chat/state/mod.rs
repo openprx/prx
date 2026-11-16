@@ -679,6 +679,12 @@ impl StreamState {
         self.visible_drafts.clear();
     }
 
+    /// Drop every visible draft except those past phase 1, whose ordered
+    /// commit is still to settle.
+    fn retain_ready_drafts(&mut self) {
+        self.visible_drafts.retain(|turn| turn.ready_for_commit);
+    }
+
     #[must_use]
     const fn has_visible_drafts(&self) -> bool {
         !self.visible_drafts.is_empty()
@@ -1115,8 +1121,9 @@ impl ChatState {
     ///   yet ready.
     /// - `StreamCompleted` (phase 2): the draft is visible.
     /// - `TurnCommitRequested` (non-TUI): once per task.
-    /// - `StreamCancelled`: the draft is visible, or was removed by a cancel
-    ///   before its worker reported a terminal.
+    /// - `StreamCancelled`: the draft is visible and not ready, or was removed
+    ///   by a cancel before its worker reported a terminal. A ready draft
+    ///   waits for its ordered commit.
     /// - `StreamFailed`: the draft is visible and not ready, or was removed by
     ///   such a cancel.
     #[must_use]
@@ -1127,10 +1134,10 @@ impl ChatState {
             }
             Action::StreamCompleted { draft_id, .. } => self.stream.has_visible_draft(draft_id),
             Action::TurnCommitRequested { task_id, .. } => !self.control.committed_turn_tasks.contains(task_id),
-            Action::StreamCancelled { draft_id } => {
-                self.stream.has_visible_draft(draft_id)
-                    || self.control.cancelled_drafts_awaiting_terminal.contains(draft_id)
-            }
+            Action::StreamCancelled { draft_id } => self.stream.visible_draft_ready(draft_id).map_or_else(
+                || self.control.cancelled_drafts_awaiting_terminal.contains(draft_id),
+                |ready| !ready,
+            ),
             Action::StreamFailed { draft_id, .. } => self.stream.visible_draft_ready(draft_id).map_or_else(
                 || self.control.cancelled_drafts_awaiting_terminal.contains(draft_id),
                 |ready| !ready,
@@ -1389,17 +1396,6 @@ impl ChatState {
             Action::ShutdownRequested => self.reduce_shutdown_requested(),
             Action::ForceQuit => vec![Effect::Quit],
         }
-    }
-
-    /// Helper: take the current draft id out of StreamState (the layout differs per feature).
-    #[cfg(feature = "terminal-tui")]
-    fn take_draft_id(stream: &StreamState) -> Option<String> {
-        stream.primary_streaming_draft().map(|d| d.draft_id.clone())
-    }
-
-    #[cfg(not(feature = "terminal-tui"))]
-    fn take_draft_id(stream: &StreamState) -> Option<String> {
-        stream.primary_streaming_draft().map(|d| d.draft_id.clone())
     }
 }
 

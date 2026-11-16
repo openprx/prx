@@ -33,6 +33,10 @@ const READ_TIMEOUT: Duration = Duration::from_secs(10);
 const ACCEPT_POLL: Duration = Duration::from_millis(5);
 /// Bound on joining the accept thread when the server is dropped.
 const JOIN_BOUND: Duration = Duration::from_secs(5);
+/// Longest a [`Scripted::Stall`] request is held.
+pub const STALL_BOUND: Duration = Duration::from_secs(60);
+/// Poll interval while a stalled request watches for the client's close.
+const STALL_POLL: Duration = Duration::from_millis(20);
 
 /// One scripted provider answer.
 #[derive(Clone, Debug)]
@@ -45,6 +49,11 @@ pub enum Scripted {
         name: String,
         arguments: String,
     },
+    /// An HTTP error answer with `status` and the JSON error `message`.
+    Error { status: u16, message: String },
+    /// No answer: the request is held until the client closes the connection
+    /// (a cancelled turn), or `STALL_BOUND` passes and it fails with 503.
+    Stall,
 }
 
 impl Scripted {
@@ -70,6 +79,7 @@ pub type Script = Box<dyn FnMut(usize, &serde_json::Value) -> Scripted + Send>;
 pub struct LoopbackOpenAi {
     pub base_url: String,
     requests: Arc<Mutex<Vec<serde_json::Value>>>,
+    stalls_closed: Arc<std::sync::atomic::AtomicUsize>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -80,12 +90,14 @@ impl LoopbackOpenAi {
         listener.set_nonblocking(true).expect("test: nonblocking loopback");
         let base_url = format!("http://{}/v1", listener.local_addr().expect("test: loopback address"));
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let stalls_closed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let state = Serve {
             model: model.to_owned(),
             usage,
             script: Mutex::new(script),
             requests: Arc::clone(&requests),
+            stalls_closed: Arc::clone(&stalls_closed),
         };
         let thread_stop = Arc::clone(&stop);
         let thread = std::thread::spawn(move || {
@@ -100,9 +112,15 @@ impl LoopbackOpenAi {
         Self {
             base_url,
             requests,
+            stalls_closed,
             stop,
             thread: Some(thread),
         }
+    }
+
+    /// How many [`Scripted::Stall`] requests the client closed (cancelled).
+    pub fn stalls_closed_by_client(&self) -> usize {
+        self.stalls_closed.load(Ordering::SeqCst)
     }
 
     /// `custom:<base_url>`, the provider string for a PRX config.
@@ -136,6 +154,7 @@ struct Serve {
     usage: Usage,
     script: Mutex<Script>,
     requests: Arc<Mutex<Vec<serde_json::Value>>>,
+    stalls_closed: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Serve {
@@ -175,6 +194,23 @@ impl Serve {
             requests.len() - 1
         };
         let reply = (self.script.lock().expect("test: script"))(index, &request);
+        match &reply {
+            Scripted::Error { status, message } => {
+                let body = serde_json::json!({
+                    "error": {"message": message, "type": "invalid_request_error", "code": null}
+                })
+                .to_string();
+                respond(&mut stream, *status, "application/json", &body);
+                return;
+            }
+            Scripted::Stall => {
+                if hold_until_closed(&mut stream) {
+                    self.stalls_closed.fetch_add(1, Ordering::SeqCst);
+                }
+                return;
+            }
+            Scripted::Text(_) | Scripted::ToolCall { .. } => {}
+        }
         if request["stream"] == true {
             respond(&mut stream, 200, "text/event-stream", &self.sse(&reply));
         } else {
@@ -203,6 +239,7 @@ impl Serve {
                 }
                 "stop"
             }
+            Scripted::Error { .. } | Scripted::Stall => "stop",
             Scripted::ToolCall { id, name, arguments } => {
                 frames.push(serde_json::json!({
                     "choices": [{"index": 0, "delta": {"tool_calls": [{
@@ -234,6 +271,9 @@ impl Serve {
                 serde_json::json!({"role": "assistant", "content": chunks.concat()}),
                 "stop",
             ),
+            Scripted::Error { .. } | Scripted::Stall => {
+                (serde_json::json!({"role": "assistant", "content": ""}), "stop")
+            }
             Scripted::ToolCall { id, name, arguments } => (
                 serde_json::json!({"role": "assistant", "content": null, "tool_calls": [{
                     "id": id, "type": "function", "function": {"name": name, "arguments": arguments}
@@ -250,6 +290,30 @@ impl Serve {
         }
         body.to_string()
     }
+}
+
+/// Hold a request unanswered until the client closes the connection
+/// (returns `true`), or `STALL_BOUND` passes (answers 503, returns `false`).
+fn hold_until_closed(stream: &mut TcpStream) -> bool {
+    if stream.set_read_timeout(Some(STALL_POLL)).is_err() {
+        return false;
+    }
+    let started = Instant::now();
+    let mut byte = [0_u8; 1];
+    while started.elapsed() < STALL_BOUND {
+        match stream.read(&mut byte) {
+            Ok(0) => return true,
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => return true,
+        }
+    }
+    respond(stream, 503, "application/json", r#"{"error":"stall bound"}"#);
+    false
 }
 
 fn read_request(stream: &mut TcpStream) -> Option<(String, Vec<u8>)> {

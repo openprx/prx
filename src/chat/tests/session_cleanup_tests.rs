@@ -111,7 +111,8 @@ async fn exit_shutdown_helper_calls_shutdown_all_and_records_interrupted_summary
             &session_dispatcher.dispatcher,
             &session_dispatcher.commits,
         )
-        .await;
+        .await
+        .expect("the exit summary is saved");
 
         // The acknowledged session holds the summary as soon as the helper returns.
         let chat_session = reader.session();

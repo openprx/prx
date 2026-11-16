@@ -499,6 +499,11 @@ impl ChatState {
 
     /// `Action::StreamCancelled` — the user cancelled explicitly; only clear the draft.
     pub(super) fn reduce_stream_cancelled(&mut self, draft_id: &str) -> Vec<Effect> {
+        // A cancel after phase 1 does not apply: the draft waits for its
+        // ordered commit, as for `StreamFailed`.
+        if self.stream.visible_draft_ready(draft_id) == Some(true) {
+            return vec![];
+        }
         let Some(removed_draft) = self.stream.remove_visible_draft(draft_id) else {
             // A cancel already removed the draft; this is its one terminal.
             self.control.cancelled_drafts_awaiting_terminal.remove(draft_id);

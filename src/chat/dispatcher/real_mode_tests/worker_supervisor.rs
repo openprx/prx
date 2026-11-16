@@ -447,6 +447,16 @@ impl SupervisedTurn {
         &self,
         release: tokio::sync::oneshot::Receiver<()>,
     ) -> impl std::future::Future<Output = ()> + Send + 'static {
+        self.ready_worker(release, true)
+    }
+
+    /// A worker that starts, reports phase 1 with nonzero usage, then, when
+    /// `release` fires, panics (`panic_after_release`) or returns normally.
+    fn ready_worker(
+        &self,
+        release: tokio::sync::oneshot::Receiver<()>,
+        panic_after_release: bool,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
         let lifecycle_tx = self.lifecycle_tx.clone();
         let actions = self.dispatcher.sender();
         let task_id = self.task;
@@ -480,7 +490,7 @@ impl SupervisedTurn {
                 .await
                 .expect("action channel open");
             release.await.expect("test releases the worker");
-            panic!("worker panics after its terminal");
+            assert!(!panic_after_release, "worker panics after its terminal");
         }
     }
 
@@ -671,5 +681,72 @@ async fn metered_usage_is_recorded_while_a_duplicate_terminal_is_refused() {
     assert_eq!(usage.total_tokens, Some(42), "metered usage is recorded");
     release.send(()).expect("worker waiting");
     turn.run_loop.await_exit(turn.task).await;
+    turn.assert_no_failure_accepted();
+}
+
+/// Bound on phase 2 after a cancel between the phases; far below the
+/// 30-second ordered-commit acknowledgement timeout a stranded commit hits.
+const PHASE_TWO_DEADLINE: Duration = Duration::from_secs(5);
+
+#[tokio::test]
+async fn a_cancel_between_the_commit_phases_lets_the_commit_finish() {
+    let mut turn = SupervisedTurn::new();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let worker = turn.ready_worker(released, false);
+    turn.supervise(worker).await;
+    assert!(
+        matches!(turn.phase_one().await, Some(TurnOutcomeKind::Completed { .. })),
+        "phase 1 completes before the cancel"
+    );
+    // Ctrl-C lands after phase 1 and before the ordered commit; the awaited
+    // barrier guarantees the reducer has handled it before phase 2 starts.
+    turn.dispatcher
+        .sender()
+        .send(Action::CancelRequested)
+        .await
+        .expect("action channel open");
+    turn.barrier().await;
+    let committed = tokio::time::timeout(
+        PHASE_TWO_DEADLINE,
+        dispatch_ordered_provider_turn_commit_and_wait(
+            &turn.dispatcher,
+            &turn.run_loop.signal,
+            turn.task,
+            OrderedCommitTerminal::StreamCompleted {
+                draft_id: DRAFT,
+                reasoning: "",
+            },
+            REQUEST,
+            ANSWER,
+            false,
+            true,
+        ),
+    )
+    .await
+    .expect("phase 2 settles without waiting for the acknowledgement timeout");
+    assert_eq!(committed, Ok(()), "the commit completes after the late cancel");
+    assert!(
+        turn.run_loop.signal.history_commit_acknowledged(turn.task),
+        "the commit is acknowledged"
+    );
+    assert!(
+        turn.run_loop.signal.ensure_history_commits_healthy().is_ok(),
+        "no unconfirmed-commit failure is latched"
+    );
+    let acked = turn.dispatcher.session_reader().acked();
+    let turns: Vec<(&str, &str)> = acked
+        .session
+        .turns
+        .iter()
+        .map(|turn| (turn.role.as_str(), turn.content.as_str()))
+        .collect();
+    assert_eq!(
+        turns,
+        vec![("user", REQUEST), ("assistant", ANSWER)],
+        "the acknowledged session holds the committed turn"
+    );
+    release.send(()).expect("worker waiting");
+    turn.run_loop.await_exit(turn.task).await;
+    turn.barrier().await;
     turn.assert_no_failure_accepted();
 }

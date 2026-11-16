@@ -300,8 +300,8 @@ fn provider_view_from_acked(
 /// turn never resends the replaced cold prefix. Only the committed request
 /// keeps its enrichment (as in the manual and preflight helpers): the newest
 /// stored user turn, when it is that request, becomes `enriched_request`.
-/// Only the TUI finalizer commits a turn after a detached worker compaction.
-#[cfg(feature = "terminal-tui")]
+/// The TUI finalizer uses it after a detached worker compaction, the inline
+/// tool loop after an in-turn overflow compaction.
 pub(super) fn provider_view_after_compacted_commit(
     current_view: &[ChatMessage],
     acked: &crate::chat::acked_session::AckedSession,
@@ -314,6 +314,28 @@ pub(super) fn provider_view_after_compacted_commit(
         && slot.content == plain.content
     {
         *slot = enriched_request.clone();
+    }
+    view
+}
+
+/// The provider view after a turn that failed or was cancelled once a
+/// compaction had been adopted during it: rebuilt from the acknowledged
+/// snapshot, so the next turn never resends the replaced cold prefix. The
+/// turn's own request is not kept: a failed or cancelled request is never
+/// part of the next turn's view (the reducer rolls its recorded copy back
+/// too), so a trailing stored copy of it is dropped.
+pub(super) fn provider_view_after_compacted_abort(
+    current_view: &[ChatMessage],
+    acked: &crate::chat::acked_session::AckedSession,
+    plain_request: &str,
+) -> Vec<ChatMessage> {
+    let mut view = provider_view_from_acked(current_view, acked);
+    let plain = crate::agent::turn_contracts::inbound_user_message(plain_request);
+    if view
+        .last()
+        .is_some_and(|message| message.role == "user" && message.content == plain.content)
+    {
+        view.pop();
     }
     view
 }
@@ -845,4 +867,182 @@ pub(super) async fn persist_legacy_chat_compaction_audit(
     {
         tracing::debug!(error = %error, "failed to append legacy chat compaction run");
     }
+}
+
+/// The inline tool loop's compaction sink: chat turns that run the shared
+/// loop in the run loop's task (non-TUI builds, draftless turns) hand every
+/// overflow compaction to the session authority instead of keeping it as a
+/// private mutation of the provider view.
+///
+/// The turn's request is already recorded in the reducer (`RecordUserTurn` at
+/// admission), so the reducer's target is the compacted view in its durable
+/// form (native tool envelopes and loop notes removed, as for a worker) with
+/// the recorded plain request in place of the enriched one. The patch is
+/// guarded by the reducer history this sink tracks and is awaited: the reducer
+/// applies it with its typed apply, and a refusal changes nothing. Either way
+/// [`Self::compacted`] reports that the provider view diverged from the
+/// pre-turn state, and the run loop rebuilds that view from the acknowledged
+/// session after the turn, so `/compact`, the saved session and the next
+/// provider request read one history.
+pub(super) struct InlineCompactionSink {
+    chat_dispatcher: dispatcher::ChatDispatcher,
+    commits: dispatcher::TurnCompletionSignal,
+    user_input: String,
+    /// The reducer history the next patch is guarded by.
+    reducer_history: parking_lot::Mutex<Vec<ChatMessage>>,
+    compacted: std::sync::atomic::AtomicBool,
+}
+
+impl InlineCompactionSink {
+    pub(super) fn new(
+        chat_dispatcher: dispatcher::ChatDispatcher,
+        commits: dispatcher::TurnCompletionSignal,
+        user_input: &str,
+        reducer_history: Vec<ChatMessage>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            chat_dispatcher,
+            commits,
+            user_input: user_input.to_owned(),
+            reducer_history: parking_lot::Mutex::new(reducer_history),
+            compacted: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// Whether the loop compacted or trimmed its view during the turn.
+    pub(super) fn compacted(&self) -> bool {
+        self.compacted.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn mark_compacted(&self) {
+        self.compacted.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    async fn adopt_patch(
+        &self,
+        source_history: Vec<ChatMessage>,
+        patch: crate::agent::turn_contracts::CompactionPatch,
+        config: crate::config::AgentCompactionConfig,
+    ) -> anyhow::Result<()> {
+        self.mark_compacted();
+        let mut compacted = source_history;
+        if let Err(error) = apply_compaction_patch_exact(&mut compacted, &patch) {
+            tracing::warn!(
+                %error,
+                guard_history_len = patch.guard.history_len,
+                source_len = compacted.len(),
+                "inline compaction patch does not match its source; reducer patch not sent"
+            );
+            return Ok(());
+        }
+        let mut target = dispatcher::reducer_history_from_compacted_worker(&compacted);
+        target.push(crate::agent::turn_contracts::inbound_user_message(&self.user_input));
+        let reducer_patch = {
+            let source = self.reducer_history.lock();
+            let guard = crate::agent::compaction::compaction_patch_guard_for(&source, 0, source.len())
+                .ok_or_else(|| anyhow::anyhow!("invalid reducer compaction source"))?;
+            crate::agent::turn_contracts::CompactionPatch {
+                replacement: target.clone(),
+                append_after: Vec::new(),
+                guard,
+            }
+        };
+        let ack = self
+            .chat_dispatcher
+            .dispatch_awaited(
+                crate::chat::action::Action::HistoryCompactionPatchApplied {
+                    reason: crate::chat::action::CompactReason::ContextOverflow,
+                    patch: reducer_patch,
+                    compaction_config: config,
+                },
+                &self.commits,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("Chat stopped after an unconfirmed history commit: {error}"))?;
+        match ack {
+            crate::chat::acked_session::Ack::Published(_) => *self.reducer_history.lock() = target,
+            crate::chat::acked_session::Ack::Unchanged(_) | crate::chat::acked_session::Ack::Rejected(_) => {
+                tracing::warn!(
+                    replacement_len = target.len(),
+                    "inline compaction was not adopted by the session; the provider view follows the acknowledged session after the turn"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn adopt_trim(&self) -> anyhow::Result<()> {
+        self.mark_compacted();
+        let ack = self
+            .chat_dispatcher
+            .dispatch_awaited(
+                crate::chat::action::Action::HistoryCompacted {
+                    reason: crate::chat::action::CompactReason::ContextOverflow,
+                },
+                &self.commits,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("Chat stopped after an unconfirmed history commit: {error}"))?;
+        if let crate::chat::acked_session::Ack::Published(acked) = ack {
+            let mut source = self.reducer_history.lock();
+            let view = provider_view_from_acked(&source, &acked);
+            *source = view;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::agent::turn_contracts::ToolLoopEventSink for InlineCompactionSink {
+    async fn emit(&self, event: crate::agent::turn_contracts::ToolLoopEvent) -> anyhow::Result<()> {
+        match event {
+            crate::agent::turn_contracts::ToolLoopEvent::ContextCompactionPatch {
+                source_history,
+                patch,
+                config,
+                ..
+            } => self.adopt_patch(source_history, patch, config).await,
+            crate::agent::turn_contracts::ToolLoopEvent::ContextCompacted => self.adopt_trim().await,
+            // Text and tool progress reach the terminal through the turn's
+            // own delta and tool-call channels.
+            crate::agent::turn_contracts::ToolLoopEvent::TextDelta(_)
+            | crate::agent::turn_contracts::ToolLoopEvent::ReasoningDelta(_)
+            | crate::agent::turn_contracts::ToolLoopEvent::RetryAttempt { .. }
+            | crate::agent::turn_contracts::ToolLoopEvent::ToolStarted { .. }
+            | crate::agent::turn_contracts::ToolLoopEvent::ToolFinished { .. } => Ok(()),
+        }
+    }
+}
+
+/// Bring the run loop's provider view up to the acknowledged session after an
+/// inline turn. When the loop compacted during the turn or the acknowledged
+/// compaction epoch moved since `compaction_epoch_at_start`, the view is
+/// rebuilt from the acknowledged snapshot: after a commit with the committed
+/// request in its enriched form (`committed` = `Some(enriched request)`),
+/// after a failure or cancellation without the request. Returns whether it
+/// rebuilt the view.
+pub(super) fn reconcile_inline_turn(
+    history: &mut Vec<ChatMessage>,
+    chat_dispatcher: &dispatcher::ChatDispatcher,
+    sink: &InlineCompactionSink,
+    compaction_epoch_at_start: u64,
+    user_input: &str,
+    committed: Option<&ChatMessage>,
+) -> bool {
+    let acked = chat_dispatcher.session_reader().acked();
+    if acked.compaction_epoch == compaction_epoch_at_start && !sink.compacted() {
+        return false;
+    }
+    let view = committed.map_or_else(
+        || provider_view_after_compacted_abort(history, &acked, user_input),
+        |enriched| provider_view_after_compacted_commit(history, &acked, user_input, enriched),
+    );
+    tracing::info!(
+        messages_before = history.len(),
+        messages_after = view.len(),
+        committed = committed.is_some(),
+        "inline turn's provider view rebuilt from the acknowledged session after an in-turn compaction"
+    );
+    *history = view;
+    true
 }

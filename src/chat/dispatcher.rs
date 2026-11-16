@@ -2553,7 +2553,7 @@ impl ReasoningProgressBatcher {
 /// the ordered turn owner, and native call/result envelopes belong only to the
 /// live worker. Remove those by position/representation, never by matching Q's
 /// text: an older turn may contain identical input.
-fn reducer_history_from_compacted_worker(
+pub(super) fn reducer_history_from_compacted_worker(
     history: &[crate::providers::ChatMessage],
 ) -> Vec<crate::providers::ChatMessage> {
     let pending = crate::agent::history::latest_user_query_index(history);

@@ -475,32 +475,50 @@ pub(super) fn is_chat_quit_command(input: &str) -> bool {
     matches!(input, "/quit" | "/exit")
 }
 
+/// Stop every child session and save the interrupted summaries before
+/// teardown. Each summary is recorded and saved by the reducer and its
+/// acknowledgement is awaited before teardown stops the dispatcher; a summary
+/// that is not saved (the store refused it, the channel closed or the
+/// acknowledgement timed out) has latched the history-commit failure and is
+/// returned as the typed stop error, so the chat cannot exit successfully
+/// after losing it.
 pub(super) async fn shutdown_child_sessions_for_exit(
     chat_sessions: &mut crate::chat::sessions::ChatSessionsHandle,
     chat_dispatcher: &dispatcher::ChatDispatcher,
     commits: &dispatcher::TurnCompletionSignal,
-) -> crate::chat::sessions::runtime::ShutdownReport {
+) -> anyhow::Result<crate::chat::sessions::runtime::ShutdownReport> {
     let report = chat_sessions.shutdown_all("chat-exit").await;
-    // Each interrupted summary is recorded and saved by the reducer; the
-    // acknowledgement is awaited before teardown stops the dispatcher.
     for persisted in report
         .summaries
         .iter()
         .filter(|summary| summary.status == crate::chat::sessions::model::STATUS_INTERRUPTED)
         .cloned()
     {
-        if let Err(error) = chat_dispatcher
+        let ack = chat_dispatcher
             .dispatch_awaited(
                 crate::chat::action::Action::BackgroundSessionRecorded { summary: persisted },
                 commits,
             )
-            .await
-        {
-            tracing::warn!(error_kind = error.kind(), "exit summary was not acknowledged");
-            break;
+            .await;
+        match ack {
+            Ok(crate::chat::acked_session::Ack::Rejected(_)) => {
+                let reason = "exit summary save was rejected";
+                tracing::warn!("{reason}");
+                commits.fail_history_commit(reason);
+                anyhow::bail!("Chat stopped after an unconfirmed history commit: {reason}");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(error_kind = error.kind(), "exit summary was not acknowledged");
+                commits.ensure_history_commits_healthy()?;
+                anyhow::bail!(
+                    "Chat stopped after an unconfirmed history commit: exit summary was not acknowledged ({})",
+                    error.kind()
+                );
+            }
         }
     }
-    report
+    Ok(report)
 }
 
 /// Surface a background-session system message into the chat (v1b reflow).

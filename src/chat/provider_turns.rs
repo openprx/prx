@@ -1360,6 +1360,36 @@ fn adopt_committed_turn(
     }
 }
 
+/// Bring the run loop's provider view up to the acknowledged session after a
+/// turn that failed or was cancelled. When a compaction was adopted during
+/// the turn (the acknowledged compaction epoch moved since the turn copied
+/// its view), the view is rebuilt from the acknowledged snapshot without the
+/// failed or cancelled request and `true` is returned; otherwise the view is
+/// left to the caller's ordinary failure or cancellation handling and `false`
+/// is returned. Without this, the next turn starts from the pre-compaction
+/// view, resends the replaced cold prefix, and its own start epoch already
+/// includes the compaction, so no later epoch comparison could repair it.
+#[cfg(feature = "terminal-tui")]
+fn reconcile_aborted_turn(
+    history: &mut Vec<ChatMessage>,
+    chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
+    compaction_epoch_at_start: u64,
+    user_input: &str,
+) -> bool {
+    let acked = chat_dispatcher.session_reader().acked();
+    if acked.compaction_epoch == compaction_epoch_at_start {
+        return false;
+    }
+    let view = super::compaction::provider_view_after_compacted_abort(history, &acked, user_input);
+    tracing::info!(
+        messages_before = history.len(),
+        messages_after = view.len(),
+        "provider view rebuilt from the acknowledged snapshot after a compaction in a failed or cancelled turn"
+    );
+    *history = view;
+    true
+}
+
 #[cfg(feature = "terminal-tui")]
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn apply_ready_ordered_provider_turn_commits(
@@ -1562,6 +1592,12 @@ async fn finalize_per_turn_context(
                 }
                 tracing::warn!(error = %error, "Failed to commit ordered failed Chat terminal event");
             }
+            reconcile_aborted_turn(
+                history,
+                chat_dispatcher,
+                pending.compaction_epoch_at_start,
+                &pending.user_input,
+            );
             let interactive_tui_active = redraw_tx_for_main.is_some();
             if !interactive_tui_active {
                 let _ = terminal.cancel_draft("user", &pending.draft_id).await;
@@ -1608,7 +1644,14 @@ async fn finalize_per_turn_context(
                 tracing::warn!(error = %error, "Failed to commit ordered cancelled Chat terminal event");
             }
             let _ = terminal.cancel_draft("user", &pending.draft_id).await;
-            rollback_cancelled_turn_history(history, pending.history_len_before_user_turn);
+            if !reconcile_aborted_turn(
+                history,
+                chat_dispatcher,
+                pending.compaction_epoch_at_start,
+                &pending.user_input,
+            ) {
+                rollback_cancelled_turn_history(history, pending.history_len_before_user_turn);
+            }
             publish_main_queue_status(chat_dispatcher, turn_scheduler);
             publish_provider_worker_status(chat_dispatcher, provider_turn_workers);
         }

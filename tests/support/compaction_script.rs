@@ -398,3 +398,36 @@ pub fn lookup_results(requests: &[serde_json::Value]) -> Vec<String> {
         .filter(|text| text.contains(CODENAME))
         .collect()
 }
+
+/// The `(role, content)` turns of the saved chat session row (the
+/// `chat_session:` memory); empty while none is saved.
+pub fn saved_session_turns(workspace: &std::path::Path) -> Vec<(String, String)> {
+    let Ok(database) = rusqlite::Connection::open_with_flags(
+        workspace.join("memory/brain.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) else {
+        return Vec::new();
+    };
+    let Ok(row) = database.query_row(
+        "SELECT content FROM memories WHERE key LIKE 'chat_session:%' ORDER BY rowid LIMIT 1",
+        [],
+        |row| row.get::<_, String>(0),
+    ) else {
+        return Vec::new();
+    };
+    let session: serde_json::Value = serde_json::from_str(&row).expect("test: session row JSON");
+    session["turns"]
+        .as_array()
+        .map(|turns| {
+            turns
+                .iter()
+                .map(|turn| {
+                    (
+                        turn["role"].as_str().unwrap_or_default().to_owned(),
+                        turn["content"].as_str().unwrap_or_default().to_owned(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}

@@ -2,6 +2,11 @@
 
 use super::{ChatState, Effect, ToolInvocationKey, ToolTaskKey};
 
+/// What a cancel reports when it reaches a turn whose reply was already
+/// produced and is being committed.
+const TURN_ALREADY_FINISHED_NOTICE: &str =
+    "Cancel not applied: the turn had already finished and its reply is being saved.";
+
 impl ChatState {
     #[cfg(feature = "terminal-tui")]
     pub(super) fn remove_pending_tool_cards(&mut self, key: ToolTaskKey) {
@@ -422,10 +427,17 @@ impl ChatState {
     }
 
     pub(super) fn cancel_task(&mut self, tool_key: ToolTaskKey, draft_id: String, reason: &'static str) -> Vec<Effect> {
+        if self.stream.visible_draft_ready(&draft_id) == Some(true) {
+            #[cfg(feature = "terminal-tui")]
+            self.ui
+                .conversation_lines
+                .push(crate::chat::tui::ConversationLine::system_notice(
+                    TURN_ALREADY_FINISHED_NOTICE.to_owned(),
+                ));
+            return cancel_after_ready_for_commit(&draft_id);
+        }
         let cancel_opt = self.control.take_turn_cancel(tool_key);
-        if let Some(removed) = self.stream.remove_visible_draft(&draft_id)
-            && !removed.ready_for_commit
-        {
+        if self.stream.remove_visible_draft(&draft_id).is_some() {
             self.control.cancelled_drafts_awaiting_terminal.insert(draft_id.clone());
         }
         self.finalize_pending_tool_cards(tool_key, true, Some(reason));
@@ -477,7 +489,15 @@ impl ChatState {
     /// underlying LLM stream never receives the cancel signal.
     pub(super) fn reduce_shutdown_requested(&mut self) -> Vec<Effect> {
         let (draft_id_opt, cancel_tokens) = if self.control.generating {
-            let id = Self::take_draft_id(&self.stream);
+            // A draft past phase 1 is kept until its ordered commit settles
+            // (see `cancel_after_ready_for_commit`); only the others are
+            // cancelled.
+            let id = self
+                .stream
+                .visible_drafts
+                .iter()
+                .find(|turn| !turn.ready_for_commit)
+                .map(|turn| turn.draft.draft_id.clone());
             let tokens = self.control.drain_turn_cancels();
             for turn in &self.stream.visible_drafts {
                 if !turn.ready_for_commit {
@@ -486,7 +506,7 @@ impl ChatState {
                         .insert(turn.draft.draft_id.clone());
                 }
             }
-            self.stream.clear_visible_drafts();
+            self.stream.retain_ready_drafts();
             self.control.generating = false;
             (id, tokens)
         } else {
@@ -503,4 +523,22 @@ impl ChatState {
         effects.push(Effect::Quit);
         effects
     }
+}
+
+/// A cancel that reaches a draft after its phase 1 (`ProviderTurnReadyForCommit`):
+/// the reply was already produced and its ordered commit (phase 2) is
+/// under way, so the draft stays visible until that commit settles, the
+/// worker's token and the terminal draft are left alone, and the cancel
+/// only reports that the turn had already finished (the TUI also shows
+/// [`TURN_ALREADY_FINISHED_NOTICE`]). Removing the draft
+/// here would make the commit's `StreamCompleted` unacceptable and strand
+/// its waiter until the acknowledgement timeout.
+fn cancel_after_ready_for_commit(draft_id: &str) -> Vec<Effect> {
+    vec![
+        Effect::LogTrace {
+            level: tracing::Level::INFO,
+            msg: format!("cancel_after_ready_for_commit draft_id={draft_id}: {TURN_ALREADY_FINISHED_NOTICE}"),
+        },
+        Effect::RequestRedraw,
+    ]
 }

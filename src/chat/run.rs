@@ -4052,6 +4052,7 @@ Retry with a compatible model: /provider {shown} <model>",
             &legacy_budget_config,
             crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
         );
+        let mut preflight_adopted = false;
         if preflight_budget.over_hard_limit {
             let audit_source_history = original_legacy_chat_compaction_audit_source(&persisted_history_for_turn);
             let summary_projection = bounded_legacy_chat_compaction_audit_source(&persisted_history_for_turn);
@@ -4094,6 +4095,7 @@ Retry with a compatible model: /provider {shown} <model>",
                 )
                 .await
             };
+            preflight_adopted = !matches!(preflight_outcome, super::compaction::ManualCompactOutcome::Refused { .. });
             persist_legacy_chat_compaction_audit(
                 mem.as_ref(),
                 &runtime_envelope,
@@ -4120,6 +4122,20 @@ Retry with a compatible model: /provider {shown} <model>",
                 "legacy chat context budget preflight compacted before provider call"
             );
         }
+
+        // The inline loop hands its in-turn compactions to the reducer instead
+        // of keeping them as private mutations of `history`; after the turn the
+        // view follows the acknowledged session (`reconcile_inline_turn`). The
+        // reducer history it guards against holds the recorded request: the
+        // acknowledged snapshot already does after an adopted preflight.
+        let inline_compaction_epoch_at_start = chat_session.acked().compaction_epoch;
+        let inline_compaction = {
+            let mut reducer_source = persisted_history_for_current_turn(&chat_session.session(), &system_prompt, &user_input);
+            if preflight_adopted {
+                reducer_source.pop();
+            }
+            super::compaction::InlineCompactionSink::new(chat_dispatcher.clone(), turn_signal.clone(), &user_input, reducer_source)
+        };
 
         // D8-4: seed a turn-root spawn execution context so a sub-agent spawned
         // directly from this chat turn inherits parent_run_id = the per-turn
@@ -4179,7 +4195,8 @@ Retry with a compatible model: /provider {shown} <model>",
                                 runtime_adapter: chat_turn_binding.as_ref().map(|binding| crate::agent::turn_contracts::ToolLoopRuntimeAdapter {
                                     guarded_delivery: true,
                                     provider_trace: binding.retained_provider_trace(),
-                                    events: None, stream_provider: false,
+                                    events: Some(Arc::clone(&inline_compaction) as Arc<dyn crate::agent::turn_contracts::ToolLoopEventSink>),
+                                    stream_provider: false,
                                     tool_execution_service: Some(Arc::new(super::line_approval::line_tool_execution_service(
                                         Arc::clone(&tools_registry), &mem, &security,
                                         Arc::clone(&approval_manager), cancellation.clone(),
@@ -4355,7 +4372,16 @@ Retry with a compatible model: /provider {shown} <model>",
         let (response, turn_trace) = match turn_outcome {
             TurnOutcome::Success(resp) => (resp, successful_trace.context("successful Chat outcome has no serving trace")?),
             TurnOutcome::Cancelled => {
-                rollback_cancelled_turn_history(&mut history, history_len_before_user_turn);
+                if !super::compaction::reconcile_inline_turn(
+                    &mut history,
+                    &chat_dispatcher,
+                    &inline_compaction,
+                    inline_compaction_epoch_at_start,
+                    &user_input,
+                    None,
+                ) {
+                    rollback_cancelled_turn_history(&mut history, history_len_before_user_turn);
+                }
                 finish_inline_provider_turn(&mut provider_turn_workers, provider_turn_task_id, None);
                 gate_cancelled_provider_turn_finalization(
                     &mut turn_scheduler,
@@ -4369,6 +4395,14 @@ Retry with a compatible model: /provider {shown} <model>",
                 continue;
             }
             TurnOutcome::FailedWithError { err, .. } => {
+                super::compaction::reconcile_inline_turn(
+                    &mut history,
+                    &chat_dispatcher,
+                    &inline_compaction,
+                    inline_compaction_epoch_at_start,
+                    &user_input,
+                    None,
+                );
                 finish_inline_provider_turn(&mut provider_turn_workers, provider_turn_task_id, None);
                 gate_failed_provider_turn_finalization(
                     &mut turn_scheduler,
@@ -4534,6 +4568,14 @@ Retry with a compatible model: /provider {shown} <model>",
             {
                 anyhow::bail!("Chat stopped after an unconfirmed history commit: {error}");
             }
+            super::compaction::reconcile_inline_turn(
+                &mut history,
+                &chat_dispatcher,
+                &inline_compaction,
+                inline_compaction_epoch_at_start,
+                &user_input,
+                Some(&history_user_message),
+            );
             if let Some(ref d_id) = draft_id
                 && let Err(e) = terminal.cancel_draft("user", d_id).await
             {
@@ -4574,6 +4616,16 @@ Retry with a compatible model: /provider {shown} <model>",
             continue;
         }
 
+        // Persist only the user-facing assistant response. Tool results already
+        // live in structured history entries; adding a synthetic summary here
+        // can teach the model to emit that internal marker as a final answer.
+        // The loop already appended its final reply: that slot becomes the
+        // committed (sanitized) response, so the next request carries the
+        // reply once, as the saved session does.
+        match history.last_mut() {
+            Some(last) if last.role == "assistant" => *last = ChatMessage::assistant(&response),
+            _ => history.push(ChatMessage::assistant(&response)),
+        }
         let terminal_usage = match finalize_chat_success_turn(
             chat_turn_binding.as_deref(),
             &memory_fabric,
@@ -4584,7 +4636,7 @@ Retry with a compatible model: /provider {shown} <model>",
             route_scope.clone(),
             provider_outcome.clone(),
             Some(response.clone()),
-            history.len().saturating_add(1),
+            history.len(),
             "legacy tool loop completed",
             &config.cost,
             &config.workspace_dir,
@@ -4597,10 +4649,6 @@ Retry with a compatible model: /provider {shown} <model>",
             }
         };
 
-        // Persist only the user-facing assistant response. Tool results already
-        // live in structured history entries; adding a synthetic summary here
-        // can teach the model to emit that internal marker as a final answer.
-        history.push(ChatMessage::assistant(&response));
 
         // S2-B Step 4: RecordAssistantTurn(response) is dispatched at the same point as the legacy
         // `history.push(ChatMessage::assistant(...))` — so the reducer's session.history is
@@ -4642,6 +4690,14 @@ Retry with a compatible model: /provider {shown} <model>",
         {
             anyhow::bail!("Chat stopped after an unconfirmed history commit: {error}");
         }
+        super::compaction::reconcile_inline_turn(
+            &mut history,
+            &chat_dispatcher,
+            &inline_compaction,
+            inline_compaction_epoch_at_start,
+            &user_input,
+            Some(&history_user_message),
+        );
         #[cfg(feature = "terminal-tui")]
         if let Some(tx) = redraw_tx_for_main.as_ref() {
             let _ = tx.try_send(());
@@ -4750,8 +4806,11 @@ Retry with a compatible model: /provider {shown} <model>",
     // live sessions as interrupted, then terminate and clear every child
     // registry through the single session owner. This covers running agents,
     // NeedsInput agents, background shells, and interactive PTYs uniformly.
-    let _shutdown_report =
-        shutdown_child_sessions_for_exit(&mut chat_sessions, &chat_dispatcher, &turn_signal).await;
+    // A lost exit summary does not stop the cleanup below; it is returned
+    // once teardown has finished.
+    let exit_summaries = shutdown_child_sessions_for_exit(&mut chat_sessions, &chat_dispatcher, &turn_signal)
+        .await
+        .map(drop);
     session_rings.clear();
     withdraw_assignment_enrolment(
         assignment_enrolment.as_ref(),
@@ -4770,11 +4829,17 @@ Retry with a compatible model: /provider {shown} <model>",
             &history,
         )
     });
-    startup::finish_chat_session(
+    let finished = startup::finish_chat_session(
         &shutdown, chat_dispatcher, dispatcher_handle,
         #[cfg(feature = "terminal-tui")] &terminal_guard,
         plain_mode_turn_failed && one_shot.is_none(),
-    ).await?;
+    ).await;
+    // The dispatcher is drained now: a save that failed during exit,
+    // including one only seen while draining, has latched by this point, and
+    // `/exit` or EOF must not report success over it.
+    exit_summaries?;
+    turn_signal.ensure_history_commits_healthy()?;
+    finished?;
     one_shot_reply.transpose()
     }).await;
     turn_service

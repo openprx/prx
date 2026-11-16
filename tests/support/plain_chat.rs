@@ -135,6 +135,16 @@ impl Running {
         stdin.flush().expect("test: flush stdin");
     }
 
+    /// Send the child one SIGINT, as a single Ctrl-C at its terminal would.
+    pub fn interrupt(&self) {
+        let status = Command::new("kill")
+            .arg("-INT")
+            .arg(self.child.id().to_string())
+            .status()
+            .expect("test: run kill");
+        assert!(status.success(), "test: SIGINT delivered to prx");
+    }
+
     /// Close stdin and wait for exit within `CHILD_DEADLINE`.
     pub fn wait(mut self) -> Output {
         drop(self.stdin.take());

@@ -1448,6 +1448,7 @@ async fn run_turn_unguarded(
                     let mut restore_position = RestoredRequestPosition::AboveEverythingLeftStanding;
                     tracing::warn!("Context overflow detected; running compaction and retrying LLM call");
                     let mut emitted_exact_patch = false;
+                    let mut inline_patch_source: Option<(Vec<ChatMessage>, usize)> = None;
                     if let Some(config) = compaction_config {
                         let mut before_trim = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
                         let mut degraded_reason = None;
@@ -1551,17 +1552,26 @@ async fn run_turn_unguarded(
                                             emitted_exact_patch = true;
                                         }
                                     }
-                                } else if let Err(error) = apply_compaction_patch_exact(history, &patch) {
-                                    warn_overflow_patch_refused(&error);
-                                    restore_position = RestoredRequestPosition::AboveEverythingLeftStanding;
-                                    trim_overflow_without_handoff(
-                                        history,
-                                        config,
-                                        runtime_adapter.stream_provider,
-                                        messages_before_compaction,
-                                        tokens_before_compaction,
-                                    );
-                                    degraded_reason = Some("handoff_unavailable");
+                                } else {
+                                    // An inline loop with an event sink (chat without a
+                                    // worker) reports the compaction to its session
+                                    // authority once the request is restored below.
+                                    let source_history = runtime_adapter.events.is_some().then(|| history.clone());
+                                    if let Err(error) = apply_compaction_patch_exact(history, &patch) {
+                                        warn_overflow_patch_refused(&error);
+                                        restore_position = RestoredRequestPosition::AboveEverythingLeftStanding;
+                                        trim_overflow_without_handoff(
+                                            history,
+                                            config,
+                                            runtime_adapter.stream_provider,
+                                            messages_before_compaction,
+                                            tokens_before_compaction,
+                                        );
+                                        degraded_reason = Some("handoff_unavailable");
+                                    } else {
+                                        inline_patch_source =
+                                            source_history.map(|source| (source, patch.range_start()));
+                                    }
                                 }
                             }
                             Ok(None) => {
@@ -1586,6 +1596,18 @@ async fn run_turn_unguarded(
                             "overflow_retry",
                             restore_position,
                         );
+                        if let Some(source) = inline_patch_source.take() {
+                            emit_inline_overflow_patch(
+                                &runtime_adapter,
+                                history,
+                                source,
+                                config,
+                                messages_before_compaction,
+                                tokens_before_compaction,
+                            )
+                            .await?;
+                            emitted_exact_patch = true;
+                        }
                         if matches!(config.mode, crate::config::AgentCompactionMode::Switch)
                             && let Some(reason) = degraded_reason
                         {
@@ -2140,6 +2162,47 @@ async fn run_turn_unguarded(
             );
         }
     }
+}
+
+/// Report an inline loop's overflow compaction to its event sink as one exact
+/// patch over the pre-compaction history of `(source_history, range_start)`:
+/// the guarded range runs from `range_start` to the end and its replacement
+/// is the compacted view
+/// with the turn's request restored, so the sink sees exactly the history the
+/// retry sends.
+async fn emit_inline_overflow_patch(
+    runtime_adapter: &crate::agent::turn_contracts::ToolLoopRuntimeAdapter,
+    history: &[ChatMessage],
+    (source_history, range_start): (Vec<ChatMessage>, usize),
+    config: &crate::config::AgentCompactionConfig,
+    messages_before_compaction: usize,
+    tokens_before_compaction: usize,
+) -> Result<()> {
+    let guard =
+        crate::agent::compaction::compaction_patch_guard_for(&source_history, range_start, source_history.len())
+            .ok_or_else(|| anyhow::anyhow!("invalid inline overflow compaction patch range"))?;
+    let patch = crate::agent::turn_contracts::CompactionPatch {
+        replacement: history.iter().skip(range_start).cloned().collect(),
+        append_after: Vec::new(),
+        guard,
+    };
+    let system_messages =
+        |messages: &[ChatMessage]| usize::from(messages.first().is_some_and(|message| message.role == "system"));
+    let used_context_tokens = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD).used_tokens;
+    emit_tool_loop_event(
+        runtime_adapter,
+        ToolLoopEvent::ContextCompactionPatch {
+            turns_before: messages_before_compaction.saturating_sub(system_messages(&source_history)),
+            source_history,
+            patch,
+            config: config.clone(),
+            tokens_before: tokens_before_compaction,
+            turns_after: history.len().saturating_sub(system_messages(history)),
+            tokens_after: estimate_history_tokens(history),
+            used_context_tokens,
+        },
+    )
+    .await
 }
 
 /// Logs a refused overflow compaction patch with lengths and range only.

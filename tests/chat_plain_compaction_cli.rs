@@ -22,7 +22,7 @@ use compaction_script::{
     PLANT, READ_DONE, RECALL, RECALL_WINDOW_TOKENS, RECALLED, assistant_reply_count, carries_handoff_and_lookup,
     read_line, switch_event_counts, write_filler_files,
 };
-use loopback_openai::{LoopbackOpenAi, write_config};
+use loopback_openai::{LoopbackOpenAi, Script, Scripted, write_config};
 use plain_chat::{Output, Running, Sandbox};
 
 const MODEL: &str = "prx-loop-model";
@@ -150,6 +150,10 @@ impl<'a> HeldChat<'a> {
 
     fn command(&mut self, line: &str) {
         self.running.send(line);
+    }
+
+    fn interrupt(&self) {
+        self.running.interrupt();
     }
 
     fn exit(mut self) -> Output {
@@ -640,4 +644,312 @@ fn a_compacted_fact_reaches_the_model_only_through_the_lookup() {
         "the lookup returned the stored planted row `{planted}`: {results:?}"
     );
     assert!(output.stdout.contains(RECALLED), "stdout: {}", output.stdout);
+}
+
+/// The newest user message of `request`.
+fn newest_user_text(request: &serde_json::Value) -> String {
+    request["messages"]
+        .as_array()
+        .and_then(|messages| messages.iter().rev().find(|message| message["role"] == "user"))
+        .map(ToString::to_string)
+        .unwrap_or_default()
+}
+
+/// The compaction script, except that every call of the first `read` turn
+/// whose request carries a handoff (the turn whose preflight switched) gets
+/// `fault`, so a provider-side fallback attempt fails too; `faulted` is set
+/// once the first of them has been answered. Later turns are answered
+/// normally.
+fn script_faulting_first_handoff(fault: Scripted, faulted: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Script {
+    let mut base = compaction_script::script();
+    let mut faulted_turn: Option<String> = None;
+    Box::new(move |index, request| {
+        let newest = newest_user_text(request);
+        let in_faulted_turn = faulted_turn.as_deref() == Some(newest.as_str());
+        if in_faulted_turn
+            || faulted_turn.is_none() && compaction_script::handoff_note(request).is_some() && newest.contains("read f")
+        {
+            faulted_turn = Some(newest);
+            faulted.store(true, std::sync::atomic::Ordering::SeqCst);
+            return fault.clone();
+        }
+        base(index, request)
+    })
+}
+
+/// Drive tool-heavy turns until the faulted request was answered; returns the
+/// number of stored replies at that point.
+fn read_until_faulted(
+    sandbox: &Sandbox,
+    chat: &mut HeldChat<'_>,
+    faulted: &std::sync::atomic::AtomicBool,
+    mut replies: usize,
+) -> usize {
+    for file in 0..SWITCH_FILLERS {
+        chat.command(&read_line(file));
+        let started = Instant::now();
+        loop {
+            if faulted.load(std::sync::atomic::Ordering::SeqCst) {
+                return replies;
+            }
+            if assistant_reply_count(&sandbox.workspace) > replies {
+                replies += 1;
+                break;
+            }
+            assert!(
+                started.elapsed() < TURN_DEADLINE,
+                "read turn {file} neither replied nor reached the fault within TURN_DEADLINE"
+            );
+            std::thread::sleep(POLL);
+        }
+    }
+    panic!("no request carried a handoff after {SWITCH_FILLERS} tool-heavy turns");
+}
+
+/// The ordinary turn after the aborted one sends the compacted view: no cold
+/// prefix, the committed generation-1 handoff, and no second rollover.
+fn assert_ordinary_turn_after_abort(
+    sandbox: &Sandbox,
+    server: &LoopbackOpenAi,
+    output: &Output,
+    handoffs_at_abort: usize,
+) {
+    assert!(
+        !output.stderr.contains("panicked"),
+        "no panic on stderr: {}",
+        output.stderr
+    );
+    assert!(
+        !output.stdout.contains("history commit") && !output.stderr.contains("history commit"),
+        "no unconfirmed history commit; stdout: {}\nstderr: {}",
+        output.stdout,
+        output.stderr
+    );
+    assert_eq!(
+        handoffs_at_abort, 1,
+        "the aborted turn's preflight wrote exactly one handoff"
+    );
+    let ordinary: Vec<serde_json::Value> = server
+        .requests()
+        .into_iter()
+        .filter(|request| request.to_string().contains(ORDINARY))
+        .collect();
+    assert!(!ordinary.is_empty(), "the ordinary turn reached the provider");
+    for request in &ordinary {
+        assert!(
+            !request.to_string().contains(compaction_script::CODENAME),
+            "the ordinary turn after the aborted one resends the replaced cold prefix: {request}"
+        );
+        assert!(
+            compaction_script::handoff_note(request).is_some_and(|note| note["to_generation"] == 1),
+            "the ordinary turn's request carries the adopted handoff: {request}"
+        );
+    }
+    assert_eq!(
+        compaction_script::stored_handoffs(&sandbox.workspace).len(),
+        handoffs_at_abort,
+        "the ordinary turn caused no second rollover"
+    );
+}
+
+#[test]
+fn an_ordinary_turn_after_a_failed_switched_turn_sends_the_compacted_view() {
+    let sandbox = Sandbox::new();
+    write_filler_files(&sandbox.workspace, SWITCH_FILLERS);
+    let faulted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let server = LoopbackOpenAi::start(
+        MODEL,
+        Some((11, 7)),
+        script_faulting_first_handoff(
+            Scripted::Error {
+                status: 400,
+                message: "scripted refusal of this request".to_owned(),
+            },
+            std::sync::Arc::clone(&faulted),
+        ),
+    );
+    set_window(&sandbox, &server, RECALL_WINDOW_TOKENS);
+    let mut chat = HeldChat::spawn(&sandbox, &[]);
+    chat.turn(PLANT, 1);
+    let replies = read_until_faulted(&sandbox, &mut chat, &faulted, 1);
+    let handoffs_at_abort = compaction_script::stored_handoffs(&sandbox.workspace).len();
+    // The provider refused the switched turn's call; the next line is ordinary.
+    chat.turn(ORDINARY, replies + 1);
+    let output = chat.exit();
+    assert!(
+        output.stdout.contains("scripted refusal") || output.stderr.contains("scripted refusal"),
+        "the failed turn is reported; stdout: {}\nstderr: {}",
+        output.stdout,
+        output.stderr
+    );
+    assert_ordinary_turn_after_abort(&sandbox, &server, &output, handoffs_at_abort);
+}
+
+/// Longest wait for the cancelled call's connection to close.
+const CANCEL_DEADLINE: Duration = Duration::from_secs(30);
+
+#[test]
+fn an_ordinary_turn_after_a_cancelled_switched_turn_sends_the_compacted_view() {
+    let sandbox = Sandbox::new();
+    write_filler_files(&sandbox.workspace, SWITCH_FILLERS);
+    let faulted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let server = LoopbackOpenAi::start(
+        MODEL,
+        Some((11, 7)),
+        script_faulting_first_handoff(Scripted::Stall, std::sync::Arc::clone(&faulted)),
+    );
+    set_window(&sandbox, &server, RECALL_WINDOW_TOKENS);
+    let mut chat = HeldChat::spawn(&sandbox, &[]);
+    chat.turn(PLANT, 1);
+    let replies = read_until_faulted(&sandbox, &mut chat, &faulted, 1);
+    let handoffs_at_abort = compaction_script::stored_handoffs(&sandbox.workspace).len();
+    // The switched turn's call is held open; a single Ctrl-C cancels it.
+    chat.interrupt();
+    let started = Instant::now();
+    while server.stalls_closed_by_client() == 0 {
+        assert!(
+            started.elapsed() < CANCEL_DEADLINE,
+            "the cancelled call's connection was not closed within CANCEL_DEADLINE"
+        );
+        std::thread::sleep(POLL);
+    }
+    chat.turn(ORDINARY, replies + 1);
+    let output = chat.exit();
+    assert_clean(&output, "a cancelled switched turn then an ordinary turn");
+    assert_ordinary_turn_after_abort(&sandbox, &server, &output, handoffs_at_abort);
+}
+
+/// The user line whose first call the provider refuses as a context overflow.
+const FORCE_OVERFLOW: &str = "FORCE-OVERFLOW say noted";
+
+/// The compaction script, except that the first call of the `FORCE_OVERFLOW`
+/// turn is refused as a context overflow and every later call of that turn
+/// is answered `NOTED`; `forced` is set once the call was refused.
+fn script_forcing_one_overflow(forced: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Script {
+    let mut base = compaction_script::script();
+    Box::new(move |index, request| {
+        if newest_user_text(request).contains(FORCE_OVERFLOW) {
+            if forced.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return Scripted::text(compaction_script::NOTED);
+            }
+            return Scripted::Error {
+                status: 400,
+                message: "This model's maximum context length is 8192 tokens (context_length_exceeded)".to_owned(),
+            };
+        }
+        base(index, request)
+    })
+}
+
+/// The text of a request message (string or text parts).
+fn message_text(message: &serde_json::Value) -> String {
+    match &message["content"] {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(parts) => parts.iter().filter_map(|part| part["text"].as_str()).collect(),
+        _ => String::new(),
+    }
+}
+
+/// Wait until the saved session row ends with the ordinary turn's reply.
+fn wait_for_saved_ordinary_turn(sandbox: &Sandbox) -> Vec<(String, String)> {
+    let started = Instant::now();
+    loop {
+        let saved = compaction_script::saved_session_turns(&sandbox.workspace);
+        let committed =
+            saved.len() >= 2 && saved[saved.len() - 2].1.contains(ORDINARY) && saved[saved.len() - 1].0 == "assistant";
+        if committed {
+            return saved;
+        }
+        assert!(
+            started.elapsed() < TURN_DEADLINE,
+            "the saved session did not commit the ordinary turn within TURN_DEADLINE: {saved:?}"
+        );
+        std::thread::sleep(POLL);
+    }
+}
+
+#[test]
+fn an_overflow_recovery_after_the_preflight_is_adopted_by_the_session() {
+    let sandbox = Sandbox::new();
+    write_filler_files(&sandbox.workspace, SWITCH_FILLERS);
+    let forced = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let server = LoopbackOpenAi::start(
+        MODEL,
+        Some((11, 7)),
+        script_forcing_one_overflow(std::sync::Arc::clone(&forced)),
+    );
+    // A window no preflight crosses: only the provider's refusal compacts.
+    set_window(&sandbox, &server, LARGE_WINDOW_TOKENS);
+    let mut chat = HeldChat::spawn(&sandbox, &[]);
+    chat.turn(PLANT, 1);
+    chat.turn(&read_line(0), 2);
+    chat.turn(&read_line(1), 3);
+    chat.turn(FORCE_OVERFLOW, 4);
+    assert!(
+        forced.load(std::sync::atomic::Ordering::SeqCst),
+        "the provider refused one call as an overflow"
+    );
+    chat.turn(ORDINARY, 5);
+    // The saved session once the ordinary turn is committed.
+    let saved_before_compact = wait_for_saved_ordinary_turn(&sandbox);
+    chat.command("/compact");
+    let output = chat.exit();
+    assert_clean(&output, "overflow recovery then an ordinary turn and /compact");
+
+    // The recovery ran in this turn (switch mode records its degradation).
+    let (_, unavailable) = switch_event_counts(&sandbox.workspace);
+    assert!(
+        unavailable >= 1 || !compaction_script::stored_handoffs(&sandbox.workspace).is_empty(),
+        "the overflow recovery compacted the history; stdout: {}\nstderr: {}",
+        output.stdout,
+        output.stderr
+    );
+    // The next provider request reads the saved session: every saved turn
+    // before the ordinary one, in order, and nothing the session dropped.
+    let ordinary = server
+        .requests()
+        .into_iter()
+        .find(|request| newest_user_text(request).contains(ORDINARY))
+        .expect("the ordinary turn reached the provider");
+    let sent: Vec<(String, String)> = ordinary["messages"]
+        .as_array()
+        .expect("request messages")
+        .iter()
+        .filter(|message| message["role"] != "system")
+        .map(|message| {
+            (
+                message["role"].as_str().unwrap_or_default().to_owned(),
+                message_text(message),
+            )
+        })
+        .collect();
+    let expected = &saved_before_compact[..saved_before_compact.len() - 1];
+    assert_eq!(
+        sent.len(),
+        expected.len(),
+        "the ordinary request carries exactly the saved turns\nsent: {sent:?}\nsaved: {expected:?}"
+    );
+    for ((sent_role, sent_text), (saved_role, saved_text)) in sent.iter().zip(expected) {
+        assert!(
+            sent_role == saved_role && sent_text.ends_with(saved_text.as_str()),
+            "the ordinary request matches the saved session turn for turn\nsent: {sent:?}\nsaved: {expected:?}"
+        );
+    }
+    // `/compact` read the same history the ordinary request was built from:
+    // everything after its leading system prompt, plus the committed reply.
+    let request_messages = ordinary["messages"].as_array().map_or(0, Vec::len);
+    let leading_system = usize::from(ordinary["messages"][0]["role"] == "system");
+    let compacted_from: usize = output
+        .stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Compacted context: "))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|count| count.parse().ok())
+        .unwrap_or_else(|| panic!("no compaction line in stdout: {}", output.stdout));
+    assert_eq!(
+        compacted_from,
+        request_messages - leading_system + 1,
+        "/compact compacted the history the ordinary request was built from; stdout: {}",
+        output.stdout
+    );
 }
