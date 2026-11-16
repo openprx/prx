@@ -26,7 +26,8 @@ fn a_trim_never_reaches_the_canonical_history_and_later_appends_do() {
 
     assert_eq!(
         contents(turn_history.canonical_mut(&view).messages()),
-        vec!["sys", "old question", "old answer", "request", "round one", "round two"]
+        vec!["sys", "old question", "old answer", "request", "round one", "round two"],
+        "the canonical history keeps what the trim removed and absorbs every append, before and after it"
     );
 }
 
@@ -43,7 +44,8 @@ fn a_caller_supplied_canonical_history_is_the_canonical_history() {
 
     assert_eq!(
         contents(turn_history.canonical_mut(&view).messages()),
-        vec!["sys", "trimmed by the caller", "request", "reply"]
+        vec!["sys", "trimmed by the caller", "request", "reply"],
+        "the caller's canonical history plus the turn's append is the canonical history"
     );
 }
 
@@ -57,9 +59,21 @@ fn the_projection_reapplies_the_recalled_page_and_the_skill_suppression() {
 
     let projected = turn_history.project(&view);
 
-    assert_eq!(contents(&projected), vec!["intro\n", "recalled", "request"]);
-    assert_eq!(contents(turn_history.canonical(&view))[0], system);
-    assert_eq!(turn_history.replacement_offset(), 1);
+    assert_eq!(
+        contents(&projected),
+        vec!["intro\n", "recalled", "request"],
+        "the projection strips the skill metadata and inserts the recalled page after the system prompt"
+    );
+    assert_eq!(
+        contents(turn_history.canonical(&view))[0],
+        system,
+        "the canonical system prompt keeps the skill metadata"
+    );
+    assert_eq!(
+        turn_history.replacement_offset(),
+        1,
+        "the recalled page shifts a compaction's replacement by one message"
+    );
 }
 
 #[test]
@@ -75,10 +89,16 @@ fn a_caller_rollover_stays_current_until_the_turn_appends_or_compacts() {
         Some(CanonicalHistory::from_test_messages(untrimmed.clone())),
         true,
     );
-    assert!(turn_history.caller_rollover_current(&view));
+    assert!(
+        turn_history.caller_rollover_current(&view),
+        "a caller rollover is current before the turn appends"
+    );
 
     view.push(ChatMessage::assistant("round one"));
-    assert!(!turn_history.caller_rollover_current(&view));
+    assert!(
+        !turn_history.caller_rollover_current(&view),
+        "an append ends the caller rollover"
+    );
 
     let mut compacted_view = vec![ChatMessage::system("sys"), ChatMessage::user("request")];
     let mut compacted = TurnHistory::new(
@@ -88,8 +108,14 @@ fn a_caller_rollover_stays_current_until_the_turn_appends_or_compacts() {
     );
     let projected = compacted.project(&compacted_view);
     compacted.reshape(&mut compacted_view, |view| *view = projected);
-    assert!(!compacted.caller_rollover_current(&compacted_view));
-    assert!(!TurnHistory::new(&compacted_view, None, true).caller_rollover_current(&compacted_view));
+    assert!(
+        !compacted.caller_rollover_current(&compacted_view),
+        "a re-derived view ends the caller rollover"
+    );
+    assert!(
+        !TurnHistory::new(&compacted_view, None, true).caller_rollover_current(&compacted_view),
+        "without a canonical history there is no caller rollover"
+    );
 }
 
 #[test]
@@ -107,11 +133,13 @@ fn an_enriched_request_lives_only_in_the_projection() {
 
     assert_eq!(
         contents(turn_history.canonical_mut(&view).messages()),
-        vec!["sys", "old question", "old answer", "request"]
+        vec!["sys", "old question", "old answer", "request"],
+        "the canonical history is the acknowledged turns plus the plain request, without any enrichment"
     );
     assert_eq!(
         contents(&turn_history.project(&view)),
-        vec!["sys", "old question", "old answer", "[memory] request"]
+        vec!["sys", "old question", "old answer", "[memory] request"],
+        "the projection shows only the current request enriched; older-turn enrichment is not carried"
     );
 }
 
@@ -135,10 +163,15 @@ fn the_reducer_form_drops_the_pending_request_tool_traffic_and_loop_notes() {
 
     let reducer_form = canonical.reducer_form();
 
-    assert_eq!(contents(reducer_form.messages()), vec!["sys", "question", "answer"]);
+    assert_eq!(
+        contents(reducer_form.messages()),
+        vec!["sys", "question", "answer"],
+        "the reducer form keeps the system prompt and the durable turns only"
+    );
     assert_eq!(
         reducer_form,
-        reducer_form.clone().with_raw_request("next").reducer_form()
+        reducer_form.clone().with_raw_request("next").reducer_form(),
+        "a sink that adds the next request and takes the reducer form again describes the same reducer history"
     );
 }
 
@@ -159,12 +192,17 @@ fn a_refresh_aside_moves_into_the_projection_after_its_replacement() {
 
     let compacted = turn_history.finish_durable_compaction(&view).clone();
 
-    assert_eq!(contents(compacted.messages()), vec!["sys", "summary", "request"]);
+    assert_eq!(
+        contents(compacted.messages()),
+        vec!["sys", "summary", "request"],
+        "the reported canonical history holds no refresh aside"
+    );
     let projected = turn_history.project(&view);
-    assert_eq!(projected.len(), 4);
+    assert_eq!(projected.len(), 4, "the projection adds the aside back: {projected:?}");
     assert!(
         projected[2]
             .content
-            .starts_with(crate::agent::turn_contracts::POST_COMPACTION_REFRESH_MARKER)
+            .starts_with(crate::agent::turn_contracts::POST_COMPACTION_REFRESH_MARKER),
+        "the aside follows the summary it was written after: {projected:?}"
     );
 }
