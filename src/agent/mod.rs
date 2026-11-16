@@ -33,6 +33,7 @@ pub(crate) mod tool_scheduler;
 pub(crate) mod turn_context;
 pub(crate) mod turn_contracts;
 pub(crate) mod turn_engine;
+pub(crate) mod turn_history;
 pub(crate) mod turn_request;
 pub(crate) mod turn_tests;
 

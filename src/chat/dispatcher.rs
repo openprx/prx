@@ -2866,6 +2866,10 @@ async fn drive_start_turn_stream(
     // Preserve a separate reducer source only if preflight changes the worker
     // snapshot; ordinary turns move the existing guard view into the sink.
     let mut reducer_source_history = None;
+    // The untrimmed provider view, when the preflight below trimmed the worker
+    // view: the turn builds every durable compaction from it, never from the
+    // trimmed projection.
+    let mut canonical_view = None;
     // Redux-specific preflight projection stays in the adapter because it must
     // publish the exact compaction patch and injection diagnostic into reducer
     // state before the shared owner starts the visible provider turn. The
@@ -2902,6 +2906,13 @@ async fn drive_start_turn_stream(
                 redux_injection_overbudget_diagnostic_text(&history, &compaction_guard_history, config);
             let compaction_off = matches!(config.mode, crate::config::AgentCompactionMode::Off);
             let messages_before_rollover = history.len();
+            let view_before_rollover = history.clone();
+            let enriched_request = crate::agent::context_preflight::capture_current_turn_request_with_source(
+                &history,
+                &compaction_guard_history,
+            );
+            let source_request =
+                crate::agent::context_preflight::capture_current_turn_request(&compaction_guard_history);
             let outcome = if compaction_off {
                 ContextRolloverOutcome::default()
             } else {
@@ -2923,6 +2934,14 @@ async fn drive_start_turn_stream(
                 }
             };
             let replacement_len = outcome.replacement_len;
+            // The rollover publishes the untrimmed compacted source and trims
+            // only its provider view; that view before the trim is the
+            // canonical one. Without a rollover the view is still untrimmed.
+            let untrimmed_view = if replacement_len.is_some() {
+                provider_view_from_compacted_source(&compaction_guard_history, source_request, enriched_request)
+            } else {
+                view_before_rollover
+            };
             // A summary published the guard view at this point. A trim-only
             // fallback did not change the reducer, so its original view remains
             // authoritative even if the worker is trimmed further below.
@@ -2943,6 +2962,9 @@ async fn drive_start_turn_stream(
                     config,
                     replacement_len,
                 );
+            }
+            if !crate::agent::turn_history::same_messages(&history, &untrimmed_view) {
+                canonical_view = Some(untrimmed_view);
             }
             // The rollover produced no patch, so every message the trim above
             // removed is gone without a summary or an event to recover it from.
@@ -3062,6 +3084,7 @@ async fn drive_start_turn_stream(
             // The scope lets an approval collection record its request event; the
             // legacy chat loop (chat/run.rs) sets the same scope.
             memory: with_compaction_scope(crate::agent::turn_request::ToolLoopMemory::none(), compaction_audit)
+                .with_canonical_history(canonical_view)
                 .with_tool_surface_reserve(tool_surface_reserve)
                 .with_event_fabric(request_event_fabric)
                 .with_request_event_scope(

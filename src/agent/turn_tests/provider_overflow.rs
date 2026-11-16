@@ -261,29 +261,39 @@ async fn provider_overflow_retry_keeps_current_request() {
                         .is_some_and(|c| matches!(c.mode, AgentCompactionMode::Aggressive))
                 {
                     let events = events.0.lock().expect("events");
-                    let (patch, _config) = events
+                    let (patch, source_history) = events
                         .iter()
                         .find_map(|event| match event {
-                            ToolLoopEvent::ContextCompactionPatch { patch, config, .. } => Some((patch, config)),
+                            ToolLoopEvent::ContextCompactionPatch {
+                                patch, source_history, ..
+                            } => Some((patch, source_history)),
                             _ => None,
                         })
                         .expect("streaming summary publishes its restored view");
-                    assert!(crate::agent::compaction::compaction_patch_guard_matches(
-                        before,
-                        &patch.guard
-                    ));
-                    let mut replayed = before.clone();
-                    crate::agent::compaction::apply_compaction_patch_exact(&mut replayed, patch)
-                        .expect("test: published patch replays on its source");
-                    let pairs = |messages: &[ChatMessage]| {
+                    // The patch is built from the canonical history and guarded by it;
+                    // the provider requests add prompt sections to the system message.
+                    let conversation = |messages: &[ChatMessage]| {
                         messages
                             .iter()
+                            .filter(|message| message.role != "system")
                             .map(|message| (message.role.clone(), message.content.clone()))
                             .collect::<Vec<_>>()
                     };
+                    assert!(crate::agent::compaction::compaction_patch_guard_matches(
+                        source_history,
+                        &patch.guard
+                    ));
                     assert_eq!(
-                        pairs(&replayed),
-                        pairs(retry),
+                        conversation(source_history),
+                        conversation(before),
+                        "the patch's source is the canonical history the overflowed request was projected from"
+                    );
+                    let mut replayed = source_history.clone();
+                    crate::agent::compaction::apply_compaction_patch_exact(&mut replayed, patch)
+                        .expect("test: published patch replays on its source");
+                    assert_eq!(
+                        conversation(&replayed),
+                        conversation(retry),
                         "worker patch replays the exact retry view"
                     );
                     assert_eq!(

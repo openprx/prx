@@ -8,6 +8,7 @@ use crate::agent::context_budget::{
 };
 use crate::agent::document_ingest::DocumentIngestRuntime;
 use crate::agent::history::{history_non_system_start, latest_user_query_index};
+use crate::agent::turn_history::TurnHistory;
 use crate::providers::{ChatMessage, Provider};
 use anyhow::Result;
 
@@ -21,41 +22,75 @@ pub(super) async fn preflight_context_budget_before_provider_call(
     audit: Option<&DocumentIngestRuntime>,
     trigger: &str,
 ) -> Result<ContextBudgetSnapshot> {
-    preflight_context_budget_capturing_change(history, provider, model, config, tool_surface, audit, trigger)
-        .await
-        .map(|(budget, _)| budget)
+    let config = preflight_config(config, tool_surface);
+    let mut turn_history = TurnHistory::new(history, None);
+    let compaction = preflight_durable_compaction(
+        history,
+        &mut turn_history,
+        provider,
+        model,
+        &config,
+        tool_surface,
+        audit,
+        trigger,
+    )
+    .await?;
+    if compaction.replacement_len.is_some() {
+        let projected = turn_history.project(history);
+        turn_history.reshape(history, |view| *view = projected);
+    }
+    Ok(preflight_trim_projection(history, &mut turn_history, &config, &compaction, audit, trigger).await)
 }
 
-/// The hard budget preflight before a provider call. When it applied a
-/// summary or handoff, the history before it and right after it (before any
-/// trim, which is this request's projection) are returned with the budget, so
-/// the caller can report the durable compaction to its session authority;
-/// otherwise the second value is `None`. The clones are taken only on the
-/// compaction path.
-pub(super) async fn preflight_context_budget_capturing_change(
-    history: &mut Vec<ChatMessage>,
+/// The compaction config one provider request is budgeted with. The
+/// published tool schemas ride in the same context window as the messages,
+/// and the prompt sections compiled from them are appended to the system
+/// message after the preflight, so the window left for history is the
+/// configured one minus both. Reserving them keeps a single budget policy: the
+/// warning threshold, summary compaction and the token-aware trim all move
+/// together, and a request that publishes no tool at all is budgeted exactly
+/// as configured.
+pub(super) fn preflight_config(
+    config: &crate::config::AgentCompactionConfig,
+    tool_surface: crate::agent::turn_context::RequestToolMeasurement,
+) -> std::borrow::Cow<'_, crate::config::AgentCompactionConfig> {
+    if budgeted_request_tool_tokens(tool_surface) == 0 {
+        std::borrow::Cow::Borrowed(config)
+    } else {
+        std::borrow::Cow::Owned(reserve_request_tool_surface(config, tool_surface))
+    }
+}
+
+/// What the durable phase of the preflight did.
+#[derive(Default)]
+pub(super) struct PreflightCompaction {
+    /// The canonical history before the summary or handoff this phase applied
+    /// to it; taken by the caller that reports the compaction.
+    pub(super) source: Option<Vec<ChatMessage>>,
+    /// The applied replacement's length in the provider view.
+    pub(super) replacement_len: Option<usize>,
+    /// Why a `switch` rollover could not stay lossless.
+    degraded_reason: Option<&'static str>,
+}
+
+/// The durable phase of the hard budget preflight before a provider call.
+/// When the provider view is over the hard limit, the summary or handoff is
+/// built from and applied to the turn's canonical history, never to the view:
+/// the view may hold this turn's earlier trims, and a replacement built over
+/// them would drop the turns they left out for good. The caller reports an
+/// applied compaction to its session authority and re-derives the view from
+/// the canonical history before [`preflight_trim_projection`].
+pub(super) async fn preflight_durable_compaction(
+    view: &[ChatMessage],
+    turn_history: &mut TurnHistory,
     provider: &dyn Provider,
     model: &str,
     config: &crate::config::AgentCompactionConfig,
     tool_surface: crate::agent::turn_context::RequestToolMeasurement,
     audit: Option<&DocumentIngestRuntime>,
     trigger: &str,
-) -> Result<(ContextBudgetSnapshot, Option<(Vec<ChatMessage>, Vec<ChatMessage>)>)> {
-    // The published tool schemas ride in the same context window as the
-    // messages, and the prompt sections compiled from them are appended to the
-    // system message after this runs, so the window left for history is the
-    // configured one minus both. Reserving them keeps a single budget policy:
-    // the warning threshold, summary compaction and the token-aware trim all
-    // move together, and a request that publishes no tool at all is budgeted
-    // exactly as before.
-    let reserved_config;
-    let config = if budgeted_request_tool_tokens(tool_surface) == 0 {
-        config
-    } else {
-        reserved_config = reserve_request_tool_surface(config, tool_surface);
-        &reserved_config
-    };
-    let mut budget = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
+) -> Result<PreflightCompaction> {
+    let budget = plan_context_budget(view, config, PRE_TURN_FLUSH_THRESHOLD);
     if budget.over_warning {
         tracing::info!(
             used_tokens = budget.used_tokens,
@@ -69,123 +104,132 @@ pub(super) async fn preflight_context_budget_capturing_change(
             "context budget warning threshold crossed"
         );
     }
-    if !budget.over_hard_limit {
-        return Ok((budget, None));
+    if !budget.over_hard_limit
+        || matches!(config.mode, crate::config::AgentCompactionMode::Off)
+        || turn_history.caller_rollover_current(view)
+    {
+        return Ok(PreflightCompaction::default());
     }
-    let mut before_compaction = history.clone();
-    let mut durable_compaction = None;
-
-    // From here something will be removed from history, and with a tool
-    // surface larger than the whole window every trim below runs down to its
-    // floor. The current turn's user message is the request itself: answering
-    // a question that is no longer in the transcript is worse than serving an
-    // over-budget request, which the provider-side overflow retry already
-    // covers. Cloned once, on a path that is already about to summarize or
-    // tokenize the whole history, and only to put it back if this preflight
-    // took it. Which message is the request, and why it is not simply the last
-    // `user` one, is `capture_current_turn_request`.
-    let current_request = capture_current_turn_request(history);
-
     let is_switch = matches!(config.mode, crate::config::AgentCompactionMode::Switch);
-    let mut replacement_len = None;
+    let replacement_offset = turn_history.replacement_offset();
+    let canonical = turn_history.canonical_mut(view);
+    let before = canonical.clone();
+    // The request is the turn's own message: summary compaction cuts at the
+    // first message that may head the hot window, which in a tool round is the
+    // assistant envelope after the request, so the compaction can take it. It
+    // goes back after the replacement.
+    let request = capture_current_turn_request(canonical);
     // A `switch` rollover that cannot stay lossless must not abort the turn.
     // Failing closed here made every session that contains tool calls answer
     // each user message with the same non-retryable error, because the tool
     // round-trip messages kept provenance unresolvable and history never
-    // shrank. Degrade to a lossy trim and record the downgrade instead.
-    let mut degraded_reason: Option<&'static str> = None;
-    if !matches!(config.mode, crate::config::AgentCompactionMode::Off) {
-        match apply_configurable_compaction_with_replacement_len(history, provider, model, config, audit, trigger).await
-        {
-            Ok(applied_replacement_len) => {
-                replacement_len = applied_replacement_len;
-                if applied_replacement_len.is_some() {
-                    durable_compaction = Some((std::mem::take(&mut before_compaction), history.clone()));
-                }
-                if is_switch && applied_replacement_len.is_none() {
-                    degraded_reason = Some("handoff_unavailable");
-                }
+    // shrank. The view degrades to a lossy trim and the downgrade is recorded.
+    match apply_configurable_compaction_with_replacement_len(canonical, provider, model, config, audit, trigger).await {
+        Ok(Some(replacement_len)) => {
+            restore_current_turn_request(canonical, request, trigger, RestoredRequestPosition::Tail);
+            Ok(PreflightCompaction {
+                source: Some(before),
+                replacement_len: Some(replacement_len.saturating_add(replacement_offset)),
+                degraded_reason: None,
+            })
+        }
+        Ok(None) => Ok(PreflightCompaction {
+            source: None,
+            replacement_len: None,
+            degraded_reason: is_switch.then_some("handoff_unavailable"),
+        }),
+        Err(error) => {
+            if !is_switch {
+                return Err(error);
             }
-            Err(error) => {
-                if !is_switch {
-                    return Err(error);
-                }
-                let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
-                tracing::warn!(
-                    error_len,
-                    error_sha256,
-                    trigger,
-                    "context switch rollover failed; continuing the turn on a lossy trim"
-                );
-                degraded_reason = Some("handoff_failed");
-            }
+            // Whatever a failed rollover left behind is not a compaction.
+            *canonical = before;
+            let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+            tracing::warn!(
+                error_len,
+                error_sha256,
+                trigger,
+                "context switch rollover failed; continuing the turn on a lossy trim"
+            );
+            Ok(PreflightCompaction {
+                source: None,
+                replacement_len: None,
+                degraded_reason: Some("handoff_failed"),
+            })
         }
     }
+}
 
-    budget = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
-    let over_hard_limit_after_compaction = budget.over_hard_limit;
-    let trimmed = if over_hard_limit_after_compaction {
-        if is_switch && degraded_reason.is_none() {
-            degraded_reason = Some("over_hard_limit_after_handoff");
-        }
-        if let Some(replacement_len) = replacement_len {
-            trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
-                history,
-                config,
-                replacement_len,
-            )
-        } else {
-            trim_history_to_context_budget(history, config)
-        }
-    } else {
-        false
-    };
-    // The restore is checked on both paths. Summary compaction cuts at the
-    // first message that may head the hot window, which in a tool round is the
-    // assistant envelope *after* the request, so compaction alone can take the
-    // request and still leave history under the limit — a case no trim follows.
-    //
-    // Where it goes back is decided by what *this* call did, not by inspecting
-    // the history shape afterwards: only a compaction that replaced a front
-    // range put a summary above the request, and only then must the request
-    // land after it. `replacement_len` is that fact, already computed above.
+/// The projection phase of the hard budget preflight: a provider view still
+/// over the hard limit is trimmed for this request only (the canonical history
+/// keeps every turn), preserving the replacement the durable phase applied.
+/// The request goes back when the trim took it.
+pub(super) async fn preflight_trim_projection(
+    view: &mut Vec<ChatMessage>,
+    turn_history: &mut TurnHistory,
+    config: &crate::config::AgentCompactionConfig,
+    compaction: &PreflightCompaction,
+    audit: Option<&DocumentIngestRuntime>,
+    trigger: &str,
+) -> ContextBudgetSnapshot {
+    let budget = plan_context_budget(view, config, PRE_TURN_FLUSH_THRESHOLD);
+    if !budget.over_hard_limit {
+        return budget;
+    }
+    let is_switch = matches!(config.mode, crate::config::AgentCompactionMode::Switch);
+    let replacement_len = compaction.replacement_len;
+    let degraded_reason = compaction
+        .degraded_reason
+        .or_else(|| is_switch.then_some("over_hard_limit_after_handoff"));
+    // With a tool surface larger than the whole window every trim below runs
+    // down to its floor. The current turn's user message is the request
+    // itself: answering a question that is no longer in the transcript is
+    // worse than serving an over-budget request, which the provider-side
+    // overflow retry already covers. Which message is the request, and why it
+    // is not simply the last `user` one, is `capture_current_turn_request`.
+    // Only a compaction that replaced a front range put a summary above the
+    // request, and only then must the request land after it.
     let restore_position = if replacement_len.is_some() {
         RestoredRequestPosition::Tail
     } else {
         RestoredRequestPosition::AboveEverythingLeftStanding
     };
-    let restored = restore_current_turn_request(history, current_request, trigger, restore_position);
-    if over_hard_limit_after_compaction {
-        let after = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
+    let trimmed = turn_history.reshape(view, |view| {
+        let current_request = capture_current_turn_request(view);
+        let trimmed = if let Some(replacement_len) = replacement_len {
+            trim_history_to_context_budget_preserving_compaction_replacement_with_floor(view, config, replacement_len)
+        } else {
+            trim_history_to_context_budget(view, config)
+        };
+        restore_current_turn_request(view, current_request, trigger, restore_position);
+        trimmed
+    });
+    let after = plan_context_budget(view, config, PRE_TURN_FLUSH_THRESHOLD);
+    tracing::warn!(
+        before_used_tokens = budget.used_tokens,
+        after_used_tokens = after.used_tokens,
+        hard_limit = after.available_input_tokens,
+        trimmed,
+        mode = ?config.mode,
+        "context budget preflight applied token-aware trim"
+    );
+    if let Some(reason) = degraded_reason {
         tracing::warn!(
-            before_used_tokens = budget.used_tokens,
-            after_used_tokens = after.used_tokens,
-            hard_limit = after.available_input_tokens,
-            trimmed,
-            mode = ?config.mode,
-            "context budget preflight applied token-aware trim"
+            trigger,
+            reason,
+            "context switch degraded to a lossy token-aware trim so the turn can continue"
         );
-        if let Some(reason) = degraded_reason {
-            tracing::warn!(
-                trigger,
-                reason,
-                "context switch degraded to a lossy token-aware trim so the turn can continue"
-            );
-            persist_context_switch_degradation(
-                audit,
-                trigger,
-                reason,
-                budget.used_tokens,
-                after.used_tokens,
-                after.available_input_tokens,
-            )
-            .await;
-        }
-        budget = after;
-    } else if restored {
-        budget = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
+        persist_context_switch_degradation(
+            audit,
+            trigger,
+            reason,
+            budget.used_tokens,
+            after.used_tokens,
+            after.available_input_tokens,
+        )
+        .await;
     }
-    Ok((budget, durable_compaction))
+    after
 }
 
 /// The turn's own request, captured before a context-budget removal can take

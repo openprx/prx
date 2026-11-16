@@ -541,8 +541,10 @@ fn loop_note_name_aliases(text: &str) -> Vec<String> {
 /// target must be assigned through the neutraliser, and exactly one such
 /// history rebuild exists.
 ///
-/// MUTATION GUARD: change `*history = neutralize_middleware_user_messages(history,
-/// candidate);` in `turn_engine.rs` to `*history = candidate;` and this fails.
+/// MUTATION GUARD: change `let rewritten = neutralize_middleware_user_messages(history,
+/// candidate);` in `turn_engine.rs` (`middleware_messages`, which both the
+/// turn's inbound pass and a re-derived provider view use) to
+/// `let rewritten = candidate;` and this fails.
 #[test]
 pub(super) fn middleware_history_rebuilds_neutralize_user_messages() {
     const REBUILD: &str = "from_value::<Vec<ChatMessage>>(";
@@ -578,7 +580,7 @@ pub(super) fn middleware_history_rebuilds_neutralize_user_messages() {
     );
     assert_eq!(
         neutralised,
-        vec!["src/agent/turn_engine.rs: *history"],
+        vec!["src/agent/turn_engine.rs: let rewritten"],
         "the inbound middleware history rebuild is the one neutralised rebuild"
     );
 }

@@ -1132,11 +1132,12 @@ fn script_with_multi_read() -> Script {
 }
 
 /// The per-provider preflight inside a tool turn (after tool output grew the
-/// history past the window) trims that request's view, through real HTTP/SSE
-/// and real SQLite. A trim is the projection of one request: the session keeps
-/// every turn, so nothing is lost for a later handoff, and the next ordinary
-/// request is exactly the saved session (the run loop's view never keeps a
-/// change the session does not have).
+/// history past the window) shrinks that request's view, through real
+/// HTTP/SSE and real SQLite. A trim is the projection of one request and a
+/// handoff is built from the untrimmed canonical history, so the session keeps
+/// every turn (as bytes or through the handoff), and the next ordinary request
+/// is exactly the saved session (the run loop's view never keeps a change the
+/// session does not have).
 #[test]
 fn a_mid_turn_preflight_trim_leaves_the_session_and_the_next_request_in_agreement() {
     let sandbox = Sandbox::new();
@@ -1145,6 +1146,7 @@ fn a_mid_turn_preflight_trim_leaves_the_session_and_the_next_request_in_agreemen
     set_window(&sandbox, &server, compaction_script::SMALL_WINDOW_TOKENS);
     let mut chat = HeldChat::spawn(&sandbox, &[]);
     chat.turn(PLANT, 1);
+    let planted_events = first_message_event_ids(&sandbox, 2);
     chat.turn(MULTI_READ, 2);
     chat.turn(ORDINARY, 3);
     let saved = wait_for_saved_ordinary_turn(&sandbox);
@@ -1163,11 +1165,13 @@ fn a_mid_turn_preflight_trim_leaves_the_session_and_the_next_request_in_agreemen
         multi_sizes.len() > MULTI_READ_ROUNDS / 2 && multi_sizes.last().is_some_and(|last| *last < peak),
         "the preflight trimmed inside the tool turn (its requests shrank after their peak): {multi_sizes:?}"
     );
+    let saved_handoff_refs = saved_handoff_references(&saved);
     assert!(
         saved
             .iter()
-            .any(|(_, content)| content.contains(compaction_script::CODENAME)),
-        "the projection trim lost no saved turn: {saved:?}"
+            .any(|(_, content)| content.contains(compaction_script::CODENAME))
+            || planted_events.iter().all(|event| saved_handoff_refs.contains(event)),
+        "the session lost no turn: the planted exchange is kept as bytes or through the handoff: {saved:?}"
     );
     let ordinary = requests
         .iter()
@@ -1365,4 +1369,201 @@ fn a_per_request_trim_never_reaches_the_saved_session() {
         carried < OVERSIZED_LINES,
         "the last request was trimmed ({carried} of {OVERSIZED_LINES} lines carried), so the case exercised a trim"
     );
+}
+
+/// The user line of the multi-round tool turn in which a per-request trim
+/// runs first and a durable handoff follows.
+const TRIM_THEN_HANDOFF: &str = "TRIM-THEN-HANDOFF read every filler";
+/// Messages a handoff keeps verbatim in the trim-then-handoff case. The tool
+/// turn crosses the window while the history still has at most this many
+/// non-system messages, so nothing can be handed off and the preflight trims
+/// the request (dropping the planted exchange); two tool rounds later the
+/// history outgrows it by the planted exchange, which the handoff then
+/// replaces.
+const TRIM_THEN_HANDOFF_KEEP: usize = 15;
+
+/// What the [`TRIM_THEN_HANDOFF`] script saw.
+#[derive(Default)]
+struct TrimThenHandoff {
+    /// A request of the turn carried neither the planted message nor a
+    /// handoff: the per-request trim had left the planted exchange out.
+    trimmed_before_handoff: std::sync::atomic::AtomicBool,
+}
+
+/// Whether `request` carries the planted user message itself (the request's
+/// session-context preamble quotes it too, so a substring match would not
+/// tell).
+fn carries_planted_message(request: &serde_json::Value) -> bool {
+    request["messages"]
+        .as_array()
+        .is_some_and(|messages| messages.iter().any(|message| message_text(message) == PLANT))
+}
+
+/// The compaction script, except that the [`TRIM_THEN_HANDOFF`] turn reads one
+/// filler file per provider call until its request carries a handoff, then
+/// ends with `NOTED`.
+fn script_trim_then_handoff(seen: std::sync::Arc<TrimThenHandoff>) -> Script {
+    let mut base = compaction_script::script();
+    let mut rounds = 0;
+    Box::new(move |index, request| {
+        if !newest_user_text(request).contains(TRIM_THEN_HANDOFF) {
+            return base(index, request);
+        }
+        if compaction_script::handoff_note(request).is_some() || rounds >= SWITCH_FILLERS {
+            return Scripted::text(compaction_script::NOTED);
+        }
+        if !carries_planted_message(request) {
+            seen.trimmed_before_handoff
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        let file = format!("f{rounds}.txt");
+        rounds += 1;
+        Scripted::tool(
+            &format!("call-trim-{index}"),
+            "file_read",
+            &serde_json::json!({ "path": file }),
+        )
+    })
+}
+
+/// The event ids of the first `count` `message.created` rows of the real
+/// store (the turns before the multi-round tool turn), oldest first.
+fn first_message_event_ids(sandbox: &Sandbox, count: i64) -> Vec<String> {
+    let database = rusqlite::Connection::open_with_flags(
+        sandbox.workspace.join("memory/brain.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("test: open real store");
+    let mut statement = database
+        .prepare("SELECT event_id FROM message_events WHERE event_type = 'message.created' ORDER BY id LIMIT ?1")
+        .expect("test: event id query");
+    statement
+        .query_map([count], |row| row.get::<_, String>(0))
+        .expect("test: event id rows")
+        .map(|row| row.expect("test: event id row"))
+        .collect()
+}
+
+/// The saved session turns once the row ends with the reply to `line`.
+fn wait_for_saved_reply_to(sandbox: &Sandbox, line: &str) -> Vec<(String, String)> {
+    let started = Instant::now();
+    loop {
+        let saved = compaction_script::saved_session_turns(&sandbox.workspace);
+        let committed =
+            saved.len() >= 2 && saved[saved.len() - 2].1.contains(line) && saved[saved.len() - 1].0 == "assistant";
+        if committed {
+            return saved;
+        }
+        assert!(
+            started.elapsed() < TURN_DEADLINE,
+            "the saved session did not commit the reply to `{line}` within TURN_DEADLINE: {saved:?}"
+        );
+        std::thread::sleep(POLL);
+    }
+}
+
+/// The event ids a handoff note points its lookup at.
+fn referenced_event_ids(note: &serde_json::Value) -> Vec<String> {
+    note["lookup"]["arguments"]["event_ids"]
+        .as_array()
+        .map(|ids| ids.iter().filter_map(|id| id.as_str().map(str::to_owned)).collect())
+        .unwrap_or_default()
+}
+
+/// The event ids every handoff turn of a saved session points its lookup at.
+fn saved_handoff_references(saved: &[(String, String)]) -> Vec<String> {
+    saved
+        .iter()
+        .filter_map(|(_, content)| {
+            let start = content.find(compaction_script::HANDOFF_START)? + compaction_script::HANDOFF_START.len();
+            let end = content[start..].find(compaction_script::HANDOFF_END)? + start;
+            serde_json::from_str::<serde_json::Value>(content[start..end].trim()).ok()
+        })
+        .flat_map(|note| referenced_event_ids(&note))
+        .collect()
+}
+
+/// A per-request trim runs first inside a multi-round tool turn and leaves
+/// the planted exchange out of the provider view; later in the same turn the
+/// preflight hands off, through real HTTP/SSE and real SQLite. The handoff is
+/// built from the untrimmed canonical history, so it references the planted
+/// exchange the trim left out, the saved session keeps every turn from before
+/// the trim (as retained bytes or through the handoff), and a later lookup
+/// recovers the planted fact.
+#[test]
+fn a_handoff_after_a_trim_in_the_same_turn_keeps_the_trimmed_turns() {
+    let sandbox = Sandbox::new();
+    write_filler_files(&sandbox.workspace, SWITCH_FILLERS);
+    let seen = std::sync::Arc::new(TrimThenHandoff::default());
+    let server = LoopbackOpenAi::start(
+        MODEL,
+        Some((11, 7)),
+        script_trim_then_handoff(std::sync::Arc::clone(&seen)),
+    );
+    write_config(&sandbox.config_dir, &server.provider(), MODEL, |config| {
+        config.autonomy.level = openprx::security::AutonomyLevel::Full;
+        config.agent.compaction.mode = openprx::config::schema::AgentCompactionMode::Switch;
+        config.agent.compaction.max_context_tokens = compaction_script::SMALL_WINDOW_TOKENS;
+        config.agent.compaction.reserve_tokens = RESERVE_TOKENS;
+        config.agent.compaction.keep_recent_messages = TRIM_THEN_HANDOFF_KEEP;
+        config.memory.auto_save = false;
+    });
+    let mut chat = HeldChat::spawn(&sandbox, &[]);
+    chat.turn(PLANT, 1);
+    let pre_trim_events = first_message_event_ids(&sandbox, 2);
+    chat.turn(TRIM_THEN_HANDOFF, 2);
+    let saved = wait_for_saved_reply_to(&sandbox, TRIM_THEN_HANDOFF);
+    chat.turn(RECALL, 3);
+    let output = chat.exit();
+    assert_clean(&output, "a trim then a handoff in one turn, then a recall");
+
+    let shapes: Vec<(usize, bool, bool)> = server
+        .requests()
+        .iter()
+        .filter(|request| newest_user_text(request).contains(TRIM_THEN_HANDOFF))
+        .map(|request| {
+            (
+                request["messages"].as_array().map_or(0, Vec::len),
+                carries_planted_message(request),
+                compaction_script::handoff_note(request).is_some(),
+            )
+        })
+        .collect();
+    assert!(
+        seen.trimmed_before_handoff.load(std::sync::atomic::Ordering::SeqCst),
+        "a request of the tool turn left the planted exchange out before any handoff, so the trim ran first; \
+         requests (messages, planted message, handoff): {shapes:?}\nsaved: {saved:?}"
+    );
+    assert_eq!(
+        pre_trim_events.len(),
+        2,
+        "the planted exchange was stored: {pre_trim_events:?}"
+    );
+    // The handoff the tool turn itself saved (the row is read before the
+    // recall turn starts).
+    let saved_handoff_refs = saved_handoff_references(&saved);
+    assert!(
+        pre_trim_events.iter().all(|event| saved_handoff_refs.contains(event)),
+        "the tool turn's handoff references the turns the earlier trim left out: {pre_trim_events:?} in \
+         {saved_handoff_refs:?}; requests: {shapes:?}\nsaved: {saved:?}"
+    );
+    let pre_trim_turns = [PLANT, compaction_script::NOTED];
+    for (event, text) in pre_trim_events.iter().zip(pre_trim_turns) {
+        assert!(
+            saved_handoff_refs.contains(event) || saved.iter().any(|(_, content)| content == text),
+            "the saved session keeps the pre-trim turn `{text}` as bytes or through its handoff: {saved:?}"
+        );
+    }
+    assert!(
+        saved.iter().any(|(_, content)| content.contains(TRIM_THEN_HANDOFF)),
+        "the saved session holds the tool turn's request: {saved:?}"
+    );
+
+    assert!(
+        output.stdout.contains(RECALLED),
+        "the lookup recovered the fact planted in the trimmed turn; stdout: {}\nstderr: {}",
+        output.stdout,
+        output.stderr
+    );
+    assert_lookup_returned_the_stored_row(&sandbox, &server);
 }

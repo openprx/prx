@@ -1613,16 +1613,16 @@ fn apply_compaction_patch_exact_replaces_exactly_the_guarded_range() {
 const PREFLIGHT_CAPTURE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// The per-provider preflight hands its caller the durable part of what it
-/// did: a summary returns the history before it and right after it (what the
-/// turn engine reports to the session authority), while a degraded switch
-/// that only trims returns nothing (a projection of this request).
+/// did. A summary is built from the turn's canonical history, so the turns an
+/// earlier trim of this turn left out of the provider view are part of its
+/// source; a degraded switch that only trims returns nothing (a projection of
+/// this request) and leaves the canonical history whole.
 #[tokio::test]
-async fn the_preflight_returns_its_durable_compaction_and_nothing_for_a_trim() {
+async fn the_preflight_builds_its_durable_compaction_from_the_canonical_history_and_nothing_for_a_trim() {
     tokio::time::timeout(PREFLIGHT_CAPTURE_DEADLINE, async {
         let summary_provider =
             ScriptedProvider::from_text_responses(vec!["## Decisions\n- d\n## Open TODOs\n- t\n## Constraints\n- c"]);
-        let mut summarized = tool_roundtrip_history_fixture(10);
-        let original = summarized.clone();
+        let original = tool_roundtrip_history_fixture(10);
         let summary_config = crate::config::AgentCompactionConfig {
             mode: crate::config::AgentCompactionMode::Safeguard,
             reserve_tokens: 1,
@@ -1632,8 +1632,15 @@ async fn the_preflight_returns_its_durable_compaction_and_nothing_for_a_trim() {
             max_context_tokens_explicit: true,
             os_paging: crate::config::OsPagingConfig::default(),
         };
-        let (_, durable) = crate::agent::context_preflight::preflight_context_budget_capturing_change(
-            &mut summarized,
+        // An earlier trim of this turn took the two oldest rounds out of the view.
+        let mut view = original.clone();
+        let mut turn_history = crate::agent::turn_history::TurnHistory::new(&view, None);
+        turn_history.reshape(&mut view, |view| {
+            view.drain(1..9);
+        });
+        let compaction = crate::agent::context_preflight::preflight_durable_compaction(
+            &view,
+            &mut turn_history,
             &summary_provider,
             "model",
             &summary_config,
@@ -1649,47 +1656,59 @@ async fn the_preflight_returns_its_durable_compaction_and_nothing_for_a_trim() {
         let envelope = RuntimeEnvelope::agent("workspace-capture-trim", "run-capture-trim");
         let audit = DocumentIngestRuntime::from_envelope(Arc::clone(&memory), &envelope);
         let unused_provider = ScriptedProvider::from_text_responses(vec!["MODEL_SUMMARY_MUST_NOT_RUN"]);
+        let switch_config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Switch,
+            ..summary_config.clone()
+        };
         let mut trimmed = tool_roundtrip_history_fixture(10);
         let trimmed_len = trimmed.len();
-        let (_, trim_only) = crate::agent::context_preflight::preflight_context_budget_capturing_change(
-            &mut trimmed,
+        let mut trim_history = crate::agent::turn_history::TurnHistory::new(&trimmed, None);
+        let trim_only = crate::agent::context_preflight::preflight_durable_compaction(
+            &trimmed,
+            &mut trim_history,
             &unused_provider,
             "model",
-            &crate::config::AgentCompactionConfig {
-                mode: crate::config::AgentCompactionMode::Switch,
-                ..summary_config.clone()
-            },
+            &switch_config,
             crate::agent::turn_context::RequestToolMeasurement::NONE,
             Some(&audit),
             "test_capture_trim",
         )
         .await
         .expect("the degraded switch preflight runs");
+        crate::agent::context_preflight::preflight_trim_projection(
+            &mut trimmed,
+            &mut trim_history,
+            &switch_config,
+            &trim_only,
+            Some(&audit),
+            "test_capture_trim",
+        )
+        .await;
 
-        let (before, compacted) = durable.expect("an applied summary is returned as a durable compaction");
-        assert_eq!(
-            before.len(),
-            original.len(),
-            "the durable compaction's source is the history before the preflight"
+        let before = compaction
+            .source
+            .as_deref()
+            .expect("an applied summary is returned as a durable compaction");
+        assert!(
+            crate::agent::turn_history::same_messages(before, &original),
+            "the durable compaction's source is the canonical history, the trimmed rounds included"
         );
         assert!(
-            before
-                .iter()
-                .zip(&original)
-                .all(|(left, right)| left.role == right.role && left.content == right.content),
-            "the source is the pre-compaction history message for message"
-        );
-        assert!(
-            compacted
+            turn_history
+                .canonical(&view)
                 .iter()
                 .any(|message| message.content.contains("[Context compacted at")),
-            "the compacted history carries the summary"
+            "the compacted canonical history carries the summary"
         );
         assert!(
-            trim_only.is_none(),
+            trim_only.source.is_none(),
             "a trim without a handoff is not a durable compaction"
         );
         assert!(trimmed.len() < trimmed_len, "the degraded switch did trim the view");
+        assert!(
+            crate::agent::turn_history::same_messages(trim_history.canonical_mut(&trimmed), &original),
+            "the trim never reached the canonical history"
+        );
     })
     .await
     .expect("the preflight capture test finishes within PREFLIGHT_CAPTURE_DEADLINE");

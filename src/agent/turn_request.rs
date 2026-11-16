@@ -147,6 +147,11 @@ pub(crate) struct ToolLoopMemory {
     /// Where the turn records the tool-surface reserve its preflight applied,
     /// for a chat front end that budgets outside the turn.
     pub(super) tool_surface_reserve: Option<crate::agent::context_budget::ToolSurfaceReserve>,
+    /// The untrimmed history a caller projected the turn's view from, when it
+    /// trimmed that view before the turn (the chat worker's pre-turn
+    /// rollover). The turn builds every durable compaction from it rather than
+    /// from the trimmed view; `None` when the view is the acknowledged history.
+    pub(super) canonical_history: Option<Vec<crate::providers::ChatMessage>>,
 }
 
 impl ToolLoopMemory {
@@ -158,6 +163,7 @@ impl ToolLoopMemory {
             event_fabric: None,
             request_event_scope: None,
             tool_surface_reserve: None,
+            canonical_history: None,
         }
     }
 
@@ -182,6 +188,13 @@ impl ToolLoopMemory {
     /// Attach the entrypoint's configured event fabric. This deliberately
     /// travels with the other per-turn memory handles so every ingress reaches
     /// the same request-context persistence point inside the shared loop.
+    /// The untrimmed history the caller projected the turn's view from; see
+    /// the field's documentation.
+    pub(crate) fn with_canonical_history(mut self, canonical: Option<Vec<crate::providers::ChatMessage>>) -> Self {
+        self.canonical_history = canonical;
+        self
+    }
+
     pub(crate) fn with_event_fabric(mut self, event_fabric: MemoryFabric) -> Self {
         self.event_fabric = Some(event_fabric);
         self
