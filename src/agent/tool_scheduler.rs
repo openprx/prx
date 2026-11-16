@@ -65,8 +65,8 @@ async fn acquire_tool_barrier(
     .await
     .map_err(|_| {
         tracing::warn!(
-            tool = %tool_name,
-            barrier_key = key,
+            tool = %crate::agent::diagnostics::text_class(tool_name),
+            barrier_key = %crate::agent::diagnostics::text_class(key),
             "Tool barrier lock timed out after {TOOL_BARRIER_TIMEOUT_SECS}s; refusing tool execution",
         );
         ToolBarrierTimeout {
@@ -183,7 +183,7 @@ async fn execute_one_unrecorded(
         .unwrap_or_else(|| Uuid::now_v7().to_string());
 
     if let Some(result) = native_tool_calls.get(index).and_then(unparseable_native_arguments) {
-        tracing::warn!(tool = %call.name, "native tool call refused: arguments are not a complete JSON object");
+        tracing::warn!(tool = %crate::agent::diagnostics::text_class(&call.name), "native tool call refused: arguments are not a complete JSON object");
         emit_tool_loop_event(
             adapter,
             ToolLoopEvent::ToolFinished {

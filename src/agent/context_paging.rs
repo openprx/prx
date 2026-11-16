@@ -81,7 +81,7 @@ pub(super) async fn apply_os_paging(
     };
     if !runtime.memory.supports_document_ingest() {
         tracing::debug!(
-            backend = runtime.memory.name(),
+            backend = %crate::agent::diagnostics::text_class(runtime.memory.name()),
             "os-paging: backend does not support document ingest; deferring to legacy compaction"
         );
         return Ok(false);
@@ -292,7 +292,11 @@ pub(super) async fn recall_context_pages(
     if injected == 0 {
         return None;
     }
-    tracing::info!(pages = injected, "os-paging: recalled cold context pages");
+    let injected_count: usize = injected;
+    tracing::info!(
+        injected_pages = injected_count,
+        "os-paging: recalled cold context pages"
+    );
     match paging.retrieval_injection_role {
         crate::config::RetrievalInjectionRole::System => Some(ChatMessage::system(recalled)),
         crate::config::RetrievalInjectionRole::User => Some(ChatMessage::user(recalled)),

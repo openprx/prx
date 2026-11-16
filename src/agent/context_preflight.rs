@@ -3,7 +3,7 @@ use crate::agent::compaction::{
 };
 use crate::agent::context_budget::{
     ContextBudgetSnapshot, PRE_TURN_FLUSH_THRESHOLD, budgeted_request_tool_tokens, budgeted_tokens,
-    estimate_budgeted_request_tokens, plan_context_budget, reserve_request_tool_surface,
+    estimate_budgeted_request_tokens, plan_context_budget, reserve_request_tool_surface, token_source_label,
     trim_history_to_context_budget, trim_history_to_context_budget_preserving_compaction_replacement_with_floor,
 };
 use crate::agent::document_ingest::DocumentIngestRuntime;
@@ -20,7 +20,7 @@ pub(super) async fn preflight_context_budget_before_provider_call(
     config: &crate::config::AgentCompactionConfig,
     tool_surface: crate::agent::turn_context::RequestToolMeasurement,
     audit: Option<&DocumentIngestRuntime>,
-    trigger: &str,
+    trigger: &'static str,
 ) -> Result<ContextBudgetSnapshot> {
     let config = preflight_config(config, tool_surface);
     let mut turn_history = TurnHistory::new(history, None);
@@ -88,10 +88,11 @@ pub(super) async fn preflight_durable_compaction(
     config: &crate::config::AgentCompactionConfig,
     tool_surface: crate::agent::turn_context::RequestToolMeasurement,
     audit: Option<&DocumentIngestRuntime>,
-    trigger: &str,
+    trigger: &'static str,
 ) -> Result<PreflightCompaction> {
     let budget = plan_context_budget(view, config, PRE_TURN_FLUSH_THRESHOLD);
     if budget.over_warning {
+        let token_source: &'static str = token_source_label(budget.measurement_source);
         tracing::info!(
             used_tokens = budget.used_tokens,
             measured_tokens = budget.measured_tokens,
@@ -100,7 +101,7 @@ pub(super) async fn preflight_durable_compaction(
             request_tokens = estimate_budgeted_request_tokens(budget.measurement(), tool_surface),
             warning_threshold = budget.warning_threshold_tokens,
             hard_limit = budget.available_input_tokens,
-            source = ?budget.measurement_source,
+            source = token_source,
             "context budget warning threshold crossed"
         );
     }
@@ -170,7 +171,7 @@ pub(super) async fn preflight_trim_projection(
     config: &crate::config::AgentCompactionConfig,
     compaction: &PreflightCompaction,
     audit: Option<&DocumentIngestRuntime>,
-    trigger: &str,
+    trigger: &'static str,
 ) -> ContextBudgetSnapshot {
     let budget = plan_context_budget(view, config, PRE_TURN_FLUSH_THRESHOLD);
     if !budget.over_hard_limit {
@@ -194,7 +195,7 @@ pub(super) async fn preflight_trim_projection(
     } else {
         RestoredRequestPosition::AboveEverythingLeftStanding
     };
-    let trimmed = turn_history.reshape(view, |view| {
+    let trimmed: bool = turn_history.reshape(view, |view| {
         let current_request = capture_current_turn_request(view);
         let trimmed = if let Some(replacement_len) = replacement_len {
             trim_history_to_context_budget_preserving_compaction_replacement_with_floor(view, config, replacement_len)
@@ -213,7 +214,8 @@ pub(super) async fn preflight_trim_projection(
         mode = ?config.mode,
         "context budget preflight applied token-aware trim"
     );
-    if let Some(reason) = degraded_reason {
+    if let Some(degraded) = degraded_reason {
+        let reason: &'static str = degraded;
         tracing::warn!(
             trigger,
             reason,
@@ -426,7 +428,7 @@ pub(crate) fn capture_current_turn_request_with_source(
 pub(crate) fn restore_current_turn_request(
     history: &mut Vec<ChatMessage>,
     captured: Option<CapturedTurnRequest>,
-    trigger: &str,
+    trigger: &'static str,
     position: RestoredRequestPosition,
 ) -> bool {
     let Some(captured) = captured else {
@@ -440,9 +442,10 @@ pub(crate) fn restore_current_turn_request(
     if survived {
         return false;
     }
+    let restored_at: &'static str = position.as_str();
     tracing::warn!(
         trigger,
-        restored_at = position.as_str(),
+        restored_at,
         "the context budget removed the current turn's request; restoring it over the budget"
     );
     let message = captured.restore_message.unwrap_or(captured.message);

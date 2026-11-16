@@ -95,7 +95,11 @@ where
         MemoryBackendKind::Markdown => Ok(Box::new(MarkdownMemory::new(workspace_dir))),
         MemoryBackendKind::None => Ok(Box::new(NoneMemory::new())),
         MemoryBackendKind::Unknown => {
-            tracing::warn!("Unknown memory backend '{backend_name}'{unknown_context}, falling back to markdown");
+            tracing::warn!(
+                backend = %crate::agent::diagnostics::text_class(backend_name),
+                storage_provider_context_is_empty = unknown_context.is_empty(),
+                "Unknown memory backend, falling back to markdown"
+            );
             Ok(Box::new(MarkdownMemory::new(workspace_dir)))
         }
     }
@@ -254,7 +258,7 @@ fn resolve_embedding_config(
 
     let Some(route) = embedding_routes.iter().find(|route| route.hint.trim() == hint) else {
         tracing::warn!(
-            hint,
+            hint = %crate::agent::diagnostics::text_class(hint),
             "Unknown embedding route hint; falling back to [memory] embedding settings"
         );
         return fallback;
@@ -265,7 +269,7 @@ fn resolve_embedding_config(
     let dimensions = route.dimensions.unwrap_or(config.embedding_dimensions);
     if provider.is_empty() || model.is_empty() || dimensions == 0 {
         tracing::warn!(
-            hint,
+            hint = %crate::agent::diagnostics::text_class(hint),
             "Invalid embedding route configuration; falling back to [memory] embedding settings"
         );
         return fallback;
@@ -335,8 +339,9 @@ fn build_embedder(
     if let Err(refusal) = crate::providers::selection::check_embedder(catalog, &resolved.provider, &resolved.model) {
         tracing::warn!(
             provider = %crate::providers::redact_endpoint_userinfo(&resolved.provider),
-            model = %resolved.model,
-            "embedder refused, memory recall falls back to keywords: {refusal}"
+            model = %crate::providers::redact_endpoint_userinfo(&resolved.model),
+            refusal = %crate::agent::diagnostics::error_class(&refusal),
+            "embedder refused, memory recall falls back to keywords"
         );
         return Box::new(embeddings::NoopEmbedding);
     }
@@ -399,8 +404,8 @@ pub fn dedicated_tool_execution_ledger(workspace_dir: &Path) -> Option<Arc<dyn M
         }
         Err(error) => {
             tracing::error!(
-                path = %path.display(),
-                error = %error,
+                path = %crate::agent::diagnostics::text_class(&path.display().to_string()),
+                error = %crate::agent::diagnostics::error_class(&error),
                 "unable to open the dedicated tool-execution ledger; side-effecting tools will be refused"
             );
             None
@@ -484,7 +489,7 @@ pub fn create_memory_with_storage_and_routes_with_acl(
                 }
             }
             Err(e) => {
-                tracing::warn!("memory hydration failed: {e}");
+                tracing::warn!(error = %crate::agent::diagnostics::error_class(&e), "memory hydration failed");
             }
         }
     }
@@ -577,23 +582,17 @@ pub fn create_memory_with_storage_and_routes_with_acl(
     // runs before the backend, because it restores a missing database.
     // Best-effort memory hygiene/retention pass (throttled by state file).
     if let Err(e) = hygiene::run_if_due(config, workspace_dir) {
-        tracing::warn!(
-            "memory hygiene skipped: {}",
-            crate::security::redaction::redact_secrets(&format!("{e:#}"))
-        );
+        tracing::warn!(error = %crate::agent::diagnostics::error_class(&e), "memory hygiene skipped");
     }
     if matches!(backend_kind, MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid) {
         if let Err(e) = snapshot::export_snapshot(workspace_dir) {
-            tracing::warn!(
-                "memory snapshot skipped: {}",
-                crate::security::redaction::redact_secrets(&format!("{e:#}"))
-            );
+            tracing::warn!(error = %crate::agent::diagnostics::error_class(&e), "memory snapshot skipped");
         }
     }
 
     if matches!(backend_kind, MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid) {
         if let Err(error) = upsert_acl_bootstrap(workspace_dir, identity_bindings, user_policies) {
-            tracing::warn!("memory ACL bootstrap upsert skipped: {error}");
+            tracing::warn!(error = %crate::agent::diagnostics::error_class(&error), "memory ACL bootstrap upsert skipped");
         }
     }
 

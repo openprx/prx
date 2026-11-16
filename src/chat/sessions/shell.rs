@@ -166,7 +166,7 @@ impl ShellSession {
             // a join error means the task panicked or was aborted, which we treat
             // as best-effort (status/`/logs` carry the authoritative outcome).
             if let Err(e) = handle.await {
-                tracing::warn!(error = %e, "shell reaper join failed during kill");
+                tracing::warn!(error = %crate::agent::diagnostics::error_class(&e), "shell reaper join failed during kill");
             }
         }
         Ok(())

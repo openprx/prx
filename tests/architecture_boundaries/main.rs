@@ -19,6 +19,7 @@ mod loop_prompt;
 mod loop_requests;
 mod memory;
 mod panic_policy;
+mod payload_free_logs;
 mod process;
 mod providers;
 mod removed_modules;

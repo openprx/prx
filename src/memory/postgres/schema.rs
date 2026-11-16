@@ -1228,7 +1228,7 @@ impl PostgresMemory {
         match client.batch_execute(&init) {
             Ok(()) => true,
             Err(error) => {
-                tracing::debug!(error = %error, "Postgres pgvector/ANN initialization skipped");
+                tracing::debug!(error = %crate::agent::diagnostics::error_class(&error), "Postgres pgvector/ANN initialization skipped");
                 false
             }
         }

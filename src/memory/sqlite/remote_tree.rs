@@ -78,7 +78,7 @@ impl std::error::Error for RemoteTreeError {}
 
 /// Preserve backend failures as transient/internal failures and retain diagnostics.
 pub(crate) fn storage_error(error: impl std::fmt::Display) -> RemoteTreeError {
-    tracing::warn!(%error, "remote-tree SQLite operation failed");
+    tracing::warn!(error = %crate::agent::diagnostics::error_class(&error), "remote-tree SQLite operation failed");
     RemoteTreeError::Storage
 }
 

@@ -395,7 +395,7 @@ pub(super) fn verify_main_binding(conn: &Connection, events: &[String]) -> anyho
         match outcome {
             Ok(()) => out.verified.push(chain),
             Err((reason, error)) => {
-                tracing::warn!(reason, run_id = %chain.run_id, %error, "recovery receipt left on its unmigrated events");
+                tracing::warn!(reason = %crate::agent::diagnostics::text_class(reason), run_id = %chain.run_id, error = %crate::agent::diagnostics::error_class(&error), "recovery receipt left on its unmigrated events");
                 out.blocked.extend(input.into_iter().chain(terminal));
             }
         }
@@ -458,7 +458,7 @@ impl<'a> FullSync<'a> {
 impl Drop for FullSync<'_> {
     fn drop(&mut self) {
         if let Err(error) = self.0.pragma_update(None, "synchronous", self.1) {
-            tracing::error!(%error, "failed to restore SQLite synchronization");
+            tracing::error!(error = %crate::agent::diagnostics::error_class(&error), "failed to restore SQLite synchronization");
         }
     }
 }

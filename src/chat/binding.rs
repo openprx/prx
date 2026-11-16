@@ -23,7 +23,7 @@ pub(super) fn chat_input_persistence_failure(error: &anyhow::Error) -> anyhow::E
         }
     });
     let detail = crate::security::redaction::redact_provider_text(&format!("{error:#}"));
-    tracing::error!(store = "brain.db", run_id, error = %detail, cause = %cause,
+    tracing::error!(store = "brain.db", run_id, error = %crate::agent::diagnostics::error_class(&detail), cause = %crate::agent::diagnostics::error_class(&cause),
         "chat input persistence failed; restart to retry ingress recovery");
     let identifiers = run_id.map(|run| format!("; run_id={run}")).unwrap_or_default();
     anyhow::anyhow!(

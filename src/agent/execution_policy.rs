@@ -87,7 +87,7 @@ pub(crate) fn runtime_approval_grant_for_call(
     let keyring = match WitnessKeyring::global() {
         Ok(keyring) => keyring,
         Err(error) => {
-            tracing::error!("witness keyring unavailable; cannot issue v2 grant: {error}");
+            tracing::error!(error = %crate::agent::diagnostics::error_class(&error), "witness keyring unavailable; cannot issue v2 grant");
             // Exact ops can still use a precise v1 hash; glob ops cannot, so deny.
             return match op_id_match {
                 OpIdMatch::Exact => Some(ApprovalGrant::for_resource_operation(
@@ -137,7 +137,7 @@ pub(crate) fn runtime_approval_grant_for_call(
     match issue {
         Ok(grant) => Some(grant),
         Err(error) => {
-            tracing::error!(tool = tool_name, "failed to issue v2 approval grant: {error}");
+            tracing::error!(tool = %crate::agent::diagnostics::text_class(tool_name), error = %crate::agent::diagnostics::error_class(&error), "failed to issue v2 approval grant");
             // Exact ops can degrade to a precise v1 hash; glob ops cannot be
             // expressed in v1, so deny rather than wildcard-approve.
             match op_id_match {

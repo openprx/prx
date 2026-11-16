@@ -88,7 +88,9 @@ pub(super) fn spawn_stdin_control_reader(
                                 break;
                             }
                         }
-                        Err(error) => tracing::warn!(%error,"session-worker refused mailbox control frame"),
+                        Err(error) => {
+                            tracing::warn!(error = %crate::agent::diagnostics::error_class(&error),"session-worker refused mailbox control frame")
+                        }
                     }
                 }
                 WorkerControlFrame::BrokerResult { .. } | WorkerControlFrame::BrokerCancelAck { .. } => {

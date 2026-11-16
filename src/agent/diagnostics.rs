@@ -49,6 +49,51 @@ pub(crate) fn error_log_digest(error: &(impl std::fmt::Display + ?Sized)) -> (us
     tool_parse_log_digest(&format!("{error:#}"))
 }
 
+/// The one way production code logs an error or a free-form string: its
+/// type, byte length and SHA-256 prefix, never its text.
+///
+/// Errors from memory, providers, storage and tools can quote what they
+/// refused (a SQLite trigger message, an upstream echo of user or tool
+/// content), and names, paths and keys can be user data, so a log line
+/// carries only this class. `Display` prints `kind=<type> len=<bytes>
+/// sha256=<16 hex>`; the `architecture_boundaries` log scanner accepts a
+/// tracing field built by [`error_class`] or [`text_class`] and rejects any
+/// other way of formatting an error or a string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LogClass {
+    kind: &'static str,
+    len: usize,
+    sha256: String,
+}
+
+impl std::fmt::Display for LogClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "kind={} len={} sha256={}", self.kind, self.len, self.sha256)
+    }
+}
+
+/// [`LogClass`] of an error: its static type name, and the length and digest
+/// of its full display chain ([`error_log_digest`]).
+pub(crate) fn error_class<E: std::fmt::Display + ?Sized>(error: &E) -> LogClass {
+    let (len, sha256) = error_log_digest(error);
+    LogClass {
+        kind: std::any::type_name::<E>(),
+        len,
+        sha256,
+    }
+}
+
+/// [`LogClass`] of free text (a name, a path, a key, a label): kind `text`,
+/// its byte length and digest.
+pub(crate) fn text_class(text: &str) -> LogClass {
+    let (len, sha256) = tool_parse_log_digest(text);
+    LogClass {
+        kind: "text",
+        len,
+        sha256,
+    }
+}
+
 /// Tool arguments for the log: every credential-named value replaced and
 /// every string redacted by the one redactor.
 pub(crate) fn redact_sensitive_json_keys(value: &serde_json::Value) -> serde_json::Value {

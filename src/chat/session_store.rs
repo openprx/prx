@@ -206,7 +206,7 @@ pub(super) async fn project_chat_session_from_message_events(
         Err(error) => {
             tracing::warn!(
                 session_id,
-                error = %error,
+                error = %crate::agent::diagnostics::error_class(&error),
                 "MessageEvent projection unavailable; retaining chat blob compatibility snapshot"
             );
             return ChatMessageEventProjection {

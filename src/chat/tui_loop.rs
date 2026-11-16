@@ -117,11 +117,14 @@ pub(super) fn log_tui_input_event(ev: &crossterm::event::Event) {
     match ev {
         crossterm::event::Event::Key(k) if should_log_tui_key_event(k) => {
             let (key_class, named_key) = crate::chat::tui::key_log_class(&k.code);
+            let key_class: &'static str = key_class;
+            let named_key: Option<&crossterm::event::KeyCode> = named_key;
+            let modifiers: crossterm::event::KeyModifiers = k.modifiers;
             tracing::info!(
                 event_type = "Key",
                 key_class,
                 named_key = ?named_key,
-                modifiers = ?k.modifiers,
+                modifiers = ?modifiers,
                 kind = ?k.kind,
                 "tui_input_event"
             );
@@ -135,12 +138,29 @@ pub(super) fn log_tui_input_event(ev: &crossterm::event::Event) {
                 "tui_input_event"
             );
         }
-        crossterm::event::Event::Resize(w, h) => {
-            tracing::info!(event_type = "Resize", w, h, "tui_input_event");
+        crossterm::event::Event::Resize(cols, rows) => {
+            tracing::info!(event_type = "Resize", cols, rows, "tui_input_event");
         }
         other => {
-            tracing::info!(event_type = "Other", debug = ?other, "tui_input_event");
+            tracing::info!(
+                event_type = "Other",
+                event_kind = input_event_kind(other),
+                "tui_input_event"
+            );
         }
+    }
+}
+
+/// The variant name of a terminal input event that carries no text.
+#[cfg(feature = "terminal-tui")]
+const fn input_event_kind(event: &crossterm::event::Event) -> &'static str {
+    match event {
+        crossterm::event::Event::FocusGained => "focus_gained",
+        crossterm::event::Event::FocusLost => "focus_lost",
+        crossterm::event::Event::Key(_) => "key",
+        crossterm::event::Event::Mouse(_) => "mouse",
+        crossterm::event::Event::Paste(_) => "paste",
+        crossterm::event::Event::Resize(..) => "resize",
     }
 }
 
@@ -339,7 +359,7 @@ pub(super) fn spawn_tui_unified_loop(
                 security,
             );
             if let Err(e) = result {
-                tracing::error!("TUI unified loop error: {e}");
+                tracing::error!(error = %crate::agent::diagnostics::error_class(&e), "TUI unified loop error");
             }
         });
     match thread_result {
@@ -347,7 +367,7 @@ pub(super) fn spawn_tui_unified_loop(
             if let Some(profile) = profile {
                 if let Err(error) = profile.own_reader(reader) {
                     profile.revoke();
-                    tracing::error!(%error,"controlled reader ownership failed");
+                    tracing::error!(error = %crate::agent::diagnostics::error_class(&error),"controlled reader ownership failed");
                 }
             }
         }
@@ -355,7 +375,7 @@ pub(super) fn spawn_tui_unified_loop(
             if let Some(profile) = profile {
                 profile.revoke();
             }
-            tracing::error!(%error,"failed to start TUI render thread");
+            tracing::error!(error = %crate::agent::diagnostics::error_class(&error),"failed to start TUI render thread");
         }
     }
 }
@@ -596,7 +616,7 @@ pub(super) fn run_tui_unified_loop(
         // fullscreen rendering.
         if handoff.take_force_redraw() {
             if let Err(e) = terminal.clear() {
-                tracing::warn!(error = %e, "post-PTY terminal clear failed");
+                tracing::warn!(error = %crate::agent::diagnostics::error_class(&e), "post-PTY terminal clear failed");
             }
             skip_next_draw = false;
             deferred_redraw_requested = true;
@@ -625,7 +645,7 @@ pub(super) fn run_tui_unified_loop(
                     );
                 });
             }) {
-                tracing::warn!(error = %e, "TUI draw failed");
+                tracing::warn!(error = %crate::agent::diagnostics::error_class(&e), "TUI draw failed");
             }
         }
 
@@ -942,7 +962,7 @@ pub(super) fn run_tui_unified_loop(
                         match edit_text_with_external_editor(&initial, resolve_external_editor(), &terminal_mode) {
                             ExternalEditorResult::Edited(text) => {
                                 if let Err(e) = terminal.clear() {
-                                    tracing::warn!(error = %e, "post-editor fullscreen terminal clear failed");
+                                    tracing::warn!(error = %crate::agent::diagnostics::error_class(&e), "post-editor fullscreen terminal clear failed");
                                 }
                                 {
                                     let mut guard = mirror.lock();
@@ -964,7 +984,7 @@ pub(super) fn run_tui_unified_loop(
                             }
                             ExternalEditorResult::Unchanged(reason) => {
                                 if let Err(e) = terminal.clear() {
-                                    tracing::warn!(error = %e, "post-editor fullscreen terminal clear failed");
+                                    tracing::warn!(error = %crate::agent::diagnostics::error_class(&e), "post-editor fullscreen terminal clear failed");
                                 }
                                 surface_session_message(chat_dispatcher, Some(&redraw_tx), &reason);
                             }

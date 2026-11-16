@@ -109,7 +109,7 @@ impl crate::channels::terminal::TuiMirrorSink for SnapshotDispatcherSink {
         // UiActor side path.
         tracing::trace!(
             site = "snapshot_sink.push_tool_started",
-            tool = tool_name,
+            tool = %crate::agent::diagnostics::text_class(tool_name),
             args_len = args_full.chars().count(),
             "Pure mode ignores the UiActor side path (driver already dispatched ToolStarted)"
         );
@@ -121,7 +121,7 @@ impl crate::channels::terminal::TuiMirrorSink for SnapshotDispatcherSink {
         // UiActor no longer relies on this return value for a fallback (real path).
         tracing::trace!(
             site = "snapshot_sink.mark_tool_finished",
-            tool = tool_name,
+            tool = %crate::agent::diagnostics::text_class(tool_name),
             success,
             duration_ms,
             "Pure mode ignores the UiActor side path (driver already dispatched ToolFinished)"

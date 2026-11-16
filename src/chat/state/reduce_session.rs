@@ -134,7 +134,8 @@ impl ChatState {
         &mut self,
         admission: Option<crate::chat::action::AdmissionId>,
     ) -> Vec<Effect> {
-        let request_removed = admission.is_some_and(|admission| self.rollback_open_admission(Some(admission)));
+        let request_removed: bool = admission.is_some_and(|admission| self.rollback_open_admission(Some(admission)));
+        let admission_id: Option<u64> = admission.map(crate::chat::action::AdmissionId::get);
         if request_removed {
             self.ui.turn_count = self.session.turns.len();
         }
@@ -143,7 +144,7 @@ impl ChatState {
                 level: tracing::Level::DEBUG,
                 msg: format!(
                     "TurnAbortSettled admission={:?} request_removed={request_removed} turns={}",
-                    admission.map(crate::chat::action::AdmissionId::get),
+                    admission_id,
                     self.session.turns.len()
                 ),
             },
@@ -218,13 +219,14 @@ impl ChatState {
         if self.session.id.is_empty() {
             self.session.id = id.clone();
         }
+        let saved_label: &'static str = if self.session.id == id {
+            "Session saved"
+        } else {
+            "Inactive session save acknowledged"
+        };
         vec![Effect::LogTrace {
             level: tracing::Level::INFO,
-            msg: if self.session.id == id {
-                format!("Session saved: {id}")
-            } else {
-                format!("Inactive session save acknowledged: {id}")
-            },
+            msg: format!("{saved_label}: {id}"),
         }]
     }
 
@@ -501,7 +503,8 @@ impl ChatState {
                 Effect::LogTrace {
                     level: tracing::Level::WARN,
                     msg: format!(
-                        "HistoryCompactionPatch rejected reason={reason:?}; {error}; history unchanged len={}",
+                        "HistoryCompactionPatch rejected reason={reason:?} error={}; history unchanged len={}",
+                        crate::agent::diagnostics::error_class(&error),
                         history.len()
                     ),
                 },
@@ -552,13 +555,13 @@ impl ChatState {
         self.ui.conversation_generation = self.ui.conversation_generation.saturating_add(1);
         self.ui.turn_count = self.session.turns.len();
 
+        let range_start_index: usize = patch.range_start();
+        let range_end_index: usize = patch.range_end();
         vec![
             Effect::LogTrace {
                 level: tracing::Level::INFO,
                 msg: format!(
-                    "HistoryCompactionPatchApplied reason={reason:?} start={} end={} replacement={} append_after={} over_hard_limit={} len={}",
-                    patch.range_start(),
-                    patch.range_end(),
+                    "HistoryCompactionPatchApplied reason={reason:?} start={range_start_index} end={range_end_index} replacement={} append_after={} over_hard_limit={} len={}",
                     patch.replacement.len(),
                     patch.append_after.len(),
                     budget.over_hard_limit,

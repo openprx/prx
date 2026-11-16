@@ -102,7 +102,7 @@ impl AnswerLineSource for ControllingTerminal {
             // The chat input thread owns the terminal stdin; take its next line.
             drop(tty);
             let Some(mut claimed) = crate::channels::terminal::prompt_line::claim_next_line() else {
-                tracing::warn!(tool, "terminal approval prompt already active; denying");
+                tracing::warn!(tool = %crate::agent::diagnostics::text_class(tool), "terminal approval prompt already active; denying");
                 return AnswerRead::Unavailable;
             };
             wait_for_answer(claimed.line(), still_waiting).await
@@ -114,7 +114,7 @@ impl AnswerLineSource for ControllingTerminal {
                     answer
                 }
                 Err(error) => {
-                    tracing::warn!(tool, %error, "terminal approval reader unavailable; denying");
+                    tracing::warn!(tool = %crate::agent::diagnostics::text_class(tool), error = %crate::agent::diagnostics::error_class(&error), "terminal approval reader unavailable; denying");
                     return AnswerRead::Unavailable;
                 }
             }
@@ -155,7 +155,7 @@ pub(crate) async fn prompt_from(
         AnswerRead::Unavailable | AnswerRead::Line(None) => TerminalApproval::Deny,
         AnswerRead::Line(Some(line)) => TerminalApproval::parse(&line),
         AnswerRead::Abandoned => {
-            tracing::info!(tool, "terminal approval abandoned: the approval is no longer pending");
+            tracing::info!(tool = %crate::agent::diagnostics::text_class(tool), "terminal approval abandoned: the approval is no longer pending");
             TerminalApproval::Deny
         }
     }
@@ -184,13 +184,13 @@ where
 
 fn override_decision(tool: &str, error: &std::io::Error) -> TerminalApproval {
     let raw = std::env::var("OPENPRX_APPROVAL_OVERRIDE").ok();
-    let approved = crate::chat::dispatcher::resolve_supervised_approval_override(raw.as_deref());
+    let approved: bool = crate::chat::dispatcher::resolve_supervised_approval_override(raw.as_deref());
     if raw.is_none() {
-        tracing::warn!(tool, %error, "no controlling terminal and no approval override; denying");
+        tracing::warn!(tool = %crate::agent::diagnostics::text_class(tool), error = %crate::agent::diagnostics::error_class(&error), "no controlling terminal and no approval override; denying");
     } else {
         tracing::info!(
             security_event = "openprx_approval_override_applied",
-            tool,
+            tool = %crate::agent::diagnostics::text_class(tool),
             approved,
             "no controlling terminal; OPENPRX_APPROVAL_OVERRIDE applied"
         );

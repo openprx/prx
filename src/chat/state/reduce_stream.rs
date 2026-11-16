@@ -450,7 +450,7 @@ impl ChatState {
                 u64::try_from(elapsed).unwrap_or(u64::MAX)
             });
         }
-        let orphan_user_removed = no_visible_drafts && self.rollback_open_admission(None);
+        let orphan_user_removed: bool = no_visible_drafts && self.rollback_open_admission(None);
         self.finalize_pending_tool_cards(tool_key, false, Some("turn failed before tool finish event"));
         if no_visible_drafts && !self.control.has_task_turn_cancels() {
             self.control.active_cancel = None;

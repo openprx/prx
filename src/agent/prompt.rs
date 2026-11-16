@@ -103,7 +103,7 @@ impl SystemPromptBuilder {
             target: "openprx::prompt",
             prompt_sha256 = %compiled.sha256,
             prompt_chars = compiled.chars,
-            sections = ?compiled.sections,
+            sections_count = compiled.sections.len(),
             "compiled canonical system prompt"
         );
         Ok(compiled.content)
@@ -139,7 +139,7 @@ impl PromptSection for IdentitySection {
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        tracing::warn!(%error, "failed to load AIEOS identity; using OpenClaw format");
+                        tracing::warn!(error = %crate::agent::diagnostics::error_class(&error), "failed to load AIEOS identity; using OpenClaw format");
                     }
                 }
             }

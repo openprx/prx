@@ -598,7 +598,7 @@ impl Memory for PostgresMemory {
                         let embedding = vector::bytes_to_vec(&embedding_blob);
                         if embedding.len() != embedding_dimensions {
                             tracing::debug!(
-                                memory_id = %row.get::<_, String>(0),
+                                memory_id = %crate::agent::diagnostics::text_class(&row.get::<_, String>(0)),
                                 expected_dimensions = embedding_dimensions,
                                 actual_dimensions = embedding.len(),
                                 "Skipping stale Postgres memory embedding with mismatched dimensions"
@@ -3423,7 +3423,7 @@ impl Memory for PostgresMemory {
                         let embedding = vector::bytes_to_vec(&embedding_blob);
                         if embedding.len() != embedding_dimensions {
                             tracing::debug!(
-                                chunk_id = %row.get::<_, String>(1),
+                                chunk_id = %crate::agent::diagnostics::text_class(&row.get::<_, String>(1)),
                                 expected_dimensions = embedding_dimensions,
                                 actual_dimensions = embedding.len(),
                                 "Skipping stale Postgres document chunk embedding with mismatched dimensions"

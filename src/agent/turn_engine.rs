@@ -1138,6 +1138,7 @@ async fn run_turn_unguarded(
             let native_tool_tokens = budgeted_tokens(tool_surface.native_payload.measurement);
             let instruction_tokens = budgeted_tokens(tool_surface.instructions);
             let request_tokens = estimate_request_tokens(messages_measurement, tool_surface.native_payload.measurement);
+            let token_source: &'static str = token_source_label(messages_measurement.source);
             tracing::debug!(
                 target: "openprx::prompt",
                 system_prompt_sha256 = system_prompt_sha256.as_deref().unwrap_or("none"),
@@ -1155,7 +1156,7 @@ async fn run_turn_unguarded(
                 budgeted_messages_tokens,
                 budgeted_request_tokens,
                 request_tokens,
-                token_source = token_source_label(messages_measurement.source),
+                token_source,
                 "final request system prompt compiled"
             );
             // Compilation is completed work, including a cold tokenizer or a
@@ -1746,7 +1747,7 @@ async fn run_turn_unguarded(
                 }
                 tracing::warn!(
                     provider = %crate::providers::redact_endpoint_userinfo(provider_name),
-                    model,
+                    model = %crate::providers::redact_endpoint_userinfo(model),
                     "model returned a tool-summary-only response; retrying once with a corrective instruction"
                 );
                 tool_summary_retry_attempted = true;
@@ -1759,7 +1760,7 @@ async fn run_turn_unguarded(
                 }
                 tracing::warn!(
                     provider = %crate::providers::redact_endpoint_userinfo(provider_name),
-                    model,
+                    model = %crate::providers::redact_endpoint_userinfo(model),
                     "model returned empty assistant response; retrying once with a corrective instruction"
                 );
                 empty_response_retry_attempted = true;
@@ -1776,7 +1777,7 @@ async fn run_turn_unguarded(
             if fabricated_marker && !executed_any_tool_call && !tool_summary_retry_attempted {
                 tracing::warn!(
                     provider = %crate::providers::redact_endpoint_userinfo(provider_name),
-                    model,
+                    model = %crate::providers::redact_endpoint_userinfo(model),
                     "model claimed tool use without executing any tool; retrying once with a corrective instruction"
                 );
                 tool_summary_retry_attempted = true;
@@ -2318,9 +2319,13 @@ async fn report_durable_compaction(
 /// Logs a refused overflow compaction patch with lengths and range only.
 fn warn_overflow_patch_refused(error: &crate::agent::turn_contracts::CompactionPatchError) {
     match error {
-        crate::agent::turn_contracts::CompactionPatchError::RangeOutOfBounds { start, end, len } => tracing::warn!(
-            range_start = *start,
-            range_end = *end,
+        crate::agent::turn_contracts::CompactionPatchError::RangeOutOfBounds {
+            start: range_start_index,
+            end: range_end_index,
+            len,
+        } => tracing::warn!(
+            range_start_index = *range_start_index,
+            range_end_index = *range_end_index,
             history_len = *len,
             "overflow compaction patch range out of bounds; trimming without a handoff"
         ),

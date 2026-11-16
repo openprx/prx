@@ -421,7 +421,7 @@ pub(super) async fn build_chat_compaction_patch(
     model: &str,
     config: &crate::config::AgentCompactionConfig,
     audit: Option<&DocumentIngestRuntime>,
-    trigger: &str,
+    trigger: &'static str,
 ) -> Option<crate::agent::turn_contracts::CompactionPatch> {
     match build_configurable_compaction_patch_with_source_history(
         budget_history,
@@ -469,10 +469,12 @@ pub(super) async fn apply_chat_compaction_patch_and_sync(
 ) -> ManualCompactOutcome {
     let mut compacted = source_history.to_vec();
     if let Err(error) = apply_compaction_patch_exact(&mut compacted, &patch) {
+        let range_start_index: usize = patch.range_start();
+        let range_end_index: usize = patch.range_end();
         tracing::warn!(
             guard_history_len = patch.guard.history_len,
-            range_start = patch.range_start(),
-            range_end = patch.range_end(),
+            range_start_index,
+            range_end_index,
             source_len = source_history.len(),
             "chat compaction patch does not describe its source; nothing was changed"
         );
@@ -658,7 +660,7 @@ pub(super) async fn persist_legacy_chat_compaction_audit(
     source_history: &[ChatMessage],
     summary_projection: &[ChatMessage],
     token_metadata: LegacyCompactionTokenMetadata,
-    trigger: &str,
+    trigger: &'static str,
 ) {
     if source_history.is_empty() {
         return;

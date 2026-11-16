@@ -219,7 +219,7 @@ impl ChatState {
     pub(super) fn reduce_input_submitted(&mut self, text: String) -> Vec<Effect> {
         self.ui.slash_menu = None;
         self.ui.turn_count = self.ui.turn_count.saturating_add(1);
-        let log_msg = format!("input_submitted len={}", text.chars().count());
+        let input_len = text.chars().count();
         self.ui.last_submitted = Some(text);
         self.ui.input.clear();
         // Legacy main-turn entry only clears the Primary tool bucket; keyed
@@ -228,7 +228,7 @@ impl ChatState {
         vec![
             Effect::LogTrace {
                 level: tracing::Level::DEBUG,
-                msg: log_msg,
+                msg: format!("input_submitted len={input_len}"),
             },
             Effect::RequestRedraw,
         ]

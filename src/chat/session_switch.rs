@@ -331,7 +331,7 @@ pub(super) async fn apply_chat_session_switch(
     };
     ctx.chat_session.adopt(acked);
     let loaded = ctx.chat_session.session();
-    let cleared_approvals = clear_pending_approvals_for_session_switch(&mut ctx);
+    let cleared_approvals: usize = clear_pending_approvals_for_session_switch(&mut ctx);
     if cleared_approvals > 0 {
         tracing::warn!(
             cleared_approvals,

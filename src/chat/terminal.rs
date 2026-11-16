@@ -214,7 +214,7 @@ pub(super) fn enter_terminal_state_with_ops_inner(
         }
         Ok(false) => {}
         Err(e) => {
-            tracing::debug!(error = %e, "terminal keyboard enhancement probe failed; skipping");
+            tracing::debug!(error = %crate::agent::diagnostics::error_class(&e), "terminal keyboard enhancement probe failed; skipping");
         }
     }
 

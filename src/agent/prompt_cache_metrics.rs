@@ -175,12 +175,13 @@ pub(crate) fn record_round_trip(round: RoundTrip<'_>) {
     let provider = crate::security::redaction::redact_provider_text(round.provider);
     let model = crate::security::redaction::redact_provider_text(round.model);
     let (system_prefix_changed, tools_prefix_changed) = METRICS.lock().record(&round, &provider, &model);
-    tracing::debug!(target: "openprx::prompt_cache", provider, model,
+    let usage_reported: bool = round.usage.source == TokenUsageSource::Reported;
+    tracing::debug!(target: "openprx::prompt_cache", provider = %crate::agent::diagnostics::text_class(&provider), model = %crate::agent::diagnostics::text_class(&model),
         system_prompt_sha256 = round.system_prompt_sha256, tools_sha256 = round.tools_sha256,
         prompt_tokens = round.usage.prompt_tokens,
         cache_read_input_tokens = round.usage.cache_read_input_tokens,
         cache_creation_input_tokens = round.usage.cache_creation_input_tokens,
-        usage_source = ?round.usage.source, system_prefix_changed, tools_prefix_changed);
+        usage_reported, system_prefix_changed, tools_prefix_changed);
 }
 
 pub(crate) fn snapshot() -> BTreeMap<String, PromptCacheStats> {

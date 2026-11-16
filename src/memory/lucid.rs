@@ -259,8 +259,8 @@ impl LucidMemory {
         let args = self.build_store_args(key, content, category);
         if let Err(error) = self.run_lucid_command(&args, self.store_timeout).await {
             tracing::debug!(
-                command = %self.lucid_cmd,
-                error = %error,
+                command = %crate::agent::diagnostics::text_class(&self.lucid_cmd),
+                error = %crate::agent::diagnostics::error_class(&error),
                 "Lucid store sync failed; sqlite remains authoritative"
             );
         }
@@ -393,8 +393,8 @@ impl Memory for LucidMemory {
             Err(error) => {
                 self.mark_failure_now();
                 tracing::debug!(
-                    command = %self.lucid_cmd,
-                    error = %error,
+                    command = %crate::agent::diagnostics::text_class(&self.lucid_cmd),
+                    error = %crate::agent::diagnostics::error_class(&error),
                     "Lucid context unavailable; using local sqlite results"
                 );
                 Ok(local_results)

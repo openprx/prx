@@ -807,7 +807,7 @@ async fn attach_compaction_event_provenance(
 
 async fn persist_context_switch(
     audit: &DocumentIngestRuntime,
-    trigger: &str,
+    trigger: &'static str,
     source: &CompactionAuditSource,
     handoff_event_id: &str,
     handoff_message: &str,
@@ -871,8 +871,8 @@ async fn persist_context_switch(
 /// of only being logged.
 pub(crate) async fn persist_context_switch_degradation(
     audit: Option<&DocumentIngestRuntime>,
-    trigger: &str,
-    reason: &str,
+    trigger: &'static str,
+    reason: &'static str,
     before_tokens: usize,
     after_tokens: usize,
     hard_limit: usize,
@@ -961,7 +961,7 @@ pub(crate) async fn persist_context_switch_degradation(
 
 async fn persist_compaction_audit(
     audit: Option<&DocumentIngestRuntime>,
-    trigger: &str,
+    trigger: &'static str,
     mode: &crate::config::AgentCompactionMode,
     source: Option<&CompactionAuditSource>,
     summary: &str,
@@ -1149,7 +1149,7 @@ enum CompactionDemand {
 }
 
 impl CompactionDemand {
-    fn from_trigger(trigger: &str) -> Self {
+    fn from_trigger(trigger: &'static str) -> Self {
         if trigger == MANUAL_COMPACT_TRIGGER {
             Self::Manual
         } else if trigger.contains("overflow") {
@@ -1170,7 +1170,7 @@ pub(crate) async fn build_configurable_compaction_patch(
     model: &str,
     config: &crate::config::AgentCompactionConfig,
     audit: Option<&DocumentIngestRuntime>,
-    trigger: &str,
+    trigger: &'static str,
 ) -> Result<Option<CompactionPatch>> {
     build_configurable_compaction_patch_with_source_history(history, history, provider, model, config, audit, trigger)
         .await
@@ -1183,7 +1183,7 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
     model: &str,
     config: &crate::config::AgentCompactionConfig,
     audit: Option<&DocumentIngestRuntime>,
-    trigger: &str,
+    trigger: &'static str,
 ) -> Result<Option<CompactionPatch>> {
     let Some(limit) = compaction_trigger_limit(config) else {
         return Ok(None);
@@ -1475,7 +1475,7 @@ pub(super) async fn apply_configurable_compaction_with_replacement_len(
     model: &str,
     config: &crate::config::AgentCompactionConfig,
     audit: Option<&DocumentIngestRuntime>,
-    trigger: &str,
+    trigger: &'static str,
 ) -> Result<Option<usize>> {
     let Some(patch) = build_configurable_compaction_patch(history, provider, model, config, audit, trigger).await?
     else {
@@ -1495,7 +1495,7 @@ pub(super) async fn apply_configurable_compaction(
     model: &str,
     config: &crate::config::AgentCompactionConfig,
     audit: Option<&DocumentIngestRuntime>,
-    trigger: &str,
+    trigger: &'static str,
 ) -> Result<bool> {
     Ok(
         apply_configurable_compaction_with_replacement_len(history, provider, model, config, audit, trigger)

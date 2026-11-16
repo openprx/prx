@@ -4,6 +4,7 @@ use super::{ChatState, Effect, ToolInvocationKey, ToolTaskKey};
 
 /// What a cancel reports when it reaches a turn whose reply was already
 /// produced and is being committed.
+#[cfg(feature = "terminal-tui")]
 const TURN_ALREADY_FINISHED_NOTICE: &str =
     "Cancel not applied: the turn had already finished and its reply is being saved.";
 
@@ -222,7 +223,10 @@ impl ChatState {
             Effect::RequestRedraw,
             Effect::LogTrace {
                 level: tracing::Level::DEBUG,
-                msg: format!("tool_finished name={name} success={success} duration_ms={duration_ms}"),
+                msg: format!(
+                    "tool_finished name_len={} success={success} duration_ms={duration_ms}",
+                    name.len()
+                ),
             },
         ]
     }
@@ -261,7 +265,10 @@ impl ChatState {
             Effect::RequestRedraw,
             Effect::LogTrace {
                 level: tracing::Level::DEBUG,
-                msg: format!("tool_finished name={name} success={success} duration_ms={duration_ms}"),
+                msg: format!(
+                    "tool_finished name_len={} success={success} duration_ms={duration_ms}",
+                    name.len()
+                ),
             },
         ]
     }
@@ -309,7 +316,7 @@ impl ChatState {
         vec![
             Effect::LogTrace {
                 level: tracing::Level::DEBUG,
-                msg: format!("tool_approval_requested tool_id={tool_id} name={name}"),
+                msg: format!("tool_approval_requested tool_id={tool_id} name_len={}", name.len()),
             },
             Effect::RequestApproval {
                 task_id,
@@ -537,7 +544,7 @@ fn cancel_after_ready_for_commit(draft_id: &str) -> Vec<Effect> {
     vec![
         Effect::LogTrace {
             level: tracing::Level::INFO,
-            msg: format!("cancel_after_ready_for_commit draft_id={draft_id}: {TURN_ALREADY_FINISHED_NOTICE}"),
+            msg: format!("cancel_after_ready_for_commit draft_id={draft_id}: turn already finished"),
         },
         Effect::RequestRedraw,
     ]

@@ -326,7 +326,7 @@ impl PostgresMemory {
             Ok(())
         });
         if let Err(error) = outcome {
-            tracing::debug!(error = %error, "Postgres access-audit log write failed (best-effort)");
+            tracing::debug!(error = %crate::agent::diagnostics::error_class(&error), "Postgres access-audit log write failed (best-effort)");
         }
     }
 
@@ -354,7 +354,7 @@ impl PostgresMemory {
         })
         .await;
         if let Err(error) = outcome {
-            tracing::debug!(error = %error, "Postgres access-audit task failed (best-effort)");
+            tracing::debug!(error = %crate::agent::diagnostics::error_class(&error), "Postgres access-audit task failed (best-effort)");
         }
     }
 
@@ -440,11 +440,11 @@ impl PostgresMemory {
         let lookup = match resolved {
             Ok(Ok(value)) => value,
             Ok(Err(error)) => {
-                tracing::debug!(error = %error, "Postgres principal resolution query failed; using anonymous");
+                tracing::debug!(error = %crate::agent::diagnostics::error_class(&error), "Postgres principal resolution query failed; using anonymous");
                 None
             }
             Err(join_error) => {
-                tracing::debug!(error = %join_error, "Postgres principal resolution task panicked; using anonymous");
+                tracing::debug!(error = %crate::agent::diagnostics::error_class(&join_error), "Postgres principal resolution task panicked; using anonymous");
                 None
             }
         };

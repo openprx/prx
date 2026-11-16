@@ -314,7 +314,7 @@ impl SqliteMemory {
                     let topic_id = match resolve_topic(&tx, &content, &principal, bound_scope.as_deref()) {
                         Ok(topic_id) => topic_id,
                         Err(error) => {
-                            tracing::warn!("memory topic resolve failed: {error}");
+                            tracing::warn!(error = %crate::agent::diagnostics::error_class(&error), "memory topic resolve failed");
                             None
                         }
                     };
@@ -1134,7 +1134,7 @@ impl SqliteMemory {
             let keyword_results = match Self::fts5_search(&conn, &query, limit * 2) {
                 Ok(results) => results,
                 Err(e) => {
-                    tracing::warn!("FTS5 search failed (returning empty): {e}");
+                    tracing::warn!(error = %crate::agent::diagnostics::error_class(&e), "FTS5 search failed (returning empty)");
                     Vec::new()
                 }
             };
@@ -1154,7 +1154,7 @@ impl SqliteMemory {
                 ) {
                     Ok(results) => results,
                     Err(e) => {
-                        tracing::warn!("Vector search failed (returning empty): {e}");
+                        tracing::warn!(error = %crate::agent::diagnostics::error_class(&e), "Vector search failed (returning empty)");
                         Vec::new()
                     }
                 }

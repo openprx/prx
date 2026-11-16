@@ -63,6 +63,18 @@ pub enum HistoryCommitDecision {
     },
 }
 
+impl HistoryCommitDecision {
+    /// The decision's variant name for the log; its summary is session text
+    /// and is never logged.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Commit { .. } => "commit",
+            Self::Skip { .. } => "skip",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HistoryCommitError {
     DuplicateTask(TurnTaskId),
@@ -79,6 +91,14 @@ pub enum HistoryCommitError {
         expected: usize,
         actual: usize,
     },
+}
+
+/// The typed fields only (ids, states, counts); used by the payload-free log
+/// class, never shown to the user as prose.
+impl std::fmt::Display for HistoryCommitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self, f)
+    }
 }
 
 #[derive(Debug, Default)]

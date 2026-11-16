@@ -220,8 +220,8 @@ pub(super) async fn persist_tool_output_document(
     // compaction instead of emitting a fail-fast error on every large tool output.
     if !runtime.memory.supports_document_ingest() {
         tracing::debug!(
-            tool = %tool_name,
-            backend = runtime.memory.name(),
+            tool = %crate::agent::diagnostics::text_class(tool_name),
+            backend = %crate::agent::diagnostics::text_class(runtime.memory.name()),
             "memory backend does not support document ingest; skipping tool output persistence (status=backend_not_supported)"
         );
         return Some("backend_not_supported");
@@ -257,7 +257,7 @@ pub(super) async fn persist_tool_output_document(
         Ok(document) => {
             tracing::info!(
                 document_id = %document.document_id,
-                tool = %tool_name,
+                tool = %crate::agent::diagnostics::text_class(tool_name),
                 chunks = document.chunk_count,
                 "Persisted oversized tool output into document store"
             );
@@ -266,8 +266,8 @@ pub(super) async fn persist_tool_output_document(
         Err(error) => {
             tracing::warn!(
                 document_id = %document_id,
-                tool = %tool_name,
-                error = %error,
+                tool = %crate::agent::diagnostics::text_class(tool_name),
+                error = %crate::agent::diagnostics::error_class(&error),
                 "Failed to persist oversized tool output into document store"
             );
             Some("document_ingest_failed")
@@ -331,8 +331,8 @@ pub(super) async fn persist_untrusted_external_copy(
     };
     if !runtime.memory.supports_document_ingest() {
         tracing::debug!(
-            tool = %tool_name,
-            backend = runtime.memory.name(),
+            tool = %crate::agent::diagnostics::text_class(tool_name),
+            backend = %crate::agent::diagnostics::text_class(runtime.memory.name()),
             "memory backend does not support document ingest; skipping untrusted external copy"
         );
         return;
@@ -375,7 +375,7 @@ pub(super) async fn persist_untrusted_external_copy(
         Ok(document) => {
             tracing::info!(
                 document_id = %document.document_id,
-                tool = %tool_name,
+                tool = %crate::agent::diagnostics::text_class(tool_name),
                 chunks = document.chunk_count,
                 "Persisted read-only untrusted external content copy"
             );
@@ -383,8 +383,8 @@ pub(super) async fn persist_untrusted_external_copy(
         Err(error) => {
             tracing::warn!(
                 document_id = %document_id,
-                tool = %tool_name,
-                error = %error,
+                tool = %crate::agent::diagnostics::text_class(tool_name),
+                error = %crate::agent::diagnostics::error_class(&error),
                 "Failed to persist untrusted external content copy (non-fatal)"
             );
         }

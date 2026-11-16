@@ -226,7 +226,7 @@ impl SuspendingApprovalResolver {
             tracing::warn!(
                 run_id = %self.run_id,
                 session_id = %self.session_id,
-                error = %error,
+                error = %crate::agent::diagnostics::error_class(&error),
                 "failed to enqueue NeedsInput banner"
             );
         }
@@ -347,7 +347,7 @@ impl ApprovalResolver for SuspendingApprovalResolver {
             return ApprovalDecision::Deny;
         }
 
-        tracing::info!(run_id = %self.run_id, tool = %request.tool_name, "background sub-agent suspended awaiting approval");
+        tracing::info!(run_id = %self.run_id, tool = %crate::agent::diagnostics::text_class(&request.tool_name), "background sub-agent suspended awaiting approval");
 
         // 4. Await the operator decision, bounded by the approval timeout. A
         //    timeout or a dropped sender (kill/teardown) is treated as a safe

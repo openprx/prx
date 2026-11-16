@@ -139,7 +139,7 @@ async fn child_hit_admitted(mem: &dyn Memory, gate: &ChildRecallGate<'_>, source
         Ok(Some(event)) => child_event_visible(&event, gate.task_id),
         Ok(None) => false,
         Err(error) => {
-            tracing::debug!(error = %error, "child recall dropped a hit whose source event did not resolve");
+            tracing::debug!(error = %crate::agent::diagnostics::error_class(&error), "child recall dropped a hit whose source event did not resolve");
             false
         }
     }
@@ -734,14 +734,14 @@ async fn append_document_retrieval_trace(
     let selected_json = match serde_json::to_string(selected) {
         Ok(value) => Some(value),
         Err(error) => {
-            tracing::debug!(error = %error, "failed to serialize selected document retrieval trace items");
+            tracing::debug!(error = %crate::agent::diagnostics::error_class(&error), "failed to serialize selected document retrieval trace items");
             None
         }
     };
     let dropped_json = match serde_json::to_string(dropped) {
         Ok(value) => Some(value),
         Err(error) => {
-            tracing::debug!(error = %error, "failed to serialize dropped document retrieval trace items");
+            tracing::debug!(error = %crate::agent::diagnostics::error_class(&error), "failed to serialize dropped document retrieval trace items");
             None
         }
     };
@@ -774,7 +774,7 @@ async fn append_document_retrieval_trace(
         })
         .await
     {
-        tracing::debug!(error = %error, "failed to append document retrieval trace");
+        tracing::debug!(error = %crate::agent::diagnostics::error_class(&error), "failed to append document retrieval trace");
     }
 }
 
@@ -946,7 +946,7 @@ pub(crate) async fn increment_recalled_useful_counts(mem: &dyn Memory, recalled_
     let unique_ids: BTreeSet<&str> = recalled_ids.iter().map(String::as_str).collect();
     for id in unique_ids {
         if let Err(error) = mem.increment_useful_count(id).await {
-            tracing::debug!(memory_id = id, error = %error, "failed to increment useful_count");
+            tracing::debug!(memory_id = id, error = %crate::agent::diagnostics::error_class(&error), "failed to increment useful_count");
         }
     }
 }

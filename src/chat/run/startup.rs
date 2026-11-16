@@ -29,7 +29,7 @@ pub(super) fn chat_tracing_guard() -> Option<TracingChatGuard> {
     match ensure_chat_tracing_to_file() {
         Ok(g) => g,
         Err(e) => {
-            tracing::warn!(error = %e, "P3-1: keeping tracing on stderr (chat.log unavailable)");
+            tracing::warn!(error = %crate::agent::diagnostics::error_class(&e), "P3-1: keeping tracing on stderr (chat.log unavailable)");
             None
         }
     }
@@ -232,7 +232,7 @@ pub(in crate::chat) async fn resume_session(
                 .await
             {
                 Ok(Some(s)) => {
-                    info!(id = %s.id, title_len = s.title.chars().count(), turns = s.turn_count(), "Resumed session");
+                    info!(id = %s.id, title_len = s.title.chars().count(), turns_count = s.turn_count(), "Resumed session");
                     s
                 }
                 Ok(None) if strict => anyhow::bail!("no saved chat session to continue"),
@@ -252,7 +252,7 @@ pub(in crate::chat) async fn resume_session(
                 .await
             {
                 Ok(Some(s)) => {
-                    info!(id = %s.id, title_len = s.title.chars().count(), turns = s.turn_count(), "Resumed session");
+                    info!(id = %s.id, title_len = s.title.chars().count(), turns_count = s.turn_count(), "Resumed session");
                     s
                 }
                 Ok(None) if strict => anyhow::bail!("session '{id}' not found"),
@@ -339,7 +339,7 @@ pub(super) async fn initial_tui_mirror(
             .map(|session| crate::chat::session::SavedSessionPickerEntry::from_session(session, &chat_session.id))
             .collect::<Vec<_>>(),
         Err(e) => {
-            tracing::warn!(error = %e, "failed to load saved chat sessions for TUI slash-menu cache");
+            tracing::warn!(error = %crate::agent::diagnostics::error_class(&e), "failed to load saved chat sessions for TUI slash-menu cache");
             Vec::new()
         }
     };
@@ -562,10 +562,10 @@ pub(super) async fn terminal_input(
                 if let Some(producer) = producer.take() {
                     producer.profile().revoke();
                     shutdown.cancel();
-                    tracing::error!("controlled terminal reader unavailable: {e}");
+                    tracing::error!(error = %crate::agent::diagnostics::error_class(&e), "controlled terminal reader unavailable");
                     return (None, None);
                 }
-                tracing::warn!(error = %e, "TerminalGuard::enter failed; falling back to reedline input");
+                tracing::warn!(error = %crate::agent::diagnostics::error_class(&e), "TerminalGuard::enter failed; falling back to reedline input");
                 // On guard failure the banner has not been printed yet
                 // and we are about to use the legacy non-TUI path, so
                 // print it the old way.
@@ -720,7 +720,7 @@ pub(super) fn sigterm_handler(shutdown: &CancellationToken, chat_dispatcher: &di
                 });
             }
             Err(e) => {
-                tracing::warn!("Failed to register SIGTERM handler: {e}");
+                tracing::warn!(error = %crate::agent::diagnostics::error_class(&e), "Failed to register SIGTERM handler");
             }
         }
     }
@@ -750,7 +750,7 @@ pub(super) async fn finish_chat_session(
             effects = stats.effects_seen,
             "redux dispatcher shutdown clean"
         ),
-        Err(e) => tracing::warn!(error = %e, "redux dispatcher join failed"),
+        Err(e) => tracing::warn!(error = %crate::agent::diagnostics::error_class(&e), "redux dispatcher join failed"),
     }
 
     // Restore terminal state after the TUI loop has observed shutdown, so no

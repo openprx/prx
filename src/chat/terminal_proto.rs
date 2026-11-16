@@ -294,7 +294,7 @@ fn display_image_iterm2(data: &[u8], name: &str) -> io::Result<()> {
 /// Works in terminals that support OSC 52 (xterm, kitty, iTerm2, WezTerm, etc.).
 pub fn copy_to_clipboard(text: &str) -> io::Result<()> {
     if let Err(error) = copy_to_tmux_buffer(text) {
-        tracing::debug!(%error, "tmux clipboard handoff failed; falling back to OSC 52");
+        tracing::debug!(error = %crate::agent::diagnostics::error_class(&error), "tmux clipboard handoff failed; falling back to OSC 52");
     }
     let mut stdout = io::stdout().lock();
     write!(stdout, "{}", osc52_clipboard_sequence(text))?;

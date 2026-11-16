@@ -2399,7 +2399,7 @@ Retry with a compatible model: /provider {shown} <model>",
                                         }
                                         Err(e) => {
                                             tracing::warn!(
-                                                error = %e,
+                                                error = %crate::agent::diagnostics::error_class(&e),
                                                 "Failed to serialize spawn approval grant; proceeding without it"
                                             );
                                         }
@@ -2553,7 +2553,7 @@ Retry with a compatible model: /provider {shown} <model>",
                                         }
                                         Err(e) => {
                                             tracing::warn!(
-                                                error = %e,
+                                                error = %crate::agent::diagnostics::error_class(&e),
                                                 "Failed to serialize steer approval grant; proceeding without it"
                                             );
                                         }
@@ -2975,7 +2975,7 @@ Retry with a compatible model: /provider {shown} <model>",
                                     }
                                     Err(e) => {
                                         tracing::warn!(
-                                            error = %e,
+                                            error = %crate::agent::diagnostics::error_class(&e),
                                             "Failed to serialize steer approval grant; proceeding without it"
                                         );
                                     }
@@ -3218,7 +3218,7 @@ Retry with a compatible model: /provider {shown} <model>",
         let draft_id = match terminal.send_draft(&SendMessage::new("", "user")).await {
             Ok(id) => id,
             Err(e) => {
-                tracing::debug!("Failed to start draft: {e}");
+                tracing::debug!(error = %crate::agent::diagnostics::error_class(&e), "Failed to start draft");
                 None
             }
         };
@@ -3296,7 +3296,7 @@ Retry with a compatible model: /provider {shown} <model>",
                     {
                         accumulated.push_str(&delta);
                         if let Err(e) = channel.update_draft(&reply_target, &draft_id_owned, &accumulated).await {
-                            tracing::debug!("Draft update failed: {e}");
+                            tracing::debug!(error = %crate::agent::diagnostics::error_class(&e), "Draft update failed");
                         }
                     }
                     // Step 5b shadow: forward the **incremental** delta into
@@ -3374,10 +3374,11 @@ Retry with a compatible model: /provider {shown} <model>",
         // `tui_mirror` binding from being flagged as unused when the renderer
         // wiring lands in P2-12).
         #[cfg(feature = "terminal-tui")]
-        tracing::trace!(
-            tracked_tool_cards = tui_mirror.lock().last_tool_result_index().map(|i| i + 1).unwrap_or(0),
-            "tui_mirror initialized"
-        );
+        {
+            let tracked_tool_cards_count: usize =
+                tui_mirror.lock().last_tool_result_index().map_or(0, |index| index + 1);
+            tracing::trace!(tracked_tool_cards_count, "tui_mirror initialized");
+        }
 
         // ── Unified tool authorization (permission-model Phase 1) ──
         // Tool access is governed solely by `[autonomy]` via
@@ -3437,7 +3438,7 @@ Retry with a compatible model: /provider {shown} <model>",
             )),
         );
         if let Err(e) = record_route_decision_event(&memory_fabric, route_scope.clone(), &route_decision).await {
-            tracing::warn!(error = %e, "Failed to append router.route_decision message event");
+            tracing::warn!(error = %crate::agent::diagnostics::error_class(&e), "Failed to append router.route_decision message event");
         }
         let provider_started_at = chrono::Utc::now();
 
@@ -3623,7 +3624,7 @@ Retry with a compatible model: /provider {shown} <model>",
             // as Failed and fall through to cleanup, otherwise notify_fut is never fired.
             if !matches!(dispatch_result, dispatcher::DispatchResult::Sent) {
                 tracing::warn!(
-                    result = ?dispatch_result,
+                    result = dispatch_result.kind(),
                     "Redux driver: StartLLMTurn dispatch failed; aborting turn"
                 );
                 // S2-B Step 3: send StreamCancelled synchronously so the reducer clears
@@ -3848,14 +3849,14 @@ Retry with a compatible model: /provider {shown} <model>",
                         ) };
                         if !finalizer_result.finalized {
                             if let Err(e) = terminal.cancel_draft("user", &d_id).await {
-                                tracing::debug!(error = %e, "Redux driver: cancel empty-response draft failed");
+                                tracing::debug!(error = %crate::agent::diagnostics::error_class(&e), "Redux driver: cancel empty-response draft failed");
                             }
                             publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
                             publish_provider_worker_status(&chat_dispatcher, &provider_turn_workers);
                             continue;
                         }
                         if let Err(e) = terminal.cancel_draft("user", &d_id).await {
-                            tracing::debug!(error = %e, "Redux driver: cancel empty-response draft failed");
+                            tracing::debug!(error = %crate::agent::diagnostics::error_class(&e), "Redux driver: cancel empty-response draft failed");
                         }
                         let terminal_usage = match finalize_chat_success_turn(
                             chat_turn_binding.as_deref(),
@@ -3876,6 +3877,7 @@ Retry with a compatible model: /provider {shown} <model>",
                         {
                             Ok(receipt) => receipt.into_session_usage(),
                             Err(error) => {
+                                tracing::error!(error = %crate::agent::diagnostics::error_class(&error), "Chat terminal persistence is unconfirmed");
                                 return Err(error);
                             }
                         };
@@ -3913,7 +3915,7 @@ Retry with a compatible model: /provider {shown} <model>",
                     ) };
                     if !finalizer_result.finalized {
                         if let Err(e) = terminal.cancel_draft("user", &d_id).await {
-                            tracing::debug!(error = %e, "Redux driver: cancel commit-gated draft failed");
+                            tracing::debug!(error = %crate::agent::diagnostics::error_class(&e), "Redux driver: cancel commit-gated draft failed");
                         }
                         publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
                         publish_provider_worker_status(&chat_dispatcher, &provider_turn_workers);
@@ -3927,7 +3929,7 @@ Retry with a compatible model: /provider {shown} <model>",
                     //    it (the driver path does not go through the delta_tx → draft_updater chain,
                     //    it finalizes directly).
                     if let Err(e) = terminal.finalize_draft("user", &d_id, &final_text).await {
-                        tracing::warn!(error = %e, "Redux driver: finalize_draft failed");
+                        tracing::warn!(error = %crate::agent::diagnostics::error_class(&e), "Redux driver: finalize_draft failed");
                     }
                     let terminal_usage = match finalize_chat_success_turn(
                         chat_turn_binding.as_deref(),
@@ -3948,6 +3950,7 @@ Retry with a compatible model: /provider {shown} <model>",
                     {
                         Ok(receipt) => receipt.into_session_usage(),
                         Err(error) => {
+                            tracing::error!(error = %crate::agent::diagnostics::error_class(&error), "Chat terminal persistence is unconfirmed");
                             return Err(error);
                         }
                     };
@@ -4007,7 +4010,7 @@ Retry with a compatible model: /provider {shown} <model>",
                     .await
                     {
                         if chat_turn_binding.as_ref().is_some_and(|binding| binding.is_decided()) { return Err(error); }
-                        tracing::warn!(error = %error, "Failed to commit shared failed Chat terminal event");
+                        tracing::warn!(error = %crate::agent::diagnostics::error_class(&error), "Failed to commit shared failed Chat terminal event");
                     }
                     // The worker's compactions and terminal precede this settlement on the
                     // action channel; the reducer never recorded a driver turn's request.
@@ -4055,7 +4058,7 @@ Retry with a compatible model: /provider {shown} <model>",
                     .await
                     {
                         if chat_turn_binding.as_ref().is_some_and(|binding| binding.is_decided()) { return Err(error); }
-                        tracing::warn!(error = %error, "Failed to commit shared cancelled Chat terminal event");
+                        tracing::warn!(error = %crate::agent::diagnostics::error_class(&error), "Failed to commit shared cancelled Chat terminal event");
                     }
                     if let Some(ref id) = draft_id {
                         let _ = terminal.cancel_draft("user", id).await;
@@ -4359,7 +4362,7 @@ Retry with a compatible model: /provider {shown} <model>",
                 .await
                 {
                     if chat_turn_binding.as_ref().is_some_and(|binding| binding.is_decided()) { return Err(error); }
-                    tracing::warn!(error = %error, "Failed to commit shared cancelled Chat terminal event");
+                    tracing::warn!(error = %crate::agent::diagnostics::error_class(&error), "Failed to commit shared cancelled Chat terminal event");
                 }
             }
             TurnOutcome::FailedWithError { err, retryable } => {
@@ -4390,7 +4393,7 @@ Retry with a compatible model: /provider {shown} <model>",
                 .await
                 {
                     if chat_turn_binding.as_ref().is_some_and(|binding| binding.is_decided()) { return Err(error); }
-                    tracing::warn!(error = %error, "Failed to commit shared failed Chat terminal event");
+                    tracing::warn!(error = %crate::agent::diagnostics::error_class(&error), "Failed to commit shared failed Chat terminal event");
                 }
                 surface_turn_elapsed_message(
                     &chat_dispatcher,
@@ -4568,6 +4571,7 @@ Retry with a compatible model: /provider {shown} <model>",
             {
                 Ok(receipt) => receipt.into_session_usage(),
                 Err(error) => {
+                    tracing::error!(error = %crate::agent::diagnostics::error_class(&error), "Chat terminal persistence is unconfirmed");
                     return Err(error);
                 }
             };
@@ -4681,6 +4685,7 @@ Retry with a compatible model: /provider {shown} <model>",
         {
             Ok(receipt) => receipt.into_session_usage(),
             Err(error) => {
+                tracing::error!(error = %crate::agent::diagnostics::error_class(&error), "Chat terminal persistence is unconfirmed");
                 return Err(error);
             }
         };
@@ -4744,7 +4749,7 @@ Retry with a compatible model: /provider {shown} <model>",
         for (media_type, path) in &media_items {
             if media_type == "IMAGE" && std::path::Path::new(path).exists() {
                 if let Err(e) = terminal_proto::display_image(path) {
-                    tracing::debug!("Image display failed: {e}");
+                    tracing::debug!(error = %crate::agent::diagnostics::error_class(&e), "Image display failed");
                     println!("  [image: {path}]");
                 }
             } else {
@@ -4780,7 +4785,7 @@ Retry with a compatible model: /provider {shown} <model>",
                     let _ = terminal.send(&SendMessage::new(rendered, "user")).await;
                 } else {
                     tracing::warn!(
-                        error = %e,
+                        error = %crate::agent::diagnostics::error_class(&e),
                         "finalize_draft failed; suppressing resend to preserve idempotency (user already saw streamed content)"
                     );
                 }

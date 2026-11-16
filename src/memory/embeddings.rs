@@ -196,9 +196,8 @@ impl OpenAiEmbedding {
 
     fn http_client(&self) -> reqwest::Client {
         crate::config::build_runtime_proxy_client("memory.embeddings")
-            .map_err(|e| {
-                tracing::error!("proxy build failed for memory.embeddings, using direct: {e}");
-                e
+            .inspect_err(|e| {
+                tracing::error!(error = %crate::agent::diagnostics::error_class(e), "proxy build failed for memory.embeddings, using direct");
             })
             .unwrap_or_else(|_| reqwest::Client::new())
     }

@@ -347,7 +347,7 @@ impl PostgresConnectionPool {
                     if !recycled {
                         return Err(error);
                     }
-                    tracing::debug!(%error, "discarding stale pooled PostgreSQL connection");
+                    tracing::debug!(error = %crate::agent::diagnostics::error_class(&error), "discarding stale pooled PostgreSQL connection");
                     last_error = Some(error);
                 }
             }
@@ -473,6 +473,6 @@ fn drop_client_off_runtime(client: Client) {
         .name("postgres-memory-drop".to_string())
         .spawn(move || drop(client))
     {
-        tracing::warn!(%error, "failed to spawn PostgreSQL connection teardown thread");
+        tracing::warn!(error = %crate::agent::diagnostics::error_class(&error), "failed to spawn PostgreSQL connection teardown thread");
     }
 }

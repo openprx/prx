@@ -115,6 +115,14 @@ pub enum ProviderTurnWorkerError {
     },
 }
 
+/// The typed fields only (ids, states, counts); used by the payload-free log
+/// class, never shown to the user as prose.
+impl std::fmt::Display for ProviderTurnWorkerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self, f)
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct ProviderTurnWorkerRegistry {
     workers: HashMap<TurnTaskId, ProviderTurnWorker>,

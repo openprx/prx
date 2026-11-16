@@ -163,7 +163,7 @@ pub(super) async fn reattach_pty(
             // unwind, so the terminal is restored. The session detaches defensively
             // (it stays alive for a later attempt). Surface the fault.
             session.detach();
-            tracing::error!(error = %e, seq, "PTY passthrough task panicked");
+            tracing::error!(error = %crate::agent::diagnostics::error_class(&e), seq, "PTY passthrough task panicked");
             emit_chat_output(&format!("PTY session #{seq} ended unexpectedly; terminal restored."));
         }
     }
@@ -265,7 +265,7 @@ fn run_pty_attach(session: &crate::chat::sessions::pty::PtyShellSession) -> PtyE
     //    the subsequent `attach()` redraw is laid out for the real terminal. Cheap,
     //    synchronous, non-fatal.
     if let Err(e) = session.resize(host_size()) {
-        tracing::debug!(error = %e, "PTY resize-to-host before re-attach redraw failed");
+        tracing::debug!(error = %crate::agent::diagnostics::error_class(&e), "PTY resize-to-host before re-attach redraw failed");
     }
 
     // 1. Clear the screen + home the cursor, then attach. `attach()` flips the sink
@@ -313,7 +313,7 @@ fn run_pty_attach(session: &crate::chat::sessions::pty::PtyShellSession) -> PtyE
                     pixel_width: 0,
                     pixel_height: 0,
                 }) {
-                    tracing::warn!(error = %e, cols, rows, "PTY resize forward failed");
+                    tracing::warn!(error = %crate::agent::diagnostics::error_class(&e), cols, rows, "PTY resize forward failed");
                 }
             }
         }
@@ -339,7 +339,7 @@ fn run_pty_attach(session: &crate::chat::sessions::pty::PtyShellSession) -> PtyE
     match result {
         Ok(exit) => exit,
         Err(e) => {
-            tracing::warn!(error = %e, "PTY attach stdin loop ended with error; detaching");
+            tracing::warn!(error = %crate::agent::diagnostics::error_class(&e), "PTY attach stdin loop ended with error; detaching");
             PtyExit::Detached
         }
     }

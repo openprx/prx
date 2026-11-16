@@ -105,7 +105,7 @@ impl std::ops::DerefMut for ConnectionDeadline<'_> {
 impl Drop for ConnectionDeadline<'_> {
     fn drop(&mut self) {
         if let Err(error) = self.connection.progress_handler(0, None::<fn() -> bool>) {
-            tracing::error!(%error, "SQLite ingress progress handler reset failed");
+            tracing::error!(error = %crate::agent::diagnostics::error_class(&error), "SQLite ingress progress handler reset failed");
         }
         match crate::runtime::sqlite_pool::install_busy_handler(self.connection) {
             Ok(()) => {
@@ -113,7 +113,7 @@ impl Drop for ConnectionDeadline<'_> {
                 DEADLINE_BUSY_INSTALLED.with(|cell| cell.set(false));
             }
             Err(error) => {
-                tracing::error!(%error, "SQLite ingress busy handler reset failed");
+                tracing::error!(error = %crate::agent::diagnostics::error_class(&error), "SQLite ingress busy handler reset failed");
             }
         }
         IO_DEADLINE.with(|cell| cell.set(self.previous));

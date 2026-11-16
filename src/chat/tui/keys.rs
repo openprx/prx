@@ -317,13 +317,17 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
     // [DIAG] trace every key that enters the dispatch function so we can
     // correlate raw events (tui_input_event) with what the handler sees.
     let (key_class, named_key) = key_log_class(&key.code);
+    let key_class: &'static str = key_class;
+    let named_key: Option<&KeyCode> = named_key;
+    let modifiers: KeyModifiers = key.modifiers;
+    let input_first_line_chars: usize = state.input.lines.first().map_or(0, |line| line.chars().count());
     tracing::debug!(
         key_class,
         named_key = ?named_key,
-        modifiers = ?key.modifiers,
+        modifiers = ?modifiers,
         kind = ?key.kind,
         input_lines_before = state.input.lines.len(),
-        input_first_line_chars = state.input.lines.first().map(|s| s.chars().count()).unwrap_or(0),
+        input_first_line_chars,
         "dispatch_global_key_entry"
     );
     if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {

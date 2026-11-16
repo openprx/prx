@@ -677,7 +677,7 @@ impl SqliteMemory {
                     Err(rusqlite::Error::SqliteFailure(err, Some(ref msg)))
                         if msg.contains("duplicate column name") =>
                     {
-                        tracing::debug!("Column memories.{name} already exists (concurrent migration): {err}");
+                        tracing::debug!(err = %crate::agent::diagnostics::error_class(&err), "Column of memories already exists (concurrent migration)");
                     }
                     Err(e) => {
                         return Err(anyhow::anyhow!("Failed to add memories.{name}: {e}"));
@@ -788,7 +788,7 @@ impl SqliteMemory {
                     Err(rusqlite::Error::SqliteFailure(err, Some(ref msg)))
                         if msg.contains("duplicate column name") =>
                     {
-                        tracing::debug!("Column document_chunks.{name} already exists (concurrent migration): {err}");
+                        tracing::debug!(err = %crate::agent::diagnostics::error_class(&err), "Column of document_chunks already exists (concurrent migration)");
                     }
                     Err(e) => {
                         return Err(anyhow::anyhow!("Failed to add document_chunks.{name}: {e}"));
@@ -817,7 +817,7 @@ impl SqliteMemory {
                     Err(rusqlite::Error::SqliteFailure(err, Some(ref msg)))
                         if msg.contains("duplicate column name") =>
                     {
-                        tracing::debug!("Column embedding_cache.{name} already exists (concurrent migration): {err}");
+                        tracing::debug!(err = %crate::agent::diagnostics::error_class(&err), "Column of embedding_cache already exists (concurrent migration)");
                     }
                     Err(e) => {
                         return Err(anyhow::anyhow!("Failed to add embedding_cache.{name}: {e}"));
@@ -843,7 +843,7 @@ impl SqliteMemory {
             match conn.execute_batch("ALTER TABLE message_events ADD COLUMN owner_id TEXT") {
                 Ok(()) => {}
                 Err(rusqlite::Error::SqliteFailure(err, Some(ref msg))) if msg.contains("duplicate column name") => {
-                    tracing::debug!("Column message_events.owner_id already exists (concurrent migration): {err}");
+                    tracing::debug!(err = %crate::agent::diagnostics::error_class(&err), "Column message_events.owner_id already exists (concurrent migration)");
                 }
                 Err(e) => return Err(anyhow::anyhow!("Failed to add message_events.owner_id: {e}")),
             }
@@ -852,7 +852,7 @@ impl SqliteMemory {
             match conn.execute_batch("ALTER TABLE message_events ADD COLUMN event_type TEXT") {
                 Ok(()) => {}
                 Err(rusqlite::Error::SqliteFailure(err, Some(ref msg))) if msg.contains("duplicate column name") => {
-                    tracing::debug!("Column message_events.event_type already exists (concurrent migration): {err}");
+                    tracing::debug!(err = %crate::agent::diagnostics::error_class(&err), "Column message_events.event_type already exists (concurrent migration)");
                 }
                 Err(e) => return Err(anyhow::anyhow!("Failed to add message_events.event_type: {e}")),
             }
@@ -875,7 +875,7 @@ impl SqliteMemory {
             match conn.execute_batch(&alter_sql) {
                 Ok(()) => {}
                 Err(rusqlite::Error::SqliteFailure(err, Some(ref msg))) if msg.contains("duplicate column name") => {
-                    tracing::debug!("Column message_events.{name} already exists (concurrent migration): {err}");
+                    tracing::debug!(err = %crate::agent::diagnostics::error_class(&err), "Column of message_events already exists (concurrent migration)");
                 }
                 Err(e) => return Err(anyhow::anyhow!("Failed to add message_events.{name}: {e}")),
             }
@@ -900,7 +900,7 @@ impl SqliteMemory {
             match conn.execute_batch("ALTER TABLE sessions ADD COLUMN owner_id TEXT") {
                 Ok(()) => {}
                 Err(rusqlite::Error::SqliteFailure(err, Some(ref msg))) if msg.contains("duplicate column name") => {
-                    tracing::debug!("Column sessions.owner_id already exists (concurrent migration): {err}");
+                    tracing::debug!(err = %crate::agent::diagnostics::error_class(&err), "Column sessions.owner_id already exists (concurrent migration)");
                 }
                 Err(e) => return Err(anyhow::anyhow!("Failed to add sessions.owner_id: {e}")),
             }
@@ -936,7 +936,7 @@ impl SqliteMemory {
                         if msg.contains("duplicate column name") =>
                     {
                         tracing::debug!(
-                            "Column conversation_turns.{name} already exists (concurrent migration): {err}"
+                            err = %crate::agent::diagnostics::error_class(&err), "Column of conversation_turns already exists (concurrent migration)"
                         );
                     }
                     Err(e) => {
@@ -977,7 +977,7 @@ impl SqliteMemory {
                     Err(rusqlite::Error::SqliteFailure(err, Some(ref msg)))
                         if msg.contains("duplicate column name") =>
                     {
-                        tracing::debug!("Column memory_drafts.{name} already exists (concurrent migration): {err}");
+                        tracing::debug!(err = %crate::agent::diagnostics::error_class(&err), "Column of memory_drafts already exists (concurrent migration)");
                     }
                     Err(e) => {
                         return Err(anyhow::anyhow!("Failed to add memory_drafts.{name}: {e}"));
@@ -997,7 +997,7 @@ impl SqliteMemory {
                 Ok(()) => {}
                 Err(rusqlite::Error::SqliteFailure(err, Some(ref msg))) if msg.contains("duplicate column name") => {
                     tracing::debug!(
-                        "Column compaction_runs.source_event_range_json already exists (concurrent migration): {err}"
+                        err = %crate::agent::diagnostics::error_class(&err), "Column compaction_runs.source_event_range_json already exists (concurrent migration)"
                     );
                 }
                 Err(e) => {
@@ -1039,7 +1039,7 @@ impl SqliteMemory {
                     Err(rusqlite::Error::SqliteFailure(err, Some(ref msg)))
                         if msg.contains("duplicate column name") =>
                     {
-                        tracing::debug!("Column memory_events.{name} already exists (concurrent migration): {err}");
+                        tracing::debug!(err = %crate::agent::diagnostics::error_class(&err), "Column of memory_events already exists (concurrent migration)");
                     }
                     Err(e) => {
                         return Err(anyhow::anyhow!("Failed to add memory_events.{name}: {e}"));
@@ -1126,7 +1126,7 @@ impl SqliteMemory {
         super::remote_tree::init_schema(conn)?;
         super::child_sessions::init_schema(conn)?;
         super::mailbox_schema::init_schema(conn)?;
-        let unattributed = super::agent_migration::migrate_legacy_console(conn)?;
+        let unattributed: u64 = super::agent_migration::migrate_legacy_console(conn)?;
         if unattributed > 0 {
             tracing::warn!(unattributed, "legacy console rows left without an agent scope");
         }

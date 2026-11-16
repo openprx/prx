@@ -119,3 +119,28 @@ fn a_tool_parse_log_digest_carries_length_and_hash_but_no_content() {
     assert!(!hash.contains("SENTINEL"), "the digest carries no body content");
     assert_eq!(tool_parse_log_digest(body), (len, hash), "the digest is stable");
 }
+
+#[test]
+fn error_and_text_classes_display_only_type_length_and_digest() {
+    let error = anyhow::anyhow!("refused SENTINEL-7f3a");
+    let class = error_class(&error).to_string();
+    assert!(
+        class.starts_with("kind=anyhow::Error len=") && class.contains(" sha256="),
+        "an error class shows its type, byte length and digest: {class}"
+    );
+    assert!(
+        !class.contains("SENTINEL"),
+        "an error class never shows the error text: {class}"
+    );
+    let text = text_class("SENTINEL-7f3a").to_string();
+    assert!(
+        text.starts_with("kind=text len=13 sha256="),
+        "a text class shows its length: {text}"
+    );
+    assert!(!text.contains("SENTINEL"), "a text class never shows the text: {text}");
+    assert_eq!(
+        text_class("SENTINEL-7f3a"),
+        text_class("SENTINEL-7f3a"),
+        "the same text always has the same class, so log lines stay correlatable"
+    );
+}

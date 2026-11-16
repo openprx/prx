@@ -148,7 +148,7 @@ pub fn search_topics_fts(conn: &Connection, query: &str, limit: usize) -> Result
     let rows = match stmt.query_map(params![fts_query, limit_i64], map_topic) {
         Ok(rows) => rows,
         Err(error) => {
-            tracing::warn!("topic fts query rejected, skipping candidate lookup: {error}");
+            tracing::warn!(error = %crate::agent::diagnostics::error_class(&error), "topic fts query rejected, skipping candidate lookup");
             return Ok(Vec::new());
         }
     };
@@ -409,7 +409,7 @@ pub fn resolve_topic(
     ) {
         Ok(topic_id) => topic_id,
         Err(error) => {
-            tracing::warn!("memory topic resolve skipped: {error}");
+            tracing::warn!(error = %crate::agent::diagnostics::error_class(&error), "memory topic resolve skipped");
             return Ok(None);
         }
     };

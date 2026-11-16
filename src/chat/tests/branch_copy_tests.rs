@@ -106,7 +106,7 @@ async fn record_pairs(
     }
 }
 
-async fn compact(history: &mut Vec<ChatMessage>, audit: &DocumentIngestRuntime, trigger: &str) {
+async fn compact(history: &mut Vec<ChatMessage>, audit: &DocumentIngestRuntime, trigger: &'static str) {
     let patch = build_configurable_compaction_patch(
         history,
         &UnusedProvider,

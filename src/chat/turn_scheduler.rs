@@ -47,6 +47,20 @@ impl TurnTaskState {
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Cancelled | Self::Completed | Self::Failed)
     }
+
+    /// The state's name for the log.
+    #[must_use]
+    pub const fn kind(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Dispatched => "dispatched",
+            Self::Running => "running",
+            Self::Cancelling => "cancelling",
+            Self::Cancelled => "cancelled",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,6 +168,14 @@ pub enum TurnSchedulerError {
         expected: &'static str,
         actual: TurnTaskState,
     },
+}
+
+/// The typed fields only (ids, states, counts); used by the payload-free log
+/// class, never shown to the user as prose.
+impl std::fmt::Display for TurnSchedulerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self, f)
+    }
 }
 
 #[derive(Debug, Default)]

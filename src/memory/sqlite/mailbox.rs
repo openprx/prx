@@ -69,7 +69,7 @@ impl SqliteMailbox {
 }
 
 pub(super) fn storage_error(error: impl std::fmt::Display) -> MailboxError {
-    tracing::warn!(%error,"mailbox SQLite operation failed");
+    tracing::warn!(error = %crate::agent::diagnostics::error_class(&error),"mailbox SQLite operation failed");
     MailboxError::Storage
 }
 

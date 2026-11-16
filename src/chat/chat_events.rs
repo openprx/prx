@@ -34,7 +34,7 @@ impl ReduxMode {
             let value = raw.trim();
             if !value.is_empty() && !value.eq_ignore_ascii_case("pure") && value != "2" {
                 tracing::warn!(
-                    requested = value,
+                    requested = %crate::agent::diagnostics::text_class(value),
                     "PRX_CHAT_REDUX legacy modes are retired; using Pure reducer path"
                 );
             }

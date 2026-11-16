@@ -845,9 +845,10 @@ impl Drop for AssignmentTurnGuard {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             // Outside a runtime there is nothing to spawn onto. Say so where it
             // can be found rather than pretending the report went out.
+            let status_label: &'static str = status.as_str();
             tracing::warn!(
                 assignment = %self.assignment_id,
-                status = status.as_str(),
+                status = status_label,
                 "no tokio runtime to report a daemon assignment result on"
             );
             return;
@@ -954,7 +955,8 @@ impl FailureNotices {
         let episode = self.episode.as_mut()?;
         episode.pulls = episode.pulls.saturating_add(1);
         if self.announced.contains(reason) || self.announced.len() >= MAX_TRACKED_REASONS {
-            tracing::debug!(reason, pulls = episode.pulls, "chat assignment pull is still failing");
+            let failed_pulls: u64 = episode.pulls;
+            tracing::debug!(reason = %crate::agent::diagnostics::text_class(reason), failed_pulls, "chat assignment pull is still failing");
             return None;
         }
         self.announced.insert(reason.to_string());
@@ -1179,7 +1181,7 @@ pub async fn run_poller(
                 // on each one would put a notice on screen every poll interval.
                 if last_re_enrolment.is_some_and(|at| at.elapsed() < RE_ENROLMENT_MIN_INTERVAL) {
                     tracing::debug!(
-                        session = %session_ref,
+                        session = %crate::agent::diagnostics::text_class(&session_ref),
                         "daemon still does not know this chat session; re-enrolment is rate limited"
                     );
                     tokio::select! {

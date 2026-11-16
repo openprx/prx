@@ -106,7 +106,7 @@ pub(crate) fn call_token_budget(
         move || {
             spend
                 .live()
-                .inspect_err(|error| tracing::warn!(%error, "called-tool spend ceiling unavailable"))
+                .inspect_err(|error| tracing::warn!(error = %crate::agent::diagnostics::error_class(&error), "called-tool spend ceiling unavailable"))
                 .ok()
         },
         move |schema_bytes| {

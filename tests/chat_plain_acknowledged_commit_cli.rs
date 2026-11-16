@@ -9,7 +9,8 @@
 //! - `/cost` right after a reply reports that turn's exact scripted usage;
 //! - a preflight/switch compaction is acknowledged and every later request
 //!   carries its current request exactly once;
-//! - with `RUST_LOG=trace` no session content reaches stderr or `chat.log`.
+//! - with `RUST_LOG=trace` no session content reaches stderr or `chat.log`,
+//!   also when the store refuses a terminal write with the sentinel in its error.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
@@ -429,6 +430,87 @@ fn trace_logging_carries_no_session_content() {
     );
     assert!(!output.stderr.contains(SENTINEL), "the sentinel reached stderr");
     assert!(!chat_log.contains(SENTINEL), "the sentinel reached chat.log");
+}
+
+/// The lines of `logs` written by the tracing formatter (a level column),
+/// as opposed to the user-visible error report on stderr.
+fn tracing_lines(logs: &str) -> Vec<&str> {
+    logs.lines()
+        .filter(|line| {
+            [" TRACE ", " DEBUG ", " INFO ", " WARN ", " ERROR "]
+                .iter()
+                .any(|level| line.contains(level))
+        })
+        .collect()
+}
+
+/// The number of `turn.finalized` rows the real store holds.
+fn finalized_terminal_rows(sandbox: &Sandbox) -> i64 {
+    let database = rusqlite::Connection::open_with_flags(
+        sandbox.workspace.join("memory/brain.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("test: open the real database read-only");
+    database
+        .query_row(
+            "SELECT COUNT(*) FROM message_events WHERE event_type = 'turn.finalized'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("test: count turn.finalized rows")
+}
+
+/// I-LOG through an actual terminal-write failure: after one committed
+/// turn, a SQLite trigger refuses every `turn.finalized` insert with the
+/// sentinel in the database error. The next turn's terminal write fails in
+/// the real store; with `RUST_LOG=trace` no tracing line on stderr or in
+/// `chat.log` carries the refusal text (the error is logged by its class
+/// only), and the refused terminal row was not written.
+#[test]
+fn a_terminal_write_the_store_refuses_logs_no_refusal_text() {
+    let sandbox = Sandbox::new();
+    let _server = serve(&sandbox, Box::new(|_, _| Scripted::text("PRX-TERMINAL-REPLY")));
+    let mut command = sandbox.command(&["chat", "--plain"]);
+    command.env("RUST_LOG", "trace");
+    let mut chat = Running::spawn(command);
+    chat.send("first question");
+    wait_for_saved_turns(&sandbox, 2);
+    let finalized_before = finalized_terminal_rows(&sandbox);
+    let connection =
+        rusqlite::Connection::open(sandbox.workspace.join("memory/brain.db")).expect("test: open the real database");
+    connection
+        .execute_batch(&format!(
+            "CREATE TRIGGER test_refuse_terminal BEFORE INSERT ON message_events \
+             WHEN NEW.event_type = 'turn.finalized' \
+             BEGIN SELECT RAISE(ABORT, 'refused {SENTINEL}'); END;"
+        ))
+        .expect("test: install the refusing trigger");
+    drop(connection);
+    chat.send("second question");
+    // End of input after the refused turn: the process stops on the
+    // unconfirmed commit or exits at EOF, whichever comes first.
+    let output = chat.wait();
+
+    let chat_log = read_bounded_chat_log(&sandbox.config_dir.join("chat.log"));
+    let logs = format!("{}\n{chat_log}", output.stderr);
+    let lines = tracing_lines(&logs);
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("terminal") && line.contains("kind=") && line.contains("sha256=")),
+        "the refused terminal write is logged by its error class; stderr: {}\nchat.log tail: {}",
+        output.stderr,
+        chat_log.lines().rev().take(40).collect::<Vec<_>>().join("\n")
+    );
+    let leaked: Vec<&&str> = lines.iter().filter(|line| line.contains(SENTINEL)).collect();
+    assert!(leaked.is_empty(), "the refusal text reached a log line: {leaked:?}");
+    assert!(!chat_log.contains(SENTINEL), "the refusal text reached chat.log");
+    assert!(!output.stderr.contains("panicked"), "stderr: {}", output.stderr);
+    assert_eq!(
+        finalized_terminal_rows(&sandbox),
+        finalized_before,
+        "the refused terminal row is not in the store"
+    );
 }
 
 /// Make SQLite refuse every write of a session row that records an

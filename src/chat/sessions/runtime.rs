@@ -713,7 +713,9 @@ impl ChatSessionsHandle {
             if !shell.is_terminal() {
                 match shell.kill().await {
                     Ok(()) => killed_shells = killed_shells.saturating_add(1),
-                    Err(e) => tracing::warn!(error = %e, reason, "failed to terminate shell during chat shutdown"),
+                    Err(e) => {
+                        tracing::warn!(error = %crate::agent::diagnostics::error_class(&e), reason = %crate::agent::diagnostics::text_class(reason), "failed to terminate shell during chat shutdown")
+                    }
                 }
             }
         }
@@ -735,7 +737,9 @@ impl ChatSessionsHandle {
                 if !pty.has_exited() {
                     match pty.kill().await {
                         Ok(()) => killed_ptys = killed_ptys.saturating_add(1),
-                        Err(e) => tracing::warn!(error = %e, reason, "failed to terminate PTY during chat shutdown"),
+                        Err(e) => {
+                            tracing::warn!(error = %crate::agent::diagnostics::error_class(&e), reason = %crate::agent::diagnostics::text_class(reason), "failed to terminate PTY during chat shutdown")
+                        }
                     }
                 }
             }

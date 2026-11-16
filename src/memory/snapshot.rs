@@ -276,11 +276,7 @@ pub fn export_snapshot(workspace_dir: &Path) -> Result<usize> {
     let snapshot_path = snapshot_path(workspace_dir);
     fs::write(&snapshot_path, output)?;
 
-    tracing::info!(
-        "📸 Memory snapshot exported: {} core memories → {}",
-        rows.len(),
-        snapshot_path.display()
-    );
+    tracing::info!(exported_count = rows.len(), "Memory snapshot exported");
 
     Ok(exported_count)
 }
@@ -290,7 +286,6 @@ pub fn export_snapshot(workspace_dir: &Path) -> Result<usize> {
 /// Called during cold-boot when `brain.db` doesn't exist but the snapshot does.
 /// Returns the number of entries hydrated.
 pub fn hydrate_from_snapshot(workspace_dir: &Path) -> Result<usize> {
-    let snapshot = snapshot_path(workspace_dir);
     let entries = collect_hydration_entries(workspace_dir)?;
 
     if entries.is_empty() {
@@ -496,7 +491,7 @@ pub fn hydrate_from_snapshot(workspace_dir: &Path) -> Result<usize> {
     let _ = conn.execute_batch("ALTER TABLE embedding_cache ADD COLUMN accessed_at TEXT NOT NULL DEFAULT ''");
 
     let now = Local::now().to_rfc3339();
-    let mut hydrated = 0;
+    let mut hydrated_count: usize = 0;
 
     for (key, content, category, origin) in &entries {
         let id = uuid::Uuid::new_v4().to_string();
@@ -526,25 +521,20 @@ pub fn hydrate_from_snapshot(workspace_dir: &Path) -> Result<usize> {
                     "INSERT INTO memories_fts(key, content) VALUES (?1, ?2)",
                     params![key, content],
                 );
-                hydrated += 1;
+                hydrated_count += 1;
             }
             Ok(_) => {
-                tracing::debug!("hydrate: key '{key}' already exists, skipping");
+                tracing::debug!(key = %crate::agent::diagnostics::text_class(&key), "hydrate: key already exists, skipping");
             }
             Err(e) => {
-                tracing::warn!("hydrate: failed to insert key '{key}': {e}");
+                tracing::warn!(error = %crate::agent::diagnostics::error_class(&e), key = %crate::agent::diagnostics::text_class(&key), "hydrate: failed to insert key");
             }
         }
     }
 
-    tracing::info!(
-        "🧬 Memory hydration complete: {} entries restored from {}",
-        hydrated,
-        snapshot.display()
-    );
-    tracing::info!("Hydrated {hydrated} memories from files");
+    tracing::info!(hydrated_count, "Memory hydration complete");
 
-    Ok(hydrated)
+    Ok(hydrated_count)
 }
 
 /// Check if we should auto-hydrate on startup.
@@ -677,9 +667,11 @@ fn parse_origin(json: &str) -> Option<SnapshotOrigin> {
     match serde_json::from_str(json) {
         Ok(origin) => Some(origin),
         Err(error) => {
+            let line: usize = error.line();
+            let column: usize = error.column();
             tracing::warn!(
-                line = error.line(),
-                column = error.column(),
+                line,
+                column,
                 "snapshot hydration: malformed origin line ignored; the entry is restored without an owner"
             );
             None

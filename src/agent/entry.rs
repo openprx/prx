@@ -2157,7 +2157,7 @@ pub(crate) async fn run_with_runtime_envelope(
                         )
                         .await
                         {
-                            tracing::warn!(error = %finalize_error, "Failed to commit failed single-shot agent terminal event");
+                            tracing::warn!(error = %crate::agent::diagnostics::error_class(&finalize_error), "Failed to commit failed single-shot agent terminal event");
                         }
                         if !QUIET_SINGLE_SHOT.try_with(|quiet| *quiet).unwrap_or(false)
                             && let Some(refusal) =
@@ -2256,7 +2256,7 @@ pub(crate) async fn run_with_runtime_envelope(
                         &config.cost,
                         &config.workspace_dir,
                     ).await {
-                        tracing::warn!(error = %error, "Failed to commit cancelled single-shot agent terminal event");
+                        tracing::warn!(error = %crate::agent::diagnostics::error_class(&error), "Failed to commit cancelled single-shot agent terminal event");
                     }
                     }
                     Err(anyhow::anyhow!("agent single-shot run cancelled by shutdown signal"))

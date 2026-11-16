@@ -380,7 +380,7 @@ pub(super) fn migrate_legacy_console(conn: &Connection) -> anyhow::Result<u64> {
         if let Err(error) = stamped {
             // Never keep a stamp whose receipt could not be rebound and re-verified.
             conn.execute_batch("ROLLBACK TO ma_main_attribution")?;
-            tracing::warn!(reason = "recovery_rebind_failed", %error, "legacy console rows left unmigrated");
+            tracing::warn!(reason = "recovery_rebind_failed", error = %crate::agent::diagnostics::error_class(&error), "legacy console rows left unmigrated");
         }
         conn.execute_batch("RELEASE ma_main_attribution")?;
     }

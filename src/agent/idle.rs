@@ -689,7 +689,7 @@ async fn terminate(
     // for anything that will not unwind on its own. Killing by process *group*
     // is what keeps forked grandchildren from escaping, and routing through the
     // registry is what makes the termination visible in `prx tasks list`.
-    let killed = kill_turn_subtree().await;
+    let killed: usize = kill_turn_subtree().await;
 
     let terminated = IdleHangTerminated {
         reason,
@@ -702,15 +702,17 @@ async fn terminate(
         killed,
     };
 
+    let reason_label: &'static str = reason.as_str();
+    let last_progress: &'static str = terminated.last_progress.as_str();
     tracing::error!(
-        reason = reason.as_str(),
-        label = label,
+        reason = reason_label,
+        label = %crate::agent::diagnostics::text_class(label),
         idle_secs = terminated.idle.as_secs(),
         threshold_secs = threshold.as_secs(),
         elapsed_secs = terminated.elapsed.as_secs(),
         progress_events = terminated.progress_events,
-        last_progress = terminated.last_progress.as_str(),
-        killed = killed,
+        last_progress,
+        killed,
         "agent turn terminated by the idle (no-progress) detector"
     );
     registry::record_hang_termination(

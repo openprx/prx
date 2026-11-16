@@ -1379,8 +1379,8 @@ fn unscoped_read_is_withheld(backend: &str, context: Option<&MemoryWriteContext>
         return false;
     }
     tracing::warn!(
-        backend = backend,
-        operation = operation,
+        backend = %crate::agent::diagnostics::text_class(backend),
+        operation = %crate::agent::diagnostics::text_class(operation),
         "memory backend cannot scope a read to an owner; the owner-isolated caller is served nothing"
     );
     true

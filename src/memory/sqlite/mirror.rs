@@ -66,7 +66,7 @@ impl SqliteMemory {
         let path = Self::backup_file_path(db_path, category);
         if let Some(parent) = path.parent() {
             if let Err(error) = std::fs::create_dir_all(parent) {
-                tracing::warn!("memory backup mkdir failed ({}): {error}", parent.display());
+                tracing::warn!(error = %crate::agent::diagnostics::error_class(&error), path = %crate::agent::diagnostics::text_class(&parent.display().to_string()), "memory backup mkdir failed");
                 return;
             }
         }
@@ -94,7 +94,7 @@ impl SqliteMemory {
 
         if matches!(category, MemoryCategory::Core) {
             if let Err(error) = Self::upsert_core_backup_entry(&path, &key, &body) {
-                tracing::warn!("core memory backup update failed ({}): {error}", path.display());
+                tracing::warn!(error = %crate::agent::diagnostics::error_class(&error), path = %crate::agent::diagnostics::text_class(&path.display().to_string()), "core memory backup update failed");
             }
             return;
         }
@@ -108,11 +108,11 @@ impl SqliteMemory {
         match open_result {
             Ok(mut file) => {
                 if let Err(error) = file.write_all(payload.as_bytes()) {
-                    tracing::warn!("memory backup append failed ({}): {error}", path.display());
+                    tracing::warn!(error = %crate::agent::diagnostics::error_class(&error), path = %crate::agent::diagnostics::text_class(&path.display().to_string()), "memory backup append failed");
                 }
             }
             Err(error) => {
-                tracing::warn!("memory backup open failed ({}): {error}", path.display());
+                tracing::warn!(error = %crate::agent::diagnostics::error_class(&error), path = %crate::agent::diagnostics::text_class(&path.display().to_string()), "memory backup open failed");
             }
         }
     }

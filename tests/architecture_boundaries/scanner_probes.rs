@@ -45,6 +45,7 @@ use super::memory::{
     the_owner_isolation_bit_is_never_asserted_by_memory_production_code,
 };
 use super::panic_policy::production_has_no_panic_shortcuts;
+use super::payload_free_logs::log_lines_carry_only_typed_metadata;
 use super::process::{
     every_production_process_command_is_inventoried, git_is_named_only_in_the_reviewed_places,
     git_runs_only_through_the_hardened_launch, native_working_root_selection_sites_are_explicit,
@@ -466,6 +467,9 @@ planted_violation_probes! {
     probe_sub_agent_resolver_type_alias: sub_agent_tools_resolve_compaction_from_the_whole_configuration,
         "src/tools/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
         "type D0Spawn = crate::tools::SessionsSpawnTool;\npub fn d0_planted_type(a: A) -> D0Spawn {\n    D0Spawn::new_with_registry(a)\n}\n";
+    probe_payload_free_logs: log_lines_carry_only_typed_metadata,
+        "src/chat/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "pub fn d0_planted_log(error: &str) {\n    tracing::warn!(\"failed: {error}\");\n}\n";
     probe_raw_label_log_field: provider_labels_never_reach_a_log_field_raw,
         "src/providers/context_window.rs", Planted::AppendedTo, Reads::ProductionText,
         "pub fn d0_planted_label(provider: &str) {\n    tracing::warn!(provider, \"planted\");\n}\n";

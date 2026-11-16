@@ -244,14 +244,14 @@ fn finish(bundle: &Path, root: &Path) -> anyhow::Result<()> {
 fn quarantine(bundle: &Path, root: &Path) {
     let quarantined = root.join(format!("{INCOMPLETE_PREFIX}q-{}", uuid::Uuid::new_v4()));
     if let Err(error) = std::fs::rename(bundle, &quarantined) {
-        tracing::warn!(%error, "failed recovery backup was not quarantined");
+        tracing::warn!(error = %crate::agent::diagnostics::error_class(&error), "failed recovery backup was not quarantined");
         // Make the marker durable (file, then directory) before relying on it.
         let marked = std::fs::File::create(bundle.join(INCOMPLETE_MARKER))
             .and_then(|marker| marker.sync_all())
             .map_err(anyhow::Error::from)
             .and_then(|()| sync_directory(bundle));
         if let Err(error) = marked {
-            tracing::warn!(%error, "failed recovery backup is not marked incomplete");
+            tracing::warn!(error = %crate::agent::diagnostics::error_class(&error), "failed recovery backup is not marked incomplete");
         }
         return;
     }
@@ -261,7 +261,7 @@ fn quarantine(bundle: &Path, root: &Path) {
         Ok(())
     });
     if let Err(error) = barrier {
-        tracing::warn!(%error, "quarantine of a failed recovery backup is not durable");
+        tracing::warn!(error = %crate::agent::diagnostics::error_class(&error), "quarantine of a failed recovery backup is not durable");
         return;
     }
     #[cfg(test)]
@@ -274,7 +274,7 @@ fn quarantine(bundle: &Path, root: &Path) {
 fn discard(removed: std::io::Result<()>) {
     if let Err(error) = removed {
         if error.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(%error, "unpublished recovery backup was not removed");
+            tracing::warn!(error = %crate::agent::diagnostics::error_class(&error), "unpublished recovery backup was not removed");
         }
     }
 }

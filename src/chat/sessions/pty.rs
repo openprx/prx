@@ -356,7 +356,7 @@ pub(crate) fn write_chat_alt_screen_leave_for_handoff(out: &mut dyn std::io::Wri
         out.flush()
     });
     if let Err(e) = result {
-        tracing::warn!(error = %e, "terminal handoff: failed to leave chat alternate screen");
+        tracing::warn!(error = %crate::agent::diagnostics::error_class(&e), "terminal handoff: failed to leave chat alternate screen");
     }
 }
 
@@ -376,7 +376,7 @@ pub(crate) fn write_handoff_terminal_restore(
         out.flush()
     });
     if let Err(e) = result {
-        tracing::warn!(error = %e, "terminal handoff: failed to restore terminal modes");
+        tracing::warn!(error = %crate::agent::diagnostics::error_class(&e), "terminal handoff: failed to restore terminal modes");
     }
 }
 
@@ -538,7 +538,7 @@ impl PtySink {
         // screen redraw" stall is acceptable. We `warn` on failure rather than
         // swallow it so a broken terminal is at least diagnosable.
         if let Err(e) = out.write_all(&redraw).and_then(|()| out.flush()) {
-            tracing::warn!(error = %e, "PTY re-attach redraw write to terminal failed");
+            tracing::warn!(error = %crate::agent::diagnostics::error_class(&e), "PTY re-attach redraw write to terminal failed");
         }
     }
 
@@ -611,7 +611,7 @@ impl std::io::Write for PtySink {
             // broken terminal mirror is diagnosable.
             let mut out = std::io::stdout();
             if let Err(e) = out.write_all(buf).and_then(|()| out.flush()) {
-                tracing::warn!(error = %e, "PTY live mirror write to terminal failed");
+                tracing::warn!(error = %crate::agent::diagnostics::error_class(&e), "PTY live mirror write to terminal failed");
             }
         }
         Ok(buf.len())
@@ -896,10 +896,10 @@ impl PtyShellSession {
             pixel_height: 0,
         };
         if let Err(e) = self.resize(jitter) {
-            tracing::debug!(error = %e, "PTY redraw nudge (jitter resize) failed");
+            tracing::debug!(error = %crate::agent::diagnostics::error_class(&e), "PTY redraw nudge (jitter resize) failed");
         }
         if let Err(e) = self.resize(size) {
-            tracing::debug!(error = %e, "PTY redraw nudge (restore resize) failed");
+            tracing::debug!(error = %crate::agent::diagnostics::error_class(&e), "PTY redraw nudge (restore resize) failed");
         }
     }
 
@@ -986,8 +986,8 @@ impl PtyShellSession {
                 let (hup, kill) = unsafe {
                     // SIGHUP first (the natural "terminal closed" signal for an
                     // interactive shell), then SIGKILL to guarantee teardown.
-                    let hup = libc::killpg(pgid, libc::SIGHUP);
-                    let kill = libc::killpg(pgid, libc::SIGKILL);
+                    let hup: i32 = libc::killpg(pgid, libc::SIGHUP);
+                    let kill: i32 = libc::killpg(pgid, libc::SIGKILL);
                     (hup, kill)
                 };
                 // Don't silently ignore the result: a non-`ESRCH` failure means
@@ -1002,9 +1002,9 @@ impl PtyShellSession {
                     if errno.raw_os_error() != Some(libc::ESRCH) && !super::shell::process_group_leader_is_gone(pgid) {
                         tracing::warn!(
                             pgid,
-                            hup_rc = hup,
-                            kill_rc = kill,
-                            error = %errno,
+                            hup,
+                            kill,
+                            error = %crate::agent::diagnostics::error_class(&errno),
                             "kill_now: killpg(SIGKILL) did not succeed"
                         );
                     }
@@ -1017,7 +1017,7 @@ impl PtyShellSession {
         // (clippy::significant_drop_in_scrutinee).
         let kill_result = self.child.lock().kill();
         if let Err(e) = kill_result {
-            tracing::warn!(error = %e, "kill_now: direct child kill failed");
+            tracing::warn!(error = %crate::agent::diagnostics::error_class(&e), "kill_now: direct child kill failed");
         }
     }
 
@@ -1179,8 +1179,8 @@ fn bounded_join(handle: std::thread::JoinHandle<()>, deadline: std::time::Durati
     while !handle.is_finished() {
         if start.elapsed() >= deadline {
             tracing::warn!(
-                "PTY drain reader did not stop within {:?}; detaching thread to avoid blocking chat (it is flagged to stop and will exit shortly)",
-                deadline
+                deadline_ms = deadline.as_millis(),
+                "PTY drain reader did not stop within the deadline; detaching thread to avoid blocking chat (it is flagged to stop and will exit shortly)"
             );
             // Drop `handle` without joining: detaches the thread.
             return false;

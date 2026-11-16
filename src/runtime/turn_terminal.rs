@@ -786,7 +786,7 @@ impl Drop for TurnTerminalGuard {
                         drop(stage);
                     }
                     if let Err(error) = &result {
-                        tracing::error!(error = %error, "Runtime interrupted terminal cleanup remains incomplete");
+                        tracing::error!(error = %crate::agent::diagnostics::error_class(error), "Runtime interrupted terminal cleanup remains incomplete");
                     }
                     if let Some(ticket) = cleanup_ticket {
                         ticket.finish(result.is_ok());

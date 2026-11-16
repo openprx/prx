@@ -285,7 +285,7 @@ impl ChatTuiApprovalStrategy {
             Ok(value) => Some(value),
             Err(error) => {
                 let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
-                tracing::error!(tool = %request.descriptor.public_name, error_len, error_sha256, "failed to serialize runtime approval grant");
+                tracing::error!(tool = %crate::agent::diagnostics::text_class(&request.descriptor.public_name), error_len, error_sha256, "failed to serialize runtime approval grant");
                 None
             }
         });
@@ -354,6 +354,18 @@ pub enum DispatchResult {
     Backpressured,
     /// Channel is closed (the dispatcher task has exited)
     ChannelClosed,
+}
+
+impl DispatchResult {
+    /// The result's name for the log.
+    #[must_use]
+    pub const fn kind(self) -> &'static str {
+        match self {
+            Self::Sent => "sent",
+            Self::Backpressured => "backpressured",
+            Self::ChannelClosed => "channel_closed",
+        }
+    }
 }
 
 impl ChatDispatcher {
@@ -1581,7 +1593,7 @@ impl EffectExecutor {
                         provider_turn_task_id,
                     ))
                 });
-                let provider_turn_task_id_for_trace = provider_turn_task_id.map(|id| id.get());
+                let trace_provider_turn_task_id = provider_turn_task_id.map(|id| id.get());
                 let provider_turn_lifecycle_tx = deps.provider_turn_lifecycle_tx.clone();
                 let provider_turn_handle_tx = deps.provider_turn_lifecycle_tx.clone();
                 let observer = Arc::clone(&deps.observer);
@@ -1610,7 +1622,7 @@ impl EffectExecutor {
                             let _ = tx.send(ProviderTurnLifecycleEvent::Started { task_id, lease_id }).await;
                         }
                         tracing::debug!(
-                            provider_turn_task_id = provider_turn_task_id_for_trace,
+                            provider_turn_task_id = trace_provider_turn_task_id,
                             provider_turn_execution_lease_id,
                             draft_id = %draft_id,
                             "provider turn worker task started"
@@ -1686,7 +1698,7 @@ impl EffectExecutor {
                         // `crate::agent::idle` finds it has stopped making progress.
                         scoped_driver.await;
                         tracing::debug!(
-                            provider_turn_task_id = provider_turn_task_id_for_trace,
+                            provider_turn_task_id = trace_provider_turn_task_id,
                             provider_turn_execution_lease_id,
                             "provider turn worker task exited"
                         );
@@ -1746,7 +1758,7 @@ impl EffectExecutor {
                     tracing::debug!(
                         draft_id = %draft_id,
                         text_len = text.len(),
-                        channel = %channel.name(),
+                        channel = %crate::agent::diagnostics::text_class(channel.name()),
                         "SendDraftFinalize effect: calling channel.finalize_draft"
                     );
                     if let Err(e) = channel.finalize_draft(recipient, &draft_id, &text).await {
@@ -1793,7 +1805,7 @@ impl EffectExecutor {
                     let _scope = guard_scope;
                     if let Err(e) = memory.store(&key, &value, category, None).await {
                         let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&e);
-                        tracing::warn!(error_len, error_sha256, key = %key, "PersistToMemory effect: store failed");
+                        tracing::warn!(error_len, error_sha256, key = %crate::agent::diagnostics::text_class(&key), "PersistToMemory effect: store failed");
                     }
                 });
             }
@@ -1808,7 +1820,7 @@ impl EffectExecutor {
             Effect::DisplayMedia { kind, path } => {
                 // Media display is a user-visible short synchronous path; record it with tracing (the observer has
                 // no generic trace variant, and in stage 5a-1 the legacy path still does the real media display).
-                tracing::debug!(kind = %kind, path = %path, "DisplayMedia effect");
+                tracing::debug!(kind = %crate::agent::diagnostics::text_class(&kind), path = %crate::agent::diagnostics::text_class(&path), "DisplayMedia effect");
                 let _ = deps.observer.name(); // placeholder so the deps.observer field is not warned about
             }
             Effect::AutoTitleSession(title) => {
@@ -1851,7 +1863,7 @@ impl EffectExecutor {
                         }
                         tracing::warn!(
                             tool_id = %tool_id,
-                            name = %name,
+                            name = %crate::agent::diagnostics::text_class(&name),
                             args_len = args.len(),
                             "RequestApproval effect: TUI active but no approval surface, failing closed"
                         );
@@ -2070,7 +2082,7 @@ async fn apply_redux_context_rollover(
     audit: Option<&crate::agent::document_ingest::DocumentIngestRuntime>,
     action_tx: &mpsc::Sender<Action>,
     reason: crate::chat::action::CompactReason,
-    trigger: &str,
+    trigger: &'static str,
 ) -> Result<ContextRolloverOutcome, ()> {
     if matches!(config.mode, crate::config::AgentCompactionMode::Off) {
         return Ok(ContextRolloverOutcome::default());
@@ -2219,7 +2231,7 @@ async fn apply_redux_context_rollover(
         // untrimmed compacted source, which is what the session adopts below.
         let before_trim = history.len();
         let mut projection_guard = compaction_guard_history.clone();
-        let trimmed = trim_redux_driver_context_budget_after_rollover(
+        let trimmed: bool = trim_redux_driver_context_budget_after_rollover(
             history,
             &mut projection_guard,
             config,
@@ -3593,8 +3605,8 @@ impl StreamChunkCoalescer {
     /// Returns a `DispatchResult` for the caller to observe (on Closed the caller should stop pumping chunks).
     pub fn try_send_chunk(&mut self, draft_id: String, delta: String, version: u64) -> DispatchResult {
         // 1. If pending exists, first try to send the accumulated result + the current delta as one merged Action
-        if let Some((p_draft, p_delta, p_version)) = self.pending.take() {
-            if p_draft == draft_id {
+        if let Some((pending_draft_id, p_delta, p_version)) = self.pending.take() {
+            if pending_draft_id == draft_id {
                 // same draft: accumulate the delta, take max of version (matching the reducer's strict-monotonic rule)
                 let merged_delta = format!("{p_delta}{delta}");
                 let merged_version = p_version.max(version);
@@ -3615,7 +3627,7 @@ impl StreamChunkCoalescer {
             }
             // different draft: the old pending is meaningless, drop it and take the fast path for the current delta
             tracing::warn!(
-                old_draft = %p_draft,
+                old_draft_id = %pending_draft_id,
                 new_draft = %draft_id,
                 "coalescer cross-draft pending dropped (defensive)"
             );

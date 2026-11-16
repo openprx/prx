@@ -498,7 +498,7 @@ impl ToolLoopOutcome {
             Self::AwaitingApproval { reply } => reply,
             Self::Silent { reason } => {
                 tracing::debug!(
-                    reason = reason.as_str(),
+                    reason = %crate::agent::diagnostics::text_class(&reason),
                     "tool loop produced a silent outcome on a legacy text path"
                 );
                 String::new()

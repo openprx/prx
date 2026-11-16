@@ -126,7 +126,7 @@ pub(crate) fn measure_native_tool_payload_for(
             // A schema that cannot be serialized here cannot reach the provider
             // either, so it contributes nothing to the request it would have
             // travelled in. The name is an identifier, not schema content.
-            tracing::warn!(tool = %spec.name, "native tool payload size skipped: schema is not serializable");
+            tracing::warn!(tool = %crate::agent::diagnostics::text_class(&spec.name), "native tool payload size skipped: schema is not serializable");
             continue;
         };
         bytes = bytes.saturating_add(serialized.len());

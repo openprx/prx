@@ -244,7 +244,7 @@ async fn kill_local_session(
         }
         Err(e) => {
             tracing::warn!(
-                error = %e,
+                error = %crate::agent::diagnostics::error_class(&e),
                 "Failed to serialize kill approval grant; proceeding without it"
             );
         }
@@ -734,7 +734,8 @@ pub(super) fn start_assignment_enrolment(
     use crate::chat::sessions::assignment::{self, Enrolable};
 
     match assignment::enrolable(config) {
-        Enrolable::No(reason) => {
+        Enrolable::No(not_enrolling) => {
+            let reason: &'static str = not_enrolling;
             tracing::debug!(reason, "chat is not enrolling for daemon assignments");
             return None;
         }
@@ -811,7 +812,7 @@ pub(super) async fn withdraw_assignment_enrolment(
             ),
         ),
         Err(error) => tracing::warn!(
-            error = %error,
+            error = %crate::agent::diagnostics::error_class(&error),
             "could not withdraw this chat session from the daemon assignment registry; it will be listed \
              as silent until an operator reaps it"
         ),
