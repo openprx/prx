@@ -197,6 +197,21 @@ pub(crate) fn is_loop_written_user_note(content: &str) -> bool {
         .any(|marker| content.starts_with(marker))
 }
 
+/// Whether a history message is a durable session turn: any assistant message,
+/// or a user message that is not one of the loop's own notes. Inbound user text
+/// is neutralised on entry ([`inbound_user_message`], [`stored_turn_message`]),
+/// so a user message that opens with a reserved marker is always loop-written;
+/// no loop note has the assistant role, so an assistant message is kept
+/// whatever its text. The reducer, when it rebuilds its history after adopting
+/// a compaction patch, and every sink's reducer form apply this one rule.
+pub(crate) fn is_durable_turn_message(message: &ChatMessage) -> bool {
+    match message.role.as_str() {
+        "assistant" => true,
+        "user" => !is_loop_written_user_note(&message.content),
+        _ => false,
+    }
+}
+
 /// Inbound user text as it may enter a history: unchanged, unless it opens
 /// with a reserved marker, which [`RESERVED_MARKER_ESCAPE`] then defuses.
 pub(crate) fn neutralize_reserved_markers(text: &str) -> std::borrow::Cow<'_, str> {
@@ -406,8 +421,13 @@ pub(crate) enum ToolLoopEvent {
     ContextCompactionPatch {
         patch: CompactionPatch,
         /// The canonical history the patch is guarded by (never a provider
-        /// view); adapters derive the reducer form from it.
+        /// view).
         source_history: crate::agent::turn_history::CanonicalHistory,
+        /// `source_history` with `patch` applied, with the provenance of
+        /// every message (which are acknowledged turns, which are this turn's
+        /// tool rounds). Adapters check that the patch replays to it and
+        /// derive the reducer form from it.
+        compacted_history: Box<crate::agent::turn_history::CanonicalHistory>,
         config: crate::config::AgentCompactionConfig,
         turns_before: usize,
         tokens_before: usize,

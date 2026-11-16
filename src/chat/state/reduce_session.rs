@@ -29,7 +29,10 @@ impl ChatState {
             return vec![
                 Effect::LogTrace {
                     level: tracing::Level::WARN,
-                    msg: format!("SessionLoaded rejected while generating: {id}"),
+                    msg: format!(
+                        "SessionLoaded rejected while generating: {}",
+                        crate::agent::diagnostics::text_class(&id)
+                    ),
                 },
                 Effect::ActionRejected {
                     reason: "a session cannot be loaded while a turn is generating".to_owned(),
@@ -116,7 +119,11 @@ impl ChatState {
             Effect::RequestRedraw,
             Effect::LogTrace {
                 level: tracing::Level::INFO,
-                msg: format!("Session loaded: {id} load_epoch={}", self.session.load_epoch),
+                msg: format!(
+                    "Session loaded: {} load_epoch={}",
+                    crate::agent::diagnostics::text_class(&id),
+                    self.session.load_epoch
+                ),
             },
         ]
     }
@@ -145,7 +152,7 @@ impl ChatState {
                 msg: format!(
                     "TurnAbortSettled admission={:?} request_removed={request_removed} turns={}",
                     admission_id,
-                    self.session.turns.len()
+                    Vec::len(&self.session.turns)
                 ),
             },
             Effect::SaveSession(self.session_commit()),
@@ -226,7 +233,7 @@ impl ChatState {
         };
         vec![Effect::LogTrace {
             level: tracing::Level::INFO,
-            msg: format!("{saved_label}: {id}"),
+            msg: format!("{saved_label}: {}", crate::agent::diagnostics::text_class(&id)),
         }]
     }
 
@@ -245,7 +252,7 @@ impl ChatState {
             Effect::SaveSession(self.session_commit()),
             Effect::LogTrace {
                 level: tracing::Level::INFO,
-                msg: format!("Session switching to: {id}"),
+                msg: format!("Session switching to: {}", crate::agent::diagnostics::text_class(&id)),
             },
             Effect::RequestRedraw,
         ]
@@ -317,7 +324,7 @@ impl ChatState {
             .push(crate::agent::turn_contracts::inbound_user_message(&content));
         vec![Effect::LogTrace {
             level: tracing::Level::DEBUG,
-            msg: format!("RecordUserTurn len={}", self.session.turns.len()),
+            msg: format!("RecordUserTurn len={}", Vec::len(&self.session.turns)),
         }]
     }
 
@@ -356,7 +363,7 @@ impl ChatState {
         self.session.history.push(ChatMessage::assistant(content));
         vec![Effect::LogTrace {
             level: tracing::Level::DEBUG,
-            msg: format!("RecordAssistantTurn len={}", self.session.turns.len()),
+            msg: format!("RecordAssistantTurn len={}", Vec::len(&self.session.turns)),
         }]
     }
 
@@ -373,7 +380,7 @@ impl ChatState {
         self.session.history.push(ChatMessage::system(content));
         vec![Effect::LogTrace {
             level: tracing::Level::DEBUG,
-            msg: format!("RecordSystemMessage history_len={}", self.session.history.len()),
+            msg: format!("RecordSystemMessage history_len={}", Vec::len(&self.session.history)),
         }]
     }
 
@@ -404,7 +411,7 @@ impl ChatState {
         }
         vec![Effect::LogTrace {
             level: tracing::Level::DEBUG,
-            msg: format!("SetLeadingSystemPrompt history_len={}", self.session.history.len()),
+            msg: format!("SetLeadingSystemPrompt history_len={}", Vec::len(&self.session.history)),
         }]
     }
 
@@ -505,7 +512,7 @@ impl ChatState {
                     msg: format!(
                         "HistoryCompactionPatch rejected reason={reason:?} error={}; history unchanged len={}",
                         crate::agent::diagnostics::error_class(&error),
-                        history.len()
+                        Vec::len(history)
                     ),
                 },
                 Effect::ActionRejected {
@@ -565,7 +572,7 @@ impl ChatState {
                     patch.replacement.len(),
                     patch.append_after.len(),
                     budget.over_hard_limit,
-                    history.len()
+                    Vec::len(history)
                 ),
             },
             Effect::SaveSession(self.session_commit()),

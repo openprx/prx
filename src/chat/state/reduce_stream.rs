@@ -105,7 +105,10 @@ impl ChatState {
         vec![
             Effect::LogTrace {
                 level: tracing::Level::INFO,
-                msg: format!("turn_started draft_id={draft_id}"),
+                msg: format!(
+                    "turn_started draft_id={}",
+                    crate::agent::diagnostics::text_class(&draft_id)
+                ),
             },
             Effect::RequestRedraw,
         ]
@@ -121,7 +124,10 @@ impl ChatState {
         vec![
             Effect::LogTrace {
                 level: tracing::Level::INFO,
-                msg: format!("turn_started draft_id={draft_id}"),
+                msg: format!(
+                    "turn_started draft_id={}",
+                    crate::agent::diagnostics::text_class(&draft_id)
+                ),
             },
             Effect::RequestRedraw,
         ]
@@ -174,7 +180,11 @@ impl ChatState {
         vec![
             Effect::LogTrace {
                 level: tracing::Level::INFO,
-                msg: format!("start_llm_turn draft_id={draft_id} history_len={}", history.len()),
+                msg: format!(
+                    "start_llm_turn draft_id={} history_len={}",
+                    crate::agent::diagnostics::text_class(&draft_id),
+                    history.len()
+                ),
             },
             Effect::StartTurn {
                 provider_turn_task_id,
@@ -228,7 +238,11 @@ impl ChatState {
         vec![
             Effect::LogTrace {
                 level: tracing::Level::INFO,
-                msg: format!("start_llm_turn draft_id={draft_id} history_len={}", history.len()),
+                msg: format!(
+                    "start_llm_turn draft_id={} history_len={}",
+                    crate::agent::diagnostics::text_class(&draft_id),
+                    history.len()
+                ),
             },
             Effect::StartTurn {
                 provider_turn_task_id,
@@ -484,7 +498,8 @@ impl ChatState {
             Effect::LogTrace {
                 level: tracing::Level::WARN,
                 msg: format!(
-                    "stream_failed draft_id={draft_id} retryable={retryable} orphan_user_removed={orphan_user_removed} err_len={err_len} err_sha256={err_sha256}"
+                    "stream_failed draft_id={} retryable={retryable} orphan_user_removed={orphan_user_removed} err_len={err_len} err_sha256={err_sha256}",
+                    crate::agent::diagnostics::text_class(&draft_id)
                 ),
             },
             Effect::NotifyHook {

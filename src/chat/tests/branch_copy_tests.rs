@@ -310,10 +310,14 @@ async fn a_branch_of_a_nested_chain_reads_the_fact_through_its_own_copies_only()
                 content: turn.content.clone(),
             })
             .collect::<Vec<_>>();
-        let provenance =
-            resolve_compaction_event_provenance(chain.memory.as_ref(), target.memory_principal(), &branch_messages)
-                .await
-                .expect("test: provenance read");
+        let provenance = resolve_compaction_event_provenance(
+            chain.memory.as_ref(),
+            target.memory_principal(),
+            &branch_messages,
+            crate::agent::compaction::RoundCompanions::Acknowledged,
+        )
+        .await
+        .expect("test: provenance read");
         assert_eq!(
             provenance.map(|provenance| provenance.source_event_ids.len()),
             Some(branch_messages.len()),
@@ -378,6 +382,7 @@ async fn a_failing_row_rolls_back_every_earlier_copy() {
                     content: turn.content.clone(),
                 })
                 .collect::<Vec<_>>(),
+            crate::agent::compaction::RoundCompanions::Acknowledged,
         )
         .await
         .expect("test: provenance read")

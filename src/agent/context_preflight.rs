@@ -126,24 +126,9 @@ pub(super) async fn preflight_durable_compaction(
     // shrank. The view degrades to a lossy trim and the downgrade is recorded.
     // Measured on the provider view the gate saw, built from and applied to
     // the canonical history.
-    match apply_configurable_compaction_over_view(
-        canonical.durable_compaction_target(),
-        view,
-        provider,
-        model,
-        config,
-        audit,
-        trigger,
-    )
-    .await
-    {
+    match apply_configurable_compaction_over_view(canonical, view, provider, model, config, audit, trigger).await {
         Ok(Some(replacement_len)) => {
-            restore_current_turn_request(
-                canonical.durable_compaction_target(),
-                request,
-                trigger,
-                RestoredRequestPosition::Tail,
-            );
+            canonical.restore_request_at_tail(request, trigger);
             Ok(PreflightCompaction {
                 source: Some(before),
                 replacement_len: Some(replacement_len.saturating_add(replacement_offset)),
@@ -213,13 +198,13 @@ pub(super) async fn preflight_trim_projection(
     };
     let trimmed: bool = turn_history.reshape(view, |view| {
         let current_request = capture_current_turn_request(view);
-        let trimmed = if let Some(replacement_len) = replacement_len {
+        let applied = if let Some(replacement_len) = replacement_len {
             trim_history_to_context_budget_preserving_compaction_replacement_with_floor(view, config, replacement_len)
         } else {
             trim_history_to_context_budget(view, config)
         };
         restore_current_turn_request(view, current_request, trigger, restore_position);
-        trimmed
+        applied
     });
     let after = plan_context_budget(view, config, PRE_TURN_FLUSH_THRESHOLD);
     tracing::warn!(

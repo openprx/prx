@@ -434,12 +434,12 @@ pub(super) async fn finalize_recovery_terminal(
                 Ok(InlineProjection::Settled) => false,
                 Ok(InlineProjection::Retryable) => true,
                 Err(error) => {
-                    tracing::warn!(error = %crate::agent::diagnostics::error_class(&error), settlement_id = %commit.terminal_id, "recovery cost projection failed");
+                    tracing::warn!(error = %crate::agent::diagnostics::error_class(&error), settlement_id = %crate::agent::diagnostics::text_class(&commit.terminal_id), "recovery cost projection failed");
                     true
                 }
             };
             if retryable {
-                tracing::warn!(settlement_id = %commit.terminal_id, "recovery cost projection deferred to the cost outbox projector");
+                tracing::warn!(settlement_id = %crate::agent::diagnostics::text_class(&commit.terminal_id), "recovery cost projection deferred to the cost outbox projector");
                 crate::runtime::cost_recovery::rearm();
             }
         }

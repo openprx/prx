@@ -175,7 +175,7 @@ impl Metrics {
 pub(crate) fn record_round_trip(round: RoundTrip<'_>) {
     let provider: ProviderLabel = ProviderLabel::redacted(round.provider);
     let model: ProviderLabel = ProviderLabel::redacted(round.model);
-    let (system_prefix_changed, tools_prefix_changed) =
+    let (system_prefix_changed, tools_prefix_changed): (bool, bool) =
         METRICS.lock().record(&round, provider.as_str(), model.as_str());
     let usage_reported: bool = round.usage.source == TokenUsageSource::Reported;
     tracing::debug!(target: "openprx::prompt_cache", %provider, %model,

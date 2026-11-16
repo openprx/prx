@@ -403,7 +403,7 @@ async fn run_internal(
     // var is not parsed in several places.
     // S4-B: Pure is the only supported run path; non-Pure values are warned about and forced up.
     #[cfg(feature = "terminal-tui")]
-    let top_redux_mode = { ReduxMode::from_env() };
+    let top_redux_mode: ReduxMode = { ReduxMode::from_env() };
     #[cfg(feature = "terminal-tui")]
     let max_concurrent_visible_turns = config.chat.max_concurrent_visible_turns.max(1);
     #[cfg(not(feature = "terminal-tui"))]
@@ -429,7 +429,7 @@ async fn run_internal(
     // Pick the EffectExecutor mode from the redux mode (TUI feature only)
     #[cfg(feature = "terminal-tui")]
     let effect_executor = {
-        let mode = top_redux_mode;
+        let mode: ReduxMode = top_redux_mode;
         let deps = dispatcher::EffectDeps {
             provider: Arc::clone(&provider),
             memory_event_recording: config.memory.event_recording_config(),
@@ -3481,7 +3481,7 @@ Retry with a compatible model: /provider {shown} <model>",
             // Registry roots before routing, refresh and alias expansion;
             // the wire count is the compiled-request event's
             // `tool_snapshot.count`.
-            registry_root_tools = tools_registry.len(),
+            registry_root_tools = Vec::len(&tools_registry),
             route = "ReduxDriver",
             "chat::run turn route decision"
         );
@@ -3694,7 +3694,7 @@ Retry with a compatible model: /provider {shown} <model>",
                     .is_some()
                 {
                     tracing::warn!(
-                        task_id = task_id.get(),
+                        task_id = crate::chat::turn_scheduler::TurnTaskId::get(task_id),
                         "replaced pending Redux turn context before completion"
                     );
                 }

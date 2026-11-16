@@ -113,15 +113,6 @@ fn conversation_lines_from_turns(turns: &[ChatTurn]) -> Vec<ConversationLine> {
         .collect()
 }
 
-/// A compacted history message that belongs in the durable transcript: a user
-/// or assistant turn that is not one of the loop's own notes (the refresh
-/// aside, a `[Tool results]` block, a recalled page). A real user turn that
-/// opened with a marker was neutralised on entry and stays durable.
-fn is_durable_compaction_history_message(message: &ChatMessage) -> bool {
-    matches!(message.role.as_str(), "user" | "assistant")
-        && !crate::agent::turn_contracts::is_loop_written_user_note(&message.content)
-}
-
 /// The durable turns of a compacted history. `handoff_notes` are the exact
 /// contents of the context handoff notes the compaction code wrote (the
 /// current patch's and every earlier one the session kept); a turn equal to
@@ -133,7 +124,7 @@ fn durable_turns_from_compacted_history(
     let timestamp = chrono::Utc::now();
     history
         .iter()
-        .filter(|message| is_durable_compaction_history_message(message))
+        .filter(|message| crate::agent::turn_contracts::is_durable_turn_message(message))
         .map(|message| ChatTurn {
             role: message.role.clone(),
             content: message.content.clone(),

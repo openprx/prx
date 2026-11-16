@@ -483,7 +483,8 @@ pub fn create_memory_with_storage_and_routes_with_acl(
     {
         tracing::info!("🧬 Cold boot detected — hydrating from MEMORY_SNAPSHOT.md");
         match snapshot::hydrate_from_snapshot(workspace_dir) {
-            Ok(count) => {
+            Ok(hydrated) => {
+                let count: usize = hydrated;
                 if count > 0 {
                     tracing::info!("🧬 Hydrated {count} core memories from snapshot");
                 }

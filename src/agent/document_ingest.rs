@@ -256,7 +256,7 @@ pub(super) async fn persist_tool_output_document(
     match runtime.memory.ingest_document(input).await {
         Ok(document) => {
             tracing::info!(
-                document_id = %document.document_id,
+                document_id = %crate::agent::diagnostics::text_class(&document.document_id),
                 tool = %crate::agent::diagnostics::text_class(tool_name),
                 chunks = document.chunk_count,
                 "Persisted oversized tool output into document store"
@@ -265,7 +265,7 @@ pub(super) async fn persist_tool_output_document(
         }
         Err(error) => {
             tracing::warn!(
-                document_id = %document_id,
+                document_id = %crate::agent::diagnostics::text_class(&document_id),
                 tool = %crate::agent::diagnostics::text_class(tool_name),
                 error = %crate::agent::diagnostics::error_class(&error),
                 "Failed to persist oversized tool output into document store"
@@ -374,7 +374,7 @@ pub(super) async fn persist_untrusted_external_copy(
     match runtime.memory.ingest_document(input).await {
         Ok(document) => {
             tracing::info!(
-                document_id = %document.document_id,
+                document_id = %crate::agent::diagnostics::text_class(&document.document_id),
                 tool = %crate::agent::diagnostics::text_class(tool_name),
                 chunks = document.chunk_count,
                 "Persisted read-only untrusted external content copy"
@@ -382,7 +382,7 @@ pub(super) async fn persist_untrusted_external_copy(
         }
         Err(error) => {
             tracing::warn!(
-                document_id = %document_id,
+                document_id = %crate::agent::diagnostics::text_class(&document_id),
                 tool = %crate::agent::diagnostics::text_class(tool_name),
                 error = %crate::agent::diagnostics::error_class(&error),
                 "Failed to persist untrusted external content copy (non-fatal)"

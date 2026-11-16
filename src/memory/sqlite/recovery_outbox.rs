@@ -205,7 +205,7 @@ pub(super) fn scan_recovery_costs(
         match authenticate(&directory, row) {
             Ok(row) => rows.push(row),
             Err(_) => {
-                tracing::warn!(%settlement_id, "recovery cost outbox row failed authentication; left unprojected")
+                tracing::warn!(settlement_id = %crate::agent::diagnostics::text_class(&settlement_id), "recovery cost outbox row failed authentication; left unprojected")
             }
         }
     }

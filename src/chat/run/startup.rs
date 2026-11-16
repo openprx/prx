@@ -232,7 +232,7 @@ pub(in crate::chat) async fn resume_session(
                 .await
             {
                 Ok(Some(s)) => {
-                    info!(id = %s.id, title_len = s.title.chars().count(), turns_count = s.turn_count(), "Resumed session");
+                    info!(id = %crate::agent::diagnostics::text_class(&s.id), title_len = s.title.chars().count(), turns_count = s.turn_count(), "Resumed session");
                     s
                 }
                 Ok(None) if strict => anyhow::bail!("no saved chat session to continue"),
@@ -252,7 +252,7 @@ pub(in crate::chat) async fn resume_session(
                 .await
             {
                 Ok(Some(s)) => {
-                    info!(id = %s.id, title_len = s.title.chars().count(), turns_count = s.turn_count(), "Resumed session");
+                    info!(id = %crate::agent::diagnostics::text_class(&s.id), title_len = s.title.chars().count(), turns_count = s.turn_count(), "Resumed session");
                     s
                 }
                 Ok(None) if strict => anyhow::bail!("session '{id}' not found"),

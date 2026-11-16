@@ -525,7 +525,8 @@ fn folded_tool_roundtrips_counts_requests_and_names_their_tools() {
         "{} web_search output",
         crate::agent::turn_contracts::TOOL_RESULTS_PREFIX
     )));
-    let folded = folded_tool_roundtrips(&window);
+    let companions = shape_companions(&window);
+    let folded = folded_tool_roundtrips(&window, RoundCompanions::Marked(&companions));
     assert_eq!(
         folded.count, 4,
         "three native envelopes plus one prompt-mode results block"
@@ -541,7 +542,8 @@ fn folded_tool_roundtrips_counts_requests_and_names_their_tools() {
         "notice must say the folded output cannot be looked up: {notice}"
     );
 
-    let empty = folded_tool_roundtrips(&[ChatMessage::user("plain"), ChatMessage::assistant("plain")]);
+    let plain = [ChatMessage::user("plain"), ChatMessage::assistant("plain")];
+    let empty = folded_tool_roundtrips(&plain, RoundCompanions::Marked(&shape_companions(&plain)));
     assert_eq!(empty, FoldedToolRoundtrips::default());
     assert_eq!(
         format_folded_tool_roundtrips_notice(&empty),
@@ -643,10 +645,16 @@ async fn context_switch_resolves_provenance_across_tool_roundtrips() {
     };
 
     let cold_window = history.get(1..37).expect("cold window slice").to_vec();
-    let provenance = resolve_compaction_event_provenance(&*memory, envelope.memory_principal(), &cold_window)
-        .await
-        .unwrap()
-        .expect("tool round-trips must not make provenance unresolvable");
+    let companions = shape_companions(&cold_window);
+    let provenance = resolve_compaction_event_provenance(
+        &*memory,
+        envelope.memory_principal(),
+        &cold_window,
+        RoundCompanions::Marked(&companions),
+    )
+    .await
+    .unwrap()
+    .expect("tool round-trips must not make provenance unresolvable");
     assert_eq!(
         provenance.source_event_ids.len(),
         18,
@@ -998,7 +1006,7 @@ async fn a_cold_window_of_only_tool_roundtrips_still_folds_into_one_handoff() {
 
     // The unit the whole outcome turns on.
     assert_eq!(
-        compaction_boundary_without_orphan_tool_results(&history, 1, 41),
+        compaction_boundary_without_orphan_tool_results(&shape_companions(&history), 1, 41),
         42,
         "a boundary that cannot walk back must walk forward, not give up"
     );
@@ -1102,10 +1110,16 @@ async fn switch_provenance_holds_when_tool_events_are_recorded() {
     );
 
     let cold_window = history.get(1..37).expect("cold window slice").to_vec();
-    let provenance = resolve_compaction_event_provenance(&*memory, envelope.memory_principal(), &cold_window)
-        .await
-        .unwrap()
-        .expect("recorded tool events must not make provenance unresolvable");
+    let companions = shape_companions(&cold_window);
+    let provenance = resolve_compaction_event_provenance(
+        &*memory,
+        envelope.memory_principal(),
+        &cold_window,
+        RoundCompanions::Marked(&companions),
+    )
+    .await
+    .unwrap()
+    .expect("recorded tool events must not make provenance unresolvable");
     assert_eq!(provenance.source_event_ids.len(), 18);
     assert_eq!(provenance.companion_message_count, 18);
 
@@ -1450,6 +1464,7 @@ async fn compaction_provenance_refuses_ambiguous_repeated_event_sequences() {
         mem.as_ref(),
         envelope.memory_principal(),
         &[ChatMessage::user("same repeated turn")],
+        RoundCompanions::Acknowledged,
     )
     .await
     .unwrap();
@@ -1712,4 +1727,10 @@ async fn the_preflight_builds_its_durable_compaction_from_the_canonical_history_
     })
     .await
     .expect("the preflight capture test finishes within PREFLIGHT_CAPTURE_DEADLINE");
+}
+
+/// The companion flags of a fixture window that carries no recorded
+/// provenance (as a caller without a session): read by the round-trip shape.
+fn shape_companions(messages: &[ChatMessage]) -> Vec<bool> {
+    crate::agent::turn_history::CanonicalHistory::from_test_messages(messages.to_vec()).tool_round_companions()
 }

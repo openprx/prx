@@ -457,7 +457,7 @@ pub(super) async fn build_chat_compaction_patch(
 ) -> Option<crate::agent::turn_contracts::CompactionPatch> {
     match build_configurable_compaction_patch_with_source_history(
         budget_history,
-        source_history.messages(),
+        source_history,
         provider,
         model,
         config,
@@ -689,6 +689,7 @@ pub(super) async fn persist_legacy_chat_compaction_audit(
         mem,
         envelope.memory_principal(),
         source_history,
+        crate::agent::compaction::RoundCompanions::Acknowledged,
     )
     .await
     {
@@ -872,9 +873,10 @@ pub(super) async fn persist_legacy_chat_compaction_audit(
 /// private mutation of the provider view.
 ///
 /// The turn's request is already recorded in the reducer (`UserTurnAdmitted` at
-/// admission), so the reducer's target is the compacted view in its durable
-/// form (native tool envelopes and loop notes removed, as for a worker) with
-/// the recorded plain request in place of the enriched one. The patch is
+/// admission), so the reducer's target is the compacted canonical history in
+/// its reducer form (as for a worker: the pending request and this turn's tool
+/// rounds left out by provenance, every acknowledged turn kept whatever its
+/// text) with the recorded plain request appended. The patch is
 /// guarded by the reducer history this sink tracks and is awaited: the reducer
 /// applies it with its typed apply, and a refusal changes nothing. Either way
 /// [`Self::compacted`] reports that the provider view diverged from the
@@ -925,19 +927,28 @@ impl InlineCompactionSink {
     async fn adopt_patch(
         &self,
         source_history: crate::agent::turn_history::CanonicalHistory,
+        compacted: crate::agent::turn_history::CanonicalHistory,
         patch: crate::agent::turn_contracts::CompactionPatch,
         config: crate::config::AgentCompactionConfig,
     ) -> anyhow::Result<()> {
         self.mark_compacted();
-        let mut compacted = source_history;
-        if let Err(error) = compacted.apply_patch(&patch) {
+        let mut replayed = source_history;
+        if let Err(error) = replayed.apply_patch(&patch) {
             let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
             tracing::warn!(
                 error_len,
                 error_sha256,
                 guard_history_len = patch.guard.history_len,
-                source_len = compacted.len(),
+                source_len = replayed.len(),
                 "inline compaction patch does not match its source; reducer patch not sent"
+            );
+            return Ok(());
+        }
+        if replayed != compacted {
+            tracing::warn!(
+                replayed_len = replayed.len(),
+                compacted_len = compacted.len(),
+                "inline compaction patch does not replay to its compacted history; reducer patch not sent"
             );
             return Ok(());
         }
@@ -969,7 +980,7 @@ impl InlineCompactionSink {
             crate::chat::acked_session::Ack::Published(_) => *self.reducer_history.lock() = target,
             crate::chat::acked_session::Ack::Unchanged(_) | crate::chat::acked_session::Ack::Rejected(_) => {
                 tracing::warn!(
-                    replacement_len = target.len(),
+                    replacement_len = crate::agent::turn_history::CanonicalHistory::len(&target),
                     "inline compaction was not adopted by the session; the provider view follows the acknowledged session after the turn"
                 );
             }
@@ -984,10 +995,14 @@ impl crate::agent::turn_contracts::ToolLoopEventSink for InlineCompactionSink {
         match event {
             crate::agent::turn_contracts::ToolLoopEvent::ContextCompactionPatch {
                 source_history,
+                compacted_history,
                 patch,
                 config,
                 ..
-            } => self.adopt_patch(source_history, patch, config).await,
+            } => {
+                self.adopt_patch(source_history, *compacted_history, patch, config)
+                    .await
+            }
             // Text and tool progress reach the terminal through the turn's
             // own delta and tool-call channels.
             crate::agent::turn_contracts::ToolLoopEvent::TextDelta(_)

@@ -313,7 +313,13 @@ fn run_pty_attach(session: &crate::chat::sessions::pty::PtyShellSession) -> PtyE
                     pixel_width: 0,
                     pixel_height: 0,
                 }) {
-                    tracing::warn!(error = %crate::agent::diagnostics::error_class(&e), cols, rows, "PTY resize forward failed");
+                    let (log_cols, log_rows): (u16, u16) = (cols, rows);
+                    tracing::warn!(
+                        error = %crate::agent::diagnostics::error_class(&e),
+                        cols = log_cols,
+                        rows = log_rows,
+                        "PTY resize forward failed"
+                    );
                 }
             }
         }

@@ -224,8 +224,8 @@ impl SuspendingApprovalResolver {
             prompt: prompt.to_owned(),
         }) {
             tracing::warn!(
-                run_id = %self.run_id,
-                session_id = %self.session_id,
+                run_id = %crate::agent::diagnostics::text_class(&self.run_id),
+                session_id = %crate::agent::diagnostics::text_class(self.session_id.as_str()),
                 error = %crate::agent::diagnostics::error_class(&error),
                 "failed to enqueue NeedsInput banner"
             );
@@ -347,7 +347,7 @@ impl ApprovalResolver for SuspendingApprovalResolver {
             return ApprovalDecision::Deny;
         }
 
-        tracing::info!(run_id = %self.run_id, tool = %crate::agent::diagnostics::text_class(&request.tool_name), "background sub-agent suspended awaiting approval");
+        tracing::info!(run_id = %crate::agent::diagnostics::text_class(&self.run_id), tool = %crate::agent::diagnostics::text_class(&request.tool_name), "background sub-agent suspended awaiting approval");
 
         // 4. Await the operator decision, bounded by the approval timeout. A
         //    timeout or a dropped sender (kill/teardown) is treated as a safe
@@ -358,11 +358,11 @@ impl ApprovalResolver for SuspendingApprovalResolver {
         let decision = match tokio::time::timeout(self.timeout, rx).await {
             Ok(Ok(decision)) => decision,
             Ok(Err(_recv_closed)) => {
-                tracing::warn!(run_id = %self.run_id, "approval waiter channel closed; defaulting to deny");
+                tracing::warn!(run_id = %crate::agent::diagnostics::text_class(&self.run_id), "approval waiter channel closed; defaulting to deny");
                 ApprovalDecision::Deny
             }
             Err(_elapsed) => {
-                tracing::warn!(run_id = %self.run_id, timeout_secs = self.timeout.as_secs(), "approval timed out; defaulting to deny");
+                tracing::warn!(run_id = %crate::agent::diagnostics::text_class(&self.run_id), timeout_secs = std::time::Duration::as_secs(&self.timeout), "approval timed out; defaulting to deny");
                 ApprovalDecision::Deny
             }
         };

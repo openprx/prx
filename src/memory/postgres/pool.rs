@@ -253,7 +253,7 @@ impl PostgresConnectionPool {
         if waited {
             self.metrics.saturated_acquisitions.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(
-                waited_ms = elapsed.as_millis(),
+                waited_ms = std::time::Duration::as_millis(&elapsed),
                 max_size = self.max_size,
                 "PostgreSQL connection pool saturated; checkout was queued"
             );

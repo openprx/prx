@@ -707,7 +707,7 @@ async fn terminate(
     tracing::error!(
         reason = reason_label,
         label = %crate::agent::diagnostics::text_class(label),
-        idle_secs = terminated.idle.as_secs(),
+        idle_secs = std::time::Duration::as_secs(&terminated.idle),
         threshold_secs = threshold.as_secs(),
         elapsed_secs = terminated.elapsed.as_secs(),
         progress_events = terminated.progress_events,

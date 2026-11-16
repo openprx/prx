@@ -946,7 +946,7 @@ pub(crate) async fn increment_recalled_useful_counts(mem: &dyn Memory, recalled_
     let unique_ids: BTreeSet<&str> = recalled_ids.iter().map(String::as_str).collect();
     for id in unique_ids {
         if let Err(error) = mem.increment_useful_count(id).await {
-            tracing::debug!(memory_id = id, error = %crate::agent::diagnostics::error_class(&error), "failed to increment useful_count");
+            tracing::debug!(memory_id = %crate::agent::diagnostics::text_class(id), error = %crate::agent::diagnostics::error_class(&error), "failed to increment useful_count");
         }
     }
 }

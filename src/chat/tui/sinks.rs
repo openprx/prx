@@ -131,14 +131,14 @@ impl crate::channels::terminal::TuiMirrorSink for SnapshotDispatcherSink {
     fn start_stream(&self, draft_id: &str) {
         tracing::trace!(
             site = "snapshot_sink.start_stream",
-            draft_id,
+            draft_id = %crate::agent::diagnostics::text_class(draft_id),
             "Pure mode ignores the UiActor side path (driver already dispatched TurnStarted)"
         );
     }
     fn update_stream(&self, draft_id: &str, accumulated: &str, version: u64) {
         tracing::trace!(
             site = "snapshot_sink.update_stream",
-            draft_id,
+            draft_id = %crate::agent::diagnostics::text_class(draft_id),
             version,
             chars = accumulated.chars().count(),
             "Pure mode ignores the UiActor side path (driver already dispatched StreamChunkReceived)"
@@ -147,7 +147,7 @@ impl crate::channels::terminal::TuiMirrorSink for SnapshotDispatcherSink {
     fn finalize_stream(&self, draft_id: &str, final_text: &str) {
         tracing::trace!(
             site = "snapshot_sink.finalize_stream",
-            draft_id,
+            draft_id = %crate::agent::diagnostics::text_class(draft_id),
             chars = final_text.chars().count(),
             "Pure mode ignores the UiActor side path (driver already dispatched StreamCompleted)"
         );
@@ -155,7 +155,7 @@ impl crate::channels::terminal::TuiMirrorSink for SnapshotDispatcherSink {
     fn cancel_stream(&self, draft_id: &str) {
         tracing::trace!(
             site = "snapshot_sink.cancel_stream",
-            draft_id,
+            draft_id = %crate::agent::diagnostics::text_class(draft_id),
             "Pure mode ignores the UiActor side path (driver already dispatched StreamCancelled)"
         );
     }

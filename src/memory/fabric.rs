@@ -642,7 +642,7 @@ impl MemoryFabric {
                 .await;
             if let Err(error) = link {
                 tracing::debug!(
-                    %document_id,
+                    document_id = %crate::agent::diagnostics::text_class(&document_id),
                     key = %crate::agent::diagnostics::text_class(key),
                     error = %crate::agent::diagnostics::error_class(&error), "memory source link skipped (backend unsupported or transient)"
                 );

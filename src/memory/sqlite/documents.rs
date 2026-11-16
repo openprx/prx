@@ -496,7 +496,7 @@ impl SqliteMemory {
                     let embedding = vector::bytes_to_vec(&embedding_blob);
                     if embedding.len() != embedding_dimensions {
                         tracing::debug!(
-                            chunk_id = %chunk.chunk_id,
+                            chunk_id = %crate::agent::diagnostics::text_class(&chunk.chunk_id),
                             expected_dimensions = embedding_dimensions,
                             actual_dimensions = embedding.len(),
                             "Skipping stale document chunk embedding with mismatched dimensions"
@@ -576,7 +576,7 @@ impl SqliteMemory {
             let document_scope = document_scope.flatten();
             if !super::agent_migration::scopes_compatible(&tx, document_scope.as_deref(), bound_scope.as_deref())? {
                 tracing::debug!(
-                    document_id = %input.document_id,
+                    document_id = %crate::agent::diagnostics::text_class(&input.document_id),
                     "memory source link refused: document is not the writer's incarnation"
                 );
                 return Err(AgentScopeRefused.into());

@@ -847,7 +847,7 @@ impl Drop for AssignmentTurnGuard {
             // can be found rather than pretending the report went out.
             let status_label: &'static str = status.as_str();
             tracing::warn!(
-                assignment = %self.assignment_id,
+                assignment = %crate::agent::diagnostics::text_class(&self.assignment_id),
                 status = status_label,
                 "no tokio runtime to report a daemon assignment result on"
             );

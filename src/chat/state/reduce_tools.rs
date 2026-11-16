@@ -316,7 +316,11 @@ impl ChatState {
         vec![
             Effect::LogTrace {
                 level: tracing::Level::DEBUG,
-                msg: format!("tool_approval_requested tool_id={tool_id} name_len={}", name.len()),
+                msg: format!(
+                    "tool_approval_requested tool_id={} name_len={}",
+                    crate::agent::diagnostics::text_class(&tool_id),
+                    name.len()
+                ),
             },
             Effect::RequestApproval {
                 task_id,
@@ -345,7 +349,10 @@ impl ChatState {
         vec![
             Effect::LogTrace {
                 level: tracing::Level::DEBUG,
-                msg: format!("tool_approval_received tool_id={tool_id} approved={approved}"),
+                msg: format!(
+                    "tool_approval_received tool_id={} approved={approved}",
+                    crate::agent::diagnostics::text_class(&tool_id)
+                ),
             },
             Effect::RequestRedraw,
         ]
@@ -544,7 +551,10 @@ fn cancel_after_ready_for_commit(draft_id: &str) -> Vec<Effect> {
     vec![
         Effect::LogTrace {
             level: tracing::Level::INFO,
-            msg: format!("cancel_after_ready_for_commit draft_id={draft_id}: turn already finished"),
+            msg: format!(
+                "cancel_after_ready_for_commit draft_id={}: turn already finished",
+                crate::agent::diagnostics::text_class(&draft_id)
+            ),
         },
         Effect::RequestRedraw,
     ]

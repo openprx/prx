@@ -1,6 +1,7 @@
 use crate::agent::compaction::COMPACTION_MAX_SUMMARY_CHARS;
 use crate::agent::context_budget::{estimate_history_tokens, plan_context_budget};
 use crate::agent::document_ingest::DocumentIngestRuntime;
+#[cfg(test)]
 use crate::agent::history::drop_orphan_tool_results_at;
 use crate::agent::response_guard::strip_quoted_fabricated_tool_markers;
 use crate::agent::turn_contracts::OS_PAGING_RECALL_MARKER;
@@ -60,31 +61,71 @@ fn build_page_transcript(messages: &[ChatMessage]) -> String {
 /// the function returns `Ok(false)` (or propagates only on genuinely fatal
 /// errors) so the caller can fall back to legacy compaction without regression.
 ///
+#[cfg(test)]
 pub(super) async fn apply_os_paging(
     history: &mut Vec<ChatMessage>,
     config: &crate::config::AgentCompactionConfig,
     runtime: Option<&DocumentIngestRuntime>,
 ) -> Result<bool> {
+    let Some(eviction) = plan_os_paging(history, config, runtime).await? else {
+        return Ok(false);
+    };
+    eviction.apply_to(history);
+    Ok(true)
+}
+
+/// An OS-paging eviction whose page is already in the document store:
+/// `history[start..end]` is replaced by `breadcrumb`, and any `role="tool"`
+/// result left directly behind the breadcrumb is dropped with it.
+#[derive(Debug, Clone)]
+pub(super) struct OsPagingEviction {
+    pub(super) start: usize,
+    pub(super) end: usize,
+    pub(super) breadcrumb: ChatMessage,
+}
+
+impl OsPagingEviction {
+    /// Apply the eviction to the history it was planned over.
+    #[cfg(test)]
+    fn apply_to(&self, history: &mut Vec<ChatMessage>) {
+        if self.start > self.end || self.end > history.len() {
+            return;
+        }
+        history.splice(self.start..self.end, std::iter::once(self.breadcrumb.clone()));
+        // The breadcrumb carries no `tool_calls`, so anything left directly
+        // behind it that still claims to answer one is an orphan.
+        drop_orphan_tool_results_at(history, self.start.saturating_add(1));
+    }
+}
+
+/// Plan an OS-paging eviction of `history` and write its page to the document
+/// store; the caller applies the returned eviction. `Ok(None)` when nothing is
+/// evicted (all failures are soft, as for [`apply_os_paging`]).
+pub(super) async fn plan_os_paging(
+    history: &[ChatMessage],
+    config: &crate::config::AgentCompactionConfig,
+    runtime: Option<&DocumentIngestRuntime>,
+) -> Result<Option<OsPagingEviction>> {
     let paging = &config.os_paging;
     if config.max_context_tokens == 0 {
-        return Ok(false);
+        return Ok(None);
     }
     let budget = plan_context_budget(history, config, paging.eviction_threshold);
     if !budget.over_warning {
-        return Ok(false);
+        return Ok(None);
     }
 
     // OS-paging requires a durable, searchable document backend. Without one we
     // cannot non-destructively evict, so defer to the legacy compaction path.
     let Some(runtime) = runtime else {
-        return Ok(false);
+        return Ok(None);
     };
     if !runtime.memory.supports_document_ingest() {
         tracing::debug!(
             backend_kind = ?runtime.memory.backend_kind(),
             "os-paging: backend does not support document ingest; deferring to legacy compaction"
         );
-        return Ok(false);
+        return Ok(None);
     }
 
     let has_system = history.first().is_some_and(|m| m.role == "system");
@@ -93,7 +134,7 @@ pub(super) async fn apply_os_paging(
     let keep_recent = paging.keep_recent_messages.max(1).min(non_system_count);
     let evict_count = non_system_count.saturating_sub(keep_recent);
     if evict_count == 0 {
-        return Ok(false);
+        return Ok(None);
     }
     // Page out the stranded tail of a tool round-trip together with the
     // assistant message that requested it. Cutting between them leaves a
@@ -106,18 +147,18 @@ pub(super) async fn apply_os_paging(
     }
     if evict_end >= history.len() {
         tracing::debug!("os-paging: eviction would consume the whole hot window; deferring to legacy compaction");
-        return Ok(false);
+        return Ok(None);
     }
     let Some(to_evict) = history.get(start..evict_end) else {
-        return Ok(false);
+        return Ok(None);
     };
     if to_evict.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
 
     let transcript = build_page_transcript(to_evict);
     let token_count = estimate_history_tokens(to_evict);
-    let evicted_message_count = to_evict.len();
+    let evicted_message_count: usize = to_evict.len();
     let timestamp = chrono::Utc::now().to_rfc3339();
     // V02-R6: clone the turn's key once. The paging identifiers below fall back
     // to a fixed label when the turn carries none, but the event row must carry
@@ -165,7 +206,7 @@ pub(super) async fn apply_os_paging(
     match runtime.memory.ingest_document(input).await {
         Ok(document) => {
             tracing::info!(
-                document_id = %document.document_id,
+                document_id = %crate::agent::diagnostics::text_class(&document.document_id),
                 messages = evicted_message_count,
                 token_count,
                 "os-paging: evicted cold context to document store"
@@ -177,33 +218,27 @@ pub(super) async fn apply_os_paging(
             // regression on the hot path).
             let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
             tracing::warn!(
-                document_id = %document_id,
+                document_id = %crate::agent::diagnostics::text_class(&document_id),
                 error_len,
                 error_sha256,
                 "os-paging: eviction failed; deferring to legacy compaction"
             );
-            return Ok(false);
+            return Ok(None);
         }
     }
 
     // Replace the evicted span with a single short breadcrumb so the model knows
     // older context exists and can be recalled. Unlike compaction this is a
     // pointer, not a lossy summary — the full content lives in the page store.
-    history.splice(
-        start..evict_end,
-        std::iter::once(ChatMessage::assistant(format!(
+    Ok(Some(OsPagingEviction {
+        start,
+        end: evict_end,
+        breadcrumb: ChatMessage::assistant(format!(
             "{OS_PAGING_EVICT_MARKER} {timestamp}. {} older messages moved to durable page store \
              (id: {document_id}); relevant excerpts are recalled automatically when needed.]",
             evicted_message_count
-        ))),
-    );
-    // The breadcrumb carries no `tool_calls`, so anything left directly behind
-    // it that still claims to answer one is an orphan. The forward walk above
-    // normally leaves none; this is the invariant, asserted at the mutation
-    // point rather than assumed.
-    drop_orphan_tool_results_at(history, start.saturating_add(1));
-
-    Ok(true)
+        )),
+    }))
 }
 
 /// Source line stamped in front of every recalled page excerpt so the model can

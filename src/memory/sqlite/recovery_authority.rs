@@ -395,7 +395,7 @@ pub(super) fn verify_main_binding(conn: &Connection, events: &[String]) -> anyho
         match outcome {
             Ok(()) => out.verified.push(chain),
             Err((reason, error)) => {
-                tracing::warn!(reason = %crate::agent::diagnostics::text_class(reason), run_id = %chain.run_id, error = %crate::agent::diagnostics::error_class(&error), "recovery receipt left on its unmigrated events");
+                tracing::warn!(reason = %crate::agent::diagnostics::text_class(reason), run_id = %crate::agent::diagnostics::text_class(&chain.run_id), error = %crate::agent::diagnostics::error_class(&error), "recovery receipt left on its unmigrated events");
                 out.blocked.extend(input.into_iter().chain(terminal));
             }
         }

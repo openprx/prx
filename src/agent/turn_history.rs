@@ -39,6 +39,28 @@ pub(crate) fn same_messages(left: &[ChatMessage], right: &[ChatMessage]) -> bool
             .all(|(left, right)| left.role == right.role && left.content == right.content)
 }
 
+/// Where one canonical message came from. Provenance is recorded when a
+/// message enters the canonical history and carried through every durable
+/// compaction; nothing is ever classified by its text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MessageOrigin {
+    /// An acknowledged session turn (or the leading system prompt), or a
+    /// message a durable compaction wrote in place of turns (a handoff note, a
+    /// summary, a memory flush, a page breadcrumb).
+    Acknowledged,
+    /// The turn's raw request: canonical, but pending until the ordered commit.
+    Request,
+    /// Appended by this turn's tool loop: tool-call envelopes, tool results,
+    /// the loop's result blocks. Transient until the turn commits.
+    TurnRound,
+    /// The refresh aside a summary appends after its replacement. A
+    /// projection: [`TurnHistory::finish_durable_compaction`] lifts it out.
+    RefreshAside,
+    /// History of a caller with no acknowledged session store, which arrived
+    /// without provenance.
+    CallerSupplied,
+}
+
 /// The canonical history (I-CANON): the acknowledged session, as the reducer
 /// holds it (an optional leading system prompt, then every stored user and
 /// assistant turn through [`stored_turn_message`]), plus the raw messages this
@@ -53,9 +75,16 @@ pub(crate) fn same_messages(left: &[ChatMessage], right: &[ChatMessage]) -> bool
 /// `Vec<ChatMessage>` cannot become one: it is built from acknowledged turns
 /// ([`Self::from_acknowledged`]), and changed only by appending this turn's
 /// messages or by a durable compaction of itself.
+///
+/// Every message carries its [`MessageOrigin`]: the reducer form and the
+/// compaction's tool round-trip folding tell an acknowledged turn from this
+/// turn's transient tool traffic by that provenance, never by the message's
+/// text (an acknowledged answer may itself read like a tool-call envelope).
 #[derive(Debug, Clone)]
 pub(crate) struct CanonicalHistory {
     messages: Vec<ChatMessage>,
+    /// One origin per message, index for index.
+    origins: Vec<MessageOrigin>,
 }
 
 impl PartialEq for CanonicalHistory {
@@ -65,6 +94,11 @@ impl PartialEq for CanonicalHistory {
 }
 
 impl CanonicalHistory {
+    fn with_origin(messages: Vec<ChatMessage>, origin: MessageOrigin) -> Self {
+        let origins = vec![origin; messages.len()];
+        Self { messages, origins }
+    }
+
     /// The acknowledged session: `leading_system` (if any), then each stored
     /// `(role, content)` turn whose role is `user` or `assistant`, rebuilt
     /// with [`stored_turn_message`]. This is the form the reducer rebuilds its
@@ -84,13 +118,14 @@ impl CanonicalHistory {
                 .filter(|(role, _)| matches!(*role, "user" | "assistant"))
                 .map(|(role, content)| stored_turn_message(role.to_owned(), content.to_owned())),
         );
-        Self { messages }
+        Self::with_origin(messages, MessageOrigin::Acknowledged)
     }
 
     /// `self` with the turn's plain request appended as inbound user text.
     #[must_use]
     pub(crate) fn with_raw_request(mut self, request: &str) -> Self {
         self.messages.push(inbound_user_message(request));
+        self.origins.push(MessageOrigin::Request);
         self
     }
 
@@ -101,9 +136,7 @@ impl CanonicalHistory {
     /// for a direct `Effect::StartTurn` without a guard source (the reducer
     /// always supplies one).
     pub(crate) fn of_caller_without_session(messages: &[ChatMessage]) -> Self {
-        Self {
-            messages: messages.to_vec(),
-        }
+        Self::with_origin(messages.to_vec(), MessageOrigin::CallerSupplied)
     }
 
     pub(crate) fn messages(&self) -> &[ChatMessage] {
@@ -114,16 +147,24 @@ impl CanonicalHistory {
         self.messages.len()
     }
 
-    /// The history a durable compaction (a handoff, a summary, an evicted
-    /// page, and the request it restores at the tail) mutates in place. Only
-    /// durable compaction steps take it; a lossy trim runs on the provider view.
-    pub(crate) const fn durable_compaction_target(&mut self) -> &mut Vec<ChatMessage> {
-        &mut self.messages
-    }
-
     /// Absorb the raw messages this turn appended to its provider view.
     fn append_turn_messages(&mut self, appended: &[ChatMessage]) {
         self.messages.extend_from_slice(appended);
+        self.origins
+            .extend(std::iter::repeat_n(MessageOrigin::TurnRound, appended.len()));
+    }
+
+    /// Replace `self[start..end]` with `replacement`, every new message of
+    /// `origin`. `false` (and `self` unchanged) when the range is not inside
+    /// the history.
+    fn splice(&mut self, start: usize, end: usize, replacement: &[ChatMessage], origin: MessageOrigin) -> bool {
+        if start > end || end > self.messages.len() || self.origins.len() != self.messages.len() {
+            return false;
+        }
+        self.messages.splice(start..end, replacement.iter().cloned());
+        self.origins
+            .splice(start..end, std::iter::repeat_n(origin, replacement.len()));
+        true
     }
 
     /// The guard of a patch that replaces `self[range_start..]`.
@@ -136,25 +177,112 @@ impl CanonicalHistory {
         self.guard_from(0)
     }
 
+    /// Check `patch` against `self` without changing it: its range lies
+    /// inside the history and its guard describes it.
+    fn check_patch(
+        &self,
+        patch: &crate::agent::turn_contracts::CompactionPatch,
+    ) -> Result<(), crate::agent::turn_contracts::CompactionPatchError> {
+        let (start, end, len) = (patch.range_start(), patch.range_end(), self.messages.len());
+        if start > end || end > len {
+            return Err(crate::agent::turn_contracts::CompactionPatchError::RangeOutOfBounds { start, end, len });
+        }
+        if !crate::agent::compaction::compaction_patch_guard_matches(&self.messages, &patch.guard) {
+            return Err(crate::agent::turn_contracts::CompactionPatchError::GuardMismatch {
+                expected_len: patch.guard.history_len,
+                actual_len: len,
+            });
+        }
+        Ok(())
+    }
+
     /// Apply a durable compaction `patch` built over `self`: its replacement
     /// only. The loop notes it appends after the replacement (a summary's
     /// refresh aside) are a projection and are returned with the index they
-    /// follow, for [`ProjectionInputs::set_refresh_notes`]. On error `self`
-    /// is unchanged.
+    /// follow, for [`ProjectionInputs::set_refresh_notes`]. The replacement is
+    /// the compaction's own messages; every message outside the replaced range
+    /// keeps its provenance. On error `self` is unchanged.
     pub(crate) fn apply_patch(
         &mut self,
         patch: &crate::agent::turn_contracts::CompactionPatch,
     ) -> Result<RefreshNotes, crate::agent::turn_contracts::CompactionPatchError> {
-        let durable = crate::agent::turn_contracts::CompactionPatch {
-            replacement: patch.replacement.clone(),
-            append_after: Vec::new(),
-            guard: patch.guard.clone(),
-        };
-        crate::agent::compaction::apply_compaction_patch_exact(&mut self.messages, &durable)?;
+        self.check_patch(patch)?;
+        let (start, end) = (patch.range_start(), patch.range_end());
+        if !self.splice(start, end, &patch.replacement, MessageOrigin::Acknowledged) {
+            return Err(crate::agent::turn_contracts::CompactionPatchError::RangeOutOfBounds {
+                start,
+                end,
+                len: self.messages.len(),
+            });
+        }
         Ok(RefreshNotes {
-            at: patch.range_start().saturating_add(patch.replacement.len()),
+            at: start.saturating_add(patch.replacement.len()),
             notes: patch.append_after.clone(),
         })
+    }
+
+    /// Apply a durable compaction `patch` built over `self` in place, its
+    /// refresh aside included (marked as such, so
+    /// [`TurnHistory::finish_durable_compaction`] lifts it into the
+    /// projection). On error `self` is unchanged.
+    pub(crate) fn apply_patch_with_refresh_aside(
+        &mut self,
+        patch: &crate::agent::turn_contracts::CompactionPatch,
+    ) -> Result<(), crate::agent::turn_contracts::CompactionPatchError> {
+        let notes = self.apply_patch(patch)?;
+        if !self.splice(notes.at, notes.at, &notes.notes, MessageOrigin::RefreshAside) {
+            return Err(crate::agent::turn_contracts::CompactionPatchError::RangeOutOfBounds {
+                start: notes.at,
+                end: notes.at,
+                len: self.messages.len(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Put the turn's request back at the tail when a durable compaction
+    /// folded it away ([`restore_current_turn_request`] at
+    /// [`RestoredRequestPosition::Tail`]). Whether it was restored.
+    ///
+    /// [`restore_current_turn_request`]: crate::agent::context_preflight::restore_current_turn_request
+    /// [`RestoredRequestPosition::Tail`]: crate::agent::context_preflight::RestoredRequestPosition::Tail
+    pub(crate) fn restore_request_at_tail(
+        &mut self,
+        captured: Option<crate::agent::context_preflight::CapturedTurnRequest>,
+        trigger: &'static str,
+    ) -> bool {
+        let restored = crate::agent::context_preflight::restore_current_turn_request(
+            &mut self.messages,
+            captured,
+            trigger,
+            crate::agent::context_preflight::RestoredRequestPosition::Tail,
+        );
+        if restored {
+            self.origins.push(MessageOrigin::Request);
+        }
+        restored
+    }
+
+    /// Apply an OS-paging eviction planned over `self`: the breadcrumb takes
+    /// the evicted range, and a `role="tool"` result left directly behind it
+    /// is dropped. Whether it was applied.
+    pub(super) fn apply_page_eviction(&mut self, eviction: &crate::agent::context_paging::OsPagingEviction) -> bool {
+        if !self.splice(
+            eviction.start,
+            eviction.end,
+            std::slice::from_ref(&eviction.breadcrumb),
+            MessageOrigin::Acknowledged,
+        ) {
+            return false;
+        }
+        let behind = eviction.start.saturating_add(1);
+        while self.messages.get(behind).is_some_and(|message| message.role == "tool") {
+            self.messages.remove(behind);
+            if behind < self.origins.len() {
+                self.origins.remove(behind);
+            }
+        }
+        true
     }
 
     /// Move every refresh aside a durable compaction step wrote into the
@@ -162,64 +290,101 @@ impl CanonicalHistory {
     fn lift_refresh_notes(&mut self) -> Vec<(usize, ChatMessage)> {
         let mut lifted = Vec::new();
         let mut kept = Vec::with_capacity(self.messages.len());
-        for message in self.messages.drain(..) {
-            if is_refresh_aside(&message) {
+        let mut kept_origins = Vec::with_capacity(self.origins.len());
+        for (message, origin) in self.messages.drain(..).zip(self.origins.drain(..)) {
+            if origin == MessageOrigin::RefreshAside {
                 lifted.push((kept.len(), message));
             } else {
                 kept.push(message);
+                kept_origins.push(origin);
             }
         }
         self.messages = kept;
+        self.origins = kept_origins;
         lifted
     }
 
-    /// The history the reducer holds for this canonical history once the
-    /// turn's pending request is left out: the leading system prompt, then
-    /// every durable user and assistant message (no tool result, no
-    /// tool-call message, no later system message, no loop note) rebuilt with
-    /// [`Self::from_acknowledged`], exactly as the reducer rebuilds its own
-    /// history after it adopts a patch. A worker's reducer source and every
+    /// Per message, whether a compaction folds it into the assistant turn of
+    /// a tool round-trip instead of resolving it to a transcript event of its
+    /// own ([`crate::agent::compaction::RoundCompanions`]). Only this turn's
+    /// own round traffic can be a companion (an acknowledged turn, the
+    /// request and a compaction's own message never are); within that
+    /// traffic, the round-trip shape says which part it is. A caller without
+    /// an acknowledged session supplies no provenance, so its history is read
+    /// by shape alone.
+    pub(crate) fn tool_round_companions(&self) -> Vec<bool> {
+        self.messages
+            .iter()
+            .zip(&self.origins)
+            .map(|(message, origin)| match origin {
+                MessageOrigin::TurnRound | MessageOrigin::CallerSupplied => {
+                    crate::agent::compaction::is_tool_roundtrip_companion(message)
+                }
+                MessageOrigin::Acknowledged | MessageOrigin::Request | MessageOrigin::RefreshAside => false,
+            })
+            .collect()
+    }
+
+    /// The history the reducer holds for this canonical history: the leading
+    /// system prompt, then every acknowledged message that is a durable turn
+    /// ([`is_durable_turn_message`], the rule the reducer rebuilds its own
+    /// history with after it adopts a patch), rebuilt with
+    /// [`Self::from_acknowledged`]. Left out by provenance only: the pending
+    /// request and everything this turn's tool loop appended. An acknowledged
+    /// turn is kept whatever its text. A worker's reducer source and every
     /// reducer patch replacement are this form, so a guard over one describes
     /// the other.
+    ///
+    /// A caller-supplied history (no acknowledged session) has no recorded
+    /// request; its newest user query is the pending request.
+    ///
+    /// [`is_durable_turn_message`]: crate::agent::turn_contracts::is_durable_turn_message
     #[must_use]
     pub(crate) fn reducer_form(&self) -> Self {
-        let pending = crate::agent::history::latest_user_query_index(&self.messages);
+        let caller_pending = crate::agent::history::latest_user_query_index(&self.messages)
+            .filter(|index| self.origins.get(*index) == Some(&MessageOrigin::CallerSupplied));
         let leading_system = self
             .messages
             .first()
             .filter(|message| message.role == "system")
             .map(|message| message.content.as_str());
-        let turns = self.messages.iter().enumerate().filter_map(|(index, message)| {
-            let durable = Some(index) != pending
-                && matches!(message.role.as_str(), "user" | "assistant")
-                && !crate::agent::turn_contracts::is_loop_written_user_note(&message.content)
-                && !(message.role == "assistant" && is_tool_call_message(&message.content));
-            durable.then_some((message.role.as_str(), message.content.as_str()))
-        });
+        let turns = self
+            .messages
+            .iter()
+            .zip(&self.origins)
+            .enumerate()
+            .filter_map(|(index, (message, origin))| {
+                let acknowledged = match origin {
+                    MessageOrigin::Acknowledged => true,
+                    MessageOrigin::CallerSupplied => Some(index) != caller_pending,
+                    MessageOrigin::Request | MessageOrigin::TurnRound | MessageOrigin::RefreshAside => false,
+                };
+                (acknowledged && crate::agent::turn_contracts::is_durable_turn_message(message))
+                    .then_some((message.role.as_str(), message.content.as_str()))
+            });
         Self::from_acknowledged(leading_system, turns)
     }
 
-    /// A canonical history a test states message by message.
+    /// A canonical history a test states message by message (no recorded
+    /// provenance, as a caller without a session).
     #[cfg(test)]
-    pub(crate) const fn from_test_messages(messages: Vec<ChatMessage>) -> Self {
-        Self { messages }
+    pub(crate) fn from_test_messages(messages: Vec<ChatMessage>) -> Self {
+        Self::with_origin(messages, MessageOrigin::CallerSupplied)
     }
-}
 
-fn is_refresh_aside(message: &ChatMessage) -> bool {
-    message.role == "user"
-        && message
-            .content
-            .starts_with(crate::agent::turn_contracts::POST_COMPACTION_REFRESH_MARKER)
-}
-
-fn is_tool_call_message(content: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(content).is_ok_and(|value| {
-        value
-            .get("tool_calls")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|calls| !calls.is_empty())
-    })
+    /// A canonical history a test builds as a chat turn does: acknowledged
+    /// `turns`, the raw `request`, then `round` as this turn's tool traffic.
+    #[cfg(test)]
+    pub(crate) fn from_test_turn(
+        leading_system: Option<&str>,
+        turns: &[(&str, &str)],
+        request: &str,
+        round: &[ChatMessage],
+    ) -> Self {
+        let mut canonical = Self::from_acknowledged(leading_system, turns.iter().copied()).with_raw_request(request);
+        canonical.append_turn_messages(round);
+        canonical
+    }
 }
 
 /// The refresh aside a durable compaction appends after its replacement, and

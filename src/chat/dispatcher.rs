@@ -104,9 +104,10 @@ impl ApprovalRouter {
     fn register_entry(&self, tool_id: String, entry: PendingApproval) -> bool {
         let mut guard = self.pending.lock();
         if !guard.is_empty() {
+            let pending: usize = guard.len();
             tracing::warn!(
-                tool_id = %tool_id,
-                pending = guard.len(),
+                tool_id = %crate::agent::diagnostics::text_class(&tool_id),
+                pending,
                 "ApprovalRouter::register: rejecting concurrent approval request"
             );
             drop(guard);
@@ -114,7 +115,7 @@ impl ApprovalRouter {
             return false;
         }
         if guard.insert(tool_id.clone(), entry).is_some() {
-            tracing::warn!(tool_id = %tool_id, "ApprovalRouter::register: replacing existing pending tx");
+            tracing::warn!(tool_id = %crate::agent::diagnostics::text_class(&tool_id), "ApprovalRouter::register: replacing existing pending tx");
         }
         true
     }
@@ -168,7 +169,7 @@ impl ApprovalRouter {
     pub fn resolve_decision(&self, tool_id: &str, approved: bool, always: bool) -> bool {
         let entry = self.pending.lock().remove(tool_id);
         let Some(entry) = entry else {
-            tracing::debug!(tool_id = %tool_id, "ApprovalRouter::resolve: no pending entry");
+            tracing::debug!(tool_id = %crate::agent::diagnostics::text_class(&tool_id), "ApprovalRouter::resolve: no pending entry");
             return false;
         };
         if approved
@@ -179,7 +180,7 @@ impl ApprovalRouter {
         }
         if entry.tx.send(approved).is_err() {
             tracing::debug!(
-                tool_id = %tool_id,
+                tool_id = %crate::agent::diagnostics::text_class(&tool_id),
                 "ApprovalRouter::resolve: rx already dropped (driver cancelled)"
             );
         }
@@ -1297,7 +1298,7 @@ impl EffectExecutor {
         persistence: &PersistenceDeps,
     ) {
         if !self.persist_sessions {
-            tracing::debug!(session_id = %commit.session.id, "SaveSession effect: unsaved one-shot session, no row");
+            tracing::debug!(session_id = %crate::agent::diagnostics::text_class(&commit.session.id), "SaveSession effect: unsaved one-shot session, no row");
             self.publish(&commit);
             return;
         }
@@ -1371,7 +1372,7 @@ impl EffectExecutor {
             && !publisher.publish(acked.clone())
         {
             tracing::debug!(
-                session_id = %acked.session_id,
+                session_id = %crate::agent::diagnostics::text_class(&acked.session_id),
                 load_epoch = acked.load_epoch,
                 revision = acked.revision,
                 "acknowledged session not published: an equal or newer load is already published"
@@ -1593,13 +1594,13 @@ impl EffectExecutor {
                         provider_turn_task_id,
                     ))
                 });
-                let trace_provider_turn_task_id = provider_turn_task_id.map(|id| id.get());
+                let trace_provider_turn_task_id: Option<u64> = provider_turn_task_id.map(|id| id.get());
                 let provider_turn_lifecycle_tx = deps.provider_turn_lifecycle_tx.clone();
                 let provider_turn_handle_tx = deps.provider_turn_lifecycle_tx.clone();
                 let observer = Arc::clone(&deps.observer);
                 let hooks = Arc::clone(&deps.hooks);
                 let tool_surface_reserve = deps.tool_surface_reserve.clone();
-                let provider_turn_execution_lease_id =
+                let provider_turn_execution_lease_id: Option<u64> =
                     provider_turn_task_id.map(|_| next_provider_turn_execution_lease_id());
                 // Task locals do not cross spawn; carry the chat owner's tracker.
                 let cleanup_owner = self.cleanup_owner.clone();
@@ -1624,7 +1625,7 @@ impl EffectExecutor {
                         tracing::debug!(
                             provider_turn_task_id = trace_provider_turn_task_id,
                             provider_turn_execution_lease_id,
-                            draft_id = %draft_id,
+                            draft_id = %crate::agent::diagnostics::text_class(&draft_id),
                             "provider turn worker task started"
                         );
                         // RAII scope: automatically resets dual_write_guard when the subtask exits (including on panic).
@@ -1760,8 +1761,8 @@ impl EffectExecutor {
                     let _scope = guard_scope;
                     let recipient = "user";
                     tracing::debug!(
-                        draft_id = %draft_id,
-                        text_len = text.len(),
+                        draft_id = %crate::agent::diagnostics::text_class(&draft_id),
+                        text_len = str::len(&text),
                         channel = %crate::agent::diagnostics::text_class(channel.name()),
                         "SendDraftFinalize effect: calling channel.finalize_draft"
                     );
@@ -1769,7 +1770,7 @@ impl EffectExecutor {
                         let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&e);
                         tracing::warn!(
                             error_len, error_sha256,
-                            draft_id = %draft_id,
+                            draft_id = %crate::agent::diagnostics::text_class(&draft_id),
                             "SendDraftFinalize effect: finalize_draft failed"
                         );
                     }
@@ -1781,7 +1782,7 @@ impl EffectExecutor {
                 let recipient = "user".to_string();
                 if let Err(e) = channel.cancel_draft(&recipient, &draft_id).await {
                     let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&e);
-                    tracing::debug!(error_len, error_sha256, draft_id = %draft_id, "CancelDraft effect: channel returned err");
+                    tracing::debug!(error_len, error_sha256, draft_id = %crate::agent::diagnostics::text_class(&draft_id), "CancelDraft effect: channel returned err");
                 }
             }
             Effect::CancelToken(token) => {
@@ -1866,9 +1867,9 @@ impl EffectExecutor {
                             return;
                         }
                         tracing::warn!(
-                            tool_id = %tool_id,
+                            tool_id = %crate::agent::diagnostics::text_class(&tool_id),
                             name = %crate::agent::diagnostics::text_class(&name),
-                            args_len = args.len(),
+                            args_len = str::len(&args),
                             "RequestApproval effect: TUI active but no approval surface, failing closed"
                         );
                         let action_tx = deps.persistence.action_tx.clone();
@@ -1973,48 +1974,27 @@ pub(crate) fn resolve_supervised_approval_override(raw: Option<&str>) -> bool {
 
 // ─── StartTurn streaming driver (Step 5a-2) ────────────────────────────────────
 
-/// The detached Redux driver receives a provider/guard snapshot that already
-/// contains the pending user message. Reducer state intentionally does not add
-/// that message until ordered commit, so the patch sent back to the reducer
-/// guards the pre-turn reducer history and replaces it with the exact compacted
-/// durable target minus that pending turn. Ordered commit then appends the user
-/// message without shifting patch indices or weakening stale-state detection.
-fn compaction_patch_for_reducer_without_pending_user(
-    patch: &crate::agent::turn_contracts::CompactionPatch,
+/// The reducer patch of a detached rollover. The driver's guard source holds
+/// the pending request, which the reducer does not add until the ordered
+/// commit, so the patch guards the reducer form of the pre-rollover source
+/// (the reducer's own history) and replaces it with the reducer form of the
+/// compacted source: the same rule ([`CanonicalHistory::reducer_form`]) every
+/// sink applies, so the pending request and this turn's tool rounds are left
+/// out by provenance and every acknowledged turn is kept. Ordered commit then
+/// appends the request without shifting patch indices or weakening stale-state
+/// detection.
+///
+/// [`CanonicalHistory::reducer_form`]: crate::agent::turn_history::CanonicalHistory::reducer_form
+fn compaction_patch_for_reducer(
     source_history: &crate::agent::turn_history::CanonicalHistory,
     compacted_history: &crate::agent::turn_history::CanonicalHistory,
-) -> crate::agent::turn_contracts::CompactionPatch {
-    let source_history = source_history.messages();
-    let compacted_history = compacted_history.messages();
-    let Some(pending_index) = source_history.len().checked_sub(1) else {
-        return patch.clone();
-    };
-    if source_history
-        .get(pending_index)
-        .is_none_or(|message| message.role != "user")
-    {
-        return patch.clone();
-    }
-    let Some(reducer_source) = source_history.get(..pending_index) else {
-        return patch.clone();
-    };
-    let Some(guard) = crate::agent::compaction::compaction_patch_guard_for(reducer_source, 0, reducer_source.len())
-    else {
-        return patch.clone();
-    };
-    let mut reducer_target_with_pending = compacted_history.to_vec();
-    if reducer_target_with_pending
-        .last()
-        .is_none_or(|message| message.role != "user")
-    {
-        return patch.clone();
-    }
-    reducer_target_with_pending.pop();
-    crate::agent::turn_contracts::CompactionPatch {
-        replacement: reducer_target_with_pending,
+) -> Option<crate::agent::turn_contracts::CompactionPatch> {
+    let guard = source_history.reducer_form().guard()?;
+    Some(crate::agent::turn_contracts::CompactionPatch {
+        replacement: compacted_history.reducer_form().messages().to_vec(),
         append_after: Vec::new(),
         guard,
-    }
+    })
 }
 
 /// What a redux rollover attempt left behind for its caller.
@@ -2077,7 +2057,7 @@ async fn apply_redux_context_rollover(
         crate::agent::context_preflight::capture_current_turn_request(compaction_guard_history.messages());
     let patch = match crate::agent::compaction::build_configurable_compaction_patch_with_source_history(
         history,
-        compaction_guard_history.messages(),
+        compaction_guard_history,
         provider,
         model,
         config,
@@ -2190,12 +2170,7 @@ async fn apply_redux_context_rollover(
         }
     };
     let reducer_source_history = std::mem::replace(compaction_guard_history, compacted_source);
-    crate::agent::context_preflight::restore_current_turn_request(
-        compaction_guard_history.durable_compaction_target(),
-        guard_request.clone(),
-        trigger,
-        crate::agent::context_preflight::RestoredRequestPosition::Tail,
-    );
+    compaction_guard_history.restore_request_at_tail(guard_request.clone(), trigger);
     // The one conversion: the compacted canonical source projected with the
     // enriched request in place of the plain one (exactly once) and the
     // summary's refresh aside after its replacement.
@@ -2254,24 +2229,9 @@ async fn apply_redux_context_rollover(
             .await;
         }
     }
-    let mut restored_patch = patch;
-    let range_start = restored_patch.range_start();
-    let Some(guard) = reducer_source_history.guard_from(range_start) else {
+    let Some(reducer_patch) = compaction_patch_for_reducer(&reducer_source_history, compaction_guard_history) else {
         return Err(());
     };
-    restored_patch.guard = guard;
-    restored_patch.replacement = compaction_guard_history
-        .messages()
-        .iter()
-        .skip(range_start)
-        .cloned()
-        .collect();
-    restored_patch.append_after.clear();
-    let reducer_patch = compaction_patch_for_reducer_without_pending_user(
-        &restored_patch,
-        &reducer_source_history,
-        compaction_guard_history,
-    );
     if let Err(error) = action_tx
         .send(Action::HistoryCompactionPatchApplied {
             reason,
@@ -2654,6 +2614,7 @@ impl crate::agent::turn_contracts::ToolLoopEventSink for ReduxToolLoopEventSink 
             crate::agent::turn_contracts::ToolLoopEvent::ContextCompactionPatch {
                 patch,
                 source_history,
+                compacted_history,
                 config,
                 turns_before,
                 tokens_before,
@@ -2661,8 +2622,8 @@ impl crate::agent::turn_contracts::ToolLoopEventSink for ReduxToolLoopEventSink 
                 tokens_after,
                 used_context_tokens,
             } => {
-                let mut compacted_history = source_history;
-                if let Err(error) = compacted_history.apply_patch(&patch) {
+                let mut replayed = source_history;
+                if let Err(error) = replayed.apply_patch(&patch) {
                     // No mutation and no reducer patch: the reducer keeps its
                     // acknowledged history and the worker's own view proceeds.
                     let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
@@ -2670,8 +2631,16 @@ impl crate::agent::turn_contracts::ToolLoopEventSink for ReduxToolLoopEventSink 
                         error_len,
                         error_sha256,
                         guard_history_len = patch.guard.history_len,
-                        source_len = compacted_history.len(),
+                        source_len = crate::agent::turn_history::CanonicalHistory::len(&replayed),
                         "worker compaction patch does not match its source; reducer patch not sent"
+                    );
+                    return Ok(());
+                }
+                if replayed != *compacted_history {
+                    tracing::warn!(
+                        replayed_len = crate::agent::turn_history::CanonicalHistory::len(&replayed),
+                        compacted_len = crate::agent::turn_history::CanonicalHistory::len(&compacted_history),
+                        "worker compaction patch does not replay to its compacted history; reducer patch not sent"
                     );
                     return Ok(());
                 }
@@ -3360,7 +3329,7 @@ fn push_snapshot_if_dirty(
     let Some(tx) = snapshot_tx.as_ref() else {
         return;
     };
-    let next_rev = snapshot_rev.fetch_add(1, AtomicOrdering::Relaxed).saturating_add(1);
+    let next_rev: u64 = snapshot_rev.fetch_add(1, AtomicOrdering::Relaxed).saturating_add(1);
     let new_snap = Arc::new(state.build_ui_snapshot(next_rev));
     tx.send_replace(new_snap);
     tracing::trace!(rev = next_rev, "s4_a snapshot pushed");
@@ -3580,8 +3549,8 @@ impl StreamChunkCoalescer {
             }
             // different draft: the old pending is meaningless, drop it and take the fast path for the current delta
             tracing::warn!(
-                old_draft_id = %pending_draft_id,
-                new_draft = %draft_id,
+                old_draft_id = %crate::agent::diagnostics::text_class(&pending_draft_id),
+                new_draft = %crate::agent::diagnostics::text_class(&draft_id),
                 "coalescer cross-draft pending dropped (defensive)"
             );
         }

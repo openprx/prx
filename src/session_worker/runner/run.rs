@@ -1299,7 +1299,7 @@ async fn run_owned_manifest(
     {
         Ok(event) => Some(event),
         Err(error) => {
-            tracing::warn!(run_id = %manifest.run_id, error = %crate::agent::diagnostics::error_class(&error), "failed to record session-worker result event");
+            tracing::warn!(run_id = %crate::agent::diagnostics::text_class(&manifest.run_id), error = %crate::agent::diagnostics::error_class(&error), "failed to record session-worker result event");
             None
         }
     };

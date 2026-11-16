@@ -170,7 +170,7 @@ pub(super) fn pop_next_input_task_with_scheduler(
         && let Err(error) = scheduler.mark_dispatched_to_chat_loop(id)
     {
         tracing::warn!(
-            task_id = id.get(),
+            task_id = crate::chat::turn_scheduler::TurnTaskId::get(id),
             error = %crate::agent::diagnostics::error_class(&error),
             "TurnScheduler chat-loop dequeue mirror failed"
         );
@@ -237,7 +237,7 @@ pub(super) fn requeue_post_route_admission_rejected_input(
         && let Err(error) = scheduler.return_dispatched_to_queue(id)
     {
         tracing::warn!(
-            task_id = id.get(),
+            task_id = crate::chat::turn_scheduler::TurnTaskId::get(id),
             error = %crate::agent::diagnostics::error_class(&error),
             "TurnScheduler chat-loop requeue mirror failed"
         );

@@ -29,7 +29,7 @@ pub(super) async fn record_hybrid_worker_draft_if_needed(
         ResourceRiskLevel::Low,
         None,
     ) {
-        tracing::warn!(run_id = %manifest.run_id, error = %crate::agent::diagnostics::error_class(&error), "hybrid worker draft blocked by SideEffectGate");
+        tracing::warn!(run_id = %crate::agent::diagnostics::text_class(&manifest.run_id), error = %crate::agent::diagnostics::error_class(&error), "hybrid worker draft blocked by SideEffectGate");
         return;
     }
 
@@ -71,15 +71,15 @@ pub(super) async fn record_hybrid_worker_draft_if_needed(
                             .await
                         {
                             tracing::warn!(
-                                run_id = %manifest.run_id,
-                                draft_id = %draft.draft_id,
+                                run_id = %crate::agent::diagnostics::text_class(&manifest.run_id),
+                                draft_id = %crate::agent::diagnostics::text_class(&draft.draft_id),
                                 error = %crate::agent::diagnostics::error_class(&error), "failed to record hybrid draft merge request"
                             );
                         }
                     }
                     Err(error) => {
                         tracing::warn!(
-                            run_id = %manifest.run_id,
+                            run_id = %crate::agent::diagnostics::text_class(&manifest.run_id),
                             error = %crate::agent::diagnostics::error_class(&error), "failed to open parent shared memory for hybrid draft request"
                         );
                     }
@@ -87,7 +87,7 @@ pub(super) async fn record_hybrid_worker_draft_if_needed(
             }
         }
         Err(error) => {
-            tracing::warn!(run_id = %manifest.run_id, error = %crate::agent::diagnostics::error_class(&error), "failed to create hybrid worker memory draft");
+            tracing::warn!(run_id = %crate::agent::diagnostics::text_class(&manifest.run_id), error = %crate::agent::diagnostics::error_class(&error), "failed to create hybrid worker memory draft");
         }
     }
 }

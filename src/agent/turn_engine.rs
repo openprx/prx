@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 #[cfg(test)]
 use crate::agent::compaction::is_tool_roundtrip_companion;
 use crate::agent::compaction::{
-    COMPACTION_KEEP_RECENT_MESSAGES, apply_compaction_patch_exact, apply_configurable_compaction_over_view,
+    COMPACTION_KEEP_RECENT_MESSAGES, apply_configurable_compaction_over_view,
     build_configurable_compaction_patch_with_source_history, is_context_handoff_message,
     persist_context_switch_degradation,
 };
@@ -34,7 +34,7 @@ use crate::agent::context_budget::{
     trim_history_to_context_budget_preserving_compaction_replacement_with_floor, trim_history_token_aware,
 };
 use crate::agent::context_paging::{
-    apply_os_paging, context_mode_uses_os_paging, inject_recalled_context, recall_context_pages,
+    context_mode_uses_os_paging, inject_recalled_context, plan_os_paging, recall_context_pages,
 };
 use crate::agent::context_preflight::{
     RestoredRequestPosition, capture_current_turn_request, preflight_config, preflight_durable_compaction,
@@ -516,8 +516,8 @@ async fn run_turn_unguarded(
         if plan_context_budget(history, config, config.os_paging.eviction_threshold).over_warning {
             let canonical = turn_history.canonical_mut(history);
             let before = history_before_change(&runtime_adapter, canonical);
-            match apply_os_paging(canonical.durable_compaction_target(), config, document_ingest.as_ref()).await {
-                Ok(true) => {
+            match plan_os_paging(canonical.messages(), config, document_ingest.as_ref()).await {
+                Ok(Some(eviction)) if canonical.apply_page_eviction(&eviction) => {
                     crate::agent::idle::beat(crate::agent::idle::ProgressKind::Compaction);
                     tracing::debug!("os-paging: pre-turn eviction applied");
                     report_durable_compaction(
@@ -529,7 +529,7 @@ async fn run_turn_unguarded(
                     .await?;
                     rederive_provider_view(&mut turn_history, history, hooks, channel_name).await;
                 }
-                Ok(false) => {}
+                Ok(_) => {}
                 Err(error) => {
                     let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
                     tracing::warn!(error_len, error_sha256, "os-paging: pre-turn eviction error (soft)");
@@ -557,7 +557,7 @@ async fn run_turn_unguarded(
             // Measured on the provider view the gate saw (the enriched
             // request included), built from and applied to the canonical history.
             match apply_configurable_compaction_over_view(
-                canonical.durable_compaction_target(),
+                canonical,
                 history,
                 provider,
                 model,
@@ -1124,7 +1124,7 @@ async fn run_turn_unguarded(
             .find(|message| message.role == "system");
         let system_prompt_sha256 =
             final_system_prompt.map(|message| crate::agent::prompt::prompt_sha256(&message.content));
-        let system_prompt_chars = final_system_prompt.map_or(0, |message| message.content.chars().count());
+        let system_prompt_chars: usize = final_system_prompt.map_or(0, |message| message.content.chars().count());
         if let Some(brief_hash) = decision_brief_sha256.as_deref() {
             tracing::debug!(
                 system_prompt_sha256 = system_prompt_sha256.as_deref(),
@@ -1132,7 +1132,7 @@ async fn run_turn_unguarded(
                 "advisory request prepared"
             );
         }
-        let tool_snapshot = compiled_tool_context.fingerprint();
+        let tool_snapshot: &crate::agent::turn_context::ToolSnapshotFingerprint = compiled_tool_context.fingerprint();
         // How much of this request is prompt and how much is native tool
         // schema. Sizes, counts and estimates only: this is emitted into a
         // durable event, so no schema body, prompt body or tool argument may
@@ -1152,14 +1152,14 @@ async fn run_turn_unguarded(
         // second full tokenizer pass over the prompt, on every iteration, for
         // a number nobody consumes.
         if event_fabric.is_some() || tracing::enabled!(target: "openprx::prompt", tracing::Level::DEBUG) {
-            let budgeted_messages_tokens = budgeted_totals.map(|(messages, _)| messages);
-            let budgeted_request_tokens = budgeted_totals.map(|(_, request)| request);
-            let messages_bytes = prepared_messages.messages.iter().fold(0usize, |total, message| {
+            let budgeted_messages_tokens: Option<usize> = budgeted_totals.map(|(messages, _)| messages);
+            let budgeted_request_tokens: Option<usize> = budgeted_totals.map(|(_, request)| request);
+            let messages_bytes: usize = prepared_messages.messages.iter().fold(0usize, |total, message| {
                 total
                     .saturating_add(message.role.len())
                     .saturating_add(message.content.len())
             });
-            let messages_chars = prepared_messages.messages.iter().fold(0usize, |total, message| {
+            let messages_chars: usize = prepared_messages.messages.iter().fold(0usize, |total, message| {
                 total
                     .saturating_add(message.role.chars().count())
                     .saturating_add(message.content.chars().count())
@@ -1601,7 +1601,7 @@ async fn run_turn_unguarded(
                         // the canonical history.
                         let compaction = match build_configurable_compaction_patch_with_source_history(
                             history,
-                            canonical.messages(),
+                            canonical,
                             provider,
                             model,
                             config,
@@ -1613,19 +1613,14 @@ async fn run_turn_unguarded(
                             Ok(Some(patch)) => {
                                 crate::agent::idle::beat(crate::agent::idle::ProgressKind::Compaction);
                                 let mut compacted = canonical.clone();
-                                match apply_compaction_patch_exact(compacted.durable_compaction_target(), &patch) {
+                                match compacted.apply_patch_with_refresh_aside(&patch) {
                                     Ok(()) => {
                                         // The whole resulting history, request included, is what
                                         // the session adopts: restoring the request only in the
                                         // view would leave the saved history without it. A
                                         // refresh aside moves into the projection when the
                                         // compaction is finished.
-                                        restore_current_turn_request(
-                                            compacted.durable_compaction_target(),
-                                            canonical_request,
-                                            "overflow_retry",
-                                            RestoredRequestPosition::Tail,
-                                        );
+                                        compacted.restore_request_at_tail(canonical_request, "overflow_retry");
                                         Some((std::mem::replace(canonical, compacted), patch.replacement.len()))
                                     }
                                     Err(error) => {
@@ -2267,7 +2262,7 @@ async fn run_turn_unguarded(
         // round that needs no trim still clones nothing.
         if let Some(reserved_config) = reserved_config.as_ref() {
             let mid_turn_tokens = estimate_history_tokens(history);
-            let mid_turn_limit = reserved_config
+            let mid_turn_limit: usize = reserved_config
                 .max_context_tokens
                 .saturating_sub(reserved_config.reserve_tokens);
             if mid_turn_tokens > mid_turn_limit {
@@ -2346,6 +2341,7 @@ async fn report_durable_compaction(
                 .saturating_sub(system_messages(source_history.messages())),
             tokens_before: estimate_history_tokens(source_history.messages()),
             source_history,
+            compacted_history: Box::new(compacted.clone()),
             patch,
             config: config.clone(),
             turns_after: compacted_messages
@@ -2361,24 +2357,26 @@ async fn report_durable_compaction(
 /// Logs a refused overflow compaction patch with lengths and range only.
 fn warn_overflow_patch_refused(error: &crate::agent::turn_contracts::CompactionPatchError) {
     match error {
-        crate::agent::turn_contracts::CompactionPatchError::RangeOutOfBounds {
-            start: range_start_index,
-            end: range_end_index,
-            len,
-        } => tracing::warn!(
-            range_start_index = *range_start_index,
-            range_end_index = *range_end_index,
-            history_len = *len,
-            "overflow compaction patch range out of bounds; trimming without a handoff"
-        ),
+        crate::agent::turn_contracts::CompactionPatchError::RangeOutOfBounds { start, end, len } => {
+            let (range_start_index, range_end_index, history_len): (usize, usize, usize) = (*start, *end, *len);
+            tracing::warn!(
+                range_start_index,
+                range_end_index,
+                history_len,
+                "overflow compaction patch range out of bounds; trimming without a handoff"
+            );
+        }
         crate::agent::turn_contracts::CompactionPatchError::GuardMismatch {
             expected_len,
             actual_len,
-        } => tracing::warn!(
-            guard_history_len = *expected_len,
-            history_len = *actual_len,
-            "overflow compaction patch guard mismatch; trimming without a handoff"
-        ),
+        } => {
+            let (guard_history_len, history_len): (usize, usize) = (*expected_len, *actual_len);
+            tracing::warn!(
+                guard_history_len,
+                history_len,
+                "overflow compaction patch guard mismatch; trimming without a handoff"
+            );
+        }
     }
 }
 

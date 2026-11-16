@@ -78,7 +78,7 @@ pub(crate) async fn supervise_provider_turn_worker(
         };
         if lease.lifecycle_tx.send(exited).await.is_err() {
             tracing::debug!(
-                task_id = lease.task_id.get(),
+                task_id = crate::chat::turn_scheduler::TurnTaskId::get(lease.task_id),
                 lease_id = lease.lease_id,
                 "provider turn worker exit: lifecycle channel closed"
             );
@@ -99,7 +99,7 @@ async fn failure_accepted(lease: Option<&WorkerLease>) -> bool {
     };
     if lease.lifecycle_tx.send(request).await.is_err() {
         tracing::debug!(
-            task_id = lease.task_id.get(),
+            task_id = crate::chat::turn_scheduler::TurnTaskId::get(lease.task_id),
             lease_id = lease.lease_id,
             "provider turn worker failure: lifecycle channel closed"
         );

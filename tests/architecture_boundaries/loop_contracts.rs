@@ -29,10 +29,16 @@ pub(super) fn chat_route_decision_names_the_registry_root_count() {
         let source = read_source(&path);
         let production = strip_cfg_test_items(&blank_comments_and_literals(&source));
         let normalized = normalize_line(&production);
-        if normalized.contains("tools_count = tools_registry.len()") {
+        if normalized.contains("tools_count = tools_registry.len()")
+            || normalized.contains("tools_count = Vec::len(&tools_registry)")
+        {
             misleading.push(relative.clone());
         }
-        named += normalized.matches("registry_root_tools = tools_registry.len()").count();
+        // The registry roots are logged through the fully qualified `Vec::len`,
+        // the receiver proof the payload-free log scanner accepts.
+        named += normalized
+            .matches("registry_root_tools = Vec::len(&tools_registry)")
+            .count();
     }
     assert!(
         misleading.is_empty(),

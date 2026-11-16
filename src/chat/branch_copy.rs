@@ -216,13 +216,16 @@ async fn retained_turn_event_ids(
     if retained.is_empty() {
         return Ok(Vec::new());
     }
-    let provenance = resolve_compaction_event_provenance(mem, source.memory_principal(), &retained)
-        .await?
-        .filter(|provenance| {
-            provenance.companion_message_count == 0 && provenance.source_event_ids.len() == retained.len()
-        })
-        .ok_or(BranchCopyError::InvalidPlan(
-            "the retained turns have no exact transcript rows",
-        ))?;
+    let provenance = resolve_compaction_event_provenance(
+        mem,
+        source.memory_principal(),
+        &retained,
+        crate::agent::compaction::RoundCompanions::Acknowledged,
+    )
+    .await?
+    .filter(|provenance| provenance.companion_message_count == 0 && provenance.source_event_ids.len() == retained.len())
+    .ok_or(BranchCopyError::InvalidPlan(
+        "the retained turns have no exact transcript rows",
+    ))?;
     Ok(provenance.source_event_ids)
 }

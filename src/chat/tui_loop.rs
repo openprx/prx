@@ -120,12 +120,13 @@ pub(super) fn log_tui_input_event(ev: &crossterm::event::Event) {
             let key_class: &'static str = key_class;
             let named_key: Option<&crossterm::event::KeyCode> = named_key;
             let modifiers: crossterm::event::KeyModifiers = k.modifiers;
+            let kind: crossterm::event::KeyEventKind = k.kind;
             tracing::info!(
                 event_type = "Key",
                 key_class,
                 named_key = ?named_key,
                 modifiers = ?modifiers,
-                kind = ?k.kind,
+                kind = ?kind,
                 "tui_input_event"
             );
         }
@@ -134,12 +135,18 @@ pub(super) fn log_tui_input_event(ev: &crossterm::event::Event) {
             tracing::info!(
                 event_type = "Paste",
                 chars_count = s.chars().count(),
-                bytes_count = s.len(),
+                bytes_count = str::len(&s),
                 "tui_input_event"
             );
         }
         crossterm::event::Event::Resize(cols, rows) => {
-            tracing::info!(event_type = "Resize", cols, rows, "tui_input_event");
+            let (log_cols, log_rows): (u16, u16) = (*cols, *rows);
+            tracing::info!(
+                event_type = "Resize",
+                cols = log_cols,
+                rows = log_rows,
+                "tui_input_event"
+            );
         }
         other => {
             tracing::info!(

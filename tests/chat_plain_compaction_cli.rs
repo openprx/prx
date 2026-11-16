@@ -1695,6 +1695,7 @@ fn refused_patch_lines(sandbox: &Sandbox, stderr: &str) -> Vec<String> {
             line.contains("HistoryCompactionPatch rejected")
                 || line.contains("does not describe the session history")
                 || line.contains("does not match its source")
+                || line.contains("does not replay to its compacted history")
         })
         .map(str::to_owned)
         .collect()
@@ -1752,5 +1753,196 @@ fn consecutive_summary_compactions_after_an_outer_rollover_are_all_accepted() {
     assert!(
         saved.iter().any(|(_, content)| content.contains(&newest)),
         "the saved session adopted the newest summary `{newest}`: {saved:?}"
+    );
+}
+
+/// The question whose committed answer reads like a native tool-call envelope.
+const JSON_QUESTION: &str = "JSON-ANSWER reply with the example envelope";
+/// An ordinary final answer that reads like a tool-call envelope: it names no
+/// executable tool, so the turn commits it as text.
+const JSON_ANSWER: &str = r#"{"tool_calls":[{"id":"example"}]}"#;
+/// A tool turn that reads one filler per call until its request carries a
+/// handoff (an in-turn compaction reported to the session authority).
+const READ_UNTIL_HANDOFF: &str = "READ-UNTIL-HANDOFF read every filler";
+
+/// The compaction script, except that [`JSON_QUESTION`] is answered with
+/// [`JSON_ANSWER`] and the [`READ_UNTIL_HANDOFF`] turn reads one filler file
+/// per provider call until its request carries a handoff, then ends with
+/// `NOTED`.
+fn script_json_answer_then_handoff() -> Script {
+    let mut base = compaction_script::script();
+    let mut rounds = 0;
+    Box::new(move |index, request| {
+        let newest = newest_user_text(request);
+        if newest.contains(JSON_QUESTION) {
+            return Scripted::text(JSON_ANSWER);
+        }
+        if !newest.contains(READ_UNTIL_HANDOFF) {
+            return base(index, request);
+        }
+        if compaction_script::handoff_note(request).is_some() || rounds >= SWITCH_FILLERS {
+            return Scripted::text(compaction_script::NOTED);
+        }
+        let file = format!("f{rounds}.txt");
+        rounds += 1;
+        Scripted::tool(
+            &format!("call-json-{index}"),
+            "file_read",
+            &serde_json::json!({ "path": file }),
+        )
+    })
+}
+
+/// What one JSON-answer run left behind.
+struct JsonAnswerRun {
+    /// The `message.created` event ids of the question and the answer.
+    answer_turn_events: Vec<String>,
+    /// The saved session once the tool turn committed.
+    saved: Vec<(String, String)>,
+    /// Every request of the tool turn that carried a handoff.
+    handoff_requests: Vec<serde_json::Value>,
+    /// Refused or mismatched compaction patch lines (stderr and `chat.log`).
+    refused: Vec<String>,
+}
+
+/// One held chat over real HTTP/SSE and real SQLite in `switch` mode keeping
+/// `keep_recent` messages: the [`JSON_QUESTION`] turn commits
+/// [`JSON_ANSWER`], then the [`READ_UNTIL_HANDOFF`] tool turn hands off in
+/// the middle of the turn. A TUI build runs the turn on a detached provider
+/// worker, whose sink reports the compaction; a non-TUI build runs the inline
+/// loop, whose inline sink reports it.
+fn run_json_answer_then_handoff(keep_recent: usize) -> JsonAnswerRun {
+    let sandbox = Sandbox::new();
+    write_filler_files(&sandbox.workspace, SWITCH_FILLERS);
+    let server = LoopbackOpenAi::start(MODEL, Some((11, 7)), script_json_answer_then_handoff());
+    write_config(&sandbox.config_dir, &server.provider(), MODEL, |config| {
+        config.autonomy.level = openprx::security::AutonomyLevel::Full;
+        config.agent.compaction.mode = openprx::config::schema::AgentCompactionMode::Switch;
+        config.agent.compaction.max_context_tokens = compaction_script::SMALL_WINDOW_TOKENS;
+        config.agent.compaction.reserve_tokens = RESERVE_TOKENS;
+        config.agent.compaction.keep_recent_messages = keep_recent;
+        config.memory.auto_save = false;
+    });
+    let mut command = sandbox.command(&["chat", "--plain"]);
+    command.env("RUST_LOG", "warn");
+    let mut chat = HeldChat {
+        sandbox: &sandbox,
+        running: Running::spawn(command),
+    };
+    chat.turn(JSON_QUESTION, 1);
+    let committed = wait_for_saved_reply_to(&sandbox, JSON_QUESTION);
+    assert_eq!(
+        committed.last().map(|(_, content)| content.as_str()),
+        Some(JSON_ANSWER),
+        "the envelope-shaped answer was committed as the turn's text: {committed:?}"
+    );
+    let answer_turn_events = first_message_event_ids(&sandbox, 2);
+    chat.turn(READ_UNTIL_HANDOFF, 2);
+    let saved = wait_for_saved_reply_to(&sandbox, READ_UNTIL_HANDOFF);
+    let output = chat.exit();
+    assert_clean(&output, "a JSON-shaped answer, then an in-turn handoff");
+    let handoff_requests = server
+        .requests()
+        .into_iter()
+        .filter(|request| {
+            newest_user_text(request).contains(READ_UNTIL_HANDOFF) && compaction_script::handoff_note(request).is_some()
+        })
+        .collect();
+    JsonAnswerRun {
+        answer_turn_events,
+        saved,
+        handoff_requests,
+        refused: refused_patch_lines(&sandbox, &output.stderr),
+    }
+}
+
+/// Whether `request` carries [`JSON_ANSWER`] as an assistant message.
+fn carries_json_answer(request: &serde_json::Value) -> bool {
+    request["messages"].as_array().is_some_and(|messages| {
+        messages
+            .iter()
+            .any(|message| message["role"] == "assistant" && message_text(message) == JSON_ANSWER)
+    })
+}
+
+/// Messages kept verbatim when the answer must sit in the hot tail. Even, so
+/// the first handoff the tool turn can make (the history outgrows it by one
+/// message: the question) leaves exactly the question in the cold window.
+const JSON_ANSWER_HOT_KEEP: usize = 16;
+/// Messages kept verbatim when the answer must fall into the cold window: the
+/// first possible handoff leaves the question and the answer cold.
+const JSON_ANSWER_COLD_KEEP: usize = 15;
+
+/// A committed answer that reads like a tool-call envelope sits in the hot
+/// tail an in-turn handoff retains: the session accepts the compaction (no
+/// refused patch, no guard mismatch), the request after the handoff carries
+/// the answer verbatim, and the saved session keeps it.
+#[test]
+fn a_committed_json_answer_in_the_hot_tail_survives_an_in_turn_handoff() {
+    let run = run_json_answer_then_handoff(JSON_ANSWER_HOT_KEEP);
+
+    assert!(
+        run.refused.is_empty(),
+        "no compaction patch was refused or mismatched its guard: {:?}",
+        run.refused
+    );
+    assert!(
+        !run.handoff_requests.is_empty(),
+        "the tool turn handed off in the middle of the turn; saved: {:?}",
+        run.saved
+    );
+    assert!(
+        run.handoff_requests.iter().all(carries_json_answer),
+        "every request after the handoff carries the answer from the retained hot tail; saved: {:?}",
+        run.saved
+    );
+    let saved_handoff_refs = saved_handoff_references(&run.saved);
+    assert!(
+        !saved_handoff_refs.is_empty(),
+        "the saved session adopted the handoff: {:?}",
+        run.saved
+    );
+    assert!(
+        run.saved
+            .iter()
+            .any(|(role, content)| role == "assistant" && content == JSON_ANSWER),
+        "the saved session keeps the answer as bytes: {:?}",
+        run.saved
+    );
+}
+
+/// A committed answer that reads like a tool-call envelope falls into the
+/// cold window of an in-turn handoff: the session accepts the compaction, and
+/// the handoff resolves the answer to its own stored event (an acknowledged
+/// turn is never folded as tool traffic), so the saved session keeps it
+/// through the handoff's references.
+#[test]
+fn a_committed_json_answer_in_the_cold_window_is_referenced_by_the_handoff() {
+    let run = run_json_answer_then_handoff(JSON_ANSWER_COLD_KEEP);
+
+    assert!(
+        run.refused.is_empty(),
+        "no compaction patch was refused or mismatched its guard: {:?}",
+        run.refused
+    );
+    assert!(
+        !run.handoff_requests.is_empty(),
+        "the tool turn handed off in the middle of the turn; saved: {:?}",
+        run.saved
+    );
+    assert_eq!(
+        run.answer_turn_events.len(),
+        2,
+        "the question and the answer were stored: {:?}",
+        run.answer_turn_events
+    );
+    let saved_handoff_refs = saved_handoff_references(&run.saved);
+    assert!(
+        run.answer_turn_events
+            .iter()
+            .all(|event| saved_handoff_refs.contains(event)),
+        "the saved handoff references the question and the answer: {:?} in {saved_handoff_refs:?}; saved: {:?}",
+        run.answer_turn_events,
+        run.saved
     );
 }

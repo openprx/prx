@@ -502,7 +502,29 @@ pub(super) fn is_tool_roundtrip_companion(message: &ChatMessage) -> bool {
     }
 }
 
-/// True when `message` is the *request* half of a tool round-trip: the assistant
+/// Which messages of a compaction source are tool round-trip companions
+/// ([`is_tool_roundtrip_companion`]): folded into the assistant turn that
+/// requested them rather than resolved to a transcript event of their own.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RoundCompanions<'a> {
+    /// Every message is an acknowledged session turn: none is a companion,
+    /// whatever its text.
+    Acknowledged,
+    /// One flag per message, from the canonical history's provenance
+    /// ([`crate::agent::turn_history::CanonicalHistory::tool_round_companions`]).
+    Marked(&'a [bool]),
+}
+
+impl RoundCompanions<'_> {
+    fn is_companion(self, index: usize) -> bool {
+        match self {
+            Self::Acknowledged => false,
+            Self::Marked(flags) => flags.get(index).copied().unwrap_or_default(),
+        }
+    }
+}
+
+/// True when a companion `message` is the *request* half of a tool round-trip: the assistant
 /// envelope carrying native `tool_calls`, or the prompt-mode `[Tool results]`
 /// block that stands in for one when the request itself is a durable message.
 ///
@@ -510,13 +532,7 @@ pub(super) fn is_tool_roundtrip_companion(message: &ChatMessage) -> bool {
 /// number the model and the user can reason about: one per tool batch the
 /// window contains.
 fn is_tool_roundtrip_request(message: &ChatMessage) -> bool {
-    match message.role.as_str() {
-        "user" => message
-            .content
-            .starts_with(crate::agent::turn_contracts::TOOL_RESULTS_PREFIX),
-        "assistant" => is_tool_roundtrip_companion(message),
-        _ => false,
-    }
+    matches!(message.role.as_str(), "user" | "assistant")
 }
 
 /// Names of the tools called inside `message`, in call order.
@@ -559,12 +575,17 @@ pub(crate) struct FoldedToolRoundtrips {
 /// starts being the payload it is meant to replace.
 const FOLDED_TOOL_NAME_LIMIT: usize = 12;
 
-pub(crate) fn folded_tool_roundtrips(source_messages: &[ChatMessage]) -> FoldedToolRoundtrips {
+pub(crate) fn folded_tool_roundtrips(
+    source_messages: &[ChatMessage],
+    companions: RoundCompanions<'_>,
+) -> FoldedToolRoundtrips {
     let mut count = 0usize;
     let mut tools: Vec<String> = Vec::new();
     for message in source_messages
         .iter()
-        .filter(|message| is_tool_roundtrip_request(message))
+        .enumerate()
+        .filter(|(index, message)| companions.is_companion(*index) && is_tool_roundtrip_request(message))
+        .map(|(_, message)| message)
     {
         count = count.saturating_add(1);
         for name in tool_names_in_roundtrip_request(message) {
@@ -599,17 +620,13 @@ pub(crate) fn format_folded_tool_roundtrips_notice(folded: &FoldedToolRoundtrips
 /// A `role="tool"` result whose requesting assistant message was compacted away
 /// is an orphan every native provider rejects, so the boundary walks back until
 /// the first retained message is a durable user/assistant turn.
-fn compaction_boundary_without_orphan_tool_results(
-    source_history: &[ChatMessage],
-    start: usize,
-    compact_end: usize,
-) -> usize {
+fn compaction_boundary_without_orphan_tool_results(companions: &[bool], start: usize, compact_end: usize) -> usize {
     let mut boundary = compact_end;
     while boundary > start {
-        let Some(first_retained) = source_history.get(boundary) else {
+        let Some(first_retained) = companions.get(boundary) else {
             break;
         };
-        if !is_tool_roundtrip_companion(first_retained) {
+        if !*first_retained {
             break;
         }
         boundary = boundary.saturating_sub(1);
@@ -624,8 +641,8 @@ fn compaction_boundary_without_orphan_tool_results(
     // message that can stand at the head of the hot window instead — the cold
     // window grows, but it still folds into one handoff.
     let mut forward = compact_end;
-    while forward < source_history.len() {
-        if !source_history.get(forward).is_some_and(is_tool_roundtrip_companion) {
+    while forward < companions.len() {
+        if !companions.get(forward).copied().unwrap_or_default() {
             return forward;
         }
         forward = forward.saturating_add(1);
@@ -663,6 +680,7 @@ pub(crate) async fn resolve_compaction_event_provenance(
     mem: &dyn Memory,
     principal: MemoryPrincipal,
     source_messages: &[ChatMessage],
+    companions: RoundCompanions<'_>,
 ) -> anyhow::Result<Option<CompactionEventProvenance>> {
     if principal.session_key.is_none() || source_messages.is_empty() {
         return Ok(None);
@@ -671,13 +689,14 @@ pub(crate) async fn resolve_compaction_event_provenance(
     // Tool round-trip messages are never persisted verbatim, so they cannot be
     // matched against transcript events. Fold them into the assistant turn that
     // produced them and resolve provenance over the durable remainder.
-    let companion_message_count = source_messages
-        .iter()
-        .filter(|message| is_tool_roundtrip_companion(message))
+    let companion_message_count = (0..source_messages.len())
+        .filter(|index| companions.is_companion(*index))
         .count();
     let durable_messages = source_messages
         .iter()
-        .filter(|message| !is_tool_roundtrip_companion(message))
+        .enumerate()
+        .filter(|(index, _)| !companions.is_companion(*index))
+        .map(|(_, message)| message)
         .collect::<Vec<_>>();
     if durable_messages.is_empty()
         || durable_messages
@@ -779,9 +798,12 @@ pub(crate) async fn resolve_compaction_event_provenance(
 async fn attach_compaction_event_provenance(
     audit: &DocumentIngestRuntime,
     source_messages: &[ChatMessage],
+    companions: RoundCompanions<'_>,
     source: &mut CompactionAuditSource,
 ) {
-    match resolve_compaction_event_provenance(&*audit.memory, audit.memory_principal(), source_messages).await {
+    match resolve_compaction_event_provenance(&*audit.memory, audit.memory_principal(), source_messages, companions)
+        .await
+    {
         Ok(Some(provenance)) => {
             source.source_event_ids = provenance.source_event_ids;
             source.source_event_range = Some(provenance.covered_range);
@@ -1173,13 +1195,14 @@ pub(crate) async fn build_configurable_compaction_patch(
     audit: Option<&DocumentIngestRuntime>,
     trigger: &'static str,
 ) -> Result<Option<CompactionPatch>> {
-    build_configurable_compaction_patch_with_source_history(history, history, provider, model, config, audit, trigger)
+    let source = crate::agent::turn_history::CanonicalHistory::from_test_messages(history.to_vec());
+    build_configurable_compaction_patch_with_source_history(history, &source, provider, model, config, audit, trigger)
         .await
 }
 
 pub(crate) async fn build_configurable_compaction_patch_with_source_history(
     budget_history: &[ChatMessage],
-    source_history: &[ChatMessage],
+    source: &crate::agent::turn_history::CanonicalHistory,
     provider: &dyn Provider,
     model: &str,
     config: &crate::config::AgentCompactionConfig,
@@ -1193,6 +1216,10 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
         return Ok(None);
     }
 
+    let source_history = source.messages();
+    // This turn's tool round traffic, by provenance (an acknowledged turn is
+    // never folded, whatever its text).
+    let companions = source.tool_round_companions();
     let has_system = source_history.first().is_some_and(|m| m.role == "system");
     let start = if has_system { 1 } else { 0 };
     let non_system_count = source_history.len().saturating_sub(start);
@@ -1209,18 +1236,19 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
     // requesting assistant message was compacted away is rejected by every
     // native provider.
     let compact_end =
-        compaction_boundary_without_orphan_tool_results(source_history, start, start + requested_compact_count);
+        compaction_boundary_without_orphan_tool_results(&companions, start, start + requested_compact_count);
     let compact_count = compact_end.saturating_sub(start);
     if compact_count == 0 {
         return Ok(None);
     }
     let keep_recent = source_history.len().saturating_sub(compact_end);
     let compacted_source_messages = source_history.get(start..compact_end);
+    let compacted_companions = RoundCompanions::Marked(companions.get(start..compact_end).unwrap_or_default());
     let mut audit_source = audit.and_then(|_| compacted_source_messages.map(build_compaction_audit_source));
     if let (Some(audit), Some(source_messages), Some(source)) =
         (audit, compacted_source_messages, audit_source.as_mut())
     {
-        attach_compaction_event_provenance(audit, source_messages, source).await;
+        attach_compaction_event_provenance(audit, source_messages, compacted_companions, source).await;
     }
     let Some(guard) = compaction_patch_guard_for(source_history, start, compact_end) else {
         return Ok(None);
@@ -1264,7 +1292,7 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
         // round-trips have no events of their own. Without this line the note
         // reads as an exact transfer while the tool output — usually the
         // substance of an agentic window — is gone with nothing naming it.
-        let folded = folded_tool_roundtrips(compacted_source_messages.unwrap_or_default());
+        let folded = folded_tool_roundtrips(compacted_source_messages.unwrap_or_default(), compacted_companions);
         let folded_notice = format_folded_tool_roundtrips_notice(&folded);
         let note = serde_json::json!({
             "schema_version": 1,
@@ -1496,7 +1524,7 @@ pub(super) async fn apply_configurable_compaction_with_replacement_len(
 /// and how much is measured on the projection (what the provider receives,
 /// enrichment included), the patch is built from and applied to `source`.
 pub(super) async fn apply_configurable_compaction_over_view(
-    source: &mut Vec<ChatMessage>,
+    source: &mut crate::agent::turn_history::CanonicalHistory,
     budget_history: &[ChatMessage],
     provider: &dyn Provider,
     model: &str,
@@ -1519,7 +1547,7 @@ pub(super) async fn apply_configurable_compaction_over_view(
     };
     crate::agent::idle::beat(crate::agent::idle::ProgressKind::Compaction);
     let replacement_len = patch.replacement.len();
-    apply_compaction_patch_exact(source, &patch)?;
+    source.apply_patch_with_refresh_aside(&patch)?;
     Ok(Some(replacement_len))
 }
 

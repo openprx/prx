@@ -129,7 +129,7 @@ impl WorkerMailboxParent {
             }
             WorkerOutputFrame::Ack { message_id, state } => {
                 let Some(delivery) = self.pending.get(&message_id) else {
-                    tracing::debug!(%message_id, "worker acknowledgment has no pending delivery");
+                    tracing::debug!(message_id = %crate::agent::diagnostics::text_class(&message_id.to_string()), "worker acknowledgment has no pending delivery");
                     return Ok(None);
                 };
                 if state == DeliveryState::Consumed {

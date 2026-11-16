@@ -143,30 +143,35 @@ fn an_enriched_request_lives_only_in_the_projection() {
     );
 }
 
-#[test]
-fn the_reducer_form_drops_the_pending_request_tool_traffic_and_loop_notes() {
-    let canonical = CanonicalHistory::from_test_messages(vec![
-        ChatMessage::system("sys"),
-        ChatMessage::user("question"),
-        ChatMessage::assistant("answer"),
-        ChatMessage::user(format!(
-            "{} aside",
-            crate::agent::turn_contracts::POST_COMPACTION_REFRESH_MARKER
+/// A native tool round as the loop appends it: the assistant envelope and
+/// its result.
+fn native_round(id: &str) -> Vec<ChatMessage> {
+    vec![
+        ChatMessage::assistant(format!(
+            r#"{{"content":"","tool_calls":[{{"id":"{id}","name":"file_read"}}]}}"#
         )),
-        ChatMessage::user("request"),
-        ChatMessage::assistant(r#"{"tool_calls":[{"id":"c1"}]}"#),
         ChatMessage {
             role: "tool".to_owned(),
-            content: "result".to_owned(),
+            content: format!(r#"{{"tool_call_id":"{id}","content":"result"}}"#),
         },
-    ]);
+    ]
+}
+
+#[test]
+fn the_reducer_form_leaves_out_the_pending_request_and_this_turns_rounds_by_provenance() {
+    let canonical = CanonicalHistory::from_test_turn(
+        Some("sys"),
+        &[("user", "question"), ("assistant", "answer")],
+        "request",
+        &native_round("c1"),
+    );
 
     let reducer_form = canonical.reducer_form();
 
     assert_eq!(
         contents(reducer_form.messages()),
         vec!["sys", "question", "answer"],
-        "the reducer form keeps the system prompt and the durable turns only"
+        "the reducer form keeps the system prompt and the acknowledged turns only"
     );
     assert_eq!(
         reducer_form,
@@ -176,19 +181,97 @@ fn the_reducer_form_drops_the_pending_request_tool_traffic_and_loop_notes() {
 }
 
 #[test]
+fn an_acknowledged_answer_shaped_like_a_tool_call_envelope_stays_in_the_reducer_form() {
+    let json_answer = r#"{"tool_calls":[{"id":"example"}]}"#;
+    let marker_answer = format!(
+        "{} quoted by the model",
+        crate::agent::turn_contracts::TOOL_RESULTS_PREFIX
+    );
+    let canonical = CanonicalHistory::from_test_turn(
+        Some("sys"),
+        &[
+            ("user", "q1"),
+            ("assistant", json_answer),
+            ("user", "q2"),
+            ("assistant", &marker_answer),
+        ],
+        "request",
+        &native_round("c1"),
+    );
+
+    let reducer_form = canonical.reducer_form();
+
+    assert_eq!(
+        contents(reducer_form.messages()),
+        vec!["sys", "q1", json_answer, "q2", marker_answer.as_str()],
+        "acknowledged answers are kept whatever their text; only the request and the round are left out"
+    );
+    assert_eq!(
+        canonical.tool_round_companions(),
+        vec![false, false, false, false, false, false, true, true],
+        "only this turn's round folds into a handoff; the acknowledged JSON answer resolves to its own event"
+    );
+}
+
+#[test]
+fn a_compaction_keeps_the_provenance_of_its_retained_tail() {
+    let json_answer = r#"{"tool_calls":[{"id":"example"}]}"#;
+    let mut canonical = CanonicalHistory::from_test_turn(
+        Some("sys"),
+        &[
+            ("user", "q1"),
+            ("assistant", "a1"),
+            ("user", "q2"),
+            ("assistant", json_answer),
+        ],
+        "request",
+        &native_round("c1"),
+    );
+    let guard = crate::agent::compaction::compaction_patch_guard_for(canonical.messages(), 1, 3)
+        .expect("test: the range lies inside the history");
+    let patch = crate::agent::turn_contracts::CompactionPatch {
+        replacement: vec![ChatMessage::assistant("summary")],
+        append_after: vec![ChatMessage::user(format!(
+            "{} aside",
+            crate::agent::turn_contracts::POST_COMPACTION_REFRESH_MARKER
+        ))],
+        guard,
+    };
+
+    canonical
+        .apply_patch_with_refresh_aside(&patch)
+        .expect("test: the patch describes its source");
+    let lifted = canonical.lift_refresh_notes();
+
+    assert_eq!(
+        lifted.len(),
+        1,
+        "the aside is marked as a projection and lifted: {lifted:?}"
+    );
+    assert_eq!(
+        contents(canonical.reducer_form().messages()),
+        vec!["sys", "summary", "q2", json_answer],
+        "the summary and the retained acknowledged tail are kept; the retained round and the request are not"
+    );
+}
+
+#[test]
 fn a_refresh_aside_moves_into_the_projection_after_its_replacement() {
     let view = vec![ChatMessage::system("sys"), ChatMessage::user("request")];
     let mut turn_history = TurnHistory::new(&view, None, false);
-    turn_history.canonical_mut(&view).durable_compaction_target().splice(
-        1..1,
-        [
-            ChatMessage::assistant("summary"),
-            ChatMessage::user(format!(
+    let canonical = turn_history.canonical_mut(&view);
+    let guard =
+        crate::agent::compaction::compaction_patch_guard_for(canonical.messages(), 1, 1).expect("test: empty range");
+    canonical
+        .apply_patch_with_refresh_aside(&crate::agent::turn_contracts::CompactionPatch {
+            replacement: vec![ChatMessage::assistant("summary")],
+            append_after: vec![ChatMessage::user(format!(
                 "{} aside",
                 crate::agent::turn_contracts::POST_COMPACTION_REFRESH_MARKER
-            )),
-        ],
-    );
+            ))],
+            guard,
+        })
+        .expect("test: the patch describes its source");
 
     let compacted = turn_history.finish_durable_compaction(&view).clone();
 

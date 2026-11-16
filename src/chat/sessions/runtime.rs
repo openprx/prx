@@ -656,7 +656,7 @@ impl ChatSessionsHandle {
                     task_controls.push(control);
                 } else if let Some(handle) = run.abort_handle.as_ref() {
                     handle.abort();
-                    tracing::warn!(run_id = %run.id, "Task termination has no cleanup acknowledgement owner");
+                    tracing::warn!(run_id = %crate::agent::diagnostics::text_class(&run.id), "Task termination has no cleanup acknowledgement owner");
                 }
             }
         }

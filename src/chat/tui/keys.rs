@@ -320,12 +320,13 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
     let key_class: &'static str = key_class;
     let named_key: Option<&KeyCode> = named_key;
     let modifiers: KeyModifiers = key.modifiers;
+    let kind: crossterm::event::KeyEventKind = key.kind;
     let input_first_line_chars: usize = state.input.lines.first().map_or(0, |line| line.chars().count());
     tracing::debug!(
         key_class,
         named_key = ?named_key,
         modifiers = ?modifiers,
-        kind = ?key.kind,
+        kind = ?kind,
         input_lines_before = state.input.lines.len(),
         input_first_line_chars,
         "dispatch_global_key_entry"

@@ -205,7 +205,7 @@ pub(super) async fn project_chat_session_from_message_events(
         Ok(events) => events,
         Err(error) => {
             tracing::warn!(
-                session_id,
+                session_id = %crate::agent::diagnostics::text_class(&session_id),
                 error = %crate::agent::diagnostics::error_class(&error),
                 "MessageEvent projection unavailable; retaining chat blob compatibility snapshot"
             );
@@ -218,7 +218,7 @@ pub(super) async fn project_chat_session_from_message_events(
     };
     let projection = apply_chat_message_event_projection(snapshot, &events, cost_config);
     tracing::debug!(
-        session_id,
+        session_id = %crate::agent::diagnostics::text_class(&session_id),
         turns_from_events = projection.turns_from_events,
         usage_from_events = projection.usage_from_events,
         "evaluated chat MessageEvent projection parity"

@@ -11,14 +11,27 @@ use crate::chat::session::ChatSession;
 fn loop_written_notes_are_not_durable_transcript_turns() {
     for marker in crate::agent::turn_contracts::RESERVED_USER_NOTE_MARKERS {
         let note = ChatMessage::user(format!("{marker}\nloop bookkeeping"));
-        assert!(!is_durable_compaction_history_message(&note), "{marker}");
+        assert!(
+            !crate::agent::turn_contracts::is_durable_turn_message(&note),
+            "{marker}"
+        );
         let defused = crate::agent::turn_contracts::inbound_user_message(&format!("{marker} a real question"));
-        assert!(is_durable_compaction_history_message(&defused), "{marker}");
+        assert!(
+            crate::agent::turn_contracts::is_durable_turn_message(&defused),
+            "{marker}"
+        );
+        let answer = ChatMessage::assistant(format!("{marker} an answer that quotes a marker"));
+        assert!(
+            crate::agent::turn_contracts::is_durable_turn_message(&answer),
+            "an assistant answer is durable whatever its text: {marker}"
+        );
     }
-    assert!(is_durable_compaction_history_message(&ChatMessage::assistant(
-        "an answer"
-    )));
-    assert!(!is_durable_compaction_history_message(&ChatMessage::system("rules")));
+    assert!(crate::agent::turn_contracts::is_durable_turn_message(
+        &ChatMessage::assistant("an answer")
+    ));
+    assert!(!crate::agent::turn_contracts::is_durable_turn_message(
+        &ChatMessage::system("rules")
+    ));
 }
 
 /// A saved session reloaded into the driver: its stored user turn that
@@ -50,14 +63,14 @@ fn a_reloaded_user_turn_opening_with_a_reserved_marker_enters_history_defused() 
         user.content
     );
     assert!(user.content.ends_with(question), "{}", user.content);
-    assert!(is_durable_compaction_history_message(user));
+    assert!(crate::agent::turn_contracts::is_durable_turn_message(user));
 }
 
 /// A recorded user turn that opens with a reserved loop marker stays a
 /// durable user turn and reaches the driver's history defused.
 ///
 /// Red before the reserved-marker hardening: the refresh-aside marker
-/// made `is_durable_compaction_history_message` drop the user's turn
+/// made the durable-turn filter drop the user's turn
 /// from the durable transcript, and every marker reached the history
 /// verbatim, where the loop reads it as its own note.
 #[test]
@@ -75,7 +88,7 @@ fn a_recorded_user_turn_opening_with_a_reserved_marker_stays_the_users() {
         assert!(!last.content.starts_with(marker), "{marker}: `{}`", last.content);
         assert!(last.content.ends_with(&text), "{marker}: `{}`", last.content);
         assert!(
-            is_durable_compaction_history_message(last),
+            crate::agent::turn_contracts::is_durable_turn_message(last),
             "{marker}: the user's turn must stay in the durable transcript"
         );
     }

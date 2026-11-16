@@ -335,7 +335,12 @@ pub(super) fn record_provider_turn_lifecycle_event(
     event: dispatcher::ProviderTurnLifecycleEvent,
 ) {
     use crate::chat::turn_worker::ProviderTurnWorkerError;
-    let (task_id, lease_id, kind, result) = match event {
+    let (task_id, lease_id, kind, result): (
+        crate::chat::turn_scheduler::TurnTaskId,
+        u64,
+        &'static str,
+        Result<(), ProviderTurnWorkerError>,
+    ) = match event {
         dispatcher::ProviderTurnLifecycleEvent::HandleAttached {
             task_id,
             lease_id,
@@ -356,7 +361,7 @@ pub(super) fn record_provider_turn_lifecycle_event(
             let result = workers.record_execution_failed(task_id, lease_id);
             if accepted.send(result.is_ok()).is_err() {
                 tracing::debug!(
-                    task_id = task_id.get(),
+                    task_id = crate::chat::turn_scheduler::TurnTaskId::get(task_id),
                     lease_id,
                     "provider worker supervisor left before the failure answer"
                 );
@@ -365,7 +370,7 @@ pub(super) fn record_provider_turn_lifecycle_event(
                 // Expected when the turn already produced its terminal: the
                 // failure gate refuses and the turn keeps its outcome.
                 tracing::debug!(
-                    task_id = task_id.get(),
+                    task_id = crate::chat::turn_scheduler::TurnTaskId::get(task_id),
                     lease_id,
                     error = %crate::agent::diagnostics::error_class(&error),
                     "provider worker failure refused"
@@ -377,7 +382,7 @@ pub(super) fn record_provider_turn_lifecycle_event(
             let result = workers.record_execution_exited(task_id, lease_id);
             if let Err(ProviderTurnWorkerError::UnknownWorker(_)) = result {
                 tracing::debug!(
-                    task_id = task_id.get(),
+                    task_id = crate::chat::turn_scheduler::TurnTaskId::get(task_id),
                     lease_id,
                     "provider worker exit for a retired task"
                 );
@@ -388,7 +393,7 @@ pub(super) fn record_provider_turn_lifecycle_event(
     };
     if let Err(error) = result {
         tracing::warn!(
-            task_id = task_id.get(),
+            task_id = crate::chat::turn_scheduler::TurnTaskId::get(task_id),
             lease_id,
             kind,
             error = %crate::agent::diagnostics::error_class(&error),
@@ -403,7 +408,7 @@ fn record_provider_turn_completion_ready(
 ) {
     if let Err(error) = workers.record_completion_ready(task_id) {
         tracing::warn!(
-            task_id = task_id.get(),
+            task_id = crate::chat::turn_scheduler::TurnTaskId::get(task_id),
             error = %crate::agent::diagnostics::error_class(&error),
             "ProviderTurnWorkerRegistry provider completion-ready gate failed"
         );
@@ -431,7 +436,7 @@ pub(super) fn route_provider_completion_event(
     }
     if pending.insert(task_id, completion).is_some() {
         tracing::warn!(
-            task_id = task_id.get(),
+            task_id = crate::chat::turn_scheduler::TurnTaskId::get(task_id),
             "replaced duplicate pending provider completion event"
         );
     }
@@ -475,7 +480,7 @@ pub(super) fn record_provider_turn_completion_context(
             .is_some()
     {
         tracing::warn!(
-            task_id = task_id.get(),
+            task_id = crate::chat::turn_scheduler::TurnTaskId::get(task_id),
             "replaced duplicate provider turn completion context"
         );
     }
@@ -526,7 +531,7 @@ fn record_provider_turn_finalized_payload(
     };
     if let Err(error) = workers.record_finalized_payload(id, payload) {
         tracing::warn!(
-            task_id = id.get(),
+            task_id = crate::chat::turn_scheduler::TurnTaskId::get(id),
             error = %crate::agent::diagnostics::error_class(&error),
             "ProviderTurnWorkerRegistry provider finalized payload record failed"
         );
@@ -590,7 +595,7 @@ pub(super) fn finish_inline_provider_turn(
     };
     if let Err(error) = workers.record_inline_completion_ready(id) {
         tracing::warn!(
-            task_id = id.get(),
+            task_id = crate::chat::turn_scheduler::TurnTaskId::get(id),
             error = %crate::agent::diagnostics::error_class(&error),
             "ProviderTurnWorkerRegistry inline provider completion failed"
         );
@@ -600,7 +605,7 @@ pub(super) fn finish_inline_provider_turn(
         && let Err(error) = workers.record_finalized_payload(id, payload)
     {
         tracing::warn!(
-            task_id = id.get(),
+            task_id = crate::chat::turn_scheduler::TurnTaskId::get(id),
             error = %crate::agent::diagnostics::error_class(&error),
             "ProviderTurnWorkerRegistry inline provider finalized payload record failed"
         );
@@ -1002,7 +1007,10 @@ async fn dispatch_stream_completed_commit_and_wait(
     // its own acknowledgement lifecycle.
     turn_signal.register_turn(task_id, draft_id.to_string());
     let Some(persistence_committed) = turn_signal.notified_for(task_id) else {
-        tracing::error!(task_id = task_id.get(), "missing task-scoped persistence waiter");
+        tracing::error!(
+            task_id = crate::chat::turn_scheduler::TurnTaskId::get(task_id),
+            "missing task-scoped persistence waiter"
+        );
         turn_signal.fail_history_commit("missing task-scoped persistence waiter");
         return Err("missing task-scoped persistence waiter".to_string());
     };
@@ -1037,7 +1045,7 @@ async fn dispatch_stream_completed_commit_and_wait(
         }
         Err(_) => {
             tracing::error!(
-                task_id = task_id.get(),
+                task_id = crate::chat::turn_scheduler::TurnTaskId::get(task_id),
                 "timed out waiting for ordered session persistence"
             );
             turn_signal.unregister_turn(task_id);
@@ -1426,7 +1434,7 @@ pub(super) async fn apply_ready_ordered_provider_turn_commits(
         };
         let Some(pending_commit) = pending_ordered_provider_turn_commits.remove(&task_id) else {
             tracing::debug!(
-                task_id = task_id.get(),
+                task_id = crate::chat::turn_scheduler::TurnTaskId::get(task_id),
                 "ordered provider turn commit ready before local payload was registered"
             );
             continue;
@@ -1518,8 +1526,8 @@ async fn finalize_per_turn_context(
     let history_len_before_user_turn: usize = pending.history_len_before_user_turn;
     tracing::debug!(
         task_id = pending.task_id.get(),
-        draft_id = %pending.draft_id,
-        turn_run_id = %pending.turn_run_id,
+        draft_id = %crate::agent::diagnostics::text_class(&pending.draft_id),
+        turn_run_id = %crate::agent::diagnostics::text_class(&pending.turn_run_id),
         provider_name = %crate::providers::redact_endpoint_userinfo(&pending.provider_name),
         model_name = %crate::providers::redact_endpoint_userinfo(&pending.model_name),
         history_len_before_user_turn,
@@ -1561,7 +1569,7 @@ async fn finalize_per_turn_context(
                 .is_some()
             {
                 tracing::warn!(
-                    task_id = task_id.get(),
+                    task_id = crate::chat::turn_scheduler::TurnTaskId::get(task_id),
                     "replaced pending ordered provider turn commit payload"
                 );
             }
@@ -1856,7 +1864,7 @@ pub(super) fn start_provider_turn_task(
     });
     if let Err(error) = scheduler.start_task(id) {
         tracing::warn!(
-            task_id = id.get(),
+            task_id = crate::chat::turn_scheduler::TurnTaskId::get(id),
             reused_queued_task = existing_task_id.is_some(),
             error = %crate::agent::diagnostics::error_class(&error),
             "TurnScheduler provider task start failed"
@@ -1875,9 +1883,10 @@ pub(super) fn register_provider_history_commit_task(
         && let Some(task) = scheduler.task(id)
         && let Err(error) = coordinator.register_task(task)
     {
+        let task_seq: u64 = task.sequence;
         tracing::warn!(
-            task_id = id.get(),
-            task_seq = task.sequence,
+            task_id = crate::chat::turn_scheduler::TurnTaskId::get(id),
+            task_seq,
             error = %crate::agent::diagnostics::error_class(&error),
             "HistoryCommitCoordinator provider task registration failed"
         );
@@ -1894,9 +1903,10 @@ pub(super) fn register_provider_turn_worker(
         && let Some(task) = scheduler.task(id)
         && let Err(error) = workers.start_from_task(task, kind)
     {
+        let task_seq: u64 = task.sequence;
         tracing::warn!(
-            task_id = id.get(),
-            task_seq = task.sequence,
+            task_id = crate::chat::turn_scheduler::TurnTaskId::get(id),
+            task_seq,
             kind = ?kind,
             error = %crate::agent::diagnostics::error_class(&error),
             "ProviderTurnWorkerRegistry provider worker registration failed"
@@ -1934,7 +1944,7 @@ pub(super) fn spawn_provider_turn_completion_waiter(
         };
         if tx.send(event).await.is_err() {
             tracing::debug!(
-                task_id = task_id.get(),
+                task_id = crate::chat::turn_scheduler::TurnTaskId::get(task_id),
                 "provider turn completion waiter could not deliver event"
             );
         }
@@ -1950,7 +1960,7 @@ pub(super) fn request_provider_turn_cancel(
     if let Some(id) = id {
         if let Err(error) = scheduler.request_cancel(id) {
             tracing::warn!(
-                task_id = id.get(),
+                task_id = crate::chat::turn_scheduler::TurnTaskId::get(id),
                 reason,
                 error = %crate::agent::diagnostics::error_class(&error),
                 "TurnScheduler provider task cancel request failed"
@@ -1958,7 +1968,7 @@ pub(super) fn request_provider_turn_cancel(
         }
         if let Err(error) = workers.request_cancel(id) {
             tracing::warn!(
-                task_id = id.get(),
+                task_id = crate::chat::turn_scheduler::TurnTaskId::get(id),
                 reason,
                 error = %crate::agent::diagnostics::error_class(&error),
                 "ProviderTurnWorkerRegistry provider worker cancel request failed"
@@ -2122,7 +2132,7 @@ pub(super) fn record_provider_turn_usage(
         && let Err(error) = scheduler.record_usage(id, record)
     {
         tracing::warn!(
-            task_id = id.get(),
+            task_id = crate::chat::turn_scheduler::TurnTaskId::get(id),
             error = %crate::agent::diagnostics::error_class(&error),
             "TurnScheduler provider usage ledger record failed"
         );
@@ -2146,7 +2156,7 @@ pub(super) fn mark_provider_turn_completed(
             }
             Err(error) => {
                 tracing::warn!(
-                    task_id = id.get(),
+                    task_id = crate::chat::turn_scheduler::TurnTaskId::get(id),
                     error = %crate::agent::diagnostics::error_class(&error),
                     "TurnScheduler provider task completion failed"
                 );
@@ -2173,7 +2183,7 @@ fn mark_provider_turn_failed(
             }
             Err(error) => {
                 tracing::warn!(
-                    task_id = id.get(),
+                    task_id = crate::chat::turn_scheduler::TurnTaskId::get(id),
                     error = %crate::agent::diagnostics::error_class(&error),
                     "TurnScheduler provider task failure failed"
                 );
@@ -2199,7 +2209,7 @@ fn mark_provider_turn_cancelled(
             }
             Err(error) => {
                 tracing::warn!(
-                    task_id = id.get(),
+                    task_id = crate::chat::turn_scheduler::TurnTaskId::get(id),
                     error = %crate::agent::diagnostics::error_class(&error),
                     "TurnScheduler provider task cancellation failed"
                 );
@@ -2215,7 +2225,7 @@ fn record_provider_worker_completed(
 ) -> bool {
     if let Err(error) = workers.record_completed(id) {
         tracing::warn!(
-            task_id = id.get(),
+            task_id = crate::chat::turn_scheduler::TurnTaskId::get(id),
             error = %crate::agent::diagnostics::error_class(&error),
             "ProviderTurnWorkerRegistry provider worker completion failed"
         );
@@ -2230,7 +2240,7 @@ fn record_provider_worker_failed(
 ) -> bool {
     if let Err(error) = workers.record_failed(id) {
         tracing::warn!(
-            task_id = id.get(),
+            task_id = crate::chat::turn_scheduler::TurnTaskId::get(id),
             error = %crate::agent::diagnostics::error_class(&error),
             "ProviderTurnWorkerRegistry provider worker failure failed"
         );
@@ -2245,7 +2255,7 @@ fn record_provider_worker_cancelled(
 ) -> bool {
     if let Err(error) = workers.record_cancelled(id) {
         tracing::warn!(
-            task_id = id.get(),
+            task_id = crate::chat::turn_scheduler::TurnTaskId::get(id),
             error = %crate::agent::diagnostics::error_class(&error),
             "ProviderTurnWorkerRegistry provider worker cancellation failed"
         );
@@ -2262,23 +2272,24 @@ fn record_provider_history_commit_outcome(
 ) -> Vec<crate::chat::history_commit::HistoryCommitDecision> {
     let Some(task) = scheduler.task(id) else {
         tracing::warn!(
-            task_id = id.get(),
+            task_id = crate::chat::turn_scheduler::TurnTaskId::get(id),
             "HistoryCommitCoordinator missing scheduler task for provider outcome"
         );
         return Vec::new();
     };
     let Some(outcome) = crate::chat::history_commit::HistoryCommitOutcome::from_terminal_task(task) else {
         tracing::warn!(
-            task_id = id.get(),
+            task_id = crate::chat::turn_scheduler::TurnTaskId::get(id),
             state = task.state.kind(),
             "HistoryCommitCoordinator ignored non-terminal provider outcome"
         );
         return Vec::new();
     };
     if let Err(error) = coordinator.record_outcome(outcome) {
+        let task_seq: u64 = task.sequence;
         tracing::warn!(
-            task_id = id.get(),
-            task_seq = task.sequence,
+            task_id = crate::chat::turn_scheduler::TurnTaskId::get(id),
+            task_seq,
             error = %crate::agent::diagnostics::error_class(&error),
             "HistoryCommitCoordinator provider outcome record failed"
         );
@@ -2288,14 +2299,14 @@ fn record_provider_history_commit_outcome(
     for decision in coordinator.drain_ready() {
         if let Err(error) = workers.apply_commit_decision(&decision) {
             tracing::warn!(
-                task_id = id.get(),
+                task_id = crate::chat::turn_scheduler::TurnTaskId::get(id),
                 decision_kind = decision.kind(),
                 error = %crate::agent::diagnostics::error_class(&error),
                 "ProviderTurnWorkerRegistry provider worker commit decision failed"
             );
         }
         tracing::trace!(
-            task_id = id.get(),
+            task_id = crate::chat::turn_scheduler::TurnTaskId::get(id),
             decision_kind = decision.kind(),
             pending_tasks = coordinator.pending_tasks(),
             pending_outcomes = coordinator.pending_outcomes(),

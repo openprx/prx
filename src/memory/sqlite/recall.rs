@@ -914,7 +914,7 @@ impl SqliteMemory {
             let emb = vector::bytes_to_vec(&blob);
             if emb.len() != dimensions {
                 tracing::debug!(
-                    memory_id = %id,
+                    memory_id = %crate::agent::diagnostics::text_class(&id),
                     expected_dimensions = dimensions,
                     actual_dimensions = emb.len(),
                     "Skipping stale memory embedding with mismatched dimensions"
