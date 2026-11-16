@@ -19,8 +19,9 @@ use tokio_util::sync::CancellationToken;
 #[cfg(test)]
 use crate::agent::compaction::is_tool_roundtrip_companion;
 use crate::agent::compaction::{
-    COMPACTION_KEEP_RECENT_MESSAGES, apply_compaction_patch_exact, apply_configurable_compaction,
-    build_configurable_compaction_patch, is_context_handoff_message, persist_context_switch_degradation,
+    COMPACTION_KEEP_RECENT_MESSAGES, apply_compaction_patch_exact, apply_configurable_compaction_over_view,
+    build_configurable_compaction_patch_with_source_history, is_context_handoff_message,
+    persist_context_switch_degradation,
 };
 #[cfg(test)]
 use crate::agent::context_budget::budgeted_request_tool_tokens;
@@ -553,8 +554,11 @@ async fn run_turn_unguarded(
             // Gated on the provider view, built from the canonical history.
             let canonical = turn_history.canonical_mut(history);
             let before = history_before_change(&runtime_adapter, canonical);
-            match apply_configurable_compaction(
+            // Measured on the provider view the gate saw (the enriched
+            // request included), built from and applied to the canonical history.
+            match apply_configurable_compaction_over_view(
                 canonical.durable_compaction_target(),
+                history,
                 provider,
                 model,
                 config,
@@ -563,7 +567,7 @@ async fn run_turn_unguarded(
             )
             .await
             {
-                Ok(true) => {
+                Ok(Some(_)) => {
                     report_durable_compaction(
                         &runtime_adapter,
                         before,
@@ -573,7 +577,7 @@ async fn run_turn_unguarded(
                     .await?;
                     rederive_provider_view(&mut turn_history, history, hooks, channel_name).await;
                 }
-                Ok(false) => {}
+                Ok(None) => {}
                 Err(error) => {
                     let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
                     tracing::warn!(error_len, error_sha256, "Pre-turn compaction failed");
@@ -1593,7 +1597,10 @@ async fn run_turn_unguarded(
                         let mut degraded_reason = None;
                         let canonical = turn_history.canonical_mut(history);
                         let canonical_request = capture_current_turn_request(canonical.messages());
-                        let compaction = match build_configurable_compaction_patch(
+                        // Budgeted on the overflowed provider view, built from
+                        // the canonical history.
+                        let compaction = match build_configurable_compaction_patch_with_source_history(
+                            history,
                             canonical.messages(),
                             provider,
                             model,

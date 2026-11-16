@@ -1,6 +1,4 @@
-use crate::agent::compaction::{
-    apply_configurable_compaction_with_replacement_len, persist_context_switch_degradation,
-};
+use crate::agent::compaction::{apply_configurable_compaction_over_view, persist_context_switch_degradation};
 use crate::agent::context_budget::{
     ContextBudgetSnapshot, PRE_TURN_FLUSH_THRESHOLD, budgeted_request_tool_tokens, budgeted_tokens,
     estimate_budgeted_request_tokens, plan_context_budget, reserve_request_tool_surface, token_source_label,
@@ -126,8 +124,11 @@ pub(super) async fn preflight_durable_compaction(
     // each user message with the same non-retryable error, because the tool
     // round-trip messages kept provenance unresolvable and history never
     // shrank. The view degrades to a lossy trim and the downgrade is recorded.
-    match apply_configurable_compaction_with_replacement_len(
+    // Measured on the provider view the gate saw, built from and applied to
+    // the canonical history.
+    match apply_configurable_compaction_over_view(
         canonical.durable_compaction_target(),
+        view,
         provider,
         model,
         config,

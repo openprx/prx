@@ -1164,6 +1164,7 @@ impl CompactionDemand {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn build_configurable_compaction_patch(
     history: &[ChatMessage],
     provider: &dyn Provider,
@@ -1469,6 +1470,7 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
     }))
 }
 
+#[cfg(test)]
 pub(super) async fn apply_configurable_compaction_with_replacement_len(
     history: &mut Vec<ChatMessage>,
     provider: &dyn Provider,
@@ -1489,6 +1491,39 @@ pub(super) async fn apply_configurable_compaction_with_replacement_len(
     Ok(Some(replacement_len))
 }
 
+/// [`apply_configurable_compaction_with_replacement_len`] over a `source`
+/// history whose provider projection is `budget_history`: whether to compact
+/// and how much is measured on the projection (what the provider receives,
+/// enrichment included), the patch is built from and applied to `source`.
+pub(super) async fn apply_configurable_compaction_over_view(
+    source: &mut Vec<ChatMessage>,
+    budget_history: &[ChatMessage],
+    provider: &dyn Provider,
+    model: &str,
+    config: &crate::config::AgentCompactionConfig,
+    audit: Option<&DocumentIngestRuntime>,
+    trigger: &'static str,
+) -> Result<Option<usize>> {
+    let Some(patch) = build_configurable_compaction_patch_with_source_history(
+        budget_history,
+        source,
+        provider,
+        model,
+        config,
+        audit,
+        trigger,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    crate::agent::idle::beat(crate::agent::idle::ProgressKind::Compaction);
+    let replacement_len = patch.replacement.len();
+    apply_compaction_patch_exact(source, &patch)?;
+    Ok(Some(replacement_len))
+}
+
+#[cfg(test)]
 pub(super) async fn apply_configurable_compaction(
     history: &mut Vec<ChatMessage>,
     provider: &dyn Provider,
