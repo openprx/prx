@@ -45,9 +45,25 @@ fn configure(sandbox: &Sandbox, window: usize) -> LoopbackOpenAi {
 
 /// (Re)write the configuration for `server` with a `window`-token context.
 fn set_window(sandbox: &Sandbox, server: &LoopbackOpenAi, window: usize) {
+    set_window_and_mode(
+        sandbox,
+        server,
+        window,
+        openprx::config::schema::AgentCompactionMode::Switch,
+    );
+}
+
+/// (Re)write the configuration for `server` with a `window`-token context in
+/// compaction `mode`.
+fn set_window_and_mode(
+    sandbox: &Sandbox,
+    server: &LoopbackOpenAi,
+    window: usize,
+    mode: openprx::config::schema::AgentCompactionMode,
+) {
     write_config(&sandbox.config_dir, &server.provider(), MODEL, |config| {
         config.autonomy.level = openprx::security::AutonomyLevel::Full;
-        config.agent.compaction.mode = openprx::config::schema::AgentCompactionMode::Switch;
+        config.agent.compaction.mode = mode;
         config.agent.compaction.max_context_tokens = window;
         config.agent.compaction.reserve_tokens = RESERVE_TOKENS;
         config.agent.compaction.keep_recent_messages = KEEP_RECENT;
@@ -1185,5 +1201,168 @@ fn a_mid_turn_preflight_trim_leaves_the_session_and_the_next_request_in_agreemen
         output.stdout.contains("Compacted context") && !output.stdout.contains("Compaction refused"),
         "/compact reads the same history; stdout: {}",
         output.stdout
+    );
+}
+
+/// The `/compact` feedback when no handoff or summary can be built.
+const NO_DURABLE_COMPACTION: &str =
+    "No durable compaction available; requests will be trimmed per request. Nothing was changed.";
+
+/// The user and assistant message texts of `request`, in order.
+fn conversation_texts(request: &serde_json::Value) -> Vec<String> {
+    request["messages"]
+        .as_array()
+        .map(|messages| {
+            messages
+                .iter()
+                .filter(|message| message["role"] == "user" || message["role"] == "assistant")
+                .map(message_text)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The saved session turns once the row holds `count` of them (the reply
+/// event is stored before the row is saved).
+fn wait_for_saved_turn_count(sandbox: &Sandbox, count: usize) -> Vec<(String, String)> {
+    let started = Instant::now();
+    loop {
+        let turns = compaction_script::saved_session_turns(&sandbox.workspace);
+        if turns.len() >= count {
+            return turns;
+        }
+        assert!(
+            started.elapsed() < TURN_DEADLINE,
+            "the saved session row did not reach {count} turns within TURN_DEADLINE: {turns:?}"
+        );
+        std::thread::sleep(POLL);
+    }
+}
+
+/// `/compact` when no handoff or summary can be built (`off` mode) changes
+/// nothing in the session: it reports the typed outcome, the saved turns
+/// before it are kept byte for byte, and the next request still carries them.
+#[test]
+fn manual_compact_without_a_durable_compaction_changes_nothing() {
+    let sandbox = Sandbox::new();
+    write_filler_files(&sandbox.workspace, 2);
+    let server = LoopbackOpenAi::start(MODEL, Some((11, 7)), compaction_script::script());
+    set_window_and_mode(
+        &sandbox,
+        &server,
+        LARGE_WINDOW_TOKENS,
+        openprx::config::schema::AgentCompactionMode::Off,
+    );
+    let mut chat = HeldChat::spawn(&sandbox, &[]);
+    for (replies, line) in [PLANT.to_owned(), read_line(0), read_line(1)].iter().enumerate() {
+        chat.turn(line, replies + 1);
+    }
+    let before = wait_for_saved_turn_count(&sandbox, 6);
+    chat.command("/compact");
+    chat.turn("a plain follow-up", 4);
+    let output = chat.exit();
+    assert_clean(&output, "manual compact without a durable compaction");
+
+    assert!(
+        output.stdout.contains(NO_DURABLE_COMPACTION),
+        "/compact reports that no durable compaction was available: {}",
+        output.stdout
+    );
+    assert!(!output.stdout.contains("Compacted context"), "{}", output.stdout);
+    assert!(!output.stdout.contains("Context trimmed (lossy)"), "{}", output.stdout);
+    let after = compaction_script::saved_session_turns(&sandbox.workspace);
+    assert_eq!(
+        before.len(),
+        6,
+        "three exchanges were saved before /compact: {before:?}"
+    );
+    assert_eq!(
+        after.get(..before.len()),
+        Some(before.as_slice()),
+        "the turns saved before /compact are retained byte for byte"
+    );
+    assert_eq!(
+        after.len(),
+        before.len() + 2,
+        "only the follow-up exchange was added: {after:?}"
+    );
+    let requests = server.requests();
+    let follow_up = requests
+        .iter()
+        .rev()
+        .find(|request| newest_user_text(request).contains("a plain follow-up"))
+        .expect("test: the follow-up request was sent");
+    let texts = conversation_texts(follow_up);
+    assert!(
+        texts.iter().any(|text| text.contains(PLANT)),
+        "the next request still carries the oldest turn: {texts:?}"
+    );
+}
+
+/// Bytes of each oversized `off`-mode user line (about 600 tokens).
+const OVERSIZED_LINE_BYTES: usize = 2_400;
+/// Oversized lines sent in the `off`-mode trim case; together they exceed
+/// [`compaction_script::SMALL_WINDOW_TOKENS`].
+const OVERSIZED_LINES: usize = 8;
+
+/// The `index`-th oversized user line.
+fn oversized_line(index: usize) -> String {
+    let head = format!("oversized note {index} ");
+    let filler = "lorem ipsum dolor sit amet ".repeat(OVERSIZED_LINE_BYTES / 27 + 1);
+    format!("{head}{}", &filler[..OVERSIZED_LINE_BYTES - head.len()])
+}
+
+/// A keep window larger than any history here: no switch handoff can ever
+/// be built (there is nothing older than the kept tail to replace).
+const KEEP_EVERYTHING: usize = 64;
+
+/// In `switch` mode with a keep window larger than the history no handoff
+/// can be built (and `switch` never pages out), so once the session outgrows
+/// the window every request is trimmed: the preflight, the rollover and the
+/// turn's own preflight trim the provider view for that request only. The
+/// saved session keeps every turn byte for byte.
+#[test]
+fn a_per_request_trim_never_reaches_the_saved_session() {
+    let sandbox = Sandbox::new();
+    let server = LoopbackOpenAi::start(MODEL, Some((11, 7)), compaction_script::script());
+    write_config(&sandbox.config_dir, &server.provider(), MODEL, |config| {
+        config.autonomy.level = openprx::security::AutonomyLevel::Full;
+        config.agent.compaction.mode = openprx::config::schema::AgentCompactionMode::Switch;
+        config.agent.compaction.max_context_tokens = compaction_script::SMALL_WINDOW_TOKENS;
+        config.agent.compaction.reserve_tokens = RESERVE_TOKENS;
+        config.agent.compaction.keep_recent_messages = KEEP_EVERYTHING;
+        config.memory.auto_save = false;
+    });
+    let lines: Vec<String> = (0..OVERSIZED_LINES).map(oversized_line).collect();
+    let output = held_chat(&sandbox, &lines);
+    assert_clean(&output, "per-request trim");
+
+    let expected: Vec<(String, String)> = lines
+        .iter()
+        .flat_map(|line| {
+            [
+                ("user".to_owned(), line.clone()),
+                ("assistant".to_owned(), compaction_script::NOTED.to_owned()),
+            ]
+        })
+        .collect();
+    assert_eq!(
+        compaction_script::saved_session_turns(&sandbox.workspace),
+        expected,
+        "the saved session keeps every turn byte for byte"
+    );
+    let requests = server.requests();
+    let last = requests
+        .iter()
+        .rev()
+        .find(|request| newest_user_text(request).contains(lines.last().map_or("", String::as_str)))
+        .expect("test: the last line's request was sent");
+    let carried = conversation_texts(last)
+        .iter()
+        .filter(|text| text.contains("oversized note"))
+        .count();
+    assert!(
+        carried < OVERSIZED_LINES,
+        "the last request was trimmed ({carried} of {OVERSIZED_LINES} lines carried), so the case exercised a trim"
     );
 }

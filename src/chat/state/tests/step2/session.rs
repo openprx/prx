@@ -622,103 +622,6 @@ fn context_degradation_notice_is_surfaced_once_per_turn() {
     );
 }
 
-/// S2-B Step 1: HistoryCompacted algorithm baseline — keep system + truncate each + cap the total
-#[test]
-fn test_redux_history_compacted_basic_algorithm() {
-    use crate::chat::action::CompactReason;
-    let mut state = s();
-    // build 1 system + 20 long user/assistant messages
-    state
-        .session
-        .history
-        .push(crate::providers::ChatMessage::system("system prompt - keep me"));
-    for i in 0..20 {
-        let role = if i % 2 == 0 { "user" } else { "assistant" };
-        let content = "x".repeat(500); // over COMPACT_CONTENT_CHARS=320
-        state.session.history.push(crate::providers::ChatMessage {
-            role: role.to_string(),
-            content: format!("{content} #{i}"),
-        });
-    }
-    let before_len = state.session.history.len();
-    assert_eq!(before_len, 21);
-
-    let effects = state.reduce(Action::HistoryCompacted {
-        reason: CompactReason::ContextOverflow,
-    });
-
-    // the system prompt must stay in first position
-    assert_eq!(
-        state.session.history.first().map(|m| m.role.as_str()),
-        Some("system"),
-        "system must still be first after compaction"
-    );
-    // the total count must be <= 1 system + COMPACT_KEEP_MESSAGES
-    assert!(
-        state.session.history.len() <= 1 + super::COMPACT_KEEP_MESSAGES,
-        "after compaction the non-system count must be <= COMPACT_KEEP_MESSAGES, got {}",
-        state.session.history.len()
-    );
-    // each non-system message must have <= COMPACT_CONTENT_CHARS chars (+3 for the "...")
-    for m in state.session.history.iter().skip(1) {
-        assert!(
-            m.content.chars().count() <= super::COMPACT_CONTENT_CHARS + 3,
-            "non-system msg should be truncated, got {} chars",
-            m.content.chars().count()
-        );
-    }
-    // the total budget (non-system) must be <= COMPACT_TOTAL_CHARS
-    let non_system_chars: usize = state
-        .session
-        .history
-        .iter()
-        .skip(1)
-        .map(|m| m.content.chars().count())
-        .sum();
-    assert!(
-        non_system_chars <= super::COMPACT_TOTAL_CHARS,
-        "non-system total chars {non_system_chars} > budget {}",
-        super::COMPACT_TOTAL_CHARS
-    );
-    // LogTrace must be emitted
-    assert!(has_log_trace(&effects), "HistoryCompacted must emit LogTrace");
-    // The trimmed history is the durable state: turns are rebuilt from it and saved.
-    let trimmed_non_system: Vec<&str> = state
-        .session
-        .history
-        .iter()
-        .skip(1)
-        .map(|m| m.content.as_str())
-        .collect();
-    let turns: Vec<&str> = state.session.turns.iter().map(|t| t.content.as_str()).collect();
-    assert_eq!(turns, trimmed_non_system, "turns must equal the trimmed history");
-    assert!(
-        effects.iter().any(|e| matches!(e, Effect::SaveSession(_))),
-        "a deterministic trim must save the trimmed session"
-    );
-}
-
-/// S2-B Step 1: HistoryCompacted is a no-op when len<=1
-#[test]
-fn test_redux_history_compacted_noop_when_short() {
-    use crate::chat::action::CompactReason;
-    let mut state = s();
-    // only 1 system message → nothing to compact
-    state
-        .session
-        .history
-        .push(crate::providers::ChatMessage::system("only system"));
-    let effects = state.reduce(Action::HistoryCompacted {
-        reason: CompactReason::Manual,
-    });
-    assert_eq!(state.session.history.len(), 1, "unchanged when len<=1");
-    assert!(has_log_trace(&effects), "a no-op still emits LogTrace(DEBUG)");
-    assert!(
-        !effects.iter().any(|e| matches!(e, Effect::SaveSession(_))),
-        "a no-op saves nothing"
-    );
-}
-
 #[test]
 fn redux_compaction_patch_applies_exactly_and_matches_driver_history() {
     use crate::chat::action::CompactReason;
@@ -755,10 +658,28 @@ fn redux_compaction_patch_applies_exactly_and_matches_driver_history() {
         compaction_config: config,
     });
 
+    // The reducer history is the canonical system-plus-turns form: the
+    // driver's refresh aside is a provider projection, never session history.
+    let driver_without_loop_notes: Vec<_> = driver_history
+        .iter()
+        .filter(|message| !message.content.starts_with("[Post-compaction context refresh]"))
+        .cloned()
+        .collect();
     assert_eq!(
         messages_as_pairs(&state.session.history),
-        messages_as_pairs(&driver_history),
-        "GP-6: reducer history must exactly match driver history after patch"
+        messages_as_pairs(&driver_without_loop_notes),
+        "GP-6: reducer history must match the driver history without its loop notes after patch"
+    );
+    let canonical: Vec<_> = std::iter::once(crate::providers::ChatMessage::system("sys"))
+        .chain(state.session.turns.iter().map(|turn| crate::providers::ChatMessage {
+            role: turn.role.clone(),
+            content: turn.content.clone(),
+        }))
+        .collect();
+    assert_eq!(
+        messages_as_pairs(&state.session.history),
+        messages_as_pairs(&canonical),
+        "the reducer history is the leading system prompt plus the durable turns"
     );
     assert!(
         state
@@ -772,7 +693,7 @@ fn redux_compaction_patch_applies_exactly_and_matches_driver_history() {
 }
 
 #[test]
-fn compaction_patch_refresh_position_parity_between_legacy_and_redux() {
+fn compaction_patch_refresh_aside_stays_out_of_the_reducer_history() {
     use crate::chat::action::CompactReason;
     let current_question = "What should ISS-037 answer now?";
     let mut state = s();
@@ -782,8 +703,8 @@ fn compaction_patch_refresh_position_parity_between_legacy_and_redux() {
         crate::providers::ChatMessage::assistant("old assistant"),
         crate::providers::ChatMessage::user(current_question),
     ];
-    let mut legacy_history = state.session.history.clone();
-    let guard = crate::agent::compaction::compaction_patch_guard_for(&legacy_history, 1, 3).expect("guard");
+    let mut provider_history = state.session.history.clone();
+    let guard = crate::agent::compaction::compaction_patch_guard_for(&provider_history, 1, 3).expect("guard");
     let patch = crate::agent::turn_contracts::CompactionPatch {
         replacement: vec![crate::providers::ChatMessage::assistant(
             "[Context compacted at test. Summary: ISS-037 parity summary]",
@@ -800,45 +721,39 @@ fn compaction_patch_refresh_position_parity_between_legacy_and_redux() {
         ..crate::config::AgentCompactionConfig::default()
     };
 
-    crate::agent::compaction::apply_compaction_patch_exact(&mut legacy_history, &patch)
-        .expect("test: legacy patch applies to its own source");
+    crate::agent::compaction::apply_compaction_patch_exact(&mut provider_history, &patch)
+        .expect("test: provider patch applies to its own source");
     let _ = state.reduce(Action::HistoryCompactionPatchApplied {
         reason: CompactReason::ContextOverflow,
         patch,
         compaction_config: config,
     });
 
+    assert!(
+        provider_history
+            .iter()
+            .any(|message| message.content.starts_with("[Post-compaction context refresh]")),
+        "the provider projection carries the refresh aside"
+    );
+    assert!(
+        state
+            .session
+            .history
+            .iter()
+            .all(|message| !message.content.starts_with("[Post-compaction context refresh]")),
+        "the refresh aside never enters the reducer history"
+    );
     assert_eq!(
         messages_as_pairs(&state.session.history),
-        messages_as_pairs(&legacy_history),
-        "GP-6: legacy and Redux histories must match exactly after the shared patch primitive"
-    );
-    let refresh_index = state
-        .session
-        .history
-        .iter()
-        .position(|message| message.content.starts_with("[Post-compaction context refresh]"))
-        .expect("refresh marker should be present");
-    let summary_index = state
-        .session
-        .history
-        .iter()
-        .position(|message| message.content.contains("ISS-037 parity summary"))
-        .expect("summary marker should be present");
-    let question_index = state
-        .session
-        .history
-        .iter()
-        .position(|message| message.content == current_question)
-        .expect("current question should be present");
-    assert!(
-        summary_index < refresh_index && refresh_index < question_index,
-        "refresh marker must sit after the summary and before the real current question"
-    );
-    assert_eq!(
-        state.session.history.last().map(|message| message.content.as_str()),
-        Some(current_question),
-        "real current user question must remain the trailing provider-bound user message"
+        vec![
+            ("system".to_owned(), "sys".to_owned()),
+            (
+                "assistant".to_owned(),
+                "[Context compacted at test. Summary: ISS-037 parity summary]".to_owned()
+            ),
+            ("user".to_owned(), current_question.to_owned()),
+        ],
+        "the reducer history is the summary and the real current question, in order"
     );
 }
 

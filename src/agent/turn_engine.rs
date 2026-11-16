@@ -629,7 +629,12 @@ async fn run_turn_unguarded(
             ) {
                 Ok(spec) => Some(spec),
                 Err(error) => {
-                    tracing::warn!(%error, "suppressing skill metadata: live skill_read is unavailable");
+                    let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+                    tracing::warn!(
+                        error_len,
+                        error_sha256,
+                        "suppressing skill metadata: live skill_read is unavailable"
+                    );
                     None
                 }
             }
@@ -1512,13 +1517,10 @@ async fn run_turn_unguarded(
                                             matches!(config.mode, crate::config::AgentCompactionMode::Switch);
                                         let budget = plan_context_budget(&compacted, config, PRE_TURN_FLUSH_THRESHOLD);
                                         before_trim = budget;
-                                        if !switch_mode || budget.over_hard_limit {
-                                            trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
-                                                &mut compacted,
-                                                config,
-                                                patch.replacement.len(),
-                                            );
-                                        }
+                                        // The trim below is this retry's projection only; the
+                                        // patch the session adopts is the untrimmed compaction.
+                                        let project_trim = !switch_mode || budget.over_hard_limit;
+                                        let replacement_floor = patch.replacement.len();
                                         if switch_mode && budget.over_hard_limit {
                                             degraded_reason = Some("over_hard_limit_after_handoff");
                                         }
@@ -1551,6 +1553,23 @@ async fn run_turn_unguarded(
                                             );
                                             degraded_reason = Some("handoff_unavailable");
                                         } else {
+                                            // `history` now holds the durable compaction the
+                                            // session adopts; the request this retry sends is its
+                                            // trimmed projection.
+                                            if project_trim {
+                                                let request = capture_current_turn_request(history);
+                                                trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
+                                                    history,
+                                                    config,
+                                                    replacement_floor,
+                                                );
+                                                restore_current_turn_request(
+                                                    history,
+                                                    request,
+                                                    "overflow_retry",
+                                                    RestoredRequestPosition::Tail,
+                                                );
+                                            }
                                             let turns_after = history.len().saturating_sub(usize::from(
                                                 history.first().is_some_and(|message| message.role == "system"),
                                             ));
@@ -1638,14 +1657,11 @@ async fn run_turn_unguarded(
                     // The durable part of the recovery (an inline loop's applied
                     // handoff or summary; the streaming path published its own
                     // exact patch above) reaches the session authority. A trim
-                    // fallback is this retry's projection: the session keeps the
-                    // turns a later handoff can still recover. Without a
-                    // compaction config the authority runs its own trim.
+                    // fallback, with or without a compaction config, is this
+                    // retry's projection: the session keeps the turns a later
+                    // handoff can still recover.
                     if let (Some((before, compacted)), Some(config)) = (inline_patch.take(), compaction_config) {
                         report_durable_compaction(&runtime_adapter, Some(before), &compacted, config).await?;
-                    }
-                    if compaction_config.is_none() {
-                        emit_tool_loop_event(&runtime_adapter, ToolLoopEvent::ContextCompacted).await?;
                     }
                     let made_progress = history.len() < messages_before_compaction
                         || estimate_history_tokens(history) < tokens_before_compaction;

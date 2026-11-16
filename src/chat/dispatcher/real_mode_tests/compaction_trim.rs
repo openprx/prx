@@ -218,6 +218,8 @@ async fn redux_driver_preserve_trim_floor_preserves_fitting_summary_and_matches_
         !after_compact.over_hard_limit,
         "preserve-trim floor should fully remediate when the protected replacement fits"
     );
+    // The guard view keeps the untrimmed compaction the session adopts.
+    let durable_source = compaction_guard_history.clone();
     let _ = trim_redux_driver_context_budget_after_rollover(
         &mut driver_history,
         &mut compaction_guard_history,
@@ -249,18 +251,24 @@ async fn redux_driver_preserve_trim_floor_preserves_fitting_summary_and_matches_
             .any(|message| message.content.contains("SUMMARY_MARKER")),
         "second trim must not delete the provider summary"
     );
+    // The trim is the driver's per-request projection only: the reducer
+    // saves the untrimmed compaction, in its canonical durable form.
+    let canonical = |messages: &[PMsg]| -> Vec<(String, String)> {
+        messages
+            .iter()
+            .enumerate()
+            .filter(|(index, message)| {
+                (*index == 0 && message.role == "system")
+                    || matches!(message.role.as_str(), "user" | "assistant")
+                        && !crate::agent::turn_contracts::is_loop_written_user_note(&message.content)
+            })
+            .map(|(_, message)| (message.role.clone(), message.content.clone()))
+            .collect()
+    };
     assert_eq!(
-        driver_history
-            .iter()
-            .map(|message| (message.role.clone(), message.content.clone()))
-            .collect::<Vec<_>>(),
-        reducer_state
-            .session
-            .history
-            .iter()
-            .map(|message| (message.role.clone(), message.content.clone()))
-            .collect::<Vec<_>>(),
-        "GP-6: driver fallback history must exactly match reducer history"
+        canonical(&reducer_state.session.history),
+        canonical(&durable_source),
+        "the reducer saves the untrimmed compacted source, never the driver's trim"
     );
 }
 
@@ -519,7 +527,6 @@ async fn redux_driver_off_mode_preflight_trims_without_history_compacted_action(
                 })
                 .await;
 
-            let mut saw_history_compacted = false;
             let mut saw_summary_patch = false;
             let mut saw_completion = false;
             for _ in 0..16 {
@@ -528,9 +535,6 @@ async fn redux_driver_off_mode_preflight_trims_without_history_compacted_action(
                     .expect("driver action within 2s")
                     .expect("must arrive");
                 match action {
-                    Action::HistoryCompacted { .. } => {
-                        saw_history_compacted = true;
-                    }
                     Action::HistoryCompactionPatchApplied { .. } => {
                         saw_summary_patch = true;
                     }
@@ -548,10 +552,6 @@ async fn redux_driver_off_mode_preflight_trims_without_history_compacted_action(
             assert!(
                 saw_completion,
                 "driver must complete after Off-mode trim-only preflight"
-            );
-            assert!(
-                !saw_history_compacted,
-                "Off mode must not dispatch HistoryCompacted because reducer compacts lossy"
             );
             assert!(!saw_summary_patch, "Off mode must not dispatch summary patch action");
             assert_eq!(
@@ -881,9 +881,6 @@ async fn redux_driver_overflow_retry_uses_provider_summary_patch() {
                             "overflow retry patch must carry provider summary"
                         );
                     }
-                    Action::HistoryCompacted { .. } => {
-                        panic!("overflow retry with config must not use lossy HistoryCompacted");
-                    }
                     Action::ContextWindowUpdated {
                         used_context_tokens: Some(used),
                         max_context_tokens: Some(max),
@@ -1121,9 +1118,9 @@ async fn tui_preflight_irreducible_request_fails_before_provider() {
                         assert!(!retryable);
                         break;
                     }
-                    Action::HistoryCompactionPatchApplied { .. }
-                    | Action::HistoryCompacted { .. }
-                    | Action::StreamCompleted { .. } => panic!("irreducible input cannot be mutated or answered"),
+                    Action::HistoryCompactionPatchApplied { .. } | Action::StreamCompleted { .. } => {
+                        panic!("irreducible input cannot be mutated or answered")
+                    }
                     _ => {}
                 }
             }

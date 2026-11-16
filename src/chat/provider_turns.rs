@@ -1973,18 +1973,26 @@ pub(super) fn request_provider_turn_cancel(
 /// channel delays the turn instead of dropping the request, so the later
 /// commit always includes it. A send that is not accepted latches the
 /// unconfirmed-commit stop once and fails the turn before it runs.
+///
+/// Returns the admission's identity: a failed or cancelled turn settles by
+/// it ([`settle_aborted_turn`]), so only this request is ever removed.
 pub(super) async fn record_user_turn_at_admission(
     chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
     commits: &crate::chat::dispatcher::TurnCompletionSignal,
     user_input: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<crate::chat::action::AdmissionId> {
+    let admission = crate::chat::action::AdmissionId::next();
     chat_dispatcher
         .dispatch_bounded(
-            crate::chat::action::Action::RecordUserTurn(user_input.to_owned()),
+            crate::chat::action::Action::UserTurnAdmitted {
+                admission,
+                content: user_input.to_owned(),
+            },
             commits,
         )
         .await
-        .map_err(|error| anyhow::anyhow!("Chat stopped after an unconfirmed history commit: {error}"))
+        .map_err(|error| anyhow::anyhow!("Chat stopped after an unconfirmed history commit: {error}"))?;
+    Ok(admission)
 }
 
 /// The acknowledged session as of every action sent before this call: an
@@ -2010,8 +2018,8 @@ pub(super) async fn acknowledged_session_barrier(
 
 /// Settle a failed or cancelled turn with the session authority, in order
 /// after its terminal action and every in-turn compaction the turn sent:
-/// `TurnAbortSettled` removes the recorded `request` (when the turn recorded
-/// one and it is still the trailing answerless user turn) and saves, and the
+/// `TurnAbortSettled` removes the request admitted as `admission` (when the
+/// turn recorded one and that admission is still open) and saves, and the
 /// acknowledged revision is returned. Then the run loop's provider view
 /// follows that revision ([`provider_view_after_settled_abort`]).
 ///
@@ -2021,15 +2029,10 @@ pub(super) async fn acknowledged_session_barrier(
 pub(super) async fn settle_aborted_turn(
     chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
     commits: &crate::chat::dispatcher::TurnCompletionSignal,
-    request: Option<&str>,
+    admission: Option<crate::chat::action::AdmissionId>,
 ) -> anyhow::Result<crate::chat::acked_session::AckedSession> {
     let ack = chat_dispatcher
-        .dispatch_awaited(
-            crate::chat::action::Action::TurnAbortSettled {
-                request: request.map(str::to_owned),
-            },
-            commits,
-        )
+        .dispatch_awaited(crate::chat::action::Action::TurnAbortSettled { admission }, commits)
         .await
         .map_err(|error| anyhow::anyhow!("Chat stopped after an unconfirmed history commit: {error}"))?;
     match ack {

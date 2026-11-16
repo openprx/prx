@@ -990,12 +990,14 @@ async fn step_7_1_same_overflow_fixture_characterizes_recovery_signals() {
         2,
         "buffered engine result: {agent_result:?}; history: {agent_history:?}"
     );
-    assert!(chat_actions.iter().any(|action| matches!(
-        action,
-        Action::HistoryCompacted {
-            reason: crate::chat::action::CompactReason::ContextOverflow
-        }
-    )));
+    // The overflow trim without a compaction config is a per-request
+    // projection: no compaction reaches the session.
+    assert!(
+        !chat_actions
+            .iter()
+            .any(|action| matches!(action, Action::HistoryCompactionPatchApplied { .. })),
+        "a lossy overflow trim never reaches the session"
+    );
     assert!(chat_actions.iter().any(|action| matches!(
         action,
         Action::StreamCompleted { final_text, .. } if final_text == "recovered"

@@ -1208,14 +1208,13 @@ mod step2;
 #[cfg(test)]
 mod phase_a_f;
 
-// ─── S2-B integration tests (5 new tests) ─────────────────────────────────
+// ─── S2-B integration tests ───────────────────────────────────────────────
 //
-// These five tests cover the contract after S2-B wired the chat session/cancel paths into Redux:
+// These tests cover the contract after S2-B wired the chat session/cancel paths into Redux:
 //   1. CancelRequested really emits a CancelToken effect and clears the control state
 //   2. ModeChanged leaves state.session.mode equal to legacy chat_session.set_mode
 //   3. a single RecordUserTurn write produces no duplicate session.turns
-//   4. HistoryCompacted keeps system and caps the total budget
-//   5. StreamCancelled matches the S2-A terminal behaviour (cancel and token cancel do not clash)
+//   4. StreamCancelled matches the S2-A terminal behaviour (cancel and token cancel do not clash)
 
 #[cfg(test)]
 mod s2b;

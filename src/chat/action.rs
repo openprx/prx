@@ -15,6 +15,27 @@ use crate::chat::session::{ChatSession, MainSessionTokenUsageRecord};
 use crate::llm::route_decision::TokenUsage;
 
 /// Main-session input backlog status for human-visible orchestration.
+/// The identity of one admitted user request (a turn that recorded its
+/// request before it ran). Abort settlement and stream rollback remove a
+/// request by this identity, never by its text: an earlier committed turn may
+/// hold identical text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AdmissionId(u64);
+
+impl AdmissionId {
+    /// A process-unique admission identity.
+    #[must_use]
+    pub fn next() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MainQueueStatus {
     pub queued: usize,
@@ -223,9 +244,8 @@ pub enum HistoryDir {
 
 /// Why a history compaction was triggered (used for trace / test assertions).
 ///
-/// S2-B Step 1: introduced together with the `HistoryCompacted` Action so the reducer can tell in the
-/// trace whether this was an automatic context-overflow compaction or a manual user/test trigger, and
-/// so unit tests can assert that the reason field reaches the `Effect::LogTrace` output.
+/// The reducer's trace tells an automatic context-overflow compaction from a manual `/compact`, and
+/// unit tests can assert that the reason field reaches the `Effect::LogTrace` output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactReason {
     /// Automatic compaction after exceeding the context window (the chat::run main-loop overflow
@@ -481,12 +501,13 @@ pub enum Action {
     },
     /// Ordered settlement of a provider turn that failed or was cancelled,
     /// awaited by the run loop after the turn's terminal action. It removes
-    /// the turn's recorded request while that is still the trailing
-    /// answerless user turn (`request`: the plain request recorded at
-    /// admission; `None` for a turn that never recorded it) and always saves,
-    /// so the acknowledged session and the store hold the corrected history
-    /// together with every in-turn compaction sent before it.
-    TurnAbortSettled { request: Option<String> },
+    /// the request admitted as `admission` while that admission is still
+    /// open (neither committed nor already rolled back by the turn's
+    /// terminal; `None` for a turn that never recorded its request) and
+    /// always saves, so the acknowledged session and the store hold the
+    /// corrected history together with every in-turn compaction sent before
+    /// it.
+    TurnAbortSettled { admission: Option<AdmissionId> },
     /// Wrapper for [`crate::chat::dispatcher::ChatDispatcher::dispatch_awaited`]:
     /// the dispatcher reduces `action`, runs its effects, then answers `ticket`.
     Awaited {
@@ -499,6 +520,10 @@ pub enum Action {
     SessionSwitched { id: String },
     /// Ask the reducer to persist the user turn (writes session.turns + LLM history)
     RecordUserTurn(String),
+    /// Record a turn's request at admission, before the turn runs (the
+    /// inline path). The admission stays open until the turn commits; a
+    /// failed or cancelled turn removes exactly this request, once.
+    UserTurnAdmitted { admission: AdmissionId, content: String },
     /// Ask the reducer to persist the assistant turn (writes session.turns + LLM history)
     RecordAssistantTurn {
         task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
@@ -518,16 +543,9 @@ pub enum Action {
     /// else { first_mut = system }` — this is the system prompt rebuild path that runs on every turn
     /// (the prompt injection after technique selection), and it cannot be expressed with append.
     SetLeadingSystemPrompt { content: String },
-    /// Ask the reducer to compact the LLM context history (keep system + the last N messages + a total
-    /// budget).
-    ///
-    /// S2-B Step 1: matches the semantics of chat::mod's `compact_chat_history` — the truncation
-    /// happens inside the reducer, with no side effects, producing only a LogTrace. The `reason` field
-    /// lets test assertions and the trace tell the context-overflow path from the manual one.
-    HistoryCompacted { reason: CompactReason },
     /// Apply an async provider-backed compaction result computed by the Redux
     /// driver. The reducer remains pure: it only validates the guard token and
-    /// applies the exact patch, or falls back to deterministic trim on mismatch.
+    /// applies the exact patch, or rejects it unchanged on a guard mismatch.
     HistoryCompactionPatchApplied {
         reason: CompactReason,
         patch: crate::agent::turn_contracts::CompactionPatch,
@@ -706,10 +724,10 @@ impl Action {
             Self::SessionSaved { .. } => "SessionSaved",
             Self::SessionSwitched { .. } => "SessionSwitched",
             Self::RecordUserTurn(_) => "RecordUserTurn",
+            Self::UserTurnAdmitted { .. } => "UserTurnAdmitted",
             Self::RecordAssistantTurn { .. } => "RecordAssistantTurn",
             Self::RecordSystemMessage { .. } => "RecordSystemMessage",
             Self::SetLeadingSystemPrompt { .. } => "SetLeadingSystemPrompt",
-            Self::HistoryCompacted { .. } => "HistoryCompacted",
             Self::HistoryCompactionPatchApplied { .. } => "HistoryCompactionPatchApplied",
             Self::HistoryCompactionDegraded { .. } => "HistoryCompactionDegraded",
             Self::ToolCardFoldToggled => "ToolCardFoldToggled",

@@ -649,7 +649,10 @@ fn stream_completed_removes_unfinished_pending_tool_cards() {
 #[test]
 fn stream_failed_removes_trailing_answerless_user_turn() {
     let mut state = s();
-    let _ = state.reduce(Action::RecordUserTurn("failed question".to_string()));
+    let _ = state.reduce(Action::UserTurnAdmitted {
+        admission: crate::chat::action::AdmissionId::next(),
+        content: "failed question".to_string(),
+    });
     let _ = state.reduce(Action::TurnStarted {
         draft_id: "d-failed".to_string(),
         cancel: CancellationToken::new(),
@@ -683,7 +686,10 @@ fn stream_failed_removes_trailing_answerless_user_turn() {
 #[test]
 fn stream_cancelled_removes_trailing_answerless_user_turn() {
     let mut state = s();
-    let _ = state.reduce(Action::RecordUserTurn("cancelled question".to_string()));
+    let _ = state.reduce(Action::UserTurnAdmitted {
+        admission: crate::chat::action::AdmissionId::next(),
+        content: "cancelled question".to_string(),
+    });
     let _ = state.reduce(Action::TurnStarted {
         draft_id: "d-cancelled".to_string(),
         cancel: CancellationToken::new(),
@@ -711,7 +717,10 @@ fn stream_cancelled_removes_trailing_answerless_user_turn() {
 #[test]
 fn failed_turn_orphan_is_absent_from_background_and_later_success_snapshots() {
     let mut state = s();
-    let _ = state.reduce(Action::RecordUserTurn("orphan candidate".to_string()));
+    let _ = state.reduce(Action::UserTurnAdmitted {
+        admission: crate::chat::action::AdmissionId::next(),
+        content: "orphan candidate".to_string(),
+    });
     let _ = state.reduce(Action::TurnStarted {
         draft_id: "d-failed".to_string(),
         cancel: CancellationToken::new(),
@@ -774,6 +783,62 @@ fn failed_turn_orphan_is_absent_from_background_and_later_success_snapshots() {
         completion_snapshot.turns.get(1).map(|turn| turn.content.as_str()),
         Some("real answer")
     );
+}
+
+/// An earlier request committed with an empty reply stays the trailing
+/// answerless user turn. A later identical request that fails is removed by
+/// its admission identity, once: neither the stream terminal nor the
+/// settlement touches the committed request with the same text.
+#[test]
+fn a_failed_request_never_removes_an_earlier_committed_request_with_the_same_text() {
+    let mut state = s();
+    let first = crate::chat::action::AdmissionId::next();
+    let _ = state.reduce(Action::UserTurnAdmitted {
+        admission: first,
+        content: "Q".to_string(),
+    });
+    let task_id = crate::chat::turn_scheduler::TurnScheduler::new().enqueue(
+        "Q",
+        crate::chat::turn_scheduler::TurnPriority::Normal,
+        0,
+    );
+    let _ = state.reduce(Action::TurnCommitRequested {
+        task_id,
+        draft_id: None,
+    });
+    let second = crate::chat::action::AdmissionId::next();
+    let _ = state.reduce(Action::UserTurnAdmitted {
+        admission: second,
+        content: "Q".to_string(),
+    });
+    let _ = state.reduce(Action::TurnStarted {
+        draft_id: "d-second".to_string(),
+        cancel: CancellationToken::new(),
+    });
+
+    let _ = state.reduce(Action::StreamFailed {
+        draft_id: "d-second".to_string(),
+        err: "provider failed".to_string(),
+        retryable: false,
+    });
+    let settled = state.reduce(Action::TurnAbortSettled {
+        admission: Some(second),
+    });
+    let stale = state.reduce(Action::TurnAbortSettled { admission: Some(first) });
+
+    let turns: Vec<(&str, &str)> = state
+        .session
+        .turns
+        .iter()
+        .map(|turn| (turn.role.as_str(), turn.content.as_str()))
+        .collect();
+    assert_eq!(turns, vec![("user", "Q")], "only the committed request remains");
+    for effects in [&settled, &stale] {
+        assert!(
+            effects.iter().any(|effect| matches!(effect, Effect::SaveSession(_))),
+            "every settlement saves"
+        );
+    }
 }
 
 /// Step3-8b: StreamCancelled / StreamFailed / StreamCompleted with a mismatched draft_id → no-op

@@ -169,6 +169,99 @@ fn an_empty_reply_is_committed_into_the_saved_session_row() {
     );
 }
 
+/// The last user message of a provider request.
+#[cfg(not(feature = "terminal-tui"))]
+fn last_user_text(request: &serde_json::Value) -> String {
+    request["messages"]
+        .as_array()
+        .and_then(|messages| messages.iter().rev().find(|message| message["role"] == "user"))
+        .map(text_of)
+        .unwrap_or_default()
+}
+
+/// Non-TUI only (the empty completion is a non-TUI path): an empty
+/// successful reply to `Q` leaves `Q` as the trailing answerless user turn. A
+/// second, identical `Q` that the provider refuses is settled by its admission
+/// identity, so the committed first `Q` stays in the acknowledged session (the
+/// next request carries it exactly once) and in the SQLite row.
+#[cfg(not(feature = "terminal-tui"))]
+#[test]
+fn a_failed_repeat_of_a_request_keeps_the_committed_request_with_the_same_text() {
+    const REPEATED: &str = "REPEATED-QUESTION-71";
+    const AFTER: &str = "AFTER-THE-FAILURE-71";
+    let sandbox = Sandbox::new();
+    let mut repeated_calls = 0usize;
+    let server = serve(
+        &sandbox,
+        Box::new(move |_, request| {
+            let last = last_user_text(request);
+            if last.ends_with(AFTER) {
+                return Scripted::text("AFTER-OK");
+            }
+            if !last.ends_with(REPEATED) {
+                return Scripted::text("ok");
+            }
+            repeated_calls += 1;
+            if repeated_calls == 1 {
+                Scripted::text(EMPTY_AFTER_SANITIZE)
+            } else {
+                Scripted::Error {
+                    status: 400,
+                    message: "scripted refusal of this request".to_owned(),
+                }
+            }
+        }),
+    );
+    let mut chat = spawn_plain(&sandbox);
+    chat.send(REPEATED);
+    wait_for_saved_turns(&sandbox, 1);
+    chat.send(REPEATED);
+    chat.send(AFTER);
+    wait_for_saved_turns(&sandbox, 3);
+    let output = finish(chat);
+
+    // A failed turn makes plain chat exit non-zero ("one or more chat turns
+    // failed"); the history commits themselves are all acknowledged.
+    assert!(!output.stderr.contains("panicked"), "stderr: {}", output.stderr);
+    assert!(
+        !output.stdout.contains("history commit") && !output.stderr.contains("history commit"),
+        "no unconfirmed history commit; stdout: {}\nstderr: {}",
+        output.stdout,
+        output.stderr
+    );
+    assert_eq!(
+        saved_turns(&sandbox),
+        vec![
+            ("user".to_owned(), REPEATED.to_owned()),
+            ("user".to_owned(), AFTER.to_owned()),
+            ("assistant".to_owned(), "AFTER-OK".to_owned()),
+        ],
+        "the committed request stays in the SQLite row; only the failed repeat is gone"
+    );
+    let requests = server.requests();
+    let after_request = requests
+        .iter()
+        .rev()
+        .find(|request| last_user_text(request).ends_with(AFTER))
+        .expect("test: the request after the failure was sent");
+    let earlier_users: Vec<String> = after_request["messages"]
+        .as_array()
+        .map(|messages| {
+            messages
+                .iter()
+                .filter(|message| message["role"] == "user")
+                .map(text_of)
+                .filter(|text| !text.ends_with(AFTER))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        earlier_users,
+        vec![REPEATED.to_owned()],
+        "the next request carries the committed request exactly once and not the failed repeat"
+    );
+}
+
 /// Controller ruling (G6, input-channel close): EOF on stdin after a turn
 /// ends the chat with exit code 0.
 #[test]

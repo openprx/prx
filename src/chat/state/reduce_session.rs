@@ -1,8 +1,8 @@
 //! Reducer arms for session load/save/switch, turn recording and history compaction.
 
 use super::{
-    ChatState, Effect, ToolTaskKey, compact_history_in_place, conversation_lines_from_turns,
-    durable_turns_from_compacted_history, handoff_note_contents,
+    ChatState, Effect, ToolTaskKey, conversation_lines_from_turns, durable_turns_from_compacted_history,
+    handoff_note_contents,
 };
 use crate::chat::action::{CompactReason, ProviderUsageRecordKind};
 use crate::chat::session::{ChatSession, MainSessionTokenUsageRecord, MainSessionTokenUsageSummary};
@@ -96,6 +96,7 @@ impl ChatState {
         self.control.turn_cancels.clear();
         self.control.final_usage_tasks_recorded.clear();
         self.control.committed_turn_tasks.clear();
+        self.control.open_admission = None;
         self.control.cancelled_drafts_awaiting_terminal.clear();
         self.control.generating = false;
         self.control.active_cancel = None;
@@ -121,21 +122,19 @@ impl ChatState {
     }
 
     /// `Action::TurnAbortSettled` — the ordered settlement of a failed or
-    /// cancelled turn. The recorded request is removed only while it is the
-    /// trailing answerless user turn (a draft terminal may already have rolled
-    /// it back, and a draftless or already-cancelled turn never had one); the
+    /// cancelled turn. The request admitted as `admission` is removed only
+    /// while that admission is still open: a draft terminal may already have
+    /// rolled it back, a committed turn closed it, and a turn that never
+    /// recorded its request passes `None`. Identity, not text, decides: an
+    /// earlier committed request with the same text is never touched. The
     /// session is always saved, so the acknowledged revision and the store
     /// match the corrected history, including any compaction adopted during
     /// the turn.
-    pub(super) fn reduce_turn_abort_settled(&mut self, request: Option<String>) -> Vec<Effect> {
-        let request_removed = request.is_some_and(|request| {
-            let stored = crate::agent::turn_contracts::neutralize_reserved_markers(&request);
-            self.session
-                .turns
-                .last()
-                .is_some_and(|turn| turn.role == "user" && turn.content == stored.as_ref())
-                && self.rollback_trailing_answerless_user_turn()
-        });
+    pub(super) fn reduce_turn_abort_settled(
+        &mut self,
+        admission: Option<crate::chat::action::AdmissionId>,
+    ) -> Vec<Effect> {
+        let request_removed = admission.is_some_and(|admission| self.rollback_open_admission(Some(admission)));
         if request_removed {
             self.ui.turn_count = self.session.turns.len();
         }
@@ -143,7 +142,8 @@ impl ChatState {
             Effect::LogTrace {
                 level: tracing::Level::DEBUG,
                 msg: format!(
-                    "TurnAbortSettled request_removed={request_removed} turns={}",
+                    "TurnAbortSettled admission={:?} request_removed={request_removed} turns={}",
+                    admission.map(crate::chat::action::AdmissionId::get),
                     self.session.turns.len()
                 ),
             },
@@ -164,6 +164,8 @@ impl ChatState {
                 reason: format!("turn {} was already committed", task_id.get()),
             }];
         }
+        // The admitted request is committed: no later rollback removes it.
+        self.control.open_admission = None;
         let mut effects = match draft_id {
             Some(draft_id) if self.stream.has_visible_draft(&draft_id) => {
                 self.reduce_stream_completed(&draft_id, String::new(), String::new())
@@ -315,6 +317,19 @@ impl ChatState {
             level: tracing::Level::DEBUG,
             msg: format!("RecordUserTurn len={}", self.session.turns.len()),
         }]
+    }
+
+    /// `Action::UserTurnAdmitted` — record the request at admission and open
+    /// the admission: until the turn commits, a rollback removes exactly this
+    /// request, once.
+    pub(super) fn reduce_user_turn_admitted(
+        &mut self,
+        admission: crate::chat::action::AdmissionId,
+        content: String,
+    ) -> Vec<Effect> {
+        let effects = self.reduce_record_user_turn(content);
+        self.control.open_admission = Some(admission);
+        effects
     }
 
     /// `Action::RecordAssistantTurn` — persist an assistant turn into the session record and LLM history.
@@ -472,47 +487,6 @@ impl ChatState {
         vec![Effect::SaveSession(self.session_commit())]
     }
 
-    /// `Action::HistoryCompacted` — compact the LLM context history.
-    ///
-    /// The algorithm matches `chat::mod::compact_chat_history` exactly (during dual-write both paths must
-    /// produce byte-identical results):
-    /// 1. return immediately when `history.len() <= 1` (nothing to compact).
-    /// 2. keep the system prompt (if the first entry has role==system).
-    /// 3. keep only the last [`COMPACT_KEEP_MESSAGES`] non-system messages (drain the older ones).
-    /// 4. truncate a single message with an ellipsis when it exceeds [`COMPACT_CONTENT_CHARS`] chars.
-    /// 5. drop oldest turns FIFO when the total budget exceeds [`COMPACT_TOTAL_CHARS`].
-    ///
-    /// The trimmed history is the session's durable state: its turns are
-    /// rebuilt from it and the result is saved, so every later reader sees
-    /// the trimmed revision.
-    pub(super) fn reduce_history_compacted(&mut self, reason: CompactReason) -> Vec<Effect> {
-        let history = &mut self.session.history;
-        if history.len() <= 1 {
-            return vec![Effect::LogTrace {
-                level: tracing::Level::DEBUG,
-                msg: format!("HistoryCompacted noop reason={reason:?} len={}", history.len()),
-            }];
-        }
-        compact_history_in_place(history);
-        self.session.compaction_epoch = self.session.compaction_epoch.saturating_add(1);
-
-        let final_chars: usize = history.iter().map(|m| m.content.chars().count()).sum();
-        let final_len = history.len();
-        let handoff_notes = handoff_note_contents(&self.session.turns);
-        self.session.turns = durable_turns_from_compacted_history(history, &handoff_notes);
-        self.ui.conversation_lines = conversation_lines_from_turns(&self.session.turns);
-        self.ui.conversation_generation = self.ui.conversation_generation.saturating_add(1);
-        self.ui.turn_count = self.session.turns.len();
-        vec![
-            Effect::LogTrace {
-                level: tracing::Level::INFO,
-                msg: format!("HistoryCompacted reason={reason:?} len={final_len} chars={final_chars}"),
-            },
-            Effect::SaveSession(self.session_commit()),
-            Effect::RequestRedraw,
-        ]
-    }
-
     pub(super) fn reduce_history_compaction_patch_applied(
         &mut self,
         reason: CompactReason,
@@ -551,17 +525,29 @@ impl ChatState {
                 .filter(|message| crate::agent::compaction::is_context_handoff_message(message))
                 .map(|message| message.content.clone()),
         );
-        let trim_fallback = if budget.over_hard_limit {
-            crate::agent::context_budget::trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
-                history,
-                compaction_config,
-                patch.replacement.len(),
-            )
-        } else {
-            false
-        };
+        // The adopted compaction is saved as it is, never trimmed: a lossy
+        // trim is a per-request projection of the provider view. A result
+        // still over budget is recorded in the trace and trimmed per request.
         self.session.compaction_epoch = self.session.compaction_epoch.saturating_add(1);
         self.session.turns = durable_turns_from_compacted_history(history, &handoff_notes);
+        // The reducer history takes the canonical form every published
+        // snapshot produces (leading system prompt plus the durable turns), so
+        // a later guard built from acknowledged turns describes it. Loop notes
+        // a patch appends (a summary's refresh aside) live only in the
+        // provider projection.
+        let leading_system = history.first().filter(|message| message.role == "system").cloned();
+        *history = leading_system
+            .into_iter()
+            .chain(
+                self.session
+                    .turns
+                    .iter()
+                    .filter(|turn| turn.role == "user" || turn.role == "assistant")
+                    .map(|turn| {
+                        crate::agent::turn_contracts::stored_turn_message(turn.role.clone(), turn.content.clone())
+                    }),
+            )
+            .collect();
         self.ui.conversation_lines = conversation_lines_from_turns(&self.session.turns);
         self.ui.conversation_generation = self.ui.conversation_generation.saturating_add(1);
         self.ui.turn_count = self.session.turns.len();
@@ -570,12 +556,12 @@ impl ChatState {
             Effect::LogTrace {
                 level: tracing::Level::INFO,
                 msg: format!(
-                    "HistoryCompactionPatchApplied reason={reason:?} start={} end={} replacement={} append_after={} trim_fallback={} len={}",
+                    "HistoryCompactionPatchApplied reason={reason:?} start={} end={} replacement={} append_after={} over_hard_limit={} len={}",
                     patch.range_start(),
                     patch.range_end(),
                     patch.replacement.len(),
                     patch.append_after.len(),
-                    trim_fallback,
+                    budget.over_hard_limit,
                     history.len()
                 ),
             },

@@ -23,7 +23,6 @@ use crate::hooks::HookEvent;
 use crate::memory::MemoryCategory;
 use crate::providers::ChatMessage;
 use crate::security::AutonomyLevel;
-use crate::util::truncate_with_ellipsis;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -85,13 +84,6 @@ impl StreamingDraft {
         if collapsed.is_empty() { None } else { Some(collapsed) }
     }
 }
-
-/// S2-B Step 1: the `Action::HistoryCompacted` reducer matches the constant boundaries of
-/// `chat::mod::compact_chat_history`. All three constants must share their source with `chat::mod`
-/// so both paths agree during dual-write; once a later step drops the old path, keep the reducer's.
-const COMPACT_KEEP_MESSAGES: usize = 8;
-const COMPACT_CONTENT_CHARS: usize = 320;
-const COMPACT_TOTAL_CHARS: usize = 2400;
 
 #[cfg(feature = "terminal-tui")]
 fn conversation_lines_from_turns(turns: &[ChatTurn]) -> Vec<ConversationLine> {
@@ -778,6 +770,9 @@ pub struct ControlState {
     pub final_usage_tasks_recorded: std::collections::HashSet<crate::chat::turn_scheduler::TurnTaskId>,
     /// Tasks whose non-TUI `TurnCommitRequested` was accepted (once per task).
     pub committed_turn_tasks: std::collections::HashSet<crate::chat::turn_scheduler::TurnTaskId>,
+    /// The admitted request (`UserTurnAdmitted`) that is neither committed
+    /// nor rolled back yet. A rollback removes it at most once.
+    pub open_admission: Option<crate::chat::action::AdmissionId>,
     /// Drafts removed by a cancel or shutdown before their worker reported a
     /// terminal. The worker's `StreamCancelled`/`StreamFailed` for such a
     /// draft is still the turn's one accepted terminal; the entry is dropped
@@ -991,6 +986,7 @@ impl ChatState {
                 turn_cancels: std::collections::HashMap::new(),
                 final_usage_tasks_recorded: std::collections::HashSet::new(),
                 committed_turn_tasks: std::collections::HashSet::new(),
+                open_admission: None,
                 cancelled_drafts_awaiting_terminal: std::collections::HashSet::new(),
                 context_degrade_notified: false,
             },
@@ -1247,7 +1243,6 @@ impl ChatState {
                 }
                 self.metadata_changed_effects(changed)
             }
-            Action::HistoryCompacted { reason } => self.reduce_history_compacted(reason),
             Action::HistoryCompactionPatchApplied {
                 reason,
                 patch,
@@ -1348,11 +1343,12 @@ impl ChatState {
                 leading_system_prompt,
             } => self.reduce_session_loaded(session, persist, leading_system_prompt),
             Action::TurnCommitRequested { task_id, draft_id } => self.reduce_turn_commit_requested(task_id, draft_id),
-            Action::TurnAbortSettled { request } => self.reduce_turn_abort_settled(request),
+            Action::TurnAbortSettled { admission } => self.reduce_turn_abort_settled(admission),
             Action::Awaited { action, .. } => self.reduce(*action),
             Action::SessionSaved { id } => self.reduce_session_saved(id),
             Action::SessionSwitched { id } => self.reduce_session_switched(id),
             Action::RecordUserTurn(content) => self.reduce_record_user_turn(content),
+            Action::UserTurnAdmitted { admission, content } => self.reduce_user_turn_admitted(admission, content),
             Action::RecordAssistantTurn { task_id, content } => self.reduce_record_assistant_turn(task_id, content),
             Action::RecordSystemMessage { content } => self.reduce_record_system_message(content),
             Action::SetLeadingSystemPrompt { content } => self.reduce_set_leading_system_prompt(content),
@@ -1397,55 +1393,6 @@ impl ChatState {
             Action::ShutdownRequested => self.reduce_shutdown_requested(),
             Action::ForceQuit => vec![Effect::Quit],
         }
-    }
-}
-
-// ─── Public helpers (shared with dispatcher driver) ──────────────────────────
-
-/// **S3 T3-1**: the history compaction algorithm shared with the `Action::HistoryCompacted` reducer.
-///
-/// It was extracted into a free function so `dispatcher::drive_start_turn_stream` can apply the **same**
-/// algorithm to its own `history` copy on the context-overflow retry path, preventing reducer/driver
-/// state drift (a Codex audit recommendation).
-///
-/// The behaviour matches `reduce_history_compacted` exactly:
-/// 1. keep the system prompt (if the first entry has role==system).
-/// 2. keep only the last [`COMPACT_KEEP_MESSAGES`] non-system messages (drain the older ones).
-/// 3. truncate a single message with an ellipsis when it exceeds [`COMPACT_CONTENT_CHARS`] chars.
-/// 4. drop oldest turns FIFO when the total budget exceeds [`COMPACT_TOTAL_CHARS`].
-///
-/// It is a no-op when `history.len() <= 1` (system stays the only message, or nothing at all).
-pub fn compact_history_in_place(history: &mut Vec<ChatMessage>) {
-    if history.len() <= 1 {
-        return;
-    }
-    let has_system = history.first().is_some_and(|m| m.role == "system");
-    let start = usize::from(has_system);
-
-    // Step 1: keep only the last COMPACT_KEEP_MESSAGES non-system messages
-    let turn_count = history.len().saturating_sub(start);
-    if turn_count > COMPACT_KEEP_MESSAGES {
-        let drain_end = start.saturating_add(turn_count.saturating_sub(COMPACT_KEEP_MESSAGES));
-        history.drain(start..drain_end);
-    }
-
-    // Step 2: truncate individual message contents
-    for msg in history.iter_mut().skip(start) {
-        if msg.content.chars().count() > COMPACT_CONTENT_CHARS {
-            msg.content = truncate_with_ellipsis(&msg.content, COMPACT_CONTENT_CHARS);
-        }
-    }
-
-    // Step 3: total budget constraint (drop oldest first)
-    while history
-        .iter()
-        .skip(start)
-        .map(|m| m.content.chars().count())
-        .sum::<usize>()
-        > COMPACT_TOTAL_CHARS
-        && history.len() > start.saturating_add(1)
-    {
-        history.remove(start);
     }
 }
 
@@ -1521,10 +1468,10 @@ const fn ui_dirty_for(action: &Action) -> bool {
         // compaction feedback is `SystemMessageAdded`; budget UI refresh is
         // `ContextWindowUpdated`, so the history patch itself is not snapshot-dirty.
         Action::RecordUserTurn(_)
+        | Action::UserTurnAdmitted { .. }
         | Action::RecordAssistantTurn { .. }
         | Action::RecordSystemMessage { .. }
         | Action::SetLeadingSystemPrompt { .. }
-        | Action::HistoryCompacted { .. }
         | Action::HistoryCompactionPatchApplied { .. } => false,
         // The degradation notice writes a conversation line of its own.
         Action::HistoryCompactionDegraded { .. } => true,

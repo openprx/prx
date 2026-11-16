@@ -3485,19 +3485,23 @@ Retry with a compatible model: /provider {shown} <model>",
             "chat::run turn route decision"
         );
         let provider_history_len_before_assistant;
+        // The identity of the request recorded at admission: an aborted turn
+        // settles by it, so no earlier request with the same text is touched.
+        let admission;
         #[cfg(feature = "terminal-tui")]
         {
             if reducer_driver_turn_active {
+                admission = None;
                 provider_history_len_before_assistant = history_for_provider.len();
             } else {
-                record_user_turn_at_admission(&chat_dispatcher, &turn_signal, &user_input).await?;
+                admission = Some(record_user_turn_at_admission(&chat_dispatcher, &turn_signal, &user_input).await?);
                 history.push(history_user_message.clone());
                 provider_history_len_before_assistant = history.len();
             }
         }
         #[cfg(not(feature = "terminal-tui"))]
         {
-            record_user_turn_at_admission(&chat_dispatcher, &turn_signal, &user_input).await?;
+            admission = Some(record_user_turn_at_admission(&chat_dispatcher, &turn_signal, &user_input).await?);
             history.push(history_user_message.clone());
             provider_history_len_before_assistant = history.len();
         }
@@ -4089,7 +4093,7 @@ Retry with a compatible model: /provider {shown} <model>",
             let summary_projection = bounded_legacy_chat_compaction_audit_source(&persisted_history_for_turn);
             let token_metadata = legacy_compaction_token_metadata(&history, &persisted_history_for_turn);
             let (turns_before, tokens_before) = super::compaction::chat_history_turns_and_tokens(&history);
-            // The request is already recorded (`RecordUserTurn` above), so the
+            // The request is already recorded (`UserTurnAdmitted` above), so the
             // source is the persisted history including it and the reducer gets
             // the same patch. The enriched request replaces the source's plain
             // final message in the provider view.
@@ -4117,16 +4121,12 @@ Retry with a compatible model: /provider {shown} <model>",
                 )
                 .await
             } else {
-                super::compaction::apply_deterministic_trim_and_sync(
-                    &mut history,
-                    enriched_request,
-                    crate::chat::action::CompactReason::ContextOverflow,
-                    &chat_dispatcher,
-                    &turn_signal,
-                )
-                .await
+                // No handoff or summary: the session and this view stay as they
+                // are; the turn's own preflight trims each request (a projection
+                // that is never persisted).
+                super::compaction::ManualCompactOutcome::NoDurableCompaction
             };
-            preflight_adopted = !matches!(preflight_outcome, super::compaction::ManualCompactOutcome::Refused { .. });
+            preflight_adopted = matches!(preflight_outcome, super::compaction::ManualCompactOutcome::Compacted { .. });
             persist_legacy_chat_compaction_audit(
                 mem.as_ref(),
                 &runtime_envelope,
@@ -4407,7 +4407,7 @@ Retry with a compatible model: /provider {shown} <model>",
         let (response, turn_trace) = match turn_outcome {
             TurnOutcome::Success(resp) => (resp, successful_trace.context("successful Chat outcome has no serving trace")?),
             TurnOutcome::Cancelled => {
-                let settled = settle_aborted_turn(&chat_dispatcher, &turn_signal, Some(&user_input)).await?;
+                let settled = settle_aborted_turn(&chat_dispatcher, &turn_signal, admission).await?;
                 provider_view_after_settled_abort(
                     &mut history,
                     &settled,
@@ -4429,7 +4429,7 @@ Retry with a compatible model: /provider {shown} <model>",
                 continue;
             }
             TurnOutcome::FailedWithError { err, .. } => {
-                let settled = settle_aborted_turn(&chat_dispatcher, &turn_signal, Some(&user_input)).await?;
+                let settled = settle_aborted_turn(&chat_dispatcher, &turn_signal, admission).await?;
                 provider_view_after_settled_abort(
                     &mut history,
                     &settled,

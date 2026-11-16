@@ -326,6 +326,8 @@ impl ChatState {
         let Some(removed_draft) = self.stream.remove_visible_draft(draft_id) else {
             return vec![];
         };
+        // The admitted request is committed: no later rollback removes it.
+        self.control.open_admission = None;
         let tool_key = ToolTaskKey::from_task_id(removed_draft.task_id);
         self.control.remove_turn_cancel(tool_key);
         let no_visible_drafts = !self.stream.has_visible_drafts();
@@ -380,6 +382,8 @@ impl ChatState {
         let Some(removed_draft) = self.stream.remove_visible_draft(draft_id) else {
             return vec![];
         };
+        // The admitted request is committed: no later rollback removes it.
+        self.control.open_admission = None;
         let tool_key = ToolTaskKey::from_task_id(removed_draft.task_id);
         self.control.remove_turn_cancel(tool_key);
         let no_visible_drafts = !self.stream.has_visible_drafts();
@@ -446,11 +450,7 @@ impl ChatState {
                 u64::try_from(elapsed).unwrap_or(u64::MAX)
             });
         }
-        let orphan_user_removed = if no_visible_drafts {
-            self.rollback_trailing_answerless_user_turn()
-        } else {
-            false
-        };
+        let orphan_user_removed = no_visible_drafts && self.rollback_open_admission(None);
         self.finalize_pending_tool_cards(tool_key, false, Some("turn failed before tool finish event"));
         if no_visible_drafts && !self.control.has_task_turn_cancels() {
             self.control.active_cancel = None;
@@ -523,7 +523,7 @@ impl ChatState {
         }
         self.finalize_pending_tool_cards(tool_key, true, Some("turn cancelled before tool finish event"));
         if no_visible_drafts {
-            self.rollback_trailing_answerless_user_turn();
+            self.rollback_open_admission(None);
         }
         if no_visible_drafts && !self.control.has_task_turn_cancels() {
             self.control.active_cancel = None;
@@ -533,7 +533,25 @@ impl ChatState {
         vec![Effect::RequestRedraw]
     }
 
-    pub(super) fn rollback_trailing_answerless_user_turn(&mut self) -> bool {
+    /// Remove the open admission's request, at most once: the admission is
+    /// closed whether or not its request is still the trailing answerless
+    /// user turn. `expected` names the admission a settlement removes; a
+    /// stream terminal (`None`) removes whichever admission is open, since an
+    /// inline turn is the only one that opens one. A request recorded at
+    /// commit (`RecordUserTurn`) never opens an admission and is never
+    /// removed here.
+    pub(super) fn rollback_open_admission(&mut self, expected: Option<crate::chat::action::AdmissionId>) -> bool {
+        let Some(open) = self.control.open_admission else {
+            return false;
+        };
+        if expected.is_some_and(|expected| expected != open) {
+            return false;
+        }
+        self.control.open_admission = None;
+        self.rollback_trailing_answerless_user_turn()
+    }
+
+    fn rollback_trailing_answerless_user_turn(&mut self) -> bool {
         let Some(last_turn) = self.session.turns.last() else {
             return false;
         };

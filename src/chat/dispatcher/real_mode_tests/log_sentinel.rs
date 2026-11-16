@@ -445,6 +445,105 @@ async fn a_compaction_whose_audit_storage_fails_logs_no_stored_content() {
     .expect("a_compaction_whose_audit_storage_fails_logs_no_stored_content exceeded DEADLINE");
 }
 
+/// A real detached `switch` rollover whose handoff insert fails: a SQLite
+/// trigger refuses every `context.switch.created` event with the sentinel in
+/// the database error. The rollover degrades to a trim (no patch reaches the
+/// session), and its failure line carries the error's length and digest only.
+#[tokio::test]
+async fn a_switch_rollover_whose_handoff_insert_fails_logs_no_stored_content() {
+    tokio::time::timeout(DEADLINE, async {
+        let (logs, _guard) = capture_logs();
+        let (dir, memory) = sqlite_memory();
+        let envelope =
+            crate::runtime::envelope::RuntimeEnvelope::agent("workspace-switch-sentinel", "run-switch-sentinel");
+        let audit = crate::agent::document_ingest::DocumentIngestRuntime::from_envelope(Arc::clone(&memory), &envelope);
+        let fabric = crate::memory::MemoryFabric::new(Arc::clone(&memory), "workspace-switch-sentinel");
+        let source = vec![
+            ChatMessage::system("sys"),
+            crate::agent::turn_contracts::inbound_user_message(&format!("old user {SENTINEL} ").repeat(60)),
+            ChatMessage::assistant(format!("old assistant {SENTINEL} ").repeat(60)),
+            crate::agent::turn_contracts::inbound_user_message(&format!("older user {SENTINEL} ").repeat(60)),
+            ChatMessage::assistant(format!("older assistant {SENTINEL} ").repeat(60)),
+            crate::agent::turn_contracts::inbound_user_message(&format!("pending user {SENTINEL}")),
+        ];
+        for (index, message) in source.iter().skip(1).enumerate() {
+            if message.role == "user" {
+                fabric
+                    .record_inbound_user_message(
+                        envelope.message_scope(),
+                        message.content.clone(),
+                        Some(format!("switch-sentinel-{index}")),
+                        None,
+                    )
+                    .await
+                    .expect("test: record the user event");
+            } else {
+                fabric
+                    .record_assistant_message(envelope.message_scope(), message.content.clone())
+                    .await
+                    .expect("test: record the assistant event");
+            }
+        }
+        let connection = rusqlite::Connection::open(dir.path().join("memory").join("brain.db"))
+            .expect("test: open the real database");
+        connection
+            .execute_batch(&format!(
+                "CREATE TRIGGER test_refuse_switch BEFORE INSERT ON message_events \
+                 WHEN NEW.event_type = 'context.switch.created' \
+                 BEGIN SELECT RAISE(ABORT, 'refused {SENTINEL}'); END;"
+            ))
+            .expect("test: install the refusing trigger");
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Switch,
+            reserve_tokens: 1,
+            keep_recent_messages: 1,
+            memory_flush: false,
+            max_context_tokens: 50,
+            max_context_tokens_explicit: true,
+            os_paging: crate::config::OsPagingConfig::default(),
+        };
+        let mut provider_view = source.clone();
+        let mut guard_view = source.clone();
+        let (action_tx, mut action_rx) = mpsc::channel::<Action>(8);
+
+        let outcome = apply_redux_context_rollover(
+            &SentinelSummaryProvider,
+            &mut provider_view,
+            &mut guard_view,
+            "model",
+            &config,
+            Some(&audit),
+            &action_tx,
+            crate::chat::action::CompactReason::ContextOverflow,
+            "sentinel_switch",
+        )
+        .await;
+        drop(action_tx);
+        let mut reached_session = false;
+        while let Some(action) = action_rx.recv().await {
+            reached_session |= matches!(action, Action::HistoryCompactionPatchApplied { .. });
+        }
+        let text = logs.text();
+
+        assert_eq!(
+            outcome,
+            Ok(ContextRolloverOutcome {
+                replacement_len: None,
+                degraded: true,
+            }),
+            "a refused handoff insert degrades the rollover"
+        );
+        assert!(!reached_session, "no compaction reaches the session");
+        assert!(
+            text.contains("redux driver context rollover failed") && text.contains("error_sha256"),
+            "the refused handoff insert is logged by length and digest:\n{text}"
+        );
+        assert_no_sentinel(&text, "switch rollover handoff insert failure");
+    })
+    .await
+    .expect("a_switch_rollover_whose_handoff_insert_fails_logs_no_stored_content exceeded DEADLINE");
+}
+
 #[cfg(feature = "terminal-tui")]
 #[test]
 fn typed_and_pasted_input_logs_no_characters() {

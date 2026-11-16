@@ -29,6 +29,9 @@ const ALLOWED_BRAIN_DB_OPENS_OUTSIDE_SQLITE_REPOSITORY: &[&str] = &[
     // Test-only (PR #207 r4): refusing triggers make an actual compaction's audit writes fail with the
     // sentinel in the database error, proving compaction error logs carry no stored content.
     "src/chat/dispatcher/real_mode_tests/log_sentinel.rs::a_compaction_whose_audit_storage_fails_logs_no_stored_content::let connection = rusqlite::Connection::open(dir.path().join(\"memory\").join(\"brain.db\"))",
+    // Test-only (PR #207 r5): a refusing trigger makes a real switch rollover's handoff insert fail with the
+    // sentinel in the database error, proving the rollover failure log carries no stored content.
+    "src/chat/dispatcher/real_mode_tests/log_sentinel.rs::a_switch_rollover_whose_handoff_insert_fails_logs_no_stored_content::let connection = rusqlite::Connection::open(dir.path().join(\"memory\").join(\"brain.db\"))",
     // Test-only: inspect the real tables to prove erasure leaves a tombstone and no transport digest (AUTH-02-1b).
     "src/runtime/ingress_recovery/authority_tests.rs::db::rusqlite::Connection::open(workspace.join(\"memory\").join(\"brain.db\")).expect(\"brain.db\")",
     "src/chat/tests/legacy_chat_compaction_audit_tests.rs::legacy_chat_compaction_downgrades_fidelity_when_event_provenance_is_unavailable::let conn = rusqlite::Connection::open(tmp.path().join(\"memory\").join(\"brain.db\")).unwrap();",

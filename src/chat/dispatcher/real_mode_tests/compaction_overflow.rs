@@ -5,8 +5,9 @@ use super::*;
 /// **S3 T3-1 Step 3**: context overflow → automatic compact + retry while making progress → success.
 ///
 /// The provider first sends StreamError::Provider("maximum context length exceeded") and
-/// succeeds on the second attempt. The driver must: emit HistoryCompacted{ContextOverflow} → call the
-/// stream API again → emit StreamCompleted.
+/// succeeds on the second attempt. The driver must trim its own view (a per-request projection that
+/// never reaches the session: no compaction action is sent) → call the stream API again → emit
+/// StreamCompleted.
 #[tokio::test]
 async fn t31_driver_context_overflow_triggers_compact_and_retries() {
     use crate::providers::traits::{
@@ -100,7 +101,6 @@ async fn t31_driver_context_overflow_triggers_compact_and_retries() {
                 })
                 .await;
 
-            let mut saw_compacted = false;
             let mut saw_completion = false;
             for _ in 0..16 {
                 let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
@@ -108,10 +108,8 @@ async fn t31_driver_context_overflow_triggers_compact_and_retries() {
                     .expect("driver action within 2s")
                     .expect("must arrive");
                 match action {
-                    Action::HistoryCompacted {
-                        reason: crate::chat::action::CompactReason::ContextOverflow,
-                    } => {
-                        saw_compacted = true;
+                    Action::HistoryCompactionPatchApplied { .. } => {
+                        panic!("a trim without a compaction config is a projection; nothing reaches the session");
                     }
                     Action::StreamCompleted { final_text, .. } => {
                         assert!(final_text.contains("recovered"), "want 'recovered' got {final_text:?}");
@@ -124,7 +122,6 @@ async fn t31_driver_context_overflow_triggers_compact_and_retries() {
                     _ => {}
                 }
             }
-            assert!(saw_compacted, "must emit HistoryCompacted on overflow");
             assert!(saw_completion, "must complete after compact+retry");
             Ok::<_, anyhow::Error>(())
         })
@@ -427,9 +424,6 @@ async fn redux_driver_preflight_uses_provider_summary_before_first_stream_reques
                                 .any(|message| message.content.contains("PROVIDER_SUMMARY_MARKER")),
                             "summary patch must carry provider summary marker"
                         );
-                    }
-                    Action::HistoryCompacted { .. } => {
-                        panic!("preflight summary path must not dispatch lossy HistoryCompacted");
                     }
                     Action::ContextWindowUpdated {
                         used_context_tokens: Some(used),
@@ -1096,9 +1090,11 @@ async fn redux_compaction_guard_uses_persisted_source_when_provider_history_is_e
         "persisted guard source must not log a guard mismatch"
     );
     let _ = reducer_state.reduce(Action::RecordUserTurn("current visible user".to_string()));
+    // The refresh aside lives only in the driver's provider projection.
     assert_eq!(
         driver_history
             .iter()
+            .filter(|message| !crate::agent::turn_contracts::is_loop_written_user_note(&message.content))
             .map(|message| (message.role.clone(), message.content.clone()))
             .collect::<Vec<_>>(),
         reducer_state
@@ -1224,9 +1220,11 @@ async fn redux_compaction_guard_source_is_inert_when_provider_history_is_not_enr
     });
     assert!(effects.iter().any(|effect| matches!(effect, Effect::SaveSession(_))));
     let _ = reducer_state.reduce(Action::RecordUserTurn("current user".to_string()));
+    // The refresh aside lives only in the driver's provider projection.
     assert_eq!(
         driver_history
             .iter()
+            .filter(|message| !crate::agent::turn_contracts::is_loop_written_user_note(&message.content))
             .map(|message| (message.role.clone(), message.content.clone()))
             .collect::<Vec<_>>(),
         reducer_state

@@ -139,6 +139,11 @@ pub(super) struct ManualCompact<'a> {
     pub(super) commits: &'a dispatcher::TurnCompletionSignal,
 }
 
+/// Feedback when no handoff or summary can be built: the session is left
+/// unchanged and each request is trimmed on its own.
+pub(super) const NO_DURABLE_COMPACTION_FEEDBACK: &str =
+    "No durable compaction available; requests will be trimmed per request. Nothing was changed.";
+
 /// What an explicit `/compact` or a chat preflight compaction did. Callers
 /// print from this and refresh the TUI budget; nothing else reports success.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,9 +156,11 @@ pub(super) enum ManualCompactOutcome {
         turns_after: usize,
         tokens_after: usize,
     },
-    /// No handoff or summary could be built; a deterministic trim dropped
-    /// `dropped_messages` messages.
-    Degraded { dropped_messages: usize },
+    /// No handoff or summary could be built. Nothing was changed in the
+    /// session: a lossy trim is never persisted, so each provider request is
+    /// trimmed on its own (a per-request projection) while the session keeps
+    /// every turn a later handoff can still recover.
+    NoDurableCompaction,
     /// Nothing was changed. `reason` is the user-facing explanation.
     Refused { reason: String },
 }
@@ -179,7 +186,7 @@ impl ManualCompactOutcome {
                 *tokens_after,
                 config.max_context_tokens,
             ),
-            Self::Degraded { dropped_messages } => format_context_degraded_notice(*dropped_messages),
+            Self::NoDurableCompaction => NO_DURABLE_COMPACTION_FEEDBACK.to_owned(),
             Self::Refused { reason } => reason.clone(),
         }
     }
@@ -200,9 +207,9 @@ pub(super) fn chat_history_turns_and_tokens(history: &[ChatMessage]) -> (usize, 
 /// the budget says. The source is the system prompt plus the acknowledged
 /// session turns; the reducer receives the same patch. The audit runtime binds
 /// to the session's newest persisted user-input event, so `switch` mode writes
-/// a durable context-switch handoff. The deterministic trim runs only when no
-/// handoff or summary can be built, and then reports the loss instead of
-/// "compacted".
+/// a durable context-switch handoff. When no handoff or summary can be built
+/// the session is left unchanged ([`ManualCompactOutcome::NoDurableCompaction`]):
+/// a lossy trim is never persisted.
 pub(super) async fn run_manual_compact(
     request: ManualCompact<'_>,
     emit: &mut impl FnMut(&str),
@@ -275,14 +282,7 @@ pub(super) async fn run_manual_compact(
         )
         .await;
     }
-    apply_deterministic_trim_and_sync(
-        history,
-        None,
-        crate::chat::action::CompactReason::Manual,
-        chat_dispatcher,
-        commits,
-    )
-    .await
+    ManualCompactOutcome::NoDurableCompaction
 }
 
 /// The provider view of an acknowledged snapshot: the current view's leading
@@ -343,57 +343,6 @@ pub(super) fn provider_view_after_compacted_abort(
         view.pop();
     }
     view
-}
-
-/// Replace the view's final user message (the current request as the reducer
-/// stored it, possibly capped by a trim) with `enriched`, or append `enriched`
-/// when the view does not end with a user message.
-fn replace_trailing_request(view: &mut Vec<ChatMessage>, enriched: ChatMessage) {
-    if view.last().is_some_and(|last| last.role == "user") {
-        view.pop();
-    }
-    view.push(enriched);
-}
-
-/// The lossy fallback when no handoff or summary can be built: the reducer
-/// trims, rebuilds and saves its session first; only after that saved
-/// revision is acknowledged is the provider view rebuilt from it, with
-/// `enriched_request` (preflight: the current turn's enriched request)
-/// replacing the stored request. A rejection, an acknowledgement without a
-/// saved revision or a failed acknowledgement leaves the provider view
-/// unchanged.
-pub(super) async fn apply_deterministic_trim_and_sync(
-    history: &mut Vec<ChatMessage>,
-    enriched_request: Option<ChatMessage>,
-    reason: crate::chat::action::CompactReason,
-    chat_dispatcher: &dispatcher::ChatDispatcher,
-    commits: &dispatcher::TurnCompletionSignal,
-) -> ManualCompactOutcome {
-    match chat_dispatcher
-        .dispatch_awaited(crate::chat::action::Action::HistoryCompacted { reason }, commits)
-        .await
-    {
-        Ok(crate::chat::acked_session::Ack::Published(acked)) => {
-            let messages_before = history.len();
-            let mut view = provider_view_from_acked(history, &acked);
-            if let Some(enriched) = enriched_request {
-                replace_trailing_request(&mut view, enriched);
-            }
-            *history = view;
-            ManualCompactOutcome::Degraded {
-                dropped_messages: messages_before.saturating_sub(history.len()),
-            }
-        }
-        Ok(crate::chat::acked_session::Ack::Unchanged(_)) => ManualCompactOutcome::Refused {
-            reason: "Nothing to compact: the session history is already minimal.".to_owned(),
-        },
-        Ok(crate::chat::acked_session::Ack::Rejected(rejection)) => ManualCompactOutcome::Refused {
-            reason: format!("Compaction refused: {rejection}. Nothing was changed."),
-        },
-        Err(error) => ManualCompactOutcome::Refused {
-            reason: format!("Compaction failed: {error}. Nothing was changed."),
-        },
-    }
 }
 
 pub(super) fn format_nothing_to_compact_feedback(
@@ -492,7 +441,7 @@ pub(super) async fn build_chat_compaction_patch(
                 error_len,
                 error_sha256,
                 trigger,
-                "chat summary compaction failed; falling back to deterministic trim"
+                "chat summary compaction failed; no durable compaction this time"
             );
             None
         }
@@ -564,9 +513,11 @@ pub(super) async fn apply_chat_compaction_patch_and_sync(
             };
         }
     };
-    // The provider view is rebuilt from the acknowledged snapshot (which
-    // already carries the reducer's preserving trim), never trimmed on its
-    // own: a later acknowledged read then holds exactly these turns.
+    // The provider view is rebuilt from the acknowledged snapshot, so a later
+    // acknowledged read holds exactly these turns. The refresh aside a summary
+    // appends lives only in this provider projection, never in the session.
+    // A view still over budget is trimmed per request by the turn's own
+    // preflight; that trim is never persisted.
     let mut view = provider_view_from_acked(&compacted, &acked);
     if !append_after.is_empty() {
         let insert_at = replacement_tail
@@ -901,7 +852,7 @@ pub(super) async fn persist_legacy_chat_compaction_audit(
 /// overflow compaction to the session authority instead of keeping it as a
 /// private mutation of the provider view.
 ///
-/// The turn's request is already recorded in the reducer (`RecordUserTurn` at
+/// The turn's request is already recorded in the reducer (`UserTurnAdmitted` at
 /// admission), so the reducer's target is the compacted view in its durable
 /// form (native tool envelopes and loop notes removed, as for a worker) with
 /// the recorded plain request in place of the enriched one. The patch is
@@ -954,8 +905,10 @@ impl InlineCompactionSink {
         self.mark_compacted();
         let mut compacted = source_history;
         if let Err(error) = apply_compaction_patch_exact(&mut compacted, &patch) {
+            let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
             tracing::warn!(
-                %error,
+                error_len,
+                error_sha256,
                 guard_history_len = patch.guard.history_len,
                 source_len = compacted.len(),
                 "inline compaction patch does not match its source; reducer patch not sent"
@@ -997,26 +950,6 @@ impl InlineCompactionSink {
         }
         Ok(())
     }
-
-    async fn adopt_trim(&self) -> anyhow::Result<()> {
-        self.mark_compacted();
-        let ack = self
-            .chat_dispatcher
-            .dispatch_awaited(
-                crate::chat::action::Action::HistoryCompacted {
-                    reason: crate::chat::action::CompactReason::ContextOverflow,
-                },
-                &self.commits,
-            )
-            .await
-            .map_err(|error| anyhow::anyhow!("Chat stopped after an unconfirmed history commit: {error}"))?;
-        if let crate::chat::acked_session::Ack::Published(acked) = ack {
-            let mut source = self.reducer_history.lock();
-            let view = provider_view_from_acked(&source, &acked);
-            *source = view;
-        }
-        Ok(())
-    }
 }
 
 #[async_trait::async_trait]
@@ -1029,7 +962,6 @@ impl crate::agent::turn_contracts::ToolLoopEventSink for InlineCompactionSink {
                 config,
                 ..
             } => self.adopt_patch(source_history, patch, config).await,
-            crate::agent::turn_contracts::ToolLoopEvent::ContextCompacted => self.adopt_trim().await,
             // Text and tool progress reach the terminal through the turn's
             // own delta and tool-call channels.
             crate::agent::turn_contracts::ToolLoopEvent::TextDelta(_)

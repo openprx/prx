@@ -151,8 +151,16 @@ the chain: one lookup per generation. Once a handoff exists, the
 after the newest handoff, never a row it replaced and never a row `/branch`
 copied; older facts stay reachable through `transcript_history_lookup` alone.
 In chat, `/compact` and the preflight report their outcome: compacted (new
-generation, turns and tokens after), degraded (a deterministic trim that
-dropped messages), or refused with the reason and "Nothing was changed."
+generation, turns and tokens after), "No durable compaction available;
+requests will be trimmed per request. Nothing was changed." when no handoff or
+summary can be built, or refused with the reason and "Nothing was changed."
+Only a durable compaction (a handoff, a summary or an evicted OS-paging page)
+changes the saved session. A lossy trim, wherever it runs (the chat preflight,
+the per-provider preflight, an overflow retry, a rollover still over budget),
+is a projection of one provider request: it is never saved, so the session
+keeps every turn a later handoff can still recover. The summary's
+`[Post-compaction context refresh]` aside is such a projection too; it never
+becomes a session turn.
 `/branch` of a compacted session copies the handoff chain and the kept turns
 into the branch in one transaction, with every note rewritten to point at the
 copies, so the branch's lookups read its own rows; the original session's rows

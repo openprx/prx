@@ -1080,10 +1080,9 @@ mod tests {
             "the failure is not reported as a failed compaction: {failures:?}"
         );
         assert!(
-            run.actions.iter().all(|action| !matches!(
-                action,
-                Action::HistoryCompacted { .. } | Action::HistoryCompactionPatchApplied { .. }
-            )),
+            run.actions
+                .iter()
+                .all(|action| !matches!(action, Action::HistoryCompactionPatchApplied { .. })),
             "no compaction patch reaches the chat"
         );
     }

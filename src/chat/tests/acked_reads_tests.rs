@@ -206,8 +206,10 @@ async fn manual_compaction_over_sanitized_past_turns_is_acknowledged_in_the_runt
             turn_pairs(&reference.build_session_snapshot()),
             "the published turns are the reducer's turns byte for byte"
         );
+        // The summary's refresh aside lives only in the provider projection.
         let view: Vec<(&str, &str)> = provider_view
             .iter()
+            .filter(|m| !crate::agent::turn_contracts::is_loop_written_user_note(&m.content))
             .map(|m| (m.role.as_str(), m.content.as_str()))
             .collect();
         let reducer_history: Vec<(&str, &str)> = reference
@@ -218,7 +220,13 @@ async fn manual_compaction_over_sanitized_past_turns_is_acknowledged_in_the_runt
             .collect();
         assert_eq!(
             view, reducer_history,
-            "the provider view is the compacted source the reducer holds"
+            "the provider view without its loop notes is the compacted source the reducer holds"
+        );
+        assert!(
+            provider_view.iter().any(|m| m
+                .content
+                .starts_with(crate::agent::turn_contracts::POST_COMPACTION_REFRESH_MARKER)),
+            "the provider projection carries the refresh aside"
         );
         assert_runtime_form_published_and_row_sanitized(
             &published.session,
@@ -227,6 +235,123 @@ async fn manual_compaction_over_sanitized_past_turns_is_acknowledged_in_the_runt
     })
     .await
     .expect("manual compaction test exceeded DEADLINE");
+}
+
+/// One summary compaction of the acknowledged turns, as `/compact` builds
+/// it: the source is the system prompt plus the acknowledged turns.
+async fn summary_compaction_of_acknowledged_turns(
+    harness: &TestSessionDispatcher,
+    config: &crate::config::AgentCompactionConfig,
+    provider_view: &mut Vec<ChatMessage>,
+) -> ManualCompactOutcome {
+    let acked = harness.dispatcher.session_reader().acked();
+    let mut source = vec![ChatMessage::system(SYSTEM)];
+    source.extend(session_turns_to_history(&acked.session));
+    let patch = build_chat_compaction_patch(
+        &source,
+        &source,
+        &SectionSummaryProvider,
+        "summary-model",
+        config,
+        None,
+        crate::agent::compaction::MANUAL_COMPACT_TRIGGER,
+    )
+    .await
+    .expect("test: the history yields a summary patch");
+    apply_chat_compaction_patch_and_sync(
+        provider_view,
+        &source,
+        None,
+        patch,
+        config,
+        CompactReason::Manual,
+        &harness.dispatcher,
+        &harness.commits,
+    )
+    .await
+}
+
+/// Two summary compactions in a row against the same live reducer: the first
+/// one's refresh aside stays in the provider projection, so the second
+/// source, rebuilt from the acknowledged turns, describes the reducer history
+/// and is compacted too. The stored row never holds the aside.
+#[tokio::test]
+async fn two_summary_compactions_in_a_row_are_both_compacted() {
+    tokio::time::timeout(DEADLINE, async {
+        let (_dir, memory) = sqlite_memory();
+        let config = compaction_config();
+        let state = state_with_sanitized_content();
+        let session_id = state.session.id.clone();
+        let harness = TestSessionDispatcher::spawn(Arc::clone(&memory), state);
+        let mut provider_view = vec![ChatMessage::system(SYSTEM)];
+        let epoch_before = harness.dispatcher.session_reader().acked().compaction_epoch;
+
+        let first = summary_compaction_of_acknowledged_turns(&harness, &config, &mut provider_view).await;
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        for (question, answer) in [("q4", "a4"), ("q5", "a5"), ("q6", "a6")] {
+            let _ = harness
+                .dispatcher
+                .dispatch_awaited(Action::RecordUserTurn(question.to_owned()), &harness.commits)
+                .await
+                .expect("test: question recorded");
+            let _ = harness
+                .dispatcher
+                .dispatch_awaited(
+                    Action::RecordAssistantTurn {
+                        task_id: None,
+                        content: answer.to_owned(),
+                    },
+                    &harness.commits,
+                )
+                .await
+                .expect("test: answer recorded");
+            // Each exchange is committed (saved and published) as a turn is.
+            let task_id = scheduler.enqueue(question, crate::chat::turn_scheduler::TurnPriority::Normal, 0);
+            let _ = harness
+                .dispatcher
+                .dispatch_awaited(
+                    Action::TurnCommitRequested {
+                        task_id,
+                        draft_id: None,
+                    },
+                    &harness.commits,
+                )
+                .await
+                .expect("test: exchange committed");
+        }
+        let second = summary_compaction_of_acknowledged_turns(&harness, &config, &mut provider_view).await;
+        let published = harness.dispatcher.session_publisher().current();
+        let row = stored_row(memory.as_ref(), &session_id).await;
+        let healthy = harness.commits.ensure_history_commits_healthy();
+        harness.stop().await;
+
+        assert!(
+            matches!(first, ManualCompactOutcome::Compacted { .. }),
+            "the first summary compaction is compacted: {first:?}"
+        );
+        assert!(
+            matches!(second, ManualCompactOutcome::Compacted { .. }),
+            "the second summary compaction is compacted: {second:?}"
+        );
+        assert_eq!(
+            published.compaction_epoch,
+            epoch_before + 2,
+            "both compactions were adopted"
+        );
+        assert!(
+            published.session.turns.iter().all(|turn| !turn
+                .content
+                .starts_with(crate::agent::turn_contracts::POST_COMPACTION_REFRESH_MARKER)),
+            "the refresh aside is never a session turn"
+        );
+        assert!(
+            !row.contains(crate::agent::turn_contracts::POST_COMPACTION_REFRESH_MARKER),
+            "the stored row never holds the refresh aside"
+        );
+        assert!(healthy.is_ok(), "nothing is latched: {healthy:?}");
+    })
+    .await
+    .expect("two_summary_compactions_in_a_row_are_both_compacted exceeded DEADLINE");
 }
 
 #[tokio::test]
@@ -1014,7 +1139,7 @@ async fn a_draftless_failure_after_an_in_turn_compaction_is_settled_saved_and_pu
             Arc::clone(&memory),
             TestSessionDispatcher::state_with_history(vec![ChatMessage::system("sys")]),
         );
-        crate::chat::provider_turns::record_user_turn_at_admission(
+        let admission = crate::chat::provider_turns::record_user_turn_at_admission(
             &harness.dispatcher,
             &harness.commits,
             ABORTED_REQUEST,
@@ -1049,12 +1174,9 @@ async fn a_draftless_failure_after_an_in_turn_compaction_is_settled_saved_and_pu
         };
         let row_after_compaction = stored_row(memory.as_ref(), &after_compaction.session_id).await;
 
-        let settled = crate::chat::provider_turns::settle_aborted_turn(
-            &harness.dispatcher,
-            &harness.commits,
-            Some(ABORTED_REQUEST),
-        )
-        .await;
+        let settled =
+            crate::chat::provider_turns::settle_aborted_turn(&harness.dispatcher, &harness.commits, Some(admission))
+                .await;
         let row_after_settlement = stored_row(memory.as_ref(), &after_compaction.session_id).await;
         let healthy = harness.commits.ensure_history_commits_healthy();
         harness.stop().await;
@@ -1108,9 +1230,13 @@ async fn a_settlement_after_the_draft_terminal_removes_nothing_more_and_saves() 
         })
         .await
         .expect("test: earlier answer");
-        dispatch(Action::RecordUserTurn(ABORTED_REQUEST.to_owned()))
-            .await
-            .expect("test: admission");
+        let admission = crate::chat::action::AdmissionId::next();
+        dispatch(Action::UserTurnAdmitted {
+            admission,
+            content: ABORTED_REQUEST.to_owned(),
+        })
+        .await
+        .expect("test: admission");
         dispatch(Action::TurnStarted {
             draft_id: "draft-aborted".to_owned(),
             cancel: tokio_util::sync::CancellationToken::new(),
@@ -1125,12 +1251,9 @@ async fn a_settlement_after_the_draft_terminal_removes_nothing_more_and_saves() 
         .await
         .expect("test: draft failed");
 
-        let settled = crate::chat::provider_turns::settle_aborted_turn(
-            &harness.dispatcher,
-            &harness.commits,
-            Some(ABORTED_REQUEST),
-        )
-        .await;
+        let settled =
+            crate::chat::provider_turns::settle_aborted_turn(&harness.dispatcher, &harness.commits, Some(admission))
+                .await;
         harness.stop().await;
 
         let settled = settled.expect("the settlement is acknowledged");

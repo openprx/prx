@@ -284,7 +284,8 @@ impl ChatTuiApprovalStrategy {
         .and_then(|grant| match serde_json::to_value(grant) {
             Ok(value) => Some(value),
             Err(error) => {
-                tracing::error!(tool = %request.descriptor.public_name, %error, "failed to serialize runtime approval grant");
+                let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+                tracing::error!(tool = %request.descriptor.public_name, error_len, error_sha256, "failed to serialize runtime approval grant");
                 None
             }
         });
@@ -1619,7 +1620,8 @@ impl EffectExecutor {
                         if cancel.is_cancelled() {
                             // already cancelled before start: send StreamCancelled directly, do not issue an LLM request.
                             if let Err(e) = action_tx.send(Action::StreamCancelled { draft_id }).await {
-                                tracing::debug!(error = %e, "StartTurn: action_tx closed on pre-cancel");
+                                let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&e);
+                                tracing::debug!(error_len, error_sha256, "StartTurn: action_tx closed on pre-cancel");
                             }
                             return;
                         }
@@ -1748,8 +1750,9 @@ impl EffectExecutor {
                         "SendDraftFinalize effect: calling channel.finalize_draft"
                     );
                     if let Err(e) = channel.finalize_draft(recipient, &draft_id, &text).await {
+                        let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&e);
                         tracing::warn!(
-                            error = %e,
+                            error_len, error_sha256,
                             draft_id = %draft_id,
                             "SendDraftFinalize effect: finalize_draft failed"
                         );
@@ -1761,7 +1764,8 @@ impl EffectExecutor {
                 let channel = Arc::clone(&deps.channel);
                 let recipient = "user".to_string();
                 if let Err(e) = channel.cancel_draft(&recipient, &draft_id).await {
-                    tracing::debug!(error = %e, draft_id = %draft_id, "CancelDraft effect: channel returned err");
+                    let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&e);
+                    tracing::debug!(error_len, error_sha256, draft_id = %draft_id, "CancelDraft effect: channel returned err");
                 }
             }
             Effect::CancelToken(token) => {
@@ -1777,7 +1781,8 @@ impl EffectExecutor {
                 tokio::spawn(async move {
                     let _scope = guard_scope;
                     if let Err(e) = channel.send(&send_msg).await {
-                        tracing::warn!(error = %e, "EmitChannelMessage effect: send failed");
+                        let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&e);
+                        tracing::warn!(error_len, error_sha256, "EmitChannelMessage effect: send failed");
                     }
                 });
             }
@@ -1787,7 +1792,8 @@ impl EffectExecutor {
                 tokio::spawn(async move {
                     let _scope = guard_scope;
                     if let Err(e) = memory.store(&key, &value, category, None).await {
-                        tracing::warn!(error = %e, key = %key, "PersistToMemory effect: store failed");
+                        let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&e);
+                        tracing::warn!(error_len, error_sha256, key = %key, "PersistToMemory effect: store failed");
                     }
                 });
             }
@@ -1859,7 +1865,12 @@ impl EffectExecutor {
                                 })
                                 .await
                             {
-                                tracing::debug!(error = %e, "RequestApproval fail-closed: action_tx closed");
+                                let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&e);
+                                tracing::debug!(
+                                    error_len,
+                                    error_sha256,
+                                    "RequestApproval fail-closed: action_tx closed"
+                                );
                             }
                         });
                         return;
@@ -1881,7 +1892,12 @@ impl EffectExecutor {
                         })
                         .await
                     {
-                        tracing::debug!(error = %e, "RequestApproval terminal prompt: action_tx closed");
+                        let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&e);
+                        tracing::debug!(
+                            error_len,
+                            error_sha256,
+                            "RequestApproval terminal prompt: action_tx closed"
+                        );
                     }
                 });
             }
@@ -2034,7 +2050,12 @@ async fn send_context_degraded_notice(
         })
         .await
     {
-        tracing::debug!(%error, "StartTurn: action_tx closed on compaction-degraded notice");
+        let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+        tracing::debug!(
+            error_len,
+            error_sha256,
+            "StartTurn: action_tx closed on compaction-degraded notice"
+        );
         return Err(());
     }
     Ok(())
@@ -2107,7 +2128,13 @@ async fn apply_redux_context_rollover(
             });
         }
         Err(error) => {
-            tracing::warn!(error = %error, trigger, "redux driver context rollover failed; falling back to trim");
+            let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+            tracing::warn!(
+                error_len,
+                error_sha256,
+                trigger,
+                "redux driver context rollover failed; falling back to trim"
+            );
             let budget = crate::agent::context_budget::plan_context_budget(
                 history,
                 config,
@@ -2134,8 +2161,10 @@ async fn apply_redux_context_rollover(
     // the provider view. Validate against the source before any mutation or send.
     let mut compacted_source = compaction_guard_history.clone();
     if let Err(error) = crate::agent::compaction::apply_compaction_patch_exact(&mut compacted_source, &patch) {
+        let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
         tracing::warn!(
-            %error,
+            error_len,
+            error_sha256,
             trigger,
             guard_history_len = patch.guard.history_len,
             source_len = compaction_guard_history.len(),
@@ -2186,10 +2215,13 @@ async fn apply_redux_context_rollover(
                 "context switch remained above the hard limit; degraded to a lossy trim"
             );
         }
+        // A projection of this request only: the guard view keeps the
+        // untrimmed compacted source, which is what the session adopts below.
         let before_trim = history.len();
+        let mut projection_guard = compaction_guard_history.clone();
         let trimmed = trim_redux_driver_context_budget_after_rollover(
             history,
-            compaction_guard_history,
+            &mut projection_guard,
             config,
             Some(replacement_len),
         );
@@ -2242,7 +2274,12 @@ async fn apply_redux_context_rollover(
         })
         .await
     {
-        tracing::debug!(%error, "StartTurn: action_tx closed on summary-compaction-patch");
+        let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+        tracing::debug!(
+            error_len,
+            error_sha256,
+            "StartTurn: action_tx closed on summary-compaction-patch"
+        );
         return Err(());
     }
     // The patch itself is lossless; only the extra trim above is not, so the
@@ -2285,7 +2322,13 @@ async fn send_redux_compaction_feedback(
         return Ok(false);
     }
     if let Err(error) = action_tx.send(Action::SystemMessageAdded { text: text.clone() }).await {
-        tracing::debug!(%error, context, "StartTurn: action_tx closed on compaction feedback");
+        let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+        tracing::debug!(
+            error_len,
+            error_sha256,
+            context,
+            "StartTurn: action_tx closed on compaction feedback"
+        );
         return Err(());
     }
     *last_feedback = Some(text);
@@ -2339,7 +2382,13 @@ async fn send_redux_injection_overbudget_diagnostic(
         return Ok(false);
     }
     if let Err(error) = action_tx.send(Action::SystemMessageAdded { text: text.clone() }).await {
-        tracing::debug!(%error, context, "StartTurn: action_tx closed on injection-overbudget diagnostic");
+        let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+        tracing::debug!(
+            error_len,
+            error_sha256,
+            context,
+            "StartTurn: action_tx closed on injection-overbudget diagnostic"
+        );
         return Err(());
     }
     *last_feedback = Some(text);
@@ -2377,7 +2426,13 @@ async fn send_redux_context_window_update(
         })
         .await
     {
-        tracing::debug!(%error, context, "StartTurn: action_tx closed on context-window update");
+        let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+        tracing::debug!(
+            error_len,
+            error_sha256,
+            context,
+            "StartTurn: action_tx closed on context-window update"
+        );
         return Err(());
     }
     Ok(())
@@ -2621,9 +2676,6 @@ impl crate::agent::turn_contracts::ToolLoopEventSink for ReduxToolLoopEventSink 
             crate::agent::turn_contracts::ToolLoopEvent::RetryAttempt { attempt, reason } => {
                 Action::StreamRetryAttempt { attempt, reason }
             }
-            crate::agent::turn_contracts::ToolLoopEvent::ContextCompacted => Action::HistoryCompacted {
-                reason: crate::chat::action::CompactReason::ContextOverflow,
-            },
             crate::agent::turn_contracts::ToolLoopEvent::ContextCompactionPatch {
                 patch,
                 source_history,
@@ -2640,8 +2692,10 @@ impl crate::agent::turn_contracts::ToolLoopEventSink for ReduxToolLoopEventSink 
                 {
                     // No mutation and no reducer patch: the reducer keeps its
                     // acknowledged history and the worker's own view proceeds.
+                    let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
                     tracing::warn!(
-                        %error,
+                        error_len,
+                        error_sha256,
                         guard_history_len = patch.guard.history_len,
                         source_len = compacted_history.len(),
                         "worker compaction patch does not match its source; reducer patch not sent"

@@ -403,7 +403,6 @@ pub(crate) enum ToolLoopEvent {
         attempt: u8,
         reason: String,
     },
-    ContextCompacted,
     ContextCompactionPatch {
         patch: CompactionPatch,
         /// Worker source guarded by the patch; adapters project their durable transcript.

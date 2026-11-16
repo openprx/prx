@@ -1,8 +1,7 @@
 #![cfg(test)]
 
 use super::super::*;
-use crate::chat::action::{Action, CompactReason};
-use crate::providers::ChatMessage;
+use crate::chat::action::Action;
 use tokio_util::sync::CancellationToken;
 
 fn s() -> ChatState {
@@ -369,64 +368,6 @@ fn redux_record_turns_single_write_no_duplicate_session_turns() {
     // (the reducer is not idempotent — dedup is the caller's job; this confirms it is append-only)
     let _ = state.reduce(Action::RecordUserTurn("hello".to_string()));
     assert_eq!(state.session.turns.len(), 3, "a second dispatch must append one more");
-}
-
-/// S2-B-4: redux_compaction_action_preserves_system_and_budget
-///
-/// HistoryCompacted must keep the system prompt and hold the total char count <= COMPACT_TOTAL_CHARS.
-/// This is the core contract of the chat::mod main loop's context-overflow retry path.
-#[test]
-fn redux_compaction_action_preserves_system_and_budget() {
-    let mut state = s();
-    // system + 20 long user/assistant messages
-    state
-        .session
-        .history
-        .push(ChatMessage::system("system rules — must survive compaction"));
-    for i in 0..20 {
-        let role = if i % 2 == 0 { "user" } else { "assistant" };
-        state.session.history.push(ChatMessage {
-            role: role.to_string(),
-            content: format!("turn-{i} {}", "y".repeat(400)),
-        });
-    }
-
-    let effects = state.reduce(Action::HistoryCompacted {
-        reason: CompactReason::ContextOverflow,
-    });
-
-    // The system prompt must stay in first position
-    assert_eq!(
-        state.session.history.first().map(|m| m.role.as_str()),
-        Some("system"),
-        "system must still be first after compaction"
-    );
-    assert!(
-        state
-            .session
-            .history
-            .first()
-            .is_some_and(|m| m.content.contains("must survive")),
-        "the system content must be kept in full (never truncated)"
-    );
-    // the non-system part must stay within COMPACT_TOTAL_CHARS
-    let non_system_chars: usize = state
-        .session
-        .history
-        .iter()
-        .skip(1)
-        .map(|m| m.content.chars().count())
-        .sum();
-    assert!(
-        non_system_chars <= super::COMPACT_TOTAL_CHARS,
-        "non-system total chars {non_system_chars} must be <= {}",
-        super::COMPACT_TOTAL_CHARS
-    );
-    // at least one LogTrace must be emitted
-    assert!(
-        effects.iter().any(|e| matches!(e, Effect::LogTrace { .. })),
-        "HistoryCompacted must emit LogTrace"
-    );
 }
 
 /// S2-B-5: redux_stream_cancelled_cooperates_with_s2a_terminal_actions
