@@ -518,12 +518,19 @@ async fn recovery_failure_keeps_run_and_store_names_in_reply_and_chat_log() {
     ] {
         assert!(reply.contains(expected), "missing {expected}: {reply}");
     }
-    for expected in [first.run_id.as_deref().unwrap(), "brain.db", "sha256="] {
+    // The run id reaches the log as its class (length and digest), never as text.
+    let run_class = format!("run_id=kind=text len={}", first.run_id.as_deref().unwrap().len());
+    let run_digest = crate::agent::diagnostics::text_class(first.run_id.as_deref().unwrap()).to_string();
+    for expected in [run_class.as_str(), run_digest.as_str(), "brain.db", "sha256="] {
         assert!(
             line.contains(expected),
-            "the log line names the run and the store and classifies the error: missing {expected}: {line}"
+            "the log line classifies the run, names the store and classifies the error: missing {expected}: {line}"
         );
     }
+    assert!(
+        !line.contains(first.run_id.as_deref().unwrap()),
+        "the log line never carries the run id text: {line}"
+    );
     assert!(!reply.contains('/'), "full paths must stay out of the reply: {reply}");
     let store = dir.path().join("memory/brain.db");
     assert!(
@@ -544,6 +551,14 @@ async fn recovery_failure_keeps_run_and_store_names_in_reply_and_chat_log() {
     let log = std::fs::read_to_string(&log_path).unwrap();
     assert!(!log.contains("prx_fixture_password"), "credential reached chat.log");
     assert!(!log.contains("prx_fixture_query"), "URL query secret reached chat.log");
-    assert!(log.to_ascii_lowercase().contains("[redacted]"), "{log}");
+    assert!(
+        !log.contains("prx-private-run"),
+        "the private run id reached chat.log: {log}"
+    );
+    let redacted_run = crate::agent::diagnostics::text_class("[redacted]").to_string();
+    assert!(
+        log.contains(&redacted_run),
+        "a private run id is redacted before its class is logged: {log}"
+    );
     first_cleanup.run(async { Ok(()) }).await.unwrap();
 }

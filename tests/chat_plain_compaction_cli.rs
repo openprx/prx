@@ -1773,11 +1773,13 @@ fn script_json_answer_then_handoff() -> Script {
     let mut base = compaction_script::script();
     let mut rounds = 0;
     Box::new(move |index, request| {
+        // The tool turn's request quotes earlier turns in its session-context
+        // preamble, so its own marker is checked first.
         let newest = newest_user_text(request);
-        if newest.contains(JSON_QUESTION) {
-            return Scripted::text(JSON_ANSWER);
-        }
         if !newest.contains(READ_UNTIL_HANDOFF) {
+            if newest.contains(JSON_QUESTION) {
+                return Scripted::text(JSON_ANSWER);
+            }
             return base(index, request);
         }
         if compaction_script::handoff_note(request).is_some() || rounds >= SWITCH_FILLERS {
@@ -1856,15 +1858,6 @@ fn run_json_answer_then_handoff(keep_recent: usize) -> JsonAnswerRun {
     }
 }
 
-/// Whether `request` carries [`JSON_ANSWER`] as an assistant message.
-fn carries_json_answer(request: &serde_json::Value) -> bool {
-    request["messages"].as_array().is_some_and(|messages| {
-        messages
-            .iter()
-            .any(|message| message["role"] == "assistant" && message_text(message) == JSON_ANSWER)
-    })
-}
-
 /// Messages kept verbatim when the answer must sit in the hot tail. Even, so
 /// the first handoff the tool turn can make (the history outgrows it by one
 /// message: the question) leaves exactly the question in the cold window.
@@ -1875,8 +1868,9 @@ const JSON_ANSWER_COLD_KEEP: usize = 15;
 
 /// A committed answer that reads like a tool-call envelope sits in the hot
 /// tail an in-turn handoff retains: the session accepts the compaction (no
-/// refused patch, no guard mismatch), the request after the handoff carries
-/// the answer verbatim, and the saved session keeps it.
+/// refused patch, no guard mismatch), the handoff references only the
+/// question (the answer is retained, not handed off), and the saved session
+/// keeps the answer as bytes.
 #[test]
 fn a_committed_json_answer_in_the_hot_tail_survives_an_in_turn_handoff() {
     let run = run_json_answer_then_handoff(JSON_ANSWER_HOT_KEEP);
@@ -1891,15 +1885,17 @@ fn a_committed_json_answer_in_the_hot_tail_survives_an_in_turn_handoff() {
         "the tool turn handed off in the middle of the turn; saved: {:?}",
         run.saved
     );
-    assert!(
-        run.handoff_requests.iter().all(carries_json_answer),
-        "every request after the handoff carries the answer from the retained hot tail; saved: {:?}",
-        run.saved
-    );
     let saved_handoff_refs = saved_handoff_references(&run.saved);
-    assert!(
-        !saved_handoff_refs.is_empty(),
-        "the saved session adopted the handoff: {:?}",
+    assert_eq!(
+        run.answer_turn_events.len(),
+        2,
+        "the question and the answer were stored: {:?}",
+        run.answer_turn_events
+    );
+    assert_eq!(
+        saved_handoff_refs,
+        run.answer_turn_events[..1].to_vec(),
+        "the saved handoff references the question only: the answer sits in the retained hot tail; saved: {:?}",
         run.saved
     );
     assert!(

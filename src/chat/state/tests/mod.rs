@@ -1055,7 +1055,10 @@ fn session_loaded_is_rejected_while_generating_without_clearing_active_turn() {
             Effect::LogTrace {
                 level: tracing::Level::WARN,
                 msg,
-            } if msg.contains("SessionLoaded rejected while generating: sess-new")
+            } if *msg == format!(
+                "SessionLoaded rejected while generating: {}",
+                crate::agent::diagnostics::text_class("sess-new")
+            )
         )
     }));
 }
