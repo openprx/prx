@@ -106,13 +106,20 @@ async fn record_pairs(
     }
 }
 
-async fn compact(history: &mut Vec<ChatMessage>, audit: &DocumentIngestRuntime, trigger: &'static str) {
+/// One compaction is one admitted turn: it gets its own automatic switch budget.
+async fn compact(
+    history: &mut Vec<ChatMessage>,
+    memory: &Arc<dyn Memory>,
+    source: &RuntimeEnvelope,
+    trigger: &'static str,
+) {
+    let audit = DocumentIngestRuntime::from_envelope(Arc::clone(memory), source);
     let patch = build_configurable_compaction_patch(
         history,
         &UnusedProvider,
         "model",
         &switch_config(),
-        Some(audit),
+        Some(&audit),
         trigger,
     )
     .await
@@ -128,12 +135,11 @@ async fn nested_chain() -> Chain {
     let fabric = MemoryFabric::new(Arc::clone(&memory), WORKSPACE);
     let mut session = session::ChatSession::new("test-provider", "test-model");
     let source = chat_runtime_envelope(WORKSPACE, &format!("chat:{}", session.id));
-    let audit = DocumentIngestRuntime::from_envelope(Arc::clone(&memory), &source);
     let mut history = vec![ChatMessage::system("sys")];
     record_pairs(&fabric, &source, &mut history, 0, 20).await;
-    compact(&mut history, &audit, "first").await;
+    compact(&mut history, &memory, &source, "first").await;
     record_pairs(&fabric, &source, &mut history, 1, 12).await;
-    compact(&mut history, &audit, "second").await;
+    compact(&mut history, &memory, &source, "second").await;
     record_pairs(&fabric, &source, &mut history, 2, 1).await;
     session.turns = history
         .iter()
