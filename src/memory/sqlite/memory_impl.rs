@@ -793,7 +793,18 @@ impl Memory for SqliteMemory {
     }
 
     async fn store_session_snapshot(&self, key: &str, content: &str, session_id: Option<&str>) -> anyhow::Result<()> {
-        self.store_session_snapshot_impl(key, content, session_id).await
+        self.store_session_snapshot_impl(key, content, session_id, None).await
+    }
+
+    async fn store_session_snapshot_with_metadata(
+        &self,
+        key: &str,
+        content: &str,
+        session_id: Option<&str>,
+        metadata: MemoryStoreMetadata,
+    ) -> anyhow::Result<()> {
+        self.store_session_snapshot_impl(key, content, session_id, Some(metadata))
+            .await
     }
 
     async fn find_message_event_by_idempotency_key(

@@ -141,6 +141,49 @@ fn a_reply_is_committed_into_the_saved_session_row() {
     );
 }
 
+/// Identity-number shapes in a real plain-chat session: the first question
+/// holds a 15-digit run, the second reply holds an SSN shape and an 18-character
+/// identity-number shape. Both turns must reach the saved session row byte for
+/// byte, with no content filter in the way.
+const SHAPE_FIRST_QUESTION: &str = "order 123456789012345 for the refund";
+const SHAPE_FIRST_REPLY: &str = "PRX-SHAPE-FIRST-REPLY";
+const SHAPE_SECOND_QUESTION: &str = "second question";
+const SHAPE_SECOND_REPLY: &str = "SSN 123-45-6789 and 110101199003078888 are on file";
+
+#[test]
+fn identity_shaped_turns_are_committed_into_the_saved_session_row() {
+    let sandbox = Sandbox::new();
+    let _server = serve(
+        &sandbox,
+        Box::new(|_, request| {
+            // The second request carries the second question; the first one does not.
+            if request.to_string().contains(SHAPE_SECOND_QUESTION) {
+                Scripted::text(SHAPE_SECOND_REPLY)
+            } else {
+                Scripted::text(SHAPE_FIRST_REPLY)
+            }
+        }),
+    );
+    let mut chat = spawn_plain(&sandbox);
+    chat.send(SHAPE_FIRST_QUESTION);
+    wait_for_saved_turns(&sandbox, 2);
+    chat.send(SHAPE_SECOND_QUESTION);
+    wait_for_saved_turns(&sandbox, 4);
+    let output = finish(chat);
+
+    assert_clean(&output);
+    assert_eq!(
+        saved_turns(&sandbox),
+        vec![
+            ("user".to_owned(), SHAPE_FIRST_QUESTION.to_owned()),
+            ("assistant".to_owned(), SHAPE_FIRST_REPLY.to_owned()),
+            ("user".to_owned(), SHAPE_SECOND_QUESTION.to_owned()),
+            ("assistant".to_owned(), SHAPE_SECOND_REPLY.to_owned()),
+        ],
+        "the saved row holds both identity-shaped turns byte for byte"
+    );
+}
+
 /// Two isolated tool-call JSON lines: not one JSON value, so the agent loop
 /// reads them as reply text rather than a call, and the channel sanitizer then
 /// strips both lines, leaving an empty reply.

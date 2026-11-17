@@ -188,27 +188,19 @@ impl SqliteMemory {
             .await
     }
 
-    /// The trusted session-snapshot write (`Memory::store_session_snapshot`):
-    /// the same write as `store`, checked by
-    /// [`MemorySafetyFilter::check_session_snapshot`].
+    /// The session-snapshot write (`Memory::store_session_snapshot` and
+    /// `Memory::store_session_snapshot_with_metadata`). The snapshot is the
+    /// owner's transcript, not recall memory, so the memory content filter
+    /// does not run. Target validation and the checked write stay.
     pub(super) async fn store_session_snapshot_impl(
         &self,
         key: &str,
         content: &str,
         session_id: Option<&str>,
+        metadata: Option<MemoryStoreMetadata>,
     ) -> anyhow::Result<()> {
         validate_memory_write_target(key, session_id)?;
-        let source = SourceMetadata {
-            actor: Self::safety_actor_for_context(None),
-            historical_accuracy: None,
-        };
-        let result = MemorySafetyFilter::default()
-            .check_session_snapshot(content, &source)
-            .await;
-        if !result.passed {
-            anyhow::bail!("{}", safety_rejection_message(&result.issues));
-        }
-        self.write_checked(key, content, MemoryCategory::Conversation, session_id, None, None)
+        self.write_checked(key, content, MemoryCategory::Conversation, session_id, None, metadata)
             .await
     }
 

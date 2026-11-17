@@ -106,6 +106,20 @@ impl Memory for RecordedChannelFixtureMemory {
     ) -> anyhow::Result<()> {
         self.original.store(key, content, category, session_id).await
     }
+    async fn store_session_snapshot(&self, key: &str, content: &str, session_id: Option<&str>) -> anyhow::Result<()> {
+        self.original.store_session_snapshot(key, content, session_id).await
+    }
+    async fn store_session_snapshot_with_metadata(
+        &self,
+        key: &str,
+        content: &str,
+        session_id: Option<&str>,
+        metadata: crate::memory::traits::MemoryStoreMetadata,
+    ) -> anyhow::Result<()> {
+        self.original
+            .store_session_snapshot_with_metadata(key, content, session_id, metadata)
+            .await
+    }
     async fn recall(&self, query: &str, limit: usize, session_id: Option<&str>) -> anyhow::Result<Vec<MemoryEntry>> {
         self.original.recall(query, limit, session_id).await
     }

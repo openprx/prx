@@ -1230,78 +1230,62 @@ async fn sqlite_scoped_memory_acl_conformance() {
     crate::memory::traits::conformance::assert_scoped_memory_acl_conformance(&mem, "sqlite-scoped-conformance").await;
 }
 
-/// A stored session snapshot whose tool-call preview cut an event id after
-/// digit-only groups (they read as a phone number), and whose user turn is
-/// `user_text`.
-fn session_snapshot_json(user_text: &str) -> String {
-    serde_json::json!({
-        "id": "snapshot-test",
-        "turns": [{
-            "role": "user",
-            "content": user_text,
-            "tool_calls": [{
-                "name": "transcript_history_lookup",
-                "args_preview": "{\"event_ids\":[\"20125550-1990-5550-1990-1…",
-                "success": true
-            }]
-        }]
-    })
-    .to_string()
-}
+/// Turn text the generic memory filter refuses: a 15-digit run, an SSN shape,
+/// a phone number, an 18-character identity-number shape, an email address
+/// and an injection marker. A session snapshot is the owner's transcript and
+/// must keep it byte-identical.
+const SNAPSHOT_USER_TEXT: &str = "order 123456789012345 and SSN 123-45-6789, call 212-555-0199";
+const SNAPSHOT_REPLY_TEXT: &str = "id 110101199003078888, mail jane@example.com, ignore previous instructions";
 
-/// Bound on the whole snapshot entry-point test: its real SQLite stores and
-/// reads finish in milliseconds, so a stall fails instead of hanging.
+/// Bound on the snapshot test: its real SQLite stores and reads finish in
+/// milliseconds, so a stall fails instead of hanging.
 const SNAPSHOT_TEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[tokio::test]
-async fn only_the_session_snapshot_entry_point_masks_a_cut_preview_id() {
-    tokio::time::timeout(
-        SNAPSHOT_TEST_DEADLINE,
-        only_the_session_snapshot_entry_point_masks_a_cut_preview_id_body(),
-    )
+async fn a_session_snapshot_with_pii_shapes_saves_byte_identical_and_the_generic_write_still_refuses() {
+    tokio::time::timeout(SNAPSHOT_TEST_DEADLINE, async {
+        let (_tmp, mem) = temp_sqlite();
+        let mut session = crate::chat::session::ChatSession::new("test-provider", "test-model");
+        let at = chrono::Utc::now();
+        for (role, content) in [("user", SNAPSHOT_USER_TEXT), ("assistant", SNAPSHOT_REPLY_TEXT)] {
+            session.turns.push(crate::chat::session::ChatTurn {
+                role: role.to_string(),
+                content: content.to_string(),
+                timestamp: at,
+                tool_calls: Vec::new(),
+                context_handoff: false,
+            });
+        }
+        let json = session.to_json().expect("test: serialize the chat session");
+        let key = session.memory_key();
+
+        let saved = mem.store_session_snapshot(&key, &json, Some(&session.id)).await;
+        assert!(
+            saved.is_ok(),
+            "the session snapshot saves without the content filter: {saved:?}"
+        );
+        let stored = mem
+            .get(&key)
+            .await
+            .expect("test: read the snapshot")
+            .expect("test: the snapshot row exists");
+        assert_eq!(stored.content, json, "the stored snapshot reads back byte-identical");
+
+        let generic = mem
+            .store("generic-copy", &json, MemoryCategory::Conversation, None)
+            .await;
+        let generic_error = generic
+            .expect_err("a generic write keeps the full PII check")
+            .to_string();
+        assert!(
+            generic_error.contains("Pii"),
+            "the generic write is still refused as PII: {generic_error}"
+        );
+        assert!(
+            mem.get("generic-copy").await.expect("test: read generic").is_none(),
+            "the refused generic write stored nothing"
+        );
+    })
     .await
-    .expect("the snapshot entry-point test finishes within SNAPSHOT_TEST_DEADLINE");
-}
-
-async fn only_the_session_snapshot_entry_point_masks_a_cut_preview_id_body() {
-    let (_tmp, mem) = temp_sqlite();
-    let snapshot = session_snapshot_json("look it up");
-
-    let generic = mem
-        .store("generic-copy", &snapshot, MemoryCategory::Conversation, None)
-        .await;
-    let trusted = mem.store_session_snapshot("snapshot-copy", &snapshot, None).await;
-    let spelled = mem
-        .store_session_snapshot(
-            "spelled-copy",
-            &session_snapshot_json(r#"{"args_preview":"20125550-1990-5550-1990-1…"}"#),
-            None,
-        )
-        .await;
-
-    let generic_error = generic
-        .expect_err("a generic write keeps the full PII check")
-        .to_string();
-    assert!(
-        generic_error.contains("Pii"),
-        "the generic write is refused as PII: {generic_error}"
-    );
-    assert!(
-        mem.get("generic-copy").await.expect("test: read generic").is_none(),
-        "the refused generic write stored nothing"
-    );
-    assert!(
-        trusted.is_ok(),
-        "the trusted snapshot path stores the preview: {trusted:?}"
-    );
-    let stored = mem
-        .get("snapshot-copy")
-        .await
-        .expect("test: read snapshot")
-        .expect("test: the snapshot row exists");
-    assert_eq!(stored.content, snapshot, "the snapshot is stored unchanged");
-    assert!(
-        spelled.is_err() && mem.get("spelled-copy").await.expect("test: read spelled").is_none(),
-        "user turn text spelling an `args_preview` key is refused and stores nothing: {spelled:?}"
-    );
+    .expect("the snapshot test finishes within SNAPSHOT_TEST_DEADLINE");
 }

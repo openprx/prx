@@ -4,6 +4,8 @@ use super::helpers::{
 };
 use std::fs;
 const ALLOWED_BRAIN_DB_OPENS_OUTSIDE_SQLITE_REPOSITORY: &[&str] = &[
+    // Test-only read-only probe of the sealed row: channel and owner/session MAC columns that no Memory API exposes.
+    "src/memory/encrypted_scope.rs::a_session_snapshot_through_the_scope_is_sealed_in_real_sqlite_and_reads_back_byte_identical::let db = rusqlite::Connection::open_with_flags(",
     // Architecture review Q73B/Q74: exact test-owned read-only ACL and generation-scoped Retrieve witnesses.
     "src/channels/tests/factory_reload_fixture.rs::run::let connection = rusqlite::Connection::open_with_flags(",
     // Fresh-process fixture: bounded, read-only enumeration before owned repository readback.

@@ -103,34 +103,8 @@ impl MemorySafetyFilter {
 
     /// Run the complete safety pipeline before memory write.
     pub async fn check(&self, content: &str, source: &SourceMetadata) -> SafetyCheckResult {
-        self.check_with_numeric_view(content, None, source).await
-    }
-
-    /// The safety pipeline for a chat session snapshot, called only by the
-    /// trusted session-snapshot persistence entry point
-    /// (`Memory::store_session_snapshot`). The snapshot is parsed and only
-    /// the structured tool-call preview metadata (`turns[].tool_calls[]
-    /// .args_preview`) may have a UUID prefix cut by the preview ellipsis
-    /// masked for the numeric detectors; every other field, including turn
-    /// content that spells out an `"args_preview"` key, gets the full check.
-    /// Content that is not a session snapshot gets the full check.
-    pub async fn check_session_snapshot(&self, content: &str, source: &SourceMetadata) -> SafetyCheckResult {
-        let numeric_view = session_snapshot_numeric_view(content);
-        self.check_with_numeric_view(content, numeric_view.as_deref(), source)
-            .await
-    }
-
-    /// `numeric_view`, when given, is the content the numeric PII detectors
-    /// (phone, identity number, payment card) read instead of `content`.
-    async fn check_with_numeric_view(
-        &self,
-        content: &str,
-        numeric_view: Option<&str>,
-        source: &SourceMetadata,
-    ) -> SafetyCheckResult {
         let mut issues = pii_issues(
             content,
-            numeric_view.unwrap_or(content),
             [
                 canonical_uuid_regex(),
                 pii_phone_regex(),
@@ -205,11 +179,7 @@ pub fn safety_rejection_message(issues: &[SafetyIssue]) -> String {
     }
 }
 
-fn pii_issues(
-    content: &str,
-    numeric_content: &str,
-    patterns: [std::result::Result<&Regex, &regex::Error>; 5],
-) -> Vec<SafetyIssue> {
+fn pii_issues(content: &str, patterns: [std::result::Result<&Regex, &regex::Error>; 5]) -> Vec<SafetyIssue> {
     let [uuid, phone, email, id, card] = patterns;
     let mut issues = Vec::new();
     // Session snapshots contain system-generated UUIDs. Depending on their
@@ -218,7 +188,7 @@ fn pii_issues(
     // conversation nondeterministically. UUIDs are opaque internal
     // identifiers, so exclude only their canonical shape from numeric PII
     // detectors while continuing to inspect every user-authored field.
-    let numeric_pii_content = mask_uuids(numeric_content, uuid);
+    let numeric_pii_content = mask_uuids(content, uuid);
 
     push_pii_issue(
         &mut issues,
@@ -244,51 +214,6 @@ fn mask_uuids<'a>(content: &'a str, pattern: std::result::Result<&Regex, &regex:
     pattern.map_or(std::borrow::Cow::Borrowed(content), |pattern| {
         pattern.replace_all(content, "<uuid>")
     })
-}
-
-/// The numeric-detector view of a session snapshot: the snapshot with a
-/// valid UUID prefix cut by the preview ellipsis masked inside each
-/// structured tool-call preview (`turns[].tool_calls[].args_preview`) only.
-/// A stored preview cuts its arguments at a fixed length, often inside an
-/// event id, and the digits of the cut id's groups would read as a phone
-/// number. `None` (the full check) when the content is not a session
-/// snapshot, nothing was masked, or the pattern is unavailable.
-fn session_snapshot_numeric_view(content: &str) -> Option<String> {
-    let prefix = preview_uuid_prefix_regex().ok()?;
-    let mut snapshot: serde_json::Value = serde_json::from_str(content).ok()?;
-    let mut masked_any = false;
-    let turns = snapshot.get_mut("turns")?.as_array_mut()?;
-    for turn in turns {
-        let Some(calls) = turn.get_mut("tool_calls").and_then(serde_json::Value::as_array_mut) else {
-            continue;
-        };
-        for call in calls {
-            if let Some(serde_json::Value::String(preview)) = call.get_mut("args_preview")
-                && let std::borrow::Cow::Owned(masked) = prefix.replace_all(preview, "<uuid-prefix>")
-            {
-                *preview = masked;
-                masked_any = true;
-            }
-        }
-    }
-    masked_any.then(|| snapshot.to_string())
-}
-
-/// A valid UUID prefix cut by a preview ellipsis (`…` or `...`): an 8-hex
-/// group, then any number of the following full 4-4-4 groups, the group at
-/// the cut partial (the last 12-hex group at most 12).
-fn preview_uuid_prefix_regex() -> std::result::Result<&'static Regex, &'static regex::Error> {
-    static PREFIX: LazyLock<std::result::Result<Regex, regex::Error>> = LazyLock::new(|| {
-        Regex::new(
-            r"(?i)\b[0-9a-f]{8}(?:-(?:[0-9a-f]{4}-(?:[0-9a-f]{4}-(?:[0-9a-f]{4}-[0-9a-f]{0,12}|[0-9a-f]{0,4})|[0-9a-f]{0,4})|[0-9a-f]{0,4}))?(?:…|\.\.\.)",
-        )
-    });
-    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    let pattern = PREFIX.as_ref();
-    if pattern.is_err() && !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        tracing::error!("memory safety pattern unavailable");
-    }
-    pattern
 }
 
 fn pii_pattern_match<'a>(
@@ -518,101 +443,8 @@ mod tests {
         .to_string()
     }
 
-    #[tokio::test]
-    async fn a_uuid_cut_by_a_preview_ellipsis_is_not_phone_pii_in_a_session_snapshot() {
-        within_filter_test_deadline(async {
-            let filter = MemorySafetyFilter::default();
-            let unicode = session_row("look it up", r#"{"event_ids":["dd098779-5841-4428-bce2-1…"#);
-            let ascii = session_row("look it up", r#"{"event_ids":["dd098779-5841-4428-b..."#);
-
-            assert!(
-                filter.check_session_snapshot(&unicode, &agent_source()).await.passed,
-                "a UUID cut inside its last group by `…` in a preview is an identifier"
-            );
-            assert!(
-                filter.check_session_snapshot(&ascii, &agent_source()).await.passed,
-                "a UUID cut inside a 4-hex group by `...` in a preview is an identifier"
-            );
-            let with_phone = session_row("call 212-555-0199", r#"{"event_ids":["dd098779-5841-4428-bce2-1…"#);
-            assert!(
-                !filter.check_session_snapshot(&with_phone, &agent_source()).await.passed,
-                "a phone number next to a masked preview id is still caught"
-            );
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn pii_inside_a_malformed_uuid_prefix_in_a_preview_is_still_caught() {
-        within_filter_test_deadline(async {
-            let filter = MemorySafetyFilter::default();
-            let cases = [
-                ("phone", r#"{"event_ids":["deadbeef-212-555-0199…"#, "phone"),
-                ("identity number", r#"{"event_ids":["deadbeef-123-45-6789…"#, "identity"),
-                (
-                    "payment card",
-                    r#"{"event_ids":["deadbeef-4111 1111 1111 1111…"#,
-                    "payment-card",
-                ),
-            ];
-            for (label, preview, detail) in cases {
-                let result = filter
-                    .check_session_snapshot(&session_row("look it up", preview), &agent_source())
-                    .await;
-                assert!(
-                    !result.passed,
-                    "{label}: a malformed UUID prefix in a preview does not hide it"
-                );
-                assert!(
-                    result
-                        .issues
-                        .iter()
-                        .any(|issue| issue.kind == SafetyIssueKind::Pii && issue.detail.contains(detail)),
-                    "{label}: the PII detector names it: {:?}",
-                    result.issues
-                );
-            }
-        })
-        .await;
-    }
-
     /// Digit-only groups in a valid UUID-prefix shape read as a phone number.
     const DIGIT_PREFIX: &str = "20125550-1990-5550-1990-1…";
-
-    #[tokio::test]
-    async fn a_uuid_prefix_shape_outside_the_structured_preview_is_not_masked() {
-        within_filter_test_deadline(async {
-            let filter = MemorySafetyFilter::default();
-            let in_preview = session_row("look it up", &format!(r#"{{"event_ids":["{DIGIT_PREFIX}"#));
-            let in_user_text = session_row(&format!("my number is {DIGIT_PREFIX}"), r#"{"event_ids":[]}"#);
-            // User-authored turn content that spells out a preview field is
-            // turn content, not tool-call metadata.
-            let spelled_field = session_row(
-                &format!(r#"{{"args_preview":"{DIGIT_PREFIX}"}}"#),
-                r#"{"event_ids":[]}"#,
-            );
-
-            assert!(
-                filter.check_session_snapshot(&in_preview, &agent_source()).await.passed,
-                "the shape inside structured preview metadata is masked as a cut identifier"
-            );
-            assert!(
-                !filter
-                    .check_session_snapshot(&in_user_text, &agent_source())
-                    .await
-                    .passed,
-                "the same shape in user-authored turn text is never masked"
-            );
-            assert!(
-                !filter
-                    .check_session_snapshot(&spelled_field, &agent_source())
-                    .await
-                    .passed,
-                "a literal `args_preview` key inside turn content is never masked"
-            );
-        })
-        .await;
-    }
 
     #[tokio::test]
     async fn a_generic_memory_write_never_gets_the_preview_exception() {
@@ -635,7 +467,7 @@ mod tests {
             );
             assert!(
                 !structured.passed,
-                "even a snapshot-shaped document gets the full check outside the snapshot entry point: {:?}",
+                "a snapshot-shaped document keeps the full check on the generic path: {:?}",
                 structured.issues
             );
         })
@@ -760,7 +592,7 @@ mod tests {
                 credit_card_candidate_regex(),
             ];
             *patterns.get_mut(index).expect("test: bounded detector index") = Err(&error);
-            let issues = pii_issues("ordinary prose", "ordinary prose", patterns);
+            let issues = pii_issues("ordinary prose", patterns);
             assert_eq!(issues.len(), 1, "missing detector {index} must reject even clean prose");
             assert_eq!(
                 issues.first().expect("test: rejection exists").detail,
@@ -782,7 +614,7 @@ mod tests {
             credit_card_candidate_regex(),
         ];
         assert!(
-            pii_issues(content, content, patterns).is_empty(),
+            pii_issues(content, patterns).is_empty(),
             "valid mask must exclude system UUIDs"
         );
         let strict = [
@@ -793,7 +625,7 @@ mod tests {
             credit_card_candidate_regex(),
         ];
         assert!(
-            !pii_issues(content, content, strict).is_empty(),
+            !pii_issues(content, strict).is_empty(),
             "failed UUID mask must retain numeric PII detection"
         );
     }

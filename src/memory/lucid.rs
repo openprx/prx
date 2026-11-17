@@ -680,10 +680,26 @@ impl Memory for LucidMemory {
         self.local.copy_events_for_branch(plan).await
     }
 
-    /// The local SQLite store applies its trusted snapshot check; the
-    /// mirror sync matches `store`.
+    /// The local SQLite store writes the snapshot without the content
+    /// filter; the mirror sync matches `store`.
     async fn store_session_snapshot(&self, key: &str, content: &str, session_id: Option<&str>) -> anyhow::Result<()> {
         self.local.store_session_snapshot(key, content, session_id).await?;
+        self.sync_to_lucid_async(key, content, &MemoryCategory::Conversation)
+            .await;
+        Ok(())
+    }
+
+    /// The metadata-bearing snapshot write; see `store_session_snapshot`.
+    async fn store_session_snapshot_with_metadata(
+        &self,
+        key: &str,
+        content: &str,
+        session_id: Option<&str>,
+        metadata: crate::memory::traits::MemoryStoreMetadata,
+    ) -> anyhow::Result<()> {
+        self.local
+            .store_session_snapshot_with_metadata(key, content, session_id, metadata)
+            .await?;
         self.sync_to_lucid_async(key, content, &MemoryCategory::Conversation)
             .await;
         Ok(())

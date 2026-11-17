@@ -2016,12 +2016,25 @@ pub trait Memory: Send + Sync {
     }
 
     /// Store a chat session snapshot (the session-snapshot persistence path
-    /// only; nothing else calls it). A backend that runs the memory safety
-    /// filter may apply its trusted session-snapshot check
-    /// ([`crate::memory::filter::MemorySafetyFilter::check_session_snapshot`]);
-    /// the default is an ordinary `Conversation` store with the full check.
+    /// only; nothing else calls it). A snapshot is the owner's transcript, not
+    /// recall memory, so no backend runs the memory content filter on this
+    /// path. The default is an ordinary `Conversation` store.
     async fn store_session_snapshot(&self, key: &str, content: &str, session_id: Option<&str>) -> anyhow::Result<()> {
         self.store(key, content, MemoryCategory::Conversation, session_id).await
+    }
+
+    /// [`Memory::store_session_snapshot`] with fabric metadata. The default
+    /// is the metadata-bearing `Conversation` store; a backend whose
+    /// `store_with_metadata` reaches the content filter must override this.
+    async fn store_session_snapshot_with_metadata(
+        &self,
+        key: &str,
+        content: &str,
+        session_id: Option<&str>,
+        metadata: MemoryStoreMetadata,
+    ) -> anyhow::Result<()> {
+        self.store_with_metadata(key, content, MemoryCategory::Conversation, session_id, metadata)
+            .await
     }
 
     /// Copy a session's transcript rows into a new branch in one transaction,

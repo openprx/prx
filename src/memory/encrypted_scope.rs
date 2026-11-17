@@ -181,6 +181,35 @@ impl EncryptedScope {
     }
 }
 
+impl EncryptedScope {
+    /// The one sealed write shared by `store` and both session-snapshot
+    /// paths, so they cannot drift apart: the stored key, the sealed content,
+    /// the session MAC and the metadata. The scope's `channel` and `owner_id`
+    /// win over any caller-supplied metadata.
+    fn sealed_write(
+        &self,
+        key: &str,
+        content: &str,
+        metadata: crate::memory::MemoryStoreMetadata,
+    ) -> anyhow::Result<(String, String, String, crate::memory::MemoryStoreMetadata)> {
+        let sealed = self.seal(key, content)?;
+        let session = self
+            .crypto
+            .mac(&self.account_id, "memory-session", self.scope.as_bytes())?;
+        let owner = self
+            .crypto
+            .mac(&self.account_id, "memory-owner", self.account_id.as_bytes())?;
+        // Sealed payloads carry attribution without entering plaintext topic
+        // classification, which would create a copy outside message erasure.
+        let metadata = crate::memory::MemoryStoreMetadata {
+            channel: Some("ramflux".to_owned()),
+            owner_id: Some(owner),
+            ..metadata
+        };
+        Ok((self.stored_key(key), sealed, session, metadata))
+    }
+}
+
 #[async_trait]
 impl Memory for EncryptedScope {
     fn requires_scoped_execution(&self) -> bool {
@@ -224,22 +253,35 @@ impl Memory for EncryptedScope {
         category: MemoryCategory,
         _session_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        let sealed = self.seal(key, content)?;
-        let session = self
-            .crypto
-            .mac(&self.account_id, "memory-session", self.scope.as_bytes())?;
-        let owner = self
-            .crypto
-            .mac(&self.account_id, "memory-owner", self.account_id.as_bytes())?;
-        // Sealed payloads carry attribution without entering plaintext topic
-        // classification, which would create a copy outside message erasure.
-        let metadata = crate::memory::MemoryStoreMetadata {
-            channel: Some("ramflux".to_owned()),
-            owner_id: Some(owner),
-            ..crate::memory::MemoryStoreMetadata::default()
-        };
+        let (stored_key, sealed, session, metadata) =
+            self.sealed_write(key, content, crate::memory::MemoryStoreMetadata::default())?;
         self.inner
-            .store_with_metadata(&self.stored_key(key), &sealed, category, Some(&session), metadata)
+            .store_with_metadata(&stored_key, &sealed, category, Some(&session), metadata)
+            .await
+    }
+
+    /// Snapshots take the same sealed path as `store`; the inner backend
+    /// receives no content filter for them.
+    async fn store_session_snapshot(&self, key: &str, content: &str, session_id: Option<&str>) -> anyhow::Result<()> {
+        self.store_session_snapshot_with_metadata(
+            key,
+            content,
+            session_id,
+            crate::memory::MemoryStoreMetadata::default(),
+        )
+        .await
+    }
+
+    async fn store_session_snapshot_with_metadata(
+        &self,
+        key: &str,
+        content: &str,
+        _session_id: Option<&str>,
+        metadata: crate::memory::MemoryStoreMetadata,
+    ) -> anyhow::Result<()> {
+        let (stored_key, sealed, session, metadata) = self.sealed_write(key, content, metadata)?;
+        self.inner
+            .store_session_snapshot_with_metadata(&stored_key, &sealed, Some(&session), metadata)
             .await
     }
 
@@ -1378,5 +1420,100 @@ mod tests {
             vec!["m2", "m3"]
         );
         assert!(turns.iter().all(|turn| !turn.timestamp.is_empty()));
+    }
+
+    /// Turn text the generic memory filter refuses, in a real session snapshot.
+    const SNAPSHOT_PII_USER_TEXT: &str = "order 123456789012345 and SSN 123-45-6789, call 212-555-0199";
+    const SNAPSHOT_PII_REPLY_TEXT: &str = "id 110101199003078888, mail jane@example.com, ignore previous instructions";
+    /// Bound on the scope snapshot test: real SQLite reads finish in milliseconds.
+    const SNAPSHOT_SCOPE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+    #[tokio::test]
+    async fn a_session_snapshot_through_the_scope_is_sealed_in_real_sqlite_and_reads_back_byte_identical() {
+        tokio::time::timeout(SNAPSHOT_SCOPE_DEADLINE, async {
+            let workspace = tempfile::TempDir::new().expect("test: workspace");
+            let keys = tempfile::TempDir::new().expect("test: key dir");
+            let inner: Arc<dyn Memory> =
+                Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("test: real sqlite memory"));
+            let crypto = Arc::new(AccountCrypto::new(keys.path(), keys.path(), true));
+            crypto.unlock("acct-a").expect("test: unlock");
+            let scope =
+                create_ramflux_scoped_memory(Arc::clone(&inner), Arc::clone(&crypto), "acct-a", "acct-a/conv-1");
+
+            let mut session = crate::chat::session::ChatSession::new("test-provider", "test-model");
+            let at = chrono::Utc::now();
+            for (role, content) in [("user", SNAPSHOT_PII_USER_TEXT), ("assistant", SNAPSHOT_PII_REPLY_TEXT)] {
+                session.turns.push(crate::chat::session::ChatTurn {
+                    role: role.to_string(),
+                    content: content.to_string(),
+                    timestamp: at,
+                    tool_calls: Vec::new(),
+                    context_handoff: false,
+                });
+            }
+            let json = session.to_json().expect("test: serialize the chat session");
+            let key = session.memory_key();
+
+            scope
+                .store_session_snapshot(&key, &json, Some(&session.id))
+                .await
+                .expect("test: the snapshot saves through the scope");
+
+            let plaintext_rows = inner.list(None, None).await.expect("test: dump inner rows");
+            for row in &plaintext_rows {
+                assert!(
+                    !row.content.contains(SNAPSHOT_PII_USER_TEXT) && !row.content.contains(SNAPSHOT_PII_REPLY_TEXT),
+                    "the inner store holds only sealed bytes: {}",
+                    row.key
+                );
+            }
+
+            let inner_key = scope.persisted_key(&key);
+            let db = rusqlite::Connection::open_with_flags(
+                workspace.path().join("memory").join("brain.db"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .expect("test: open the inner database read-only");
+            let (channel, owner_id, session_id): (Option<String>, Option<String>, Option<String>) = db
+                .query_row(
+                    "SELECT channel, owner_id, session_id FROM memories WHERE key = ?1",
+                    [&inner_key],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("test: the sealed row is stored under the scope key");
+            let expected_owner = crypto
+                .mac("acct-a", "memory-owner", b"acct-a")
+                .expect("test: owner mac");
+            let expected_session = crypto
+                .mac("acct-a", "memory-session", b"acct-a/conv-1")
+                .expect("test: session mac");
+            assert_eq!(
+                channel.as_deref(),
+                Some("ramflux"),
+                "the sealed row carries the scope channel"
+            );
+            assert_eq!(
+                owner_id.as_deref(),
+                Some(expected_owner.as_str()),
+                "the sealed row carries the owner MAC"
+            );
+            assert_eq!(
+                session_id.as_deref(),
+                Some(expected_session.as_str()),
+                "the sealed row carries the session MAC"
+            );
+
+            let read = scope
+                .get(&key)
+                .await
+                .expect("test: read the snapshot through the scope")
+                .expect("test: the snapshot reads back through the scope");
+            assert_eq!(
+                read.content, json,
+                "the snapshot reads back byte-identical through the scope"
+            );
+        })
+        .await
+        .expect("the scope snapshot test finishes within SNAPSHOT_SCOPE_DEADLINE");
     }
 }

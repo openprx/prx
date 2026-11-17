@@ -1275,3 +1275,58 @@ async fn a_settlement_after_the_draft_terminal_removes_nothing_more_and_saves() 
     .await
     .expect("a_settlement_after_the_draft_terminal_removes_nothing_more_and_saves exceeded DEADLINE");
 }
+
+/// Turn text the generic memory filter refuses: a 15-digit run and an SSN
+/// shape. The acknowledged turn commit must save both byte for byte.
+const IDENTITY_SHAPED_USER_TEXT: &str = "order 123456789012345 and SSN 123-45-6789";
+const IDENTITY_SHAPED_REPLY_TEXT: &str = "recorded 123456789012345 for 123-45-6789";
+
+#[tokio::test]
+async fn a_turn_with_identity_shapes_is_acknowledged_and_saved_byte_identical() {
+    tokio::time::timeout(DEADLINE, async {
+        let (_dir, memory) = sqlite_memory();
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let task_id = scheduler.enqueue(
+            IDENTITY_SHAPED_USER_TEXT,
+            crate::chat::turn_scheduler::TurnPriority::Normal,
+            0,
+        );
+        let state = TestSessionDispatcher::state_with_history(Vec::new());
+        let session_id = state.session.id.clone();
+        let harness = TestSessionDispatcher::spawn(Arc::clone(&memory), state);
+
+        let committed = crate::chat::provider_turns::dispatch_ordered_provider_turn_commit_and_wait(
+            &harness.dispatcher,
+            &harness.commits,
+            task_id,
+            crate::chat::provider_turns::OrderedCommitTerminal::TurnCommitRequested { draft_id: None },
+            IDENTITY_SHAPED_USER_TEXT,
+            IDENTITY_SHAPED_REPLY_TEXT,
+            false,
+            true,
+        )
+        .await;
+        let acknowledged = harness.commits.history_commit_acknowledged(task_id);
+        harness.stop().await;
+
+        assert_eq!(
+            committed,
+            Ok(()),
+            "the turn commit with identity-shaped text is acknowledged"
+        );
+        assert!(acknowledged, "the acknowledged commit marks its task");
+        let row = stored_row(memory.as_ref(), &session_id).await;
+        let saved = ChatSession::from_json(&row).expect("test: the stored row is a chat session");
+        let turns: Vec<(String, String)> = turn_pairs(&saved);
+        assert_eq!(
+            turns,
+            vec![
+                ("user".to_owned(), IDENTITY_SHAPED_USER_TEXT.to_owned()),
+                ("assistant".to_owned(), IDENTITY_SHAPED_REPLY_TEXT.to_owned()),
+            ],
+            "the stored session keeps both turns byte for byte"
+        );
+    })
+    .await
+    .expect("a_turn_with_identity_shapes_is_acknowledged_and_saved_byte_identical exceeded DEADLINE");
+}
