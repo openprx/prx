@@ -82,13 +82,46 @@ mod search_reachability;
 mod supervised_file_edit;
 
 // D-071: every wait below ends on an event (the expected output, the process
-// exiting, the peer recording a call). These limits only turn a hang into a
-// failure: they are far above anything a loaded machine needs, and no test
-// asserts that something happens *quickly*. A wait for output also fails at
-// once when the process has exited.
-const STARTUP_TIMEOUT: Duration = Duration::from_mins(3);
-const TURN_TIMEOUT: Duration = Duration::from_mins(2);
-const EXIT_TIMEOUT: Duration = Duration::from_mins(1);
+// exiting, the peer recording a call). The limits only turn a hang into a
+// failure. A wait for output also fails at once when the process has exited.
+//
+// Budget (REQ-PTY-BANNER-EXIT-FLAKE): nextest kills a test at 60 s, and the kill
+// reports only TIMEOUT. Each single-session test therefore shares one deadline
+// (TEST_BUDGET); every wait takes min(PHASE_CAP, remaining); a failure names
+// its phase and fails before the kill. Multi-stage scenarios share
+// MULTI_STAGE_BUDGET across their sessions. Cleanup after a failure is bounded
+// by CLEANUP_BUDGET.
+const PHASE_CAP: Duration = Duration::from_secs(20);
+const TEST_BUDGET: Duration = Duration::from_secs(45);
+const MULTI_STAGE_BUDGET: Duration = Duration::from_secs(55);
+const CLEANUP_BUDGET: Duration = Duration::from_secs(5);
+/// Bound on the output kept for a failure report (reads stop appending past it).
+const MAX_CAPTURE_BYTES: usize = 4 * 1024 * 1024;
+
+/// One absolute deadline shared by the waits of a test (or of one scenario).
+#[derive(Clone, Copy)]
+struct TestDeadline {
+    started: Instant,
+    budget: Duration,
+}
+
+impl TestDeadline {
+    fn new(budget: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            budget,
+        }
+    }
+
+    /// Time left before the budget ends; saturates at zero.
+    fn remaining(&self) -> Duration {
+        self.budget.saturating_sub(self.started.elapsed())
+    }
+
+    fn elapsed_ms(&self) -> u128 {
+        self.started.elapsed().as_millis()
+    }
+}
 
 /// Synthetic reply to ESC[6n (Device Status Report → Report Cursor Position).
 /// Real terminals respond with `ESC [ row ; col R`; we always answer 1;1.
@@ -635,7 +668,7 @@ fn spawn_chat_command(cmd: Command) -> Session {
             "warning: set_window_size failed: {e}; continuing with default size"
         );
     }
-    session.set_expect_timeout(Some(TURN_TIMEOUT));
+    session.set_expect_timeout(Some(PHASE_CAP));
     session
 }
 
@@ -644,9 +677,29 @@ fn spawn_chat_command(cmd: Command) -> Session {
 struct TrackedSession {
     inner: Session,
     reaped: Option<expectrl::WaitStatus>,
+    deadline: TestDeadline,
+    /// The last phase entered (`wait[..]` or `exit`), named in failures.
+    phase: String,
+    /// Output read so far, bounded by MAX_CAPTURE_BYTES, for failure reports.
+    capture: Vec<u8>,
 }
 
 impl TrackedSession {
+    /// Record a phase transition with its elapsed time since the shared deadline started.
+    fn enter_phase(&mut self, name: &str) {
+        name.clone_into(&mut self.phase);
+        let _ = writeln!(
+            std::io::stderr(),
+            "pty-phase {name} at {}ms",
+            self.deadline.elapsed_ms()
+        );
+    }
+
+    fn record(&mut self, bytes: &[u8]) {
+        let room = MAX_CAPTURE_BYTES.saturating_sub(self.capture.len());
+        self.capture.extend_from_slice(&bytes[..bytes.len().min(room)]);
+    }
+
     fn confirmed_exit(&mut self) -> std::io::Result<bool> {
         if self.reaped.is_some() {
             return Ok(true);
@@ -680,11 +733,20 @@ struct SessionGuard {
 }
 
 impl SessionGuard {
+    /// A single-session test: its deadline starts now, with TEST_BUDGET.
     fn new(session: Session) -> Self {
+        Self::with_deadline(session, TestDeadline::new(TEST_BUDGET))
+    }
+
+    /// A session whose waits share `deadline` with other sessions of the same scenario.
+    fn with_deadline(session: Session, deadline: TestDeadline) -> Self {
         Self {
             inner: Some(TrackedSession {
                 inner: session,
                 reaped: None,
+                deadline,
+                phase: "spawned".to_owned(),
+                capture: Vec::new(),
             }),
         }
     }
@@ -707,7 +769,7 @@ impl Drop for SessionGuard {
         // First ECHILD/ESRCH is unknown: do not signal a potentially reused PID.
         if still_owned {
             let _ = session.get_process_mut().signal(expectrl::Signal::SIGKILL);
-            let deadline = Instant::now() + Duration::from_secs(30);
+            let deadline = Instant::now() + CLEANUP_BUDGET;
             while Instant::now() < deadline {
                 match session.confirmed_exit() {
                     Ok(true) => return,
@@ -758,6 +820,9 @@ fn read_until_with_dsr(session: &mut TrackedSession, needle: &str, total: Durati
 /// Wait for every needle in one accumulated capture, under a single deadline.
 fn read_until_all_with_dsr(session: &mut TrackedSession, needles: &[&str], total: Duration) -> String {
     assert!(!needles.is_empty(), "test: PTY wait requires at least one needle");
+    // Each wait takes min(its cap, what is left of the shared deadline).
+    let total = total.min(session.deadline.remaining());
+    session.enter_phase(&format!("wait[{}]", needles.join(" | ")));
     let deadline = Instant::now() + total;
     let mut accum: Vec<u8> = Vec::new();
     let mut buf = [0u8; 4096];
@@ -776,12 +841,12 @@ fn read_until_all_with_dsr(session: &mut TrackedSession, needles: &[&str], total
                 panic!("PTY hit EOF before `{needle}` appeared. Captured:\n----\n{s}\n----");
             }
             Ok(n) => {
-                const MAX_CAPTURE_BYTES: usize = 4 * 1024 * 1024;
                 assert!(
                     accum.len() + n <= MAX_CAPTURE_BYTES,
                     "test: PTY output exceeded the capture limit while waiting for {needles:?}"
                 );
                 accum.extend_from_slice(&buf[..n]);
+                session.record(&buf[..n]);
                 // Reply to every DSR query we've seen but not yet acked.
                 while let Some(pos) = window(&accum, DSR_QUERY) {
                     // Replace the query in-place with empty bytes so we don't
@@ -819,7 +884,8 @@ fn read_until_all_with_dsr(session: &mut TrackedSession, needles: &[&str], total
             let s = String::from_utf8_lossy(&accum).into_owned();
             let needle = missing_pty_needle(&s, needles);
             panic!(
-                "timeout waiting for `{needle}` after {total:?}. Captured ({} bytes):\n----\n{s}\n----",
+                "timeout in phase `{}` waiting for `{needle}` after {total:?}. Captured ({} bytes):\n----\n{s}\n----",
+                session.phase,
                 accum.len()
             );
         }
@@ -913,7 +979,9 @@ fn window(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// I/O error (e.g. EPIPE on the slave PTY side) would falsely look like it
 /// exited. We now keep draining for DSR purposes but authoritative exit
 /// detection uses owner-recorded Exited/Signaled status.
-fn wait_for_exit(session: &mut TrackedSession, total: Duration) -> bool {
+fn wait_for_owner_exit(session: &mut TrackedSession, total: Duration) -> bool {
+    let total = total.min(session.deadline.remaining());
+    session.enter_phase("exit");
     let deadline = Instant::now() + total;
     let mut pending_dsr = String::new();
     while Instant::now() < deadline {
@@ -924,7 +992,10 @@ fn wait_for_exit(session: &mut TrackedSession, total: Duration) -> bool {
             Ok(0) => {
                 // EOF on the PTY stream — still need to confirm via owner status.
             }
-            Ok(n) => ack_all_dsr_with_pending(session, &buf[..n], &mut pending_dsr),
+            Ok(n) => {
+                session.record(&buf[..n]);
+                ack_all_dsr_with_pending(session, &buf[..n], &mut pending_dsr);
+            }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(e) => {
                 // Log the error but do NOT treat it as proof of exit — the
@@ -947,6 +1018,25 @@ fn wait_for_exit(session: &mut TrackedSession, total: Duration) -> bool {
         }
     }
     false
+}
+
+/// Wait for the chat process to exit, then require a graceful exit: `Exited(_, 0)`.
+/// A signal death (`Signaled`), a non-zero status or a process still alive at the
+/// end of the wait fails the test. The panic names the phase, the wait status and
+/// the bounded capture.
+fn wait_for_graceful_exit(session: &mut TrackedSession) {
+    let exited = wait_for_owner_exit(session, PHASE_CAP);
+    match &session.reaped {
+        Some(expectrl::WaitStatus::Exited(_, 0)) => {}
+        status => panic!(
+            "chat did not exit gracefully: phase `{}`, exited within the wait: {exited}, wait status: {status:?}, \
+             budget left: {:?}. Captured ({} bytes):\n----\n{}\n----",
+            session.phase,
+            session.deadline.remaining(),
+            session.capture.len(),
+            String::from_utf8_lossy(&session.capture)
+        ),
+    }
 }
 
 fn wait_for_session_list_containing(guard: &HarnessGuard, needle: &str, total: Duration) -> String {
@@ -1027,7 +1117,7 @@ fn test_chat_banner_visible() {
     let session = sg.session();
 
     // Banner format: "prx <ver> · mock/mock" (src/chat/mod.rs:634).
-    let captured = read_until_all_with_dsr(session, &["prx ", "mock/mock"], STARTUP_TIMEOUT);
+    let captured = read_until_all_with_dsr(session, &["prx ", "mock/mock"], PHASE_CAP);
     assert!(
         captured.contains("prx "),
         "banner should start with `prx `, got:\n{captured}"
@@ -1039,7 +1129,7 @@ fn test_chat_banner_visible() {
 
     // Clean exit. reedline raw mode treats CR as Enter.
     session.send("/exit\r").expect("send /exit");
-    let _ = wait_for_exit(session, EXIT_TIMEOUT);
+    wait_for_graceful_exit(session);
     // SessionGuard drop runs cleanup automatically (including on panic).
 }
 
@@ -1052,19 +1142,19 @@ fn test_chat_mock_response_with_sentinel() {
     let session = sg.session();
 
     // Wait for banner first so reedline is ready to consume our input.
-    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    read_until_with_dsr(session, "mock/mock", PHASE_CAP);
     drain_with_dsr(session, Duration::from_millis(200));
 
     // Send a user line. reedline expects CR for Enter under raw mode.
     session.send("hello\r").expect("send hello");
 
     // Mock provider returns our sentinel verbatim.
-    let captured = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
+    let captured = read_until_with_dsr(session, sentinel, PHASE_CAP);
     assert!(captured.contains(sentinel), "mock response should contain `{sentinel}`");
 
     // Clean exit.
     session.send("/exit\r").expect("send /exit");
-    let _ = wait_for_exit(session, EXIT_TIMEOUT);
+    wait_for_graceful_exit(session);
 }
 
 /// 3. `/exit` slash command terminates the session cleanly.
@@ -1074,26 +1164,12 @@ fn test_chat_exit_command_clean() {
     let (mut sg, _guard) = spawn_chat(&[], &[]);
     let session = sg.session();
 
-    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    read_until_with_dsr(session, "mock/mock", PHASE_CAP);
     drain_with_dsr(session, Duration::from_millis(200));
 
     session.send("/exit\r").expect("send /exit");
-    assert!(
-        wait_for_exit(session, EXIT_TIMEOUT),
-        "process did not exit within {EXIT_TIMEOUT:?} after /exit"
-    );
-
-    // We accept any non-signal exit because the surface differs across
-    // platforms; the regression we care about is the process not exiting
-    // at all on /exit.
-    if let Some(status) = session.reaped {
-        match status {
-            expectrl::WaitStatus::Exited(_, code) => {
-                assert_eq!(code, 0, "non-zero exit code after /exit: {code}");
-            }
-            other => panic!("unexpected wait status after /exit: {other:?}"),
-        }
-    }
+    // Requires Exited(_, 0): a non-zero or signal exit after /exit fails here.
+    wait_for_graceful_exit(session);
 }
 
 /// Chat tracing must move to `chat.log` before configuration is loaded. If it
@@ -1107,17 +1183,14 @@ fn test_chat_redirects_startup_tracing_before_tui() {
     let mut sg = SessionGuard::new(spawn_chat_command(cmd));
     let session = sg.session();
 
-    let captured = read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    let captured = read_until_with_dsr(session, "mock/mock", PHASE_CAP);
     assert!(
         !captured.contains("Config loaded") && !captured.contains("openprx::config::schema"),
         "startup tracing must not be written to the chat terminal:\n{captured}"
     );
 
     session.send("\x04").expect("send Ctrl-D");
-    assert!(
-        wait_for_exit(session, EXIT_TIMEOUT),
-        "full-screen chat did not exit after Ctrl-D"
-    );
+    wait_for_graceful_exit(session);
 
     let log_path = guard.config_dir.join("chat.log");
     let log = std::fs::read_to_string(&log_path).expect("read redirected chat.log");
@@ -1141,7 +1214,7 @@ fn test_chat_double_ctrl_c_exit() {
     let (mut sg, _guard) = spawn_chat(&[], &[]);
     let session = sg.session();
 
-    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    read_until_with_dsr(session, "mock/mock", PHASE_CAP);
     drain_with_dsr(session, Duration::from_millis(200));
 
     // First SIGINT — at idle this just stamps last_ctrlc_ms (see
@@ -1157,7 +1230,7 @@ fn test_chat_double_ctrl_c_exit() {
         .signal(expectrl::Signal::SIGINT)
         .expect("second SIGINT");
 
-    let captured = read_until_with_dsr(session, "Exiting...", EXIT_TIMEOUT);
+    let captured = read_until_with_dsr(session, "Exiting...", PHASE_CAP);
     assert!(
         captured.contains("Exiting..."),
         "expected `Exiting...` after double Ctrl-C, captured:\n{captured}"
@@ -1170,13 +1243,7 @@ fn test_chat_double_ctrl_c_exit() {
     // bounds that wait via `runtime.shutdown_timeout` (see main.rs's
     // `RUNTIME_SHUTDOWN_TIMEOUT`). If this assertion fails, the hang bug
     // has regressed.
-    let exit_deadline = EXIT_TIMEOUT;
-    assert!(
-        wait_for_exit(session, exit_deadline),
-        "process did NOT exit within {exit_deadline:?} after double Ctrl-C \
-         even though `Exiting...` was emitted. This is the runtime-drop hang \
-         bug — see main.rs RUNTIME_SHUTDOWN_TIMEOUT."
-    );
+    wait_for_graceful_exit(session);
 }
 
 /// 5. `--plain` mode means the mock response is emitted without ANSI color
@@ -1190,11 +1257,11 @@ fn test_chat_plain_mode_no_ansi() {
     let (mut sg, _guard) = spawn_chat(&["--plain"], &[("OPENPRX_MOCK_RESPONSE", sentinel), ("PRX_TUI", "1")]);
     let session = sg.session();
 
-    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    read_until_with_dsr(session, "mock/mock", PHASE_CAP);
     drain_with_dsr(session, Duration::from_millis(200));
 
     session.send("hi\r").expect("send hi");
-    let captured = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
+    let captured = read_until_with_dsr(session, sentinel, PHASE_CAP);
 
     // Inspect only the contiguous run of bytes immediately surrounding the
     // sentinel — i.e. the chat renderer's output for that line. reedline's
@@ -1247,7 +1314,7 @@ fn test_chat_plain_mode_no_ansi() {
     );
 
     session.send("/exit\r").expect("send /exit");
-    let _ = wait_for_exit(session, EXIT_TIMEOUT);
+    wait_for_graceful_exit(session);
 }
 
 #[test]
@@ -1256,11 +1323,11 @@ fn test_chat_plain_diff_no_tui_chrome() {
     let (mut sg, _guard) = spawn_chat(&["--plain"], &[("PRX_TUI", "1")]);
     let session = sg.session();
 
-    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    read_until_with_dsr(session, "mock/mock", PHASE_CAP);
     drain_with_dsr(session, Duration::from_millis(200));
 
     session.send("/diff\r").expect("send /diff");
-    let captured = read_until_with_dsr(session, "diff unavailable:", TURN_TIMEOUT);
+    let captured = read_until_with_dsr(session, "diff unavailable:", PHASE_CAP);
     assert!(
         !captured.contains("PRX Chat |")
             && !captured.contains("Ctrl+G sessions")
@@ -1270,7 +1337,7 @@ fn test_chat_plain_diff_no_tui_chrome() {
     );
 
     session.send("/exit\r").expect("send /exit");
-    let _ = wait_for_exit(session, EXIT_TIMEOUT);
+    wait_for_graceful_exit(session);
 }
 
 #[test]
@@ -1310,11 +1377,11 @@ fn test_chat_plain_file_mention_no_tui_chrome() {
     );
     let session = sg.session();
 
-    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    read_until_with_dsr(session, "mock/mock", PHASE_CAP);
     drain_with_dsr(session, Duration::from_millis(200));
 
     session.send("please read @note.txt\r").expect("send mention");
-    let captured = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
+    let captured = read_until_with_dsr(session, sentinel, PHASE_CAP);
     assert!(captured.contains(sentinel), "mock response should contain `{sentinel}`");
     assert!(
         !captured.contains("PRX Chat |")
@@ -1325,7 +1392,7 @@ fn test_chat_plain_file_mention_no_tui_chrome() {
     );
 
     session.send("/exit\r").expect("send /exit");
-    let _ = wait_for_exit(session, EXIT_TIMEOUT);
+    wait_for_graceful_exit(session);
 }
 
 #[test]
@@ -1381,24 +1448,20 @@ fn test_chat_plain_resume_command_switches_saved_session_no_tui_chrome() {
         &[("PRX_TUI", "1"), ("OPENPRX_MOCK_RESPONSE", "BETA_REPLY")],
     );
     let session = sg.session();
-    let mut output = read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    let mut output = read_until_with_dsr(session, "mock/mock", PHASE_CAP);
 
     session.send("beta question\r").expect("send beta question");
-    output.push_str(&read_until_with_dsr(session, "BETA_REPLY", TURN_TIMEOUT));
+    output.push_str(&read_until_with_dsr(session, "BETA_REPLY", PHASE_CAP));
 
     session.send(format!("/resume {alpha_id}\r")).expect("send /resume");
-    output.push_str(&read_until_with_dsr(
-        session,
-        "Resumed saved chat session",
-        TURN_TIMEOUT,
-    ));
+    output.push_str(&read_until_with_dsr(session, "Resumed saved chat session", PHASE_CAP));
     assert!(
         output.contains("Resumed saved chat session"),
         "resume confirmation missing; output:\n{output}"
     );
 
     session.send("/cost\r").expect("send /cost");
-    output.push_str(&read_until_with_dsr(session, "Turns:        2", TURN_TIMEOUT));
+    output.push_str(&read_until_with_dsr(session, "Turns:        2", PHASE_CAP));
     assert!(
         output.contains("Turns:        2"),
         "cost after /resume should reflect alpha session's exact two persisted turns; output:\n{output}"
@@ -1412,11 +1475,7 @@ fn test_chat_plain_resume_command_switches_saved_session_no_tui_chrome() {
     );
 
     session.send("/exit\r").expect("send /exit");
-    assert!(wait_for_exit(session, EXIT_TIMEOUT), "chat did not exit");
-    assert!(
-        matches!(session.reaped, Some(expectrl::WaitStatus::Exited(_, 0))),
-        "chat did not exit successfully"
-    );
+    wait_for_graceful_exit(session);
 }
 
 #[test]
@@ -1586,12 +1645,12 @@ fn test_chat_wide_characters_response_no_extra_spaces() {
     let (mut sg, _guard) = spawn_chat(&["--plain"], &[("OPENPRX_MOCK_RESPONSE", response)]);
     let session = sg.session();
 
-    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    read_until_with_dsr(session, "mock/mock", PHASE_CAP);
     drain_with_dsr(session, Duration::from_millis(200));
 
     session.send("hi\r").expect("send hi");
     // Wait for the response suffix so a partial CJK prefix cannot end the capture.
-    let captured = read_until_with_dsr(session, "PRX", TURN_TIMEOUT);
+    let captured = read_until_with_dsr(session, "PRX", PHASE_CAP);
 
     // Strip ANSI escape sequences from the captured buffer so we compare
     // plain text only. The DSR reply (`ESC[1;1R`) and reedline SGR codes
@@ -1613,7 +1672,7 @@ fn test_chat_wide_characters_response_no_extra_spaces() {
     );
 
     session.send("/exit\r").expect("send /exit");
-    let _ = wait_for_exit(session, EXIT_TIMEOUT);
+    wait_for_graceful_exit(session);
 }
 
 // ─── Pure-mode PTY E2E coverage ─────────────────────────────────────────────
@@ -1634,19 +1693,16 @@ fn test_chat_pure_mock_response_works() {
     let sentinel = "[MOCK-PURE]";
     let (mut sg, _guard) = spawn_chat(&[], &[("OPENPRX_MOCK_RESPONSE", sentinel)]);
     let session = sg.session();
-    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    read_until_with_dsr(session, "mock/mock", PHASE_CAP);
     drain_with_dsr(session, Duration::from_millis(200));
     session.send("hi\r").expect("send hi");
-    let captured = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
+    let captured = read_until_with_dsr(session, sentinel, PHASE_CAP);
     assert!(
         captured.contains(sentinel),
         "the mock reply must render in Pure mode. captured:\n{captured}"
     );
     session.send("/exit\r").expect("send /exit");
-    assert!(
-        wait_for_exit(session, EXIT_TIMEOUT),
-        "/exit must exit cleanly in Pure mode"
-    );
+    wait_for_graceful_exit(session);
 }
 
 #[test]
@@ -1663,19 +1719,16 @@ fn test_chat_pure_tool_call_completes() {
         ],
     );
     let session = sg.session();
-    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    read_until_with_dsr(session, "mock/mock", PHASE_CAP);
     drain_with_dsr(session, Duration::from_millis(200));
     session.send("hi\r").expect("send hi");
-    let captured = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
+    let captured = read_until_with_dsr(session, sentinel, PHASE_CAP);
     assert!(
         captured.contains(sentinel),
         "the Pure-mode driver tool-call loop must return the final sentinel. captured:\n{captured}"
     );
     session.send("/exit\r").expect("send /exit");
-    assert!(
-        wait_for_exit(session, EXIT_TIMEOUT),
-        "/exit must exit cleanly after a Pure-mode tool turn"
-    );
+    wait_for_graceful_exit(session);
 }
 
 /// chat::run level integration test — runs a full Pure-mode turn plus /exit and checks the
@@ -1687,12 +1740,12 @@ fn s4_a_p1_pure_exit_after_turn_chat_run_level() {
     let sentinel = "[MOCK-PURE-EXIT]";
     let (mut sg, _guard) = spawn_chat(&[], &[("OPENPRX_MOCK_RESPONSE", sentinel)]);
     let session = sg.session();
-    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    read_until_with_dsr(session, "mock/mock", PHASE_CAP);
     drain_with_dsr(session, Duration::from_millis(200));
 
     // turn 1: full user -> assistant final
     session.send("hi\r").expect("send hi");
-    let captured1 = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
+    let captured1 = read_until_with_dsr(session, sentinel, PHASE_CAP);
     assert!(
         captured1.contains(sentinel),
         "Pure chat::run must render the turn 1 sentinel. captured:\n{captured1}"
@@ -1700,10 +1753,7 @@ fn s4_a_p1_pure_exit_after_turn_chat_run_level() {
 
     // /exit must go through the chat::run main-loop break + legacy_exit_save_enabled=false path
     session.send("/exit\r").expect("send /exit");
-    assert!(
-        wait_for_exit(session, EXIT_TIMEOUT),
-        "after a full Pure chat::run turn, /exit must exit cleanly within {EXIT_TIMEOUT:?}"
-    );
+    wait_for_graceful_exit(session);
 }
 
 /// P4a: detached Redux turns are finalized by the outer event pump while
@@ -1717,13 +1767,13 @@ fn p4a_event_pump_two_sequential_turns_complete_and_exit() {
     let second_message = "p4a second visible turn";
     let (mut sg, _guard) = spawn_chat(&[], &[("OPENPRX_MOCK_RESPONSE", sentinel)]);
     let session = sg.session();
-    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    read_until_with_dsr(session, "mock/mock", PHASE_CAP);
     drain_with_dsr(session, Duration::from_millis(200));
 
     session
         .send(format!("{first_message}\r").as_str())
         .expect("send first turn");
-    let first = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
+    let first = read_until_with_dsr(session, sentinel, PHASE_CAP);
     assert!(
         first.contains(sentinel),
         "P4a first turn should complete. captured:\n{first}"
@@ -1732,17 +1782,14 @@ fn p4a_event_pump_two_sequential_turns_complete_and_exit() {
     session
         .send(format!("{second_message}\r").as_str())
         .expect("send second turn");
-    let second = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
+    let second = read_until_with_dsr(session, sentinel, PHASE_CAP);
     assert!(
         second.contains(sentinel),
         "P4a second sequential turn should complete. captured:\n{second}"
     );
 
     session.send("/exit\r").expect("send /exit");
-    assert!(
-        wait_for_exit(session, EXIT_TIMEOUT),
-        "P4a sequential turn session should exit"
-    );
+    wait_for_graceful_exit(session);
 }
 
 /// A later ordinary conversation turn has provider history but no external
@@ -1754,28 +1801,25 @@ fn ordinary_plain_second_turn_reaches_the_serving_model() {
     let sentinel = "[MOCK-PLAIN-CONVERSATION]";
     let (mut sg, _guard) = spawn_chat(&[], &[("OPENPRX_MOCK_RESPONSE", sentinel)]);
     let session = sg.session();
-    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    read_until_with_dsr(session, "mock/mock", PHASE_CAP);
     drain_with_dsr(session, Duration::from_millis(200));
 
     session.send("hello\r").expect("send first plain turn");
-    let first = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
+    let first = read_until_with_dsr(session, sentinel, PHASE_CAP);
     assert!(
         first.contains(sentinel),
         "first plain turn should reach the model: {first}"
     );
 
     session.send("thanks\r").expect("send second plain turn");
-    let second = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
+    let second = read_until_with_dsr(session, sentinel, PHASE_CAP);
     assert!(
         second.contains(sentinel),
         "second plain turn with conversation history should reach the model: {second}"
     );
 
     session.send("/exit\r").expect("send /exit");
-    assert!(
-        wait_for_exit(session, EXIT_TIMEOUT),
-        "plain conversation should exit cleanly"
-    );
+    wait_for_graceful_exit(session);
 }
 
 /// The default decision policy must serve a plain turn without an operator
@@ -1813,21 +1857,18 @@ fn default_config_plain_turn_reaches_the_model_without_a_model_declaration() {
     let command = build_unprepared_chat_command_in(&guard, &[], &[("OPENPRX_MOCK_RESPONSE", sentinel)]);
     let mut session_guard = SessionGuard::new(spawn_chat_command(command));
     let session = session_guard.session();
-    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    read_until_with_dsr(session, "mock/mock", PHASE_CAP);
     drain_with_dsr(session, Duration::from_millis(200));
 
     session.send("hello\r").expect("send default-config plain turn");
-    let captured = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
+    let captured = read_until_with_dsr(session, sentinel, PHASE_CAP);
     assert!(
         captured.contains(sentinel),
         "a default-config plain turn should reach the model instead of Clarify: {captured}"
     );
 
     session.send("/exit\r").expect("send /exit");
-    assert!(
-        wait_for_exit(session, EXIT_TIMEOUT),
-        "default-config plain conversation should exit cleanly"
-    );
+    wait_for_graceful_exit(session);
 }
 
 #[test]
@@ -1848,7 +1889,7 @@ fn test_chat_session_resume_last_restores_saved_turns() {
         captured.contains(first_response),
         "first scripted chat process should complete turn before resume test. captured:\n{captured}"
     );
-    let before_stdout = wait_for_session_list_containing(&guard, &first_message, TURN_TIMEOUT);
+    let before_stdout = wait_for_session_list_containing(&guard, &first_message, PHASE_CAP);
     assert!(
         before_stdout.contains(&first_message) && before_stdout.contains("2 turns"),
         "first session should be saved with one user/assistant pair. stdout:\n{before_stdout}"
@@ -1865,7 +1906,7 @@ fn test_chat_session_resume_last_restores_saved_turns() {
         "resumed scripted chat process should complete follow-up turn. captured:\n{captured2}"
     );
 
-    let after_stdout = wait_for_session_list_containing(&guard, &first_message, TURN_TIMEOUT);
+    let after_stdout = wait_for_session_list_containing(&guard, &first_message, PHASE_CAP);
     assert!(
         after_stdout.contains(&first_message) && after_stdout.contains("4 turns"),
         "`--session last` should append the follow-up to the original saved session. stdout:\n{after_stdout}"
@@ -1878,7 +1919,7 @@ fn test_chat_pure_double_ctrl_c_exits_cleanly() {
     // A double Ctrl+C must not hang round 2 in Pure mode.
     let (mut sg, _guard) = spawn_chat(&[], &[]);
     let session = sg.session();
-    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    read_until_with_dsr(session, "mock/mock", PHASE_CAP);
     drain_with_dsr(session, Duration::from_millis(200));
 
     session
@@ -1891,16 +1932,12 @@ fn test_chat_pure_double_ctrl_c_exits_cleanly() {
         .signal(expectrl::Signal::SIGINT)
         .expect("second SIGINT");
 
-    let captured = read_until_with_dsr(session, "Exiting...", EXIT_TIMEOUT);
+    let captured = read_until_with_dsr(session, "Exiting...", PHASE_CAP);
     assert!(
         captured.contains("Exiting..."),
         "a double Ctrl+C must print Exiting... in Pure mode; captured:\n{captured}"
     );
-    let exit_deadline = EXIT_TIMEOUT;
-    assert!(
-        wait_for_exit(session, exit_deadline),
-        "a double Ctrl+C must exit within {exit_deadline:?} in Pure mode"
-    );
+    wait_for_graceful_exit(session);
 }
 
 // ─── S4-A Commit 0: minimal E2E over the real ratatui path ───────────────────
@@ -1928,7 +1965,7 @@ fn test_chat_s4_a_0_ratatui_banner_visible_via_real_path() {
     let (mut sg, _guard) = spawn_chat(&[], &[("PRX_TUI", "1")]);
     let session = sg.session();
 
-    let captured = read_until_all_with_dsr(session, &["prx ", "mock/mock"], STARTUP_TIMEOUT);
+    let captured = read_until_all_with_dsr(session, &["prx ", "mock/mock"], PHASE_CAP);
     assert!(
         captured.contains("prx "),
         "banner must start with `prx `, got:\n{captured}"
@@ -1950,7 +1987,7 @@ fn test_chat_s4_a_0_ratatui_banner_visible_via_real_path() {
         .get_process_mut()
         .signal(expectrl::Signal::SIGINT)
         .expect("second SIGINT");
-    let _ = wait_for_exit(session, EXIT_TIMEOUT);
+    wait_for_graceful_exit(session);
 }
 
 #[test]
@@ -1963,12 +2000,12 @@ fn test_chat_s4_a_0_ratatui_mock_response_via_real_path() {
     let (mut sg, _guard) = spawn_chat(&[], &[("OPENPRX_MOCK_RESPONSE", sentinel), ("PRX_TUI", "1")]);
     let session = sg.session();
 
-    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    read_until_with_dsr(session, "mock/mock", PHASE_CAP);
     drain_with_dsr(session, Duration::from_millis(300));
 
     // In ratatui raw mode Enter is still \r (crossterm KeyCode::Enter).
     session.send("hi\r").expect("send hi");
-    let captured = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
+    let captured = read_until_with_dsr(session, sentinel, PHASE_CAP);
     assert!(
         captured.contains(sentinel),
         "the mock reply must render on the real ratatui path. captured:\n{captured}"
@@ -1983,7 +2020,7 @@ fn test_chat_s4_a_0_ratatui_mock_response_via_real_path() {
         .get_process_mut()
         .signal(expectrl::Signal::SIGINT)
         .expect("second SIGINT");
-    let _ = wait_for_exit(session, EXIT_TIMEOUT);
+    wait_for_graceful_exit(session);
 }
 
 #[test]
@@ -2006,32 +2043,32 @@ fn test_chat_ratatui_resume_picker_selects_saved_session() {
 
     let mut sg = spawn_chat_in(&guard, &[], &[("PRX_TUI", "1"), ("OPENPRX_MOCK_RESPONSE", "UNUSED")]);
     let session = sg.session();
-    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    read_until_with_dsr(session, "mock/mock", PHASE_CAP);
     drain_with_dsr(session, Duration::from_millis(300));
 
     session.send("/resume\r").expect("send /resume");
-    let picker = read_until_with_dsr(session, "Saved chat sessions (/resume)", TURN_TIMEOUT);
+    let picker = read_until_with_dsr(session, "Saved chat sessions (/resume)", PHASE_CAP);
     assert!(
         picker.contains("Saved chat sessions (/resume)"),
         "TUI /resume should open saved-session picker overlay; captured:\n{picker}"
     );
 
     session.send("\x1b[B\r").expect("select older saved session");
-    let resumed = read_until_with_dsr(session, "Resumed saved chat session", TURN_TIMEOUT);
+    let resumed = read_until_with_dsr(session, "Resumed saved chat session", PHASE_CAP);
     assert!(
         resumed.contains("Resumed saved chat session"),
         "picker Enter should resume the selected saved session; captured:\n{resumed}"
     );
 
     session.send("/cost\r").expect("send /cost");
-    let cost = read_until_with_dsr(session, "Turns:        4", TURN_TIMEOUT);
+    let cost = read_until_with_dsr(session, "Turns:        4", PHASE_CAP);
     assert!(
         cost.contains("Turns:        4"),
         "selected alpha session should have four persisted turns; captured:\n{cost}"
     );
 
     session.send("/exit\r").expect("send /exit");
-    let _ = wait_for_exit(session, EXIT_TIMEOUT);
+    wait_for_graceful_exit(session);
 }
 
 #[test]
@@ -2043,7 +2080,7 @@ fn test_chat_s4_a_0_ratatui_double_ctrl_c_exit_via_real_path() {
     let (mut sg, _guard) = spawn_chat(&[], &[("PRX_TUI", "1")]);
     let session = sg.session();
 
-    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    read_until_with_dsr(session, "mock/mock", PHASE_CAP);
     drain_with_dsr(session, Duration::from_millis(200));
 
     session
@@ -2056,11 +2093,7 @@ fn test_chat_s4_a_0_ratatui_double_ctrl_c_exit_via_real_path() {
         .signal(expectrl::Signal::SIGINT)
         .expect("second SIGINT");
 
-    let exit_deadline = EXIT_TIMEOUT;
-    assert!(
-        wait_for_exit(session, exit_deadline),
-        "a double Ctrl+C on the real ratatui path must exit within {exit_deadline:?}"
-    );
+    wait_for_graceful_exit(session);
 }
 
 // ─── Real ratatui path + Pure-mode snapshot, end to end ─────────────────────
@@ -2079,7 +2112,7 @@ fn test_chat_s4_a_6_pure_snapshot_renders_banner_via_real_path() {
     let (mut sg, _guard) = spawn_chat(&[], &[("PRX_TUI", "1")]);
     let session = sg.session();
 
-    let captured = read_until_all_with_dsr(session, &["prx ", "mock/mock"], STARTUP_TIMEOUT);
+    let captured = read_until_all_with_dsr(session, &["prx ", "mock/mock"], PHASE_CAP);
     assert!(
         captured.contains("prx "),
         "banner must start with `prx `, got:\n{captured}"
@@ -2098,7 +2131,7 @@ fn test_chat_s4_a_6_pure_snapshot_renders_banner_via_real_path() {
         .get_process_mut()
         .signal(expectrl::Signal::SIGINT)
         .expect("second SIGINT");
-    let _ = wait_for_exit(session, EXIT_TIMEOUT);
+    wait_for_graceful_exit(session);
 }
 
 #[test]
@@ -2113,11 +2146,11 @@ fn test_chat_s4_a_6_pure_snapshot_mock_response_via_real_path() {
     let (mut sg, _guard) = spawn_chat(&[], &[("OPENPRX_MOCK_RESPONSE", sentinel), ("PRX_TUI", "1")]);
     let session = sg.session();
 
-    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    read_until_with_dsr(session, "mock/mock", PHASE_CAP);
     drain_with_dsr(session, Duration::from_millis(300));
 
     session.send("hi\r").expect("send hi");
-    let captured = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
+    let captured = read_until_with_dsr(session, sentinel, PHASE_CAP);
     assert!(
         captured.contains(sentinel),
         "the mock reply must render on the Pure ratatui real path. captured:\n{captured}"
@@ -2132,7 +2165,7 @@ fn test_chat_s4_a_6_pure_snapshot_mock_response_via_real_path() {
         .get_process_mut()
         .signal(expectrl::Signal::SIGINT)
         .expect("second SIGINT");
-    let _ = wait_for_exit(session, EXIT_TIMEOUT);
+    wait_for_graceful_exit(session);
 }
 
 #[test]
@@ -2153,11 +2186,11 @@ fn test_chat_s4_a_6_pure_snapshot_tool_call_via_real_path() {
     );
     let session = sg.session();
 
-    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    read_until_with_dsr(session, "mock/mock", PHASE_CAP);
     drain_with_dsr(session, Duration::from_millis(300));
 
     session.send("hi\r").expect("send hi");
-    let captured = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
+    let captured = read_until_with_dsr(session, sentinel, PHASE_CAP);
     assert!(
         captured.contains(sentinel),
         "the Pure ratatui real-path tool-call loop must return the final sentinel. captured:\n{captured}"
@@ -2172,7 +2205,7 @@ fn test_chat_s4_a_6_pure_snapshot_tool_call_via_real_path() {
         .get_process_mut()
         .signal(expectrl::Signal::SIGINT)
         .expect("second SIGINT");
-    let _ = wait_for_exit(session, EXIT_TIMEOUT);
+    wait_for_graceful_exit(session);
 }
 
 #[test]
@@ -2184,11 +2217,11 @@ fn test_chat_s4_a_6_pure_snapshot_wide_characters_no_extra_spaces_via_real_path(
     let (mut sg, _guard) = spawn_chat(&[], &[("OPENPRX_MOCK_RESPONSE", response), ("PRX_TUI", "1")]);
     let session = sg.session();
 
-    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    read_until_with_dsr(session, "mock/mock", PHASE_CAP);
     drain_with_dsr(session, Duration::from_millis(300));
 
     session.send("hi\r").expect("send hi");
-    let captured = read_until_with_dsr(session, "S4A6", TURN_TIMEOUT);
+    let captured = read_until_with_dsr(session, "S4A6", PHASE_CAP);
     // Strip ANSI escapes, then assert the wide chars are contiguous.
     let ansi_re = regex::Regex::new(r"\x1b\[[^a-zA-Z]*[a-zA-Z]").expect("ansi regex");
     let plain = ansi_re.replace_all(&captured, "").to_string();
@@ -2210,7 +2243,7 @@ fn test_chat_s4_a_6_pure_snapshot_wide_characters_no_extra_spaces_via_real_path(
         .get_process_mut()
         .signal(expectrl::Signal::SIGINT)
         .expect("second SIGINT");
-    let _ = wait_for_exit(session, EXIT_TIMEOUT);
+    wait_for_graceful_exit(session);
 }
 
 // ─── S5 P0-1: protocol-level PTY regression (anthropic / openai / gemini flavor) ─
@@ -2236,19 +2269,16 @@ fn s5_release_p0_1_anthropic_full_turn_via_real_path() {
         ],
     );
     let session = sg.session();
-    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    read_until_with_dsr(session, "mock/mock", PHASE_CAP);
     drain_with_dsr(session, Duration::from_millis(200));
     session.send("hi\r").expect("send hi");
-    let captured = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
+    let captured = read_until_with_dsr(session, sentinel, PHASE_CAP);
     assert!(
         captured.contains(sentinel),
         "the anthropic flavor must emit the sentinel. captured:\n{captured}"
     );
     session.send("/exit\r").expect("send /exit");
-    assert!(
-        wait_for_exit(session, EXIT_TIMEOUT),
-        "/exit must exit cleanly on the anthropic flavor"
-    );
+    wait_for_graceful_exit(session);
 }
 
 /// S5 P0-1: an openai-flavor turn containing a tool_call — the driver must run the tool
@@ -2268,19 +2298,16 @@ fn s5_release_p0_1_openai_tool_call_turn_via_real_path() {
         ],
     );
     let session = sg.session();
-    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    read_until_with_dsr(session, "mock/mock", PHASE_CAP);
     drain_with_dsr(session, Duration::from_millis(200));
     session.send("hi\r").expect("send hi");
-    let captured = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
+    let captured = read_until_with_dsr(session, sentinel, PHASE_CAP);
     assert!(
         captured.contains(sentinel),
         "the openai-flavor tool turn must eventually emit the sentinel. captured:\n{captured}"
     );
     session.send("/exit\r").expect("send /exit");
-    assert!(
-        wait_for_exit(session, EXIT_TIMEOUT),
-        "/exit must exit cleanly on the openai flavor"
-    );
+    wait_for_graceful_exit(session);
 }
 
 /// b2 core evidence 1, through the real binary: a single model tool call fans
@@ -2316,18 +2343,18 @@ fn b2_sessions_spawn_batch_fans_out_three_subtasks_via_real_path() {
         ],
     );
     let session = sg.session();
-    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    read_until_with_dsr(session, "mock/mock", PHASE_CAP);
     drain_with_dsr(session, Duration::from_millis(200));
     session
         .send("Call sessions_spawn to fan this out\r")
         .expect("test: send prompt");
-    read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
+    read_until_with_dsr(session, sentinel, PHASE_CAP);
 
     session.send("/sessions\r").expect("send /sessions");
     let listed = read_until_all_with_dsr(
         session,
         &["b2 fan-out one", "b2 fan-out two", "b2 fan-out three"],
-        TURN_TIMEOUT,
+        PHASE_CAP,
     );
     for task in ["b2 fan-out one", "b2 fan-out two", "b2 fan-out three"] {
         assert!(
@@ -2337,10 +2364,7 @@ fn b2_sessions_spawn_batch_fans_out_three_subtasks_via_real_path() {
     }
 
     session.send("/exit\r").expect("send /exit");
-    assert!(
-        wait_for_exit(session, EXIT_TIMEOUT),
-        "fan-out session should exit cleanly"
-    );
+    wait_for_graceful_exit(session);
 }
 
 /// S5 P0-1: gemini-flavor cancel-mid-stream — the partial turn reaches the
@@ -2360,19 +2384,19 @@ fn s5_release_p0_1_gemini_cancel_midstream_via_real_path() {
         ],
     );
     let session = sg.session();
-    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    read_until_with_dsr(session, "mock/mock", PHASE_CAP);
     drain_with_dsr(session, Duration::from_millis(200));
     session.send("hi\r").expect("send hi");
     // Reasoning progress proves the stream started. Final-answer text is
     // buffered until the no-result check accepts it, so it is not a cancel signal.
-    read_until_with_dsr(session, "CANCEL_STREAM_READY", TURN_TIMEOUT);
+    read_until_with_dsr(session, "CANCEL_STREAM_READY", PHASE_CAP);
     session
         .send(expectrl::ControlCode::EndOfText)
         .expect("mid-stream Ctrl+C");
     std::thread::sleep(Duration::from_millis(250));
 
     session.send("/cost\r").expect("send /cost after cancellation");
-    let cancelled = read_until_with_dsr(session, "Turns:        0", TURN_TIMEOUT);
+    let cancelled = read_until_with_dsr(session, "Turns:        0", PHASE_CAP);
     assert!(
         cancelled.contains("Turns:        0"),
         "the cancelled partial turn must not be committed as a completed user/assistant pair; captured:\n{cancelled}"
@@ -2383,10 +2407,7 @@ fn s5_release_p0_1_gemini_cancel_midstream_via_real_path() {
     );
 
     session.send("/exit\r").expect("send /exit after cancellation");
-    assert!(
-        wait_for_exit(session, EXIT_TIMEOUT),
-        "gemini-flavor chat must remain responsive and exit after the cancelled turn"
-    );
+    wait_for_graceful_exit(session);
 }
 
 // ── Daemon-assigned work (c2) ────────────────────────────────────────────────
@@ -2720,12 +2741,10 @@ fn test_chat_runs_daemon_assigned_work_and_reports_the_answer_back() {
     // Both captures are kept: enrolment and delivery race the banner, so a
     // notice can land in either one and asserting on only the later capture
     // would make this test flaky about the very thing it is checking.
-    let mut transcript = read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    let mut transcript = read_until_with_dsr(session, "mock/mock", PHASE_CAP);
 
     // Enrolment happens off the startup path, but it does happen.
-    daemon.wait_for("registration", STARTUP_TIMEOUT, |state| {
-        state.registered_label.is_some()
-    });
+    daemon.wait_for("registration", PHASE_CAP, |state| state.registered_label.is_some());
     assert_eq!(
         daemon.snapshot(|state| state.registered_label.clone()),
         Some("workspace".to_string()),
@@ -2733,7 +2752,7 @@ fn test_chat_runs_daemon_assigned_work_and_reports_the_answer_back() {
     );
 
     // The assignment arrives without anybody typing, is announced, and runs.
-    transcript.push_str(&read_until_with_dsr(session, sentinel, TURN_TIMEOUT));
+    transcript.push_str(&read_until_with_dsr(session, sentinel, PHASE_CAP));
     assert!(
         transcript.contains("Assigned by wacli"),
         "assigned work must never be silent; captured:\n{transcript}"
@@ -2744,7 +2763,7 @@ fn test_chat_runs_daemon_assigned_work_and_reports_the_answer_back() {
     );
 
     // The answer goes back, and it is the reply the turn produced.
-    daemon.wait_for("the result", TURN_TIMEOUT, |state| !state.results.is_empty());
+    daemon.wait_for("the result", PHASE_CAP, |state| !state.results.is_empty());
     let (id, status, summary) = daemon.snapshot(|state| state.results[0].clone());
     assert_eq!(id, "assign-1");
     assert_eq!(status, "completed");
@@ -2755,7 +2774,7 @@ fn test_chat_runs_daemon_assigned_work_and_reports_the_answer_back() {
 
     // Acknowledgement rides the *next* pull, never the one that delivered it:
     // a client that acknowledged on receipt and then died would destroy the work.
-    daemon.wait_for("the acknowledging pull", TURN_TIMEOUT, |state| {
+    daemon.wait_for("the acknowledging pull", PHASE_CAP, |state| {
         state.pull_acks.iter().any(|ack| ack.contains(&"assign-1".to_string()))
     });
     let acks = daemon.snapshot(|state| state.pull_acks.clone());
@@ -2771,8 +2790,8 @@ fn test_chat_runs_daemon_assigned_work_and_reports_the_answer_back() {
 
     // Exiting withdraws the session: nothing on the daemon reaps it on a clock.
     session.send("/exit\r").expect("send /exit");
-    assert!(wait_for_exit(session, EXIT_TIMEOUT), "chat should exit cleanly");
-    daemon.wait_for("deregistration", TURN_TIMEOUT, |state| state.deregistered);
+    wait_for_graceful_exit(session);
+    daemon.wait_for("deregistration", PHASE_CAP, |state| state.deregistered);
 }
 
 /// A chat that no daemon will accept still starts, and says why it cannot be
@@ -2790,21 +2809,18 @@ fn test_chat_starts_normally_when_it_cannot_enrol_with_a_daemon() {
     write_daemon_config(&guard, &format!("http://127.0.0.1:{port}"));
     let mut sg = spawn_chat_in(&guard, &[], &[("OPENPRX_MOCK_RESPONSE", sentinel)]);
     let session = sg.session();
-    let mut transcript = read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    let mut transcript = read_until_with_dsr(session, "mock/mock", PHASE_CAP);
 
     // The chat is fully usable: a failed enrolment costs one capability.
     session.send("hello\r").expect("send prompt");
-    transcript.push_str(&read_until_with_dsr(session, sentinel, TURN_TIMEOUT));
+    transcript.push_str(&read_until_with_dsr(session, sentinel, PHASE_CAP));
     assert!(
         transcript.contains("cannot be assigned work"),
         "a failed enrolment must be stated, not swallowed; captured:\n{transcript}"
     );
 
     session.send("/exit\r").expect("send /exit");
-    assert!(
-        wait_for_exit(session, EXIT_TIMEOUT),
-        "a chat that could not enrol must still exit cleanly"
-    );
+    wait_for_graceful_exit(session);
 }
 
 /// A daemon restart must not cost the operator a chat restart.
@@ -2826,25 +2842,23 @@ fn test_chat_re_enrols_by_itself_after_the_daemon_forgets_its_session() {
     write_daemon_config(&guard, &daemon.base_url);
     let mut sg = spawn_chat_in(&guard, &[], &[("OPENPRX_MOCK_RESPONSE", sentinel)]);
     let session = sg.session();
-    let mut transcript = read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    let mut transcript = read_until_with_dsr(session, "mock/mock", PHASE_CAP);
 
-    daemon.wait_for("the first registration", STARTUP_TIMEOUT, |state| {
-        state.registrations == 1
-    });
+    daemon.wait_for("the first registration", PHASE_CAP, |state| state.registrations == 1);
     // Wait until this chat is actually polling, so the restart lands on a
     // session the daemon really had rather than on one still being set up.
-    daemon.wait_for("the first pull", TURN_TIMEOUT, |state| !state.pull_acks.is_empty());
+    daemon.wait_for("the first pull", PHASE_CAP, |state| !state.pull_acks.is_empty());
 
     // The daemon restarts, and has work waiting for whoever registers next.
     // Nobody touches the chat from here on.
     daemon.restart_holding("assign-after-restart", "count the crates");
 
-    daemon.wait_for("the chat to register again", TURN_TIMEOUT, |state| {
+    daemon.wait_for("the chat to register again", PHASE_CAP, |state| {
         state.registrations == 2
     });
 
     // Being registered again is not the claim; being able to take work is.
-    transcript.push_str(&read_until_with_dsr(session, sentinel, TURN_TIMEOUT));
+    transcript.push_str(&read_until_with_dsr(session, sentinel, PHASE_CAP));
     assert!(
         transcript.contains("registered again"),
         "a chat that re-enrolled must say so; captured:\n{transcript}"
@@ -2853,7 +2867,7 @@ fn test_chat_re_enrols_by_itself_after_the_daemon_forgets_its_session() {
         transcript.contains("count the crates"),
         "the assignment handed to the new registration must arrive; captured:\n{transcript}"
     );
-    daemon.wait_for("the result", TURN_TIMEOUT, |state| !state.results.is_empty());
+    daemon.wait_for("the result", PHASE_CAP, |state| !state.results.is_empty());
     let (id, status, summary) = daemon.snapshot(|state| state.results[0].clone());
     assert_eq!(id, "assign-after-restart");
     assert_eq!(status, "completed");
@@ -2863,5 +2877,5 @@ fn test_chat_re_enrols_by_itself_after_the_daemon_forgets_its_session() {
     );
 
     session.send("/exit\r").expect("send /exit");
-    assert!(wait_for_exit(session, EXIT_TIMEOUT), "chat should exit cleanly");
+    wait_for_graceful_exit(session);
 }

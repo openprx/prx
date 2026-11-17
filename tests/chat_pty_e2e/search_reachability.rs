@@ -1,11 +1,11 @@
 //! Real fullscreen chat + real HTTP provider; reuses the owned PTY harness.
 use super::*;
-use anyhow::{Result, ensure};
+use anyhow::Result;
 #[path = "../support/tool_search_wire.rs"]
 mod wire;
 use wire::{MODEL, WireProbe};
 
-async fn drive(input: &str, advice: bool, skill: bool, native: bool) -> Result<()> {
+async fn drive(input: &str, advice: bool, skill: bool, native: bool, deadline: TestDeadline) -> Result<()> {
     let mut guard = new_harness_guard()?;
     // The explicit config directory owns the runtime workspace, as in the
     // real import/resume fixture. Probe the store the child actually opens.
@@ -95,20 +95,13 @@ async fn drive(input: &str, advice: bool, skill: bool, native: bool) -> Result<(
     let input = input.to_owned();
     let work = tokio::task::spawn_blocking(move || -> Result<()> {
         let _scratch = guard;
-        let mut owner = SessionGuard::new(spawn_chat_command(command));
+        let mut owner = SessionGuard::with_deadline(spawn_chat_command(command), deadline);
         let session = owner.session();
-        read_until_with_dsr(session, MODEL, STARTUP_TIMEOUT);
+        read_until_with_dsr(session, MODEL, PHASE_CAP);
         session.send(format!("{input}\r"))?;
-        read_until_with_dsr(session, wire::DONE, TURN_TIMEOUT);
+        read_until_with_dsr(session, wire::DONE, PHASE_CAP);
         session.send("/quit\r")?;
-        ensure!(
-            wait_for_exit(session, EXIT_TIMEOUT),
-            "fullscreen chat did not exit after completed probe"
-        );
-        ensure!(
-            matches!(session.reaped.as_ref(), Some(expectrl::WaitStatus::Exited(_, 0))),
-            "fullscreen chat did not exit successfully"
-        );
+        wait_for_graceful_exit(session);
         Ok(())
     })
     .await?;
@@ -120,32 +113,36 @@ async fn drive(input: &str, advice: bool, skill: bool, native: bool) -> Result<(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial(prx_chat_pty)]
 async fn engine_off_search_discovers_noncore_tool_on_all_roots() -> Result<()> {
+    let deadline = TestDeadline::new(MULTI_STAGE_BUDGET);
     for advice in [false, true] {
-        drive(wire::INPUT, advice, false, true).await?;
+        drive(wire::INPUT, advice, false, true, deadline).await?;
     }
     Ok(())
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial(prx_chat_pty)]
 async fn brief_input_keeps_available_search() -> Result<()> {
+    let deadline = TestDeadline::new(MULTI_STAGE_BUDGET);
     for advice in [false, true] {
-        drive("hi", advice, false, true).await?;
+        drive("hi", advice, false, true, deadline).await?;
     }
     Ok(())
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial(prx_chat_pty)]
 async fn installed_skill_metadata_is_readable_on_first_turn() -> Result<()> {
+    let deadline = TestDeadline::new(MULTI_STAGE_BUDGET);
     for advice in [false, true] {
-        drive("hi", advice, true, true).await?;
+        drive("hi", advice, true, true, deadline).await?;
     }
     Ok(())
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial(prx_chat_pty)]
 async fn non_tool_models_do_not_receive_search_or_unreadable_skill_metadata() -> Result<()> {
+    let deadline = TestDeadline::new(MULTI_STAGE_BUDGET);
     for advice in [false, true] {
-        drive("hi", advice, true, false).await?;
+        drive("hi", advice, true, false, deadline).await?;
     }
     Ok(())
 }

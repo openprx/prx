@@ -614,7 +614,31 @@ pub(super) fn spawn_line_input_listener(
     });
 }
 
+/// Persistent Ctrl-C listener. It is created before the banner is shown and handed to
+/// [`ctrlc_handler`], which keeps it for the whole session.
+///
+/// A `ctrl_c()` future exists only while one `select!` iteration polls it. Tokio discards a
+/// signal broadcast while no receiver exists, so a press that landed before the handler task
+/// first polled (default action: the process died without a graceful exit) or while the handler
+/// was busy with the previous press (the second press was lost) never reached the handler.
+#[cfg(unix)]
+pub(super) type InterruptListener = tokio::signal::unix::Signal;
+
+#[cfg(unix)]
+pub(super) fn interrupt_listener() -> std::io::Result<InterruptListener> {
+    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+}
+
+#[cfg(not(unix))]
+pub(super) type InterruptListener = tokio::signal::windows::CtrlC;
+
+#[cfg(not(unix))]
+pub(super) fn interrupt_listener() -> std::io::Result<InterruptListener> {
+    tokio::signal::windows::ctrl_c()
+}
+
 pub(super) fn ctrlc_handler(
+    interrupts: InterruptListener,
     last_ctrlc_ms: &Arc<AtomicU64>,
     shutdown: &CancellationToken,
     chat_dispatcher: &dispatcher::ChatDispatcher,
@@ -636,6 +660,7 @@ pub(super) fn ctrlc_handler(
     // this handler are both dropped can the channel really close and dispatcher_handle.await
     // return).
     {
+        let mut interrupts = interrupts;
         let last_ctrlc = Arc::clone(last_ctrlc_ms);
         #[cfg(not(feature = "terminal-tui"))]
         let cancel_ref = Arc::clone(active_cancel);
@@ -647,11 +672,13 @@ pub(super) fn ctrlc_handler(
         let redraw_for_signal = redraw_tx_for_main.clone();
         tokio::spawn(async move {
             loop {
+                // The listener outlives every iteration, so a press that arrives while this task
+                // is handling the previous one stays queued for the next `recv`.
                 tokio::select! {
                     biased;
                     () = shutdown_signal.cancelled() => break,
-                    res = tokio::signal::ctrl_c() => {
-                        if res.is_err() {
+                    res = interrupts.recv() => {
+                        if res.is_none() {
                             break;
                         }
                     }
@@ -726,6 +753,9 @@ pub(super) fn sigterm_handler(shutdown: &CancellationToken, chat_dispatcher: &di
     }
 }
 
+/// Teardown bound for the dispatcher drain. Same 2 s as `turn_service.shutdown` in `run.rs`.
+const DISPATCHER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub(super) async fn finish_chat_session(
     shutdown: &CancellationToken,
     chat_dispatcher: dispatcher::ChatDispatcher,
@@ -744,14 +774,27 @@ pub(super) async fn finish_chat_session(
     //    main.rs:866 remains as the fallback (do not change it).
     shutdown.cancel();
     drop(chat_dispatcher);
-    match dispatcher_handle.await {
-        Ok(stats) => tracing::info!(
-            actions = stats.actions_seen,
-            effects = stats.effects_seen,
-            "redux dispatcher shutdown clean"
-        ),
-        Err(e) => tracing::warn!(error = %crate::agent::diagnostics::error_class(&e), "redux dispatcher join failed"),
-    }
+    // Bounded like the turn service shutdown (run.rs): a drain effect that never settles must not hang the exit.
+    let drain = match tokio::time::timeout(DISPATCHER_DRAIN_TIMEOUT, dispatcher_handle).await {
+        Ok(Ok(stats)) => {
+            tracing::info!(
+                actions = stats.actions_seen,
+                effects = stats.effects_seen,
+                "redux dispatcher shutdown clean"
+            );
+            Ok(())
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %crate::agent::diagnostics::error_class(&e), "redux dispatcher join failed");
+            Ok(())
+        }
+        Err(_elapsed) => {
+            tracing::warn!("redux dispatcher did not drain at teardown; exit proceeds with an error");
+            Err(anyhow::anyhow!(
+                "redux dispatcher did not drain within {DISPATCHER_DRAIN_TIMEOUT:?} at teardown"
+            ))
+        }
+    };
 
     // Restore terminal state after the TUI loop has observed shutdown, so no
     // late redraw can print the footer after the shell prompt.
@@ -765,9 +808,105 @@ pub(super) async fn finish_chat_session(
         let _ = stdout.flush();
     }
 
+    drain?;
     info!("Chat session ended");
     if plain_mode_turn_failed {
         anyhow::bail!("one or more chat turns failed");
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "terminal-tui"))]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Send a real SIGINT to this process. The crate denies `unsafe`, so the external `kill` utility does it.
+    fn send_sigint() {
+        let status = std::process::Command::new("kill")
+            .arg("-INT")
+            .arg(std::process::id().to_string())
+            .status();
+        assert!(
+            status.as_ref().is_ok_and(std::process::ExitStatus::success),
+            "test: kill -INT failed: {status:?}"
+        );
+    }
+
+    // Blocking waits on purpose: a test that holds the mirror lock must not await the runtime. The
+    // handler blocks a worker on that lock, and the runtime timer needs that worker, so an await
+    // here deadlocks the test.
+    fn wait_until_pressed(last: &AtomicU64, what: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while last.load(Ordering::Relaxed) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "test: the handler never recorded {what}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    async fn assert_shutdown(shutdown: &CancellationToken, what: &str) {
+        let reached = tokio::time::timeout(Duration::from_secs(10), shutdown.cancelled())
+            .await
+            .is_ok();
+        assert!(reached, "test: {what}: two presses did not reach the shutdown path");
+    }
+
+    /// A press that lands before the handler task exists is kept for it, and the next press still exits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(process_sigint)]
+    async fn a_press_before_the_handler_is_spawned_is_kept_for_it() {
+        let interrupts = interrupt_listener().expect("test: interrupt listener");
+        let (dispatcher, _actions) = dispatcher::ChatDispatcher::new();
+        let shutdown = CancellationToken::new();
+        let last = Arc::new(AtomicU64::new(0));
+        let mirror = Arc::new(parking_lot::Mutex::new(tui::TuiState::new("mock", "mock")));
+
+        send_sigint();
+        ctrlc_handler(interrupts, &last, &shutdown, &dispatcher, &mirror, &None);
+        wait_until_pressed(&last, "the press that came before the handler");
+        send_sigint();
+
+        assert_shutdown(&shutdown, "a press before the handler was spawned").await;
+    }
+
+    /// The second press lands while the first press is still inside the handler's arm (blocked on the
+    /// mirror lock). It must be kept for the next `recv`, not dropped by tokio.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(process_sigint)]
+    async fn a_second_press_during_the_first_presss_handling_still_exits() {
+        let interrupts = interrupt_listener().expect("test: interrupt listener");
+        let (dispatcher, _actions) = dispatcher::ChatDispatcher::new();
+        let shutdown = CancellationToken::new();
+        let last = Arc::new(AtomicU64::new(0));
+        let mirror = Arc::new(parking_lot::Mutex::new(tui::TuiState::new("mock", "mock")));
+
+        // Hold the lock: the first press's single-press path blocks inside the arm.
+        let held = mirror.lock();
+        ctrlc_handler(interrupts, &last, &shutdown, &dispatcher, &mirror, &None);
+        send_sigint();
+        wait_until_pressed(&last, "the first press");
+        send_sigint();
+        std::thread::sleep(Duration::from_millis(50));
+        drop(held);
+
+        assert_shutdown(&shutdown, "a second press while the first was being handled").await;
+    }
+
+    /// A drain that never settles ends the teardown with an error instead of hanging.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_dispatcher_drain_ends_the_teardown_with_an_error() {
+        let (dispatcher, _actions) = dispatcher::ChatDispatcher::new();
+        let shutdown = CancellationToken::new();
+        let stalled = tokio::spawn(std::future::pending::<dispatcher::DispatcherStats>());
+
+        let result = finish_chat_session(&shutdown, dispatcher, stalled, &None, false).await;
+
+        assert!(
+            result.is_err(),
+            "test: a stalled dispatcher drain must fail the teardown, got {result:?}"
+        );
+    }
 }

@@ -3,8 +3,8 @@
 //! second edit of the session without another approval card (CF-R3).
 
 use super::{
-    EXIT_TIMEOUT, HarnessGuard, STARTUP_TIMEOUT, SessionGuard, TURN_TIMEOUT, build_provider_chat_command_in,
-    new_harness_guard, prepare_owned_chat_fixture, read_until_with_dsr, spawn_chat_command, wait_for_exit,
+    HarnessGuard, PHASE_CAP, SessionGuard, build_provider_chat_command_in, new_harness_guard,
+    prepare_owned_chat_fixture, read_until_with_dsr, spawn_chat_command, wait_for_graceful_exit,
 };
 use crate::loopback_openai::{LoopbackOpenAi, Script, Scripted};
 
@@ -58,13 +58,13 @@ fn one_edit(key: &str, reply: &str) -> HarnessGuard {
         }),
     );
     let tty = session.session();
-    read_until_with_dsr(tty, MODEL, STARTUP_TIMEOUT);
+    read_until_with_dsr(tty, MODEL, PHASE_CAP);
     tty.send("change beta to BETA in notes.txt\r").expect("send turn");
-    read_until_with_dsr(tty, CARD, TURN_TIMEOUT);
+    read_until_with_dsr(tty, CARD, PHASE_CAP);
     tty.send(key).expect("answer the approval card");
-    read_until_with_dsr(tty, reply, TURN_TIMEOUT);
+    read_until_with_dsr(tty, reply, PHASE_CAP);
     tty.send("/exit\r").expect("send /exit");
-    assert!(wait_for_exit(tty, EXIT_TIMEOUT), "chat should exit cleanly");
+    wait_for_graceful_exit(tty);
     drop(session);
     assert_eq!(server.requests().len(), 2, "the tool call and the reply");
     guard
@@ -102,16 +102,16 @@ fn supervised_file_edit_always_then_second_edit() {
         }),
     );
     let tty = session.session();
-    read_until_with_dsr(tty, MODEL, STARTUP_TIMEOUT);
+    read_until_with_dsr(tty, MODEL, PHASE_CAP);
     tty.send("change beta to BETA in notes.txt\r").expect("send first turn");
-    read_until_with_dsr(tty, CARD, TURN_TIMEOUT);
+    read_until_with_dsr(tty, CARD, PHASE_CAP);
     tty.send("a").expect("approve always");
-    read_until_with_dsr(tty, "FIRST-DONE", TURN_TIMEOUT);
+    read_until_with_dsr(tty, "FIRST-DONE", PHASE_CAP);
     tty.send("change delta to DELTA in notes.txt\r")
         .expect("send second turn");
-    let second = read_until_with_dsr(tty, "SECOND-DONE", TURN_TIMEOUT);
+    let second = read_until_with_dsr(tty, "SECOND-DONE", PHASE_CAP);
     tty.send("/exit\r").expect("send /exit");
-    assert!(wait_for_exit(tty, EXIT_TIMEOUT), "chat should exit cleanly");
+    wait_for_graceful_exit(tty);
     drop(session);
 
     assert!(

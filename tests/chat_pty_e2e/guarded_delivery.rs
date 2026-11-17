@@ -4,8 +4,8 @@
 //! assistant event.
 
 use super::{
-    EXIT_TIMEOUT, HarnessGuard, STARTUP_TIMEOUT, SessionGuard, TURN_TIMEOUT, build_provider_chat_command_in,
-    new_harness_guard, prepare_owned_chat_fixture, read_until_with_dsr, spawn_chat_command, wait_for_exit,
+    HarnessGuard, PHASE_CAP, SessionGuard, build_provider_chat_command_in, new_harness_guard,
+    prepare_owned_chat_fixture, read_until_with_dsr, spawn_chat_command, wait_for_graceful_exit,
 };
 use crate::loopback_openai::{LoopbackOpenAi, Script, Scripted, assistant_messages, message_events};
 
@@ -83,13 +83,13 @@ fn occurrences(captured: &str, needle: &str) -> usize {
 /// first reply is inspected too).
 fn two_turns(session: &mut SessionGuard, first: &str, first_reply: &str) -> String {
     let session = session.session();
-    read_until_with_dsr(session, MODEL, STARTUP_TIMEOUT);
+    read_until_with_dsr(session, MODEL, PHASE_CAP);
     session.send(format!("{first}\r")).expect("send first turn");
-    let mut captured = read_until_with_dsr(session, first_reply, TURN_TIMEOUT);
+    let mut captured = read_until_with_dsr(session, first_reply, PHASE_CAP);
     session.send("second turn\r").expect("send second turn");
-    captured.push_str(&read_until_with_dsr(session, "SECOND-DONE", TURN_TIMEOUT));
+    captured.push_str(&read_until_with_dsr(session, "SECOND-DONE", PHASE_CAP));
     session.send("/exit\r").expect("send /exit");
-    assert!(wait_for_exit(session, EXIT_TIMEOUT), "chat should exit cleanly");
+    wait_for_graceful_exit(session);
     captured
 }
 

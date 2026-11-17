@@ -11,9 +11,9 @@ use super::guarded_delivery::screen_text;
 use std::time::{Duration, Instant};
 
 use super::{
-    EXIT_TIMEOUT, HarnessGuard, STARTUP_TIMEOUT, SessionGuard, TURN_TIMEOUT, build_provider_chat_command_in,
+    HarnessGuard, MULTI_STAGE_BUDGET, PHASE_CAP, SessionGuard, TestDeadline, build_provider_chat_command_in,
     drain_with_dsr, new_harness_guard, prepare_owned_chat_fixture, read_until_all_with_dsr, read_until_with_dsr,
-    spawn_chat_command, wait_for_exit,
+    spawn_chat_command, wait_for_graceful_exit,
 };
 use crate::compaction_script::{
     PLANT, RECALL, RECALL_WINDOW_TOKENS, RECALLED, assert_handoff_chain, assistant_reply_count,
@@ -57,13 +57,15 @@ fn start(guard: &HarnessGuard, window: usize, filler_files: usize) -> (LoopbackO
     prepare_owned_chat_fixture(guard, &provider, MODEL);
     std::fs::create_dir_all(workspace(guard)).expect("test: workspace");
     write_filler_files(&workspace(guard), filler_files);
-    (server, respawn(guard, &provider, &[]))
+    // One aggregate budget for every session of this scenario (see MULTI_STAGE_BUDGET).
+    let deadline = TestDeadline::new(MULTI_STAGE_BUDGET);
+    (server, respawn(guard, &provider, &[], deadline))
 }
 
-/// Start the fullscreen chat against an already configured fixture.
-fn respawn(guard: &HarnessGuard, provider: &str, args: &[&str]) -> SessionGuard {
+/// Start the fullscreen chat against an already configured fixture, sharing `deadline`.
+fn respawn(guard: &HarnessGuard, provider: &str, args: &[&str], deadline: TestDeadline) -> SessionGuard {
     let command = build_provider_chat_command_in(guard, provider, MODEL, args, &[("PRX_TUI", "1")]);
-    SessionGuard::new(spawn_chat_command(command))
+    SessionGuard::with_deadline(spawn_chat_command(command), deadline)
 }
 
 /// Drain interval while a turn runs.
@@ -75,12 +77,15 @@ const DRAIN_SLICE: Duration = Duration::from_millis(100);
 /// reliable PTY needle; the durable reply is.
 fn turn(guard: &HarnessGuard, session: &mut SessionGuard, line: &str, replies: usize) {
     let session = session.session();
+    session.enter_phase(&format!("turn: reply {replies}"));
     session.send(format!("{line}\r")).expect("send turn");
     let started = Instant::now();
+    let limit = PHASE_CAP.min(session.deadline.remaining());
     while assistant_reply_count(&workspace(guard)) < replies {
         assert!(
-            started.elapsed() < TURN_TIMEOUT,
-            "reply {replies} to `{line}` timed out"
+            started.elapsed() < limit,
+            "reply {replies} to `{line}` timed out in phase `{}`",
+            session.phase
         );
         drain_with_dsr(session, DRAIN_SLICE);
     }
@@ -96,7 +101,7 @@ fn last_reply(guard: &HarnessGuard) -> String {
 fn exit(session: &mut SessionGuard) {
     let session = session.session();
     session.send("/exit\r").expect("send /exit");
-    assert!(wait_for_exit(session, EXIT_TIMEOUT), "chat should exit cleanly");
+    wait_for_graceful_exit(session);
 }
 
 fn assert_handoff_and_recall(guard: &HarnessGuard, server: &LoopbackOpenAi) {
@@ -114,12 +119,13 @@ fn assert_handoff_and_recall(guard: &HarnessGuard, server: &LoopbackOpenAi) {
 fn switch_compaction_and_recall() {
     let guard = new_harness_guard().expect("isolated chat paths");
     let (server, mut session) = start(&guard, RECALL_WINDOW_TOKENS, SWITCH_FILLERS);
-    let banner = read_until_all_with_dsr(session.session(), &[MODEL, "session"], STARTUP_TIMEOUT);
+    let deadline = session.session().deadline;
+    let banner = read_until_all_with_dsr(session.session(), &[MODEL, "session"], PHASE_CAP);
     turn(&guard, &mut session, PLANT, 1);
     turn(&guard, &mut session, &read_line(0), 2);
     assert_eq!(last_reply(&guard), read_done(0), "tool turn 0 completed");
     session.session().send("/compact\r").expect("send /compact");
-    let compacted = screen_text(&read_until_with_dsr(session.session(), "Compacted", TURN_TIMEOUT));
+    let compacted = screen_text(&read_until_with_dsr(session.session(), "Compacted", PHASE_CAP));
     assert!(!compacted.contains("lossy"), "manual compaction compacted: {compacted}");
     let mut replies = 2;
     let mut next_file = 1;
@@ -137,17 +143,17 @@ fn switch_compaction_and_recall() {
     // Right after the automatic switch: both read the compacted state.
     session.session().send("/compact\r").expect("send /compact");
     session.session().send("/branch 1\r").expect("send /branch");
-    let branched = screen_text(&read_until_with_dsr(session.session(), "Created branch", TURN_TIMEOUT));
+    let branched = screen_text(&read_until_with_dsr(session.session(), "Created branch", PHASE_CAP));
     replies += 1;
     turn(&guard, &mut session, RECALL, replies);
     assert_eq!(last_reply(&guard), RECALLED, "the branch recalls the planted fact");
     session.session().send("/sessions\r").expect("send /sessions");
-    let sessions = read_until_with_dsr(session.session(), "current chat session", TURN_TIMEOUT);
+    let sessions = read_until_with_dsr(session.session(), "current chat session", PHASE_CAP);
     exit(&mut session);
     drop(session);
 
-    let mut resumed = respawn(&guard, &server.provider(), &["--session", &id]);
-    read_until_with_dsr(resumed.session(), MODEL, STARTUP_TIMEOUT);
+    let mut resumed = respawn(&guard, &server.provider(), &["--session", &id], deadline);
+    read_until_with_dsr(resumed.session(), MODEL, PHASE_CAP);
     replies += 1;
     turn(&guard, &mut resumed, RECALL, replies);
     assert_eq!(
@@ -195,13 +201,13 @@ fn switch_compaction_and_recall() {
 fn cost_right_after_a_reply_reports_that_turns_exact_usage() {
     let guard = new_harness_guard().expect("isolated chat paths");
     let (_server, mut session) = start(&guard, LARGE_WINDOW_TOKENS, 0);
-    read_until_with_dsr(session.session(), MODEL, STARTUP_TIMEOUT);
+    read_until_with_dsr(session.session(), MODEL, PHASE_CAP);
     turn(&guard, &mut session, PLANT, 1);
     session.session().send("/cost\r").expect("send /cost");
     let report = screen_text(&read_until_all_with_dsr(
         session.session(),
         &["Session cost", "Completion tokens", "Total tokens"],
-        TURN_TIMEOUT,
+        PHASE_CAP,
     ));
     exit(&mut session);
     drop(session);
@@ -222,12 +228,12 @@ fn cost_right_after_a_reply_reports_that_turns_exact_usage() {
 fn manual_compact_below_threshold() {
     let guard = new_harness_guard().expect("isolated chat paths");
     let (server, mut session) = start(&guard, LARGE_WINDOW_TOKENS, 2);
-    read_until_with_dsr(session.session(), MODEL, STARTUP_TIMEOUT);
+    read_until_with_dsr(session.session(), MODEL, PHASE_CAP);
     turn(&guard, &mut session, PLANT, 1);
     turn(&guard, &mut session, &read_line(0), 2);
     turn(&guard, &mut session, &read_line(1), 3);
     session.session().send("/compact\r").expect("send /compact");
-    let compacted = screen_text(&read_until_with_dsr(session.session(), "Compacted", TURN_TIMEOUT));
+    let compacted = screen_text(&read_until_with_dsr(session.session(), "Compacted", PHASE_CAP));
     assert!(
         !compacted.contains("Nothing to compact") && !compacted.contains("lossy"),
         "manual compaction compacted: {compacted}"

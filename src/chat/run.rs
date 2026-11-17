@@ -528,6 +528,9 @@ async fn run_internal(
         Some(turn_signal.clone()),
     );
 
+    // Created before `terminal_input` shows the banner, so a press from then on is kept for the handler below.
+    let interrupts = startup::interrupt_listener()?;
+
     // ── Ctrl+C shared state ─────────────────────────────────────
     // Tracks the timestamp (ms) of the last Ctrl+C press for double-press detection.
     // Lifted above the input loop so the TUI dispatcher can fold its own
@@ -564,7 +567,7 @@ async fn run_internal(
     let mut plain_mode_turn_failed = false;
 
     startup::ctrlc_handler(
-        &last_ctrlc_ms, &shutdown, &chat_dispatcher,
+        interrupts, &last_ctrlc_ms, &shutdown, &chat_dispatcher,
         #[cfg(feature = "terminal-tui")] &chat_mirror,
         #[cfg(feature = "terminal-tui")] &redraw_tx_for_main,
         #[cfg(not(feature = "terminal-tui"))] &active_cancel,
