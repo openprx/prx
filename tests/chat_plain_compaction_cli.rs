@@ -2317,3 +2317,85 @@ fn a_committed_json_answer_in_the_cold_window_is_referenced_by_the_handoff() {
         run.saved
     );
 }
+
+/// The P1-D turn: [`SEQUENTIAL_ROUNDS`] tool rounds, one file read per
+/// provider call, before its text reply.
+const SEQUENTIAL_READS: &str = "SEQUENTIAL-READS every filler";
+/// Sequential tool rounds of the [`SEQUENTIAL_READS`] turn.
+const SEQUENTIAL_ROUNDS: usize = 20;
+/// The window of the P1-D process: small enough that filler reads switch.
+const PROCESS_WINDOW_TOKENS: usize = 12_000;
+/// Filler files for the drive loop: enough reads to cross the window.
+const PROCESS_FILLERS: usize = 60;
+
+/// The compaction script, except that the [`SEQUENTIAL_READS`] turn reads one
+/// file per provider call for [`SEQUENTIAL_ROUNDS`] calls.
+fn script_with_sequential_reads() -> Script {
+    let mut base = compaction_script::script();
+    let mut rounds = 0;
+    Box::new(move |index, request| {
+        if newest_user_text(request).contains(SEQUENTIAL_READS) {
+            if rounds < SEQUENTIAL_ROUNDS {
+                let file = format!("f{rounds}.txt");
+                rounds += 1;
+                return Scripted::tool(
+                    &format!("call-seq-{index}"),
+                    "file_read",
+                    &serde_json::json!({ "path": file }),
+                );
+            }
+            return Scripted::text(compaction_script::NOTED);
+        }
+        base(index, request)
+    })
+}
+
+/// P1-D: one real `prx chat --plain` at a 12000-token window. Filler reads
+/// drive the session across the window until an automatic switch. One turn of
+/// [`SEQUENTIAL_ROUNDS`] sequential tool rounds then runs in the same process.
+/// Every admitted turn stores at most one `context.switch.created`.
+#[test]
+fn one_automatic_switch_per_admitted_turn_across_sequential_tool_rounds() {
+    let sandbox = Sandbox::new();
+    write_filler_files(&sandbox.workspace, PROCESS_FILLERS);
+    let server = LoopbackOpenAi::start(MODEL, Some((11, 7)), script_with_sequential_reads());
+    set_window(&sandbox, &server, PROCESS_WINDOW_TOKENS);
+    let mut chat = HeldChat::spawn(&sandbox, &[]);
+    let mut replies = 0;
+    let mut switches_before = 0;
+    let mut per_turn_switches = Vec::new();
+    let mut turn = |chat: &mut HeldChat, line: &str, replies: &mut usize| {
+        *replies += 1;
+        chat.turn(line, *replies);
+        let switches_now = switch_event_counts(&sandbox.workspace).0;
+        per_turn_switches.push(switches_now - switches_before);
+        switches_before = switches_now;
+    };
+    turn(&mut chat, PLANT, &mut replies);
+    let mut next_file = 0;
+    while switch_event_counts(&sandbox.workspace).0 < 1 && next_file < PROCESS_FILLERS {
+        turn(&mut chat, &read_line(next_file), &mut replies);
+        next_file += 1;
+    }
+    assert!(
+        switch_event_counts(&sandbox.workspace).0 >= 1,
+        "filler reads must drive the session across the window and switch once"
+    );
+    turn(&mut chat, SEQUENTIAL_READS, &mut replies);
+    let output = chat.exit();
+    assert_clean(&output, "one sequential tool turn after an automatic switch");
+
+    assert!(
+        per_turn_switches.iter().all(|stored| *stored <= 1),
+        "at most one context.switch.created per admitted turn: {per_turn_switches:?}"
+    );
+    let sequential_rounds = server
+        .requests()
+        .iter()
+        .filter(|request| newest_user_text(request).contains(SEQUENTIAL_READS))
+        .count();
+    assert!(
+        sequential_rounds > SEQUENTIAL_ROUNDS,
+        "the sequential turn ran its {SEQUENTIAL_ROUNDS} tool rounds: {sequential_rounds} provider calls"
+    );
+}

@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 #[cfg(test)]
 use crate::agent::compaction::is_tool_roundtrip_companion;
 use crate::agent::compaction::{
-    COMPACTION_KEEP_RECENT_MESSAGES, apply_configurable_compaction_over_view,
+    COMPACTION_KEEP_RECENT_MESSAGES, CompactionApply, CompactionBuild, apply_configurable_compaction_over_view,
     build_configurable_compaction_patch_with_source_history, is_context_handoff_message,
     persist_context_switch_degradation,
 };
@@ -567,7 +567,7 @@ async fn run_turn_unguarded(
             )
             .await
             {
-                Ok(Some(_)) => {
+                Ok(CompactionApply::Applied(_)) => {
                     report_durable_compaction(
                         &runtime_adapter,
                         before,
@@ -577,7 +577,7 @@ async fn run_turn_unguarded(
                     .await?;
                     rederive_provider_view(&mut turn_history, history, hooks, channel_name).await;
                 }
-                Ok(None) => {}
+                Ok(CompactionApply::NotNeeded | CompactionApply::Suppressed) => {}
                 Err(error) => {
                     let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
                     tracing::warn!(error_len, error_sha256, "Pre-turn compaction failed");
@@ -1610,7 +1610,7 @@ async fn run_turn_unguarded(
                         )
                         .await
                         {
-                            Ok(Some(patch)) => {
+                            Ok(CompactionBuild::Patch(patch)) => {
                                 crate::agent::idle::beat(crate::agent::idle::ProgressKind::Compaction);
                                 let mut compacted = canonical.clone();
                                 match compacted.apply_patch_with_refresh_aside(&patch) {
@@ -1630,10 +1630,13 @@ async fn run_turn_unguarded(
                                     }
                                 }
                             }
-                            Ok(None) => {
+                            Ok(CompactionBuild::NotNeeded) => {
                                 degraded_reason = Some("handoff_unavailable");
                                 None
                             }
+                            // An automatic switch this turn already spent: the trim below is the
+                            // remediation and is not a new degradation.
+                            Ok(CompactionBuild::Suppressed) => None,
                             Err(error) => {
                                 let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
                                 tracing::warn!(error_len, error_sha256, "Overflow retry compaction failed");

@@ -2066,7 +2066,7 @@ async fn apply_redux_context_rollover(
     )
     .await
     {
-        Ok(Some(patch)) => patch,
+        Ok(crate::agent::compaction::CompactionBuild::Patch(patch)) => patch,
         // A `switch` rollover that cannot produce an exact handoff must not end
         // the turn. Failing the draft here left every session containing tool
         // calls answering each user message with the same non-retryable error
@@ -2076,7 +2076,7 @@ async fn apply_redux_context_rollover(
         // no patch at all: the caller's trim is the whole remediation, and it is
         // lossy. Summary mode returns `None` when there is simply nothing to
         // compact, which is not a degradation.
-        Ok(None) => {
+        Ok(crate::agent::compaction::CompactionBuild::NotNeeded) => {
             let degraded = matches!(config.mode, crate::config::AgentCompactionMode::Switch);
             if degraded {
                 tracing::warn!(
@@ -2102,6 +2102,11 @@ async fn apply_redux_context_rollover(
                 replacement_len: None,
                 degraded,
             });
+        }
+        // An automatic switch this turn already spent: nothing new to record;
+        // the caller's trim is the remediation.
+        Ok(crate::agent::compaction::CompactionBuild::Suppressed) => {
+            return Ok(ContextRolloverOutcome::default());
         }
         Err(error) => {
             let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);

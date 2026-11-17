@@ -3,7 +3,7 @@
 #[cfg(feature = "terminal-tui")]
 use super::tui;
 use super::{dispatcher, sanitize};
-use crate::agent::compaction::build_configurable_compaction_patch_with_source_history;
+use crate::agent::compaction::{CompactionBuild, build_configurable_compaction_patch_with_source_history};
 use crate::agent::context_budget::measure_history_tokens;
 use crate::agent::document_ingest::DocumentIngestRuntime;
 use crate::config::Config;
@@ -437,7 +437,8 @@ pub(super) async fn build_chat_compaction_patch(
     )
     .await
     {
-        Ok(patch) => patch,
+        Ok(CompactionBuild::Patch(patch)) => Some(patch),
+        Ok(CompactionBuild::NotNeeded | CompactionBuild::Suppressed) => None,
         Err(error) => {
             let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
             tracing::warn!(

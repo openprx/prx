@@ -402,10 +402,20 @@ async fn configurable_context_switch_can_roll_over_repeatedly_with_generation_li
         .unwrap();
     history.push(second_assistant);
 
+    // The second rollover is the next admitted turn: its automatic switch budget
+    // is fresh, so it builds on its own runtime rather than the spent one.
+    let next_turn_audit = DocumentIngestRuntime::from_envelope(Arc::clone(&memory), &envelope);
     assert!(
-        apply_configurable_compaction(&mut history, &provider, "model", &config, Some(&audit), "second")
-            .await
-            .unwrap(),
+        apply_configurable_compaction(
+            &mut history,
+            &provider,
+            "model",
+            &config,
+            Some(&next_turn_audit),
+            "second"
+        )
+        .await
+        .unwrap(),
         "a prior handoff must remain exact provenance for the next rollover"
     );
     let second_note = history

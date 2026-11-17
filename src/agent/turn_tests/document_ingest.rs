@@ -88,6 +88,7 @@ fn untrusted_test_runtime(memory: Arc<dyn Memory>) -> DocumentIngestRuntime {
         legacy_session_key: None,
         turn_key: "turn:test-untrusted".to_string(),
         degradation_recorded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        automatic_switch_spent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         agent_id: None,
         persona_id: None,
         channel: Some("terminal".to_string()),

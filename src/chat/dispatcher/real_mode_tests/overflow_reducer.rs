@@ -254,3 +254,153 @@ async fn engine_capacity_failure_reaches_non_retryable_stream_failed() {
     })
     .await;
 }
+
+/// P1-B: one admitted turn through the real redux rollover, then the provider
+/// overflow trigger in the engine. The rollover persists the turn's one
+/// automatic switch; the overflow trigger finds the budget spent and trims
+/// instead, so exactly one `context.switch.created` is stored for the turn.
+#[tokio::test]
+async fn redux_rollover_then_overflow_persists_one_switch_per_admitted_turn() {
+    Box::pin(async {
+        let memory_dir = tempfile::TempDir::new().expect("memory temp dir");
+        let memory: Arc<dyn Memory> =
+            Arc::new(crate::memory::SqliteMemory::new(memory_dir.path()).expect("sqlite memory"));
+        let (mut deps, mut actions, _hooks, temp) = build_deps(Arc::clone(&memory), CancellationToken::new());
+        std::fs::write(temp.path().join("overflow-probe.txt"), CONTENT).expect("real read fixture");
+        let security = Arc::new(crate::security::SecurityPolicy {
+            autonomy: crate::security::AutonomyLevel::Full,
+            workspace_dir: temp.path().to_path_buf(),
+            ..crate::security::SecurityPolicy::default()
+        });
+        deps.tool_security_policy = security.clone();
+        // A switch needs the transcript lookup tool to be registered: the
+        // handoff tells the model how to recover what it dropped.
+        deps.tools_registry = Some(Arc::new(vec![
+            Box::new(crate::tools::FileReadTool::new(security, false)) as Box<dyn crate::tools::Tool>,
+            Box::new(crate::tools::TranscriptHistoryLookupTool::new(Arc::clone(&memory))),
+        ]));
+        let provider = Arc::new(OverflowProvider {
+            calls: AtomicUsize::new(0),
+            rounds: 9,
+            always_overflow: false,
+            requests: Mutex::new(Vec::new()),
+        });
+        deps.provider = provider.clone();
+        let fixture_deps = deps.clone();
+        let cleanup =
+            crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new()).expect("cleanup owner");
+        cleanup
+            .run(async {
+                let binding = admit_start_turn_fixture(&fixture_deps, "prx-one-switch", REQUEST, true).await?;
+                let envelope = binding.envelope().clone();
+                let fabric = crate::memory::MemoryFabric::new(Arc::clone(&memory), envelope.workspace_id.clone());
+                let executor = EffectExecutor::new_with_deps(deps);
+                let mut state = ChatState::new(Arc::from("ollama"), Arc::from("test-model"), CancellationToken::new());
+                state.reduce(Action::RecordSystemMessage { content: "sys".into() });
+                state.reduce(Action::RecordUserTurn("older question".into()));
+                state.reduce(Action::RecordAssistantTurn {
+                    task_id: None,
+                    content: "older completed turn".into(),
+                });
+                // Large old turns, so the cold window is a substantial part of
+                // the history the redux rollover replaces.
+                for i in 0..12 {
+                    state.reduce(Action::RecordUserTurn(format!("old input {i} ").repeat(60)));
+                    state.reduce(Action::RecordAssistantTurn {
+                        task_id: None,
+                        content: format!("old reply {i} ").repeat(60),
+                    });
+                }
+                let base = state.session.history.clone();
+                // The durable transcript carries exact provenance for the cold window.
+                for (index, message) in base.iter().enumerate().skip(1) {
+                    if message.role == "user" {
+                        fabric
+                            .record_inbound_user_message(
+                                envelope.message_scope(),
+                                message.content.clone(),
+                                Some(format!("one-switch-{index}")),
+                                None,
+                            )
+                            .await?;
+                    } else {
+                        fabric
+                            .record_assistant_message(envelope.message_scope(), message.content.clone())
+                            .await?;
+                    }
+                }
+                fabric
+                    .record_inbound_user_message(
+                        envelope.message_scope(),
+                        REQUEST.to_string(),
+                        Some("one-switch-request".to_string()),
+                        None,
+                    )
+                    .await?;
+                let mut worker = base.clone();
+                worker.push(ChatMessage::user(REQUEST));
+                let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+                let task = scheduler.enqueue(REQUEST, crate::chat::turn_scheduler::TurnPriority::Normal, base.len());
+                let config = crate::config::AgentCompactionConfig {
+                    mode: crate::config::AgentCompactionMode::Switch,
+                    max_context_tokens: 2_000,
+                    reserve_tokens: 256,
+                    keep_recent_messages: 12,
+                    memory_flush: false,
+                    ..crate::config::AgentCompactionConfig::default()
+                };
+                let effects = state.reduce(Action::StartLLMTurn {
+                    provider_turn_task_id: Some(task),
+                    provider_turn_sequence: Some(1),
+                    draft_id: "prx-one-switch".into(),
+                    history: worker.clone(),
+                    compaction_guard_history: Some(crate::agent::turn_history::CanonicalHistory::from_test_messages(
+                        worker,
+                    )),
+                    compaction_config: Some(config),
+                    cancel: CancellationToken::new(),
+                    turn_spawn_ctx: None,
+                    turn_message_send_ctx: None,
+                    routing_input: None,
+                    turn_binding: Some(binding),
+                });
+                for effect in effects {
+                    if matches!(effect, Effect::StartTurn { .. }) {
+                        executor.execute(effect).await;
+                    }
+                }
+                let mut saw_rollover = false;
+                let final_text = loop {
+                    let action = tokio::time::timeout(Duration::from_secs(60), actions.recv())
+                        .await
+                        .expect("driver progress")
+                        .expect("driver action");
+                    match action {
+                        Action::HistoryCompactionPatchApplied { .. } => {
+                            saw_rollover = true;
+                            state.reduce(action);
+                        }
+                        Action::ProviderTurnReadyForCommit { final_text, .. } => break final_text,
+                        Action::StreamFailed { err, .. } => panic!("overflow must recover: {err}"),
+                        action => {
+                            state.reduce(action);
+                        }
+                    }
+                };
+                assert!(saw_rollover, "the redux rollover must apply a switch patch");
+                assert_eq!(final_text, "probe complete");
+                let events = memory
+                    .list_message_events_recent(&envelope.memory_principal(), 500)
+                    .await?;
+                let switches = events
+                    .iter()
+                    .filter(|event| event.event_type == "context.switch.created")
+                    .count();
+                assert_eq!(switches, 1, "one automatic switch is persisted for the admitted turn");
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .expect("actual turn cleanup");
+    })
+    .await;
+}

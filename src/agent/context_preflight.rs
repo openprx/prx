@@ -1,4 +1,6 @@
-use crate::agent::compaction::{apply_configurable_compaction_over_view, persist_context_switch_degradation};
+use crate::agent::compaction::{
+    CompactionApply, apply_configurable_compaction_over_view, persist_context_switch_degradation,
+};
 use crate::agent::context_budget::{
     ContextBudgetSnapshot, PRE_TURN_FLUSH_THRESHOLD, budgeted_request_tool_tokens, budgeted_tokens,
     estimate_budgeted_request_tokens, plan_context_budget, reserve_request_tool_surface, token_source_label,
@@ -127,7 +129,7 @@ pub(super) async fn preflight_durable_compaction(
     // Measured on the provider view the gate saw, built from and applied to
     // the canonical history.
     match apply_configurable_compaction_over_view(canonical, view, provider, model, config, audit, trigger).await {
-        Ok(Some(replacement_len)) => {
+        Ok(CompactionApply::Applied(replacement_len)) => {
             canonical.restore_request_at_tail(request, trigger);
             Ok(PreflightCompaction {
                 source: Some(before),
@@ -135,10 +137,16 @@ pub(super) async fn preflight_durable_compaction(
                 degraded_reason: None,
             })
         }
-        Ok(None) => Ok(PreflightCompaction {
+        // A suppressed automatic switch leaves the turn to its trim below.
+        Ok(CompactionApply::NotNeeded) => Ok(PreflightCompaction {
             source: None,
             replacement_len: None,
             degraded_reason: is_switch.then_some("handoff_unavailable"),
+        }),
+        Ok(CompactionApply::Suppressed) => Ok(PreflightCompaction {
+            source: None,
+            replacement_len: None,
+            degraded_reason: None,
         }),
         Err(error) => {
             if !is_switch {

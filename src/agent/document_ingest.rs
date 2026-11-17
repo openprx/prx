@@ -36,6 +36,12 @@ pub(crate) struct DocumentIngestRuntime {
     /// stays degraded used to open one synchronous write transaction per
     /// iteration, forever.
     pub(super) degradation_recorded: Arc<std::sync::atomic::AtomicBool>,
+    /// Set once this admitted turn has spent its automatic `switch` budget: a
+    /// switch succeeded or made no progress. The turn then fits its requests
+    /// without another switch. Manual `/compact` is outside the budget and never
+    /// reads it. Fresh for each admitted turn, shared by clones like
+    /// `degradation_recorded`.
+    pub(super) automatic_switch_spent: Arc<std::sync::atomic::AtomicBool>,
     pub(super) agent_id: Option<String>,
     pub(super) persona_id: Option<String>,
     pub(super) channel: Option<String>,
@@ -51,6 +57,17 @@ pub(crate) struct DocumentIngestRuntime {
 }
 
 impl DocumentIngestRuntime {
+    /// Whether this admitted turn has spent its automatic switch budget.
+    pub(crate) fn automatic_switch_spent(&self) -> bool {
+        self.automatic_switch_spent.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Spend the turn's automatic switch budget (see `automatic_switch_spent`).
+    pub(crate) fn mark_automatic_switch_spent(&self) {
+        self.automatic_switch_spent
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     pub(crate) fn from_envelope(memory: Arc<dyn Memory>, envelope: &RuntimeEnvelope) -> Self {
         Self {
             memory,
@@ -68,6 +85,7 @@ impl DocumentIngestRuntime {
                 .clone()
                 .unwrap_or_else(|| format!("turn:{}", Uuid::new_v4())),
             degradation_recorded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            automatic_switch_spent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             agent_id: envelope.agent_id.clone(),
             persona_id: envelope.persona_id.clone(),
             channel: envelope.channel.clone(),
@@ -110,6 +128,7 @@ impl DocumentIngestRuntime {
                 .map(ToString::to_string)
                 .unwrap_or_else(|| format!("turn:{}", Uuid::new_v4())),
             degradation_recorded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            automatic_switch_spent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             agent_id: None,
             persona_id: None,
             // Persist the originating channel so anonymous principals can
