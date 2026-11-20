@@ -4,7 +4,7 @@ This file is loaded by Claude Code on every session. These rules are MANDATORY.
 
 ## Build & Test
 
-Module flow: the unit of work is one module, built by one lane on one branch and delivered in one PR with the whole module done. Settle every open design value before coding (design, protocol, crypto and security modules get a card audit first); stop and ask instead of inventing one. Push only checkpoint commits while coding; open the PR (not a draft) when the module is complete.
+Module flow: the unit of work is one module, built by one lane on one branch and landed whole. The controller settles every open design value in the design document before coding; a lane stops and asks instead of inventing one. Commit checkpoints on the branch while coding; the lane does not push, open a PR or land.
 
 When the module is written, run these local gates on a warm, persistent target, scoped to what changed:
 
@@ -18,7 +18,7 @@ cargo test --test architecture_boundaries          # fast boundary guard
 
 Add the module's real-component tests (a real process and real wire bytes; never a shared store or synthetic bytes). Tests accept the business logic; there are no break-the-fix checks. After the module lands, it gets a real test on QA (real binary built from main, real provider keys); a failure is the next task.
 
-Do not run the full `cargo test --all-features` suite, mutation batches or stress loops locally. PR CI is the full gate.
+A lane does not run the whole-workspace suite, mutation batches or stress loops. The full gate is the controller's local full gate (the ci-run.yml gate set plus supply-chain checks, run on the build hosts); it runs once on the finished, rebased branch.
 
 ## Seven Iron Rules (Strictly Enforced)
 
@@ -166,7 +166,7 @@ The canonical panic and test rules (Google Rust Style Guide plus PRX resource li
 - See `AGENTS.md` for full architecture protocol
 - Extend via trait implementation + factory registration
 - One concern per module, one concern per PR
-- Branch workflow: one module per branch and per PR. While coding, push checkpoint commits to the branch only (no PR, no CI, no review mid-way). When the whole module passes the local gates, open the PR; CI is the only full gate. After CI is green, one review by a different model (code reading only: check that each test exercises the changed path through real components; no break-the-fix checks); every finding, Lows included, is fixed on the same PR, with no follow-up cards. Then rebase locally onto `origin/main`; if there is no conflict, push `main` directly and delete the branch. There is no merge queue and no post-submit stage. Right after landing, run the module's real test on QA against a binary built from `main`. A red `main` or a failed real test becomes the next task. Three strikes: the same failure signature a third time stops all retries and guess-fixes; write a root-cause note naming the violated invariant, fix against it, and turn the lesson into a flow rule the same day. Compare an infra-looking CI failure (exit 143, OOM, timeout) with main's config and a passing PR's command before calling it a flake.
+- Branch workflow: one module per branch. The lane runs the scoped gates above plus every test it wrote or changed and the suites it touched (feature-gated backends with their feature on), then reports. The controller rebases the branch onto `origin/main` and runs the local full gate; when it is green, `main` is pushed directly (fast-forward) and the branch is deleted. There is no PR, no code review after coding, no merge queue and no post-submit stage; GitHub CI runs on `main` after the push and covers what the local gate cannot (Windows). A change to Windows-only code, installers or `.github/workflows` goes through a PR and GitHub CI first. Right after landing, run the module's real test against a binary built from `main`. A red `main` or a failed real test becomes the next task. Three strikes: the same failure signature a third time stops all retries and guess-fixes; write a root-cause note naming the violated invariant, fix against it, and turn the lesson into a flow rule the same day. Compare an infra-looking CI failure (exit 143, OOM, timeout) with main's config and a passing PR's command before calling it a flake.
 
 ## Commit Style
 

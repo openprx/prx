@@ -242,11 +242,11 @@ All contributors (human or agent) must follow the same collaboration flow:
 
 - Create and work from a non-`main` branch.
 - Commit changes to that branch with clear, scoped commit messages.
-- The unit of work is one module: one branch and one PR with the whole module done. No stacked PRs. Settle every open design value before coding (design, protocol, crypto and security modules get a card audit first); stop and ask instead of inventing one.
-- While coding, push checkpoint commits to the branch only. Do not open a PR, run CI or request review mid-way.
-- When the module passes the local gates (including real-component tests), open the PR (not a draft). CI is the only full gate; review starts only after CI is green.
-- One review by a different model: it reads the code only (no break-the-fix checks) and checks that each test exercises the changed path through real components. Fix every finding, Lows included, on the same PR; no follow-up cards.
-- After the review passes: rebase locally onto the live `origin/main`. If there is no conflict, push `main` directly and delete the branch. There is no merge queue and no post-submit stage.
+- The unit of work is one module: one branch, landed whole. The controller settles every open design value in the design document before coding; stop and ask instead of inventing one.
+- While coding, commit checkpoints on the branch. A lane does not push, open a PR or land.
+- When the module passes the lane's gates (the scoped checks, every test the lane wrote or changed, and the suites it touched, including real-component tests), the lane reports. The full gate is the controller's local full gate (the ci-run.yml gate set plus supply-chain checks, run on the build hosts).
+- There is no code review after coding. Each test must exercise the changed path through real components; there are no break-the-fix checks.
+- When the local full gate is green on the branch rebased onto the live `origin/main`, the controller pushes `main` directly (fast-forward) and deletes the branch. There is no PR, no merge queue and no post-submit stage. GitHub CI runs on `main` after the push. A change to Windows-only code, installers or `.github/workflows` goes through a PR and GitHub CI first.
 - A red `main` becomes the next task.
 
 ### 6.2 Worktree Workflow (Required for Multi-Track Agent Work)
@@ -321,7 +321,7 @@ Use these rules to keep the trait/factory architecture stable under growth.
 
 ## 8) Validation Matrix
 
-Default local checks for code changes (a scoped inner loop; PR CI is the full gate):
+Default local checks for code changes (a scoped inner loop; the controller's local full gate runs once on the finished branch):
 
 ```bash
 cargo fmt --all
@@ -332,7 +332,7 @@ cargo test --test architecture_boundaries
 
 Add the module's real-component tests (a real process and real wire bytes; never a shared store or synthetic bytes). No break-the-fix checks; the real test on QA after landing is the end-to-end proof. A test that needs the real `prx` binary is an integration test under `tests/` (it gets `CARGO_BIN_EXE_prx`); a lib unit test must not depend on the binary artifact, because building both in one CI archive exhausts the hosted runner's memory.
 
-Do not run the full suite, mutation batches, stress loops or a full CI run locally. PR CI is the only full gate.
+A lane does not run the whole-workspace suite, mutation batches or stress loops. It does run every test it wrote or changed and the suites it touched before reporting.
 
 Additional expectations by change type:
 
