@@ -162,6 +162,17 @@ impl<'a> PublicationScope<'a> {
         })
     }
 
+    /// The exhausted daily limit of this turn's pinned spend inputs, if any.
+    pub(crate) fn exhausted_daily_budget(
+        &self,
+        proof: &dyn TurnSourceProof,
+    ) -> Result<Option<crate::cost::tracker::ExhaustedDailyBudget>, AgentDecisionBudgetError> {
+        self.holder
+            .spend_ceiling(proof)?
+            .exhausted_daily()
+            .map_err(AgentDecisionBudgetError::Spend)
+    }
+
     /// A published catalog cannot authorize a capability after its live
     /// registry schema or binding has changed. Call before candidate exposure
     /// and again immediately before committing a directive.

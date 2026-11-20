@@ -553,6 +553,8 @@ async fn run_internal(
             &pty_handoff, &config, &security, &stdin_closed,
         ).await
     };
+    #[cfg(feature = "terminal-tui")]
+    let _operator_notices = startup::tui_operator_notices(&chat_dispatcher, redraw_tx_for_main.as_ref());
     #[cfg(not(feature = "terminal-tui"))]
     let redraw_tx_for_main: Option<mpsc::Sender<()>> = None;
     #[cfg(not(feature = "terminal-tui"))]

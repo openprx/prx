@@ -3016,6 +3016,8 @@ parity and PRX-to-PRX messaging are planned; they are not current behaviour.
 
 A one-shot `prx chat --message 'msg'` turn that closes as a policy refusal still prints the reply on stdout and exits `2`. Exit `1` remains a command or runtime failure. Configuration-actionable refusals (missing price or tariff, exhausted budget, invalid configured price) append one `Reason:` line after the generic sentence. Gate codes that also cover channel eligibility, stale capability references, or decision-transport failure stay on the generic sentence, as do security and policy-internal refusals (including approval internals). A child turn's close reply is the parent tool result, so the same hint reaches `delegate` / `sessions_spawn` callers. Interactive `prx chat` prints the reply and continues.
 
+An exhausted budget refuses only priced turns. A turn whose model is not metered (subscription-billed or local, so its cost estimate is $0) is still admitted when `[cost] daily_limit_usd` or `max_cost_per_day_cents` is used up. The first such turn of a process prints one notice, on stderr in `--plain` and `--message` (stdout stays the reply) and as a system line in the TUI: `Budget exhausted ($<spent> of $<limit> today, UTC); this turn is admitted because <provider>/<model> is not metered.` The amount named is the exhausted limit with the lower remaining. A one-shot reads the limits when it starts, so an edit applies to the next invocation. A running interactive `prx chat` keeps the limits it started with; restart it after a change (spend itself is re-read from the ledger on every send).
+
 ### `[cost.prices]` keys
 
 `[cost.prices]` is an operator-override table. G6 looks up a key with this

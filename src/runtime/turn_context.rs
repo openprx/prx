@@ -61,6 +61,12 @@ impl SpendCeiling {
             .manifest_micro
             .map_or(remaining, |manifest| remaining.min(manifest)))
     }
+
+    /// The daily limit (`[cost] daily_limit_usd` or the security policy's
+    /// `max_cost_per_day_cents`) that today's spend has used up, if any.
+    pub(crate) fn exhausted_daily(&self) -> anyhow::Result<Option<crate::cost::tracker::ExhaustedDailyBudget>> {
+        crate::cost::tracker::exhausted_daily_budget_read_only(&self.cost, &self.workspace_dir, self.security_cents)
+    }
 }
 
 /// Recovery inputs of a root publication: the cleanup owner.

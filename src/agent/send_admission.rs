@@ -255,5 +255,55 @@ pub(crate) fn admit_provider_send(
         }
         .into());
     }
+    if estimate.micro_usd == 0 && ceiling == 0 {
+        notice_budget_exemption(service, proof, &limits.model);
+    }
     Ok(())
+}
+
+/// Set once this process has shown the budget-exemption notice.
+static BUDGET_EXEMPTION_NOTICED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A $0 send was admitted with no spend left. When a daily limit is what is
+/// used up, tell the operator once per process that the turn runs only
+/// because its model is not metered. The notice never reaches the model.
+fn notice_budget_exemption(
+    service: &TurnRuntimeService,
+    proof: &dyn TurnSourceProof,
+    model: &crate::providers::catalog::ResolvedModel,
+) {
+    use std::sync::atomic::Ordering;
+    if BUDGET_EXEMPTION_NOTICED.load(Ordering::Acquire) {
+        return;
+    }
+    let exhausted = match service.exhausted_daily_budget(proof) {
+        Ok(Some(exhausted)) => exhausted,
+        // Spent up by the monthly limit or a child's funding: not a daily notice.
+        Ok(None) => return,
+        Err(error) => {
+            let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+            tracing::warn!(
+                error_len,
+                error_sha256,
+                "budget exemption notice skipped: the daily spend could not be read"
+            );
+            return;
+        }
+    };
+    if BUDGET_EXEMPTION_NOTICED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    crate::runtime::operator_notice::emit(&format!(
+        "Budget exhausted (${} of ${} today, UTC); this turn is admitted because {}/{} is not metered.",
+        usd_text(exhausted.spent_micro_usd),
+        usd_text(exhausted.limit_micro_usd),
+        model.provider_label(),
+        model.model(),
+    ));
+}
+
+/// Micro-USD as dollars rounded to cents, for example `1.83`.
+fn usd_text(micro_usd: u128) -> String {
+    let cents = micro_usd.saturating_add(5_000) / 10_000;
+    format!("{}.{:02}", cents / 100, cents % 100)
 }

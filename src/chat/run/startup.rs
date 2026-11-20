@@ -592,6 +592,26 @@ pub(super) async fn terminal_input(
     }
 }
 
+/// While the TUI draws the chat (`redraw_tx` is set), operator notices are
+/// shown as system lines instead of on stderr, which the TUI screen hides.
+#[cfg(feature = "terminal-tui")]
+pub(super) fn tui_operator_notices(
+    chat_dispatcher: &dispatcher::ChatDispatcher,
+    redraw_tx: Option<&mpsc::Sender<()>>,
+) -> Option<crate::runtime::operator_notice::SinkRegistration> {
+    let redraw_tx = redraw_tx?.clone();
+    let actions = chat_dispatcher.sender();
+    Some(crate::runtime::operator_notice::register_sink(move |text| {
+        let line = crate::chat::action::Action::SystemMessageAdded { text: text.to_owned() };
+        if actions.try_send(line).is_err() {
+            tracing::warn!("operator notice dropped: the chat action channel is full or closed");
+            return;
+        }
+        // A full slot means a redraw is already pending.
+        let _ = redraw_tx.try_send(());
+    }))
+}
+
 /// Read terminal lines (the plain / non-TTY front end) into the chat input
 /// channel. When stdin reaches EOF (or the read fails) `stdin_closed` fires:
 /// the input channel has other senders (scheduled and daemon-assigned input),

@@ -407,6 +407,13 @@ impl TurnRuntimeService {
         self.publication_scope().send_limits(proof)
     }
 
+    pub(crate) fn exhausted_daily_budget(
+        &self,
+        proof: &dyn TurnSourceProof,
+    ) -> Result<Option<crate::cost::tracker::ExhaustedDailyBudget>, AgentDecisionBudgetError> {
+        self.publication_scope().exhausted_daily_budget(proof)
+    }
+
     pub(crate) fn check_live_parity(&self) -> Result<(), ParityError> {
         self.publication_scope().check_live_parity()
     }

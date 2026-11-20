@@ -156,6 +156,52 @@ fn remaining_micro_usd_read_only_inner(
     workspace_dir: &Path,
     security_daily_micro: Option<u128>,
 ) -> Result<u64> {
+    let spend = read_only_spend(config, workspace_dir)?;
+    let remaining = spend
+        .day_limit
+        .saturating_sub(spend.daily)
+        .min(spend.month_limit.saturating_sub(spend.monthly))
+        .min(security_daily_micro.map_or(u128::MAX, |limit| limit.saturating_sub(spend.daily)));
+    u64::try_from(remaining).context("remaining cost budget is out of range")
+}
+
+/// A daily limit that today's charged amount has used up, in micro-USD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExhaustedDailyBudget {
+    /// Today's (UTC) settled spend plus active reservations.
+    pub(crate) spent_micro_usd: u128,
+    /// The exhausted limit: the lower of `[cost] daily_limit_usd` and the
+    /// security policy's `max_cost_per_day_cents`.
+    pub(crate) limit_micro_usd: u128,
+}
+
+/// The daily limit with the lower remaining when today's spend has used it
+/// up, read from the same bounded ledger snapshot as the remaining budget;
+/// `None` while both daily limits have budget left.
+pub(crate) fn exhausted_daily_budget_read_only(
+    config: &CostConfig,
+    workspace_dir: &Path,
+    max_cost_per_day_cents: u32,
+) -> Result<Option<ExhaustedDailyBudget>> {
+    let spend = read_only_spend(config, workspace_dir)?;
+    // Both limits charge the same daily figure, so the lower limit is the one
+    // with the lower remaining.
+    let limit = spend.day_limit.min(u128::from(max_cost_per_day_cents) * 10_000);
+    Ok((spend.daily >= limit).then_some(ExhaustedDailyBudget {
+        spent_micro_usd: spend.daily,
+        limit_micro_usd: limit,
+    }))
+}
+
+/// Charged amounts and configured limits of one read-only ledger snapshot.
+struct ReadOnlySpend {
+    daily: u128,
+    monthly: u128,
+    day_limit: u128,
+    month_limit: u128,
+}
+
+fn read_only_spend(config: &CostConfig, workspace_dir: &Path) -> Result<ReadOnlySpend> {
     if !config.daily_limit_usd.is_finite()
         || !config.monthly_limit_usd.is_finite()
         || config.daily_limit_usd < 0.0
@@ -207,13 +253,12 @@ fn remaining_micro_usd_read_only_inner(
     monthly = monthly
         .checked_add(pending)
         .context("monthly reserved cost overflows")?;
-    let day_limit = floor_micro_usd(config.daily_limit_usd)?;
-    let month_limit = floor_micro_usd(config.monthly_limit_usd)?;
-    let remaining = day_limit
-        .saturating_sub(daily)
-        .min(month_limit.saturating_sub(monthly))
-        .min(security_daily_micro.map_or(u128::MAX, |limit| limit.saturating_sub(daily)));
-    u64::try_from(remaining).context("remaining cost budget is out of range")
+    Ok(ReadOnlySpend {
+        daily,
+        monthly,
+        day_limit: floor_micro_usd(config.daily_limit_usd)?,
+        month_limit: floor_micro_usd(config.monthly_limit_usd)?,
+    })
 }
 
 pub(crate) fn ceil_micro_usd(usd: f64) -> Result<u128> {

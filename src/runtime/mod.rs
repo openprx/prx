@@ -16,6 +16,7 @@ pub(crate) mod h2_entry;
 pub(crate) mod lesson_delivery;
 pub(crate) mod logical_clock;
 pub mod native;
+pub(crate) mod operator_notice;
 pub mod registry;
 pub mod remote_tree;
 mod shell_cgroup;
