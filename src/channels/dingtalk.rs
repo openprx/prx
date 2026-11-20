@@ -245,7 +245,8 @@ impl DingTalkChannel {
             .post(format!("{}/v1.0/oauth2/accessToken", self.openapi_base))
             .json(&body)
             .send()
-            .await?;
+            .await
+            .map_err(reqwest::Error::without_url)?;
         if !resp.status().is_success() {
             let status = resp.status();
             let err = resp.text().await.unwrap_or_default();
@@ -307,7 +308,8 @@ impl DingTalkChannel {
             .header("x-acs-dingtalk-access-token", token)
             .json(&body)
             .send()
-            .await?;
+            .await
+            .map_err(reqwest::Error::without_url)?;
         let status = resp.status();
         let payload = resp.text().await.unwrap_or_default();
         if !status.is_success() {
@@ -364,7 +366,8 @@ impl DingTalkChannel {
             .post(format!("{}/v1.0/gateway/connections/open", self.openapi_base))
             .json(&body)
             .send()
-            .await?;
+            .await
+            .map_err(reqwest::Error::without_url)?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -427,7 +430,14 @@ impl Channel for DingTalkChannel {
                 }
             });
 
-            match self.http_client().post(&route.webhook).json(&body).send().await {
+            match self
+                .http_client()
+                .post(&route.webhook)
+                .json(&body)
+                .send()
+                .await
+                .map_err(webhook_failure_text)
+            {
                 Ok(resp) => {
                     let status = resp.status();
                     let payload = resp.text().await.unwrap_or_default();
@@ -665,10 +675,36 @@ impl Channel for DingTalkChannel {
     }
 }
 
+/// Keep server-issued session capabilities out of transport diagnostics.
+fn webhook_failure_text(error: reqwest::Error) -> String {
+    format!("session webhook: {}", error.without_url())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn secret_url_webhook_failure_strips_session() {
+        use crate::secret_url_test_support::{DEADLINE, MARKER, dropping_server};
+        tokio::time::timeout(DEADLINE, async {
+            let (address, server) = dropping_server(1, None).await;
+            let error = reqwest::Client::new()
+                .post(format!("http://{address}/reply?session={MARKER}"))
+                .send()
+                .await
+                .expect_err("test: dropped webhook must fail");
+            let shown = webhook_failure_text(error);
+            assert!(!shown.contains(MARKER), "test: session capability leaked: {shown}");
+            assert!(
+                shown.contains("session webhook"),
+                "test: safe operation label was lost: {shown}"
+            );
+            server.await.expect("test: join webhook listener");
+        })
+        .await
+        .expect("test: webhook confidentiality deadline");
+    }
     #[test]
     fn test_name() {
         let ch = DingTalkChannel::new("id".into(), "secret".into(), vec![]);

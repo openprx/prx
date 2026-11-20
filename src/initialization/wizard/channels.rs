@@ -183,7 +183,7 @@ pub(super) fn setup_channels() -> Result<ChannelsConfig> {
                 let thread_result = std::thread::spawn(move || {
                     let client = reqwest::blocking::Client::new();
                     let url = format!("https://api.telegram.org/bot{token_clone}/getMe");
-                    let resp = client.get(&url).send()?;
+                    let resp = client.get(&url).send().map_err(reqwest::Error::without_url)?;
                     let ok = resp.status().is_success();
                     let data: serde_json::Value = resp.json().unwrap_or_default();
                     let bot_name = data
@@ -275,7 +275,8 @@ pub(super) fn setup_channels() -> Result<ChannelsConfig> {
                     let resp = client
                         .get("https://discord.com/api/v10/users/@me")
                         .header("Authorization", format!("Bot {token_clone}"))
-                        .send()?;
+                        .send()
+                        .map_err(reqwest::Error::without_url)?;
                     let ok = resp.status().is_success();
                     let data: serde_json::Value = resp.json().unwrap_or_default();
                     let bot_name = data
@@ -369,7 +370,8 @@ pub(super) fn setup_channels() -> Result<ChannelsConfig> {
                     let resp = client
                         .get("https://slack.com/api/auth.test")
                         .bearer_auth(&token_clone)
-                        .send()?;
+                        .send()
+                        .map_err(reqwest::Error::without_url)?;
                     let ok = resp.status().is_success();
                     let data: serde_json::Value = resp.json().unwrap_or_default();
                     let api_ok = data.get("ok").and_then(serde_json::Value::as_bool).unwrap_or(false);
@@ -610,7 +612,8 @@ pub(super) fn setup_channels() -> Result<ChannelsConfig> {
                     let resp = client
                         .get(&url)
                         .header("Authorization", format!("Bearer {}", access_token_clone.trim()))
-                        .send()?;
+                        .send()
+                        .map_err(reqwest::Error::without_url)?;
                     Ok::<_, reqwest::Error>(resp.status().is_success())
                 })
                 .join();
@@ -699,7 +702,8 @@ pub(super) fn setup_channels() -> Result<ChannelsConfig> {
                     let resp = client
                         .get(url)
                         .header("Authorization", format!("Bearer {}", api_token_clone.trim()))
-                        .send()?;
+                        .send()
+                        .map_err(reqwest::Error::without_url)?;
                     Ok::<_, reqwest::Error>(resp.status().is_success())
                 })
                 .join();
@@ -938,7 +942,8 @@ pub(super) fn setup_channels() -> Result<ChannelsConfig> {
                     let resp = client
                         .post("https://api.dingtalk.com/v1.0/gateway/connections/open")
                         .json(&body)
-                        .send()?;
+                        .send()
+                        .map_err(reqwest::Error::without_url)?;
                     Ok::<_, reqwest::Error>(resp.status().is_success())
                 })
                 .join();
@@ -1012,7 +1017,8 @@ pub(super) fn setup_channels() -> Result<ChannelsConfig> {
                     let resp = client
                         .post("https://bots.qq.com/app/getAppAccessToken")
                         .json(&body)
-                        .send()?;
+                        .send()
+                        .map_err(reqwest::Error::without_url)?;
                     if !resp.status().is_success() {
                         return Ok::<_, reqwest::Error>((false, false));
                     }
@@ -1117,6 +1123,7 @@ pub(super) fn setup_channels() -> Result<ChannelsConfig> {
                         .post(endpoint)
                         .json(&body)
                         .send()
+                        .map_err(reqwest::Error::without_url)
                         .map_err(|err| format!("request error: {err}"))?;
 
                     let status = response.status();

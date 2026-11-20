@@ -749,7 +749,7 @@ fn responses_stream_to_chunks(
             let bytes = match item {
                 Ok(bytes) => bytes,
                 Err(err) => {
-                    let _ = tx.send(Err(StreamError::Http(err))).await;
+                    let _ = tx.send(Err(StreamError::from(err))).await;
                     return;
                 }
             };
@@ -1090,7 +1090,7 @@ impl OpenAiCodexProvider {
             {
                 Ok(response) => response,
                 Err(err) => {
-                    let _ = tx.send(Err(StreamError::Http(err))).await;
+                    let _ = tx.send(Err(StreamError::from(err))).await;
                     return;
                 }
             };

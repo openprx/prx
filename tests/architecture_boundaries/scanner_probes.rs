@@ -734,6 +734,10 @@ macro_rules! source_mutation_probes {
 }
 
 source_mutation_probes! {
+    secret_url_builders_are_inventoried => probe_secret_url_builders,
+    secret_url_carriers_strip_request_urls => probe_secret_url_carriers,
+    stream_http_errors_have_one_constructor => probe_stream_http_constructor,
+    server_url_logs_are_redacted => probe_server_url_logs,
     provider_label_sinks_redact_url_userinfo => terminal_provider_label_guard_rejects_bypass_missing_calls_and_literal_decoys,
     embedded_user_input_cannot_bypass_reserved_marker_neutralization => mutation_proof_embedded_input_guard,
     every_non_tool_execute_call_site_shows_its_type_evidence => mutation_proof_execution_binding_guard,
@@ -966,5 +970,55 @@ fn panic_guard_permits_generic_unwrap_or() {
             )]
         ),
         "generic unwrap_or must remain permitted by the panic guard"
+    );
+}
+
+use super::secret_urls::{
+    secret_url_builders_are_inventoried, secret_url_carriers_strip_request_urls, server_url_logs_are_redacted,
+    stream_http_errors_have_one_constructor,
+};
+
+#[test]
+fn probe_secret_url_builders() {
+    run_planted_probe(
+        "secret_url_builders_are_inventoried",
+        secret_url_builders_are_inventoried,
+        "src/secret_url_probe.rs",
+        Planted::NewFile,
+        Reads::ProductionText,
+        r#"fn probe() { let x = format!("https://example.com/?sig={x}"); }"#,
+    );
+}
+#[test]
+fn probe_secret_url_carriers() {
+    run_planted_probe(
+        "secret_url_carriers_strip_request_urls",
+        secret_url_carriers_strip_request_urls,
+        "src/secret_url_probe.rs",
+        Planted::NewFile,
+        Reads::ProductionText,
+        r#"fn probe() { let url = format!("https://example.com/?sig={x}"); client.get(url).send().await?; }"#,
+    );
+}
+#[test]
+fn probe_stream_http_constructor() {
+    run_planted_probe(
+        "stream_http_errors_have_one_constructor",
+        stream_http_errors_have_one_constructor,
+        "src/secret_url_probe.rs",
+        Planted::NewFile,
+        Reads::ProductionText,
+        "fn probe() { Err(StreamError::Http(e)) }",
+    );
+}
+#[test]
+fn probe_server_url_logs() {
+    run_planted_probe(
+        "server_url_logs_are_redacted",
+        server_url_logs_are_redacted,
+        "src/channels/secret_url_probe.rs",
+        Planted::NewFile,
+        Reads::ProductionText,
+        r#"fn probe() { tracing::info!("connecting {wss_url}"); }"#,
     );
 }

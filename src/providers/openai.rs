@@ -1038,7 +1038,7 @@ impl Provider for OpenAiProvider {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx.send(Err(StreamError::Http(e))).await;
+                    let _ = tx.send(Err(StreamError::from(e))).await;
                     return;
                 }
             };
@@ -1074,7 +1074,7 @@ impl Provider for OpenAiProvider {
                 let bytes = match bytes_res {
                     Ok(b) => b,
                     Err(e) => {
-                        let _ = tx.send(Err(StreamError::Http(e))).await;
+                        let _ = tx.send(Err(StreamError::from(e))).await;
                         return;
                     }
                 };

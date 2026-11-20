@@ -1028,7 +1028,7 @@ impl Provider for OllamaProvider {
             let response = match req_builder.send().await {
                 Ok(response) => response,
                 Err(err) => {
-                    let _ = tx.send(Err(StreamError::Http(err))).await;
+                    let _ = tx.send(Err(StreamError::from(err))).await;
                     return;
                 }
             };
@@ -1046,7 +1046,7 @@ impl Provider for OllamaProvider {
                 let bytes = match item {
                     Ok(bytes) => bytes,
                     Err(err) => {
-                        let _ = tx.send(Err(StreamError::Http(err))).await;
+                        let _ = tx.send(Err(StreamError::from(err))).await;
                         return;
                     }
                 };

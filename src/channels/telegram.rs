@@ -619,32 +619,14 @@ impl TelegramChannel {
     /// error from Telegram or from a proxy in between may echo it. The token
     /// is replaced before the cut, so a cut can never leave part of it behind.
     fn sanitize_diagnostic(&self, text: &str) -> String {
-        let redacted = if self.bot_token.is_empty() {
-            std::borrow::Cow::Borrowed(text)
-        } else {
-            std::borrow::Cow::Owned(text.replace(self.bot_token.as_str(), TELEGRAM_REDACTION_MARKER))
-        };
-        let mut chars = redacted.chars();
-        let mut kept: String = chars.by_ref().take(TELEGRAM_DIAGNOSTIC_MAX_CHARS).collect();
-        if chars.next().is_some() {
-            kept.push_str(TELEGRAM_DIAGNOSTIC_TRUNCATED);
-        }
-        kept
+        sanitize_diagnostic(&self.bot_token, text)
     }
 
     /// Turn a failed Bot API request or response read into an error that is
     /// safe to log or return: the request URL is dropped, the causes are
     /// kept as text, and the result goes through `sanitize_diagnostic`.
     fn transport_error(&self, error: reqwest::Error) -> anyhow::Error {
-        let error = error.without_url();
-        let mut text = error.to_string();
-        let mut cause = std::error::Error::source(&error);
-        while let Some(inner) = cause {
-            text.push_str(": ");
-            text.push_str(&inner.to_string());
-            cause = inner.source();
-        }
-        anyhow::anyhow!(self.sanitize_diagnostic(&text))
+        transport_error(&self.bot_token, error)
     }
 
     /// Read the body of a Bot API response for diagnostics only, through
@@ -1917,7 +1899,8 @@ impl Channel for TelegramChannel {
                     "message_id": msg_id,
                 }))
                 .send()
-                .await;
+                .await
+                .map_err(|error| self.transport_error(error));
 
             // Fall back to chunked send
             return self.send_text_chunks(text, &chat_id, thread_id.as_deref()).await;
@@ -2118,7 +2101,8 @@ Ensure only one `openprx` process is using this bot token."
                         .post(self.api_url("sendChatAction"))
                         .json(&typing_body)
                         .send()
-                        .await; // Ignore errors for typing indicator
+                        .await
+                        .map_err(|error| self.transport_error(error)); // Ignore errors for typing indicator
 
                     if tx.send(msg).await.is_err() {
                         return Ok(());
@@ -2149,6 +2133,7 @@ Ensure only one `openprx` process is using this bot token."
 
         let client = self.http_client();
         let url = self.api_url("sendChatAction");
+        let bot_token = self.bot_token.clone();
         let chat_id = recipient.to_string();
 
         let handle = tokio::spawn(async move {
@@ -2157,7 +2142,12 @@ Ensure only one `openprx` process is using this bot token."
                     "chat_id": &chat_id,
                     "action": "typing"
                 });
-                let _ = client.post(&url).json(&body).send().await;
+                let _ = client
+                    .post(&url)
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|error| transport_error(&bot_token, error));
                 // Telegram typing indicator expires after 5s; refresh at 4s
                 tokio::time::sleep(Duration::from_secs(4)).await;
             }
@@ -2176,6 +2166,33 @@ Ensure only one `openprx` process is using this bot token."
         }
         Ok(())
     }
+}
+
+// Share the channel's diagnostic policy with the owned background typing task.
+fn sanitize_diagnostic(bot_token: &str, text: &str) -> String {
+    let redacted = if bot_token.is_empty() {
+        std::borrow::Cow::Borrowed(text)
+    } else {
+        std::borrow::Cow::Owned(text.replace(bot_token, TELEGRAM_REDACTION_MARKER))
+    };
+    let mut chars = redacted.chars();
+    let mut kept: String = chars.by_ref().take(TELEGRAM_DIAGNOSTIC_MAX_CHARS).collect();
+    if chars.next().is_some() {
+        kept.push_str(TELEGRAM_DIAGNOSTIC_TRUNCATED);
+    }
+    kept
+}
+
+fn transport_error(bot_token: &str, error: reqwest::Error) -> anyhow::Error {
+    let error = error.without_url();
+    let mut text = error.to_string();
+    let mut cause = std::error::Error::source(&error);
+    while let Some(inner) = cause {
+        text.push_str(": ");
+        text.push_str(&inner.to_string());
+        cause = inner.source();
+    }
+    anyhow::anyhow!(sanitize_diagnostic(bot_token, &text))
 }
 
 #[cfg(test)]
@@ -2817,7 +2834,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transport_errors_do_not_carry_the_bot_token() {
+    async fn secret_url_telegram_transport_errors_do_not_carry_the_bot_token() {
         let (base, closer) = closing_loopback_base().await;
         let ch = TelegramChannel::new(LEAK_TEST_TOKEN.into(), vec!["*".into()], false).with_api_base(&base);
         let url = ch.api_url("getUpdates");

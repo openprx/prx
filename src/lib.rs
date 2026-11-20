@@ -876,3 +876,6 @@ pub enum EvolutionLayerArg {
     #[value(name = "L3")]
     L3,
 }
+
+#[cfg(test)]
+mod secret_url_test_support;

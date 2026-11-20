@@ -1413,7 +1413,7 @@ impl Provider for BedrockProvider {
                 let bytes = match item {
                     Ok(bytes) => bytes,
                     Err(err) => {
-                        let _ = tx.send(Err(StreamError::Http(err))).await;
+                        let _ = tx.send(Err(StreamError::from(err))).await;
                         return;
                     }
                 };

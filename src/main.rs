@@ -1675,7 +1675,7 @@ fn main() -> std::process::ExitCode {
     {
         Ok(runtime) => runtime,
         Err(err) => {
-            eprintln!("Error: {err:?}");
+            eprintln!("Error: {}", openprx::security::redaction::redacted_error_report(&err));
             return std::process::ExitCode::FAILURE;
         }
     };
@@ -1691,7 +1691,7 @@ fn main() -> std::process::ExitCode {
             if code == openprx::chat::ONE_SHOT_REFUSAL_EXIT_CODE {
                 return std::process::ExitCode::from(code);
             }
-            eprintln!("Error: {err:?}");
+            eprintln!("Error: {}", openprx::security::redaction::redacted_error_report(&err));
             std::process::ExitCode::FAILURE
         }
     }
