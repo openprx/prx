@@ -576,6 +576,12 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
             }
             Some(DoctorCommands::Memory) => doctor::run_memory(&config),
             Some(DoctorCommands::Runtime) => doctor::run_runtime(&config).await,
+            Some(DoctorCommands::Ingress) => {
+                let config_for_ingress = config.clone();
+                crate::runtime::blocking::spawn_blocking(move || doctor::run_ingress(&config_for_ingress))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("doctor ingress task failed: {e}"))?
+            }
             None => {
                 // `doctor::run` is fully synchronous (filesystem probes plus
                 // short-lived `df`/`--version` subprocesses); keep it off the

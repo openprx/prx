@@ -1,9 +1,10 @@
 //! Recovery consumes authenticated durable reception, never execution authority.
 use crate::memory::ingress_recovery::PendingFacts;
 use crate::memory::ingress_recovery::{
-    IngressAppendOutcome, IngressAttestation, IngressCapsule, IngressEventLookup, IngressLifetime,
-    IngressRecoveryCommit, IngressRecoveryScan, IngressRecoveryScope, IngressRecoveryState, MAX_CAPSULE_BYTES,
-    MAX_RECOVERY_EVENT_BYTES, MAX_RECOVERY_PAGE, input_within_bounds, remaining, serialized_within,
+    IngressAppendOutcome, IngressAttestation, IngressCapsule, IngressEventLookup, IngressLifetime, IngressLockMissing,
+    IngressRecoveryClaim, IngressRecoveryCommit, IngressRecoveryScan, IngressRecoveryScope, IngressRecoveryState,
+    MAX_CAPSULE_BYTES, MAX_RECOVERY_EVENT_BYTES, MAX_RECOVERY_PAGE, OrphanCause, input_within_bounds, remaining,
+    serialized_within,
 };
 use crate::memory::recovery_authority::{RecoveryChain, RecoveryMacDomain, RecoveryRepository, RecoveryTag};
 use crate::memory::{Memory, MemoryVisibility, MessageEvent, MessageEventInput};
@@ -370,7 +371,9 @@ impl IngressRecorder {
             })
             .await?
         };
-        match self
+        // Only a fault of the store on this new row fails the append; it names
+        // this run and the store for the operator.
+        let appended = self
             .memory
             .append_ingress_input(
                 input,
@@ -379,18 +382,18 @@ impl IngressRecorder {
                 self.deadline,
                 Some(attestation),
             )
-            .await?
-        {
+            .await
+            .with_context(|| self.diagnostic(&capsule.run_id))?;
+        match appended {
             IngressAppendOutcome::Inserted(event) => {
-                {
+                let verified = {
                     let capsule = capsule.clone();
                     let event = event.clone();
-                    self.owned_work(move |recorder| {
-                        recorder.verify(&capsule, &event)?;
-                        Ok(())
-                    })
-                    .await?;
-                }
+                    self.owned_work(move |recorder| recorder.verify(&capsule, &event))
+                        .await?
+                };
+                // The owner settles this row in its own terminal commit (I3).
+                settlement::register_owned_input(&capsule, verified, &self.lifetime);
                 remaining(self.deadline)?;
                 Ok(event)
             }
@@ -469,9 +472,12 @@ impl IngressRecorder {
         let _barrier = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), self.barrier.lock())
             .await
             .context("ingress recovery barrier deadline elapsed")?;
+        let namespace = self.lifetime.namespace().to_owned();
         let mut cursor = 0;
         loop {
-            let candidates = self
+            // No prior row can stop new input (I2). A failed scan settles
+            // nothing and blocks nothing: the new row meets the store itself.
+            let candidates = match self
                 .memory
                 .list_ingress_recovery_candidates(
                     scope,
@@ -485,154 +491,207 @@ impl IngressRecorder {
                     MAX_RECOVERY_PAGE,
                     deadline,
                 )
-                .await?;
-            remaining(deadline)?;
-            if candidates.is_empty() {
+                .await
+            {
+                Ok(candidates) => candidates,
+                Err(error) => {
+                    tracing::warn!(error = %crate::agent::diagnostics::error_class(&error),
+                        "ingress recovery scan failed; new input continues");
+                    return Ok(());
+                }
+            };
+            if candidates.is_empty() || remaining(deadline).is_err() {
                 return Ok(());
             }
             for candidate in candidates {
-                anyhow::ensure!(
-                    candidate.cursor > cursor && candidate.capsule.scope == *scope,
-                    "ingress recovery cursor or owner changed"
-                );
+                if candidate.cursor <= cursor || candidate.capsule.scope != *scope {
+                    tracing::warn!("ingress recovery scan returned an out-of-order or foreign row; the scan stops");
+                    return Ok(());
+                }
                 cursor = candidate.cursor;
                 let capsule = candidate.capsule;
-                let recovered = async {
-                    if capsule.lifetime == self.lifetime.token() {
-                        return Ok(());
-                    }
-                    if self.boxed_quarantine_marker(scope, &capsule).await? {
-                        return Ok(());
-                    }
-                    let Some(claim) = self
-                        .memory
-                        .claim_ingress_recovery(&scope.workspace_id, &capsule.lifetime, deadline)
-                        .await?
-                    else {
-                        anyhow::bail!("another ingress lifetime remains active; recovery is not ready");
-                    };
-                    let event = self
-                        .memory
-                        .read_ingress_event(
-                            scope,
-                            &IngressEventLookup::EventId(capsule.input_event_id.clone()),
-                            deadline,
-                        )
-                        .await?
-                        .context("durable ingress input is missing")?;
-                    let verified = {
-                        let capsule = capsule.clone();
-                        let event = event.clone();
-                        self.owned_work(move |recorder| recorder.verify(&capsule, &event)).await
-                    };
-                    let verified = match verified {
-                        Ok(input) => input,
-                        Err(error) if unverifiable_ingress(&error).is_some() => {
-                            self.boxed_record_quarantine(scope, &capsule, unverifiable_ingress(&error).unwrap_or("unverifiable ingress"))
-                                .await?;
-                            return Ok(());
-                        }
-                        Err(error) => return Err(error),
-                    };
-                    let final_event = if recovery.is_some() {
-                        self.memory
-                            .read_ingress_event(
-                                scope,
-                                &IngressEventLookup::IdempotencyKey(format!("turn:{}:final", capsule.run_id)),
-                                deadline,
-                            )
-                            .await?
-                    } else {
-                        None
-                    };
-                    let state = if let (Some(recovery), Some(_)) = (recovery, final_event.as_ref()) {
-                        match recovery.rejoin_ingress_terminal(&capsule, deadline, &self.owner).await {
-                            Ok(_) => IngressRecoveryState::Reconciled,
-                            Err(error) if unverifiable_ingress(&error).is_some() => {
-                                self.boxed_record_quarantine(scope, &capsule, unverifiable_ingress(&error).unwrap_or("unverifiable terminal"))
-                                    .await?;
-                                return Ok(());
-                            }
-                            Err(error) => return Err(error),
-                        }
-                    } else {
-                        IngressRecoveryState::Unconfirmed
-                    };
-                    let mut evidence = verified;
-                    let state_label = if state == IngressRecoveryState::Reconciled {
-                        "reconciled"
-                    } else {
-                        "unconfirmed"
-                    };
-                    // Absence of a verified final is never interpreted as no charge
-                    // or no provider execution. A late final remains replayable by
-                    // the existing signed terminal verifier.
-                    evidence.event_id = None;
-                    evidence.causation_event_id = Some(capsule.input_event_id.clone());
-                    evidence.idempotency_key = Some(format!("ingress:{}:{state_label}", capsule.input_event_id));
-                    evidence.role = "event".into();
-                    evidence.event_type = if state == IngressRecoveryState::Reconciled {
-                        "turn.ingress.reconciled"
-                    } else {
-                        "turn.ingress.interrupted"
-                    }
-                    .into();
-                    evidence.content = if state == IngressRecoveryState::Reconciled {
-                        "turn.ingress.reconciled authenticated final evidence rejoined"
-                    } else {
-                        "turn.ingress.interrupted outcome and usage remain unconfirmed"
-                    }
-                    .into();
-                    let state_bytes = serde_json::to_vec(&(state_label, &capsule))?;
-                    let capsule_for_mac = capsule.clone();
-                    let authentication = hex::encode(
-                        self.owned_work(move |recorder| {
-                            recorder.slot_mac(&capsule_for_mac, RecoveryMacDomain::StateV3, &state_bytes)
-                        })
-                        .await?,
-                    );
-                    evidence.raw_payload_json = Some(serde_json::to_string(
-                        &serde_json::json!({"ingress_recovery":{"capsule":capsule,"state":state_label,"evidence_authentication":authentication}}),
-                    )?);
-                    let expected = evidence.clone();
-                    let recorded = self
-                        .memory
-                        .commit_ingress_recovery(IngressRecoveryCommit {
-                            capsule: capsule.clone(),
-                            state,
-                            evidence,
-                            claim,
-                            deadline,
-                        })
-                        .await?;
-                    anyhow::ensure!(
-                        recorded.idempotency_key == expected.idempotency_key
-                            && recorded.content == expected.content
-                            && recorded.raw_payload_json == expected.raw_payload_json,
-                        "interruption evidence receipt differs from proposal"
-                    );
-                    let stored = self
-                        .memory
-                        .read_ingress_event(scope, &IngressEventLookup::EventId(recorded.event_id.clone()), deadline)
-                        .await?
-                        .context("interruption evidence readback missing")?;
-                    anyhow::ensure!(
-                        serde_json::to_value(stored)? == serde_json::to_value(recorded)?,
-                        "interruption evidence is not durably confirmed"
-                    );
-                    Ok(())
-                }.await;
-                match recovered {
+                // The owner settles its own rows in their terminal commits.
+                if capsule.lifetime == self.lifetime.token()
+                    || settlement::quarantined_this_process(&namespace, &capsule)
+                {
+                    continue;
+                }
+                let outcome = match self.boxed_recover_row(scope, &capsule, recovery, deadline).await {
+                    Ok(outcome) => outcome,
                     // Matrix row "K = no": this capsule's key is unusable. Write
                     // no marker, do not replay, leave it pending; the shared
                     // warning is emitted by the memory layer, once.
-                    Err(error) if crate::memory::recovery_authority::is_key_unavailable(&error) => {}
-                    other => {
-                        other.with_context(|| self.diagnostic(&capsule.run_id))?;
+                    Err(failure) if crate::memory::recovery_authority::is_key_unavailable(&failure.error) => continue,
+                    // The budget ran out inside the row: not a fault of the row.
+                    Err(_) if remaining(deadline).is_err() => return Ok(()),
+                    Err(failure) => {
+                        tracing::debug!(error = %crate::agent::diagnostics::error_class(&failure.error),
+                            cause = failure.cause.as_str(), "prior ingress row failed recovery");
+                        if let Err(error) = self.boxed_record_quarantine(scope, &capsule, failure.cause).await {
+                            tracing::warn!(error = %crate::agent::diagnostics::error_class(&error),
+                                "ingress quarantine marker was not recorded; the row is retried after a restart");
+                        }
+                        RecoveryRowOutcome::Quarantined(failure.cause)
                     }
-                }
+                };
+                settlement::note_outcome(&namespace, &capsule, outcome);
             }
         }
+    }
+
+    /// One prior row of another lifetime. Recovery never runs or re-sends
+    /// anything (I4); it only records the row's outcome. A row whose lifetime
+    /// may still be live is never labelled (I5).
+    async fn recover_row(
+        self: &Arc<Self>,
+        scope: &IngressRecoveryScope,
+        capsule: &IngressCapsule,
+        recovery: Option<&RecoveryScope>,
+        deadline: Instant,
+    ) -> Result<RecoveryRowOutcome, RowFailure> {
+        let claim = match self
+            .memory
+            .claim_ingress_recovery(&scope.workspace_id, &capsule.lifetime, deadline)
+            .await
+        {
+            Ok(Some(claim)) => Some(claim),
+            Ok(None) => return Ok(RecoveryRowOutcome::SkippedLive),
+            Err(error) if error.is::<IngressLockMissing>() => None,
+            Err(error) => {
+                return Err(RowFailure {
+                    cause: QuarantineCause::LockUnusable,
+                    error,
+                });
+            }
+        };
+        let event = self
+            .memory
+            .read_ingress_event(
+                scope,
+                &IngressEventLookup::EventId(capsule.input_event_id.clone()),
+                deadline,
+            )
+            .await
+            .at(QuarantineCause::InputUnreadable)?;
+        let (base, cause) = match event {
+            // The input is gone, or its capsule is: only the row's own capsule
+            // remains to describe it.
+            None => (
+                settlement::capsule_evidence_base(capsule),
+                Some(OrphanCause::InputMissing),
+            ),
+            Some(event) if !carries_capsule(&event) => (
+                settlement::capsule_evidence_base(capsule),
+                Some(OrphanCause::InputMissing),
+            ),
+            Some(event) => {
+                let verified = {
+                    let capsule = capsule.clone();
+                    self.owned_work(move |recorder| recorder.verify(&capsule, &event)).await
+                }
+                .map_err(|error| RowFailure {
+                    cause: QuarantineCause::of_input(&error),
+                    error,
+                })?;
+                (verified, claim.is_none().then_some(OrphanCause::LockMissing))
+            }
+        };
+        // An authenticated final upgrades the row (I6); a row without its
+        // input has nothing to rejoin.
+        let final_found = recovery.is_some()
+            && cause != Some(OrphanCause::InputMissing)
+            && self
+                .memory
+                .read_ingress_event(
+                    scope,
+                    &IngressEventLookup::IdempotencyKey(format!("turn:{}:final", capsule.run_id)),
+                    deadline,
+                )
+                .await
+                .at(QuarantineCause::TerminalUnreadable)?
+                .is_some();
+        let state = match recovery {
+            Some(recovery) if final_found => {
+                recovery
+                    .rejoin_ingress_terminal(capsule, deadline, &self.owner)
+                    .await
+                    .map_err(|error| RowFailure {
+                        cause: QuarantineCause::of_terminal(&error),
+                        error,
+                    })?;
+                IngressRecoveryState::Reconciled
+            }
+            _ => IngressRecoveryState::Unconfirmed,
+        };
+        let outcome = match (state, cause) {
+            (IngressRecoveryState::Unconfirmed, Some(cause)) => RecoveryRowOutcome::Orphaned(cause),
+            _ => RecoveryRowOutcome::Settled,
+        };
+        if state == IngressRecoveryState::Unconfirmed
+            && self
+                .memory
+                .read_ingress_event(
+                    scope,
+                    &IngressEventLookup::IdempotencyKey(format!("ingress:{}:unconfirmed", capsule.input_event_id)),
+                    deadline,
+                )
+                .await
+                .at(QuarantineCause::EvidenceRejected)?
+                .is_some()
+        {
+            // Already recorded unconfirmed; nothing new to write.
+            return Ok(outcome);
+        }
+        let evidence = {
+            let capsule = capsule.clone();
+            self.owned_work(move |recorder| {
+                let repository = recorder
+                    .memory
+                    .recovery_repository()
+                    .context("recovery repository unavailable")?;
+                settlement::settlement_evidence(repository, base, &capsule, state, cause, Settler::Successor)
+            })
+            .await
+            .at(QuarantineCause::EvidenceRejected)?
+        };
+        let expected = evidence.clone();
+        let orphan = claim.is_none();
+        let commit = IngressRecoveryCommit {
+            capsule: capsule.clone(),
+            state,
+            evidence,
+            claim: claim.unwrap_or_else(|| IngressRecoveryClaim {
+                lifetime: self.lifetime.clone(),
+            }),
+            deadline,
+            cause,
+        };
+        let recorded = if orphan {
+            self.memory.commit_orphaned_ingress_recovery(commit).await
+        } else {
+            self.memory.commit_ingress_recovery(commit).await
+        }
+        .at(QuarantineCause::EvidenceRejected)?;
+        let confirmed = async {
+            anyhow::ensure!(
+                recorded.idempotency_key == expected.idempotency_key
+                    && recorded.content == expected.content
+                    && recorded.raw_payload_json == expected.raw_payload_json,
+                "interruption evidence receipt differs from proposal"
+            );
+            let stored = self
+                .memory
+                .read_ingress_event(scope, &IngressEventLookup::EventId(recorded.event_id.clone()), deadline)
+                .await?
+                .context("interruption evidence readback missing")?;
+            anyhow::ensure!(
+                serde_json::to_value(stored)? == serde_json::to_value(&recorded)?,
+                "interruption evidence is not durably confirmed"
+            );
+            Ok(())
+        };
+        confirmed.await.at(QuarantineCause::EvidenceRejected)?;
+        Ok(outcome)
     }
 
     // `append` and service startup await recovery. Storing that state machine
@@ -655,14 +714,16 @@ impl IngressRecorder {
         })
     }
 
-    // The marker futures stay out of `recover` for the same reason.
+    // The row and marker futures stay out of `recover` for the same reason.
     #[inline(never)]
-    fn boxed_quarantine_marker<'a>(
+    fn boxed_recover_row<'a>(
         self: &'a Arc<Self>,
         scope: &'a IngressRecoveryScope,
         capsule: &'a IngressCapsule,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<bool>> + Send + 'a>> {
-        Box::pin(self.quarantine_marker_present(scope, capsule))
+        recovery: Option<&'a RecoveryScope>,
+        deadline: Instant,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RecoveryRowOutcome, RowFailure>> + Send + 'a>> {
+        Box::pin(self.recover_row(scope, capsule, recovery, deadline))
     }
 
     #[inline(never)]
@@ -670,9 +731,9 @@ impl IngressRecorder {
         self: &'a Arc<Self>,
         scope: &'a IngressRecoveryScope,
         capsule: &'a IngressCapsule,
-        reason: &'static str,
+        cause: QuarantineCause,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
-        Box::pin(self.record_quarantine(scope, capsule, reason))
+        Box::pin(self.record_quarantine(scope, capsule, cause))
     }
 
     fn quarantine_key(capsule: &IngressCapsule) -> String {
@@ -765,13 +826,14 @@ impl IngressRecorder {
         Ok(false)
     }
 
-    /// Leave the unverifiable row in place and remember that it must not block
-    /// a later turn. The marker carries no user content and no key material.
+    /// Leave the row in place and record why it was quarantined. The marker
+    /// carries the cause code only: no user content, no error text and no key
+    /// material.
     async fn record_quarantine(
         self: &Arc<Self>,
         scope: &IngressRecoveryScope,
         capsule: &IngressCapsule,
-        reason: &'static str,
+        cause: QuarantineCause,
     ) -> anyhow::Result<()> {
         if self.quarantine_marker_present(scope, capsule).await? {
             return Ok(());
@@ -789,7 +851,7 @@ impl IngressRecorder {
         } else {
             primary
         };
-        let mut payload = serde_json::json!({"capsule": capsule, "reason": reason});
+        let mut payload = serde_json::json!({"capsule": capsule, "reason": cause.as_str()});
         let payload_bytes = serde_json::to_vec(&payload)?;
         let capsule_for_mac = capsule.clone();
         let authentication = hex::encode(
@@ -830,7 +892,7 @@ impl IngressRecorder {
                 lease_epoch: None,
                 config_generation_id: None,
                 config_source_revision: None,
-                content: format!("turn.ingress.quarantined {reason}"),
+                content: format!("turn.ingress.quarantined {}", cause.as_str()),
                 raw_payload_json: Some(serde_json::to_string(&payload)?),
                 visibility: MemoryVisibility::System,
             })
@@ -845,42 +907,8 @@ impl IngressRecorder {
             recorded.idempotency_key.as_deref() == Some(key.as_str()) && verified,
             "quarantine marker was not recorded"
         );
-        tracing::error!(reason, run_id = %capsule.run_id,
-            brain_db = %self.workspace.join("memory/brain.db").display(),
-            "quarantined unverifiable ingress record; startup recovery will continue");
         Ok(())
     }
-}
-
-fn unverifiable_ingress(error: &anyhow::Error) -> Option<&'static str> {
-    const REASONS: &[&str] = &[
-        "terminal replay authentication failed",
-        "terminal replay event authentication failed",
-        "invalid ingress capsule authentication",
-        "unsigned terminal cannot be replayed",
-        "invalid terminal replay signature",
-        "terminal replay binding does not match the committed marker",
-        "original terminal source event is missing",
-        "terminal replay decision row is missing",
-    ];
-    // A terminal whose restart verification fails (D§4.4), including one
-    // that carries no settled receipt, and a pre-v3 capsule are never
-    // re-executed or settled: the scan quarantines them like any other
-    // unauthenticated terminal.
-    error.chain().find_map(|cause| {
-        if cause.is::<crate::runtime::turn_terminal::restart_verify::TerminalNotReplayable>()
-            || matches!(
-                cause.downcast_ref::<crate::memory::ingress_recovery::IngressAttestationError>(),
-                Some(crate::memory::ingress_recovery::IngressAttestationError::Mismatch(
-                    "capsule_version"
-                ))
-            )
-        {
-            return Some("terminal replay authentication failed");
-        }
-        let text = cause.to_string();
-        REASONS.iter().copied().find(|reason| text == *reason)
-    })
 }
 
 /// The v3 attestation for a new input: the keyed transport and stable-key tags
@@ -926,6 +954,15 @@ fn pending_attestation(
         transport,
         input_key,
     ))
+}
+
+/// Whether an input event may still carry its capsule. A payload that does
+/// not parse might: it is verified (and quarantined) rather than orphaned.
+fn carries_capsule(event: &MessageEvent) -> bool {
+    event.raw_payload_json.as_deref().is_some_and(|raw| {
+        serde_json::from_str::<serde_json::Value>(raw)
+            .map_or(true, |payload| payload.get("prx_ingress_capsule").is_some())
+    })
 }
 
 fn capsule_from_event(event: &MessageEvent) -> anyhow::Result<IngressCapsule> {
@@ -1079,8 +1116,11 @@ fn recovery_gate(lifetime: &Arc<dyn IngressLifetime>) -> anyhow::Result<Arc<toki
 mod tests;
 
 mod authority;
+mod settlement;
 pub(crate) mod status;
 pub(crate) use authority::{SettledTerminalFacts, SkillObservation};
+pub(crate) use settlement::{QuarantineCause, RecoveryRowOutcome, owner_settled, owner_settlement};
+use settlement::{RowFailure, RowStep as _, Settler};
 
 #[cfg(test)]
 mod authority_tests;

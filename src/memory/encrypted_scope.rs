@@ -941,6 +941,15 @@ impl Memory for EncryptedScope {
         Ok(self.reveal(event))
     }
 
+    async fn commit_orphaned_ingress_recovery(
+        &self,
+        mut commit: crate::memory::ingress_recovery::IngressRecoveryCommit,
+    ) -> anyhow::Result<crate::memory::MessageEvent> {
+        self.seal_event_content(&mut commit.evidence)?;
+        let event = self.inner.commit_orphaned_ingress_recovery(commit).await?;
+        Ok(self.reveal(event))
+    }
+
     async fn commit_recovery_terminal(
         &self,
         mut commit: crate::memory::recovery_authority::RecoveryTerminalCommit,
@@ -979,7 +988,21 @@ impl Memory for EncryptedScope {
             }
         }
         if let Some(ingress) = commit.ingress.as_mut() {
-            self.seal_event_content(&mut ingress.evidence)?;
+            // A replay keeps the stored ciphertext so the receipt compares equal.
+            let stored = match ingress.evidence.idempotency_key.as_deref() {
+                Some(key) => {
+                    self.inner
+                        .find_message_event_by_idempotency_key(&ingress.evidence.workspace_id, key)
+                        .await?
+                }
+                None => None,
+            };
+            match stored {
+                Some(stored) if self.reveal(stored.clone()).content == ingress.evidence.content => {
+                    ingress.evidence.content.clone_from(&stored.content);
+                }
+                _ => self.seal_event_content(&mut ingress.evidence)?,
+            }
         }
         let reveal = Self {
             inner: Arc::clone(&self.inner),

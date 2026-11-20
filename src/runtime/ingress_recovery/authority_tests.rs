@@ -238,6 +238,12 @@ impl Memory for LegacyLedger {
     ) -> anyhow::Result<MessageEvent> {
         self.0.commit_ingress_recovery(commit).await
     }
+    async fn commit_orphaned_ingress_recovery(
+        &self,
+        commit: crate::memory::ingress_recovery::IngressRecoveryCommit,
+    ) -> anyhow::Result<MessageEvent> {
+        self.0.commit_orphaned_ingress_recovery(commit).await
+    }
     async fn append_message_event(&self, input: MessageEventInput) -> anyhow::Result<MessageEvent> {
         self.0.append_message_event(input).await
     }

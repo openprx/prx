@@ -643,6 +643,12 @@ impl Memory for LucidMemory {
     ) -> anyhow::Result<MessageEvent> {
         self.local.commit_ingress_recovery(commit).await
     }
+    async fn commit_orphaned_ingress_recovery(
+        &self,
+        commit: crate::memory::ingress_recovery::IngressRecoveryCommit,
+    ) -> anyhow::Result<MessageEvent> {
+        self.local.commit_orphaned_ingress_recovery(commit).await
+    }
     async fn commit_recovery_terminal(
         &self,
         commit: crate::memory::recovery_authority::RecoveryTerminalCommit,

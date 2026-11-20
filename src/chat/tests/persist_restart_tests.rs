@@ -479,18 +479,8 @@ async fn recovery_failure_keeps_run_and_store_names_in_reply_and_chat_log() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    // A second chat cannot claim this live lifetime. Replace only the decision
-    // database, as in O12, while retaining the real completed source and owner.
-    let first_cleanup = CleanupScope::new(None, CancellationToken::new()).unwrap();
-    let first = completed_chat_under_cleanup(dir.path(), &first_cleanup).await;
-    let saved = dir.path().join("previous-decisions");
-    std::fs::create_dir(&saved).unwrap();
-    for name in ["decisions.db", "decisions.db-wal", "decisions.db-shm"] {
-        let file = dir.path().join("self/causal_tree").join(name);
-        if file.exists() {
-            std::fs::rename(&file, saved.join(name)).unwrap();
-        }
-    }
+    // A prior row never refuses new input; only a fault of the store on the
+    // new row does. The store refuses the new input row itself.
     let log_path = dir.path().join("chat.log");
     let file = std::fs::File::create(&log_path).unwrap();
     let subscriber = tracing_subscriber::fmt()
@@ -500,10 +490,12 @@ async fn recovery_failure_keeps_run_and_store_names_in_reply_and_chat_log() {
         .finish();
     let _logging = tracing::subscriber::set_default(subscriber);
     let memory = Arc::new(SqliteMemory::new(dir.path()).unwrap());
+    memory.reject_user_events_for_test().unwrap();
     let generation = crate::config::new_shared(config_at(dir.path())).pin();
-    let error = match guarded_input(memory, &generation, "prx-current-run").await {
+    let run = "prx-current-run";
+    let error = match guarded_input(memory, &generation, run).await {
         Err(error) => error,
-        Ok(_) => panic!("a live prior lifetime must refuse recovery"),
+        Ok(_) => panic!("a store fault on the new row must refuse the input"),
     };
     let reply = error.to_string();
     let log = std::fs::read_to_string(&log_path).unwrap();
@@ -512,15 +504,16 @@ async fn recovery_failure_keeps_run_and_store_names_in_reply_and_chat_log() {
         .find(|line| line.contains("chat input persistence failed"))
         .unwrap();
     for expected in [
-        first.run_id.as_deref().unwrap(),
+        run,
         "brain.db",
-        "another ingress lifetime remains active",
+        "inbound write rejected by store",
+        "Restart to retry ingress recovery",
     ] {
         assert!(reply.contains(expected), "missing {expected}: {reply}");
     }
     // The run id reaches the log as its class (length and digest), never as text.
-    let run_class = format!("run_id=kind=text len={}", first.run_id.as_deref().unwrap().len());
-    let run_digest = crate::agent::diagnostics::text_class(first.run_id.as_deref().unwrap()).to_string();
+    let run_class = format!("run_id=kind=text len={}", run.len());
+    let run_digest = crate::agent::diagnostics::text_class(run).to_string();
     for expected in [run_class.as_str(), run_digest.as_str(), "brain.db", "sha256="] {
         assert!(
             line.contains(expected),
@@ -528,13 +521,13 @@ async fn recovery_failure_keeps_run_and_store_names_in_reply_and_chat_log() {
         );
     }
     assert!(
-        !line.contains(first.run_id.as_deref().unwrap()),
+        !line.contains(run),
         "the log line never carries the run id text: {line}"
     );
     assert!(!reply.contains('/'), "full paths must stay out of the reply: {reply}");
     let store = dir.path().join("memory/brain.db");
     assert!(
-        !line.contains(store.to_str().unwrap()) && !line.contains("another ingress lifetime remains active"),
+        !line.contains(store.to_str().unwrap()) && !line.contains("inbound write rejected by store"),
         "the log line carries the error's class, never its text or the store path: {line}"
     );
     assert!(line.contains("run_id="), "missing structured run field: {line}");
@@ -560,5 +553,292 @@ async fn recovery_failure_keeps_run_and_store_names_in_reply_and_chat_log() {
         log.contains(&redacted_run),
         "a private run id is redacted before its class is logged: {log}"
     );
-    first_cleanup.run(async { Ok(()) }).await.unwrap();
+}
+
+/// The reconciled evidence the owner wrote for `source`, and proof that no
+/// row of its run is left unsettled (I3).
+async fn assert_owner_settled(workspace: &Path, source: &MessageEvent, cell: &str) {
+    let memory = SqliteMemory::new(workspace).unwrap();
+    let owner = source.owner_id.as_deref().expect("test: input owner");
+    let evidence = memory
+        .find_owned_message_event_by_idempotency_key(
+            &source.workspace_id,
+            owner,
+            &format!("ingress:{}:reconciled", source.event_id),
+        )
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("test: {cell}: the owner settles its own ingress row"));
+    assert_eq!(
+        evidence.content, "turn.ingress.reconciled final committed by its owner",
+        "{cell}"
+    );
+    let run = source.run_id.as_deref().expect("test: input run");
+    assert!(
+        memory
+            .find_owned_message_event_by_idempotency_key(&source.workspace_id, owner, &format!("turn:{run}:final"))
+            .await
+            .unwrap()
+            .is_some(),
+        "{cell}: the settlement commits with the run's final"
+    );
+    let inspection = crate::memory::sqlite::inspect_unsettled_ingress(&workspace.join("memory/brain.db")).unwrap();
+    assert!(
+        inspection.rows.iter().all(|row| row.run_id != run),
+        "{cell}: no unsettled row of the run remains: {:?}",
+        inspection.rows
+    );
+}
+
+/// One recorded chat input ended by a terminal of `status`, committed
+/// through the real chat binding. `refused` ends it as a policy refusal does:
+/// failed, with no provider outcome and a suppressed delivery.
+async fn chat_terminal_cell(
+    workspace: &Path,
+    run: &str,
+    status: crate::agent::terminal::TurnTerminalStatus,
+    refused: bool,
+) -> MessageEvent {
+    use crate::agent::terminal::{TurnDeliveryIntent, TurnTerminalDraft, TurnTerminalTelemetry};
+    let cleanup = CleanupScope::new(None, CancellationToken::new()).unwrap();
+    let source = cleanup
+        .scope_admission(async {
+            let memory = Arc::new(SqliteMemory::new(workspace).unwrap());
+            let generation = crate::config::new_shared(config_at(workspace)).pin();
+            let (source, binding, guard) = guarded_input(memory.clone(), &generation, run).await?;
+            let service = publish(memory.clone(), generation).await?;
+            binding.issue_decision(&service, &CancellationToken::new()).await?;
+            let fabric = MemoryFabric::new(memory, workspace.to_string_lossy());
+            let scope = binding.envelope().message_scope();
+            let now = chrono::Utc::now();
+            binding
+                .commit_terminal(
+                    &fabric,
+                    TurnTerminalDraft {
+                        binding: binding.terminal_binding(run)?,
+                        terminal_id: run.to_owned(),
+                        scope,
+                        status,
+                        history: None,
+                        history_scope: None,
+                        provider_outcome: None,
+                        telemetry: TurnTerminalTelemetry {
+                            summary: if refused { "refused by policy" } else { "turn ended" }.into(),
+                            started_at: now,
+                            finished_at: now,
+                        },
+                        delivery_intent: if refused {
+                            TurnDeliveryIntent::Suppress {
+                                reason: "policy refusal".into(),
+                            }
+                        } else {
+                            TurnDeliveryIntent::None
+                        },
+                    },
+                    &config_at(workspace).cost,
+                    workspace,
+                )
+                .await?;
+            guard.handoff();
+            service
+                .shutdown(std::time::Instant::now() + Duration::from_secs(5))
+                .await;
+            Ok(source)
+        })
+        .await
+        .unwrap();
+    cleanup.run(async { Ok(()) }).await.unwrap();
+    source
+}
+
+/// A provider that answers one embedded one-shot turn.
+struct OneShotProvider;
+
+#[async_trait::async_trait]
+impl Provider for OneShotProvider {
+    async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> Result<String> {
+        anyhow::bail!("fixture requires the traced provider dispatch")
+    }
+
+    async fn chat_traced(
+        &self,
+        _request: crate::providers::ChatRequest<'_>,
+        model: &str,
+        _temperature: f64,
+    ) -> Result<crate::providers::traits::ChatTrace> {
+        use crate::llm::route_decision::{AttemptStatus, ProviderAttempt, TokenUsage, TokenUsageSource};
+        let now = chrono::Utc::now();
+        Ok(crate::providers::traits::ChatTrace {
+            response: crate::providers::ChatResponse {
+                text: Some("One-shot answer.".into()),
+                tool_calls: Vec::new(),
+                reasoning_content: None,
+            },
+            attempts: vec![ProviderAttempt {
+                seq: 1,
+                provider: "ollama".into(),
+                model: model.into(),
+                started_at: now,
+                finished_at: now,
+                status: AttemptStatus::Success,
+                error_class: None,
+                error_message: None,
+            }],
+            final_provider: "ollama".into(),
+            final_model: model.into(),
+            served_member: None,
+            tokens_used: TokenUsage {
+                prompt_tokens: Some(3),
+                completion_tokens: Some(2),
+                total_tokens: Some(5),
+                source: TokenUsageSource::Reported,
+                ..TokenUsage::default()
+            },
+        })
+    }
+}
+
+/// One embedded single-shot agent turn: input recorded, provider answered,
+/// terminal committed by the agent's own terminal owner.
+async fn one_shot_cell(workspace: &Path) -> MessageEvent {
+    const MODEL: &str = "prx-one-shot-model";
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace).unwrap());
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = workspace.to_owned();
+    config.config_path = workspace.join("config.toml");
+    config.default_model = Some(MODEL.into());
+    config.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
+    config.providers.models.push(
+        toml::from_str(&format!(
+            "provider = \"ollama\"\nmodel = \"{MODEL}\"\noperations = [\"chat\"]\nnative_tools = true\n"
+        ))
+        .unwrap(),
+    );
+    let mut agent = crate::agent::agent::Agent::builder()
+        .runtime_config(config, "ollama")
+        .provider(Box::new(OneShotProvider))
+        .tools(Vec::new())
+        .memory(Arc::clone(&memory))
+        .observer(Arc::new(crate::observability::NoopObserver {}))
+        .tool_dispatcher(Box::new(crate::agent::dispatcher::XmlToolDispatcher))
+        .build()
+        .unwrap();
+    Box::pin(agent.turn("one-shot question")).await.unwrap();
+    drop(agent);
+    let workspace_id = workspace.to_string_lossy().into_owned();
+    let owner = format!("owner:{workspace_id}:agent_api:embedded-caller");
+    let inputs = memory
+        .list_owned_message_events_by_type(&workspace_id, &owner, "message.created", 0, 16)
+        .await
+        .unwrap();
+    inputs
+        .into_iter()
+        .find(|event| event.role == "user")
+        .expect("test: the one-shot input is recorded")
+}
+
+#[tokio::test]
+async fn a_terminal_commit_settles_its_own_ingress_row() {
+    use crate::agent::terminal::TurnTerminalStatus;
+    let completed = tempfile::tempdir().unwrap();
+    let source = completed_chat(completed.path()).await;
+    assert_owner_settled(completed.path(), &source, "completed").await;
+
+    for (cell, status, refused) in [
+        ("failed", TurnTerminalStatus::Failed, false),
+        ("cancelled", TurnTerminalStatus::Cancelled, false),
+        ("refused", TurnTerminalStatus::Failed, true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let source = chat_terminal_cell(dir.path(), &format!("prx-{cell}-run"), status, refused).await;
+        assert_owner_settled(dir.path(), &source, cell).await;
+    }
+
+    let one_shot = tempfile::tempdir().unwrap();
+    let source = one_shot_cell(one_shot.path()).await;
+    assert_owner_settled(one_shot.path(), &source, "one-shot").await;
+}
+
+#[tokio::test]
+async fn an_orphaned_row_is_upgraded_when_its_final_is_found() {
+    let dir = tempfile::tempdir().unwrap();
+    // The lock directory moves mid-turn, as a reboot that renumbers the volume
+    // does: the owner can no longer prove its lifetime, so its final commits
+    // without settling the row, and the row's lock is out of reach.
+    let cleanup = CleanupScope::new(None, CancellationToken::new()).unwrap();
+    let first = cleanup
+        .scope_admission(async {
+            let memory = Arc::new(SqliteMemory::new(dir.path()).unwrap());
+            let generation = crate::config::new_shared(config_at(dir.path())).pin();
+            let (source, binding, guard) = guarded_input(memory.clone(), &generation, "prx-first-run").await?;
+            let service = publish(memory.clone(), generation).await?;
+            binding.issue_decision(&service, &CancellationToken::new()).await?;
+            let root = dir.path().join(".prx-ingress-recovery-v1");
+            let locks: Vec<_> = std::fs::read_dir(&root)?
+                .take(2)
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<std::io::Result<_>>()?;
+            assert_eq!(locks.len(), 1, "test: one lock directory");
+            for lock in &locks {
+                std::fs::rename(lock, lock.with_extension("moved"))?;
+            }
+            let fabric = MemoryFabric::new(memory.clone(), dir.path().to_string_lossy());
+            let _receipt = persist_completed_chat(&binding, &fabric, dir.path(), 2).await;
+            guard.handoff();
+            service
+                .shutdown(std::time::Instant::now() + Duration::from_secs(5))
+                .await;
+            Ok(source)
+        })
+        .await
+        .unwrap();
+    cleanup.run(async { Ok(()) }).await.unwrap();
+    let workspace = first.workspace_id.clone();
+    let owner = first.owner_id.clone().expect("test: input owner");
+    let key = |suffix: &str| format!("ingress:{}:{suffix}", first.event_id);
+    {
+        let memory = SqliteMemory::new(dir.path()).unwrap();
+        assert!(
+            memory
+                .find_owned_message_event_by_idempotency_key(&workspace, &owner, &key("reconciled"))
+                .await
+                .unwrap()
+                .is_none(),
+            "test: the final committed without settling the row"
+        );
+    }
+
+    // The next process accepts its input (orphaning the row) and its startup
+    // recovery finds the authenticated final and upgrades the row.
+    restarted_chat(dir.path(), "prx-after-move").await;
+    let memory = SqliteMemory::new(dir.path()).unwrap();
+    for (suffix, state) in [("unconfirmed", "unconfirmed"), ("reconciled", "reconciled")] {
+        let evidence = memory
+            .find_owned_message_event_by_idempotency_key(&workspace, &owner, &key(suffix))
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("test: {suffix} evidence"));
+        let payload: serde_json::Value = serde_json::from_str(evidence.raw_payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            payload
+                .pointer("/ingress_recovery/state")
+                .and_then(serde_json::Value::as_str),
+            Some(state)
+        );
+        assert_eq!(
+            payload
+                .pointer("/ingress_recovery/cause")
+                .and_then(serde_json::Value::as_str),
+            Some("lock_missing")
+        );
+    }
+    let inspection = crate::memory::sqlite::inspect_unsettled_ingress(&dir.path().join("memory/brain.db")).unwrap();
+    assert!(
+        inspection
+            .rows
+            .iter()
+            .all(|row| Some(row.run_id.as_str()) != first.run_id.as_deref()),
+        "the upgraded row is reconciled: {:?}",
+        inspection.rows
+    );
 }

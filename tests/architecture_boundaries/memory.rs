@@ -50,6 +50,9 @@ const ALLOWED_BRAIN_DB_OPENS_OUTSIDE_SQLITE_REPOSITORY: &[&str] = &[
     // Read-only doctor probes must not initialize the memory repository merely
     // to count legacy rows in an existing database.
     "src/doctor/mod.rs::read_only_sqlite_key_prefix_count::let connection = rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;",
+    // `prx doctor ingress` (REQ-INGRESS-RECOVERY-NONBLOCKING step 4): the SQLite repository's
+    // read-only inspection of unsettled ingress rows; it must not initialize the schema.
+    "src/memory/sqlite/ingress_recovery.rs::inspect_unsettled_ingress::let connection = Connection::open_with_flags(&canonical, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;",
     // D-107 amendment: the doctor reads the cron and Xin stores read-only.
     "src/doctor/mod.rs::read_only_unowned_rows::let connection = rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;",
     "src/doctor/mod.rs::doctor_names_shell_jobs_without_a_recorded_creator::rusqlite::Connection::open(&db_path)",

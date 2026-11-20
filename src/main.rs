@@ -1626,6 +1626,8 @@ enum DoctorCommands {
     Memory,
     /// Report live runtime validation matrix readiness
     Runtime,
+    /// List durable ingress rows that are not reconciled (read-only)
+    Ingress,
 }
 
 /// Process-wide bound on how long the runtime drop will wait for stuck

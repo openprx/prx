@@ -232,6 +232,8 @@ pub struct RecoveryCostScan {
 /// Atomic terminal commit: claim, optional assistant/usage, final, attestation, outbox.
 pub struct RecoveryTerminalCommit {
     pub events: Vec<super::traits::MessageEventInput>,
+    /// The turn's own ingress row, reconciled by its live owner in the same
+    /// transaction; `claim` is the owner's lifetime.
     pub ingress: Option<super::ingress_recovery::IngressRecoveryCommit>,
     pub publication: RecoveryPublication,
     pub outbox: RecoveryCostIntent,

@@ -1,6 +1,7 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 mod decision_engine;
+mod ingress;
 mod prompt_cache;
 use crate::config::Config;
 use anyhow::{Context, Result};
@@ -11,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 mod provider_circuits;
+pub use ingress::{diagnose_ingress, run_ingress};
 const DAEMON_STALE_SECONDS: i64 = 30;
 const SCHEDULER_STALE_SECONDS: i64 = 120;
 const CHANNEL_STALE_SECONDS: i64 = 300;

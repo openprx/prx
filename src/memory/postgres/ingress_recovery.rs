@@ -356,10 +356,11 @@ impl PostgresMemory {
         input: MessageEventInput,
         mutation: AtomicIngressMutation,
     ) -> anyhow::Result<(MessageEvent, bool)> {
-        let deadline = match &mutation {
-            AtomicIngressMutation::Input { deadline, .. } => *deadline,
-            AtomicIngressMutation::Recovery(commit) => commit.deadline,
-        };
+        // A PostgreSQL lease is a database session: it cannot go missing.
+        if matches!(mutation, AtomicIngressMutation::Orphan(_)) {
+            return Err(crate::memory::ingress_recovery::IngressOrphanUnsupported.into());
+        }
+        let deadline = mutation.deadline();
         self.append_bounded(input, Some(mutation), deadline).await
     }
     pub(super) async fn ingress_repair_append(
@@ -413,7 +414,14 @@ impl PostgresMemory {
                         "ingress capsule wrapper mismatch"
                     );
                 }
-                AtomicIngressMutation::Recovery(commit) => {
+                AtomicIngressMutation::Recovery(commit)
+                | AtomicIngressMutation::Owner(commit)
+                | AtomicIngressMutation::Orphan(commit) => {
+                    anyhow::ensure!(
+                        !matches!(operation, AtomicIngressMutation::Owner(_))
+                            || (commit.state == IngressRecoveryState::Reconciled && commit.cause.is_none()),
+                        "owner settlement must reconcile its own row"
+                    );
                     let (state, event_type) = match commit.state {
                         IngressRecoveryState::Unconfirmed => ("unconfirmed", "turn.ingress.interrupted"),
                         IngressRecoveryState::Reconciled => ("reconciled", "turn.ingress.reconciled"),
@@ -445,17 +453,14 @@ impl PostgresMemory {
                                 .and_then(serde_json::Value::as_str)
                                 .is_some_and(
                                     |value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-                                ),
+                                )
+                            && crate::memory::ingress_recovery::evidence_cause_matches(binding, commit.cause),
                         "invalid ingress recovery evidence binding"
                     );
                 }
             }
-            let value = match operation {
-                AtomicIngressMutation::Input { lifetime, .. } => lifetime,
-                AtomicIngressMutation::Recovery(commit) => &commit.claim.lifetime,
-            };
             issued_lease(
-                value,
+                operation.lease(),
                 &self.qualified_message_events_table,
                 self.ingress_instance(),
                 capsule,
@@ -635,9 +640,14 @@ impl PostgresMemory {
                         tx.execute(&format!("INSERT INTO {table}(namespace,workspace_id,owner_id,source,token,input_event_id,capsule,status) VALUES($1,$2,$3,$4,$5,$6,$7,'pending')"),&[&self.qualified_message_events_table,&capsule.scope.workspace_id,&capsule.scope.owner_id,&capsule.scope.source.as_str(),&capsule.lifetime,&capsule.input_event_id,&encoded]).await?;
                     }
                 }
-                AtomicIngressMutation::Recovery(commit) => {
-                    let source_exists:bool=tx.query_one(&format!("SELECT EXISTS(SELECT 1 FROM {qualified_message_events_table} WHERE event_id=$1 AND workspace_id=$2 AND owner_id=$3 AND source=$4 AND idempotency_key=$5 AND run_id=$6 AND role='user' AND event_type='message.created')"),&[&capsule.input_event_id,&capsule.scope.workspace_id,&capsule.scope.owner_id,&capsule.scope.source.as_str(),&capsule.input_key,&capsule.run_id]).await?.get(0);
-                    anyhow::ensure!(source_exists,"ingress recovery input no longer matches its owned capsule");
+                AtomicIngressMutation::Recovery(commit) | AtomicIngressMutation::Owner(commit) | AtomicIngressMutation::Orphan(commit) => {
+                    if commit.cause==Some(crate::memory::ingress_recovery::OrphanCause::InputMissing) {
+                        let present:bool=tx.query_one(&format!("SELECT EXISTS(SELECT 1 FROM {qualified_message_events_table} WHERE event_id=$1)"),&[&capsule.input_event_id]).await?.get(0);
+                        anyhow::ensure!(!present,"orphaned ingress input still exists");
+                    } else {
+                        let source_exists:bool=tx.query_one(&format!("SELECT EXISTS(SELECT 1 FROM {qualified_message_events_table} WHERE event_id=$1 AND workspace_id=$2 AND owner_id=$3 AND source=$4 AND idempotency_key=$5 AND run_id=$6 AND role='user' AND event_type='message.created')"),&[&capsule.input_event_id,&capsule.scope.workspace_id,&capsule.scope.owner_id,&capsule.scope.source.as_str(),&capsule.input_key,&capsule.run_id]).await?.get(0);
+                        anyhow::ensure!(source_exists,"ingress recovery input no longer matches its owned capsule");
+                    }
                     let row=tx.query_one(&format!("SELECT CASE WHEN octet_length(capsule)<=16384 THEN capsule ELSE NULL END,status FROM {table} WHERE namespace=$1 AND workspace_id=$2 AND owner_id=$3 AND input_event_id=$4 FOR UPDATE"),&[&self.qualified_message_events_table,&capsule.scope.workspace_id,&capsule.scope.owner_id,&capsule.input_event_id]).await?;
                     anyhow::ensure!(row.get::<_,Option<String>>(0).context("oversized stored ingress capsule")?==serde_json::to_string(capsule)?,"ingress recovery capsule changed");
                     let old:String=row.get(1);

@@ -21,6 +21,10 @@ mod recovery_outbox;
 mod recovery_terminal;
 pub(crate) mod remote_tree;
 
+#[cfg(unix)]
+pub(crate) use ingress_recovery::{
+    IngressLockReach, MAX_INSPECTED_ROWS, UnsettledIngressRow, inspect_unsettled_ingress,
+};
 #[cfg(test)]
 pub(crate) use recovery_outbox::{
     forge_acknowledged_cost_for_test, forge_error_cost_for_test, insert_raw_for_test, remove_cost_for_test,

@@ -2115,6 +2115,8 @@ pub trait Memory: Send + Sync {
     }
 
     /// None means another lifetime still owns the lock; no death inference.
+    /// [`IngressLockMissing`](super::ingress_recovery::IngressLockMissing) means
+    /// the lock is missing, which proves nothing about the lifetime either.
     async fn claim_ingress_recovery(
         &self,
         workspace_id: &str,
@@ -2132,6 +2134,17 @@ pub trait Memory: Send + Sync {
     ) -> anyhow::Result<MessageEvent> {
         let _ = commit;
         Err(crate::memory::fabric::fail_fast(self.name(), "commit_ingress_recovery"))
+    }
+
+    /// Settle another lifetime's row whose lifetime lock is missing. `commit.claim`
+    /// is the caller's own live lifetime; the backend proves the lock absent in
+    /// the same transaction. Backends whose leases cannot go missing refuse.
+    async fn commit_orphaned_ingress_recovery(
+        &self,
+        commit: super::ingress_recovery::IngressRecoveryCommit,
+    ) -> anyhow::Result<MessageEvent> {
+        let _ = commit;
+        Err(super::ingress_recovery::IngressOrphanUnsupported.into())
     }
 
     /// Atomic terminal commit: claim, optional assistant/usage, final, attestation, outbox.

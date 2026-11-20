@@ -373,19 +373,58 @@ pub struct IngressRecoveryClaim {
     pub lifetime: Arc<dyn IngressLifetime>,
 }
 
+/// A claim found no lock for the row's lifetime: neither its lock file nor its
+/// lock directory exists. Nothing proves the lifetime dead or alive.
+#[derive(Debug, thiserror::Error)]
+#[error("ingress lifetime lock is missing")]
+pub struct IngressLockMissing;
+
+/// The backend has no orphan settlement: its leases cannot go missing.
+#[derive(Debug, thiserror::Error)]
+#[error("this backend has no orphaned ingress settlement")]
+pub struct IngressOrphanUnsupported;
+
+/// Why a prior row could not be settled through its own lifetime lock or its
+/// input. The code is bound into the row's authenticated evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrphanCause {
+    /// The row's lifetime lock file or lock directory is missing.
+    LockMissing,
+    /// The row's durable input event is missing.
+    InputMissing,
+}
+
+impl OrphanCause {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LockMissing => "lock_missing",
+            Self::InputMissing => "input_missing",
+        }
+    }
+
+    #[must_use]
+    pub fn from_code(code: &str) -> Option<Self> {
+        [Self::LockMissing, Self::InputMissing]
+            .into_iter()
+            .find(|cause| cause.as_str() == code)
+    }
+}
+
+/// `claim` is the lease that authorizes the mutation: a successor's recovery
+/// claim on the row's dead lifetime, the owner's own live lifetime, or, for an
+/// orphan, the settling process's own live lifetime.
 pub struct IngressRecoveryCommit {
     pub capsule: IngressCapsule,
     pub state: IngressRecoveryState,
     pub evidence: MessageEventInput,
     pub claim: IngressRecoveryClaim,
     pub deadline: std::time::Instant,
+    /// Set when the row is orphaned; `InputMissing` requires the input to be absent.
+    pub cause: Option<OrphanCause>,
 }
 
 /// Internal transaction hook, shared with the existing message/outbox append.
-#[expect(
-    clippy::large_enum_variant,
-    reason = "Inline atomic ownership preserves the recovery transaction allocation profile"
-)]
 pub(crate) enum AtomicIngressMutation {
     Input {
         capsule: IngressCapsule,
@@ -393,15 +432,40 @@ pub(crate) enum AtomicIngressMutation {
         deadline: std::time::Instant,
         attestation: Option<IngressAttestation>,
     },
+    /// A successor holding a recovery claim on the row's dead lifetime.
     Recovery(IngressRecoveryCommit),
+    /// The row's own live lifetime settles it in its terminal commit.
+    Owner(IngressRecoveryCommit),
+    /// A live lifetime settles another lifetime's row whose lock is missing.
+    Orphan(IngressRecoveryCommit),
 }
 impl AtomicIngressMutation {
     pub(crate) const fn capsule(&self) -> &IngressCapsule {
         match self {
             Self::Input { capsule, .. } => capsule,
-            Self::Recovery(commit) => &commit.capsule,
+            Self::Recovery(commit) | Self::Owner(commit) | Self::Orphan(commit) => &commit.capsule,
         }
     }
+
+    pub(crate) const fn deadline(&self) -> std::time::Instant {
+        match self {
+            Self::Input { deadline, .. } => *deadline,
+            Self::Recovery(commit) | Self::Owner(commit) | Self::Orphan(commit) => commit.deadline,
+        }
+    }
+
+    /// The lease presented for this mutation.
+    pub(crate) const fn lease(&self) -> &Arc<dyn IngressLifetime> {
+        match self {
+            Self::Input { lifetime, .. } => lifetime,
+            Self::Recovery(commit) | Self::Owner(commit) | Self::Orphan(commit) => &commit.claim.lifetime,
+        }
+    }
+}
+
+/// The evidence binding must name exactly the commit's orphan cause, or none.
+pub(crate) fn evidence_cause_matches(evidence: &serde_json::Value, cause: Option<OrphanCause>) -> bool {
+    evidence.get("cause").map(serde_json::Value::as_str) == cause.map(|cause| Some(cause.as_str()))
 }
 
 pub const MAX_RECOVERY_PAGE: usize = 64;

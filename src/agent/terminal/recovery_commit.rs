@@ -358,9 +358,13 @@ pub(super) async fn finalize_recovery_terminal(
         "usage_event_id": usage_id,
         "final_event_id": final_id,
     }))?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    // The turn's own ingress row is reconciled by its owner in this same
+    // transaction (I3), whatever the terminal status.
+    let ingress = crate::runtime::ingress_recovery::owner_settlement(&memory, &chain, deadline).await;
     let terminal_commit = RecoveryTerminalCommit {
         events,
-        ingress: None,
+        ingress,
         publication: RecoveryPublication {
             chain: chain.clone(),
             input: None,
@@ -376,13 +380,13 @@ pub(super) async fn finalize_recovery_terminal(
         },
     };
 
-    let deadline = Instant::now() + Duration::from_secs(15);
     let outcome = memory.commit_recovery_terminal(terminal_commit, deadline).await?;
 
     let events = match outcome {
         RecoveryTerminalOutcome::Committed { events, .. } | RecoveryTerminalOutcome::Replayed { events, .. } => events,
         RecoveryTerminalOutcome::Conflict => anyhow::bail!("recovery terminal commit conflict"),
     };
+    crate::runtime::ingress_recovery::owner_settled(&chain);
 
     if matches!(pricing, RecoveryPricing::Metered | RecoveryPricing::Subscription) {
         let skip_inline = {

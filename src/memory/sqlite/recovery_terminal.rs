@@ -90,9 +90,12 @@ fn commit_blocking(
         let mut inserted_any = false;
         let mut existing_any = false;
 
+        // The turn's own ingress row, settled by its live owner in this
+        // transaction. It precedes the terminal events and stays out of the
+        // prefix hook, which sees the terminal prefix only.
         if let Some(ingress) = commit.ingress.take() {
             let input = ingress.evidence.clone();
-            let mutation = AtomicIngressMutation::Recovery(ingress);
+            let mutation = AtomicIngressMutation::Owner(ingress);
             ingress_recovery::before_append(&tx, &mutation, &input)?;
             let (event, inserted) = SqliteMemory::append_event_row(&tx, input, true)?;
             ingress_recovery::after_append(&tx, &mutation, &event, inserted)?;
@@ -100,6 +103,7 @@ fn commit_blocking(
             existing_any |= !inserted;
             stored.push(event);
         }
+        let terminal_start = stored.len();
 
         let final_index = commit.events.len().saturating_sub(1);
         let prefix: Vec<MessageEventInput> = commit.events.drain(..final_index).collect();
@@ -116,7 +120,7 @@ fn commit_blocking(
         }
 
         if let Some(hook) = hook {
-            hook(&stored, &mut final_input)?;
+            hook(stored.get(terminal_start..).unwrap_or_default(), &mut final_input)?;
         }
 
         let (final_event, inserted) = insert_terminal_event(&tx, final_input)?;

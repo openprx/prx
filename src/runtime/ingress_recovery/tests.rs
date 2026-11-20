@@ -408,6 +408,29 @@ fn verify_recovery(completed: bool) {
         .collect();
     assert_eq!(evidence.len(), 1);
     let evidence = evidence.into_iter().next().unwrap();
+    // A completed turn is reconciled by its owner, in its own terminal commit,
+    // before the process exits; the next process neither rewrites nor relabels
+    // it. A killed turn is left to the next process.
+    let owner_written = before
+        .events
+        .iter()
+        .find(|row| row.idempotency_key.as_deref() == Some(&recovery_key));
+    assert_eq!(owner_written.is_some(), completed);
+    if let Some(owner_written) = owner_written {
+        assert_eq!(
+            serde_json::to_value(owner_written).unwrap(),
+            serde_json::to_value(evidence).unwrap()
+        );
+        assert_eq!(evidence.content, "turn.ingress.reconciled final committed by its owner");
+        let relabel = format!("ingress:{}:unconfirmed", original.event_id);
+        assert!(
+            !after
+                .events
+                .iter()
+                .any(|row| row.idempotency_key.as_deref() == Some(&relabel)),
+            "the next process never relabels a row its owner settled"
+        );
+    }
     assert_eq!(evidence.causation_event_id.as_deref(), Some(original.event_id.as_str()));
     assert_eq!(evidence.run_id, original.run_id);
     assert_eq!(evidence.owner_id, original.owner_id);
@@ -485,13 +508,16 @@ fn normally_completed_agent_float_turn_restarts_and_accepts_the_next_turn() {
     next.finish(false);
     assert_eq!(after.calls, 1, "the next agent turn must reach the provider");
     assert_ne!(before.pid, after.pid);
-    assert!(
-        after
-            .events
-            .iter()
-            .any(|row| row.event_type == "turn.ingress.reconciled"
-                && row.causation_event_id.as_deref() == Some(source.event_id.as_str()))
-    );
+    // The owner reconciled its own row before it exited.
+    for report in [&before, &after] {
+        assert!(
+            report
+                .events
+                .iter()
+                .any(|row| row.event_type == "turn.ingress.reconciled"
+                    && row.causation_event_id.as_deref() == Some(source.event_id.as_str()))
+        );
+    }
     assert!(
         !after
             .events
@@ -803,6 +829,9 @@ async fn recovery_erasure_indexes_settlement_terminal() {
 fn recovery_restart_from_killed_process() {
     auth_02_3_tests::recovery_restart_from_killed_process();
 }
+
+#[path = "outcome_tests.rs"]
+mod outcome_tests;
 
 #[path = "subscription_recovery_tests.rs"]
 mod subscription_recovery_tests;

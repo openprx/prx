@@ -208,7 +208,8 @@ async fn chat_inbound_on_an_agent_store_survives_an_unverifiable_capsule() {
     assert!(second.id > 0);
     let marker = quarantine_marker(&memory, &first).await;
     assert_eq!(marker.event_type, "turn.ingress.quarantined");
-    assert!(marker.content.contains("invalid ingress capsule authentication"));
+    // The marker names its typed cause; no error text and no input content.
+    assert_eq!(marker.content, "turn.ingress.quarantined capsule_authentication");
     assert!(!marker.content.contains("prx hello"));
 }
 
@@ -281,5 +282,5 @@ async fn unverifiable_terminal_is_quarantined_so_chat_can_start() {
         .expect("chat start after an unverifiable terminal");
     let marker = quarantine_marker(&memory, &first).await;
     assert_eq!(marker.event_type, "turn.ingress.quarantined");
-    assert!(marker.content.contains("terminal replay authentication failed"));
+    assert_eq!(marker.content, "turn.ingress.quarantined terminal_authentication");
 }

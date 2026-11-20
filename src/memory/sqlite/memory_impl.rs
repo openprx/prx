@@ -748,6 +748,20 @@ impl Memory for SqliteMemory {
         .map(|(event, _)| event)
     }
 
+    async fn commit_orphaned_ingress_recovery(
+        &self,
+        commit: crate::memory::ingress_recovery::IngressRecoveryCommit,
+    ) -> anyhow::Result<MessageEvent> {
+        ingress_recovery::validate_input_bounds(&commit.evidence)?;
+        self.append_event_with_recovery(
+            commit.evidence.clone(),
+            Some(crate::memory::ingress_recovery::AtomicIngressMutation::Orphan(commit)),
+            None,
+        )
+        .await
+        .map(|(event, _)| event)
+    }
+
     async fn commit_recovery_terminal(
         &self,
         commit: crate::memory::recovery_authority::RecoveryTerminalCommit,

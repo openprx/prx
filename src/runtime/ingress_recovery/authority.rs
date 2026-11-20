@@ -2,7 +2,7 @@
 use super::IngressRecorder;
 use crate::agent::terminal::TurnTerminalStatus;
 use crate::memory::ingress_recovery::{IngressAttestationError, IngressCapsule};
-use crate::memory::recovery_authority::{RecoveryMacDomain, RecoveryTag};
+use crate::memory::recovery_authority::{RecoveryMacDomain, RecoveryRepository, RecoveryTag};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
@@ -98,6 +98,18 @@ fn ensure_v3(capsule: &IngressCapsule) -> anyhow::Result<()> {
     }
 }
 
+/// MAC under the key slot the capsule names; only a v3 capsule names one.
+pub(super) fn capsule_mac(
+    repository: &dyn RecoveryRepository,
+    capsule: &IngressCapsule,
+    domain: RecoveryMacDomain,
+    bytes: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    ensure_v3(capsule)?;
+    let id = capsule.key_id.as_deref().context("missing recovery key id")?;
+    Ok(repository.recovery_mac(Some(id), domain, bytes)?.tag.to_vec())
+}
+
 impl IngressRecorder {
     #[cfg(test)]
     pub(crate) fn backend_namespace(&self) -> &str {
@@ -110,13 +122,11 @@ impl IngressRecorder {
         domain: RecoveryMacDomain,
         bytes: &[u8],
     ) -> anyhow::Result<Vec<u8>> {
-        ensure_v3(capsule)?;
         let repository = self
             .memory
             .recovery_repository()
             .context("recovery repository unavailable")?;
-        let id = capsule.key_id.as_deref().context("missing recovery key id")?;
-        Ok(repository.recovery_mac(Some(id), domain, bytes)?.tag.to_vec())
+        capsule_mac(repository, capsule, domain, bytes)
     }
 
     pub(super) fn verify_slot(
