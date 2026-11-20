@@ -187,11 +187,11 @@ skillratings = { version = "0.27", optional = true }
 tiktoken-rs = "0.5"
 
 # WASM Plugin System (optional)
-wasmtime = { version = "50.0.1", optional = true, default-features = false, features = ["async", "component-model", "cranelift"] }
-wasmtime-wasi = { version = "50.0.1", optional = true }
+wasmtime = { version = "50.0.2", optional = true, default-features = false, features = ["async", "component-model", "cranelift"] }
+wasmtime-wasi = { version = "50.0.2", optional = true }
 
 # email
-lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }
+lettre = { version = "0.11.24", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }
 mail-parser = "0.11.2"
 async-imap = { version = "0.11",features = ["runtime-tokio"], default-features = false }
 
