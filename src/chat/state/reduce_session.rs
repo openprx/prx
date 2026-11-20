@@ -511,6 +511,10 @@ impl ChatState {
         // The tool evidence of each stored turn, by its index in the history
         // the patch describes; carried to the turns the patch keeps.
         let (mut evidence, misaligned_at) = turn_evidence_by_history_index(history, &self.session.turns);
+        // A worker compaction replaces the whole history and repeats the
+        // turns it keeps verbatim at the replacement's end: those keep the
+        // evidence of the messages they repeat.
+        let replacement_evidence = replacement_tail_evidence(history, &evidence, &patch);
         if let Err(error) = crate::agent::compaction::apply_compaction_patch_exact(history, &patch) {
             // The patch does not describe the reducer's history: nothing is
             // changed and nothing is saved.
@@ -528,14 +532,15 @@ impl ChatState {
                 },
             ];
         }
-        // The patch's own messages (its replacement and the loop notes it
-        // appends right after it) carry no evidence.
-        // An applied patch's range lies inside the history the evidence was
-        // indexed by; anything else carries nothing.
+        // The patch's own messages (a handoff, a summary, the loop notes it
+        // appends after the replacement) carry no evidence; a replacement
+        // message that repeats a replaced turn keeps that turn's. An applied
+        // patch's range lies inside the history the evidence was indexed by;
+        // anything else carries nothing.
         let (range_start, range_end) = (patch.range_start(), patch.range_end());
         if range_start <= range_end && range_end <= evidence.len() {
-            let inserted = patch.replacement.len().saturating_add(patch.append_after.len());
-            evidence.splice(range_start..range_end, std::iter::repeat_n(None, inserted));
+            let appended = std::iter::repeat_n(None, patch.append_after.len());
+            evidence.splice(range_start..range_end, replacement_evidence.into_iter().chain(appended));
         } else {
             evidence = vec![None; history.len()];
         }
@@ -641,4 +646,34 @@ impl ChatState {
             Effect::SurfaceNotice { text },
         ]
     }
+}
+
+/// The evidence of each message of `patch.replacement`, taken from the
+/// replaced range of `history` (indexed like `evidence`): walking both from
+/// their ends, each replacement message equal (role and bytes) to the replaced
+/// message at the same distance from the end keeps that message's evidence.
+/// The first difference ends the carry, so only the verbatim retained tail is
+/// matched and a handoff or summary never inherits a record.
+fn replacement_tail_evidence(
+    history: &[ChatMessage],
+    evidence: &[Option<crate::agent::tool_evidence::TurnToolEvidence>],
+    patch: &crate::agent::turn_contracts::CompactionPatch,
+) -> Vec<Option<crate::agent::tool_evidence::TurnToolEvidence>> {
+    let mut carried = vec![None; patch.replacement.len()];
+    let range = patch.range_start()..patch.range_end();
+    let (Some(replaced), Some(replaced_evidence)) = (history.get(range.clone()), evidence.get(range)) else {
+        return carried;
+    };
+    let pairs = carried
+        .iter_mut()
+        .zip(&patch.replacement)
+        .rev()
+        .zip(replaced.iter().zip(replaced_evidence).rev());
+    for ((slot, replacement), (message, message_evidence)) in pairs {
+        if replacement.role != message.role || replacement.content != message.content {
+            break;
+        }
+        slot.clone_from(message_evidence);
+    }
+    carried
 }

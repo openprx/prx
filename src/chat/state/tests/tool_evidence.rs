@@ -262,3 +262,34 @@ fn misaligned_history_stops_carrying_evidence() {
         "the lost evidence is reported: {effects:?}"
     );
 }
+
+#[test]
+fn whole_history_replacement_keeps_evidence_of_the_repeated_tail() {
+    let mut state = three_exchange_state();
+    // A worker compaction: the whole history is replaced by the system
+    // prompt, a handoff and the retained turns repeated verbatim.
+    let history = state.session.history.clone();
+    let guard = crate::agent::compaction::compaction_patch_guard_for(&history, 0, history.len())
+        .expect("test: the whole history is a valid range");
+    let mut replacement = vec![
+        ChatMessage::system("sys"),
+        ChatMessage::assistant("handoff of the first two exchanges"),
+    ];
+    replacement.extend(history.iter().skip(history.len() - 2).cloned());
+    let patch = crate::agent::turn_contracts::CompactionPatch {
+        replacement,
+        append_after: Vec::new(),
+        guard,
+    };
+
+    let _ = apply_patch(&mut state, patch);
+
+    assert_eq!(
+        assistant_evidence(&state),
+        vec![
+            ("handoff of the first two exchanges".to_owned(), None),
+            ("a3".to_owned(), Some(evidence_of(&[EDIT_DENIED]))),
+        ],
+        "the repeated retained reply keeps its evidence; the handoff gets none"
+    );
+}

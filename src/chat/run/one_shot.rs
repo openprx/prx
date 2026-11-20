@@ -124,7 +124,8 @@ pub(super) fn note_turn_failure(binding: Option<&ChatTurnBinding>, error: &anyho
 /// Read the turn's end: the driver's refusal note first, then a failure, then
 /// the answer of a turn whose ordered commit was acknowledged (`committed`);
 /// a turn without an acknowledged commit that did not fail was cancelled
-/// (Ctrl-C), which is a failure for the process.
+/// (Ctrl-C), which is a failure for the process. `history` is the committed
+/// session's stored turns: the reply is printed exactly as it was saved.
 pub(super) fn outcome(
     binding: Option<&ChatTurnBinding>,
     turn_failed: bool,

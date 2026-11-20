@@ -71,7 +71,7 @@ use super::session_store::{
     format_turn_boundaries, leading_system_prompt_for_session, list_saved_sessions,
     load_latest_session_with_message_events, load_session_by_id_with_message_events, parse_turn_boundary,
     persisted_history_for_current_turn, provider_view_for_session, save_session, saved_chat_sessions,
-    upsert_leading_system_prompt,
+    session_turns_to_history, upsert_leading_system_prompt,
 };
 #[cfg(feature = "terminal-tui")]
 use super::session_switch::request_diff_apply_approval;
@@ -4872,7 +4872,9 @@ Retry with a compatible model: /provider {shown} <model>",
             one_shot_binding.as_deref(),
             plain_mode_turn_failed,
             one_shot_task_id.is_some_and(|task_id| turn_signal.history_commit_acknowledged(task_id)),
-            &history,
+            // The committed turns' stored text, never the provider view (which
+            // renders each reply with its tool evidence).
+            &session_turns_to_history(&chat_dispatcher.session_reader().acked().session),
         )
     });
     let finished = startup::finish_chat_session(

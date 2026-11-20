@@ -53,7 +53,9 @@ fn newest_user_text(request: &serde_json::Value) -> String {
 }
 
 /// `run echo ev-1` calls `shell` and answers `EV-1` after its result; every
-/// other `say ev-N` line is answered `EV-N` without a tool.
+/// other `say ev-N` line is answered `EV-N` without a tool. The newest user
+/// message may open with a recall preamble quoting earlier lines, so a line
+/// is recognized by how the message ends.
 fn script() -> Script {
     Box::new(|index, request| {
         let last_is_tool = request["messages"]
@@ -61,7 +63,8 @@ fn script() -> Script {
             .and_then(|messages| messages.last())
             .is_some_and(|message| message["role"] == "tool");
         let user = newest_user_text(request);
-        if user.contains("ev-1") {
+        let line = user.trim_end();
+        if line.ends_with("run echo ev-1") {
             return if last_is_tool {
                 Scripted::text(EV_1)
             } else {
@@ -72,8 +75,8 @@ fn script() -> Script {
                 )
             };
         }
-        for (marker, reply) in [("ev-2", EV_2), ("ev-3", "EV-3"), ("ev-4", "EV-4")] {
-            if user.contains(marker) {
+        for (marker, reply) in [("say ev-2", EV_2), ("say ev-3", "EV-3"), ("say ev-4", "EV-4")] {
+            if line.ends_with(marker) {
                 return Scripted::text(reply);
             }
         }
@@ -154,7 +157,7 @@ fn assistant_texts(request: &serde_json::Value) -> Vec<String> {
 fn request_for<'a>(requests: &'a [serde_json::Value], marker: &str) -> &'a serde_json::Value {
     requests
         .iter()
-        .find(|request| newest_user_text(request).contains(marker))
+        .find(|request| newest_user_text(request).trim_end().ends_with(marker))
         .unwrap_or_else(|| panic!("no request for {marker}"))
 }
 
@@ -199,12 +202,12 @@ fn next_turn_request_carries_evidence_of_the_previous_reply() {
 
     let requests = server.requests();
     assert_eq!(
-        assistant_texts(request_for(&requests, "ev-2")),
+        assistant_texts(request_for(&requests, "say ev-2")),
         vec![EV_1_REPLAYED.to_owned()],
         "the second turn's request replays the shell reply with its evidence"
     );
     assert_eq!(
-        assistant_texts(request_for(&requests, "ev-3")),
+        assistant_texts(request_for(&requests, "say ev-3")),
         vec![EV_1_REPLAYED.to_owned(), EV_2_REPLAYED.to_owned()],
         "the third turn's request replays both replies, the tool-less one with none"
     );
@@ -226,8 +229,8 @@ fn resumed_session_replays_identical_evidence_bytes() {
     );
 
     let requests = server.requests();
-    let in_process = assistant_texts(request_for(&requests, "ev-3"));
-    let after_restart = assistant_texts(request_for(&requests, "ev-4"));
+    let in_process = assistant_texts(request_for(&requests, "say ev-3"));
+    let after_restart = assistant_texts(request_for(&requests, "say ev-4"));
     assert_eq!(
         after_restart.get(..in_process.len()),
         Some(in_process.as_slice()),
@@ -292,7 +295,7 @@ fn one_shot_message_with_session_replays_evidence() {
     assert_eq!(output.stdout, "EV-4\n", "stdout is the reply alone");
 
     let requests = server.requests();
-    let one_shot = assistant_texts(request_for(&requests, "ev-4"));
+    let one_shot = assistant_texts(request_for(&requests, "say ev-4"));
     assert_eq!(
         one_shot.first().map(String::as_str),
         Some(EV_1_REPLAYED),
