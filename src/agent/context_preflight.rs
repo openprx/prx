@@ -412,7 +412,8 @@ pub(crate) fn capture_current_turn_request_with_source(
 /// call walks forward from a fixed index at or ahead of the front, so nothing
 /// behind a surviving request is ever removed: compaction replaces a range that
 /// starts at the first non-system message, `trim_history_token_aware` removes
-/// repeatedly at the first non-system index, and
+/// repeatedly at the first non-system index (right behind it while that index
+/// holds the protected handoff, which is never the request), and
 /// `trim_history_to_context_budget_preserving_compaction_replacement` — the one
 /// removal that is *not* front-first — removes repeatedly at `start +
 /// replacement_len`, deliberately behind the summary it preserves, but still

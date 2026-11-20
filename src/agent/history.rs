@@ -54,6 +54,62 @@ pub(super) fn history_non_system_start(history: &[ChatMessage]) -> usize {
     usize::from(history.first().is_some_and(|message| message.role == "system"))
 }
 
+/// The newest validated context handoff of a provider view. Every front-first
+/// trim skips it while another removable message older than the view's newest
+/// message remains, so it is removed last, before only that newest message:
+/// the handoff is the model's only pointer to the turns it folded. Taken once
+/// per trim call, before the trim starts; a view without a handoff trims
+/// exactly as without the protection.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ProtectedHandoff(Option<usize>);
+
+impl ProtectedHandoff {
+    pub(super) fn of(history: &[ChatMessage]) -> Self {
+        Self(crate::agent::compaction::newest_validated_context_handoff_index(
+            history,
+        ))
+    }
+
+    /// The message a front-first trim removes when `oldest` is the oldest
+    /// message it may remove and `newest` the newest: the next one when
+    /// `oldest` is the protected handoff and another message lies before
+    /// `newest`, else `oldest` (with only the handoff and the newest message
+    /// left, the handoff goes first, as without the protection).
+    pub(super) fn removal_index(self, oldest: usize, newest: usize) -> usize {
+        let next = oldest.saturating_add(1);
+        if self.0 == Some(oldest) && next < newest {
+            next
+        } else {
+            oldest
+        }
+    }
+
+    /// Remove `history[index]` and the tool results that removal strands,
+    /// keeping track of where the protected handoff now is. Nothing happens
+    /// when `index` is outside the history.
+    pub(super) fn remove_at(&mut self, history: &mut Vec<ChatMessage>, index: usize) {
+        let before = history.len();
+        if index >= before {
+            return;
+        }
+        history.remove(index);
+        drop_orphan_tool_results_at(history, index);
+        let removed = before.saturating_sub(history.len());
+        self.0 = match self.0 {
+            Some(protected) if protected == index => None,
+            // The stranded results sat between the removed message and the
+            // handoff, which is never a tool result.
+            Some(protected) if protected > index => Some(protected.saturating_sub(removed)),
+            unchanged => unchanged,
+        };
+    }
+
+    /// The protected handoff's position when it lies in `start..end`.
+    fn within(self, start: usize, end: usize) -> Option<usize> {
+        self.0.filter(|protected| (start..end).contains(protected))
+    }
+}
+
 fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
     // Nothing to trim if within limit
     let has_system = history.first().map_or(false, |m| m.role == "system");
@@ -65,7 +121,19 @@ fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
 
     let start: usize = if has_system { 1 } else { 0 };
     let to_remove = non_system_count - max_history;
-    history.drain(start..start + to_remove);
+    let end = start + to_remove;
+    // The cut would take the protected handoff: the first message after the
+    // cut goes in its place, unless that message is the newest one.
+    if let Some(protected) = ProtectedHandoff::of(history)
+        .within(start, end)
+        .filter(|_| end.saturating_add(1) < history.len())
+    {
+        history.drain(protected.saturating_add(1)..=end);
+        drop_orphan_tool_results_at(history, protected.saturating_add(1));
+        history.drain(start..protected);
+        return;
+    }
+    history.drain(start..end);
     drop_orphan_tool_results_at(history, start);
 }
 

@@ -1,4 +1,4 @@
-use crate::agent::history::{drop_orphan_tool_results_at, history_non_system_start};
+use crate::agent::history::{ProtectedHandoff, drop_orphan_tool_results_at, history_non_system_start};
 use crate::providers::ChatMessage;
 use crate::tokens::count::{TokenMeasurement, TokenMeasurementSource, count_tokens_with_source};
 
@@ -10,9 +10,12 @@ pub(crate) const PRE_TURN_FLUSH_THRESHOLD: f64 = 0.85;
 pub(super) const TOKEN_HEURISTIC_BUDGET_MULTIPLIER: usize = 2;
 
 /// Token-aware mid-turn trim: remove the oldest non-system messages one at a time
-/// until the estimated token count drops below max_tokens.
+/// until the estimated token count drops below max_tokens. The newest validated
+/// context handoff is skipped while another message older than the newest one
+/// remains ([`ProtectedHandoff`]).
 pub(super) fn trim_history_token_aware(history: &mut Vec<ChatMessage>, max_tokens: usize) {
     let start_of_non_system = history_non_system_start(history);
+    let mut handoff = ProtectedHandoff::of(history);
     loop {
         if estimate_history_tokens(history) <= max_tokens {
             break;
@@ -22,8 +25,8 @@ pub(super) fn trim_history_token_aware(history: &mut Vec<ChatMessage>, max_token
         if history.len() <= start + 1 {
             break; // nothing left to remove
         }
-        history.remove(start);
-        drop_orphan_tool_results_at(history, start);
+        let index = handoff.removal_index(start, history.len().saturating_sub(1));
+        handoff.remove_at(history, index);
     }
     drop_orphan_tool_results_at(history, start_of_non_system);
 }
@@ -332,6 +335,7 @@ pub fn trim_history_to_context_budget_preserving_compaction_replacement(
     let has_system = history.first().is_some_and(|m| m.role == "system");
     let start: usize = if has_system { 1 } else { 0 };
     let preserve_until = start.saturating_add(replacement_len).min(history.len());
+    let mut handoff = ProtectedHandoff::of(history);
     loop {
         if estimate_history_tokens(history) <= limit {
             break;
@@ -343,8 +347,8 @@ pub fn trim_history_to_context_budget_preserving_compaction_replacement(
         } else {
             break;
         };
-        history.remove(remove_index);
-        drop_orphan_tool_results_at(history, remove_index);
+        let remove_index = handoff.removal_index(remove_index, history.len().saturating_sub(1));
+        handoff.remove_at(history, remove_index);
     }
     history.len() != before_len || measure_history_tokens(history) != before_tokens
 }
@@ -360,13 +364,14 @@ pub fn trim_history_to_context_budget_preserving_compaction_replacement_with_flo
     let after_preserve = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
     if after_preserve.over_hard_limit {
         trim_history_to_context_budget(history, config);
+        let mut handoff = ProtectedHandoff::of(history);
         while plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD).over_hard_limit {
             let start = history_non_system_start(history);
             if history.len() <= start {
                 break;
             }
-            history.remove(start);
-            drop_orphan_tool_results_at(history, start);
+            let index = handoff.removal_index(start, history.len().saturating_sub(1));
+            handoff.remove_at(history, index);
         }
     }
     history.len() != before_len || measure_history_tokens(history) != before_tokens

@@ -4062,3 +4062,6 @@ async fn lookup_tool_is_published_when_canonical_history_holds_a_handoff() {
     .await
     .expect("test: within the deadline");
 }
+
+#[path = "handoff_trim.rs"]
+mod handoff_trim;

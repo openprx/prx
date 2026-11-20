@@ -2477,3 +2477,62 @@ async fn switch_provenance_refuses_a_session_past_the_pool_bound() {
     .await
     .expect("switch_provenance_refuses_a_session_past_the_pool_bound exceeded its deadline");
 }
+
+#[tokio::test]
+async fn cold_window_over_500_events_folds_the_oldest_500() {
+    tokio::time::timeout(PROVENANCE_TEST_DEADLINE, async {
+        const PAIRS: usize = 260;
+        const MAX_EVENTS: usize = crate::tools::transcript_history_lookup::MAX_REFERENCED_EVENTS;
+        let store = ProvenanceStore::new("m2-cold-window-cap");
+        let mut history = vec![ChatMessage::system("sys")];
+        let mut rows = Vec::new();
+        for pair in 0..PAIRS {
+            let run = format!("cap-run-{pair}");
+            let question = format!("cold question {pair}");
+            let answer = format!("cold answer {pair}");
+            rows.push(store.user(Some(run.as_str()), &question).await);
+            rows.push(store.assistant(Some(run.as_str()), &answer).await);
+            history.push(ChatMessage::user(question));
+            history.push(ChatMessage::assistant(answer));
+        }
+        store.user(Some("cap-tail"), "tail question").await;
+        history.push(ChatMessage::user("tail question"));
+        assert!(
+            rows.len() > MAX_EVENTS,
+            "premise: the requested cold window holds more durable messages than a handoff references"
+        );
+
+        let patch = store
+            .build(&history, 1)
+            .await
+            .expect("test: an oversized cold window still switches");
+
+        let note = switch_note(&patch);
+        let oldest: Vec<&MessageEvent> = rows.iter().take(MAX_EVENTS).collect();
+        assert_eq!(
+            note_event_ids(&note),
+            ids_of(&oldest),
+            "the handoff references the oldest 500 rows in history order"
+        );
+        assert_eq!(
+            (patch.range_start(), patch.range_end()),
+            (1, 1 + MAX_EVENTS),
+            "the switch folds exactly the oldest 500 messages"
+        );
+        let mut compacted = history.clone();
+        apply_compaction_patch_exact(&mut compacted, &patch).expect("test: the patch applies to its source");
+        let expected_tail: Vec<ChatMessage> = history.iter().skip(1 + MAX_EVENTS).cloned().collect();
+        assert_eq!(
+            compacted.get(2..).map(contents),
+            Some(contents(&expected_tail)),
+            "the rest of the cold window and the tail stay in the window for a later switch"
+        );
+        assert_eq!(
+            store.switch_rows().await.len(),
+            1,
+            "exactly one switch row is persisted"
+        );
+    })
+    .await
+    .expect("cold_window_over_500_events_folds_the_oldest_500 exceeded its deadline");
+}

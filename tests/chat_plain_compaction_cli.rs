@@ -2826,3 +2826,126 @@ fn nested_handoff_is_recoverable_in_two_lookups() {
     assert!(output.stdout.contains(RECALLED), "stdout: {}", output.stdout);
     assert_lookup_returned_the_stored_row(&sandbox, &server);
 }
+
+/// The line of the long tool turn that runs after an automatic switch.
+const LONG_READS: &str = "LONG-READS every filler";
+/// Tool rounds of the [`LONG_READS`] turn before its text reply: one per
+/// filler file, enough tool output to overflow the small window inside the
+/// turn several times.
+const LONG_READ_ROUNDS: usize = SWITCH_FILLERS;
+
+/// The compaction script, except that the [`LONG_READS`] turn reads one
+/// filler file per provider call for [`LONG_READ_ROUNDS`] calls.
+fn script_with_long_reads() -> Script {
+    let mut base = compaction_script::script();
+    let mut rounds = 0;
+    Box::new(move |index, request| {
+        if newest_user_text(request).contains(LONG_READS) {
+            if rounds < LONG_READ_ROUNDS {
+                let file = format!("f{rounds}.txt");
+                rounds += 1;
+                return Scripted::tool(
+                    &format!("call-long-{index}"),
+                    "file_read",
+                    &serde_json::json!({ "path": file }),
+                );
+            }
+            return Scripted::text(compaction_script::NOTED);
+        }
+        base(index, request)
+    })
+}
+
+/// The handoff message of `request` as the model sees it (the newest
+/// assistant message that opens with the handoff marker), if any.
+fn shown_handoff(request: &serde_json::Value) -> Option<String> {
+    request["messages"].as_array()?.iter().rev().find_map(|message| {
+        let text = message_text(message);
+        (message["role"] == "assistant" && text.starts_with(compaction_script::HANDOFF_START)).then_some(text)
+    })
+}
+
+/// The non-system `(role, text)` messages of `request`.
+fn conversation_messages(request: &serde_json::Value) -> Vec<(String, String)> {
+    request["messages"]
+        .as_array()
+        .map(|messages| {
+            messages
+                .iter()
+                .filter(|message| message["role"] != "system")
+                .map(|message| {
+                    (
+                        message["role"].as_str().unwrap_or_default().to_owned(),
+                        message_text(message),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// M2 (REQ-HANDOFF-RECALL-AND-TRIM): tool turns drive one real `prx chat
+/// --plain` across the small window until an automatic switch; a long tool
+/// turn then overflows the window again and again. Every per-request trim of
+/// that turn takes older messages and keeps the handoff, so each of its
+/// requests still shows the model the pointer to the folded turns, in the
+/// compact form a chat view renders it in.
+#[test]
+fn a_long_turn_after_a_switch_keeps_the_handoff_in_every_request() {
+    let sandbox = Sandbox::new();
+    write_filler_files(&sandbox.workspace, SWITCH_FILLERS);
+    let server = LoopbackOpenAi::start(MODEL, Some((11, 7)), script_with_long_reads());
+    set_window(&sandbox, &server, compaction_script::SMALL_WINDOW_TOKENS);
+    let mut chat = HeldChat::spawn(&sandbox, &[]);
+    let mut replies = 1;
+    chat.turn(PLANT, replies);
+    let mut next_file = 0;
+    while switch_event_counts(&sandbox.workspace).0 < 1 && next_file < SWITCH_FILLERS {
+        replies += 1;
+        chat.turn(&read_line(next_file), replies);
+        next_file += 1;
+    }
+    assert!(
+        switch_event_counts(&sandbox.workspace).0 >= 1,
+        "premise: the filler reads drive the session across the window and switch"
+    );
+    replies += 1;
+    chat.turn(LONG_READS, replies);
+    let output = chat.exit();
+    assert_clean(&output, "a long tool turn after an automatic switch");
+
+    let requests = server.requests();
+    let long_turn: Vec<&serde_json::Value> = requests
+        .iter()
+        .filter(|request| newest_user_text(request).contains(LONG_READS))
+        .collect();
+    assert!(
+        long_turn.len() > LONG_READ_ROUNDS,
+        "premise: the long turn ran its {LONG_READ_ROUNDS} tool rounds: {} provider calls",
+        long_turn.len()
+    );
+    let trimmed_under_one_handoff = long_turn.windows(2).any(|pair| {
+        let (earlier, later) = (pair[0], pair[1]);
+        let later_messages = conversation_messages(later);
+        shown_handoff(earlier).is_some()
+            && shown_handoff(earlier) == shown_handoff(later)
+            && conversation_messages(earlier)
+                .iter()
+                .any(|message| !later_messages.contains(message))
+    });
+    assert!(
+        trimmed_under_one_handoff,
+        "premise: a per-request trim (not a switch) dropped messages inside the long turn"
+    );
+    let compact_prefix = format!("{} handoff_event_id=", compaction_script::HANDOFF_START);
+    for (index, request) in long_turn.iter().enumerate() {
+        assert!(
+            shown_handoff(request).is_some_and(|handoff| handoff.starts_with(&compact_prefix)),
+            "request {index} of the long turn carries the compact [context_handoff]: {:?}",
+            conversation_messages(request)
+                .iter()
+                .map(|(role, text)| format!("{role}: {}", text.chars().take(60).collect::<String>()))
+                .collect::<Vec<_>>()
+        );
+    }
+}

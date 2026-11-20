@@ -310,6 +310,25 @@ pub(crate) fn is_context_handoff_turn(role: &str, content: &str) -> bool {
     role == "assistant" && content.starts_with(CONTEXT_HANDOFF_START)
 }
 
+/// Whether `message` is a context handoff the compaction code wrote, in
+/// either form a provider view holds: the stored note, when it validates
+/// ([`validated_context_handoff_note`]), or exactly the compact rendering
+/// [`render_context_handoff_for_provider`] makes of a validated note (a chat
+/// view). Model output that merely looks like either one, and any message
+/// that is not an assistant message, is not.
+pub(crate) fn is_validated_context_handoff_message(message: &ChatMessage) -> bool {
+    is_context_handoff_message(message)
+        && (is_compact_context_handoff(&message.content) || validated_context_handoff_note(&message.content).is_some())
+}
+
+/// Position of the newest validated context handoff in `messages`: the one
+/// handoff a front-first trim of a provider view keeps until nothing else it
+/// may remove is left.
+#[must_use]
+pub(crate) fn newest_validated_context_handoff_index(messages: &[ChatMessage]) -> Option<usize> {
+    messages.iter().rposition(is_validated_context_handoff_message)
+}
+
 /// The JSON note inside a context handoff message, if `content` is one.
 #[must_use]
 pub(crate) fn parse_context_handoff_note(content: &str) -> Option<serde_json::Value> {
@@ -405,6 +424,55 @@ struct HandoffNoteLookupArguments {
     event_ids: Vec<String>,
     first_row_id: i64,
     last_row_id: i64,
+}
+
+/// A handoff message in the exact form the switch writes, referencing
+/// `event_ids` (stored rows `first_row_id..`), for tests that need a validated
+/// handoff in a provider view without running a switch over a store.
+#[cfg(test)]
+pub(crate) fn handoff_message_for_test(handoff_event_id: &str, event_ids: &[&str], first_row_id: i64) -> String {
+    let folded = FoldedToolRoundtrips {
+        count: 0,
+        tools: Vec::new(),
+    };
+    let last_row_id = first_row_id.saturating_add(i64::try_from(event_ids.len()).unwrap_or(i64::MAX));
+    let note = serde_json::json!({
+        "schema_version": 1,
+        "kind": "context_handoff",
+        "strategy": "hard_switch",
+        "handoff_event_id": handoff_event_id,
+        "parent_handoff_event_id": null,
+        "from_generation": 0,
+        "to_generation": 1,
+        "created_at": "2026-11-20T00:00:00+00:00",
+        "trigger": "pre_provider_call",
+        "source_message_count": event_ids.len(),
+        "source_token_estimate": 0,
+        "unpersisted_companion_count": 0,
+        "folded_tool_roundtrips": {
+            "count": folded.count,
+            "tools": folded.tools,
+        },
+        "folded_tool_roundtrips_notice": format_folded_tool_roundtrips_notice(&folded),
+        "provenance_status": "exact",
+        "source_event_range": {
+            "first_event_id": event_ids.first().copied().unwrap_or_default(),
+            "last_event_id": event_ids.last().copied().unwrap_or_default(),
+            "first_row_id": first_row_id,
+            "last_row_id": last_row_id,
+            "source_event_count": event_ids.len(),
+        },
+        "retained_recent_message_count": 2,
+        "lookup": {
+            "tool": crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME,
+            "arguments": {
+                "event_ids": event_ids,
+                "first_row_id": first_row_id,
+                "last_row_id": last_row_id,
+            }
+        }
+    });
+    format_context_handoff_message(&note.to_string())
 }
 
 /// An id, handoff id or trigger of a validated note: ASCII letters, digits,
@@ -556,16 +624,61 @@ pub(crate) fn render_context_handoff_for_provider<'a>(role: &str, content: &'a s
 /// transcript_history_lookup(handoff_event_id="<id>").`, followed by
 /// ` <k> tool round-trips were folded.` only when `k` is not zero.
 fn format_compact_context_handoff(handoff: &ValidatedContextHandoff) -> String {
-    let id = &handoff.handoff_event_id;
-    let mut rendered = format!(
-        "{CONTEXT_HANDOFF_START} handoff_event_id={id} — {} earlier messages were moved out of this window. They are recoverable with {}(handoff_event_id=\"{id}\").",
+    format_compact_context_handoff_parts(
+        &handoff.handoff_event_id,
         handoff.event_ids.len(),
+        handoff.folded_roundtrips,
+    )
+}
+
+/// The compact rendering of a note with handoff id `id`, `messages`
+/// referenced events and `folded` folded tool round-trips.
+fn format_compact_context_handoff_parts(id: &str, messages: usize, folded: usize) -> String {
+    let mut rendered = format!(
+        "{CONTEXT_HANDOFF_START}{COMPACT_HANDOFF_ID_FIELD}{id} — {messages} earlier messages were moved out of this window. They are recoverable with {}(handoff_event_id=\"{id}\").",
         crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME,
     );
-    if handoff.folded_roundtrips > 0 {
-        let _ = write!(rendered, " {} tool round-trips were folded.", handoff.folded_roundtrips);
+    if folded > 0 {
+        let _ = write!(rendered, " {folded}{COMPACT_HANDOFF_FOLDED_SUFFIX}");
     }
     rendered
+}
+
+/// What follows the handoff marker in a compact rendering, up to the id.
+const COMPACT_HANDOFF_ID_FIELD: &str = " handoff_event_id=";
+
+/// The sentence after the folded round-trip count of a compact rendering.
+const COMPACT_HANDOFF_FOLDED_SUFFIX: &str = " tool round-trips were folded.";
+
+/// Whether `content` is exactly a compact rendering
+/// ([`format_compact_context_handoff_parts`]) of a validated note: a
+/// well-formed handoff id, a positive message count, an optional positive
+/// folded count, and every other byte as the renderer writes it. The parts
+/// are read back and the rendering rebuilt from them, so the renderer stays
+/// the one definition of the shape.
+fn is_compact_context_handoff(content: &str) -> bool {
+    let Some(rest) = content
+        .strip_prefix(CONTEXT_HANDOFF_START)
+        .and_then(|rest| rest.strip_prefix(COMPACT_HANDOFF_ID_FIELD))
+    else {
+        return false;
+    };
+    let Some((id, rest)) = rest.split_once(" — ") else {
+        return false;
+    };
+    let Some(messages) = rest
+        .split_once(' ')
+        .and_then(|(count, _)| count.parse::<usize>().ok())
+        .filter(|count| *count > 0)
+    else {
+        return false;
+    };
+    let folded = content
+        .strip_suffix(COMPACT_HANDOFF_FOLDED_SUFFIX)
+        .and_then(|head| head.rsplit_once(' '))
+        .and_then(|(_, count)| count.parse::<usize>().ok())
+        .unwrap_or(0);
+    is_handoff_note_identifier(id) && format_compact_context_handoff_parts(id, messages, folded) == content
 }
 
 /// True when `message` exists only inside a live tool round-trip and therefore
@@ -707,6 +820,31 @@ pub(crate) fn format_folded_tool_roundtrips_notice(folded: &FoldedToolRoundtrips
         "{} tool round-trips (tools: {tools}) were folded into this handoff and are not recoverable in this window",
         folded.count
     )
+}
+
+/// The end of a switch's cold window `start..requested_end`, capped so it
+/// holds at most [`MAX_REFERENCED_EVENTS`] durable messages (every message
+/// that is not a tool round companion resolves to one transcript event).
+///
+/// A handoff references at most that many events, so a larger cold window
+/// would be refused (`bound:too_many_events`) on every rollover. Folding the
+/// oldest messages up to the bound instead leaves the rest in the window for
+/// a later switch. The capped end is the next durable message, so the hot
+/// window still starts on a durable turn.
+///
+/// [`MAX_REFERENCED_EVENTS`]: crate::tools::transcript_history_lookup::MAX_REFERENCED_EVENTS
+fn switch_cold_window_end(companions: &[bool], start: usize, requested_end: usize) -> usize {
+    let mut durable = 0usize;
+    for index in start..requested_end {
+        if companions.get(index).copied().unwrap_or_default() {
+            continue;
+        }
+        if durable == crate::tools::transcript_history_lookup::MAX_REFERENCED_EVENTS {
+            return index;
+        }
+        durable = durable.saturating_add(1);
+    }
+    requested_end
 }
 
 /// Move the compaction boundary backwards so the retained hot window never
@@ -1956,8 +2094,13 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
     // Never cut inside a tool round-trip: an orphan `role="tool"` result whose
     // requesting assistant message was compacted away is rejected by every
     // native provider.
-    let compact_end =
-        compaction_boundary_without_orphan_tool_results(&companions, start, start + requested_compact_count);
+    let requested_end = start.saturating_add(requested_compact_count);
+    let requested_end = if matches!(config.mode, crate::config::AgentCompactionMode::Switch) {
+        switch_cold_window_end(&companions, start, requested_end)
+    } else {
+        requested_end
+    };
+    let compact_end = compaction_boundary_without_orphan_tool_results(&companions, start, requested_end);
     let compact_count = compact_end.saturating_sub(start);
     if compact_count == 0 {
         return Ok(CompactionBuild::NotNeeded);
