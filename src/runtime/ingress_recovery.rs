@@ -639,8 +639,10 @@ impl IngressRecorder {
                 .at(QuarantineCause::EvidenceRejected)?
                 .is_some()
         {
-            // Already recorded unconfirmed; nothing new to write.
-            return Ok(outcome);
+            // Already recorded unconfirmed and still without a final: nothing
+            // new to write or report. The scan keeps visiting the row so a
+            // final that appears later still upgrades it to reconciled.
+            return Ok(RecoveryRowOutcome::Unchanged);
         }
         let evidence = {
             let capsule = capsule.clone();

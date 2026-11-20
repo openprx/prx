@@ -29,6 +29,9 @@ pub(crate) enum RecoveryRowOutcome {
     /// Left as it is, with an authenticated quarantine marker; retried at most
     /// once per process start.
     Quarantined(QuarantineCause),
+    /// Already recorded `unconfirmed` with its evidence and still without a
+    /// final: nothing was written, so nothing is reported.
+    Unchanged,
 }
 
 impl RecoveryRowOutcome {
@@ -38,12 +41,13 @@ impl RecoveryRowOutcome {
             Self::SkippedLive => "skipped_live",
             Self::Orphaned(_) => "orphaned",
             Self::Quarantined(_) => "quarantined",
+            Self::Unchanged => "unchanged",
         }
     }
 
     const fn cause(self) -> &'static str {
         match self {
-            Self::Settled | Self::SkippedLive => "none",
+            Self::Settled | Self::SkippedLive | Self::Unchanged => "none",
             Self::Orphaned(cause) => cause.as_str(),
             Self::Quarantined(cause) => cause.as_str(),
         }
@@ -407,7 +411,12 @@ pub(super) fn quarantined_this_process(namespace: &str, capsule: &IngressCapsule
 }
 
 /// Remember `outcome` and log it once per row and outcome, without payload.
+/// An unchanged row is not logged: a later process revisits it on every scan
+/// (to upgrade it once its final appears), and nothing about it changed.
 pub(super) fn note_outcome(namespace: &str, capsule: &IngressCapsule, outcome: RecoveryRowOutcome) {
+    if outcome == RecoveryRowOutcome::Unchanged {
+        return;
+    }
     let (namespace, input) = row_key(namespace, capsule);
     let first = {
         let mut memo = row_memo().lock();
