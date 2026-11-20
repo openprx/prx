@@ -104,12 +104,14 @@ impl KeyDirectory {
         )?);
         #[cfg(test)]
         check_cloexec(&directory)?;
+        let mut ancestor = std::path::PathBuf::from("/");
         for component in memory.components() {
             let name = match component {
                 Component::RootDir => continue,
                 Component::Normal(name) => name,
                 _ => anyhow::bail!("unsafe recovery ancestor"),
             };
+            ancestor.push(name);
             directory = File::from(openat(
                 &directory,
                 name,
@@ -124,13 +126,21 @@ impl KeyDirectory {
             let sticky_root = metadata.uid() == 0 && metadata.mode() & 0o1000 != 0;
             anyhow::ensure!(
                 (metadata.uid() == owner || metadata.uid() == 0) && (metadata.mode() & 0o022 == 0 || sticky_root),
-                "unsafe recovery ancestor ownership or mode"
+                "unsafe recovery ancestor {} (mode {:o}, owner {}, euid {}): must be owned by you or root and not group/other-writable",
+                ancestor.display(),
+                metadata.mode() & 0o7777,
+                metadata.uid(),
+                owner
             );
         }
         let metadata = directory.metadata()?;
         anyhow::ensure!(
             metadata.uid() == owner && metadata.mode() & 0o777 == 0o700,
-            "unsafe memory directory"
+            "unsafe memory directory {} (mode {:o}, owner {}, euid {}): must be yours and 0700",
+            memory.display(),
+            metadata.mode() & 0o7777,
+            metadata.uid(),
+            owner
         );
         if !staging {
             match statat(&directory, INCOMPLETE_MARKER, AtFlags::SYMLINK_NOFOLLOW) {

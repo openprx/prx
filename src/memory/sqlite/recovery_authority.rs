@@ -845,10 +845,10 @@ impl RecoveryRepository for SqliteMemory {
         // The gate covers the check, the load and the failure publication, so
         // queued callers observe the recorded failure instead of loading again.
         let _serial = self.recovery_activation.lock();
-        if self.recovery_unavailable.get().is_some() {
-            return Err(anyhow::Error::new(RecoveryKeyUnavailable(
-                "recovery authority unavailable; activation was refused earlier".to_owned(),
-            )));
+        if let Some(reason) = self.recovery_unavailable.get() {
+            return Err(anyhow::Error::new(RecoveryKeyUnavailable(format!(
+                "recovery authority unavailable; activation was refused earlier: {reason}"
+            ))));
         }
         #[cfg(test)]
         self.recovery_activation_attempts
@@ -856,7 +856,7 @@ impl RecoveryRepository for SqliteMemory {
         match self.recovery_activate(false) {
             Ok(id) => Ok(id),
             Err(error) if crate::memory::recovery_authority::is_key_unavailable(&error) => {
-                let _ = self.recovery_unavailable.set(());
+                let _ = self.recovery_unavailable.set(format!("{error:#}"));
                 self.warn_unavailable_once();
                 Err(error)
             }
