@@ -244,7 +244,7 @@ All contributors (human or agent) must follow the same collaboration flow:
 - Commit changes to that branch with clear, scoped commit messages.
 - The unit of work is one module: one branch, landed whole. The controller settles every open design value in the design document before coding; stop and ask instead of inventing one.
 - While coding, commit checkpoints on the branch. A lane does not push, open a PR or land.
-- A lane writes no test code (owner 2026-11-20). When the module passes the lane's gates (the scoped checks and the existing suites it touched), the lane reports and the branch gets a real test on a debug binary. The full gate is the controller's local full gate (the ci-run.yml gate set plus supply-chain checks, run on the build hosts).
+- A lane writes no test code (owner 2026-11-20). When the module passes the lane's gates (the scoped checks; a lane runs no `cargo test` — the existing suite runs once in the controller's full gate), the lane reports and the branch gets a real test on a debug binary. The full gate is the controller's local full gate (the ci-run.yml gate set plus supply-chain checks, run on the build hosts).
 - There is no code review after coding. Each test must exercise the changed path through real components; there are no break-the-fix checks.
 - When the local full gate is green on the branch rebased onto the live `origin/main`, the controller pushes `main` directly (fast-forward) and deletes the branch. There is no PR, no merge queue and no post-submit stage. GitHub CI runs on `main` after the push. A change to Windows-only code, installers or `.github/workflows` goes through a PR and GitHub CI first.
 - A red `main` becomes the next task.
@@ -325,14 +325,14 @@ Default local checks for code changes (a scoped inner loop; the controller's loc
 
 ```bash
 cargo fmt --all
-cargo clippy --all-targets -- -D warnings
-cargo test --lib <module::path>                 # existing tests of the touched module only
-cargo test --test architecture_boundaries
+cargo clippy --lib --bins -- -D warnings                    # inner loop: production code only
+cargo clippy --all-targets --all-features -- -D warnings    # once, before reporting
+scripts/ci/build_architecture_boundaries.sh /tmp/arch && /tmp/arch   # boundary scanners, standalone build
 ```
 
 Do not write test code (owner 2026-11-20): a lane writes business logic only. It keeps the existing tests compiling and passing with the smallest mechanical edit, deletes a test that asserts behaviour the change intentionally replaces, and lists every such edit in its report. A change is verified by a real test: a debug `prx` built from the branch, run against real providers on an isolated state directory. Rules below about test style and placement apply to the existing tests when they are edited. A test that needs the real `prx` binary is an integration test under `tests/` (it gets `CARGO_BIN_EXE_prx`); a lib unit test must not depend on the binary artifact, because building both in one CI archive exhausts the hosted runner's memory.
 
-A lane does not run the whole-workspace suite, mutation batches or stress loops. It does run the existing suites it touched before reporting.
+A lane does not run the whole-workspace suite, mutation batches or stress loops. It runs no `cargo test` at all.
 
 Additional expectations by change type:
 
