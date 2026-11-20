@@ -14,7 +14,7 @@ from profile import read_bounded
 
 MAX_ARTIFACT = 16 * 1024 * 1024
 AGENT_KEYS = ("git_sha", "binary_sha256", "profile_sha256", "instruction_sha256", "version",
-              "model_id", "provider", "settlement_provider", "sampling", "profile_values",
+              "model_id", "provider", "settlement_provider", "sampling", "profile_values", "workdir",
               "agent_timeout_sec", "agent_exec_timeout_sec", "per_attempt_models")
 TRANSPORT = re.compile(r"API error \((?:5\d\d|429)\b|\b(?:HTTP|status)[ /:=]*(?:5\d\d|429)\b|error sending request|error trying to connect|tcp connect error|connection (?:refused|reset|closed)|dns error|failed to lookup address|name resolution|invalid peer certificate|tls handshake|request timed out|operation timed out", re.I)
 
@@ -279,6 +279,7 @@ def finalize(trial):
         "harness_prompt_sha256": unavailable("runtime-built prompt not exported; covered by binary and profile"),
         "model_id": agent["model_id"], "provider": agent["provider"],
         "sampling": agent["sampling"], "profile_values": agent["profile_values"],
+        "workdir": agent["workdir"],
         "resource_limits": {"cpus": env.get("cpus", unavailable("not declared")),
                             "memory_mb": resource_mb(env, "memory"),
                             "storage_mb": resource_mb(env, "storage"),
