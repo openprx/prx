@@ -46,7 +46,13 @@ fn ledger_lines(workspace: &Path, settlement: &str) -> usize {
         u64::try_from(text.len()).expect("test: ledger length") <= MAX_LEDGER_BYTES,
         "test: the cost ledger exceeds {MAX_LEDGER_BYTES} bytes"
     );
-    text.lines().filter(|line| line.contains(settlement)).count()
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter(|line| {
+            let row: serde_json::Value = serde_json::from_str(line).expect("test: cost ledger line is JSON");
+            row.get("settlement_id").and_then(serde_json::Value::as_str) == Some(settlement)
+        })
+        .count()
 }
 
 async fn commit_metered(workspace: &Path, memory: &Arc<dyn Memory>, terminal_id: &str) {
