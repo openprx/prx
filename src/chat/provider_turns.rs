@@ -86,7 +86,6 @@ pub(super) struct PerTurnContext {
     pub(super) provider_name: String,
     pub(super) model_name: String,
     pub(super) history_len_before_user_turn: usize,
-    pub(super) history_user_message: ChatMessage,
     /// The reducer's compaction epoch when the turn's provider view was
     /// copied. A newer acknowledged epoch at commit means a worker compaction
     /// ran during the turn, and the run loop's view is rebuilt from the
@@ -1331,14 +1330,18 @@ async fn commit_completed_provider_turn(
     true
 }
 
-/// Bring the run loop's provider view up to an acknowledged turn commit.
-/// Without a compaction since the turn copied its view, the committed request
-/// (enriched) and reply are appended. After a worker compaction the view is
-/// rebuilt from the committed snapshot instead: appending to the
-/// pre-compaction view would resend the replaced cold prefix and force
-/// another rollover or a lossy fallback on the next turn.
+/// Bring the run loop's provider view up to an acknowledged turn commit, so
+/// it equals the view rebuilt from the committed snapshot
+/// ([`super::compaction::provider_view_from_acked`]). Without a compaction
+/// since the turn copied its view, the committed request and reply are
+/// appended; the request is the plain stored text, never the enriched form
+/// the turn sent (only a request still being sent carries its recalled
+/// context and attached files). After a worker compaction the view is rebuilt
+/// from the committed snapshot instead: appending to the pre-compaction view
+/// would resend the replaced cold prefix and force another rollover or a lossy
+/// fallback on the next turn.
 #[cfg(feature = "terminal-tui")]
-fn adopt_committed_turn(
+pub(super) fn adopt_committed_turn(
     history: &mut Vec<ChatMessage>,
     chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
     pending: &PerTurnContext,
@@ -1346,12 +1349,7 @@ fn adopt_committed_turn(
 ) {
     let acked = chat_dispatcher.session_reader().acked();
     if acked.compaction_epoch != pending.compaction_epoch_at_start {
-        let view = super::compaction::provider_view_after_compacted_commit(
-            history,
-            &acked,
-            &pending.user_input,
-            &pending.history_user_message,
-        );
+        let view = super::compaction::provider_view_from_acked(history, &acked);
         tracing::info!(
             task_id = pending.task_id.get(),
             messages_before = history.len(),
@@ -1361,7 +1359,7 @@ fn adopt_committed_turn(
         *history = view;
         return;
     }
-    history.push(pending.history_user_message.clone());
+    history.push(crate::agent::turn_contracts::inbound_user_message(&pending.user_input));
     if let Some(reply) = reply {
         history.push(committed_reply_message(&acked, reply));
     }

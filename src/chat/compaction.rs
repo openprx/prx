@@ -289,63 +289,22 @@ pub(super) async fn run_manual_compact(
 }
 
 /// The provider view of an acknowledged snapshot: the current view's leading
-/// system prompt (if any) followed by the acknowledged turns. Older-turn
-/// enrichment is not carried (R2), so every later acknowledged read describes
-/// exactly the messages this view holds.
+/// system prompt (if any) followed by the acknowledged turns, through the one
+/// conversion ([`crate::agent::turn_history::project`]). No request keeps its
+/// enrichment (R2): only a request still being sent is enriched, so every
+/// later acknowledged read describes exactly the messages this view holds. A
+/// turn commit leaves the run loop's view equal to this view.
 pub(super) fn provider_view_from_acked(
     current_view: &[ChatMessage],
     acked: &crate::chat::acked_session::AckedSession,
-) -> Vec<ChatMessage> {
-    project_acked(current_view, acked, None)
-}
-
-/// The one conversion ([`crate::agent::turn_history::project`]) over the
-/// acknowledged canonical history of `acked` under the current view's
-/// leading system prompt, with `request` (plain, enriched) as its only input.
-fn project_acked(
-    current_view: &[ChatMessage],
-    acked: &crate::chat::acked_session::AckedSession,
-    request: Option<(ChatMessage, ChatMessage)>,
 ) -> Vec<ChatMessage> {
     let system = current_view
         .first()
         .filter(|message| message.role == "system")
         .map(|message| message.content.as_str());
     let canonical = super::session_store::canonical_history_of_acked(acked, system);
-    let (plain, enriched) = request.unzip();
-    let inputs = crate::agent::turn_history::ProjectionInputs::default().with_enriched_request(plain, enriched);
-    crate::agent::turn_history::project(&canonical, &inputs).into_messages()
-}
-
-/// The provider view after a turn whose commit follows a worker (automatic)
-/// compaction: rebuilt from the committed acknowledged snapshot, so the next
-/// turn never resends the replaced cold prefix. Only the committed request
-/// keeps its enrichment (as in the manual and preflight helpers): the newest
-/// stored user turn, when it is that request, becomes `enriched_request`.
-/// The TUI finalizer uses it after a detached worker compaction, the inline
-/// tool loop after an in-turn overflow compaction.
-pub(super) fn provider_view_after_compacted_commit(
-    current_view: &[ChatMessage],
-    acked: &crate::chat::acked_session::AckedSession,
-    plain_request: &str,
-    enriched_request: &ChatMessage,
-) -> Vec<ChatMessage> {
-    let plain = crate::agent::turn_contracts::inbound_user_message(plain_request);
-    let newest_user_is_request = acked
-        .session
-        .turns
-        .iter()
-        .rev()
-        .find(|turn| turn.role == "user")
-        .is_some_and(|turn| {
-            crate::agent::turn_contracts::stored_turn_message(turn.role.clone(), turn.content.clone()).content
-                == plain.content
-        });
-    project_acked(
-        current_view,
-        acked,
-        newest_user_is_request.then(|| (plain, enriched_request.clone())),
-    )
+    crate::agent::turn_history::project(&canonical, &crate::agent::turn_history::ProjectionInputs::default())
+        .into_messages()
 }
 
 pub(super) fn format_nothing_to_compact_feedback(
@@ -983,34 +942,20 @@ impl crate::agent::turn_contracts::ToolLoopEventSink for InlineCompactionSink {
 }
 
 /// Bring the run loop's provider view up to the committed session after an
-/// inline turn's commit. When the view changed during the turn other than by
-/// appending (`changed_in_turn`: a reported compaction, or a trim that was the
-/// projection of one request) or the acknowledged compaction epoch moved
-/// since `compaction_epoch_before_preflight` (the preflight's own compaction
-/// included), the view is rebuilt from the
-/// committed snapshot with the committed request in its enriched form
-/// (`committed`). A failed or cancelled turn is settled instead
-/// (`provider_turns::settle_aborted_turn`). Returns whether it rebuilt the view.
-pub(super) fn reconcile_inline_turn(
-    history: &mut Vec<ChatMessage>,
-    chat_dispatcher: &dispatcher::ChatDispatcher,
-    changed_in_turn: bool,
-    compaction_epoch_before_preflight: u64,
-    user_input: &str,
-    committed: &ChatMessage,
-) -> bool {
+/// inline turn's commit: the view is rebuilt from the committed snapshot
+/// ([`provider_view_from_acked`]), so the committed request is kept plain and
+/// the view holds what the session holds, as after a reducer-driven commit; a
+/// compaction or a trim of the turn is followed the same way. A failed or cancelled turn is settled
+/// instead (`provider_turns::settle_aborted_turn`).
+pub(super) fn reconcile_inline_turn(history: &mut Vec<ChatMessage>, chat_dispatcher: &dispatcher::ChatDispatcher) {
     let acked = chat_dispatcher.session_reader().acked();
-    if acked.compaction_epoch == compaction_epoch_before_preflight && !changed_in_turn {
-        return false;
-    }
-    let view = provider_view_after_compacted_commit(history, &acked, user_input, committed);
-    tracing::info!(
+    let view = provider_view_from_acked(history, &acked);
+    tracing::debug!(
         messages_before = history.len(),
         messages_after = view.len(),
-        "inline turn's provider view rebuilt from the committed session after a compaction"
+        "inline turn's provider view rebuilt from the committed session"
     );
     *history = view;
-    true
 }
 
 /// The digest of the provider view an inline turn starts from. A turn only

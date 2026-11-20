@@ -141,6 +141,9 @@ mod regfix_approval_switch_tests;
 #[cfg(all(test, feature = "terminal-tui"))]
 mod p6b1_transcript_tests;
 
+#[cfg(all(test, feature = "terminal-tui"))]
+mod view_hygiene_tests;
+
 #[cfg(test)]
 mod v4_reload_recap_tests;
 

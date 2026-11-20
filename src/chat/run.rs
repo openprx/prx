@@ -3689,7 +3689,6 @@ Retry with a compatible model: /provider {shown} <model>",
                             provider_name: provider_name.to_string(),
                             model_name: model_name.to_string(),
                             history_len_before_user_turn,
-                            history_user_message: history_user_message.clone(),
                             compaction_epoch_at_start,
                             assignment: assignment_guard.take(),
                         },
@@ -4612,14 +4611,7 @@ Retry with a compatible model: /provider {shown} <model>",
             {
                 anyhow::bail!("Chat stopped after an unconfirmed history commit: {error}");
             }
-            super::compaction::reconcile_inline_turn(
-                &mut history,
-                &chat_dispatcher,
-                inline_view_changed,
-                inline_compaction_epoch_before_preflight,
-                &user_input,
-                &history_user_message,
-            );
+            super::compaction::reconcile_inline_turn(&mut history, &chat_dispatcher);
             if let Some(ref d_id) = draft_id
                 && let Err(e) = terminal.cancel_draft("user", d_id).await
             {
@@ -4736,14 +4728,7 @@ Retry with a compatible model: /provider {shown} <model>",
         {
             anyhow::bail!("Chat stopped after an unconfirmed history commit: {error}");
         }
-        super::compaction::reconcile_inline_turn(
-            &mut history,
-            &chat_dispatcher,
-            inline_view_changed,
-            inline_compaction_epoch_before_preflight,
-            &user_input,
-            &history_user_message,
-        );
+        super::compaction::reconcile_inline_turn(&mut history, &chat_dispatcher);
         #[cfg(feature = "terminal-tui")]
         if let Some(tx) = redraw_tx_for_main.as_ref() {
             let _ = tx.try_send(());

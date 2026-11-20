@@ -670,6 +670,60 @@ fn a_compacted_fact_reaches_the_model_only_through_the_lookup() {
     assert!(output.stdout.contains(RECALLED), "stdout: {}", output.stdout);
 }
 
+/// The request growth allowed per short turn: 100 tokens, measured in request
+/// bytes at 4 bytes per token (the usual cl100k rate for English text; the
+/// test support has no tokenizer).
+const MAX_GROWTH_BYTES_PER_SHORT_TURN: usize = 100 * 4;
+
+/// The bytes of `request` without its newest user message: what the earlier,
+/// committed turns cost. The newest user message is the current request with
+/// its own enrichment, which grows only until the recalled-context block is
+/// full.
+fn committed_bytes(request: &serde_json::Value) -> usize {
+    let mut committed = request.clone();
+    if let Some(messages) = committed["messages"].as_array_mut()
+        && let Some(newest_user) = messages.iter().rposition(|message| message["role"] == "user")
+    {
+        messages.remove(newest_user);
+    }
+    committed.to_string().len()
+}
+
+/// M3: a committed turn stays in the provider view as its plain request, so
+/// each one-word turn adds about one short exchange to the next request and
+/// never an earlier turn's recalled context.
+#[test]
+fn request_growth_per_short_turn_is_bounded() {
+    const WORDS: [&str; 10] = [
+        "amber", "basil", "cedar", "dune", "ember", "fjord", "grove", "harbor", "indigo", "juniper",
+    ];
+    let sandbox = Sandbox::new();
+    let server = configure(&sandbox, LARGE_WINDOW_TOKENS);
+    let lines: Vec<String> = WORDS.iter().map(|word| (*word).to_owned()).collect();
+    let output = held_chat(&sandbox, &lines);
+    assert!(output.status.success(), "stderr: {}", output.stderr);
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), WORDS.len(), "one provider request per one-word turn");
+    for (request, word) in requests.iter().zip(WORDS) {
+        assert!(
+            newest_user_text(request).contains(word),
+            "each request is the turn of `{word}`"
+        );
+    }
+    let sizes: Vec<usize> = requests.iter().map(|request| request.to_string().len()).collect();
+    let committed: Vec<usize> = requests.iter().map(committed_bytes).collect();
+    let growth: Vec<usize> = committed
+        .windows(2)
+        .map(|pair| pair[1].saturating_sub(pair[0]))
+        .collect();
+    assert!(
+        growth.iter().all(|bytes| *bytes < MAX_GROWTH_BYTES_PER_SHORT_TURN),
+        "each request after the first grows by less than {MAX_GROWTH_BYTES_PER_SHORT_TURN} bytes of committed \
+         turns: growth {growth:?}, committed {committed:?}, whole requests {sizes:?}"
+    );
+}
+
 /// The newest user message of `request`.
 fn newest_user_text(request: &serde_json::Value) -> String {
     request["messages"]
