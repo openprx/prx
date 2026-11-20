@@ -239,9 +239,24 @@ async fn spawn_records_request_and_result_message_events() {
     let parent_events = read_all(principal("telegram:chat-1:alice")).await;
     let child_key = format!("spawn:{run_id}");
     let events = read_all(principal(&child_key)).await;
+    // A parent reader also sees every workspace-visible row, the spawned
+    // run's included, so the check is on the stored key itself.
+    let misplaced: Vec<_> = parent_events
+        .iter()
+        .filter(|event| {
+            event.source == "sessions_spawn" && event.session_key.as_deref() == Some("telegram:chat-1:alice")
+        })
+        .map(|event| (&event.event_type, &event.role))
+        .collect();
     assert!(
-        parent_events.iter().all(|event| event.source != "sessions_spawn"),
-        "no spawned-run row lands under the parent key"
+        misplaced.is_empty(),
+        "no spawned-run row lands under the parent key: {misplaced:?}"
+    );
+    assert!(
+        parent_events
+            .iter()
+            .any(|event| event.source == "sessions_spawn" && event.session_key.as_deref() == Some(child_key.as_str())),
+        "the parent reader sees the run's workspace rows under their own key"
     );
 
     let parent_event = parent_events

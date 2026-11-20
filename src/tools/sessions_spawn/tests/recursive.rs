@@ -129,7 +129,7 @@ impl crate::providers::Provider for ScriptedProvider {
             .iter()
             .find(|message| message.role == "user")
             .map_or("", |message| message.content.as_str());
-        let results = request
+        let results: Vec<String> = request
             .messages
             .iter()
             .filter(|message| {
@@ -145,6 +145,7 @@ impl crate::providers::Provider for ScriptedProvider {
             .tools
             .map(|specs| specs.iter().map(|spec| spec.name.clone()).collect())
             .unwrap_or_default();
+        let answered = results.len();
         let next = self.0.answer(
             Seen {
                 own_task: own_task(first_user),
@@ -159,7 +160,9 @@ impl crate::providers::Provider for ScriptedProvider {
                 (
                     None,
                     vec![crate::providers::ToolCall {
-                        id: format!("prx-recursive-{name}"),
+                        // One id per call: a reused id replays the first
+                        // call's idempotency key.
+                        id: format!("prx-recursive-{name}-{answered}"),
                         name: name.to_owned(),
                         arguments: arguments.to_string(),
                     }],
@@ -829,11 +832,19 @@ async fn task_spawned_delegations(fixture: &Fixture) -> Vec<(String, Option<Stri
     recorded
 }
 
-/// The `capability_search` hit for `name` among a model's tool results.
+/// The `capability_search` hit for `name` among a model's tool results. A
+/// native tool message carries the output under `content`.
 fn search_hit(results: &[String], name: &str) -> Option<serde_json::Value> {
     results
         .iter()
         .filter_map(|result| serde_json::from_str::<serde_json::Value>(result).ok())
+        .map(|result| {
+            let inner = result
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|content| serde_json::from_str::<serde_json::Value>(content).ok());
+            inner.unwrap_or(result)
+        })
         .filter_map(|result| result.get("hits").and_then(serde_json::Value::as_array).cloned())
         .flatten()
         .find(|hit| hit.pointer("/schema/name").and_then(serde_json::Value::as_str) == Some(name))
