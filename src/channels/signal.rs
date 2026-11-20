@@ -2083,7 +2083,7 @@ impl Channel for SignalChannel {
         tracing::info!(
             "Signal send: is_native={} http_url={}",
             self.is_native,
-            crate::providers::redact_endpoint_userinfo(&self.http_url)
+            crate::security::redaction::redact_provider_text(&self.http_url)
         );
         if self.is_native {
             // In native mode, attachments are referenced as absolute paths.
@@ -2257,7 +2257,7 @@ impl Channel for SignalChannel {
             let sse_url = format!("{}/api/v1/events", self.http_url);
             tracing::info!(
                 "Signal native: listening via SSE on {}",
-                crate::providers::redact_endpoint_userinfo(&sse_url)
+                crate::security::redaction::redact_provider_text(&sse_url)
             );
             return self.listen_sse(&sse_url, tx).await;
         }
@@ -2279,13 +2279,13 @@ impl Channel for SignalChannel {
         if use_polling {
             tracing::info!(
                 "Signal channel using REST polling on {}...",
-                crate::providers::redact_endpoint_userinfo(&self.http_url)
+                crate::security::redaction::redact_provider_text(&self.http_url)
             );
             self.listen_polling(&poll_url, tx).await
         } else {
             tracing::info!(
                 "Signal channel using SSE on {}...",
-                crate::providers::redact_endpoint_userinfo(&self.http_url)
+                crate::security::redaction::redact_provider_text(&self.http_url)
             );
             self.listen_sse(&sse_url_str, tx).await
         }

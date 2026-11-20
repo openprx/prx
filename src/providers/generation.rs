@@ -167,9 +167,9 @@ async fn get_or_create_provider_for_generation_with_catalog(
 
     if let Err(error) = provider.warmup().await {
         tracing::warn!(
-            provider = %super::redact_endpoint_userinfo(provider_name),
+            provider = %crate::security::redaction::redact_provider_text(provider_name),
             "Provider warmup failed: {}",
-            super::redact_endpoint_userinfo(&error.to_string())
+            crate::security::redaction::redact_provider_text(&error.to_string())
         );
     }
 

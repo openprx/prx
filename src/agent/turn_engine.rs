@@ -1794,8 +1794,8 @@ async fn run_turn_unguarded(
                     anyhow::bail!("model returned a tool-summary-only response after one corrective retry");
                 }
                 tracing::warn!(
-                    provider = %crate::providers::redact_endpoint_userinfo(provider_name),
-                    model = %crate::providers::redact_endpoint_userinfo(model),
+                    provider = %crate::security::redaction::redact_provider_text(provider_name),
+                    model = %crate::security::redaction::redact_provider_text(model),
                     "model returned a tool-summary-only response; retrying once with a corrective instruction"
                 );
                 tool_summary_retry_attempted = true;
@@ -1807,8 +1807,8 @@ async fn run_turn_unguarded(
                     anyhow::bail!("model returned an empty response after one corrective retry");
                 }
                 tracing::warn!(
-                    provider = %crate::providers::redact_endpoint_userinfo(provider_name),
-                    model = %crate::providers::redact_endpoint_userinfo(model),
+                    provider = %crate::security::redaction::redact_provider_text(provider_name),
+                    model = %crate::security::redaction::redact_provider_text(model),
                     "model returned empty assistant response; retrying once with a corrective instruction"
                 );
                 empty_response_retry_attempted = true;
@@ -1828,8 +1828,8 @@ async fn run_turn_unguarded(
                 || claims_tool_evidence(&display_text);
             if fabricated_marker && !executed_any_tool_call && !tool_summary_retry_attempted {
                 tracing::warn!(
-                    provider = %crate::providers::redact_endpoint_userinfo(provider_name),
-                    model = %crate::providers::redact_endpoint_userinfo(model),
+                    provider = %crate::security::redaction::redact_provider_text(provider_name),
+                    model = %crate::security::redaction::redact_provider_text(model),
                     "model claimed tool use without executing any tool; retrying once with a corrective instruction"
                 );
                 tool_summary_retry_attempted = true;

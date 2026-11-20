@@ -1550,8 +1550,8 @@ async fn finalize_per_turn_context(
         task_id = pending.task_id.get(),
         draft_id = %crate::agent::diagnostics::text_class(&pending.draft_id),
         turn_run_id = %crate::agent::diagnostics::text_class(&pending.turn_run_id),
-        provider_name = %crate::providers::redact_endpoint_userinfo(&pending.provider_name),
-        model_name = %crate::providers::redact_endpoint_userinfo(&pending.model_name),
+        provider_name = %crate::security::redaction::redact_provider_text(&pending.provider_name),
+        model_name = %crate::security::redaction::redact_provider_text(&pending.model_name),
         history_len_before_user_turn,
         "finalizing provider turn context"
     );

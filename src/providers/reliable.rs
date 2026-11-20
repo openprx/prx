@@ -8,6 +8,7 @@ use super::traits::{
     StreamOptions, StreamResult,
 };
 use crate::llm::route_decision::{AttemptStatus, ProviderAttempt, ProviderExecutionOutcome, RouteDecision};
+use crate::security::redaction::redact_provider_text;
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use std::collections::HashMap;
@@ -817,7 +818,7 @@ impl ReliableProvider {
         if ctx.overload {
             let wait = overload_wait_ms(ctx.attempt, hint_ms);
             tracing::warn!(
-                provider = ctx.provider_name,
+                provider = %redact_provider_text(ctx.provider_name),
                 model = ctx.model,
                 attempt = ctx.attempt,
                 wait_ms = wait,
@@ -833,7 +834,7 @@ impl ReliableProvider {
         match plan_retry_wait(backoff_ms, err) {
             RetryWait::HintExceedsCap(requested_ms) => {
                 tracing::warn!(
-                    provider = ctx.provider_name,
+                    provider = %redact_provider_text(ctx.provider_name),
                     model = ctx.model,
                     requested_retry_after_ms = requested_ms,
                     max_honored_ms = MAX_HONORED_RETRY_AFTER_MS,
@@ -848,7 +849,7 @@ impl ReliableProvider {
             }
             RetryWait::Sleep(wait) => {
                 tracing::warn!(
-                    provider = ctx.provider_name,
+                    provider = %redact_provider_text(ctx.provider_name),
                     model = ctx.model,
                     attempt = ctx.attempt,
                     backoff_ms = wait,
@@ -871,7 +872,7 @@ impl ReliableProvider {
     async fn await_rate_limit_gate(&self, provider_name: &str, gate_key: &str, model: &str) {
         if let Some(deferred_ms) = self.rate_limit_gate.wait_until_clear(gate_key, provider_name).await {
             tracing::warn!(
-                provider = provider_name,
+                provider = %redact_provider_text(provider_name),
                 model,
                 deferred_ms,
                 "Deferred behind the shared provider rate-limit cool-down"
@@ -1062,9 +1063,9 @@ impl Provider for ReliableProvider {
 
     async fn warmup(&self) -> anyhow::Result<()> {
         for ChainMember { name, provider, .. } in &self.providers {
-            tracing::info!(provider = %name, "Warming up provider connection pool");
+            tracing::info!(provider = %redact_provider_text(name), "Warming up provider connection pool");
             if provider.warmup().await.is_err() {
-                tracing::warn!(provider = %name, "Warmup failed (non-fatal)");
+                tracing::warn!(provider = %redact_provider_text(name), "Warmup failed (non-fatal)");
             }
         }
         Ok(())
@@ -1132,7 +1133,7 @@ impl Provider for ReliableProvider {
                             complete_circuit(permit, BreakerOutcome::Answered);
                             if attempt > 0 || *current_model != model {
                                 tracing::info!(
-                                    provider = %provider_name,
+                                    provider = %redact_provider_text(provider_name),
                                     model = *current_model,
                                     attempt,
                                     original_model = model,
@@ -1165,7 +1166,7 @@ impl Provider for ReliableProvider {
 
                             if non_retryable {
                                 tracing::warn!(
-                                    provider = %provider_name,
+                                    provider = %redact_provider_text(provider_name),
                                     model = *current_model,
                                     error = %error_detail,
                                     "Non-retryable error, moving on"
@@ -1220,14 +1221,14 @@ impl Provider for ReliableProvider {
                 if rate_limited_seen {
                     rate_limit::record_exhausted(provider_name);
                     tracing::error!(
-                        provider = %provider_name,
+                        provider = %redact_provider_text(provider_name),
                         model = *current_model,
                         attempts = self.max_retries + 1,
                         "Provider rate limit outlasted the retry budget; abandoning this candidate"
                     );
                 }
                 tracing::warn!(
-                    provider = %provider_name,
+                    provider = %redact_provider_text(provider_name),
                     model = *current_model,
                     "Exhausted retries, trying next provider/model"
                 );
@@ -1299,7 +1300,7 @@ impl Provider for ReliableProvider {
                             complete_circuit(permit, BreakerOutcome::Answered);
                             if attempt > 0 || *current_model != model {
                                 tracing::info!(
-                                    provider = %provider_name,
+                                    provider = %redact_provider_text(provider_name),
                                     model = *current_model,
                                     attempt,
                                     original_model = model,
@@ -1332,7 +1333,7 @@ impl Provider for ReliableProvider {
 
                             if non_retryable {
                                 tracing::warn!(
-                                    provider = %provider_name,
+                                    provider = %redact_provider_text(provider_name),
                                     model = *current_model,
                                     error = %error_detail,
                                     "Non-retryable error, moving on"
@@ -1387,14 +1388,14 @@ impl Provider for ReliableProvider {
                 if rate_limited_seen {
                     rate_limit::record_exhausted(provider_name);
                     tracing::error!(
-                        provider = %provider_name,
+                        provider = %redact_provider_text(provider_name),
                         model = *current_model,
                         attempts = self.max_retries + 1,
                         "Provider rate limit outlasted the retry budget; abandoning this candidate"
                     );
                 }
                 tracing::warn!(
-                    provider = %provider_name,
+                    provider = %redact_provider_text(provider_name),
                     model = *current_model,
                     "Exhausted retries, trying next provider/model"
                 );
@@ -1491,7 +1492,7 @@ impl Provider for ReliableProvider {
                             complete_circuit(permit, BreakerOutcome::Answered);
                             if attempt > 0 || *current_model != model {
                                 tracing::info!(
-                                    provider = %provider_name,
+                                    provider = %redact_provider_text(provider_name),
                                     model = *current_model,
                                     attempt,
                                     original_model = model,
@@ -1561,7 +1562,7 @@ impl Provider for ReliableProvider {
 
                             if non_retryable {
                                 tracing::warn!(
-                                    provider = %provider_name,
+                                    provider = %redact_provider_text(provider_name),
                                     model = *current_model,
                                     error = %error_detail,
                                     "Non-retryable error, moving on"
@@ -1620,14 +1621,14 @@ impl Provider for ReliableProvider {
                 if rate_limited_seen {
                     rate_limit::record_exhausted(provider_name);
                     tracing::error!(
-                        provider = %provider_name,
+                        provider = %redact_provider_text(provider_name),
                         model = *current_model,
                         attempts = self.max_retries + 1,
                         "Provider rate limit outlasted the retry budget; abandoning this candidate"
                     );
                 }
                 tracing::warn!(
-                    provider = %provider_name,
+                    provider = %redact_provider_text(provider_name),
                     model = *current_model,
                     "Exhausted retries, trying next provider/model"
                 );
@@ -1740,7 +1741,7 @@ impl Provider for ReliableProvider {
                             complete_circuit(permit, BreakerOutcome::Answered);
                             if attempt > 0 || *current_model != model {
                                 tracing::info!(
-                                    provider = %provider_name,
+                                    provider = %redact_provider_text(provider_name),
                                     model = *current_model,
                                     attempt,
                                     original_model = model,
@@ -1773,7 +1774,7 @@ impl Provider for ReliableProvider {
 
                             if non_retryable {
                                 tracing::warn!(
-                                    provider = %provider_name,
+                                    provider = %redact_provider_text(provider_name),
                                     model = *current_model,
                                     error = %error_detail,
                                     "Non-retryable error, moving on"
@@ -1828,14 +1829,14 @@ impl Provider for ReliableProvider {
                 if rate_limited_seen {
                     rate_limit::record_exhausted(provider_name);
                     tracing::error!(
-                        provider = %provider_name,
+                        provider = %redact_provider_text(provider_name),
                         model = *current_model,
                         attempts = self.max_retries + 1,
                         "Provider rate limit outlasted the retry budget; abandoning this candidate"
                     );
                 }
                 tracing::warn!(
-                    provider = %provider_name,
+                    provider = %redact_provider_text(provider_name),
                     model = *current_model,
                     "Exhausted retries, trying next provider/model"
                 );
@@ -2328,7 +2329,7 @@ where
                 };
                 if let Some(deferred_ms) = gate.wait_until_clear(&attempt.member_key, &attempt.provider_name).await {
                     tracing::warn!(
-                        provider = %attempt.provider_name,
+                        provider = %redact_provider_text(&attempt.provider_name),
                         model = %attempt.model,
                         deferred_ms,
                         "Deferred behind the shared provider rate-limit cool-down"
@@ -2404,7 +2405,7 @@ where
                             // downstream, a transparent retry is unsafe.
                             if emitted_content {
                                 tracing::warn!(
-                                    provider = %attempt.provider_name,
+                                    provider = %redact_provider_text(&attempt.provider_name),
                                     model = %attempt.model,
                                     "Streaming error after content emitted; surfacing without failover (mid-stream resume not supported): {err}"
                                 );
@@ -2481,7 +2482,7 @@ where
                                 let retry = pre_content_retries + 1;
                                 let wait = overload_wait_ms(retry, hint_ms);
                                 tracing::warn!(
-                                    provider = %attempt.provider_name,
+                                    provider = %redact_provider_text(&attempt.provider_name),
                                     model = %attempt.model,
                                     attempt = retry,
                                     wait_ms = wait,
@@ -2503,7 +2504,7 @@ where
                                 match plan_wait_from_hint(backoff_ms, hint_ms) {
                                     RetryWait::Sleep(wait) => {
                                         tracing::warn!(
-                                            provider = %attempt.provider_name,
+                                            provider = %redact_provider_text(&attempt.provider_name),
                                             model = %attempt.model,
                                             ?class,
                                             retry_after_ms = hint_ms,
@@ -2528,7 +2529,7 @@ where
                                     }
                                     RetryWait::HintExceedsCap(requested_ms) => {
                                         tracing::warn!(
-                                            provider = %attempt.provider_name,
+                                            provider = %redact_provider_text(&attempt.provider_name),
                                             model = %attempt.model,
                                             requested_retry_after_ms = requested_ms,
                                             max_honored_ms = MAX_HONORED_RETRY_AFTER_MS,
@@ -2548,7 +2549,7 @@ where
                                     hint_ms.unwrap_or(backoff_ms).min(MAX_HONORED_RETRY_AFTER_MS),
                                 );
                                 tracing::error!(
-                                    provider = %attempt.provider_name,
+                                    provider = %redact_provider_text(&attempt.provider_name),
                                     model = %attempt.model,
                                     attempts = pre_content_retries + 1,
                                     "Streaming rate limit outlasted the retry budget; abandoning this candidate"
@@ -2561,7 +2562,7 @@ where
 
                             if can_fallback {
                                 tracing::warn!(
-                                    provider = %attempt.provider_name,
+                                    provider = %redact_provider_text(&attempt.provider_name),
                                     model = %attempt.model,
                                     ?class,
                                     "Streaming attempt failed before content; falling back to next candidate: {err}"
@@ -2575,7 +2576,7 @@ where
                             }
 
                             tracing::warn!(
-                                provider = %attempt.provider_name,
+                                provider = %redact_provider_text(&attempt.provider_name),
                                 model = %attempt.model,
                                 ?class,
                                 "Streaming attempt failed with no viable failover; surfacing: {err}"

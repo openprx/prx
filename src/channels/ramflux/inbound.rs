@@ -228,8 +228,8 @@ fn on_hello(inner: &Inner, params: &Value) -> Result<Value, InboundError> {
         authorization = hello.authorization.as_str(),
         effective = inner.auth.effective().as_str(),
         prompt_bytes,
-        model = model.as_deref().unwrap_or(""),
-        provider = provider.as_deref().unwrap_or(""),
+        model = %crate::security::redaction::redact_provider_text(model.as_deref().unwrap_or("")),
+        provider = %crate::security::redaction::redact_provider_text(provider.as_deref().unwrap_or("")),
         "ramflux bridge hello"
     );
     *inner.persona.lock() = Some(persona);

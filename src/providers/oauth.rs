@@ -330,7 +330,7 @@ pub(super) fn resolve_minimax_oauth_refresh_token(name: &str) -> Option<String> 
     match refresh_minimax_oauth_access_token(name, &refresh_token) {
         Ok(token) => Some(token),
         Err(error) => {
-            tracing::warn!(provider = name, error = %error, "MiniMax OAuth refresh failed");
+            tracing::warn!(provider = %crate::security::redaction::redact_provider_text(name), error = %error, "MiniMax OAuth refresh failed");
             None
         }
     }

@@ -1941,7 +1941,7 @@ impl OpenAiCompatibleProvider {
                 let arguments = &body[..end];
                 if !allowed.contains(name) {
                     tracing::warn!(
-                        provider = %self.name,
+                        provider = %crate::security::redaction::redact_provider_text(&self.name),
                         tool = %sanitize_tool_call_log_preview(name),
                         reason = "tool name is not registered for this request",
                         "declared textual tool-call block rejected"
@@ -1954,7 +1954,7 @@ impl OpenAiCompatibleProvider {
                     });
                 } else {
                     tracing::warn!(
-                        provider = %self.name,
+                        provider = %crate::security::redaction::redact_provider_text(&self.name),
                         tool = %sanitize_tool_call_log_preview(name),
                         reason = "body is not JSON",
                         body = %sanitize_tool_call_log_preview(arguments),
@@ -2057,7 +2057,7 @@ impl OpenAiCompatibleProvider {
             let sanitized = super::sanitize_api_error(&error);
 
             tracing::warn!(
-                provider = %self.name,
+                provider = %crate::security::redaction::redact_provider_text(&self.name),
                 http_status = %status,
                 error_preview = %&sanitized[..sanitized.len().min(300)],
                 "OpenAiCompatibleProvider.chat() got non-200 response"
@@ -2674,7 +2674,7 @@ impl Provider for OpenAiCompatibleProvider {
             {
                 let status = response.status();
                 tracing::debug!(
-                    provider = %provider_name,
+                    provider = %crate::security::redaction::redact_provider_text(&provider_name),
                     %status,
                     "stream_options.include_usage rejected; retrying stream without usage request"
                 );
@@ -2776,7 +2776,7 @@ impl Provider for OpenAiCompatibleProvider {
             {
                 let status = response.status();
                 tracing::debug!(
-                    provider = %provider_name,
+                    provider = %crate::security::redaction::redact_provider_text(&provider_name),
                     %status,
                     "stream_options.include_usage rejected; retrying stream without usage request"
                 );

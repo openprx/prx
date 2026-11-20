@@ -235,7 +235,7 @@ pub async fn put_credential(
     match stored {
         Ok(status) => {
             tracing::info!(
-                provider = %status.owner,
+                provider = %crate::security::redaction::redact_provider_text(&status.owner),
                 reference = %status.id,
                 "Credential reference stored through the gateway"
             );

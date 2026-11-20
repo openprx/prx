@@ -1,8 +1,8 @@
 use super::helpers::braced_block;
 use super::helpers::log_macro_arguments;
 use super::helpers::{
-    assert_inventory, blank_comments_and_literals, enclosing_function, function_body, read_source, repository_root,
-    strip_cfg_test_items,
+    assert_inventory, blank_comments_and_literals, enclosing_function, function_body, is_test_code_file, read_source,
+    relative_path, repository_root, rust_source_files, strip_cfg_test_items, test_module_files,
 };
 use super::scanner_probes::scanner_fails_with;
 use std::fs;
@@ -60,6 +60,17 @@ const LABEL_LOG_FILES: &[&str] = &[
     "src/tools/sessions_spawn/worker_manifest.rs",
 ];
 
+/// Source roots whose every production file is scanned like
+/// [`LABEL_LOG_FILES`]: the provider transports, the agent loop, chat, the
+/// gateway and the channels all log provider labels or endpoints.
+const LABEL_LOG_ROOTS: &[&str] = &[
+    "src/providers/",
+    "src/agent/",
+    "src/chat/",
+    "src/gateway/",
+    "src/channels/",
+];
+
 /// Log fields that name a provider or a `<provider>/<model>` target.
 const LABEL_LOG_FIELDS: &[&str] = &[
     "provider",
@@ -71,6 +82,9 @@ const LABEL_LOG_FIELDS: &[&str] = &[
     "escalate_to",
     "selected_provider",
     "chosen_provider",
+    "base_url",
+    "api_url",
+    "endpoint",
 ];
 
 /// Bindings that hold a provider label or a `<provider>/<model>` target.
@@ -85,11 +99,19 @@ const LABEL_BINDINGS: &[&str] = &[
     "effective_model",
     "selected_provider",
     "chosen_provider",
+    "base_url",
+    "api_url",
+    "endpoint",
 ];
 
 /// Whether a log value shows a label only in its redacted form.
+///
+/// `redact_endpoint_userinfo` alone is not enough: it removes URL userinfo
+/// but keeps query values such as `?api_key=...`. Only the one provider-text
+/// redactor (`redact_provider_text`, which also masks query values and
+/// fragments) or a `shown_*` value built from it counts.
 fn log_value_is_redacted(value: &str) -> bool {
-    value.contains("redact_endpoint_userinfo(")
+    value.contains("redact_provider_text(")
         || value.contains(".shown_provider()")
         || value
             .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
@@ -120,12 +142,12 @@ fn raw_label_log_arguments(relative: &str, production: &str) -> Vec<String> {
         .collect()
 }
 
-/// No log line in [`LABEL_LOG_FILES`] prints a provider label or a
+/// No log line in [`LABEL_LOG_FILES`] or under [`LABEL_LOG_ROOTS`] prints a provider label or a
 /// `<provider>/<model>` target raw (INT-2B USERINFO-3, B4f M-2).
 ///
 /// Checked site by site: every argument of every `tracing` event macro whose
 /// field is a label field, or whose value names a label binding, must show
-/// the value through `redact_endpoint_userinfo`, `shown_provider()` or a
+/// the value through `redact_provider_text`, `shown_provider()` or a
 /// `shown_*` binding. Reverting any one redaction turns this red, also where
 /// one function has several. What it cannot see is a label under a name not
 /// in [`LABEL_BINDINGS`], or a log line outside these files.
@@ -134,11 +156,21 @@ fn raw_label_log_arguments(relative: &str, production: &str) -> Vec<String> {
 /// `RouterEngine::record_outcome_detailed` and the inventory gains it.
 #[test]
 pub(super) fn provider_labels_never_reach_a_log_field_raw() {
+    let modules = test_module_files();
     let mut raw = Vec::new();
-    for relative in LABEL_LOG_FILES {
-        let path = repository_root().join(relative);
-        let production = strip_cfg_test_items(&blank_comments_and_literals(&read_source(&path)));
-        raw.extend(raw_label_log_arguments(relative, &production));
+    for path in rust_source_files() {
+        let relative = relative_path(&path);
+        let scanned = LABEL_LOG_FILES.contains(&relative.as_str())
+            || LABEL_LOG_ROOTS.iter().any(|root| relative.starts_with(root));
+        if !scanned {
+            continue;
+        }
+        let source = read_source(&path);
+        if is_test_code_file(&relative, &source, &modules) {
+            continue;
+        }
+        let production = strip_cfg_test_items(&blank_comments_and_literals(&source));
+        raw.extend(raw_label_log_arguments(&relative, &production));
     }
     assert_inventory("log arguments that print a provider label raw", raw, &[]);
 }
@@ -147,7 +179,7 @@ pub(super) fn provider_labels_never_reach_a_log_field_raw() {
 /// sees every field form (INT-2B B4f).
 #[test]
 fn raw_label_log_arguments_sees_every_field_form() {
-    let production = "fn f() {\n    tracing::warn!(provider, model, \"x\");\n    tracing::info!(provider = %p, default_provider = default_provider.as_str(), \"y\");\n    warn!(planned_model = ?planned_model);\n    debug!(\"z {}\", provider_name);\n    info!(provider = %redact_endpoint_userinfo(p), x = %shown_reachable.len(), y = %c.shown_provider());\n    error!(escalate_to = premium_model.as_str(), n = 1);\n}\n";
+    let production = "fn f() {\n    tracing::warn!(provider, model, \"x\");\n    tracing::info!(provider = %p, default_provider = default_provider.as_str(), \"y\");\n    warn!(planned_model = ?planned_model);\n    debug!(\"z {}\", provider_name);\n    info!(provider = %redact_provider_text(p), x = %shown_reachable.len(), y = %c.shown_provider());\n    error!(escalate_to = premium_model.as_str(), n = 1);\n}\n";
     let found = raw_label_log_arguments("src/x.rs", production);
     assert_eq!(
         found,

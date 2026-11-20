@@ -104,10 +104,10 @@ impl RouterEngine {
             // Provider labels may be `custom:` URLs with `user:password@`.
             let shown_reachable: Vec<String> = reachable_providers
                 .iter()
-                .map(|provider| crate::providers::redact_endpoint_userinfo(provider).into_owned())
+                .map(|provider| crate::security::redaction::redact_provider_text(provider))
                 .collect();
             tracing::warn!(
-                default_provider = %crate::providers::redact_endpoint_userinfo(&default_provider),
+                default_provider = %crate::security::redaction::redact_provider_text(&default_provider),
                 reachable_providers = ?shown_reachable,
                 "Router has no reachable models after provider filtering"
             );
@@ -116,7 +116,7 @@ impl RouterEngine {
         models = filter_reachable_entries(models, &default_provider, &model_routes);
         if models.is_empty() {
             tracing::warn!(
-                default_provider = %crate::providers::redact_endpoint_userinfo(&default_provider),
+                default_provider = %crate::security::redaction::redact_provider_text(&default_provider),
                 "Router has no reachable models after defensive post-load filtering"
             );
         }
@@ -479,7 +479,7 @@ impl RouterEngine {
         if let (Some(provider), Some(model)) = (result.chosen_provider.as_deref(), result.chosen_model.as_deref()) {
             if !is_model_reachable(&self.default_provider, &self.model_routes, provider, model) {
                 tracing::warn!(
-                    provider = %crate::providers::redact_endpoint_userinfo(provider),
+                    provider = %crate::security::redaction::redact_provider_text(provider),
                     model,
                     "Router selected unreachable model; falling back to default model"
                 );
@@ -492,7 +492,7 @@ impl RouterEngine {
         let (candidates, filtered) = decision_log_candidates(&result);
         tracing::info!(
             chosen = result.chosen_model.as_deref().unwrap_or(""),
-            provider = %crate::providers::redact_endpoint_userinfo(result.chosen_provider.as_deref().unwrap_or("")),
+            provider = %crate::security::redaction::redact_provider_text(result.chosen_provider.as_deref().unwrap_or("")),
             score = result.score,
             intent = result.intent.as_str(),
             estimated_tokens = result.estimated_tokens,
@@ -746,8 +746,8 @@ impl RouterEngine {
         };
         let Some(snapshot) = snapshot else {
             tracing::warn!(
-                planned_model = %crate::providers::redact_endpoint_userinfo(planned_model),
-                actual_model = %crate::providers::redact_endpoint_userinfo(actual_model),
+                planned_model = %crate::security::redaction::redact_provider_text(planned_model),
+                actual_model = %crate::security::redaction::redact_provider_text(actual_model),
                 fallback_chain_used,
                 "Router outcome ignored for unknown model"
             );
@@ -779,8 +779,8 @@ impl RouterEngine {
         // A model target may be `<provider label>/<model>`, and a `custom:`
         // label may carry `user:password@`.
         tracing::info!(
-            planned_model = %crate::providers::redact_endpoint_userinfo(planned_model),
-            actual_model = %crate::providers::redact_endpoint_userinfo(actual_model),
+            planned_model = %crate::security::redaction::redact_provider_text(planned_model),
+            actual_model = %crate::security::redaction::redact_provider_text(actual_model),
             fallback_chain_used,
             success,
             latency_ms,

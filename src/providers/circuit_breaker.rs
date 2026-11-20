@@ -272,12 +272,12 @@ impl Transition {
     }
 
     fn log(self) {
-        let provider = redact_provider_text(&self.label);
+        let shown_provider = redact_provider_text(&self.label);
         if self.state == "open" {
-            tracing::warn!(provider = %provider, consecutive_failures = self.failures,
+            tracing::warn!(provider = %shown_provider, consecutive_failures = self.failures,
                 open_for_ms = self.open_for_ms, "Provider circuit open");
         } else {
-            tracing::info!(provider = %provider, state = self.state, "Provider circuit transition");
+            tracing::info!(provider = %shown_provider, state = self.state, "Provider circuit transition");
         }
     }
 }

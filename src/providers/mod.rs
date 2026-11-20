@@ -904,7 +904,7 @@ pub fn create_routed_provider_for(
                 provider,
             )),
             Err(error) => {
-                let refusal = redact_endpoint_userinfo(&error.to_string()).into_owned();
+                let refusal = crate::security::redaction::redact_provider_text(&error.to_string());
                 tracing::warn!(hint = %configured.hint, "Skipping refused model route: {refusal}");
                 refused_routes.push((configured.hint.clone(), refusal));
             }
@@ -1122,9 +1122,9 @@ fn create_resilient_provider_from_resolved(
                             Ok(rotated_provider) => providers.push((primary_name.to_string(), rotated_provider)),
                             Err(error) => {
                                 tracing::warn!(
-                                    provider = %redact_endpoint_userinfo(primary_name),
+                                    provider = %crate::security::redaction::redact_provider_text(primary_name),
                                     "Ignoring extra api_keys[] rotation credential that failed to initialize: {}",
-                                    redact_endpoint_userinfo(&error.to_string())
+                                    crate::security::redaction::redact_provider_text(&error.to_string())
                                 );
                             }
                         }
@@ -1141,7 +1141,7 @@ fn create_resilient_provider_from_resolved(
                     );
                 }
                 tracing::warn!(
-                    provider = %redact_endpoint_userinfo(provider_name),
+                    provider = %crate::security::redaction::redact_provider_text(provider_name),
                     "Ignoring unavailable fallback provider"
                 );
                 unavailable.push((provider_name.clone(), reason));
