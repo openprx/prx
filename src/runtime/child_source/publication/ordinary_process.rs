@@ -141,15 +141,19 @@ impl OrdinaryProcessLaunch {
             crate::providers::catalog::UnknownPolicy::Invocation,
         )?;
         let source_provider = crate::providers::ProviderId::of(proof.provider_name());
+        // A route spelling (`hint:<name>`) also names its provider: the
+        // provider pinned at ingress is the route's, not the selection's.
+        let pinned_provider = crate::providers::ProviderId::of(proof.model_binding().pinned_provider_label());
+        let worker_provider = crate::providers::ProviderId::of(&worker.provider_name);
         // Name the differing fields (never their values).
         let differing: Vec<&str> = [
             (
                 "resolved_provider",
-                crate::providers::ProviderId::of(resolved.provider_label()) == source_provider,
+                crate::providers::ProviderId::of(resolved.provider_label()) == pinned_provider,
             ),
             (
                 "worker_provider",
-                crate::providers::ProviderId::of(&worker.provider_name) == source_provider,
+                worker_provider == source_provider || worker_provider == pinned_provider,
             ),
             // A route spelling (`hint:<name>`) resolves to the model pinned
             // at ingress; the worker may carry either spelling of it.

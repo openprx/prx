@@ -1484,6 +1484,12 @@ impl AgentModelBinding {
         &self.model
     }
 
+    /// The provider pinned at ingress: the one a route spelling (`hint:<name>`)
+    /// resolved to, which may differ from the provider the selection named.
+    pub(crate) fn pinned_provider_label(&self) -> &str {
+        &self.provider_label
+    }
+
     pub(crate) const fn credential_reference(&self) -> &crate::providers::credentials::CredentialRef {
         &self.credential_ref
     }
