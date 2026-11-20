@@ -1371,6 +1371,8 @@ fn adopt_committed_turn(
 /// tool evidence of the snapshot's newest turn when that turn is this reply
 /// (an `assistant` turn holding exactly `reply`); otherwise the bare reply,
 /// since evidence that cannot be tied to the reply is never attached to it.
+/// A reply that is a context handoff passes through the handoff renderer
+/// first, as on every other provider-view path.
 #[cfg(feature = "terminal-tui")]
 pub(super) fn committed_reply_message(acked: &crate::chat::acked_session::AckedSession, reply: &str) -> ChatMessage {
     let evidence = acked
@@ -1382,8 +1384,9 @@ pub(super) fn committed_reply_message(acked: &crate::chat::acked_session::AckedS
     if evidence.is_none() {
         tracing::debug!("committed reply is not the snapshot's newest assistant turn; replayed without tool evidence");
     }
+    let reply = crate::agent::compaction::render_context_handoff_for_provider("assistant", reply);
     ChatMessage::assistant(
-        crate::agent::tool_evidence::render_assistant_content(reply, evidence.flatten()).into_owned(),
+        crate::agent::tool_evidence::render_assistant_content(&reply, evidence.flatten()).into_owned(),
     )
 }
 

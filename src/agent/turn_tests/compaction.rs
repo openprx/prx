@@ -1879,13 +1879,10 @@ impl ProvenanceStore {
     /// Read the note's rows back through the real lookup tool.
     async fn lookup(&self, note: &serde_json::Value) -> Vec<String> {
         use crate::tools::traits::Tool as _;
-        let arguments = note.pointer("/lookup/arguments").expect("test: lookup arguments");
         let result =
             crate::tools::transcript_history_lookup::TranscriptHistoryLookupTool::new(Arc::clone(&self.memory))
                 .execute(serde_json::json!({
-                    "event_ids": arguments.get("event_ids"),
-                    "first_row_id": arguments.get("first_row_id"),
-                    "last_row_id": arguments.get("last_row_id"),
+                    "handoff_event_id": note.get("handoff_event_id"),
                     "_zc_scope_trusted": true,
                     "_zc_scope": {
                         "workspace_id": self.session.workspace_id,

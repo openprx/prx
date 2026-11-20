@@ -347,9 +347,9 @@ pub(super) fn session_turns_to_history(session: &session::ChatSession) -> Vec<Ch
 }
 
 /// The provider view of `session`'s stored turns: [`session_turns_to_history`]
-/// with every assistant reply rendered with its tool evidence by the one
-/// renderer, so a resumed or switched view holds the bytes the turn had
-/// in-process.
+/// with every context handoff in its compact form and every assistant reply
+/// rendered with its tool evidence, each by its one renderer, so a resumed or
+/// switched view holds the bytes the turn had in-process.
 pub(super) fn session_turns_to_provider_view(session: &session::ChatSession) -> Vec<ChatMessage> {
     let mut view = session_turns_to_history(session);
     let stored_turns = session
@@ -357,6 +357,11 @@ pub(super) fn session_turns_to_provider_view(session: &session::ChatSession) -> 
         .iter()
         .filter(|turn| turn.role == "user" || turn.role == "assistant");
     for (message, turn) in view.iter_mut().zip(stored_turns) {
+        if let std::borrow::Cow::Owned(rendered) =
+            crate::agent::compaction::render_context_handoff_for_provider(&message.role, &message.content)
+        {
+            message.content = rendered;
+        }
         if message.role == "assistant"
             && let std::borrow::Cow::Owned(rendered) =
                 crate::agent::tool_evidence::render_assistant_content(&message.content, turn.tool_evidence.as_ref())

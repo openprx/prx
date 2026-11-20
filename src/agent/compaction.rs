@@ -430,6 +430,35 @@ fn is_handoff_note_tool_name(value: &str) -> bool {
 /// particular for model output that merely looks like a handoff.
 #[must_use]
 pub(crate) fn validated_context_handoff_note(content: &str) -> Option<serde_json::Value> {
+    let (_, json) = validate_context_handoff(content)?;
+    serde_json::from_str::<serde_json::Value>(json).ok()
+}
+
+/// The values of a validated handoff note ([`validated_context_handoff_note`])
+/// that its provider rendering and the lookup by handoff id read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ValidatedContextHandoff {
+    /// The note's own identity, the argument of a lookup.
+    pub(crate) handoff_event_id: String,
+    /// The transcript events the handoff moved out of the window, in order.
+    pub(crate) event_ids: Vec<String>,
+    /// The row range the referenced events lie in.
+    pub(crate) first_row_id: i64,
+    pub(crate) last_row_id: i64,
+    /// Tool round-trips folded into the handoff (they have no events).
+    pub(crate) folded_roundtrips: usize,
+}
+
+/// [`validated_context_handoff_note`] as typed values; `None` exactly when the
+/// note does not validate.
+#[must_use]
+pub(crate) fn validated_context_handoff(content: &str) -> Option<ValidatedContextHandoff> {
+    validate_context_handoff(content).map(|(handoff, _)| handoff)
+}
+
+/// The typed values and the JSON text of a note that passes every check of
+/// [`validated_context_handoff_note`].
+fn validate_context_handoff(content: &str) -> Option<(ValidatedContextHandoff, &str)> {
     if content.len() > MAX_HANDOFF_MESSAGE_BYTES {
         return None;
     }
@@ -476,7 +505,67 @@ pub(crate) fn validated_context_handoff_note(content: &str) -> Option<serde_json
     if !valid {
         return None;
     }
-    serde_json::from_str::<serde_json::Value>(json).ok()
+    let HandoffNoteLookupArguments {
+        event_ids,
+        first_row_id,
+        last_row_id,
+    } = note.lookup.arguments;
+    Some((
+        ValidatedContextHandoff {
+            handoff_event_id: note.handoff_event_id,
+            event_ids,
+            first_row_id,
+            last_row_id,
+            folded_roundtrips: folded.count,
+        },
+        json,
+    ))
+}
+
+/// The system-prompt paragraph of a chat session that states what a handoff
+/// in its window means and how earlier turns are reached. Its bytes never
+/// change between turns, so the cacheable prompt prefix stays stable.
+pub(crate) const CONTEXT_HANDOFF_PROMPT_RULE: &str = "A message that starts with [context_handoff] means earlier turns of this session were moved out of this window; they still exist. Never treat the oldest visible message as the start of the session. Before answering a question about anything that may have happened earlier than the visible window, call transcript_history_lookup with that handoff's handoff_event_id and read the result; if the result contains another [context_handoff], look that one up too.";
+
+/// Whether `messages` hold a context handoff, in its stored or its rendered
+/// form: both start with the handoff marker.
+#[must_use]
+pub(crate) fn holds_context_handoff(messages: &[ChatMessage]) -> bool {
+    messages.iter().any(is_context_handoff_message)
+}
+
+/// The one renderer of a stored message in a provider view: a context handoff
+/// (`role` assistant, the handoff marker) is replaced by its compact form,
+/// built from the validated note; every other message is borrowed unchanged.
+/// A handoff whose note does not validate is replayed as stored. The stored
+/// note, the canonical history and every saved turn keep the stored bytes;
+/// the rendering of one note never changes between turns or restarts.
+pub(crate) fn render_context_handoff_for_provider<'a>(role: &str, content: &'a str) -> std::borrow::Cow<'a, str> {
+    if !is_context_handoff_turn(role, content) {
+        return std::borrow::Cow::Borrowed(content);
+    }
+    let Some(handoff) = validated_context_handoff(content) else {
+        tracing::warn!("context handoff note does not validate; the provider view replays it as stored");
+        return std::borrow::Cow::Borrowed(content);
+    };
+    std::borrow::Cow::Owned(format_compact_context_handoff(&handoff))
+}
+
+/// `[context_handoff] handoff_event_id=<id> — <n> earlier messages were moved
+/// out of this window. They are recoverable with
+/// transcript_history_lookup(handoff_event_id="<id>").`, followed by
+/// ` <k> tool round-trips were folded.` only when `k` is not zero.
+fn format_compact_context_handoff(handoff: &ValidatedContextHandoff) -> String {
+    let id = &handoff.handoff_event_id;
+    let mut rendered = format!(
+        "{CONTEXT_HANDOFF_START} handoff_event_id={id} — {} earlier messages were moved out of this window. They are recoverable with {}(handoff_event_id=\"{id}\").",
+        handoff.event_ids.len(),
+        crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME,
+    );
+    if handoff.folded_roundtrips > 0 {
+        let _ = write!(rendered, " {} tool round-trips were folded.", handoff.folded_roundtrips);
+    }
+    rendered
 }
 
 /// True when `message` exists only inside a live tool round-trip and therefore
@@ -685,12 +774,12 @@ fn context_handoff_lineage(history: &[ChatMessage]) -> (u64, Option<String>) {
 /// Rows per page of the provenance pool read (D8; the SQLite query cap,
 /// `MAX_CONVERSATION_QUERY_LIMIT`). A shorter page means the session's first
 /// row has been read.
-const POOL_PAGE_ROWS: usize = 500;
+pub(crate) const POOL_PAGE_ROWS: usize = 500;
 
 /// Most rows the provenance pool reads (D8: 40 pages). A session with more own
 /// user/assistant rows has a pool whose completeness is unproven, so its
 /// provenance is never exact (D9).
-const POOL_MAX_ROWS: usize = 20_000;
+pub(crate) const POOL_MAX_ROWS: usize = 20_000;
 
 /// Candidate checks one segment search may spend (D7). Running out leaves
 /// uniqueness unproven: the result is unavailable, never a guess.

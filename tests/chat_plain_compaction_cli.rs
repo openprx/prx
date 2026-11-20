@@ -221,13 +221,15 @@ fn assert_switch_request_keeps_the_tail(sandbox: &Sandbox, requests: &[serde_jso
     let index = requests
         .iter()
         .position(|request| {
-            compaction_script::handoff_note(request).is_some_and(|note| note["to_generation"] == generation)
+            compaction_script::handoff_note(&sandbox.workspace, request)
+                .is_some_and(|note| note["to_generation"] == generation)
         })
         .unwrap_or_else(|| panic!("a request carries the generation {generation} handoff"));
     let messages = requests[index]["messages"].as_array().expect("test: messages");
     let handoff_at = messages
         .iter()
-        .position(|message| message.to_string().contains(compaction_script::HANDOFF_START))
+        // The system prompt states the handoff rule, which names the marker.
+        .position(|message| message["role"] != "system" && message.to_string().contains(compaction_script::HANDOFF_START))
         .expect("test: handoff message");
     assert!(
         messages[..handoff_at].iter().all(|message| message["role"] == "system"),
@@ -255,7 +257,7 @@ fn assert_switch_request_keeps_the_tail(sandbox: &Sandbox, requests: &[serde_jso
                 .is_some_and(|content| stored.iter().any(|row| row == without_tool_evidence(content)));
         assert!(verbatim, "a tail message is not carried verbatim: {message}");
     }
-    let note = compaction_script::handoff_note(&requests[index]).expect("test: handoff note");
+    let note = compaction_script::handoff_note(&sandbox.workspace, &requests[index]).expect("test: handoff note");
     assert_eq!(
         Some(tail.len() as u64),
         note["retained_recent_message_count"].as_u64(),
@@ -406,7 +408,7 @@ fn an_ordinary_turn_right_after_an_automatic_switch_sends_the_compacted_view() {
             "the ordinary turn's request resends the replaced cold prefix: {request}"
         );
         assert!(
-            compaction_script::handoff_note(request).is_some_and(|note| note["to_generation"] == 1),
+            compaction_script::handoff_note(&sandbox.workspace, request).is_some_and(|note| note["to_generation"] == 1),
             "the ordinary turn's request carries the committed handoff: {request}"
         );
     }
@@ -586,7 +588,7 @@ fn branch_of_a_nested_chain_recalls_the_fact_through_its_own_copies() {
     let mut resumed = HeldChat::spawn(&sandbox, &["--session", &branch_id]);
     replies += 1;
     resumed.turn(RECALL, replies);
-    let original_lookup = original[0].note["lookup"]["arguments"].to_string();
+    let original_lookup = serde_json::json!({ "handoff_event_id": original[0].event_id }).to_string();
     replies += 1;
     resumed.turn(
         &format!("{}{original_lookup}", compaction_script::LOOKUP_EXACTLY),
@@ -691,7 +693,7 @@ fn script_faulting_first_handoff(fault: Scripted, faulted: std::sync::Arc<std::s
         let newest = newest_user_text(request);
         let in_faulted_turn = faulted_turn.as_deref() == Some(newest.as_str());
         if in_faulted_turn
-            || faulted_turn.is_none() && compaction_script::handoff_note(request).is_some() && newest.contains("read f")
+            || faulted_turn.is_none() && compaction_script::handoff_id(request).is_some() && newest.contains("read f")
         {
             faulted_turn = Some(newest);
             faulted.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -714,7 +716,7 @@ fn script_faulting_second_handoff_turn(
     let mut faulted_turn: Option<String> = None;
     Box::new(move |index, request| {
         let newest = newest_user_text(request);
-        let carries_handoff = compaction_script::handoff_note(request).is_some() && newest.contains("read f");
+        let carries_handoff = compaction_script::handoff_id(request).is_some() && newest.contains("read f");
         if faulted_turn.as_deref() == Some(newest.as_str())
             || faulted_turn.is_none() && carries_handoff && answered_turn.as_deref().is_some_and(|turn| turn != newest)
         {
@@ -796,7 +798,7 @@ fn assert_ordinary_turn_after_abort(
             "the ordinary turn after the aborted one resends the replaced cold prefix: {request}"
         );
         assert!(
-            compaction_script::handoff_note(request).is_some_and(|note| note["to_generation"] == 1),
+            compaction_script::handoff_note(&sandbox.workspace, request).is_some_and(|note| note["to_generation"] == 1),
             "the ordinary turn's request carries the adopted handoff: {request}"
         );
     }
@@ -1205,7 +1207,8 @@ fn a_mid_turn_preflight_trim_leaves_the_session_and_the_next_request_in_agreemen
     );
     for ((sent_role, sent_text), (saved_role, saved_text)) in sent.iter().zip(expected) {
         assert!(
-            sent_role == saved_role && without_tool_evidence(sent_text).ends_with(saved_text.as_str()),
+            sent_role == saved_role
+                && without_tool_evidence(sent_text).ends_with(as_provider_sees(saved_text).as_str()),
             "the ordinary request matches the saved session turn for turn\nsent: {sent:?}\nsaved: {expected:?}"
         );
     }
@@ -1417,7 +1420,7 @@ fn script_trim_then_handoff(seen: std::sync::Arc<TrimThenHandoff>) -> Script {
         if !newest_user_text(request).contains(TRIM_THEN_HANDOFF) {
             return base(index, request);
         }
-        if compaction_script::handoff_note(request).is_some() || rounds >= SWITCH_FILLERS {
+        if compaction_script::handoff_id(request).is_some() || rounds >= SWITCH_FILLERS {
             return Scripted::text(compaction_script::NOTED);
         }
         if !carries_planted_message(request) {
@@ -1533,7 +1536,7 @@ fn a_handoff_after_a_trim_in_the_same_turn_keeps_the_trimmed_turns() {
             (
                 request["messages"].as_array().map_or(0, Vec::len),
                 carries_planted_message(request),
-                compaction_script::handoff_note(request).is_some(),
+                compaction_script::handoff_id(request).is_some(),
             )
         })
         .collect();
@@ -1630,7 +1633,7 @@ fn an_enriched_earlier_request_stays_plain_through_a_mid_turn_compaction() {
         requests
             .iter()
             .any(|request| newest_user_text(request).contains(TRIM_THEN_HANDOFF)
-                && compaction_script::handoff_note(request).is_some()),
+                && compaction_script::handoff_id(request).is_some()),
         "the tool turn handed off in the middle of the turn; saved: {saved:?}"
     );
     assert!(
@@ -2165,7 +2168,7 @@ fn script_json_answer_then_handoff() -> Script {
             }
             return base(index, request);
         }
-        if compaction_script::handoff_note(request).is_some() || rounds >= SWITCH_FILLERS {
+        if compaction_script::handoff_id(request).is_some() || rounds >= SWITCH_FILLERS {
             return Scripted::text(compaction_script::NOTED);
         }
         let file = format!("f{rounds}.txt");
@@ -2230,7 +2233,7 @@ fn run_json_answer_then_handoff(keep_recent: usize) -> JsonAnswerRun {
         .requests()
         .into_iter()
         .filter(|request| {
-            newest_user_text(request).contains(READ_UNTIL_HANDOFF) && compaction_script::handoff_note(request).is_some()
+            newest_user_text(request).contains(READ_UNTIL_HANDOFF) && compaction_script::handoff_id(request).is_some()
         })
         .collect();
     JsonAnswerRun {
@@ -2641,7 +2644,8 @@ fn switch_keeps_exact_provenance_and_evidence_of_kept_turns() {
         .iter()
         .find(|request| newest_user_text(request).contains(ORDINARY))
         .expect("the ordinary turn reached the provider");
-    let note = compaction_script::handoff_note(ordinary).expect("the post-switch request carries the handoff");
+    let note = compaction_script::handoff_note(&sandbox.workspace, ordinary)
+        .expect("the post-switch request carries the handoff");
     assert_eq!(
         note["provenance_status"], "exact",
         "the switch resolved exact provenance over the acknowledged turns: {note}"
@@ -2675,4 +2679,150 @@ fn switch_keeps_exact_provenance_and_evidence_of_kept_turns() {
             .any(|text| text.starts_with(&compaction_script::read_done(0))),
         "the first tool turn was folded into the handoff, not kept: {assistants:?}"
     );
+}
+
+/// The system-prompt paragraph a chat session states about handoffs (M1).
+const HANDOFF_RULE: &str = "A message that starts with [context_handoff] means earlier turns of this session were moved out of this window; they still exist. Never treat the oldest visible message as the start of the session. Before answering a question about anything that may have happened earlier than the visible window, call transcript_history_lookup with that handoff's handoff_event_id and read the result; if the result contains another [context_handoff], look that one up too.";
+
+/// The compact rendering of the stored `note`, as the provider must see it.
+fn expected_compact_handoff(note: &serde_json::Value) -> String {
+    let id = note["handoff_event_id"].as_str().expect("test: handoff id");
+    let events = note["lookup"]["arguments"]["event_ids"].as_array().map_or(0, Vec::len);
+    let folded = note["folded_tool_roundtrips"]["count"].as_u64().unwrap_or(0);
+    let mut text = format!(
+        "[context_handoff] handoff_event_id={id} — {events} earlier messages were moved out of this window. \
+         They are recoverable with transcript_history_lookup(handoff_event_id=\"{id}\")."
+    );
+    if folded > 0 {
+        text = format!("{text} {folded} tool round-trips were folded.");
+    }
+    text
+}
+
+/// A stored message as a provider view replays it: a stored handoff note in
+/// its compact rendering, every other text unchanged.
+fn as_provider_sees(stored: &str) -> String {
+    stored
+        .strip_prefix(compaction_script::HANDOFF_START)
+        .and_then(|rest| rest.trim().strip_suffix(compaction_script::HANDOFF_END))
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json.trim()).ok())
+        .map_or_else(|| stored.to_owned(), |note| expected_compact_handoff(&note))
+}
+
+/// After an automatic switch, the next request carries the handoff only in
+/// its compact form (never the stored note), the handoff rule once in the
+/// system prompt, and the lookup tool; the store keeps the stored note.
+#[test]
+fn request_after_a_switch_carries_the_compact_handoff_and_the_rule() {
+    let sandbox = Sandbox::new();
+    write_filler_files(&sandbox.workspace, SWITCH_FILLERS);
+    let server = configure(&sandbox, RECALL_WINDOW_TOKENS);
+    let mut chat = HeldChat::spawn(&sandbox, &[]);
+    let mut replies = 1;
+    chat.turn(PLANT, replies);
+    let mut next_file = 0;
+    while compaction_script::stored_handoffs(&sandbox.workspace).is_empty() && next_file < SWITCH_FILLERS {
+        replies += 1;
+        chat.turn(&read_line(next_file), replies);
+        next_file += 1;
+    }
+    replies += 1;
+    chat.turn(ORDINARY, replies);
+    let output = chat.exit();
+    assert_clean(&output, "automatic switch then an ordinary turn");
+
+    let stored = compaction_script::stored_handoffs(&sandbox.workspace);
+    let [handoff] = stored.as_slice() else {
+        panic!("exactly one automatic switch; stdout: {}", output.stdout);
+    };
+    let expected = expected_compact_handoff(&handoff.note);
+    let ordinary = server
+        .requests()
+        .into_iter()
+        .find(|request| newest_user_text(request).contains(ORDINARY))
+        .expect("the ordinary turn reached the provider");
+    assert_eq!(
+        compaction_script::compact_handoff(&ordinary).as_deref(),
+        Some(expected.as_str()),
+        "the request carries the compact handoff, byte for byte"
+    );
+    let bytes = ordinary.to_string();
+    assert!(
+        !bytes.contains("[/context_handoff]") && !bytes.contains("\\\"source_event_range\\\""),
+        "the stored note never reaches the provider: {bytes}"
+    );
+    let system = ordinary["messages"][0]["content"].as_str().unwrap_or_default();
+    assert_eq!(
+        system.matches(HANDOFF_RULE).count(),
+        1,
+        "the rule is stated once: {system}"
+    );
+    assert!(
+        compaction_script::publishes(&ordinary, compaction_script::LOOKUP_TOOL),
+        "the lookup tool is published"
+    );
+    assert_eq!(
+        handoff.note["handoff_event_id"],
+        handoff.event_id.as_str(),
+        "the store keeps the stored note"
+    );
+}
+
+/// A fact behind two handoffs is recovered in one turn by two lookups: the
+/// newest handoff's id, then the id of the handoff its result contains.
+#[test]
+fn nested_handoff_is_recoverable_in_two_lookups() {
+    let sandbox = Sandbox::new();
+    write_filler_files(&sandbox.workspace, SWITCH_FILLERS);
+    let server = configure(&sandbox, RECALL_WINDOW_TOKENS);
+    let mut chat = HeldChat::spawn(&sandbox, &[]);
+    let mut replies = 0;
+    for line in [PLANT.to_owned(), read_line(0)] {
+        replies += 1;
+        chat.turn(&line, replies);
+    }
+    chat.command("/compact");
+    let mut next_file = 1;
+    while compaction_script::stored_handoffs(&sandbox.workspace).len() < 2 && next_file < SWITCH_FILLERS {
+        replies += 1;
+        chat.turn(&read_line(next_file), replies);
+        next_file += 1;
+    }
+    replies += 1;
+    chat.turn(RECALL, replies);
+    let output = chat.exit();
+    assert_clean(&output, "two handoffs then a recall");
+
+    let session_id = current_session_id(&output.stderr);
+    let chain = compaction_script::session_handoffs(&sandbox.workspace, &session_id);
+    compaction_script::assert_handoff_chain(&chain, 2);
+    assert_eq!(chain.len(), 2, "exactly two handoffs; stdout: {}", output.stdout);
+    let last = server
+        .requests()
+        .into_iter()
+        .rev()
+        .find(|request| newest_user_text(request).contains(RECALL))
+        .expect("the recall turn reached the provider");
+    let messages = last["messages"].as_array().expect("test: messages");
+    let recall_at = messages
+        .iter()
+        .rposition(|message| message["role"] == "user" && message.to_string().contains(RECALL))
+        .expect("test: the recall line");
+    let looked_up: Vec<String> = messages[recall_at..]
+        .iter()
+        .filter_map(|message| message["tool_calls"].as_array())
+        .flatten()
+        .filter(|call| call["function"]["name"] == compaction_script::LOOKUP_TOOL)
+        .filter_map(|call| {
+            let arguments: serde_json::Value = serde_json::from_str(call["function"]["arguments"].as_str()?).ok()?;
+            arguments["handoff_event_id"].as_str().map(str::to_owned)
+        })
+        .collect();
+    assert_eq!(
+        looked_up,
+        vec![chain[1].event_id.clone(), chain[0].event_id.clone()],
+        "the newest handoff, then its parent"
+    );
+    assert!(output.stdout.contains(RECALLED), "stdout: {}", output.stdout);
+    assert_lookup_returned_the_stored_row(&sandbox, &server);
 }

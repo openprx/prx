@@ -84,6 +84,9 @@ mod legacy_chat_compaction_audit_tests;
 mod branch_copy_tests;
 
 #[cfg(test)]
+mod handoff_view_tests;
+
+#[cfg(test)]
 mod file_mention_tests;
 
 #[cfg(test)]

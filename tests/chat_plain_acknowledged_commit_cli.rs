@@ -582,7 +582,7 @@ fn a_compaction_before_the_call_is_acknowledged_and_the_request_occurs_once() {
     let requests = server.requests();
     let carried: Vec<&serde_json::Value> = requests
         .iter()
-        .filter(|request| compaction_script::handoff_note(request).is_some())
+        .filter(|request| compaction_script::handoff_id(request).is_some())
         .collect();
     assert!(
         !carried.is_empty(),

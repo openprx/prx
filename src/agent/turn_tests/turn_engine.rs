@@ -3924,3 +3924,141 @@ fn q79_boxed_fixture_work<'a, F: std::future::Future + 'a>(
 
 #[path = "provider_overflow.rs"]
 mod provider_overflow;
+
+/// A native-tool provider that records the tool names every request
+/// publishes and answers with text.
+struct PublishedToolsRecorder {
+    published: Arc<parking_lot::Mutex<Vec<Vec<String>>>>,
+}
+
+#[async_trait]
+impl Provider for PublishedToolsRecorder {
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calling: true,
+            vision: false,
+        }
+    }
+
+    async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+        Ok("unused".to_string())
+    }
+
+    async fn chat(&self, request: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+        let names = request
+            .tools
+            .unwrap_or_default()
+            .iter()
+            .map(|spec| spec.name.clone())
+            .collect();
+        self.published.lock().push(names);
+        Ok(ChatResponse {
+            text: Some("done".to_string()),
+            tool_calls: Vec::new(),
+            reasoning_content: None,
+        })
+    }
+}
+
+/// The tool names of each request of one turn whose canonical history holds
+/// `canonical_turns` while its provider view holds only the last two of them
+/// (a per-request trim left the rest out), in `switch` mode.
+async fn tools_published_for(canonical_turns: &[(&str, &str)]) -> Vec<Vec<String>> {
+    const REQUEST: &str = "What did I say first?";
+    let workspace = TempDir::new().expect("test: workspace");
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = workspace.path().to_path_buf();
+    config.agent.compaction.mode = crate::config::AgentCompactionMode::Switch;
+    let registry = crate::agent::turn_tests::admission::registry_with_search(vec![Box::new(
+        crate::tools::TranscriptHistoryLookupTool::new(Arc::new(crate::memory::NoneMemory::new())),
+    )]);
+    let admission =
+        crate::agent::turn_tests::admission::AdmittedTurn::with_config(config, REQUEST, Arc::clone(&registry)).await;
+    let canonical = crate::agent::turn_history::CanonicalHistory::from_acknowledged_turns(
+        Some("sys"),
+        canonical_turns.iter().map(|(role, content)| (*role, *content, None)),
+    )
+    .with_raw_request(REQUEST);
+    let mut view = vec![ChatMessage::system("sys")];
+    view.extend(
+        canonical_turns
+            .iter()
+            .rev()
+            .take(2)
+            .rev()
+            .map(|(role, content)| ChatMessage {
+                role: (*role).to_string(),
+                content: (*content).to_string(),
+            }),
+    );
+    view.push(crate::agent::turn_contracts::inbound_user_message(REQUEST));
+    let published = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let provider = PublishedToolsRecorder {
+        published: Arc::clone(&published),
+    };
+    run_turn(
+        &mut view,
+        crate::agent::turn_request::TurnRequest {
+            advice: None,
+            channel_name: "cli",
+            scope: None,
+            mode: ChatMode::default(),
+            silent: true,
+            expose_stay_silent: false,
+            multimodal: &crate::config::MultimodalConfig::default(),
+            schedule: crate::agent::turn_request::TurnSchedule {
+                read_only_tool_concurrency_window: 2,
+                priority_scheduling_enabled: false,
+                low_priority_tool_names: Vec::new(),
+            },
+            compaction: Some(admission.compaction()),
+            decision: admission.decision(),
+        },
+        crate::agent::turn_request::TurnServices {
+            provider: &provider,
+            provider_name: "ollama",
+            model: "prx-local-model",
+            temperature: 0.0,
+            tools_registry: registry,
+            observer: &NoopObserver,
+            hooks: &HookManager::new(std::env::temp_dir()),
+            approval: None,
+            approval_resolver: None,
+            runtime_adapter: Some(admission.adapter()),
+            memory: crate::agent::turn_request::ToolLoopMemory::none().with_canonical_history(canonical, false),
+        },
+        crate::agent::turn_request::TurnDelivery {
+            cancellation: None,
+            on_delta: None,
+            on_tool_call: None,
+        },
+    )
+    .await
+    .expect("test: the turn completes");
+    published.lock().clone()
+}
+
+#[tokio::test]
+async fn lookup_tool_is_published_when_canonical_history_holds_a_handoff() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let handoff = "[context_handoff]\n{}\n[/context_handoff]";
+        let with_handoff =
+            tools_published_for(&[("assistant", handoff), ("user", "ACK-20"), ("assistant", "ACK-20")]).await;
+        let without_handoff =
+            tools_published_for(&[("user", "PLANT"), ("user", "ACK-20"), ("assistant", "ACK-20")]).await;
+
+        let lookup = crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME;
+        assert!(
+            !with_handoff.is_empty() && with_handoff.iter().all(|names| names.iter().any(|name| name == lookup)),
+            "every request publishes the lookup while canonical history holds a handoff: {with_handoff:?}"
+        );
+        assert!(
+            without_handoff
+                .iter()
+                .all(|names| names.iter().all(|name| name != lookup)),
+            "without a handoff the lookup is not published: {without_handoff:?}"
+        );
+    })
+    .await
+    .expect("test: within the deadline");
+}

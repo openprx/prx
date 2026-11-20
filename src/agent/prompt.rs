@@ -79,6 +79,21 @@ impl SystemPromptBuilder {
         self
     }
 
+    /// The builder of a session whose provider view renders context handoffs
+    /// compactly: the rule that explains a handoff and its lookup follows the
+    /// tool-evidence rule (or the task section, or ends the prompt).
+    #[must_use]
+    pub fn with_context_handoff_rule(mut self) -> Self {
+        let at = self
+            .sections
+            .iter()
+            .position(|section| section.name() == "tool_evidence")
+            .or_else(|| self.sections.iter().position(|section| section.name() == "task"))
+            .map_or(self.sections.len(), |index| index.saturating_add(1));
+        self.sections.insert(at, Box::new(ContextHandoffSection));
+        self
+    }
+
     pub fn add_section(mut self, section: Box<dyn PromptSection>) -> Self {
         self.sections.push(section);
         self
@@ -134,6 +149,8 @@ pub struct RuntimeSection;
 pub struct DateTimeSection;
 /// The tool-evidence rule (`tool_evidence::TOOL_EVIDENCE_PROMPT_RULE`).
 pub struct ToolEvidenceSection;
+/// The context-handoff rule (`compaction::CONTEXT_HANDOFF_PROMPT_RULE`).
+pub struct ContextHandoffSection;
 
 impl PromptSection for IdentitySection {
     fn name(&self) -> &str {
@@ -215,6 +232,16 @@ impl PromptSection for ToolEvidenceSection {
 
     fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
         Ok(crate::agent::tool_evidence::TOOL_EVIDENCE_PROMPT_RULE.to_owned())
+    }
+}
+
+impl PromptSection for ContextHandoffSection {
+    fn name(&self) -> &str {
+        "context_handoff"
+    }
+
+    fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
+        Ok(crate::agent::compaction::CONTEXT_HANDOFF_PROMPT_RULE.to_owned())
     }
 }
 

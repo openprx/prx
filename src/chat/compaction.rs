@@ -544,7 +544,8 @@ pub(super) async fn apply_chat_compaction_patch_and_sync(
     *history = crate::agent::turn_history::project(&acked_canonical, &inputs).into_messages();
     let (turns_after, tokens_after) = chat_history_turns_and_tokens(history);
     ManualCompactOutcome::Compacted {
-        generation: crate::agent::compaction::context_handoff_generation(history),
+        // Read from the stored note: the view holds the compact rendering.
+        generation: crate::agent::compaction::context_handoff_generation(acked_canonical.messages()),
         turns_after,
         tokens_after,
     }

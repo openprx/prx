@@ -42,9 +42,12 @@ pub(crate) fn build_runtime_system_prompt(
 /// The system prompt of an interactive chat session. In a build whose chat
 /// turns run through the reducer driver (`terminal-tui`), every assistant
 /// turn is replayed with its tool evidence, so the prompt states what the
-/// evidence marker is ([`crate::agent::tool_evidence::TOOL_EVIDENCE_PROMPT_RULE`]).
-/// The paragraph is fixed text: it never changes the prompt between turns,
-/// and it is part of the system message every budget estimate counts.
+/// evidence marker is ([`crate::agent::tool_evidence::TOOL_EVIDENCE_PROMPT_RULE`]),
+/// and a context handoff is replayed compactly, so the prompt states what a
+/// handoff means and how earlier turns are looked up
+/// ([`crate::agent::compaction::CONTEXT_HANDOFF_PROMPT_RULE`]).
+/// The paragraphs are fixed text: they never change the prompt between turns,
+/// and they are part of the system message every budget estimate counts.
 pub(crate) fn build_chat_system_prompt(
     config: &Config,
     model_name: &str,
@@ -52,7 +55,9 @@ pub(crate) fn build_chat_system_prompt(
     native_tools: bool,
 ) -> String {
     #[cfg(feature = "terminal-tui")]
-    let builder = crate::agent::prompt::SystemPromptBuilder::with_defaults().with_tool_evidence_rule();
+    let builder = crate::agent::prompt::SystemPromptBuilder::with_defaults()
+        .with_tool_evidence_rule()
+        .with_context_handoff_rule();
     #[cfg(not(feature = "terminal-tui"))]
     let builder = crate::agent::prompt::SystemPromptBuilder::with_defaults();
     build_runtime_system_prompt_with(builder, config, model_name, skills, native_tools)

@@ -2,8 +2,8 @@
 //!
 //! It answers by reading each real request body: a planted fact is
 //! acknowledged, `read <file>` turns call `file_read` (tool-heavy history), and
-//! a recall question follows the context-switch handoff's own lookup pointer
-//! with a `transcript_history_lookup` call. The recall reply quotes the fact
+//! a recall question calls `transcript_history_lookup` with the handoff id the
+//! request's compact handoff names. The recall reply quotes the fact
 //! only when the lookup result returned it from the real SQLite transcript.
 #![allow(
     dead_code,
@@ -111,26 +111,50 @@ fn text_of(message: &serde_json::Value) -> String {
     }
 }
 
-/// The newest handoff note in `request`, if any.
-pub fn handoff_note(request: &serde_json::Value) -> Option<serde_json::Value> {
+/// What follows the marker in the compact provider rendering of a handoff.
+const HANDOFF_ID_FIELD: &str = " handoff_event_id=";
+
+/// The handoff id of the newest compact handoff rendering in `request`, if
+/// any (`[context_handoff] handoff_event_id=<id> — …`).
+pub fn handoff_id(request: &serde_json::Value) -> Option<String> {
     request["messages"].as_array()?.iter().rev().find_map(|message| {
         let text = text_of(message);
-        let start = text.find(HANDOFF_START)? + HANDOFF_START.len();
-        let end = text[start..].find(HANDOFF_END)? + start;
-        serde_json::from_str(text[start..end].trim()).ok()
+        let rest = text.strip_prefix(HANDOFF_START)?.strip_prefix(HANDOFF_ID_FIELD)?;
+        rest.split_whitespace().next().map(str::to_owned)
     })
 }
 
-/// The lookup arguments of the newest handoff note in `request`, if any.
+/// The newest compact handoff rendering in `request`, verbatim, if any.
+pub fn compact_handoff(request: &serde_json::Value) -> Option<String> {
+    request["messages"]
+        .as_array()?
+        .iter()
+        .rev()
+        .map(text_of)
+        .find(|text| text.starts_with(&format!("{HANDOFF_START}{HANDOFF_ID_FIELD}")))
+}
+
+/// The stored note of the newest handoff `request` carries, read from the
+/// real store of `workspace` by the id its rendering names.
+pub fn handoff_note(workspace: &std::path::Path, request: &serde_json::Value) -> Option<serde_json::Value> {
+    let id = handoff_id(request)?;
+    stored_handoffs(workspace)
+        .into_iter()
+        .find(|handoff| handoff.note["handoff_event_id"] == id.as_str())
+        .map(|handoff| handoff.note)
+}
+
+/// The lookup arguments of the newest handoff in `request`, if any.
 pub fn handoff_lookup_arguments(request: &serde_json::Value) -> Option<serde_json::Value> {
-    handoff_note(request).map(|note| note["lookup"]["arguments"].clone())
+    handoff_id(request).map(|id| serde_json::json!({ "handoff_event_id": id }))
 }
 
 /// The lookup arguments of the newest handoff note among the events of a
-/// lookup result (`text` is the tool output as the model sees it). The output
-/// may be an inline preview cut short of its closing brackets, so each note is
-/// read between its own markers: inside the output JSON it is one escaped
-/// string value, decoded before it is parsed.
+/// lookup result (`text` is the tool output as the model sees it). A lookup
+/// result holds the stored notes; the output may be an inline preview cut
+/// short of its closing brackets, so each note is read between its own
+/// markers: inside the output JSON it is one escaped string value, decoded
+/// before it is parsed.
 fn nested_handoff_lookup(text: &str) -> Option<serde_json::Value> {
     let mut notes = Vec::new();
     let mut rest = text;
@@ -150,7 +174,7 @@ fn nested_handoff_lookup(text: &str) -> Option<serde_json::Value> {
     notes
         .into_iter()
         .max_by_key(|note| note["to_generation"].as_u64().unwrap_or(0))
-        .map(|note| note["lookup"]["arguments"].clone())
+        .map(|note| serde_json::json!({ "handoff_event_id": note["handoff_event_id"] }))
 }
 
 /// Whether `request` publishes `name` as a tool.

@@ -170,12 +170,9 @@ async fn lookup(
     scope: &RuntimeEnvelope,
     note: &serde_json::Value,
 ) -> crate::tools::ToolResult {
-    let arguments = note.pointer("/lookup/arguments").expect("test: lookup arguments");
     TranscriptHistoryLookupTool::new(Arc::clone(memory))
         .execute(json!({
-            "event_ids": arguments.get("event_ids"),
-            "first_row_id": arguments.get("first_row_id"),
-            "last_row_id": arguments.get("last_row_id"),
+            "handoff_event_id": note.get("handoff_event_id"),
             "_zc_scope_trusted": true,
             "_zc_scope": {
                 "workspace_id": scope.workspace_id,
@@ -863,4 +860,50 @@ async fn branch_and_resume_render_the_same_evidence() {
     })
     .await
     .expect("branch_and_resume_render_the_same_evidence exceeded TEST_DEADLINE");
+}
+
+/// A lookup inside a branch of a switched session resolves the handoff id its
+/// own rewritten note carries, and nothing across the session boundary.
+#[tokio::test]
+async fn a_lookup_inside_a_branch_resolves_the_handoff_id_its_copied_note_carries() {
+    tokio::time::timeout(TEST_DEADLINE, async {
+        let chain = nested_chain().await;
+        let original_newest = note_of(&chain.session.turns.first().expect("test: handoff turn").content);
+        let keep = chain.session.turns.len();
+        let mut branch = branched_chat_session_from(&chain.session, keep, "test-provider", "test-model");
+        copy_branch_transcript(chain.memory.as_ref(), WORKSPACE, &chain.session.id, &mut branch)
+            .await
+            .expect("branch copy commits");
+        let target = chat_runtime_envelope(WORKSPACE, &format!("chat:{}", branch.id));
+        let branch_newest = note_of(&branch.turns.first().expect("test: branch handoff").content);
+
+        let in_branch = looked_up_contents(&lookup(&chain.memory, &target, &branch_newest).await);
+        let in_source = looked_up_contents(&lookup(&chain.memory, &chain.source, &original_newest).await);
+        assert_eq!(
+            in_branch.len(),
+            in_source.len(),
+            "the branch resolves its copy of the newest handoff to as many events as the source"
+        );
+        assert!(
+            in_branch
+                .iter()
+                .any(|content| parse_context_handoff_note(content).is_some()),
+            "the copied parent handoff is among the branch's events"
+        );
+
+        for (scope, note) in [(&target, &original_newest), (&chain.source, &branch_newest)] {
+            let refused = lookup(&chain.memory, scope, note).await;
+            assert!(!refused.success, "a handoff of the other session is refused");
+            assert!(
+                refused
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("outside the authenticated session")),
+                "the refusal names the session boundary: {:?}",
+                refused.error
+            );
+        }
+    })
+    .await
+    .expect("a_lookup_inside_a_branch_resolves_the_handoff_id_its_copied_note_carries exceeded TEST_DEADLINE");
 }

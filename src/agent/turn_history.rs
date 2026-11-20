@@ -26,6 +26,7 @@
 //! agent entry) reports nothing to a session authority; its history is its
 //! canonical history, copied lazily at the first step that reshapes the view.
 
+use crate::agent::compaction::render_context_handoff_for_provider;
 use crate::agent::context_paging::inject_recalled_context;
 use crate::agent::tool_evidence::{TurnToolEvidence, render_assistant_content};
 use crate::agent::turn_contracts::{inbound_user_message, stored_turn_message};
@@ -537,6 +538,10 @@ pub(crate) struct ProjectionInputs {
     refresh_notes: Vec<(usize, ChatMessage)>,
     recalled_page: Option<ChatMessage>,
     suppress_skill_metadata: bool,
+    /// Keep every context handoff as stored instead of rendering it
+    /// compactly: set for a caller without an acknowledged session, whose
+    /// view is its own canonical history and is kept (and saved) as such.
+    keep_stored_handoffs: bool,
 }
 
 impl ProjectionInputs {
@@ -575,6 +580,17 @@ impl ProviderView {
 /// skill metadata is stripped when suppressed.
 pub(crate) fn project(canonical: &CanonicalHistory, inputs: &ProjectionInputs) -> ProviderView {
     let mut messages = canonical.messages.clone();
+    // Each context handoff is shown in its compact form, by the one renderer,
+    // before anything is inserted (indices still align).
+    if !inputs.keep_stored_handoffs {
+        for message in &mut messages {
+            if let std::borrow::Cow::Owned(rendered) =
+                render_context_handoff_for_provider(&message.role, &message.content)
+            {
+                message.content = rendered;
+            }
+        }
+    }
     // Each acknowledged assistant reply is shown with its tool evidence, by
     // the one renderer, before anything is inserted (indices still align).
     for (message, evidence) in messages.iter_mut().zip(&canonical.evidence) {
@@ -637,11 +653,15 @@ impl TurnHistory {
             .as_ref()
             .and_then(|canonical| newest_request(canonical.messages()));
         let enriched_request = canonical.as_ref().and_then(|_| newest_request(view));
+        let mut projection = ProjectionInputs::default().with_enriched_request(plain_request, enriched_request);
+        // A caller without a canonical history keeps the view as its history:
+        // its handoffs stay as stored, so a later turn still resolves them.
+        projection.keep_stored_handoffs = canonical.is_none();
         Self {
             caller_rollover_current: caller_rollover && canonical.is_some(),
             canonical,
             absorbed_view_len: view.len(),
-            projection: ProjectionInputs::default().with_enriched_request(plain_request, enriched_request),
+            projection,
             #[cfg(feature = "wasm-plugins")]
             inbound_middleware_applied: false,
         }

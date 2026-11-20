@@ -20,8 +20,7 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::compaction::is_tool_roundtrip_companion;
 use crate::agent::compaction::{
     COMPACTION_KEEP_RECENT_MESSAGES, CompactionApply, CompactionBuild, apply_configurable_compaction_over_view,
-    build_configurable_compaction_patch_with_source_history, is_context_handoff_message,
-    persist_context_switch_degradation,
+    build_configurable_compaction_patch_with_source_history, persist_context_switch_degradation,
 };
 #[cfg(test)]
 use crate::agent::context_budget::budgeted_request_tool_tokens;
@@ -253,6 +252,15 @@ fn middleware_messages(history: &[ChatMessage], transformed: &serde_json::Value)
 /// durable compaction changed it: the turn's projection (recalled page,
 /// skill-metadata suppression, inbound middleware) over the canonical
 /// history. The per-provider preflight trims it again before the next request.
+/// Whether this turn's history holds a context handoff: its canonical history
+/// does (a per-request trim may have left the handoff out of the view), or the
+/// provider view does (stored or rendered, both start with the marker). The
+/// one test both the recovery-tool check and its publication use.
+fn turn_holds_context_handoff(turn_history: &TurnHistory, view: &[ChatMessage]) -> bool {
+    crate::agent::compaction::holds_context_handoff(turn_history.canonical(view))
+        || crate::agent::compaction::holds_context_handoff(view)
+}
+
 async fn rederive_provider_view(
     turn_history: &mut TurnHistory,
     history: &mut Vec<ChatMessage>,
@@ -489,7 +497,7 @@ async fn run_turn_unguarded(
     // mode above the 0.85 threshold.
     if let Some(config) = compaction_config {
         let switch_needs_lookup = matches!(config.mode, crate::config::AgentCompactionMode::Switch)
-            && (history.iter().any(is_context_handoff_message)
+            && (turn_holds_context_handoff(&turn_history, history)
                 || plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD).over_warning);
         if switch_needs_lookup
             && !tools_registry
@@ -874,7 +882,7 @@ async fn run_turn_unguarded(
         // handoff tells the model to call.
         let context_lookup_required = compaction_config
             .is_some_and(|config| matches!(config.mode, crate::config::AgentCompactionMode::Switch))
-            && history.iter().any(is_context_handoff_message);
+            && turn_holds_context_handoff(&turn_history, history);
         if context_lookup_required
             && !selected_tools
                 .iter()
