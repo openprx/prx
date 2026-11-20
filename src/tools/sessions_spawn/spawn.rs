@@ -1,16 +1,16 @@
 use super::delegation;
 use super::{
     AllowedToolProxy, AnnounceOrigin, DEFAULT_SUB_AGENT_SYSTEM_PROMPT, HistoryEntry, MemoryScope, OutboundNotice,
-    PROCESS_OWNER_PANICKED_PREFIX, ProcessFinalization, ProcessModeRunSeed, ProcessRunControl, ProcessWorkerOutcome,
-    SPAWN_EXECUTION_CONTEXT, STEER_CHANNEL_CAPACITY, SessionsSpawnTool, SpawnExecutionContext, SpawnScope, SubAgentRun,
-    SubAgentStatus, TaskRunControl, TerminationCause, boxed_spawn_field, commit_process_owner_failure_if_unfinalized,
-    commit_process_terminal_state, current_spawn_execution_context, deliver_or_withhold_notice,
-    exited_without_result_reason, format_announce_message, new_process_mode_run, normalize_process_memory_strategy,
-    parse_memory_scope, parse_spawn_scope, process_terminal, record_spawn_request_event, record_spawn_result_event,
-    refresh_tools_for_explicit_allowlist, register_killable_process_run, resolve_child_provider_api_key,
-    resolve_tools_for_agent, run_sub_agent_process, run_sub_agent_task, running_run_count, spawn_event_scope,
-    spawn_lineage, spawn_session_key, spawn_started_text, sub_agent_reported_failure, task_failure_reason,
-    task_terminal, termination_cause, watch_process_mode_monitor, watch_task_mode_monitor,
+    ProcessFinalization, ProcessModeRunSeed, ProcessRunControl, ProcessWorkerOutcome, SPAWN_EXECUTION_CONTEXT,
+    STEER_CHANNEL_CAPACITY, SessionsSpawnTool, SpawnExecutionContext, SpawnScope, SubAgentRun, SubAgentStatus,
+    TaskRunControl, TerminationCause, boxed_spawn_field, commit_process_terminal_state,
+    current_spawn_execution_context, deliver_or_withhold_notice, exited_without_result_reason, format_announce_message,
+    new_process_mode_run, normalize_process_memory_strategy, parse_memory_scope, parse_spawn_scope, process_terminal,
+    record_spawn_request_event, record_spawn_result_event, refresh_tools_for_explicit_allowlist,
+    register_killable_process_run, resolve_child_provider_api_key, resolve_tools_for_agent, run_sub_agent_process,
+    run_sub_agent_task, running_run_count, spawn_event_scope, spawn_lineage, spawn_session_key, spawn_started_text,
+    sub_agent_reported_failure, task_failure_reason, task_terminal, termination_cause, watch_process_mode_monitor,
+    watch_task_mode_monitor,
 };
 use crate::providers;
 use crate::runtime::child_source::publication::ChildDelegation;
@@ -19,7 +19,6 @@ use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
 use crate::tools::traits::{Tool, ToolResult};
 use anyhow::Context as _;
 use chrono::Utc;
-use futures_util::FutureExt;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -1022,9 +1021,7 @@ impl SessionsSpawnTool {
                 SPAWN_EXECUTION_CONTEXT.scope(
                     process_execution_ctx,
                     crate::agent::idle::scope_beat(Some(Arc::clone(&monitor_progress)), async move {
-                        let failure_active_runs = active_runs.clone();
-                        let failure_run_id = rid.clone();
-                        let monitor_result = std::panic::AssertUnwindSafe(async {
+                        async {
                             tracing::info!(run_id = %rid, "Sub-agent process starting");
 
                             let worker_result = run_sub_agent_process(
@@ -1269,19 +1266,8 @@ impl SessionsSpawnTool {
                             }
 
                             tracing::info!(run_id = %rid, "Sub-agent process finished");
-                        })
-                        .catch_unwind()
-                        .await;
-
-                        if monitor_result.is_err() {
-                            commit_process_owner_failure_if_unfinalized(
-                                &failure_active_runs,
-                                &failure_run_id,
-                                monitor_process_control.as_ref(),
-                                PROCESS_OWNER_PANICKED_PREFIX.to_string(),
-                            )
-                            .await;
                         }
+                        .await;
                     }),
                 ),
             ));

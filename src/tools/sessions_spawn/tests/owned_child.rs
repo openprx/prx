@@ -491,31 +491,45 @@ async fn injected_panic_cleanup_try_wait_error_keeps_owner_pending() {
     let _ = owner.await;
 }
 
+/// Deadline for the join observer to publish its verdict.
+const MONITOR_OBSERVER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[tokio::test]
-async fn owner_panic_commits_failed_registry_state_before_finalization() {
+async fn process_monitor_panic_is_reported_by_the_join_observer() {
     let control = ProcessRunControl::new();
     let mut run = restore_test_run("process-run", SubAgentStatus::Running);
     run.process_control = Some(control.clone());
     let runs = Arc::new(RwLock::new(vec![run]));
+    let monitor = tokio::spawn(async {
+        panic!("test: simulated process monitor panic");
+    });
 
-    let panic_result = std::panic::AssertUnwindSafe(async {
-        panic!("simulated process owner panic");
-    })
-    .catch_unwind()
-    .await;
-    assert!(panic_result.is_err());
-    commit_process_owner_failure_if_unfinalized(
-        &runs,
-        "process-run",
-        control.as_ref(),
-        "process owner panicked".to_string(),
-    )
-    .await;
+    watch_process_mode_monitor(
+        monitor,
+        Arc::clone(&runs),
+        "process-run".to_string(),
+        control.clone(),
+        crate::runtime::registry::register_tool_call("sessions_spawn", None, None),
+        Arc::new(parking_lot::Mutex::new(None)),
+        None,
+        Arc::new(parking_lot::Mutex::new(None)),
+        None,
+    );
+    tokio::time::timeout(MONITOR_OBSERVER_DEADLINE, control.finalized())
+        .await
+        .expect("test: the join observer must finalize a panicked monitor within the deadline");
 
+    assert_eq!(
+        control.finalization(),
+        Some(ProcessFinalization::Unconfirmed),
+        "a panicked monitor leaves settlement unconfirmed"
+    );
     let runs = runs.read().await;
-    assert!(matches!(runs[0].status, SubAgentStatus::Failed(ref error) if error == "process owner panicked"));
-    assert_eq!(control.finalization(), Some(ProcessFinalization::TerminationFailed));
-    assert_eq!(running_run_count(&runs), 0);
+    assert!(
+        matches!(runs[0].status, SubAgentStatus::Failed(ref error) if error.contains(PANICKED_BEFORE_RESULT_SUFFIX)),
+        "the run must record the monitor panic: {:?}",
+        runs[0].status
+    );
 }
 
 #[tokio::test]

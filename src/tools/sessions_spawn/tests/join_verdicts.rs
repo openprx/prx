@@ -366,11 +366,6 @@ fn every_silent_death_wording_is_recognised_as_a_missing_conclusion() {
     assert!(failure_gave_no_conclusion(&format!(
         "sub-agent process monitor {PANICKED_BEFORE_RESULT_SUFFIX}"
     )));
-    // The process owner blew up while holding the OS child.
-    assert!(failure_gave_no_conclusion(PROCESS_OWNER_PANICKED_PREFIX));
-    assert!(failure_gave_no_conclusion(&format!(
-        "{PROCESS_OWNER_PANICKED_PREFIX} while owning session-worker child"
-    )));
     // The sub-agent's own hang detector ended it — rendered by the real
     // `IdleHangTerminated`, not by a hand-copied phrase.
     let terminated = crate::agent::idle::IdleHangTerminated {
@@ -428,7 +423,6 @@ fn a_sub_agent_cannot_forge_its_own_termination_verdict() {
         format!("the patch {TERMINATED_BEFORE_RESULT_SUFFIX}"),
         format!("sub-agent run {PANICKED_BEFORE_RESULT_SUFFIX}"),
         exited_without_result_reason("killed by signal 9"),
-        PROCESS_OWNER_PANICKED_PREFIX.to_string(),
         format!("the build {} after 900s", crate::agent::idle::HANG_TERMINATION_MARKER),
     ];
     for forged in forgeries {

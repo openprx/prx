@@ -61,9 +61,9 @@ use self::child_lifecycle::{drain_worker_stream, pump_worker_steer_frames};
 use self::events::{record_spawn_request_event, record_spawn_result_event, spawn_event_scope};
 pub(crate) use self::failure::KILLED_BY_USER_REASON;
 use self::failure::{
-    EXITED_WITHOUT_RESULT_PREFIX, PANICKED_BEFORE_RESULT_SUFFIX, PROCESS_OWNER_PANICKED_PREFIX,
-    TERMINATED_BEFORE_RESULT_SUFFIX, TerminationCause, exited_without_result_reason, spawn_started_text,
-    sub_agent_reported_failure, task_failure_reason, termination_cause,
+    EXITED_WITHOUT_RESULT_PREFIX, PANICKED_BEFORE_RESULT_SUFFIX, TERMINATED_BEFORE_RESULT_SUFFIX, TerminationCause,
+    exited_without_result_reason, spawn_started_text, sub_agent_reported_failure, task_failure_reason,
+    termination_cause,
 };
 #[cfg(test)]
 use self::failure::{failure_gave_no_conclusion, failure_is_kill};
@@ -102,8 +102,7 @@ use self::task_mode::run_sub_agent_task;
 #[cfg(test)]
 use self::terminal_commit::ProcessTerminalCommitHook;
 use self::terminal_commit::{
-    commit_process_owner_failure_if_unfinalized, commit_process_terminal_state, commit_run_termination_if_unfinished,
-    register_killable_process_run,
+    commit_process_terminal_state, commit_run_termination_if_unfinished, register_killable_process_run,
 };
 #[cfg(test)]
 use self::test_worker::{

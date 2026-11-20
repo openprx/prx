@@ -37,10 +37,6 @@ pub(crate) const EXITED_WITHOUT_RESULT_PREFIX: &str = "worker exited without res
 /// somebody and a panic was not.
 pub(crate) const PANICKED_BEFORE_RESULT_SUFFIX: &str = "panicked before it could report a result";
 
-/// Head of the reason recorded when the process-mode owner task itself blew up
-/// while holding the OS child.
-pub(crate) const PROCESS_OWNER_PANICKED_PREFIX: &str = "process owner panicked";
-
 /// Marker the runtime writes in front of a failure reason that came out of the
 /// sub-agent itself.
 ///
@@ -105,10 +101,9 @@ pub(super) enum TerminationCause {
 /// 1. The quarantine tag first. A reason the runtime marked as the sub-agent's
 ///    own account is a task verdict no matter what it says, which is what makes
 ///    the wordings below unforgeable rather than merely unlikely to collide.
-/// 2. The runtime tags that are *anchored at the front* and carry an untrusted
+/// 2. The runtime tag that is *anchored at the front* and carries an untrusted
 ///    tail — [`EXITED_WITHOUT_RESULT_PREFIX`] embeds a preview of the worker's
-///    stderr, and [`PROCESS_OWNER_PANICKED_PREFIX`] embeds a cleanup error.
-///    They are read before the suffix rule below because a worker whose last
+///    stderr. It is read before the suffix rule below because a worker whose last
 ///    stderr bytes are [`TERMINATED_BEFORE_RESULT_SUFFIX`] would otherwise
 ///    relabel its own silent death as an operator kill.
 /// 3. Only then the remaining wordings, none of which an untrusted string can
@@ -126,7 +121,7 @@ pub(super) fn termination_cause(reason: &str) -> TerminationCause {
     if reason.starts_with(SUB_AGENT_REPORTED_PREFIX) {
         return TerminationCause::SelfReported;
     }
-    if reason.starts_with(EXITED_WITHOUT_RESULT_PREFIX) || reason.starts_with(PROCESS_OWNER_PANICKED_PREFIX) {
+    if reason.starts_with(EXITED_WITHOUT_RESULT_PREFIX) {
         return TerminationCause::NoConclusion;
     }
     if failure_is_kill(reason) {
@@ -230,7 +225,6 @@ pub(super) fn spawn_started_text(
 pub(super) fn failure_gave_no_conclusion(reason: &str) -> bool {
     reason.starts_with(EXITED_WITHOUT_RESULT_PREFIX)
         || reason.ends_with(PANICKED_BEFORE_RESULT_SUFFIX)
-        || reason.starts_with(PROCESS_OWNER_PANICKED_PREFIX)
         || crate::agent::idle::message_describes_hang_termination(reason)
 }
 
