@@ -706,6 +706,7 @@ async fn a_branch_of_a_session_with_queued_turns_and_a_handoff_copies_then_switc
                 timestamp: chrono::Utc::now(),
                 tool_calls: Vec::new(),
                 context_handoff: false,
+                tool_evidence: None,
             })
             .collect();
         assert!(
