@@ -111,7 +111,6 @@ pub fn router(state: AppState) -> Router<AppState> {
             patch(models::patch_route).delete(models::delete_route),
         )
         .route("/agents", get(models::get_agents))
-        .route("/agents/catalog", get(capabilities::get_catalog))
         .route("/agents/{name}", put(models::put_agent))
         .route("/config/plans", post(manage::post_plan))
         .route("/config/apply", post(manage::post_apply))
@@ -135,7 +134,6 @@ pub fn router(state: AppState) -> Router<AppState> {
 
     let protected_routes = Router::new()
         .route("/status", get(status::get_status))
-        .route("/capabilities", get(capabilities::get_capabilities))
         .route("/identity",get(identity::get_identity))
         .route("/sessions", get(sessions::get_sessions).post(sessions::post_session))
         .route("/sessions/approvals", get(sessions::get_session_approvals))
@@ -246,6 +244,19 @@ pub fn router(state: AppState) -> Router<AppState> {
             auth_middleware,
         ));
 
+    // The rf contract routes (AC-2): their own guard gives every error the
+    // contract's coded shape; the bearer check is the shared one.
+    let rf_contract_routes = Router::new()
+        .route(
+            "/capabilities",
+            get(capabilities::get_capabilities).fallback(capabilities::method_not_allowed),
+        )
+        .route(
+            "/agents/catalog",
+            get(capabilities::get_catalog).fallback(capabilities::method_not_allowed),
+        )
+        .route_layer(middleware::from_fn_with_state(state.clone(), capabilities::guard));
+
     // The two mailbox endpoints, and only those two. They are authenticated
     // exactly like everything above — the same bearer check, plus the
     // per-session token — but they are deliberately **not** rate limited, so
@@ -277,6 +288,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/logs/stream", get(logs::ws_handler))
         .route("/sessions/media", get(sessions::get_session_media))
         .merge(protected_routes)
+        .merge(rf_contract_routes)
         .route_layer(middleware::from_fn_with_state(
             state,
             api_rate_limit_middleware,
@@ -410,18 +422,25 @@ impl ApiPrincipal {
     }
 }
 
-async fn auth_middleware(State(state): State<AppState>, mut request: Request, next: Next) -> Response {
-    let provided_token = extract_resource_auth_token(request.headers());
-
+/// The principal of a request whose bearer (or same-origin cookie) passes
+/// the pairing check; `None` when it does not.
+fn authenticated_principal(state: &AppState, headers: &HeaderMap) -> Option<ApiPrincipal> {
+    let provided_token = extract_resource_auth_token(headers);
     if state.pairing.require_pairing() && !state.pairing.is_authenticated(&provided_token) {
+        return None;
+    }
+    Some(ApiPrincipal::of_token(&provided_token))
+}
+
+async fn auth_middleware(State(state): State<AppState>, mut request: Request, next: Next) -> Response {
+    let Some(principal) = authenticated_principal(&state, request.headers()) else {
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"error": "Unauthorized"})),
         )
             .into_response();
-    }
-
-    request.extensions_mut().insert(ApiPrincipal::of_token(&provided_token));
+    };
+    request.extensions_mut().insert(principal);
     next.run(request).await
 }
 

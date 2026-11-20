@@ -27,10 +27,14 @@ RUN --mount=type=cache,id=prx-cargo-registry,target=/usr/local/cargo/registry,sh
 RUN rm -rf src benches crates/robot-kit/src
 
 # 2. Copy only build-relevant source paths (avoid cache-busting on docs/tests/scripts)
+COPY build.rs ./
 COPY src/ src/
 COPY benches/ benches/
 COPY crates/ crates/
 COPY firmware/ firmware/
+# The tree has no .git: pass `--build-arg PRX_BUILD_COMMIT=$(git rev-parse HEAD)`
+# for `GET /api/capabilities` to report the commit (otherwise `unknown`).
+ARG PRX_BUILD_COMMIT=
 RUN --mount=type=cache,id=prx-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=prx-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=prx-target,target=/app/target,sharing=locked \

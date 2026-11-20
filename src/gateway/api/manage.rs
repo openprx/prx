@@ -114,7 +114,7 @@ pub(super) fn url_carries_secret(uri: &Uri, query_keys: &[&str]) -> bool {
 }
 
 /// URL userinfo, or anything the log redactor recognises as a secret.
-fn looks_secret(text: &str) -> bool {
+pub(super) fn looks_secret(text: &str) -> bool {
     matches!(crate::providers::redact_endpoint_userinfo(text), Cow::Owned(_))
         || crate::security::redaction::redact_secrets(text) != text
 }
