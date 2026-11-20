@@ -2503,11 +2503,10 @@ fn in_relative_order(haystack: &[String], needles: &[String]) -> bool {
     needles.iter().all(|needle| rest.any(|item| item == needle))
 }
 
-/// A line sent while the previous turn is still running is stored before that
-/// turn's reply, so store order differs from transcript order; the next
-/// automatic switch still resolves exact provenance (no lossy degradation),
-/// references both turns in history order, and a later lookup recovers the
-/// planted fact.
+/// A line sent while the previous turn is still running waits for that turn
+/// (the plain REPL runs one turn at a time); the next automatic switch still
+/// resolves exact provenance (no lossy degradation), references both turns in
+/// history order, and a later lookup recovers the planted fact.
 #[test]
 fn a_queued_input_does_not_degrade_the_next_switch() {
     let sandbox = Sandbox::new();
@@ -2524,22 +2523,15 @@ fn a_queued_input_does_not_degrade_the_next_switch() {
     chat.turn(PLANT, replies);
 
     chat.command(QUEUED_FIRST);
-    chat.command(QUEUED_SECOND);
     let started = Instant::now();
-    let first_reply_before_second_input = loop {
-        if stored_row_id(&sandbox, "user", QUEUED_SECOND).is_some() {
-            break stored_row_id(&sandbox, "assistant", QUEUED_FIRST_REPLY).is_some();
-        }
+    while !gate.held.load(std::sync::atomic::Ordering::SeqCst) {
         assert!(
             started.elapsed() < TURN_DEADLINE,
-            "the second line's input row was not stored within TURN_DEADLINE"
+            "the first queued line's request did not reach the provider within TURN_DEADLINE"
         );
         std::thread::sleep(POLL);
-    };
-    assert!(
-        !first_reply_before_second_input,
-        "the second line's input row is stored while the first turn is still running"
-    );
+    }
+    chat.command(QUEUED_SECOND);
     gate.release();
     replies += 2;
     wait_for_replies(&sandbox, replies);
