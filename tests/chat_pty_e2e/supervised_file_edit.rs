@@ -71,7 +71,7 @@ fn one_call(prompt: &str, call: Scripted, key: &str, after_key: &[&str]) -> (Har
     );
     let tty = session.session();
     read_until_with_dsr(tty, MODEL, PHASE_CAP);
-    tty.send(&format!("{prompt}\r")).expect("send turn");
+    tty.send(format!("{prompt}\r")).expect("send turn");
     read_until_with_dsr(tty, CARD, PHASE_CAP);
     tty.send(key).expect("answer the approval card");
     read_until_all_with_dsr(tty, after_key, PHASE_CAP);
