@@ -11,6 +11,11 @@ use serde::{Deserialize, Serialize};
 /// kept for delegate/spawn only.
 pub const MAIN_AGENT_NAME: &str = "main";
 
+/// Grammar-valid names no named agent may take, sorted ascending: `main`
+/// selects Main, and `catalog` would collide with `GET /api/agents/catalog`.
+/// Published to rf in the agent catalog's `reserved_names`.
+pub const RESERVED_AGENT_NAMES: [&str; 2] = ["catalog", MAIN_AGENT_NAME];
+
 /// Longest accepted name, in bytes (the grammar is ASCII-only).
 pub const AGENT_NAME_MAX_LEN: usize = 64;
 
@@ -63,6 +68,12 @@ impl AgentName {
     pub fn is_main(&self) -> bool {
         self.0 == MAIN_AGENT_NAME
     }
+
+    /// Whether this is one of [`RESERVED_AGENT_NAMES`].
+    #[must_use]
+    pub fn is_reserved(&self) -> bool {
+        RESERVED_AGENT_NAMES.contains(&self.0.as_str())
+    }
 }
 
 impl TryFrom<String> for AgentName {
@@ -80,10 +91,10 @@ impl From<AgentName> for String {
 }
 
 /// Whether a configured `[agents.<name>]` key can be targeted as a named
-/// agent: it satisfies the grammar and is not the reserved `main`.
+/// agent: it satisfies the grammar and is not one of [`RESERVED_AGENT_NAMES`].
 #[must_use]
 pub fn is_targetable(raw: &str) -> bool {
-    AgentName::parse(raw).is_ok_and(|name| !name.is_main())
+    AgentName::parse(raw).is_ok_and(|name| !name.is_reserved())
 }
 
 #[cfg(test)]

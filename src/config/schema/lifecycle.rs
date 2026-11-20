@@ -827,15 +827,15 @@ impl Config {
         }
 
         for (name, agent) in &self.agents {
-            // A name outside the agent-name grammar, or the reserved `main`,
-            // keeps loading for delegate/spawn so an upgrade never stops PRX
+            // A name outside the agent-name grammar, or a reserved name
+            // (`main`, `catalog`), keeps loading for delegate/spawn so an upgrade never stops PRX
             // from starting over it; it is never targetable as a named agent.
             if !crate::config::agent_name::is_targetable(name)
                 && REPORTED_UNTARGETABLE_AGENTS.lock().insert(name.clone())
             {
                 tracing::warn!(
                     agent = %name,
-                    "agents.{name} is not a targetable agent name (^[a-z][a-z0-9_-]{{0,63}}$, not 'main'); \
+                    "agents.{name} is not a targetable agent name (^[a-z][a-z0-9_-]{{0,63}}$, not 'main' or 'catalog'); \
                      it still works for delegate/spawn but cannot be targeted by the sessions API"
                 );
             }

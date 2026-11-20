@@ -28,6 +28,7 @@ const MAX_UPLOAD_FILE_SIZE_BYTES: usize = 20 * 1024 * 1024;
 const UPLOADS_DIR_NAME: &str = "uploads";
 
 mod target;
+pub(super) use target::TARGET_EXCLUDED_TOOLS;
 use target::{
     AgentField, SelectedTurn, TargetError, TargetUnavailable, TargetedTurn, TurnTarget, prepare_target,
     resolve_incarnation, resolve_target,

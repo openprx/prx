@@ -10,6 +10,7 @@ use axum::{
     routing::{any, delete, get, patch, post, put},
 };
 
+mod capabilities;
 mod causal;
 mod channels;
 mod chat_sessions;
@@ -110,6 +111,7 @@ pub fn router(state: AppState) -> Router<AppState> {
             patch(models::patch_route).delete(models::delete_route),
         )
         .route("/agents", get(models::get_agents))
+        .route("/agents/catalog", get(capabilities::get_catalog))
         .route("/agents/{name}", put(models::put_agent))
         .route("/config/plans", post(manage::post_plan))
         .route("/config/apply", post(manage::post_apply))
@@ -133,6 +135,7 @@ pub fn router(state: AppState) -> Router<AppState> {
 
     let protected_routes = Router::new()
         .route("/status", get(status::get_status))
+        .route("/capabilities", get(capabilities::get_capabilities))
         .route("/identity",get(identity::get_identity))
         .route("/sessions", get(sessions::get_sessions).post(sessions::post_session))
         .route("/sessions/approvals", get(sessions::get_session_approvals))

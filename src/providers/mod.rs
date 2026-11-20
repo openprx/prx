@@ -25,6 +25,7 @@ pub mod compatible;
 pub mod connection_test;
 pub mod context_window;
 pub mod copilot;
+pub(crate) mod credential_readiness;
 pub mod credentials;
 pub mod gemini;
 pub(crate) mod generation;

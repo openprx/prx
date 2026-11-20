@@ -22,7 +22,7 @@ use std::sync::Arc;
 /// Tools no target can reach until an audited inventory extension: they act
 /// on the host's scheduler and background-task stores. The exclusion applies
 /// to the published surface whatever the allowlist says, wildcard included.
-const TARGET_EXCLUDED_TOOLS: [&str; 2] = ["cron", "xin"];
+pub(in crate::gateway::api) const TARGET_EXCLUDED_TOOLS: [&str; 2] = ["cron", "xin"];
 
 /// The `agent` field exactly as the request carried it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +64,9 @@ impl TurnTarget {
                 let name = AgentName::parse(&text).map_err(|_| TargetError::Invalid)?;
                 if name.is_main() {
                     Ok(Self::Main)
+                } else if name.is_reserved() {
+                    // `catalog`: reserved, never a named agent even when configured.
+                    Err(TargetError::Invalid)
                 } else {
                     Ok(Self::Named(name))
                 }
@@ -75,7 +78,8 @@ impl TurnTarget {
 /// Why a target was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum TargetError {
-    /// 400: the field is null, not a string, or outside the name grammar.
+    /// 400: the field is null, not a string, outside the name grammar, or a
+    /// reserved name other than `main`.
     Invalid,
     /// 404: no such configured agent.
     Unknown,
