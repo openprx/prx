@@ -356,11 +356,16 @@ async fn run_internal(
     ).await;
 
 
+    // A resumed plain session shows its recent history on a terminal stdout.
+    let resume_recap = (plain_mode && session_id.is_some() && one_shot.is_none() && std::io::IsTerminal::is_terminal(&std::io::stdout()))
+        .then(|| super::resume_recap::format_resume_recap(&initial_session))
+        .flatten();
     #[cfg(feature = "terminal-tui")]
     let ui_startup = startup::ChatStartupUi {
         banner: &banner,
         session_id: &initial_session.id,
         initial_saved_session_entries: &initial_saved_session_entries,
+        resume_recap: resume_recap.as_deref(),
     };
 
     // ── Input channel ────────────────────────────────────────────
@@ -568,6 +573,9 @@ async fn run_internal(
     } else {
         println!("{banner}");
         eprintln!("{}", super::session_glue::current_chat_session_line(&chat_session.session().id));
+        if let Some(recap) = resume_recap.as_deref() {
+            println!("{recap}");
+        }
         startup::spawn_line_input_listener(plain_mode, input_tx, stdin_closed.clone());
     }
 

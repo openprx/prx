@@ -94,6 +94,7 @@ mod output;
 mod plain_queue;
 mod provider_turns;
 mod pty_attach;
+mod resume_recap;
 mod run;
 mod session_glue;
 mod session_store;

@@ -20,6 +20,8 @@ pub(super) struct ChatStartupUi<'a> {
     /// The chat session id the banner names (TUI) or stderr names (plain).
     pub(super) session_id: &'a str,
     pub(super) initial_saved_session_entries: &'a Vec<crate::chat::session::SavedSessionPickerEntry>,
+    /// Recent history of a resumed session, printed by the plain front end.
+    pub(super) resume_recap: Option<&'a str>,
 }
 pub(super) fn chat_tracing_guard() -> Option<TracingChatGuard> {
     // ── P3-1: Redirect tracing to ~/.openprx/chat.log ────────────────────
@@ -587,6 +589,9 @@ pub(super) async fn terminal_input(
         // behaviour.
         println!("{banner}");
         eprintln!("{session_line}");
+        if let Some(recap) = ui_startup.resume_recap {
+            println!("{recap}");
+        }
         spawn_line_input_listener(plain_mode, input_tx, stdin_closed.clone());
         (None, None)
     }
