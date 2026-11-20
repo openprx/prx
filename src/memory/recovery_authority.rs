@@ -14,6 +14,23 @@ pub(crate) const MAX_SERIALIZED_RECOVERY_FACTS: usize = 262_144;
 #[error("recovery key unavailable: {0}")]
 pub struct RecoveryKeyUnavailable(pub String);
 
+/// The first recovery-activation refusal of this process, kept so a command
+/// that fails because recovery is unavailable can say why. Operator-facing
+/// only: it may name local paths, modes and uids, never key material.
+static FIRST_ACTIVATION_REFUSAL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Record `reason` as this process's first activation refusal; a later
+/// refusal never replaces it.
+pub(crate) fn record_activation_refusal(reason: &str) {
+    // Only the first reason is kept; a second `set` is the expected no-op.
+    let _ = FIRST_ACTIVATION_REFUSAL.set(reason.to_owned());
+}
+
+/// The first activation refusal recorded in this process, if any.
+pub(crate) fn first_activation_refusal() -> Option<&'static str> {
+    FIRST_ACTIVATION_REFUSAL.get().map(String::as_str)
+}
+
 #[must_use]
 pub fn is_key_unavailable(error: &anyhow::Error) -> bool {
     error.is::<RecoveryKeyUnavailable>()

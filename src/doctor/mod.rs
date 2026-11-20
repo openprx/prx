@@ -186,6 +186,7 @@ pub fn diagnose(config: &Config) -> DoctorReport {
     check_router_candidates(config, &mut items);
     check_decision_plane(config, &mut items);
     check_workspace(config, &mut items);
+    ingress::check_recovery_authority(config, &mut items);
     check_legacy_fitness_telemetry(config, &mut items);
     check_workspace_mcp_servers(config, &mut items);
     check_workspace_hooks(config, &mut items);

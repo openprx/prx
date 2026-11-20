@@ -23,11 +23,24 @@ pub fn diagnose_ingress(config: &Config) -> DoctorReport {
     DoctorReport::new("OpenPRX Doctor - Ingress", items)
 }
 
+/// The recovery-authority line of the full `prx doctor` report.
+pub(super) fn check_recovery_authority(config: &Config, items: &mut Vec<DiagItem>) {
+    let backend =
+        crate::memory::effective_memory_backend_name(&config.memory.backend, Some(&config.storage.provider.config));
+    if matches!(
+        crate::memory::classify_memory_backend(&backend),
+        crate::memory::MemoryBackendKind::Sqlite | crate::memory::MemoryBackendKind::Lucid
+    ) {
+        recovery_directory(&crate::schema_migration::memory_db_path(config), items);
+    }
+}
+
 fn check_ingress(config: &Config, items: &mut Vec<DiagItem>) {
     let backend =
         crate::memory::effective_memory_backend_name(&config.memory.backend, Some(&config.storage.provider.config));
     match crate::memory::classify_memory_backend(&backend) {
         crate::memory::MemoryBackendKind::Sqlite | crate::memory::MemoryBackendKind::Lucid => {
+            recovery_directory(&crate::schema_migration::memory_db_path(config), items);
             sqlite_rows(config, items);
         }
         crate::memory::MemoryBackendKind::Postgres => items.push(DiagItem::warn(
@@ -76,6 +89,27 @@ fn sqlite_rows(config: &Config, items: &mut Vec<DiagItem>) {
         ));
     }
 }
+
+/// Whether recovery can be activated for `database`: the same read-only
+/// ancestor and memory-directory rules the runtime applies. A refusal is an
+/// error because every turn's terminal write then fails.
+#[cfg(unix)]
+fn recovery_directory(database: &std::path::Path, items: &mut Vec<DiagItem>) {
+    match crate::memory::sqlite::inspect_recovery_directory(database) {
+        Ok(true) => items.push(DiagItem::ok(CATEGORY, "recovery key directory is private")),
+        Ok(false) => items.push(DiagItem::ok(
+            CATEGORY,
+            "memory directory not created yet; recovery is checked on first use",
+        )),
+        Err(error) => items.push(DiagItem::error(
+            CATEGORY,
+            format!("recovery authority unavailable: {error:#}"),
+        )),
+    }
+}
+
+#[cfg(not(unix))]
+fn recovery_directory(_database: &std::path::Path, _items: &mut Vec<DiagItem>) {}
 
 /// One row: identifiers, state, age and lock reachability; never content.
 /// `workspace` is the configured workspace id; a row of any other workspace is

@@ -221,7 +221,18 @@ impl CleanupTracker {
         #[cfg(test)]
         self.diagnostic
             .record("drain_completed", 0, 0, failed, Some(!failed && queues_drained));
-        anyhow::ensure!(!failed, "runtime terminal cleanup has unconfirmed failures");
+        if failed {
+            // A terminal write refused because recovery is unavailable fails
+            // the cleanup; name that refusal so the operator sees why.
+            return Err(crate::memory::recovery_authority::first_activation_refusal().map_or_else(
+                || anyhow::anyhow!("runtime terminal cleanup has unconfirmed failures"),
+                |reason| {
+                    anyhow::anyhow!(
+                        "runtime terminal cleanup has unconfirmed failures; recovery authority unavailable: {reason}"
+                    )
+                },
+            ));
+        }
         anyhow::ensure!(queues_drained, "runtime decision queues did not drain");
         Ok(())
     }

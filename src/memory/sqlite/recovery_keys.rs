@@ -91,57 +91,11 @@ impl KeyDirectory {
 
     #[cfg(unix)]
     fn open_with(memory: &Path, create: bool, staging: bool) -> anyhow::Result<Self> {
-        use rustix::fs::{AtFlags, Mode, OFlags, mkdirat, open, openat, statat};
+        use rustix::fs::{AtFlags, Mode, OFlags, mkdirat, openat, statat};
         if !staging {
             ensure_admitted(memory)?;
         }
-        anyhow::ensure!(memory.is_absolute(), "recovery path must be absolute");
-        let owner = rustix::process::geteuid().as_raw();
-        let mut directory = File::from(open(
-            "/",
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?);
-        #[cfg(test)]
-        check_cloexec(&directory)?;
-        let mut ancestor = std::path::PathBuf::from("/");
-        for component in memory.components() {
-            let name = match component {
-                Component::RootDir => continue,
-                Component::Normal(name) => name,
-                _ => anyhow::bail!("unsafe recovery ancestor"),
-            };
-            ancestor.push(name);
-            directory = File::from(openat(
-                &directory,
-                name,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            )?);
-            #[cfg(test)]
-            check_cloexec(&directory)?;
-            let metadata = directory.metadata()?;
-            // Root-owned sticky temporary roots are safe ancestors, but never
-            // acceptable as the repository/key directory itself.
-            let sticky_root = metadata.uid() == 0 && metadata.mode() & 0o1000 != 0;
-            anyhow::ensure!(
-                (metadata.uid() == owner || metadata.uid() == 0) && (metadata.mode() & 0o022 == 0 || sticky_root),
-                "unsafe recovery ancestor {} (mode {:o}, owner {}, euid {}): must be owned by you or root and not group/other-writable",
-                ancestor.display(),
-                metadata.mode() & 0o7777,
-                metadata.uid(),
-                owner
-            );
-        }
-        let metadata = directory.metadata()?;
-        anyhow::ensure!(
-            metadata.uid() == owner && metadata.mode() & 0o777 == 0o700,
-            "unsafe memory directory {} (mode {:o}, owner {}, euid {}): must be yours and 0700",
-            memory.display(),
-            metadata.mode() & 0o7777,
-            metadata.uid(),
-            owner
-        );
+        let directory = checked_memory_directory(memory)?;
         if !staging {
             match statat(&directory, INCOMPLETE_MARKER, AtFlags::SYMLINK_NOFOLLOW) {
                 Ok(_) => anyhow::bail!("incomplete recovery backup"),
@@ -149,6 +103,7 @@ impl KeyDirectory {
                 Err(error) => return Err(error.into()),
             }
         }
+        let owner = rustix::process::geteuid().as_raw();
         if create {
             match mkdirat(&directory, KEYS_DIRECTORY, Mode::from_raw_mode(0o700)) {
                 Ok(()) => directory.sync_all()?,
@@ -174,7 +129,81 @@ impl KeyDirectory {
         directory.sync_all()?;
         Ok(Self(keys))
     }
+}
 
+/// Read-only check of the directory that holds `database`'s recovery keys:
+/// the same ancestor and memory-directory rules that recovery activation
+/// applies, with nothing created or repaired. `Ok(false)` when the memory
+/// directory does not exist yet.
+#[cfg(unix)]
+pub(crate) fn inspect_recovery_directory(database: &Path) -> anyhow::Result<bool> {
+    let memory = database.parent().context("missing memory directory")?;
+    if !memory.exists() {
+        return Ok(false);
+    }
+    let real = ensure_admitted(memory)?;
+    checked_memory_directory(&real)?;
+    Ok(true)
+}
+
+/// Walk `memory` from `/` without following links: every ancestor must be
+/// owned by the effective uid or root and not group/other-writable (a
+/// root-owned sticky directory is accepted), and `memory` itself must be the
+/// effective uid's and 0700.
+#[cfg(unix)]
+fn checked_memory_directory(memory: &Path) -> anyhow::Result<File> {
+    use rustix::fs::{Mode, OFlags, open, openat};
+    anyhow::ensure!(memory.is_absolute(), "recovery path must be absolute");
+    let owner = rustix::process::geteuid().as_raw();
+    let mut directory = File::from(open(
+        "/",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?);
+    #[cfg(test)]
+    check_cloexec(&directory)?;
+    let mut ancestor = std::path::PathBuf::from("/");
+    for component in memory.components() {
+        let name = match component {
+            Component::RootDir => continue,
+            Component::Normal(name) => name,
+            _ => anyhow::bail!("unsafe recovery ancestor"),
+        };
+        ancestor.push(name);
+        directory = File::from(openat(
+            &directory,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?);
+        #[cfg(test)]
+        check_cloexec(&directory)?;
+        let metadata = directory.metadata()?;
+        // Root-owned sticky temporary roots are safe ancestors, but never
+        // acceptable as the repository/key directory itself.
+        let sticky_root = metadata.uid() == 0 && metadata.mode() & 0o1000 != 0;
+        anyhow::ensure!(
+            (metadata.uid() == owner || metadata.uid() == 0) && (metadata.mode() & 0o022 == 0 || sticky_root),
+            "unsafe recovery ancestor {} (mode {:o}, owner {}, euid {}): must be owned by you or root and not group/other-writable",
+            ancestor.display(),
+            metadata.mode() & 0o7777,
+            metadata.uid(),
+            owner
+        );
+    }
+    let metadata = directory.metadata()?;
+    anyhow::ensure!(
+        metadata.uid() == owner && metadata.mode() & 0o777 == 0o700,
+        "unsafe memory directory {} (mode {:o}, owner {}, euid {}): must be yours and 0700",
+        memory.display(),
+        metadata.mode() & 0o7777,
+        metadata.uid(),
+        owner
+    );
+    Ok(directory)
+}
+
+impl KeyDirectory {
     #[cfg(not(unix))]
     pub(super) fn open(_memory: &Path, _create: bool) -> anyhow::Result<Self> {
         anyhow::bail!("secure recovery key storage unavailable on this platform")

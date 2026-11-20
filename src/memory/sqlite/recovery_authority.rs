@@ -856,7 +856,9 @@ impl RecoveryRepository for SqliteMemory {
         match self.recovery_activate(false) {
             Ok(id) => Ok(id),
             Err(error) if crate::memory::recovery_authority::is_key_unavailable(&error) => {
-                let _ = self.recovery_unavailable.set(format!("{error:#}"));
+                let reason = format!("{error:#}");
+                crate::memory::recovery_authority::record_activation_refusal(&reason);
+                let _ = self.recovery_unavailable.set(reason);
                 self.warn_unavailable_once();
                 Err(error)
             }
