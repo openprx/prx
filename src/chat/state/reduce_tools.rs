@@ -358,6 +358,17 @@ impl ChatState {
         ]
     }
 
+    /// `Action::ToolApprovalDenied` (TUI): the transcript gets a notice line
+    /// naming the refused call; [`tool_approval_denied_effects`] follows.
+    #[cfg(feature = "terminal-tui")]
+    pub(super) fn push_tool_denied_notice(&mut self, name: &str, reason: &str) {
+        self.ui
+            .conversation_lines
+            .push(crate::chat::tui::ConversationLine::system_notice(format!(
+                "Denied {name}: {reason} — the call did not run."
+            )));
+    }
+
     pub(super) fn reduce_tool_approval_cleared(&mut self) -> Vec<Effect> {
         self.ui.pending_tool_approval = None;
         if matches!(self.ui.focus, crate::chat::sessions::FocusTarget::Approval) {
@@ -556,6 +567,24 @@ fn cancel_after_ready_for_commit(draft_id: &str) -> Vec<Effect> {
                 crate::agent::diagnostics::text_class(&draft_id)
             ),
         },
+        Effect::RequestRedraw,
+    ]
+}
+
+/// `Action::ToolApprovalDenied`: a tool call was refused at approval and did
+/// not run. Line mode prints the notice through [`Effect::AnnounceToolDenied`];
+/// the TUI already holds it as a transcript line.
+pub(super) fn tool_approval_denied_effects(tool_id: &str, name: String, reason: String) -> Vec<Effect> {
+    vec![
+        Effect::LogTrace {
+            level: tracing::Level::DEBUG,
+            msg: format!(
+                "tool_approval_denied tool_id={} name_len={}",
+                crate::agent::diagnostics::text_class(tool_id),
+                name.len()
+            ),
+        },
+        Effect::AnnounceToolDenied { name, reason },
         Effect::RequestRedraw,
     ]
 }

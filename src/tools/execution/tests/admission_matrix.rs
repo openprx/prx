@@ -394,6 +394,7 @@ pub(crate) async fn assert_existing_strategy(context: ToolExecutionContext, obse
             approved()
         } else {
             ToolApprovalDecision::Denied {
+                cause: ApprovalDenialCause::UserRejected,
                 reason: "project refusal".into(),
             }
         };
@@ -447,6 +448,7 @@ async fn unmodelled_operation_uses_existing_strategy_without_pending() {
             approved()
         } else {
             ToolApprovalDecision::Denied {
+                cause: ApprovalDenialCause::UserRejected,
                 reason: "project refusal".into(),
             }
         };
@@ -713,6 +715,7 @@ pub(in crate::tools::execution::tests) mod child_fixture {
                 }),
                 Arc::new(FixedApproval {
                     decision: ToolApprovalDecision::Denied {
+                        cause: ApprovalDenialCause::UserRejected,
                         reason: "no approver".into(),
                     },
                     stages: Arc::clone(&fixture.stages),

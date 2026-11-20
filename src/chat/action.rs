@@ -468,6 +468,24 @@ pub enum Action {
         approved: bool,
         always: bool,
     },
+    /// A pending approval was closed without an operator answer (no approval
+    /// surface, no terminal, EOF, a busy prompt). The reducer clears the view
+    /// as for [`Self::ToolApprovalReceived`]; the dispatcher then fails the
+    /// pending entry closed with `cause`.
+    ToolApprovalUnanswered {
+        tool_id: String,
+        cause: crate::tools::ApprovalDenialCause,
+    },
+    /// A tool call was refused at approval and did not run. Sent by the chat
+    /// approval strategy so the operator sees which call was refused and why;
+    /// `reason` is the display text the model also reads.
+    ToolApprovalDenied {
+        task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+        tool_id: String,
+        name: String,
+        cause: crate::tools::ApprovalDenialCause,
+        reason: String,
+    },
     /// Clear any visible approval prompt without approving anything.
     ///
     /// Used when a session switch fail-closes outstanding approval routes before
@@ -715,6 +733,8 @@ impl Action {
             Self::ToolProgress { .. } => "ToolProgress",
             Self::ToolApprovalRequested { .. } => "ToolApprovalRequested",
             Self::ToolApprovalReceived { .. } => "ToolApprovalReceived",
+            Self::ToolApprovalUnanswered { .. } => "ToolApprovalUnanswered",
+            Self::ToolApprovalDenied { .. } => "ToolApprovalDenied",
             Self::ToolApprovalCleared => "ToolApprovalCleared",
             Self::StreamRetryAttempt { .. } => "StreamRetryAttempt",
             Self::SessionLoaded { .. } => "SessionLoaded",

@@ -677,6 +677,58 @@ async fn request_approval_in_tui_opens_surface_without_auto_send() {
     assert_eq!(state.focus, crate::chat::sessions::FocusTarget::Approval);
 }
 
+/// A TUI with a renderer but no approval surface fails the request closed as
+/// `NoApprovalSurface`, not as a user rejection: the effect posts
+/// `ToolApprovalUnanswered`, and the dispatcher relay hands the typed cause to
+/// the waiting tool call.
+#[cfg(feature = "terminal-tui")]
+#[tokio::test]
+async fn tui_request_approval_without_surface_resolves_no_surface() {
+    let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+    let shutdown = CancellationToken::new();
+    let (deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+    assert!(deps.redraw_tx.is_some(), "the fixture has a renderer");
+    let router = Arc::clone(&deps.approval_router);
+    let (tx, rx) = tokio::sync::oneshot::channel::<ToolApprovalAnswer>();
+    assert!(router.register_tool("call-no-surface".to_string(), "shell".to_string(), tx));
+    let executor = EffectExecutor::new_with_deps(deps);
+
+    executor
+        .execute(Effect::RequestApproval {
+            task_id: None,
+            tool_id: "call-no-surface".to_string(),
+            name: "shell".to_string(),
+            args: r#"{"command":"echo no-surface"}"#.to_string(),
+        })
+        .await;
+
+    let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
+        .await
+        .expect("test: fail-closed action within 2s")
+        .expect("test: action channel open");
+    assert!(
+        matches!(
+            &action,
+            Action::ToolApprovalUnanswered { tool_id, cause: crate::tools::ApprovalDenialCause::NoApprovalSurface }
+                if tool_id == "call-no-surface"
+        ),
+        "no surface fails closed without an operator answer: {action:?}"
+    );
+    let mut state = ChatState::new(Arc::from("p"), Arc::from("m"), CancellationToken::new());
+    let mut stats = DispatcherStats::default();
+    let reduced = reduce_and_execute(&mut state, &executor, action, &mut stats).await;
+    finish_reduced_action(reduced, Some(&router), None);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("test: tool answer within 2s")
+            .expect("test: router answered the tool call"),
+        ToolApprovalAnswer::Denied(crate::tools::ApprovalDenialCause::NoApprovalSurface),
+        "the waiting tool call receives the typed no-surface cause"
+    );
+    assert!(!router.is_pending("call-no-surface"), "the approval is resolved");
+}
+
 #[cfg(feature = "terminal-tui")]
 #[test]
 fn request_approval_in_tui_ignores_openprx_override_parent() {

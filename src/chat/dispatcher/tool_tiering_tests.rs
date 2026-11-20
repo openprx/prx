@@ -465,117 +465,264 @@ async fn plain_direct_answer_without_a_child_manifest_hides_sessions_spawn() {
     );
 }
 
+/// Bound on one whole supervised probe turn, driver completion included.
+const APPROVAL_FIXTURE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+/// Bound on the actions one supervised probe turn may send.
+const APPROVAL_FIXTURE_MAX_ACTIONS: usize = 64;
+/// Most approval rows read back; one more fails the test.
+const MAX_APPROVAL_ROWS: i64 = 16;
+/// Most bytes kept from one stored approval row; one more fails the test.
+const MAX_APPROVAL_ROW_BYTES: i64 = 4096;
+
+/// What one supervised probe turn showed: its probe actions in order, the
+/// probe's executions and the provider's tool offers.
+struct ApprovalProbeRun {
+    actions: Vec<Action>,
+    executions: usize,
+    offers: Vec<Vec<String>>,
+}
+
+/// Drive one Supervised chat turn whose model calls [`APPROVAL_TOOL`]. With
+/// `occupy_router` a plain approval is already pending before the turn
+/// starts; otherwise the probe's own approval request is denied by the
+/// operator. Everything, driver completion included, runs within
+/// [`APPROVAL_FIXTURE_DEADLINE`].
+async fn run_supervised_approval_probe(workspace: &std::path::Path, occupy_router: bool) -> ApprovalProbeRun {
+    tokio::time::timeout(APPROVAL_FIXTURE_DEADLINE, async {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let registry = crate::agent::test_admission::registry_with_search(vec![Box::new(ApprovalProbeTool {
+            executions: Arc::clone(&executions),
+        }) as Box<dyn Tool>]);
+        let provider = Arc::new(CatalogRecordingProvider::new(None, Some(APPROVAL_TOOL)));
+        let (action_tx, mut action_rx) = mpsc::channel::<Action>(128);
+        let cancellation = CancellationToken::new();
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.to_owned();
+        config.autonomy.level = crate::security::AutonomyLevel::Supervised;
+        config.tool_tiering.always_include.push(APPROVAL_TOOL.to_owned());
+        let admitted = super::turn_characterization_tests::admit_chat_fixture_with_config(
+            provider.clone(),
+            Some(registry),
+            config,
+            ("ollama", "tiering-model", None),
+            ("plain-approval", "hello"),
+            action_tx.clone(),
+            cancellation.clone(),
+        )
+        .await;
+        let approval_router = Arc::clone(&admitted.approval_router);
+        let (occupying_tx, _occupying_rx) = tokio::sync::oneshot::channel::<bool>();
+        if occupy_router {
+            assert!(
+                approval_router.register("rewind-pending".to_owned(), occupying_tx),
+                "the occupying plain approval registers first"
+            );
+        }
+        let history = vec![ChatMessage::system("tiering system"), ChatMessage::user("hello")];
+        let driver = tokio::spawn(drive_start_turn_stream(
+            Some(admitted.binding),
+            None,
+            provider.clone(),
+            history.clone(),
+            crate::agent::turn_history::CanonicalHistory::from_test_messages(history),
+            "tiering-model".to_owned(),
+            0.0,
+            None,
+            cancellation,
+            "plain-approval".to_owned(),
+            action_tx.clone(),
+            Some(admitted.registry),
+            Some(admitted.service),
+            admitted.context,
+            admitted.fabric,
+            None,
+            crate::agent::context_budget::ToolSurfaceReserve::default(),
+            crate::agent::turn_contracts::ChatMode::Edit,
+            Arc::new(crate::observability::noop::NoopObserver),
+            Arc::new(crate::hooks::HookManager::new(std::path::PathBuf::new())),
+        ));
+
+        let mut actions = Vec::new();
+        let mut completed = false;
+        for _ in 0..APPROVAL_FIXTURE_MAX_ACTIONS {
+            let action = action_rx
+                .recv()
+                .await
+                .expect("test: approval action channel remains open");
+            match &action {
+                Action::ToolApprovalRequested { name, tool_id, .. } if name == APPROVAL_TOOL => {
+                    assert_eq!(
+                        executions.load(AtomicOrdering::SeqCst),
+                        0,
+                        "pending approval must not run the backend"
+                    );
+                    assert!(
+                        approval_router.resolve(tool_id, false),
+                        "deny the actual pending request"
+                    );
+                    actions.push(action);
+                }
+                Action::ToolApprovalDenied { name, .. }
+                | Action::ToolStarted { name, .. }
+                | Action::ToolFinished { name, .. }
+                    if name == APPROVAL_TOOL =>
+                {
+                    actions.push(action);
+                }
+                Action::StreamCompleted { .. } => {
+                    completed = true;
+                    break;
+                }
+                Action::StreamFailed { err, .. } => panic!("plain approval turn failed: {err}"),
+                _ => {}
+            }
+        }
+        assert!(completed, "the supervised probe turn completes");
+        driver.await.expect("test: plain approval driver task");
+        drop(action_tx);
+        let offers = provider.offered.lock().clone();
+        ApprovalProbeRun {
+            actions,
+            executions: executions.load(AtomicOrdering::SeqCst),
+            offers,
+        }
+    })
+    .await
+    .expect("test: supervised approval probe within APPROVAL_FIXTURE_DEADLINE")
+}
+
+/// Content of every `tool.approval.resolved` row in the chat ledger at
+/// `workspace`, in insert order, bounded in rows and bytes before collection.
+fn approval_rows(workspace: &std::path::Path) -> Vec<String> {
+    let database = rusqlite::Connection::open_with_flags(
+        workspace.join("memory/brain.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("test: open the chat ledger");
+    let mut statement = database
+        .prepare(
+            "SELECT substr(CAST(content AS BLOB), 1, ?1) FROM message_events
+             WHERE event_type = 'tool.approval.resolved' ORDER BY id LIMIT ?2",
+        )
+        .expect("test: approval row query");
+    let rows = statement
+        .query_map(
+            rusqlite::params![MAX_APPROVAL_ROW_BYTES + 1, MAX_APPROVAL_ROWS + 1],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .expect("test: approval rows")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("test: readable approval rows");
+    assert!(
+        i64::try_from(rows.len()).unwrap_or(i64::MAX) <= MAX_APPROVAL_ROWS,
+        "more than {MAX_APPROVAL_ROWS} approval rows"
+    );
+    rows.into_iter()
+        .map(|content| {
+            assert!(
+                i64::try_from(content.len()).unwrap_or(i64::MAX) <= MAX_APPROVAL_ROW_BYTES,
+                "an approval row exceeds {MAX_APPROVAL_ROW_BYTES} bytes"
+            );
+            String::from_utf8(content).expect("test: UTF-8 approval row")
+        })
+        .collect()
+}
+
+/// The probe's `ToolFinished` result text; asserts the call failed.
+fn probe_failure_result(run: &ApprovalProbeRun) -> &str {
+    run.actions
+        .iter()
+        .find_map(|action| match action {
+            Action::ToolFinished { success, result, .. } => {
+                assert!(!success, "an unapproved probe must be rejected");
+                Some(result.as_deref().expect("test: approval result text"))
+            }
+            _ => None,
+        })
+        .expect("test: the probe call finished")
+}
+
 #[tokio::test]
 async fn plain_direct_answer_does_not_execute_a_direct_tool_without_approval() {
-    let workspace = tempfile::tempdir().unwrap();
-    let executions = Arc::new(AtomicUsize::new(0));
-    let registry = crate::agent::test_admission::registry_with_search(vec![Box::new(ApprovalProbeTool {
-        executions: Arc::clone(&executions),
-    }) as Box<dyn Tool>]);
-    let provider = Arc::new(CatalogRecordingProvider::new(None, Some(APPROVAL_TOOL)));
-    let (action_tx, mut action_rx) = mpsc::channel::<Action>(128);
-    let cancellation = CancellationToken::new();
-    let mut config = crate::config::Config::default();
-    config.workspace_dir = workspace.path().to_owned();
-    config.autonomy.level = crate::security::AutonomyLevel::Supervised;
-    config.tool_tiering.always_include.push(APPROVAL_TOOL.to_owned());
-    let admitted = super::turn_characterization_tests::admit_chat_fixture_with_config(
-        provider.clone(),
-        Some(registry),
-        config,
-        ("ollama", "tiering-model", None),
-        ("plain-approval", "hello"),
-        action_tx.clone(),
-        cancellation.clone(),
-    )
-    .await;
-    let approval_router = Arc::clone(&admitted.approval_router);
-    let history = vec![ChatMessage::system("tiering system"), ChatMessage::user("hello")];
-    let driver = tokio::spawn(drive_start_turn_stream(
-        Some(admitted.binding),
-        None,
-        provider.clone(),
-        history.clone(),
-        crate::agent::turn_history::CanonicalHistory::from_test_messages(history),
-        "tiering-model".to_owned(),
-        0.0,
-        None,
-        cancellation,
-        "plain-approval".to_owned(),
-        action_tx.clone(),
-        Some(admitted.registry),
-        Some(admitted.service),
-        admitted.context,
-        admitted.fabric,
-        None,
-        crate::agent::context_budget::ToolSurfaceReserve::default(),
-        crate::agent::turn_contracts::ChatMode::Edit,
-        Arc::new(crate::observability::noop::NoopObserver),
-        Arc::new(crate::hooks::HookManager::new(std::path::PathBuf::new())),
-    ));
-
-    let mut saw_approval_requested = false;
-    let mut saw_approval_required = false;
-    let mut saw_finished = false;
-    let mut saw_completed = false;
-    for _ in 0..64 {
-        let action = tokio::time::timeout(std::time::Duration::from_secs(3), action_rx.recv())
-            .await
-            .expect("approval action within timeout")
-            .expect("approval action channel remains open");
-        match action {
-            Action::ToolApprovalRequested { name, tool_id, .. } if name == APPROVAL_TOOL => {
-                assert_eq!(
-                    executions.load(AtomicOrdering::SeqCst),
-                    0,
-                    "pending approval must not run the backend"
-                );
-                assert!(
-                    approval_router.resolve(&tool_id, false),
-                    "deny the actual pending request"
-                );
-                saw_approval_requested = true;
-            }
-            Action::ToolStarted { name, .. } if name == APPROVAL_TOOL => {
-                panic!("unapproved tool reached execution preparation")
-            }
-            Action::ToolFinished {
-                name, success, result, ..
-            } if name == APPROVAL_TOOL => {
-                assert!(!success, "unapproved probe must be rejected");
-                let result = result.expect("approval-required result");
-                assert!(
-                    result.contains("User rejected tool approval"),
-                    "unexpected approval result: {result}"
-                );
-                assert_eq!(
-                    executions.load(AtomicOrdering::SeqCst),
-                    0,
-                    "the backend must remain untouched while approval is pending"
-                );
-                saw_approval_required = true;
-                saw_finished = true;
-            }
-            Action::StreamCompleted { .. } => {
-                saw_completed = true;
-                break;
-            }
-            Action::StreamFailed { err, .. } => panic!("plain approval turn failed: {err}"),
-            _ => {}
-        }
-    }
-    driver.await.expect("plain approval driver task");
-    drop(action_tx);
+    let workspace = tempfile::tempdir().expect("test: workspace");
+    let run = run_supervised_approval_probe(workspace.path(), false).await;
     assert!(
-        saw_approval_requested && saw_approval_required && saw_finished && saw_completed,
-        "approval_required={saw_approval_required} finished={saw_finished} completed={saw_completed}"
+        matches!(run.actions.first(), Some(Action::ToolApprovalRequested { .. })),
+        "the probe asks for approval first: {:?}",
+        run.actions
     );
-    assert_eq!(executions.load(AtomicOrdering::SeqCst), 0);
-    let offers = provider.offered.lock();
-    assert!(contains(
-        offers.first().expect("plain approval provider offer"),
-        APPROVAL_TOOL
-    ));
+    assert!(
+        !run.actions
+            .iter()
+            .any(|action| matches!(action, Action::ToolStarted { .. })),
+        "an unapproved tool never reaches execution preparation"
+    );
+    assert!(
+        run.actions.iter().any(|action| matches!(
+            action,
+            Action::ToolApprovalDenied { cause: crate::tools::ApprovalDenialCause::UserRejected, reason, .. }
+                if reason == crate::tools::APPROVAL_DENIED_USER_REJECTED
+        )),
+        "the operator is told the call was refused: {:?}",
+        run.actions
+    );
+    let result = probe_failure_result(&run);
+    assert!(
+        result.contains(
+            "Denied: User rejected tool approval. The config_reload call did not run and produced no output."
+        ),
+        "unexpected approval result: {result}"
+    );
+    assert_eq!(run.executions, 0, "the backend stays untouched");
+    assert!(
+        contains(
+            run.offers.first().expect("plain approval provider offer"),
+            APPROVAL_TOOL
+        ),
+        "the probe was offered"
+    );
+    assert_eq!(
+        approval_rows(workspace.path()),
+        ["operation_id=tiering-direct-call capability=config_reload verdict=denied cause=user_rejected"],
+        "the denial is recorded once"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_approval_is_denied_with_typed_cause_and_row() {
+    let workspace = tempfile::tempdir().expect("test: workspace");
+    let run = run_supervised_approval_probe(workspace.path(), true).await;
+    assert!(
+        !run.actions.iter().any(|action| matches!(
+            action,
+            Action::ToolApprovalRequested { .. } | Action::ToolStarted { .. }
+        )),
+        "a concurrent request shows no second card and never prepares: {:?}",
+        run.actions
+    );
+    assert!(
+        run.actions.iter().any(|action| matches!(
+            action,
+            Action::ToolApprovalDenied { cause: crate::tools::ApprovalDenialCause::ConcurrentPending, name, .. }
+                if name == APPROVAL_TOOL
+        )),
+        "the operator is told which call was refused and why: {:?}",
+        run.actions
+    );
+    let result = probe_failure_result(&run);
+    assert!(
+        result.contains(
+            "Denied: Another tool approval was already waiting, so this call was refused; retry it after that \
+             approval is answered. The config_reload call did not run and produced no output."
+        ),
+        "the model reads the typed refusal and the retry hint: {result}"
+    );
+    assert_eq!(run.executions, 0, "a refused call never runs");
+    assert_eq!(
+        approval_rows(workspace.path()),
+        ["operation_id=tiering-direct-call capability=config_reload verdict=denied cause=concurrent_pending"],
+        "the concurrent refusal is recorded once"
+    );
 }
 
 #[tokio::test]

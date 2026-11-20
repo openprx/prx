@@ -428,27 +428,103 @@ pub struct StoredEvent {
     pub content: String,
 }
 
+/// Most message events [`message_events`] reads; one more fails the test.
+pub const MAX_EVENT_ROWS: usize = 4096;
+/// Most bytes kept from one stored event field; one more fails the test.
+pub const MAX_EVENT_FIELD_BYTES: usize = 1024 * 1024;
+/// Most bytes [`message_events`] retains in total; more fails the test.
+pub const MAX_EVENT_TOTAL_BYTES: usize = 32 * 1024 * 1024;
+
 /// Every message event in the workspace's real SQLite store, in insert order.
+/// The read is bounded before collection: at most [`MAX_EVENT_ROWS`] rows, each
+/// field cut at [`MAX_EVENT_FIELD_BYTES`] + 1 bytes in the query, and
+/// [`MAX_EVENT_TOTAL_BYTES`] retained; any overflow fails the test.
 pub fn message_events(workspace: &std::path::Path) -> Vec<StoredEvent> {
     let database = rusqlite::Connection::open_with_flags(
         workspace.join("memory/brain.db"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .expect("test: open real store");
+    let field_cap = i64::try_from(MAX_EVENT_FIELD_BYTES + 1).expect("test: field cap fits i64");
+    let row_cap = i64::try_from(MAX_EVENT_ROWS + 1).expect("test: row cap fits i64");
     let mut statement = database
-        .prepare("SELECT event_type, role, content FROM message_events ORDER BY id")
+        .prepare(
+            "SELECT substr(CAST(event_type AS BLOB), 1, ?1), substr(CAST(role AS BLOB), 1, ?1),
+                    substr(CAST(content AS BLOB), 1, ?1)
+             FROM message_events ORDER BY id LIMIT ?2",
+        )
         .expect("test: event query");
-    statement
-        .query_map([], |row| {
-            Ok(StoredEvent {
-                event_type: row.get(0)?,
-                role: row.get(1)?,
-                content: row.get(2)?,
-            })
-        })
-        .expect("test: events")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("test: event rows")
+    let mut rows = statement
+        .query(rusqlite::params![field_cap, row_cap])
+        .expect("test: events");
+    let mut events = Vec::new();
+    let mut retained = 0_usize;
+    while let Some(row) = rows.next().expect("test: event row") {
+        assert!(
+            events.len() < MAX_EVENT_ROWS,
+            "more than {MAX_EVENT_ROWS} message events"
+        );
+        let mut field = |index: usize| -> String {
+            let bytes: Vec<u8> = row.get(index).expect("test: event field");
+            assert!(
+                bytes.len() <= MAX_EVENT_FIELD_BYTES,
+                "a message event field exceeds {MAX_EVENT_FIELD_BYTES} bytes"
+            );
+            retained += bytes.len();
+            assert!(
+                retained <= MAX_EVENT_TOTAL_BYTES,
+                "message events exceed {MAX_EVENT_TOTAL_BYTES} bytes"
+            );
+            String::from_utf8(bytes).expect("test: UTF-8 event field")
+        };
+        let event_type = field(0);
+        let role = field(1);
+        let content = field(2);
+        events.push(StoredEvent {
+            event_type,
+            role,
+            content,
+        });
+    }
+    events
+}
+
+/// Content of every `tool.approval.resolved` row, in insert order, e.g.
+/// `operation_id=<id> capability=<tool> verdict=denied cause=user_rejected`.
+pub fn approval_rows(workspace: &std::path::Path) -> Vec<String> {
+    message_events(workspace)
+        .into_iter()
+        .filter(|event| event.event_type == "tool.approval.resolved")
+        .map(|event| event.content)
+        .collect()
+}
+
+/// Content of every `tool.execution.reserved` row, in insert order, e.g.
+/// `operation_id=<id> capability=<tool> attempt=0`.
+pub fn reserved_rows(workspace: &std::path::Path) -> Vec<String> {
+    message_events(workspace)
+        .into_iter()
+        .filter(|event| event.event_type == "tool.execution.reserved")
+        .map(|event| event.content)
+        .collect()
+}
+
+/// Index of the first event of `event_type` whose content starts with
+/// `prefix`, in insert order.
+pub fn event_position(workspace: &std::path::Path, event_type: &str, prefix: &str) -> Option<usize> {
+    message_events(workspace)
+        .iter()
+        .position(|event| event.event_type == event_type && event.content.starts_with(prefix))
+}
+
+/// The content of the `role:"tool"` message answering `tool_call_id` in one
+/// recorded provider request, if it holds one.
+pub fn tool_result_text(request: &serde_json::Value, tool_call_id: &str) -> Option<String> {
+    request["messages"].as_array()?.iter().find_map(|message| {
+        (message["role"] == "tool" && message["tool_call_id"] == tool_call_id)
+            .then(|| message["content"].as_str().map(str::to_owned))
+            .flatten()
+    })
 }
 
 /// Contents of the persisted assistant messages, oldest first.

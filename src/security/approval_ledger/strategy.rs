@@ -55,6 +55,7 @@ impl ApprovalStrategy for LedgerApprovalStrategy<'_> {
                 reason: format!("awaiting approval: {id}"),
             },
             Err(error) => ToolApprovalDecision::Denied {
+                cause: crate::tools::ApprovalDenialCause::LedgerRefused,
                 reason: error.to_string(),
             },
         }
@@ -89,6 +90,7 @@ impl ExecutionApprovalLedger {
             Ok(keyring) => keyring,
             Err(error) => {
                 return ToolApprovalDecision::Denied {
+                    cause: crate::tools::ApprovalDenialCause::LedgerRefused,
                     reason: error.to_string(),
                 };
             }

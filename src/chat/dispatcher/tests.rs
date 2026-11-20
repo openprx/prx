@@ -868,7 +868,11 @@ fn approval_router_always_allows_the_tool_for_the_session() {
     assert!(router.register_tool("call-1".to_owned(), "file_edit".to_owned(), tx));
     assert!(router.is_pending("call-1"));
     assert!(router.resolve_decision("call-1", true, true));
-    assert_eq!(rx.try_recv(), Ok(true));
+    assert_eq!(
+        rx.try_recv(),
+        Ok(ToolApprovalAnswer::Approved { always: true }),
+        "an always approval reaches the tool call typed"
+    );
     assert!(!router.is_pending("call-1"));
     assert!(router.is_session_allowed("file_edit"));
     assert!(!router.is_session_allowed("shell"));
@@ -880,10 +884,27 @@ fn approval_router_always_allows_the_tool_for_the_session() {
 #[test]
 fn approval_router_once_deny_and_unnamed_approvals_allow_nothing_further() {
     let router = ApprovalRouter::new();
-    for (approved, always) in [(true, false), (false, true), (false, false)] {
-        let (tx, _rx) = tokio::sync::oneshot::channel();
+    for (approved, always, expected) in [
+        (true, false, ToolApprovalAnswer::Approved { always: false }),
+        (
+            false,
+            true,
+            ToolApprovalAnswer::Denied(crate::tools::ApprovalDenialCause::UserRejected),
+        ),
+        (
+            false,
+            false,
+            ToolApprovalAnswer::Denied(crate::tools::ApprovalDenialCause::UserRejected),
+        ),
+    ] {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
         assert!(router.register_tool("call".to_owned(), "shell".to_owned(), tx));
         assert!(router.resolve_decision("call", approved, always));
+        assert_eq!(
+            rx.try_recv(),
+            Ok(expected),
+            "approved={approved} always={always} reaches the tool call typed"
+        );
         assert!(
             !router.is_session_allowed("shell"),
             "approved={approved} always={always}"

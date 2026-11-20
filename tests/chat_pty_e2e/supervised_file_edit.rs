@@ -1,12 +1,18 @@
-//! Supervised `file_edit` in the fullscreen chat over a loopback provider
-//! (real HTTP/SSE): `y` edits once, `n` leaves the file, `a` covers the
-//! second edit of the session without another approval card (CF-R3).
+//! Supervised `file_edit` and `shell` in the fullscreen chat over a loopback
+//! provider (real HTTP/SSE): `y` runs the call once, `n` leaves it unrun with
+//! a `Denied` notice, `a` covers the second edit of the session without
+//! another approval card (CF-R3). Every resolution leaves one durable
+//! `tool.approval.resolved` row, and a denial tells the model that the call
+//! did not run.
 
 use super::{
     HarnessGuard, PHASE_CAP, SessionGuard, build_provider_chat_command_in, new_harness_guard,
-    prepare_owned_chat_fixture, read_until_with_dsr, spawn_chat_command, wait_for_graceful_exit,
+    prepare_owned_chat_fixture, read_until_all_with_dsr, read_until_with_dsr, spawn_chat_command,
+    wait_for_graceful_exit,
 };
-use crate::loopback_openai::{LoopbackOpenAi, Script, Scripted};
+use crate::loopback_openai::{
+    LoopbackOpenAi, Script, Scripted, approval_rows, event_position, reserved_rows, tool_result_text,
+};
 
 const MODEL: &str = "prx-loop-model";
 const ORIGINAL: &str = "alpha\nbeta\ngamma\ndelta\n";
@@ -46,34 +52,55 @@ fn notes(guard: &HarnessGuard) -> String {
     std::fs::read_to_string(workspace(guard).join("notes.txt")).expect("test: read notes.txt")
 }
 
-/// One edit turn answered with `key` at the approval card, then `/exit`.
-fn one_edit(key: &str, reply: &str) -> HarnessGuard {
+/// A word of the denial notice line (`Denied <tool>: <reason> — ...`).
+const NOTICE: &str = "Denied";
+
+/// One tool turn: the model calls `call`, the card is answered with `key`, and
+/// the screen must show every one of `after_key` (the reply last) before
+/// `/exit`. Returns the guard and the recorded provider requests.
+fn one_call(prompt: &str, call: Scripted, key: &str, after_key: &[&str]) -> (HarnessGuard, Vec<serde_json::Value>) {
     let guard = new_harness_guard().expect("isolated chat paths");
-    let reply_text = reply.to_owned();
+    let mut call = Some(call);
+    let reply_text = after_key.last().copied().unwrap_or_default().to_owned();
     let (server, mut session) = start(
         &guard,
-        Box::new(move |index, _| match index {
-            0 => edit_call("call-edit", "beta", "BETA"),
+        Box::new(move |index, _| match (index, call.take()) {
+            (0, Some(call)) => call,
             _ => Scripted::text(&reply_text),
         }),
     );
     let tty = session.session();
     read_until_with_dsr(tty, MODEL, PHASE_CAP);
-    tty.send("change beta to BETA in notes.txt\r").expect("send turn");
+    tty.send(&format!("{prompt}\r")).expect("send turn");
     read_until_with_dsr(tty, CARD, PHASE_CAP);
     tty.send(key).expect("answer the approval card");
-    read_until_with_dsr(tty, reply, PHASE_CAP);
+    read_until_all_with_dsr(tty, after_key, PHASE_CAP);
     tty.send("/exit\r").expect("send /exit");
     wait_for_graceful_exit(tty);
     drop(session);
-    assert_eq!(server.requests().len(), 2, "the tool call and the reply");
-    guard
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2, "the tool call and the reply");
+    (guard, requests)
+}
+
+/// One edit turn answered with `key` at the approval card, then `/exit`.
+fn one_edit(key: &str, after_key: &[&str]) -> (HarnessGuard, Vec<serde_json::Value>) {
+    one_call(
+        "change beta to BETA in notes.txt",
+        edit_call("call-edit", "beta", "BETA"),
+        key,
+        after_key,
+    )
+}
+
+fn shell_call() -> Scripted {
+    Scripted::tool("call-shell", "shell", &serde_json::json!({"command": "echo tui-shell"}))
 }
 
 #[test]
 #[serial_test::serial(prx_chat_pty)]
 fn supervised_file_edit_approve_edits_once() {
-    let guard = one_edit("y", "EDIT-DONE");
+    let (guard, _) = one_edit("y", &["EDIT-DONE"]);
     assert_eq!(
         notes(&guard),
         "alpha\nBETA\ngamma\ndelta\n",
@@ -84,8 +111,70 @@ fn supervised_file_edit_approve_edits_once() {
 #[test]
 #[serial_test::serial(prx_chat_pty)]
 fn supervised_file_edit_deny_leaves_file() {
-    let guard = one_edit("n", "EDIT-DENIED");
+    let (guard, requests) = one_edit("n", &[NOTICE, "EDIT-DENIED"]);
     assert_eq!(notes(&guard), ORIGINAL, "a denied edit leaves the file unchanged");
+    assert_eq!(
+        approval_rows(&workspace(&guard)),
+        ["operation_id=call-edit capability=file_edit verdict=denied cause=user_rejected"],
+        "the denial is recorded once"
+    );
+    assert_eq!(
+        tool_result_text(&requests[1], "call-edit").as_deref(),
+        Some("Denied: User rejected tool approval. The file_edit call did not run and produced no output."),
+        "the model reads that the edit did not run"
+    );
+}
+
+#[test]
+#[serial_test::serial(prx_chat_pty)]
+fn supervised_shell_deny_shows_card_notice_and_records_denial() {
+    let (guard, requests) = one_call("run echo tui-shell", shell_call(), "n", &[NOTICE, "SHELL-DENIED"]);
+    assert_eq!(
+        approval_rows(&workspace(&guard)),
+        ["operation_id=call-shell capability=shell verdict=denied cause=user_rejected"],
+        "the denial is recorded once"
+    );
+    assert!(
+        !reserved_rows(&workspace(&guard))
+            .iter()
+            .any(|row| row.starts_with("operation_id=call-shell ")),
+        "a denied call is never reserved"
+    );
+    assert_eq!(
+        tool_result_text(&requests[1], "call-shell").as_deref(),
+        Some("Denied: User rejected tool approval. The shell call did not run and produced no output."),
+        "the model reads that the shell call did not run"
+    );
+}
+
+#[test]
+#[serial_test::serial(prx_chat_pty)]
+fn supervised_shell_approve_runs_once_with_approval_row() {
+    let (guard, requests) = one_call("run echo tui-shell", shell_call(), "y", &["SHELL-DONE"]);
+    let workspace = workspace(&guard);
+    assert_eq!(
+        approval_rows(&workspace),
+        ["operation_id=call-shell capability=shell verdict=approved"],
+        "the approval is recorded once"
+    );
+    let approved =
+        event_position(&workspace, "tool.approval.resolved", "operation_id=call-shell ").expect("test: approval row");
+    let reserved = event_position(&workspace, "tool.execution.reserved", "operation_id=call-shell ")
+        .expect("test: reservation row");
+    assert!(approved < reserved, "the approval is recorded before the reservation");
+    assert!(
+        event_position(
+            &workspace,
+            "tool.execution.finalized",
+            "operation_id=call-shell status=Succeeded"
+        )
+        .is_some(),
+        "the approved shell call ran once and succeeded"
+    );
+    assert!(
+        tool_result_text(&requests[1], "call-shell").is_some_and(|text| text.contains("tui-shell")),
+        "the model reads the real shell output"
+    );
 }
 
 #[test]

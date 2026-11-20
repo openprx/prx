@@ -72,6 +72,7 @@ async fn failed_cached_call_is_not_another_physical_failure_and_fresh_ids_still_
         }),
         Arc::new(FixedApproval {
             decision: ToolApprovalDecision::Denied {
+                cause: ApprovalDenialCause::UserRejected,
                 reason: "unexpected approval request".into(),
             },
             stages: Arc::clone(&fixture.stages),
@@ -188,6 +189,7 @@ async fn actual_unsent_abandonment_continues_but_dropped_reservation_stays_unkno
                 Vec::new(),
                 ToolExecutionDecision::Allow,
                 ToolApprovalDecision::Denied {
+                    cause: ApprovalDenialCause::UserRejected,
                     reason: "unexpected approval".into(),
                 },
                 true,

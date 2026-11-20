@@ -6,6 +6,7 @@
 //! resolving and invoking adapters directly.
 
 pub(crate) mod admission;
+mod approval_record;
 mod approval_route;
 
 use super::schema::ToolSchemaDialect;
@@ -1232,12 +1233,126 @@ pub enum ToolApprovalDecision {
         runtime_approval_granted: bool,
         runtime_grant: Option<serde_json::Value>,
     },
+    /// The call did not run. `cause` is the typed reason; `reason` is the
+    /// display text the operator and the model read.
     Denied {
+        cause: ApprovalDenialCause,
         reason: String,
     },
     Cancelled {
         reason: String,
     },
+}
+
+/// Why an approval-gated call was denied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalDenialCause {
+    /// The operator answered no (`n`, `Esc`, `Enter` on deny, or any other
+    /// plain answer).
+    UserRejected,
+    /// Plain mode: EOF, or the prompt stopped waiting.
+    NoAnswer,
+    /// The TUI had no approval surface, or the action channel closed.
+    NoApprovalSurface,
+    /// Plain or one-shot mode without a terminal and no allowing override.
+    NoTerminal,
+    /// Plain mode: the terminal was busy or its reader failed to start.
+    PromptUnavailable,
+    /// Another approval was already pending.
+    ConcurrentPending,
+    /// A session switch failed the approval closed.
+    SessionSwitched,
+    /// No resolver, or approval is not available for this agent.
+    NoResolver,
+    /// The channel approval gate denied the call.
+    ChannelDenied,
+    /// The approval ledger failed; its own error text is the reason.
+    LedgerRefused,
+}
+
+/// Display text of a user rejection.
+pub const APPROVAL_DENIED_USER_REJECTED: &str = "User rejected tool approval";
+/// Display text when no approval answer was given.
+pub const APPROVAL_DENIED_NO_ANSWER: &str = "No approval answer was given";
+/// Display text when no approval prompt could be shown.
+pub const APPROVAL_DENIED_NO_APPROVAL_SURFACE: &str = "No approval prompt could be shown, so the call was refused";
+/// Display text when no terminal could ask for approval.
+pub const APPROVAL_DENIED_NO_TERMINAL: &str = "No terminal was available to ask for approval";
+/// Display text when the approval prompt was unavailable.
+pub const APPROVAL_DENIED_PROMPT_UNAVAILABLE: &str = "The approval prompt was unavailable";
+/// Display text when another approval was already waiting.
+pub const APPROVAL_DENIED_CONCURRENT_PENDING: &str =
+    "Another tool approval was already waiting, so this call was refused; retry it after that approval is answered";
+/// Display text when the chat session was switched before approval.
+pub const APPROVAL_DENIED_SESSION_SWITCHED: &str = "The chat session was switched before approval";
+/// Display text when no approval resolver is available.
+pub const APPROVAL_DENIED_NO_RESOLVER: &str = "approval required but no approval resolver is available";
+/// Display text of a channel approval gate denial.
+pub const APPROVAL_DENIED_CHANNEL: &str = "approval denied";
+
+impl ApprovalDenialCause {
+    /// The stable snake_case name recorded in the approval row.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UserRejected => "user_rejected",
+            Self::NoAnswer => "no_answer",
+            Self::NoApprovalSurface => "no_approval_surface",
+            Self::NoTerminal => "no_terminal",
+            Self::PromptUnavailable => "prompt_unavailable",
+            Self::ConcurrentPending => "concurrent_pending",
+            Self::SessionSwitched => "session_switched",
+            Self::NoResolver => "no_resolver",
+            Self::ChannelDenied => "channel_denied",
+            Self::LedgerRefused => "ledger_refused",
+        }
+    }
+
+    /// The fixed display text of this cause. `LedgerRefused` has none: its
+    /// text is the ledger's own error, carried in `Denied.reason`.
+    #[must_use]
+    pub const fn fixed_reason(self) -> Option<&'static str> {
+        match self {
+            Self::UserRejected => Some(APPROVAL_DENIED_USER_REJECTED),
+            Self::NoAnswer => Some(APPROVAL_DENIED_NO_ANSWER),
+            Self::NoApprovalSurface => Some(APPROVAL_DENIED_NO_APPROVAL_SURFACE),
+            Self::NoTerminal => Some(APPROVAL_DENIED_NO_TERMINAL),
+            Self::PromptUnavailable => Some(APPROVAL_DENIED_PROMPT_UNAVAILABLE),
+            Self::ConcurrentPending => Some(APPROVAL_DENIED_CONCURRENT_PENDING),
+            Self::SessionSwitched => Some(APPROVAL_DENIED_SESSION_SWITCHED),
+            Self::NoResolver => Some(APPROVAL_DENIED_NO_RESOLVER),
+            Self::ChannelDenied => Some(APPROVAL_DENIED_CHANNEL),
+            Self::LedgerRefused => None,
+        }
+    }
+}
+
+/// How one approval request was resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalVerdict {
+    Approved,
+    Denied,
+    Cancelled,
+}
+
+impl ApprovalVerdict {
+    /// The stable snake_case name recorded in the approval row.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Approved => "approved",
+            Self::Denied => "denied",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// The model-visible result of a call that was denied before it ran.
+#[must_use]
+pub fn approval_denied_model_content(reason: &str, tool: &str) -> String {
+    format!("Denied: {reason}. The {tool} call did not run and produced no output.")
 }
 
 #[async_trait]
@@ -1253,7 +1368,8 @@ pub struct DenyApprovalStrategy;
 impl ApprovalStrategy for DenyApprovalStrategy {
     async fn resolve(&self, _request: ToolApprovalRequest) -> ToolApprovalDecision {
         ToolApprovalDecision::Denied {
-            reason: "approval required but no approval resolver is available".to_string(),
+            cause: ApprovalDenialCause::NoResolver,
+            reason: APPROVAL_DENIED_NO_RESOLVER.to_string(),
         }
     }
 }
@@ -1372,12 +1488,18 @@ fn tool_execution_lock(
     lock
 }
 
-fn tool_execution_ledger_keys(context: &ToolExecutionContext, idempotency_key: &str) -> (String, String) {
+/// Digest of one tool call's session, semantic turn and idempotency key: the
+/// scope shared by its execution-ledger and approval-event keys.
+fn tool_execution_scope_digest(context: &ToolExecutionContext, idempotency_key: &str) -> String {
     let scope = format!(
         "{}\0{}\0{}",
         context.envelope.session_key, context.semantic_turn_id, idempotency_key
     );
-    let digest = format!("{:x}", Sha256::digest(scope.as_bytes()));
+    format!("{:x}", Sha256::digest(scope.as_bytes()))
+}
+
+fn tool_execution_ledger_keys(context: &ToolExecutionContext, idempotency_key: &str) -> (String, String) {
+    let digest = tool_execution_scope_digest(context, idempotency_key);
     (
         format!("tool-execution:{digest}:reservation"),
         format!("tool-execution:{digest}:terminal"),
@@ -2861,6 +2983,16 @@ impl ToolExecutionService {
         }
         if decision == ToolExecutionDecision::Ask && context.pending_approval_denied {
             let reason = "approval is not available for this agent".to_string();
+            self.record_approval_resolution(
+                &command,
+                &context,
+                &input_sha256,
+                ApprovalVerdict::Denied,
+                Some(ApprovalDenialCause::NoResolver),
+                Some(&reason),
+            )
+            .await;
+            let model_content = approval_denied_model_content(&reason, &descriptor.public_name);
             return self.finish(
                 &command,
                 &context,
@@ -2868,7 +3000,7 @@ impl ToolExecutionService {
                 Some(descriptor),
                 Some(decision),
                 ToolExecutionStatus::ApprovalDenied,
-                format!("Denied: {reason}"),
+                model_content,
                 None,
                 Some(reason),
                 None,
@@ -2896,7 +3028,17 @@ impl ToolExecutionService {
                         | crate::agent::turn_contracts::ApprovalDecision::GrantForSession
                 )
             ) {
-                let reason = "approval denied".to_string();
+                let reason = APPROVAL_DENIED_CHANNEL.to_string();
+                self.record_approval_resolution(
+                    &command,
+                    &context,
+                    &input_sha256,
+                    ApprovalVerdict::Denied,
+                    Some(ApprovalDenialCause::ChannelDenied),
+                    Some(&reason),
+                )
+                .await;
+                let model_content = approval_denied_model_content(&reason, &descriptor.public_name);
                 return self.finish(
                     &command,
                     &context,
@@ -2904,13 +3046,15 @@ impl ToolExecutionService {
                     Some(descriptor),
                     Some(decision),
                     ToolExecutionStatus::ApprovalDenied,
-                    format!("Denied: {reason}"),
+                    model_content,
                     None,
                     Some(reason),
                     None,
                     started,
                 );
             }
+            self.record_approval_resolution(&command, &context, &input_sha256, ApprovalVerdict::Approved, None, None)
+                .await;
             runtime_approval_granted = true;
         } else if decision == ToolExecutionDecision::Ask {
             let (approval, ledger_route) = self
@@ -2925,10 +3069,29 @@ impl ToolExecutionService {
                     runtime_approval_granted: approved,
                     runtime_grant: grant,
                 } => {
+                    self.record_approval_resolution(
+                        &command,
+                        &context,
+                        &input_sha256,
+                        ApprovalVerdict::Approved,
+                        None,
+                        None,
+                    )
+                    .await;
                     runtime_approval_granted = approved;
                     runtime_grant = grant;
                 }
-                ToolApprovalDecision::Denied { reason } => {
+                ToolApprovalDecision::Denied { cause, reason } => {
+                    self.record_approval_resolution(
+                        &command,
+                        &context,
+                        &input_sha256,
+                        ApprovalVerdict::Denied,
+                        Some(cause),
+                        Some(&reason),
+                    )
+                    .await;
+                    let model_content = approval_denied_model_content(&reason, &descriptor.public_name);
                     return self.finish(
                         &command,
                         &context,
@@ -2936,7 +3099,7 @@ impl ToolExecutionService {
                         Some(descriptor),
                         Some(decision),
                         ToolExecutionStatus::ApprovalDenied,
-                        format!("Denied: {reason}"),
+                        model_content,
                         None,
                         Some(reason),
                         None,
@@ -2944,6 +3107,19 @@ impl ToolExecutionService {
                     );
                 }
                 ToolApprovalDecision::Cancelled { reason } => {
+                    // An approval-ledger route that is still awaiting a grant
+                    // stays pending: it writes no resolution row.
+                    if !ledger_route {
+                        self.record_approval_resolution(
+                            &command,
+                            &context,
+                            &input_sha256,
+                            ApprovalVerdict::Cancelled,
+                            None,
+                            Some(&reason),
+                        )
+                        .await;
+                    }
                     return self.finish(
                         &command,
                         &context,

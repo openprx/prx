@@ -66,6 +66,7 @@ async fn approval_denial_is_typed_and_fail_closed() {
         Vec::new(),
         ToolExecutionDecision::Ask,
         ToolApprovalDecision::Denied {
+            cause: ApprovalDenialCause::UserRejected,
             reason: "operator denied".to_string(),
         },
         true,

@@ -111,6 +111,7 @@ mod working_root_tests {
                 }
             } else {
                 crate::tools::ToolApprovalDecision::Denied {
+                    cause: crate::tools::ApprovalDenialCause::UserRejected,
                     reason: "test: operator denied".into(),
                 }
             }

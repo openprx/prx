@@ -13,6 +13,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use crate::tools::ApprovalDenialCause;
+
 /// Upper bound on the bytes kept from one answer line.
 const ANSWER_MAX_BYTES: usize = 256;
 /// How often a waiting prompt checks whether its approval is still pending.
@@ -29,9 +31,10 @@ pub(crate) enum TerminalApproval {
     Once,
     /// `a`: this call and later calls of the same tool.
     Always,
-    /// Anything else, EOF, no terminal without an allowing override, or the
-    /// approval stopped waiting (its turn was cancelled).
-    Deny,
+    /// Refused: `UserRejected` for any other answer; otherwise EOF or a
+    /// stopped wait (`NoAnswer`), no terminal without an allowing override
+    /// (`NoTerminal`), or a busy or failed reader (`PromptUnavailable`).
+    Deny(ApprovalDenialCause),
 }
 
 impl TerminalApproval {
@@ -40,7 +43,7 @@ impl TerminalApproval {
         match self {
             Self::Once => (true, false),
             Self::Always => (true, true),
-            Self::Deny => (false, false),
+            Self::Deny(_) => (false, false),
         }
     }
 
@@ -48,7 +51,7 @@ impl TerminalApproval {
         match line.trim().to_ascii_lowercase().as_str() {
             "y" | "yes" => Self::Once,
             "a" | "always" => Self::Always,
-            _ => Self::Deny,
+            _ => Self::Deny(ApprovalDenialCause::UserRejected),
         }
     }
 }
@@ -135,7 +138,7 @@ impl AnswerLineSource for ControllingTerminal {
 
 /// Ask the operator on the terminal. `still_waiting` reports whether the
 /// approval is still pending; once it is not (the turn was cancelled, for
-/// example by Ctrl-C), the prompt stops reading and returns `Deny`.
+/// example by Ctrl-C), the prompt stops reading and returns `Deny(NoAnswer)`.
 pub(crate) async fn prompt<F>(tool: &str, args: &str, still_waiting: F) -> TerminalApproval
 where
     F: Fn() -> bool + Send + Sync,
@@ -152,11 +155,12 @@ pub(crate) async fn prompt_from(
 ) -> TerminalApproval {
     match source.read_answer(tool, args, still_waiting).await {
         AnswerRead::NoTerminal(error) => override_decision(tool, &error),
-        AnswerRead::Unavailable | AnswerRead::Line(None) => TerminalApproval::Deny,
+        AnswerRead::Unavailable => TerminalApproval::Deny(ApprovalDenialCause::PromptUnavailable),
+        AnswerRead::Line(None) => TerminalApproval::Deny(ApprovalDenialCause::NoAnswer),
         AnswerRead::Line(Some(line)) => TerminalApproval::parse(&line),
         AnswerRead::Abandoned => {
             tracing::info!(tool = %crate::agent::diagnostics::text_class(tool), "terminal approval abandoned: the approval is no longer pending");
-            TerminalApproval::Deny
+            TerminalApproval::Deny(ApprovalDenialCause::NoAnswer)
         }
     }
 }
@@ -198,8 +202,13 @@ fn override_decision(tool: &str, error: &std::io::Error) -> TerminalApproval {
     if approved {
         TerminalApproval::Once
     } else {
-        TerminalApproval::Deny
+        TerminalApproval::Deny(ApprovalDenialCause::NoTerminal)
     }
+}
+
+/// Tell a line-mode operator that a tool call was refused and did not run.
+pub(crate) fn announce_denied(tool: &str, reason: &str) {
+    eprintln!("Denied {tool}: {reason} — the call did not run.");
 }
 
 /// A one-line argument summary with control characters removed.
@@ -288,6 +297,7 @@ fn read_line(mut tty: std::fs::File, stop: &AtomicBool) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::TerminalApproval;
+    use crate::tools::ApprovalDenialCause;
 
     #[test]
     fn answers_parse_to_once_always_or_deny() {
@@ -296,9 +306,9 @@ mod tests {
             (" YES \r", TerminalApproval::Once),
             ("a", TerminalApproval::Always),
             ("always", TerminalApproval::Always),
-            ("n", TerminalApproval::Deny),
-            ("", TerminalApproval::Deny),
-            ("yy", TerminalApproval::Deny),
+            ("n", TerminalApproval::Deny(ApprovalDenialCause::UserRejected)),
+            ("", TerminalApproval::Deny(ApprovalDenialCause::UserRejected)),
+            ("yy", TerminalApproval::Deny(ApprovalDenialCause::UserRejected)),
         ] {
             assert_eq!(TerminalApproval::parse(line), expected, "{line:?}");
         }

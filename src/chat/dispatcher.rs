@@ -32,8 +32,8 @@ use crate::memory::{Memory, MemoryEventRecording, MemoryFabric};
 use crate::observability::Observer;
 use crate::providers::Provider;
 use crate::tools::{
-    ApprovalStrategy, SecurityEffectPolicy, ToolApprovalDecision, ToolApprovalRequest, ToolExecutionCommand,
-    ToolExecutionContext, ToolExecutionPermit, ToolExecutionPreparation, ToolExecutionService,
+    ApprovalDenialCause, ApprovalStrategy, SecurityEffectPolicy, ToolApprovalDecision, ToolApprovalRequest,
+    ToolExecutionCommand, ToolExecutionContext, ToolExecutionPermit, ToolExecutionPreparation, ToolExecutionService,
     TracingToolExecutionAudit,
 };
 
@@ -57,8 +57,9 @@ pub const ACTION_CHANNEL_CAPACITY: usize = 2048;
 /// - parking_lot Mutex: register/resolve are short synchronous operations, the lock is never held across await
 /// - reject / timeout / cancel paths are all cleaned up by the driver itself (drop the oneshot tx)
 ///
-/// Invariant: at most one foreground approval is pending at a time. Later requests fail closed and
-/// resolve to false; they never override the human approval currently displayed/awaited.
+/// Invariant: at most one foreground approval is pending at a time. Later requests fail closed at
+/// once (`false` for a plain entry, `Denied(ConcurrentPending)` for a tool call); they never
+/// override the human approval currently displayed/awaited.
 #[derive(Default)]
 pub struct ApprovalRouter {
     pending: ParkingMutex<std::collections::HashMap<String, PendingApproval>>,
@@ -67,11 +68,50 @@ pub struct ApprovalRouter {
     session_allowlist: ParkingMutex<std::collections::HashSet<String>>,
 }
 
-/// One waiting approval: the driver's oneshot and, for a tool call, the tool
-/// name an "always" decision allows for the session.
-struct PendingApproval {
-    tx: tokio::sync::oneshot::Sender<bool>,
-    tool_name: Option<String>,
+/// A tool-call approval answer carried back to the chat approval strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolApprovalAnswer {
+    /// The operator approved; `always` also allows the tool for the session.
+    Approved { always: bool },
+    /// The call was refused, with its typed cause.
+    Denied(ApprovalDenialCause),
+}
+
+/// One waiting approval: a plain yes/no oneshot (rewind, diff-apply), or a
+/// tool call's typed oneshot with the tool name an "always" decision allows
+/// for the session.
+enum PendingApproval {
+    Plain(tokio::sync::oneshot::Sender<bool>),
+    Tool {
+        tx: tokio::sync::oneshot::Sender<ToolApprovalAnswer>,
+        tool_name: String,
+    },
+}
+
+impl PendingApproval {
+    /// Answer with the operator's decision. `false` when the waiting side
+    /// already went away.
+    fn decide(self, approved: bool, always: bool) -> bool {
+        match self {
+            Self::Plain(tx) => tx.send(approved).is_ok(),
+            Self::Tool { tx, .. } => tx
+                .send(if approved {
+                    ToolApprovalAnswer::Approved { always }
+                } else {
+                    ToolApprovalAnswer::Denied(ApprovalDenialCause::UserRejected)
+                })
+                .is_ok(),
+        }
+    }
+
+    /// Fail closed without an operator answer. `false` when the waiting side
+    /// already went away.
+    fn deny(self, cause: ApprovalDenialCause) -> bool {
+        match self {
+            Self::Plain(tx) => tx.send(false).is_ok(),
+            Self::Tool { tx, .. } => tx.send(ToolApprovalAnswer::Denied(cause)).is_ok(),
+        }
+    }
 }
 
 impl ApprovalRouter {
@@ -86,19 +126,19 @@ impl ApprovalRouter {
     /// If any approval is already pending, the new request immediately fails closed (sends false on the
     /// new tx) and returns false; the caller must not render a second approval prompt.
     pub fn register(&self, tool_id: String, tx: tokio::sync::oneshot::Sender<bool>) -> bool {
-        self.register_entry(tool_id, PendingApproval { tx, tool_name: None })
+        self.register_entry(tool_id, PendingApproval::Plain(tx))
     }
 
     /// Register a pending tool-call approval; an "always" decision for it
-    /// allows `tool_name` for the rest of the session.
-    pub fn register_tool(&self, tool_id: String, tool_name: String, tx: tokio::sync::oneshot::Sender<bool>) -> bool {
-        self.register_entry(
-            tool_id,
-            PendingApproval {
-                tx,
-                tool_name: Some(tool_name),
-            },
-        )
+    /// allows `tool_name` for the rest of the session. A concurrent
+    /// registration is answered `Denied(ConcurrentPending)` at once.
+    pub fn register_tool(
+        &self,
+        tool_id: String,
+        tool_name: String,
+        tx: tokio::sync::oneshot::Sender<ToolApprovalAnswer>,
+    ) -> bool {
+        self.register_entry(tool_id, PendingApproval::Tool { tx, tool_name })
     }
 
     fn register_entry(&self, tool_id: String, entry: PendingApproval) -> bool {
@@ -111,7 +151,9 @@ impl ApprovalRouter {
                 "ApprovalRouter::register: rejecting concurrent approval request"
             );
             drop(guard);
-            let _ = entry.tx.send(false);
+            if !entry.deny(ApprovalDenialCause::ConcurrentPending) {
+                tracing::debug!("ApprovalRouter::register: concurrent requester already gone");
+            }
             return false;
         }
         if guard.insert(tool_id.clone(), entry).is_some() {
@@ -146,12 +188,20 @@ impl ApprovalRouter {
 
     /// Resolve every pending approval with one decision and return their ids.
     ///
-    /// Used by session-switch cleanup to fail closed before swapping sessions.
+    /// Used by session-switch cleanup to fail closed before swapping sessions:
+    /// a refused tool call learns it was refused because of the switch.
     pub fn resolve_all(&self, approved: bool) -> Vec<String> {
         let pending = std::mem::take(&mut *self.pending.lock());
         let mut resolved = Vec::with_capacity(pending.len());
         for (tool_id, entry) in pending {
-            let _ = entry.tx.send(approved);
+            let delivered = if approved {
+                entry.decide(true, false)
+            } else {
+                entry.deny(ApprovalDenialCause::SessionSwitched)
+            };
+            if !delivered {
+                tracing::debug!(tool_id = %crate::agent::diagnostics::text_class(&tool_id), "ApprovalRouter::resolve_all: rx already dropped");
+            }
             resolved.push(tool_id);
         }
         resolved
@@ -174,14 +224,33 @@ impl ApprovalRouter {
         };
         if approved
             && always
-            && let Some(name) = entry.tool_name
+            && let PendingApproval::Tool { tool_name, .. } = &entry
         {
-            self.session_allowlist.lock().insert(name);
+            self.session_allowlist.lock().insert(tool_name.clone());
         }
-        if entry.tx.send(approved).is_err() {
+        if !entry.decide(approved, always) {
             tracing::debug!(
                 tool_id = %crate::agent::diagnostics::text_class(&tool_id),
                 "ApprovalRouter::resolve: rx already dropped (driver cancelled)"
+            );
+        }
+        true
+    }
+
+    /// Fail a pending approval closed without an operator answer: a tool
+    /// entry receives `Denied(cause)`, a plain entry `false`.
+    ///
+    /// Returns false when the `tool_id` is not found.
+    pub fn resolve_unanswered(&self, tool_id: &str, cause: ApprovalDenialCause) -> bool {
+        let entry = self.pending.lock().remove(tool_id);
+        let Some(entry) = entry else {
+            tracing::debug!(tool_id = %crate::agent::diagnostics::text_class(&tool_id), "ApprovalRouter::resolve_unanswered: no pending entry");
+            return false;
+        };
+        if !entry.deny(cause) {
+            tracing::debug!(
+                tool_id = %crate::agent::diagnostics::text_class(&tool_id),
+                "ApprovalRouter::resolve_unanswered: rx already dropped (driver cancelled)"
             );
         }
         true
@@ -211,7 +280,7 @@ impl ApprovalStrategy for ChatTuiApprovalStrategy {
             return self.approved(&request);
         }
         let tool_id = request.command.operation_id.clone();
-        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<ToolApprovalAnswer>();
         let registered = self
             .router
             .register_tool(tool_id.clone(), request.descriptor.public_name.clone(), tx);
@@ -227,13 +296,12 @@ impl ApprovalStrategy for ChatTuiApprovalStrategy {
                 .await
                 .is_err()
         {
-            let _ = self.router.resolve(&tool_id, false);
-            return ToolApprovalDecision::Denied {
-                reason: "approval request channel is unavailable; tool rejected for safety".to_string(),
-            };
+            let _ = self
+                .router
+                .resolve_unanswered(&tool_id, ApprovalDenialCause::NoApprovalSurface);
         }
 
-        let approved = tokio::select! {
+        let answer = tokio::select! {
             biased;
             () = self.cancellation.cancelled() => {
                 let _ = self.router.resolve(&tool_id, false);
@@ -241,22 +309,42 @@ impl ApprovalStrategy for ChatTuiApprovalStrategy {
                     reason: "tool approval cancelled with the active turn".to_string(),
                 };
             }
-            result = rx => result.unwrap_or(false),
+            result = rx => result.unwrap_or(ToolApprovalAnswer::Denied(ApprovalDenialCause::NoApprovalSurface)),
         };
-        if !approved {
-            return ToolApprovalDecision::Denied {
-                reason: if registered {
-                    "User rejected tool approval".to_string()
-                } else {
-                    "Another tool approval is already pending; this tool was rejected for safety".to_string()
-                },
-            };
+        match answer {
+            ToolApprovalAnswer::Approved { .. } => self.approved(&request),
+            ToolApprovalAnswer::Denied(cause) => self.denied(&request, cause).await,
         }
-        self.approved(&request)
     }
 }
 
 impl ChatTuiApprovalStrategy {
+    /// A refused call: tell the operator which call was refused and why, then
+    /// return the typed denial. Every cause the chat path produces has fixed
+    /// text; a cause without one is named by its stable identifier.
+    async fn denied(&self, request: &ToolApprovalRequest, cause: ApprovalDenialCause) -> ToolApprovalDecision {
+        let reason = cause.fixed_reason().unwrap_or_else(|| cause.as_str()).to_string();
+        if let Err(error) = self
+            .action_tx
+            .send(Action::ToolApprovalDenied {
+                task_id: self.task_id,
+                tool_id: request.command.operation_id.clone(),
+                name: request.descriptor.public_name.clone(),
+                cause,
+                reason: reason.clone(),
+            })
+            .await
+        {
+            let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+            tracing::debug!(
+                error_len,
+                error_sha256,
+                "tool approval denial notice not delivered: action channel closed"
+            );
+        }
+        ToolApprovalDecision::Denied { cause, reason }
+    }
+
     /// An approved call with its own single-use runtime grant.
     fn approved(&self, request: &ToolApprovalRequest) -> ToolApprovalDecision {
         let envelope = &request.context.envelope;
@@ -1875,10 +1963,9 @@ impl EffectExecutor {
                         let action_tx = deps.persistence.action_tx.clone();
                         tokio::spawn(async move {
                             if let Err(e) = action_tx
-                                .send(Action::ToolApprovalReceived {
+                                .send(Action::ToolApprovalUnanswered {
                                     tool_id,
-                                    approved: false,
-                                    always: false,
+                                    cause: ApprovalDenialCause::NoApprovalSurface,
                                 })
                                 .await
                             {
@@ -1900,15 +1987,24 @@ impl EffectExecutor {
                 tokio::spawn(async move {
                     let decision =
                         crate::chat::terminal_approval::prompt(&name, &args, || router.is_pending(&tool_id)).await;
-                    let (approved, always) = decision.flags();
-                    if let Err(e) = action_tx
-                        .send(Action::ToolApprovalReceived {
-                            tool_id,
-                            approved,
-                            always,
-                        })
-                        .await
-                    {
+                    // An operator answer resolves as a decision; a denial no
+                    // operator gave keeps its own cause.
+                    let action = match decision {
+                        crate::chat::terminal_approval::TerminalApproval::Deny(cause)
+                            if cause != ApprovalDenialCause::UserRejected =>
+                        {
+                            Action::ToolApprovalUnanswered { tool_id, cause }
+                        }
+                        answered => {
+                            let (approved, always) = answered.flags();
+                            Action::ToolApprovalReceived {
+                                tool_id,
+                                approved,
+                                always,
+                            }
+                        }
+                    };
+                    if let Err(e) = action_tx.send(action).await {
                         let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&e);
                         tracing::debug!(
                             error_len,
@@ -1924,6 +2020,17 @@ impl EffectExecutor {
                 always,
             } => {
                 deps.approval_router.resolve_decision(&tool_id, approved, always);
+            }
+            Effect::AnnounceToolDenied { name, reason } => {
+                // The TUI already shows the reducer's notice line; line mode
+                // (`--plain`, `--message`) prints it on stderr.
+                #[cfg(feature = "terminal-tui")]
+                let interactive_tui = self.redraw_slot.lock().is_some() || deps.redraw_tx.is_some();
+                #[cfg(not(feature = "terminal-tui"))]
+                let interactive_tui = false;
+                if !interactive_tui {
+                    crate::chat::terminal_approval::announce_denied(&name, &reason);
+                }
             }
             Effect::Quit => {
                 // shutdown signal: the real cancel + drop implicit protocol is finished off by chat::run
@@ -3180,7 +3287,7 @@ struct ReducedAction {
     terminal_accepted: bool,
     usage: Option<TokenUsage>,
     draft_id: Option<String>,
-    approval_response: Option<(String, bool, bool)>,
+    approval_response: Option<ApprovalRelay>,
     /// A failed save of this action's effects. Every one, awaited or not,
     /// reaches the single history-commit latch.
     persistence_failure: Option<String>,
@@ -3256,8 +3363,8 @@ fn finish_reduced_action(
     approval_router: Option<&Arc<ApprovalRouter>>,
     turn_signal: Option<&TurnCompletionSignal>,
 ) {
-    if let (Some((tool_id, approved, always)), Some(router)) = (reduced.approval_response, approval_router) {
-        router.resolve_decision(&tool_id, approved, always);
+    if let (Some(relay), Some(router)) = (reduced.approval_response, approval_router) {
+        relay.resolve(router);
     }
     if let Some(failure) = reduced.persistence_failure {
         // The reducer has moved past the last acknowledged revision; no
@@ -3476,17 +3583,54 @@ pub fn spawn_dispatcher_task_full(
     })
 }
 
-/// **S3 T3-1**: extract the (tool_id, approved, always) tuple from `Action::ToolApprovalReceived`.
+/// An approval resolution relayed to the router after the reducer step.
+enum ApprovalRelay {
+    /// `Action::ToolApprovalReceived`: the operator's decision.
+    Decision {
+        tool_id: String,
+        approved: bool,
+        always: bool,
+    },
+    /// `Action::ToolApprovalUnanswered`: no operator answer, with its cause.
+    Unanswered {
+        tool_id: String,
+        cause: ApprovalDenialCause,
+    },
+}
+
+impl ApprovalRelay {
+    fn resolve(self, router: &ApprovalRouter) -> bool {
+        match self {
+            Self::Decision {
+                tool_id,
+                approved,
+                always,
+            } => router.resolve_decision(&tool_id, approved, always),
+            Self::Unanswered { tool_id, cause } => router.resolve_unanswered(&tool_id, cause),
+        }
+    }
+}
+
+/// **S3 T3-1**: extract the approval resolution from `Action::ToolApprovalReceived` or
+/// `Action::ToolApprovalUnanswered`.
 ///
 /// Only used for approval_router forwarding before / after the reducer handles it; other Actions return None.
-/// Borrows to avoid cloning early — the tuple is extracted before the reducer consumes the action.
-fn extract_approval_response(action: &Action) -> Option<(String, bool, bool)> {
+/// Borrows to avoid cloning early — the relay is extracted before the reducer consumes the action.
+fn extract_approval_response(action: &Action) -> Option<ApprovalRelay> {
     match action {
         Action::ToolApprovalReceived {
             tool_id,
             approved,
             always,
-        } => Some((tool_id.clone(), *approved, *always)),
+        } => Some(ApprovalRelay::Decision {
+            tool_id: tool_id.clone(),
+            approved: *approved,
+            always: *always,
+        }),
+        Action::ToolApprovalUnanswered { tool_id, cause } => Some(ApprovalRelay::Unanswered {
+            tool_id: tool_id.clone(),
+            cause: *cause,
+        }),
         _ => None,
     }
 }

@@ -13,7 +13,7 @@ mod plain_chat;
 #[path = "support/pty.rs"]
 mod pty;
 
-use loopback_openai::{LoopbackOpenAi, Script, Scripted};
+use loopback_openai::{LoopbackOpenAi, Script, Scripted, approval_rows};
 use plain_chat::Sandbox;
 use pty::Pty;
 
@@ -85,9 +85,18 @@ fn y_exit_0_edited() {
 
 #[test]
 fn n_exit_0_unchanged() {
-    let (sandbox, _, code) = one_edit("n", "EDIT-DENIED");
+    let (sandbox, captured, code) = one_edit("n", "EDIT-DENIED");
     assert_eq!(code, Some(0), "a denied tool still ends the turn with a reply");
     assert_eq!(notes(&sandbox), ORIGINAL, "a denied edit leaves the file unchanged");
+    assert_eq!(
+        approval_rows(&sandbox.workspace),
+        ["operation_id=call-edit capability=file_edit verdict=denied cause=user_rejected"],
+        "the denial is recorded once"
+    );
+    assert!(
+        captured.contains("Denied file_edit"),
+        "the operator sees the denial: {captured}"
+    );
 }
 
 #[test]
@@ -186,7 +195,35 @@ fn no_tty_denies_unless_override() {
             "no prompt without a terminal: {}",
             output.stderr
         );
-        assert_eq!(server.requests().len(), 2, "the tool call and the reply");
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2, "the tool call and the reply");
         assert_eq!(notes(&sandbox), expected, "override {approval_override:?}");
+        let rows = approval_rows(&sandbox.workspace);
+        if approval_override.is_some() {
+            assert_eq!(
+                rows,
+                ["operation_id=call-edit capability=file_edit verdict=approved"],
+                "an allowing override is recorded as an approval"
+            );
+        } else {
+            assert_eq!(
+                rows,
+                ["operation_id=call-edit capability=file_edit verdict=denied cause=no_terminal"],
+                "no terminal is recorded as its own cause, not a user rejection"
+            );
+            assert_eq!(
+                loopback_openai::tool_result_text(&requests[1], "call-edit").as_deref(),
+                Some(
+                    "Denied: No terminal was available to ask for approval. \
+                     The file_edit call did not run and produced no output."
+                ),
+                "the model reads why the edit did not run"
+            );
+            assert!(
+                output.stderr.contains("Denied file_edit"),
+                "the operator sees the denial on stderr: {}",
+                output.stderr
+            );
+        }
     }
 }

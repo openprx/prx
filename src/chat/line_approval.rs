@@ -31,7 +31,7 @@ pub(super) const fn decision_for(answer: TerminalApproval) -> ApprovalDecision {
     match answer {
         TerminalApproval::Once => ApprovalDecision::Grant,
         TerminalApproval::Always => ApprovalDecision::GrantForSession,
-        TerminalApproval::Deny => ApprovalDecision::Deny,
+        TerminalApproval::Deny(_) => ApprovalDecision::Deny,
     }
 }
 
@@ -270,10 +270,17 @@ mod tests {
             ),
             "terminal `always` answer must map to a session grant"
         );
-        assert!(
-            matches!(decision_for(TerminalApproval::Deny), ApprovalDecision::Deny),
-            "terminal `deny` answer must map to a denial"
-        );
+        for cause in [
+            crate::tools::ApprovalDenialCause::UserRejected,
+            crate::tools::ApprovalDenialCause::NoAnswer,
+            crate::tools::ApprovalDenialCause::NoTerminal,
+            crate::tools::ApprovalDenialCause::PromptUnavailable,
+        ] {
+            assert!(
+                matches!(decision_for(TerminalApproval::Deny(cause)), ApprovalDecision::Deny),
+                "terminal denial {cause:?} must map to a denial"
+            );
+        }
     }
 
     /// `y` runs the supervised call once; `n`, EOF, and no terminal without

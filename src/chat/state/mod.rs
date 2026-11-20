@@ -279,6 +279,9 @@ pub enum Effect {
         approved: bool,
         always: bool,
     },
+    /// Tell a line-mode operator that a tool call was refused at approval and
+    /// did not run (stderr). The TUI shows the reducer's notice line instead.
+    AnnounceToolDenied { name: String, reason: String },
     /// Exit the main loop gracefully
     Quit,
 }
@@ -305,6 +308,7 @@ impl Effect {
             Self::SurfaceNotice { .. } => "SurfaceNotice",
             Self::RequestApproval { .. } => "RequestApproval",
             Self::ResolveApproval { .. } => "ResolveApproval",
+            Self::AnnounceToolDenied { .. } => "AnnounceToolDenied",
             Self::Quit => "Quit",
         }
     }
@@ -1324,6 +1328,14 @@ impl ChatState {
             Action::ToolApprovalReceived { tool_id, approved, .. } => {
                 self.reduce_tool_approval_received(&tool_id, approved)
             }
+            Action::ToolApprovalUnanswered { tool_id, .. } => self.reduce_tool_approval_received(&tool_id, false),
+            Action::ToolApprovalDenied {
+                tool_id, name, reason, ..
+            } => {
+                #[cfg(feature = "terminal-tui")]
+                self.push_tool_denied_notice(&name, &reason);
+                reduce_tools::tool_approval_denied_effects(&tool_id, name, reason)
+            }
             Action::ToolApprovalCleared => self.reduce_tool_approval_cleared(),
             Action::StreamRetryAttempt { attempt, reason } => self.reduce_stream_retry_attempt(attempt, &reason),
 
@@ -1447,9 +1459,11 @@ const fn ui_dirty_for(action: &Action) -> bool {
         | Action::ProviderTurnReadyForCommit { .. } => false,
         Action::ToolProgress { .. } => true,
         // Foreground approval writes pending view + focus.
-        Action::ToolApprovalRequested { .. } | Action::ToolApprovalReceived { .. } | Action::ToolApprovalCleared => {
-            true
-        }
+        Action::ToolApprovalRequested { .. }
+        | Action::ToolApprovalReceived { .. }
+        | Action::ToolApprovalUnanswered { .. }
+        | Action::ToolApprovalDenied { .. }
+        | Action::ToolApprovalCleared => true,
 
         // Session: SessionLoaded rebuilds history and may force a UI reset; SessionSaved/Switched do not
         Action::SessionLoaded { .. } | Action::TurnCommitRequested { .. } | Action::TurnAbortSettled { .. } => true,

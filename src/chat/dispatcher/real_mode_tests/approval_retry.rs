@@ -207,7 +207,35 @@ async fn interactive_exact_call(approved: bool) {
             );
         }
     }
+    let expected_row = if approved {
+        "operation_id=call-pending-shell capability=shell verdict=approved"
+    } else {
+        "operation_id=call-pending-shell capability=shell verdict=denied cause=user_rejected"
+    };
+    assert_eq!(
+        approval_row_count(expected_row),
+        1,
+        "the approval resolution is recorded once in the chat tool ledger"
+    );
     finish_owned_start_turn_fixture(cleanup).await;
+}
+
+/// How many `tool.approval.resolved` rows with exactly `content` the chat
+/// tests' dedicated tool ledger holds (the service's ledger under
+/// `NoneMemory`). A single-row count query, so the read is bounded.
+fn approval_row_count(content: &str) -> i64 {
+    let database = rusqlite::Connection::open_with_flags(
+        chat_test_workspace().join("memory/tool-ledger.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("test: open the chat tool ledger");
+    database
+        .query_row(
+            "SELECT COUNT(*) FROM message_events WHERE event_type = 'tool.approval.resolved' AND content = ?1",
+            [content],
+            |row| row.get(0),
+        )
+        .expect("test: count approval rows")
 }
 
 /// **S3 T3-1 Step 5**: io error retry — the driver succeeds on attempt 3 after io errors on attempts 1 and 2.

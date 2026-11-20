@@ -94,11 +94,15 @@ pub use document_get_chunk::DocumentGetChunkTool;
 pub use document_ingest::{DocumentIngestTool, DocumentSyncTool};
 pub use document_search::DocumentSearchTool;
 pub use execution::{
-    AdapterOwnedPreparation, ApprovalStrategy, DenyApprovalStrategy, DispatchOrigin, EffectPolicy, LegacyToolAdapter,
-    SecurityEffectPolicy, ToolAdapterKind, ToolApprovalDecision, ToolApprovalRequest, ToolBackend, ToolCatalog,
-    ToolDescriptor, ToolEffect, ToolExecutionAuditRecord, ToolExecutionAuditSink, ToolExecutionCommand,
-    ToolExecutionContext, ToolExecutionDecision, ToolExecutionOutcome, ToolExecutionPermit, ToolExecutionPreparation,
-    ToolExecutionService, ToolExecutionStatus, TracingToolExecutionAudit, decide_tool_execution,
+    APPROVAL_DENIED_CHANNEL, APPROVAL_DENIED_CONCURRENT_PENDING, APPROVAL_DENIED_NO_ANSWER,
+    APPROVAL_DENIED_NO_APPROVAL_SURFACE, APPROVAL_DENIED_NO_RESOLVER, APPROVAL_DENIED_NO_TERMINAL,
+    APPROVAL_DENIED_PROMPT_UNAVAILABLE, APPROVAL_DENIED_SESSION_SWITCHED, APPROVAL_DENIED_USER_REJECTED,
+    AdapterOwnedPreparation, ApprovalDenialCause, ApprovalStrategy, ApprovalVerdict, DenyApprovalStrategy,
+    DispatchOrigin, EffectPolicy, LegacyToolAdapter, SecurityEffectPolicy, ToolAdapterKind, ToolApprovalDecision,
+    ToolApprovalRequest, ToolBackend, ToolCatalog, ToolDescriptor, ToolEffect, ToolExecutionAuditRecord,
+    ToolExecutionAuditSink, ToolExecutionCommand, ToolExecutionContext, ToolExecutionDecision, ToolExecutionOutcome,
+    ToolExecutionPermit, ToolExecutionPreparation, ToolExecutionService, ToolExecutionStatus,
+    TracingToolExecutionAudit, decide_tool_execution,
 };
 pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;

@@ -193,7 +193,8 @@ impl crate::tools::ApprovalStrategy for AgentToolApprovalStrategy {
     async fn resolve(&self, request: crate::tools::ToolApprovalRequest) -> crate::tools::ToolApprovalDecision {
         let Some(manager) = self.manager.as_ref() else {
             return crate::tools::ToolApprovalDecision::Denied {
-                reason: "approval required but no approval resolver is available".to_string(),
+                cause: crate::tools::ApprovalDenialCause::NoResolver,
+                reason: crate::tools::APPROVAL_DENIED_NO_RESOLVER.to_string(),
             };
         };
         let tool_name = request.descriptor.public_name.as_str();
@@ -233,6 +234,7 @@ impl crate::tools::ApprovalStrategy for AgentToolApprovalStrategy {
         manager.record_decision(tool_name, &request.command.arguments, decision, &self.channel);
         if decision == ApprovalResponse::No {
             return crate::tools::ToolApprovalDecision::Denied {
+                cause: crate::tools::ApprovalDenialCause::UserRejected,
                 reason: "Denied by user".to_string(),
             };
         }

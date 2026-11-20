@@ -7,6 +7,7 @@ use crate::tools::traits::TOOL_EXECUTION_CANCELLED;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod approval_records;
 mod composition;
 mod contracts;
 mod flat_contracts;
