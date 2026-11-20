@@ -329,7 +329,7 @@ pub fn load_model_cache_state(workspace_dir: &Path) -> anyhow::Result<ModelCache
 pub fn save_model_cache_state(workspace_dir: &Path, state: &ModelCacheState) -> anyhow::Result<()> {
     let path = model_cache_path(workspace_dir);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
+        crate::util::create_private_dir_all(parent)
             .with_context(|| format!("failed to create model cache directory {}", parent.display()))?;
     }
     let json = serde_json::to_vec_pretty(state).context("failed to serialize model cache")?;

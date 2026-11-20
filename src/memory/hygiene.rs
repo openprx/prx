@@ -111,7 +111,7 @@ fn should_run_now(workspace_dir: &Path) -> Result<bool> {
 fn write_state(workspace_dir: &Path, report: &HygieneReport) -> Result<()> {
     let path = state_path(workspace_dir);
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        crate::util::create_private_dir_all(parent)?;
     }
 
     let state = HygieneState {

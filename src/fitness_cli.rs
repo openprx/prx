@@ -96,6 +96,7 @@ async fn migrate_legacy(config: &Config, apply: bool, json: bool) -> Result<()> 
         return print_value(json, &report);
     }
 
+    crate::util::create_private_dir_all(&config.workspace_dir.join("self"))?;
     let backup_dir = config.workspace_dir.join("self/fitness/migration").join(format!(
         "{}-{}",
         Utc::now().format("%Y%m%dT%H%M%SZ"),

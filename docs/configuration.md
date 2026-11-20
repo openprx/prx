@@ -273,6 +273,18 @@ the run's workspace is `<DIR>/workspace`, even when that environment variable
 names a different directory. Omit `--config-dir` (and `OPENPRX_CONFIG_DIR`) when
 you intend to select the workspace through `OPENPRX_WORKSPACE`.
 
+On Unix, new workspace `state` directories are created with mode `0700` even
+under umask `0002`; workspace parents retain their normal umask permissions.
+Cost storage refuses an existing group- or world-writable state directory:
+inspect its contents, then run `chmod 700 <workspace>/state` explicitly.
+The directory must also belong to the process's effective uid, with no root
+exemption. For `sudo prx` or container bind mounts, run as the directory owner
+or explicitly correct ownership with `chown <euid> <workspace>/state`.
+Inherited setgid is accepted. Evolution storage rooted at `<workspace>/self`
+or below it, and fitness migration, create a missing `self` privately;
+external evolution storage roots leave `self` alone. Existing directories are
+not changed by creation.
+
 The session-worker transport secret is strict. It is either the
 `SESSION_WORKER_SECRET` environment value, which must be exactly 32 bytes, or
 one persisted 32-byte file at `OPENPRX_SESSION_WORKER_SECRET_PATH`, else

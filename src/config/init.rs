@@ -1092,10 +1092,12 @@ fn finish_after_commit(
     write_managed_defaults(target_dir, managed_defaults)?;
     std::fs::create_dir_all(workspace_dir)
         .with_context(|| format!("Failed to create workspace in {}", target_dir.display()))?;
-    for subdir in &["sessions", "memory", "state", "cron", "skills"] {
+    for subdir in &["sessions", "memory", "cron", "skills"] {
         std::fs::create_dir_all(workspace_dir.join(subdir))
             .with_context(|| format!("Failed to create workspace/{subdir} in {}", target_dir.display()))?;
     }
+    crate::util::create_private_dir_all(&workspace_dir.join("state"))
+        .with_context(|| format!("Failed to create workspace/state in {}", target_dir.display()))?;
     match identity {
         Some(ctx) => crate::identity::root::initialize(workspace_dir, ctx)?,
         None => scaffold_workspace_defaults(workspace_dir)?,

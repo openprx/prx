@@ -255,7 +255,7 @@ impl SqliteMailboxStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
+            crate::util::create_private_dir_all(parent)
                 .with_context(|| format!("failed to create mailbox directory {}", parent.display()))?;
         }
         // Create the file ourselves, private, *before* SQLite sees it: SQLite

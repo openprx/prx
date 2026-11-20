@@ -6,6 +6,7 @@ use crate::agent::terminal::TurnTerminalReceipt;
 use crate::chat::binding::{ChatAdmissionMode, ChatProviderBinding, ChatTurnBinding};
 use crate::memory::{MessageEvent, MessageEventInput, SqliteMemory};
 use crate::runtime::turn_cleanup::{CleanupScope, CleanupTracker};
+use crate::util::test_helpers::run_in_isolated_process;
 use anyhow::Context;
 use std::path::Path;
 
@@ -304,24 +305,6 @@ async fn restarted_chat(workspace: &Path, run: &str) -> MessageEvent {
         })
         .await
         .unwrap()
-}
-
-fn run_in_isolated_process(test: &str, child_flag: &str) -> bool {
-    if std::env::var_os(child_flag).is_some() {
-        return false;
-    }
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([test, "--exact", "--nocapture"])
-        .env(child_flag, "1")
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    true
 }
 
 #[tokio::test(flavor = "current_thread")]

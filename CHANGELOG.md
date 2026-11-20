@@ -79,6 +79,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- New workspace `state` and selected evolution/fitness `self` directories are
+  created privately under group-writable umasks. Cost state directories must be
+  owned by the effective uid, including when running as root; `sudo prx` on a
+  user's workspace and uid-mismatched container mounts are refused. Existing
+  writable state directories require an explicit `chmod 700 <workspace>/state`;
+  ownership mismatches require `chown <euid> <workspace>/state` or running as owner.
+
 - Engine-on Clarify degrades to a plain answer with no selected tools only when a legal Answer passed its gate; the control tools stay available, and abstention accounting is preserved.
 
 - `prx agent`, `prx chat`, `prx go`, `prx doctor`, `prx status`, and other
