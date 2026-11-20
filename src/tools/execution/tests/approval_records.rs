@@ -5,10 +5,10 @@ use std::collections::VecDeque;
 
 /// Bound on the whole test, including both service calls.
 const TEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
-/// Most approval rows read back; one more fails the test.
-const MAX_APPROVAL_ROWS: i64 = 16;
-/// Most bytes kept from one stored field; one more fails the test.
-const MAX_FIELD_BYTES: i64 = 4096;
+/// Most approval rows read back in one bounded page; one more fails the test.
+const MAX_APPROVAL_ROWS: usize = 16;
+/// Most bytes one stored approval field may hold; more fails the test.
+const MAX_FIELD_BYTES: usize = 4096;
 
 /// Answers each approval request with the next scripted decision.
 struct SequencedApproval(Mutex<VecDeque<ToolApprovalDecision>>);
@@ -26,47 +26,37 @@ impl ApprovalStrategy for SequencedApproval {
     }
 }
 
-/// `(content, payload)` of every approval row in the ledger at `workspace`,
-/// in insert order, bounded in rows and bytes before collection.
-fn approval_rows(workspace: &std::path::Path) -> Vec<(String, serde_json::Value)> {
-    let database = rusqlite::Connection::open_with_flags(
-        workspace.join("memory/brain.db"),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .expect("test: open the real ledger");
-    let mut statement = database
-        .prepare(
-            "SELECT substr(CAST(content AS BLOB), 1, ?1), substr(CAST(raw_payload_json AS BLOB), 1, ?1)
-             FROM message_events WHERE event_type = ?2 ORDER BY id LIMIT ?3",
+/// `(content, payload)` of every approval row of [`context`]'s workspace and
+/// owner, in insert order, read through the SQLite repository in one page of
+/// at most `MAX_APPROVAL_ROWS + 1` rows; overflow fails the test.
+async fn approval_rows(memory: &dyn Memory) -> Vec<(String, serde_json::Value)> {
+    let envelope = context().envelope;
+    let owner_id = envelope.owner_id.expect("test: the fixture context has an owner");
+    let rows = memory
+        .list_owned_message_events_by_type(
+            &envelope.workspace_id,
+            &owner_id,
+            super::super::approval_record::TOOL_APPROVAL_RESOLVED_EVENT,
+            0,
+            MAX_APPROVAL_ROWS + 1,
         )
-        .expect("test: approval row query");
-    let rows = statement
-        .query_map(
-            rusqlite::params![
-                MAX_FIELD_BYTES + 1,
-                super::super::approval_record::TOOL_APPROVAL_RESOLVED_EVENT,
-                MAX_APPROVAL_ROWS + 1
-            ],
-            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
-        )
-        .expect("test: approval rows")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("test: readable approval rows");
+        .await
+        .expect("test: approval rows");
     assert!(
-        i64::try_from(rows.len()).unwrap_or(i64::MAX) <= MAX_APPROVAL_ROWS,
+        rows.len() <= MAX_APPROVAL_ROWS,
         "more than {MAX_APPROVAL_ROWS} approval rows"
     );
     rows.into_iter()
-        .map(|(content, payload)| {
-            for field in [&content, &payload] {
+        .map(|event| {
+            let payload = event.raw_payload_json.expect("test: approval payload");
+            for field in [&event.content, &payload] {
                 assert!(
-                    i64::try_from(field.len()).unwrap_or(i64::MAX) <= MAX_FIELD_BYTES,
+                    field.len() <= MAX_FIELD_BYTES,
                     "an approval row field exceeds {MAX_FIELD_BYTES} bytes"
                 );
             }
-            let content = String::from_utf8(content).expect("test: UTF-8 approval content");
-            let payload = serde_json::from_slice(&payload).expect("test: approval payload is JSON");
-            (content, payload)
+            let payload = serde_json::from_str(&payload).expect("test: approval payload is JSON");
+            (event.content, payload)
         })
         .collect()
 }
@@ -111,7 +101,7 @@ async fn approval_rows_survive_shared_idempotency_key() {
                 stages: Arc::clone(&fixture.stages),
             }),
         )
-        .with_idempotency_memory(memory);
+        .with_idempotency_memory(Arc::clone(&memory));
         let command = |operation_id: &str| {
             ToolExecutionCommand::new("native_write", serde_json::json!({"value": operation_id}))
                 .with_operation_id(operation_id)
@@ -138,7 +128,7 @@ async fn approval_rows_survive_shared_idempotency_key() {
         );
         assert_eq!(fixture.calls.load(Ordering::SeqCst), 1, "only the approved call runs");
 
-        let rows = approval_rows(temp.path());
+        let rows = approval_rows(memory.as_ref()).await;
         let contents: Vec<&str> = rows.iter().map(|(content, _)| content.as_str()).collect();
         assert_eq!(
             contents,

@@ -470,13 +470,19 @@ const APPROVAL_FIXTURE_DEADLINE: std::time::Duration = std::time::Duration::from
 /// Bound on the actions one supervised probe turn may send.
 const APPROVAL_FIXTURE_MAX_ACTIONS: usize = 64;
 /// Most approval rows read back; one more fails the test.
-const MAX_APPROVAL_ROWS: i64 = 16;
-/// Most bytes kept from one stored approval row; one more fails the test.
-const MAX_APPROVAL_ROW_BYTES: i64 = 4096;
+const MAX_APPROVAL_ROWS: usize = 16;
+/// Most bytes one stored approval row may hold; more fails the test.
+const MAX_APPROVAL_ROW_BYTES: usize = 4096;
+/// Events per page when reading the chat ledger back.
+const EVENT_PAGE_SIZE: usize = 50;
+/// Most event pages read back; more fails the test.
+const MAX_EVENT_PAGES: usize = 20;
 
 /// What one supervised probe turn showed: its probe actions in order, the
 /// probe's executions and the provider's tool offers.
 struct ApprovalProbeRun {
+    /// Workspace id the turn's tool events are written under.
+    workspace_id: String,
     actions: Vec<Action>,
     executions: usize,
     offers: Vec<Vec<String>>,
@@ -511,6 +517,7 @@ async fn run_supervised_approval_probe(workspace: &std::path::Path, occupy_route
         )
         .await;
         let approval_router = Arc::clone(&admitted.approval_router);
+        let workspace_id = admitted.context.envelope.workspace_id.clone();
         let (occupying_tx, _occupying_rx) = tokio::sync::oneshot::channel::<bool>();
         if occupy_router {
             assert!(
@@ -582,6 +589,7 @@ async fn run_supervised_approval_probe(workspace: &std::path::Path, occupy_route
         drop(action_tx);
         let offers = provider.offered.lock().clone();
         ApprovalProbeRun {
+            workspace_id,
             actions,
             executions: executions.load(AtomicOrdering::SeqCst),
             offers,
@@ -591,41 +599,43 @@ async fn run_supervised_approval_probe(workspace: &std::path::Path, occupy_route
     .expect("test: supervised approval probe within APPROVAL_FIXTURE_DEADLINE")
 }
 
-/// Content of every `tool.approval.resolved` row in the chat ledger at
-/// `workspace`, in insert order, bounded in rows and bytes before collection.
-fn approval_rows(workspace: &std::path::Path) -> Vec<String> {
-    let database = rusqlite::Connection::open_with_flags(
-        workspace.join("memory/brain.db"),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .expect("test: open the chat ledger");
-    let mut statement = database
-        .prepare(
-            "SELECT substr(CAST(content AS BLOB), 1, ?1) FROM message_events
-             WHERE event_type = 'tool.approval.resolved' ORDER BY id LIMIT ?2",
-        )
-        .expect("test: approval row query");
-    let rows = statement
-        .query_map(
-            rusqlite::params![MAX_APPROVAL_ROW_BYTES + 1, MAX_APPROVAL_ROWS + 1],
-            |row| row.get::<_, Vec<u8>>(0),
-        )
-        .expect("test: approval rows")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("test: readable approval rows");
-    assert!(
-        i64::try_from(rows.len()).unwrap_or(i64::MAX) <= MAX_APPROVAL_ROWS,
-        "more than {MAX_APPROVAL_ROWS} approval rows"
-    );
-    rows.into_iter()
-        .map(|content| {
+/// Content of every `tool.approval.resolved` row the chat ledger at
+/// `workspace` holds for `workspace_id`, in insert order. Read through the
+/// SQLite repository in bounded pages; too many pages, rows or row bytes fail
+/// the test.
+async fn approval_rows(workspace: &std::path::Path, workspace_id: &str) -> Vec<String> {
+    let ledger = crate::memory::SqliteMemory::new(workspace).expect("test: open the chat ledger");
+    let principal = crate::memory::MemoryPrincipal {
+        workspace_id: workspace_id.to_owned(),
+        ..Default::default()
+    };
+    let mut rows = Vec::new();
+    let mut after_id = 0;
+    for _ in 0..MAX_EVENT_PAGES {
+        let page = ledger
+            .list_message_events_since(&principal, after_id, EVENT_PAGE_SIZE)
+            .await
+            .expect("test: read a chat ledger page");
+        let Some(last) = page.last() else {
+            return rows;
+        };
+        after_id = last.id;
+        for event in page {
+            if event.event_type != "tool.approval.resolved" {
+                continue;
+            }
             assert!(
-                i64::try_from(content.len()).unwrap_or(i64::MAX) <= MAX_APPROVAL_ROW_BYTES,
+                event.content.len() <= MAX_APPROVAL_ROW_BYTES,
                 "an approval row exceeds {MAX_APPROVAL_ROW_BYTES} bytes"
             );
-            String::from_utf8(content).expect("test: UTF-8 approval row")
-        })
-        .collect()
+            rows.push(event.content);
+            assert!(
+                rows.len() <= MAX_APPROVAL_ROWS,
+                "more than {MAX_APPROVAL_ROWS} approval rows"
+            );
+        }
+    }
+    panic!("test: the chat ledger holds more than {MAX_EVENT_PAGES} event pages");
 }
 
 /// The probe's `ToolFinished` result text; asserts the call failed.
@@ -682,7 +692,7 @@ async fn plain_direct_answer_does_not_execute_a_direct_tool_without_approval() {
         "the probe was offered"
     );
     assert_eq!(
-        approval_rows(workspace.path()),
+        approval_rows(workspace.path(), &run.workspace_id).await,
         ["operation_id=tiering-direct-call capability=config_reload verdict=denied cause=user_rejected"],
         "the denial is recorded once"
     );
@@ -719,7 +729,7 @@ async fn concurrent_approval_is_denied_with_typed_cause_and_row() {
     );
     assert_eq!(run.executions, 0, "a refused call never runs");
     assert_eq!(
-        approval_rows(workspace.path()),
+        approval_rows(workspace.path(), &run.workspace_id).await,
         ["operation_id=tiering-direct-call capability=config_reload verdict=denied cause=concurrent_pending"],
         "the concurrent refusal is recorded once"
     );
