@@ -8,11 +8,12 @@ use super::{
     exited_without_result_reason, format_announce_message, new_process_mode_run, normalize_process_memory_strategy,
     parse_memory_scope, parse_spawn_scope, process_terminal, record_spawn_request_event, record_spawn_result_event,
     refresh_tools_for_explicit_allowlist, register_killable_process_run, resolve_child_provider_api_key,
-    resolve_tools_for_agent, run_sub_agent_process, run_sub_agent_task, running_run_count, spawn_completion_note,
-    spawn_event_scope, spawn_lineage, spawn_session_scope_key, sub_agent_reported_failure, task_failure_reason,
+    resolve_tools_for_agent, run_sub_agent_process, run_sub_agent_task, running_run_count, spawn_event_scope,
+    spawn_lineage, spawn_session_key, spawn_started_text, sub_agent_reported_failure, task_failure_reason,
     task_terminal, termination_cause, watch_process_mode_monitor, watch_task_mode_monitor,
 };
 use crate::providers;
+use crate::runtime::child_source::publication::ChildDelegation;
 use crate::security::SideEffectGate;
 use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
 use crate::tools::traits::{Tool, ToolResult};
@@ -162,11 +163,15 @@ impl SessionsSpawnTool {
         // all read that one object. An operator source opens its children as
         // roots, so the flag changes nothing there.
         let recursive = delegation::requested(args)?;
+        // Whether the issued child can spawn; operator and unpublished
+        // callers have no ordinary child publication and state nothing.
+        let mut child_delegation = None;
         let caller = match caller {
             Some(caller) => match caller.context().ordinary_child_publication.as_ref() {
                 Some(publication) => {
                     let served = self.child_serves_delegator(args, &publication.generation().effective)?;
-                    let selected = publication.select_for_spawn(caller.context(), recursive, served)?;
+                    let (selected, delegation) = publication.select_for_spawn(caller.context(), recursive, served)?;
+                    child_delegation = Some(delegation);
                     Some(caller.with_ordinary_publication(selected)?)
                 }
                 None => Some(caller),
@@ -299,8 +304,27 @@ impl SessionsSpawnTool {
             .as_ref()
             .map(|ctx| ctx.channel_excluded_tools.clone())
             .unwrap_or_default();
+
+        // FIX-P0-37: spawning a child session creates a new process that
+        // consumes resources and carries a potential sandbox-escape surface,
+        // so it is a Medium-risk side effect (requires an approval grant under
+        // supervised autonomy; denied outright under read-only) rather than Low.
+        let approval_grant = ApprovalGrant::from_runtime_args(self.name(), args);
+        if let Err(error) = SideEffectGate::new(launch_security.as_ref()).authorize_resource_operation(
+            self.name(),
+            "sessions_spawn:spawn",
+            ResourceRiskLevel::Medium,
+            approval_grant.as_ref(),
+        ) {
+            return Ok(SpawnOutcome::rejected(error));
+        }
+
+        let run_id = reserved_run_id.map_or_else(|| Uuid::new_v4().to_string(), str::to_owned);
+        // Every ordinary spawned run records under its own key; the caller
+        // link is `parent_session_key` and `parent_run_id`. An operator
+        // source keeps its authenticated session.
         let session_scope_key = operator_source.as_ref().map_or_else(
-            || spawn_session_scope_key(parent_exec_ctx.as_ref(), spawn_scope.as_ref()),
+            || spawn_session_key(&run_id),
             |source| {
                 use crate::runtime::turn_source::TurnSourceProof;
                 source.proof().session_key().to_owned()
@@ -320,22 +344,6 @@ impl SessionsSpawnTool {
             session_scope_key = %session_scope_key,
             "sessions_spawn accepted"
         );
-
-        // FIX-P0-37: spawning a child session creates a new process that
-        // consumes resources and carries a potential sandbox-escape surface,
-        // so it is a Medium-risk side effect (requires an approval grant under
-        // supervised autonomy; denied outright under read-only) rather than Low.
-        let approval_grant = ApprovalGrant::from_runtime_args(self.name(), args);
-        if let Err(error) = SideEffectGate::new(launch_security.as_ref()).authorize_resource_operation(
-            self.name(),
-            "sessions_spawn:spawn",
-            ResourceRiskLevel::Medium,
-            approval_grant.as_ref(),
-        ) {
-            return Ok(SpawnOutcome::rejected(error));
-        }
-
-        let run_id = reserved_run_id.map_or_else(|| Uuid::new_v4().to_string(), str::to_owned);
 
         let selected_agent = match agent_name.as_deref() {
             Some(name) => match agents.get(name) {
@@ -764,6 +772,7 @@ impl SessionsSpawnTool {
             &mode,
             (&resolved_provider_name, &resolved_model),
             &run_lineage,
+            child_delegation.map(ChildDelegation::record_code).as_deref(),
         )
         .await?;
 
@@ -1296,9 +1305,11 @@ impl SessionsSpawnTool {
 
             return Ok(SpawnOutcome::started(
                 run_id.clone(),
-                format!(
-                    "Sub-agent spawned in process mode (run_id: {run_id}). {}",
-                    spawn_completion_note(announce_result)
+                spawn_started_text(
+                    "Sub-agent spawned in process mode",
+                    &run_id,
+                    child_delegation,
+                    announce_result,
                 ),
             ));
         }
@@ -1789,10 +1800,7 @@ impl SessionsSpawnTool {
 
         Ok(SpawnOutcome::started(
             run_id.clone(),
-            format!(
-                "Sub-agent spawned (run_id: {run_id}). {}",
-                spawn_completion_note(announce_result)
-            ),
+            spawn_started_text("Sub-agent spawned", &run_id, child_delegation, announce_result),
         ))
     }
 }

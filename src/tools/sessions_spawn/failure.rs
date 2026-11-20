@@ -185,12 +185,28 @@ pub(super) fn exited_without_result_reason(detail: &str) -> String {
 /// The two sentences are not decoration: a model that just launched a batch has
 /// to know that nothing further will arrive on its own, or it will sit waiting
 /// for announcements that were switched off and never call `join`.
-pub(super) const fn spawn_completion_note(announce_result: bool) -> &'static str {
+const fn spawn_completion_note(announce_result: bool) -> &'static str {
     if announce_result {
         "Will announce result when complete."
     } else {
         "Result is not announced; collect it with the 'join' action on this batch_id."
     }
+}
+
+/// The confirmation of a started run: `<prefix> (run_id: <id>).`, then
+/// whether the child can spawn (ordinary children only), then the completion
+/// note. The prefix and run id stay first because callers parse them.
+pub(super) fn spawn_started_text(
+    prefix: &str,
+    run_id: &str,
+    child_delegation: Option<crate::runtime::child_source::publication::ChildDelegation>,
+    announce_result: bool,
+) -> String {
+    let note = spawn_completion_note(announce_result);
+    child_delegation.map_or_else(
+        || format!("{prefix} (run_id: {run_id}). {note}"),
+        |delegation| format!("{prefix} (run_id: {run_id}). {} {note}", delegation.result_sentence()),
+    )
 }
 
 /// Whether a `Failed` reason describes a run that never reached a conclusion at

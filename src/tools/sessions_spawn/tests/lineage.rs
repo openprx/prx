@@ -192,13 +192,14 @@ async fn spawn_fan_out_is_uncapped_by_concurrency_or_children() {
         FAN_OUT,
         "all {FAN_OUT} runs must be live at once; none may be capped away"
     );
+    // Every run records under its own session key, so the removed
+    // per-session ceiling has nothing left to count: the fan-out is bounded
+    // by no shared scope.
     let scope_keys: std::collections::HashSet<&str> = runs.iter().map(|run| run.session_scope_key.as_str()).collect();
-    assert_eq!(
-        scope_keys.len(),
-        1,
-        "the fan-out must share one session scope, which is what the removed \
-         per-session ceiling counted"
-    );
+    assert_eq!(scope_keys.len(), FAN_OUT, "every fan-out run has its own session key");
+    for run in &runs {
+        assert_eq!(run.session_scope_key, format!("spawn:{}", run.id));
+    }
 
     // Let the parked runs finish so nothing is left blocked on the gate.
     gate.add_permits(FAN_OUT * 4);
@@ -685,7 +686,7 @@ async fn operator_spawn_without_ambient_context_uses_source_run_as_parent() -> a
 
 #[tokio::test]
 async fn task_child_turn_runs_under_its_own_spawn_context() {
-    type Observation = (Option<SpawnExecutionContext>, Vec<String>, String);
+    type Observation = (Option<SpawnExecutionContext>, Vec<String>);
     struct ContextProbe(tokio::sync::mpsc::Sender<Observation>);
     #[async_trait::async_trait]
     impl crate::providers::Provider for ContextProbe {
@@ -694,10 +695,9 @@ async fn task_child_turn_runs_under_its_own_spawn_context() {
             // on the parent; the child turn observes its own run context.
             let context = current_spawn_execution_context();
             if context.as_ref().is_none_or(|context| context.run_id != "prx-parent") {
-                let key = spawn_session_scope_key(context.as_ref(), None);
                 // Non-blocking: this is a sync trait method. A full buffer drops
                 // the observation, which is safe because the test reads one only.
-                let _ = self.0.try_send((context, ambient_channel_excluded_tools(), key));
+                let _ = self.0.try_send((context, ambient_channel_excluded_tools()));
             }
             crate::providers::traits::ProviderCapabilities {
                 native_tool_calling: true,
@@ -742,14 +742,14 @@ async fn task_child_turn_runs_under_its_own_spawn_context() {
         .await
         .expect("real task admission");
     assert!(result.success, "{:?}", result.error);
-    let (context, hidden, scope) = tokio::time::timeout(std::time::Duration::from_secs(20), receiver.recv())
+    let (context, hidden) = tokio::time::timeout(std::time::Duration::from_secs(20), receiver.recv())
         .await
         .expect("real child turn preparation")
         .expect("probe observation");
     // CR-CI-3: the child's turn runs under its own run's spawn context, so a
     // recursive spawn from the child names it as parent, nests one level
-    // deeper, keeps the parent's hidden tools and session scope, and carries
-    // the inherited provenance.
+    // deeper, keeps the parent's hidden tools, records under its own
+    // `spawn:<run_id>` session key, and carries the inherited provenance.
     let context = context.expect("the child turn runs under its own spawn context");
     assert_ne!(context.run_id, "prx-parent");
     assert!(!context.is_turn_root);
@@ -757,5 +757,5 @@ async fn task_child_turn_runs_under_its_own_spawn_context() {
     assert_eq!(context.topic_id.as_deref(), Some("prx-topic"));
     assert!(context.task_input.inherited_provenance.is_some());
     assert_eq!(hidden, vec!["prx_hidden".to_owned()]);
-    assert_eq!(scope, "prx-parent-session");
+    assert_eq!(context.session_scope_key, format!("spawn:{}", context.run_id));
 }

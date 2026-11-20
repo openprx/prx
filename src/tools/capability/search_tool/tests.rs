@@ -71,6 +71,7 @@ async fn discovery_scope_publishes_offers_without_execution_authority() -> anyho
         Arc::downgrade(&offers),
         Arc::downgrade(&closed),
         Arc::downgrade(&descriptors),
+        BTreeMap::from([(entry.id.clone(), DiscoveryTurnState::Callable)]),
     );
     let port = CapabilitySearchPort::new(Arc::new(scope));
     let result = with_search_authority(
@@ -80,7 +81,11 @@ async fn discovery_scope_publishes_offers_without_execution_authority() -> anyho
     .await?;
     assert!(result.success);
     let result: Value = serde_json::from_str(&result.output)?;
-    assert_eq!(result.get("hits").and_then(Value::as_array).context("hits")?.len(), 1);
+    let hits = result.get("hits").and_then(Value::as_array).context("hits")?;
+    assert_eq!(hits.len(), 1);
+    let hit = hits.first().context("hit")?;
+    assert_eq!(hit.get("approval").and_then(Value::as_str), Some("none"));
+    assert!(hit.get("unavailable_reason").is_none());
     assert_eq!(offers.lock().find("prx_offer"), Some(reference));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     closed.store(true, Ordering::Release);

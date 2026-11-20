@@ -202,19 +202,11 @@ pub(super) fn current_spawn_execution_context() -> Option<SpawnExecutionContext>
     SPAWN_EXECUTION_CONTEXT.try_with(|ctx| ctx.clone()).ok()
 }
 
-pub(super) fn spawn_session_scope_key(
-    parent_ctx: Option<&SpawnExecutionContext>,
-    scope: Option<&SpawnScope>,
-) -> String {
-    if let Some(parent) = parent_ctx {
-        return parent.session_scope_key.clone();
-    }
-
-    if let Some(scope) = scope {
-        return format!("{}:{}:{}", scope.channel, scope.chat_id, scope.sender);
-    }
-
-    "sessions_spawn:global".to_string()
+/// The session key every row of an ordinary spawned run records under. The
+/// caller link is carried by `parent_session_key` and `parent_run_id`, so a
+/// child never writes into its parent's conversation key.
+pub(super) fn spawn_session_key(run_id: &str) -> String {
+    format!("spawn:{run_id}")
 }
 
 #[derive(Debug, Clone, Default)]

@@ -22,6 +22,25 @@ pub(crate) use discovery_admission::{
 };
 
 pub(crate) const MAX_SEARCH_HITS: usize = 5;
+
+/// One discovery entry's real admission in the searching turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DiscoveryTurnState {
+    Callable,
+    ApprovalRequired,
+    Unavailable(&'static str),
+}
+
+impl DiscoveryTurnState {
+    /// The hit's `approval` code and, when unavailable, its reason.
+    const fn wire(self) -> (&'static str, Option<&'static str>) {
+        match self {
+            Self::Callable => ("none", None),
+            Self::ApprovalRequired => ("required", None),
+            Self::Unavailable(reason) => ("unavailable", Some(reason)),
+        }
+    }
+}
 pub(crate) const MAX_QUERY_BYTES: usize = 1024;
 
 #[derive(Deserialize)]
@@ -167,6 +186,8 @@ pub(crate) struct CapabilitySearchHit {
     pub(crate) effect: &'static str,
     pub(crate) risk: &'static str,
     pub(crate) approval: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) unavailable_reason: Option<&'static str>,
     pub(crate) channel_eligible: bool,
     pub(crate) schema: ToolSpec,
 }
@@ -187,6 +208,7 @@ pub(crate) struct DiscoveryScope {
     offers: Weak<parking_lot::Mutex<DiscoveryOffers>>,
     closed: Weak<std::sync::atomic::AtomicBool>,
     descriptors: Weak<crate::tools::execution::ToolExecutionService>,
+    states: BTreeMap<CapabilityId, DiscoveryTurnState>,
 }
 
 pub(crate) struct DiscoveryEntry {
@@ -203,6 +225,7 @@ impl DiscoveryScope {
         offers: Weak<parking_lot::Mutex<DiscoveryOffers>>,
         closed: Weak<std::sync::atomic::AtomicBool>,
         descriptors: Weak<crate::tools::execution::ToolExecutionService>,
+        states: BTreeMap<CapabilityId, DiscoveryTurnState>,
     ) -> Self {
         Self {
             catalog,
@@ -211,6 +234,7 @@ impl DiscoveryScope {
             offers,
             closed,
             descriptors,
+            states,
         }
     }
 
@@ -256,6 +280,11 @@ impl DiscoveryScope {
                 ) == published.reference.fingerprint,
                 "discovered capability schema changed"
             );
+            let (approval, unavailable_reason) = self
+                .states
+                .get(&hit.entry.id)
+                .context("discovery result has no turn admission state")?
+                .wire();
             issued.push((hit.entry.public_name.clone(), published.reference.clone()));
             let entry = hit.entry;
             let schema = ToolSpec {
@@ -276,7 +305,8 @@ impl DiscoveryScope {
                     crate::acl::approval_grant::RiskLevel::Medium => "medium",
                     crate::acl::approval_grant::RiskLevel::High => "high",
                 },
-                approval: entry.approval.code(),
+                approval,
+                unavailable_reason,
                 channel_eligible: entry.channel_eligible,
                 schema,
             });

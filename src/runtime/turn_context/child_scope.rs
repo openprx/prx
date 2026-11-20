@@ -158,11 +158,19 @@ impl TurnRuntimeService {
             return None;
         }
         let direct = if names_delegator {
-            crate::tools::capability::search::CatalogSearch::exact_mentions(
-                catalog,
-                input,
-                usize::from(self.generation.effective.decision_engine.max_candidates),
-            )?
+            let limit = usize::from(self.generation.effective.decision_engine.max_candidates);
+            // An over-limit mention list names no tools: dropping mentions
+            // only shrinks the requested set, so it never widens authority
+            // and never removes spawning.
+            crate::tools::capability::search::CatalogSearch::exact_mentions(catalog, input, limit).unwrap_or_else(
+                || {
+                    tracing::debug!(
+                        limit,
+                        "child input names more tools than the mention limit; treating it as naming none"
+                    );
+                    Vec::new()
+                },
+            )
         } else {
             Vec::new()
         };
@@ -216,15 +224,19 @@ impl TurnRuntimeService {
             });
         for reference in references {
             let entry = catalog.entry_any(&reference.id)?;
-            if !permitted(entry)
-                || entry.fingerprint != reference.fingerprint
-                || entry.generation != reference.generation
-            {
+            if entry.fingerprint != reference.fingerprint || entry.generation != reference.generation {
                 return None;
+            }
+            // Naming a tool never removes spawning: a mention the turn may
+            // not grant, or one outside the inherited manifest, is dropped.
+            // Dropping only shrinks the requested set, so it never widens
+            // authority.
+            if !permitted(entry) {
+                continue;
             }
             if inherited.is_some() {
                 if !allowed.contains(&reference) {
-                    return None;
+                    continue;
                 }
             } else {
                 allowed.insert(reference.clone());

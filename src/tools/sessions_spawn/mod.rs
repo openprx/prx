@@ -62,7 +62,7 @@ use self::events::{record_spawn_request_event, record_spawn_result_event, spawn_
 pub(crate) use self::failure::KILLED_BY_USER_REASON;
 use self::failure::{
     EXITED_WITHOUT_RESULT_PREFIX, PANICKED_BEFORE_RESULT_SUFFIX, PROCESS_OWNER_PANICKED_PREFIX,
-    TERMINATED_BEFORE_RESULT_SUFFIX, TerminationCause, exited_without_result_reason, spawn_completion_note,
+    TERMINATED_BEFORE_RESULT_SUFFIX, TerminationCause, exited_without_result_reason, spawn_started_text,
     sub_agent_reported_failure, task_failure_reason, termination_cause,
 };
 #[cfg(test)]
@@ -92,8 +92,7 @@ use self::process_mode::run_sub_agent_process;
 use self::provider::resolve_child_provider_api_key;
 pub(crate) use self::scope::{SPAWN_EXECUTION_CONTEXT, SpawnExecutionContext, ambient_channel_excluded_tools};
 use self::scope::{
-    SpawnLineage, SpawnScope, current_spawn_execution_context, parse_spawn_scope, spawn_lineage,
-    spawn_session_scope_key,
+    SpawnLineage, SpawnScope, current_spawn_execution_context, parse_spawn_scope, spawn_lineage, spawn_session_key,
 };
 #[cfg(test)]
 use self::spawn::resolve_pinned_child_compaction;

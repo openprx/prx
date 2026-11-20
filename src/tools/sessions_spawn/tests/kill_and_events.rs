@@ -198,38 +198,53 @@ async fn spawn_records_request_and_result_message_events() {
     let run_id = &runs.first().expect("test: event fixture registered a run").id;
     wait_for_run_finished(&tool, run_id).await;
 
-    let principal = MemoryPrincipal {
+    let principal = |session_key: &str| MemoryPrincipal {
         require_owner_match: false,
         workspace_id: "/tmp".to_string(),
         agent_id: None,
         persona_id: None,
-        session_key: Some("telegram:chat-1:alice".to_string()),
+        session_key: Some(session_key.to_string()),
         channel: Some("telegram".to_string()),
         sender: Some("alice".to_string()),
         owner_id: None,
         legacy_session_key: None,
         agent_partition: None,
     };
-    let mut events = Vec::new();
-    let mut after_id = 0;
     // Claims and provider audit events share the cursor stream. Read every
     // page before checking the turn's durable conversation projections.
-    for page_index in 0..MAX_EVENT_PAGES {
-        let page = memory
-            .list_message_events_since(&principal, after_id, 10)
-            .await
-            .expect("test: read conversation event page");
-        let Some(last) = page.last() else { break };
-        assert!(last.id > after_id, "message-event cursor must advance");
-        after_id = last.id;
-        events.extend(page);
-        assert!(
-            page_index + 1 < MAX_EVENT_PAGES,
-            "test: event stream exceeded fixture budget"
-        );
-    }
+    let read_all = |principal: MemoryPrincipal| {
+        let memory = Arc::clone(&memory);
+        async move {
+            let mut events = Vec::new();
+            let mut after_id = 0;
+            for page_index in 0..MAX_EVENT_PAGES {
+                let page = memory
+                    .list_message_events_since(&principal, after_id, 10)
+                    .await
+                    .expect("test: read conversation event page");
+                let Some(last) = page.last() else { break };
+                assert!(last.id > after_id, "message-event cursor must advance");
+                after_id = last.id;
+                events.extend(page);
+                assert!(
+                    page_index + 1 < MAX_EVENT_PAGES,
+                    "test: event stream exceeded fixture budget"
+                );
+            }
+            events
+        }
+    };
+    // The parent conversation keeps its own key; the spawned run records
+    // under `spawn:<run_id>` and holds no row of the parent.
+    let parent_events = read_all(principal("telegram:chat-1:alice")).await;
+    let child_key = format!("spawn:{run_id}");
+    let events = read_all(principal(&child_key)).await;
+    assert!(
+        parent_events.iter().all(|event| event.source != "sessions_spawn"),
+        "no spawned-run row lands under the parent key"
+    );
 
-    let parent_event = events
+    let parent_event = parent_events
         .iter()
         .find(|event| event.role == "user" && event.source == "channel")
         .expect("admitted parent message event");
@@ -277,22 +292,7 @@ async fn spawn_records_request_and_result_message_events() {
     );
 
     let memory_events = memory
-        .list_memory_events_since(
-            &MemoryPrincipal {
-                require_owner_match: false,
-                workspace_id: "/tmp".to_string(),
-                agent_id: None,
-                persona_id: None,
-                session_key: Some("telegram:chat-1:alice".to_string()),
-                channel: Some("telegram".to_string()),
-                sender: Some("alice".to_string()),
-                owner_id: None,
-                legacy_session_key: None,
-                agent_partition: None,
-            },
-            0,
-            20,
-        )
+        .list_memory_events_since(&principal(&child_key), 0, 20)
         .await
         .unwrap();
     let task_events = memory_events
@@ -402,7 +402,7 @@ async fn spawn_probe_run(
                 workspace_id: "/tmp".to_string(),
                 agent_id: None,
                 persona_id: None,
-                session_key: Some("telegram:chat-1:alice".to_string()),
+                session_key: Some(format!("spawn:{run_id}")),
                 channel: Some("telegram".to_string()),
                 sender: Some("alice".to_string()),
                 owner_id: None,

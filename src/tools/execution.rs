@@ -3690,7 +3690,7 @@ fn tool_execution_event_input(
         channel: context.envelope.channel.clone(),
         session_key: Some(context.envelope.session_key.clone()),
         agent_partition: context.envelope.agent_partition.clone(),
-        parent_session_key: context.envelope.legacy_session_key.clone(),
+        parent_session_key: context.envelope.parent_session_key.clone(),
         run_id: context.envelope.run_id.clone(),
         parent_run_id: context.envelope.parent_run_id.clone(),
         agent_id: context.envelope.agent_id.clone(),

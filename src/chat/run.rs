@@ -4180,8 +4180,8 @@ Retry with a compatible model: /provider {shown} <model>",
         // D8-4: seed a turn-root spawn execution context so a sub-agent spawned
         // directly from this chat turn inherits parent_run_id = the per-turn
         // run_id. spawn_depth starts at 0 and is_turn_root keeps the first child's
-        // reported depth at 0 (a turn is not itself a spawn). The chat session key is the
-        // turn's spawn session scope.
+        // reported depth at 0 (a turn is not itself a spawn). A spawned child records
+        // under its own `spawn:<run_id>` key, never under this chat session key.
         let turn_spawn_ctx = crate::tools::sessions_spawn::SpawnExecutionContext::seed_turn_context(
             turn_run_id.clone(),
             chat_session_key.clone(),

@@ -687,9 +687,12 @@ async fn a_standalone_spawn_announces_exactly_as_before() {
         "the confirmation text is unchanged: {}",
         result.output
     );
+    // The run id is followed by the child's spawn ability, then the
+    // unchanged completion note.
     assert!(
-        result.output.ends_with("). Will announce result when complete."),
-        "the confirmation text is unchanged: {}",
+        result.output.contains("). Child can spawn: ")
+            && result.output.ends_with(". Will announce result when complete."),
+        "the confirmation states the child's spawn ability and the completion note: {}",
         result.output
     );
 

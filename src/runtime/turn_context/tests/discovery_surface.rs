@@ -1199,3 +1199,54 @@ async fn production_discovery_selects_a_skill_and_loads_its_body_only_on_executi
     context.terminal_execution_trace();
     service.shutdown(Instant::now() + Duration::from_secs(5)).await;
 }
+
+/// A search hit states the searching turn's own admission, not the catalog's
+/// static approval label: the same effectful deferred tool is `required` at a
+/// Supervised root and `none` at a Full root. The Full child half of this
+/// rule (a delegator without an outgoing manifest is `unavailable` with its
+/// reason) runs through real child turns in
+/// `tools::sessions_spawn::tests::recursive`.
+#[tokio::test]
+async fn capability_search_hits_report_the_turns_own_admission() {
+    for (autonomy, approval) in [
+        (crate::security::AutonomyLevel::Supervised, "required"),
+        (crate::security::AutonomyLevel::Full, "none"),
+    ] {
+        let turn = discovery_turn(DiscoveryTurnSpec {
+            autonomy,
+            direct: &["file_read"],
+            excluded: &[],
+            peers: &["prx_local_write"],
+            plan: false,
+            input: "record the release note",
+            run: "prx_discovery_admission_state",
+        })
+        .await;
+        let DiscoveryTurn {
+            service,
+            proof,
+            context,
+            ..
+        } = &turn;
+        let entry = service
+            .catalog()
+            .entry_for_public_name("prx_local_write")
+            .expect("test: fixture write entry");
+        assert_eq!(entry.effect.as_str(), "local_write", "test: the peer is effectful");
+        let port = service.capability_search_port(proof, context).unwrap();
+        let hits = model_search(&port, "prx_local_write", 1).await;
+        let hit = hits
+            .iter()
+            .find(|hit| hit.pointer("/schema/name").and_then(serde_json::Value::as_str) == Some("prx_local_write"))
+            .unwrap_or_else(|| panic!("{autonomy:?}: no hit for prx_local_write: {hits:?}"));
+        assert_eq!(
+            hit.get("approval").and_then(serde_json::Value::as_str),
+            Some(approval),
+            "{autonomy:?}: {hit}"
+        );
+        assert!(hit.get("unavailable_reason").is_none(), "{autonomy:?}: {hit}");
+        assert_eq!(turn.dispatches.load(Ordering::SeqCst), 0);
+        context.terminal_execution_trace();
+        service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+    }
+}

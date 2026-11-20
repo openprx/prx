@@ -57,18 +57,53 @@ pub(crate) enum RecursiveDelegationRefused {
 }
 
 impl RecursiveDelegationRefused {
-    /// The derivation hit a real bound (no delegator in the sealed parent set,
-    /// no strict subset left, or no depth left), not an integrity failure.
-    const fn is_bound(&self) -> bool {
-        matches!(
-            self,
-            Self::NoDelegator
-                | Self::DepthExhausted
-                | Self::Manifest(
-                    crate::tools::capability::child::ChildManifestError::NotStrictSubset
-                        | crate::tools::capability::child::ChildManifestError::DepthExhausted
-                )
-        )
+    /// The leaf reason when the derivation hit a real bound (no delegator in
+    /// the sealed parent set, no strict subset left, or no depth left).
+    /// `None` is an integrity failure, which is never masked.
+    const fn bound_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::NoDelegator => Some("no_delegator"),
+            Self::DepthExhausted
+            | Self::Manifest(crate::tools::capability::child::ChildManifestError::DepthExhausted) => {
+                Some("spawn_depth_exhausted")
+            }
+            Self::Manifest(crate::tools::capability::child::ChildManifestError::NotStrictSubset) => {
+                Some("not_strict_subset")
+            }
+            Self::ForeignParent | Self::Manifest(_) | Self::Caller(_) => None,
+        }
+    }
+}
+
+/// Whether a spawned ordinary child can itself spawn, as stated in the
+/// `sessions_spawn` result and the `task.spawned` record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChildDelegation {
+    /// The child carries a recursive scope with `sessions_spawn`.
+    Recursive,
+    /// The caller passed `allow_delegation: false`.
+    OptedOut,
+    /// The flag was omitted and a bound refused the recursive scope.
+    Leaf(&'static str),
+}
+
+impl ChildDelegation {
+    /// The sentence the `sessions_spawn` result carries after the run id.
+    pub(crate) fn result_sentence(self) -> std::borrow::Cow<'static, str> {
+        match self {
+            Self::Recursive => std::borrow::Cow::Borrowed("Child can spawn: yes."),
+            Self::OptedOut => std::borrow::Cow::Borrowed("Child can spawn: no (allow_delegation=false)."),
+            Self::Leaf(reason) => std::borrow::Cow::Owned(format!("Child can spawn: no ({reason}).")),
+        }
+    }
+
+    /// The `child_delegation` code recorded on the `task.spawned` event.
+    pub(crate) fn record_code(self) -> std::borrow::Cow<'static, str> {
+        match self {
+            Self::Recursive => std::borrow::Cow::Borrowed("recursive"),
+            Self::OptedOut => std::borrow::Cow::Borrowed("opted_out"),
+            Self::Leaf(reason) => std::borrow::Cow::Owned(format!("leaf:{reason}")),
+        }
     }
 }
 
@@ -211,29 +246,37 @@ impl OrdinaryChildPublication {
     /// the inherited surface exclusions nor the named agent's allowance hide
     /// it). A child that could not run the delegator gets no recursive scope:
     /// the delegator is then absent for it ([`RecursiveDelegationRefused::NoDelegator`]).
+    ///
+    /// The returned [`ChildDelegation`] states whether the issued child can
+    /// spawn and, for a bound fallback, why not.
     pub(crate) fn select_for_spawn(
         &self,
         caller: &crate::tools::ToolExecutionContext,
         request: DelegationRequest,
         delegator_served: bool,
-    ) -> Result<Self, RecursiveDelegationRefused> {
-        let derive = || {
-            if delegator_served {
-                self.with_recursive_delegation(caller)
-            } else {
-                Err(RecursiveDelegationRefused::NoDelegator)
-            }
-        };
+    ) -> Result<(Self, ChildDelegation), RecursiveDelegationRefused> {
         match request {
-            DelegationRequest::Explicit(false) => Ok(self.clone()),
-            DelegationRequest::Explicit(true) => derive(),
-            DelegationRequest::Omitted => match derive() {
-                Ok(derived) => Ok(derived),
-                Err(refused) if refused.is_bound() => {
-                    tracing::debug!(reason = %refused, "omitted allow_delegation: issuing a non-delegating child");
-                    Ok(self.clone())
-                }
-                Err(refused) => Err(refused),
+            DelegationRequest::Explicit(false) => Ok((self.clone(), ChildDelegation::OptedOut)),
+            DelegationRequest::Explicit(true) if !delegator_served => Err(RecursiveDelegationRefused::NoDelegator),
+            DelegationRequest::Explicit(true) => self
+                .with_recursive_delegation(caller)
+                .map(|derived| (derived, ChildDelegation::Recursive)),
+            DelegationRequest::Omitted if !delegator_served => {
+                tracing::info!(
+                    reason = "child_cannot_serve_sessions_spawn",
+                    "omitted allow_delegation: issuing a non-delegating child"
+                );
+                Ok((self.clone(), ChildDelegation::Leaf("child_cannot_serve_sessions_spawn")))
+            }
+            DelegationRequest::Omitted => match self.with_recursive_delegation(caller) {
+                Ok(derived) => Ok((derived, ChildDelegation::Recursive)),
+                Err(refused) => match refused.bound_reason() {
+                    Some(reason) => {
+                        tracing::info!(%refused, reason, "omitted allow_delegation: issuing a non-delegating child");
+                        Ok((self.clone(), ChildDelegation::Leaf(reason)))
+                    }
+                    None => Err(refused),
+                },
             },
         }
     }

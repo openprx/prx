@@ -42,6 +42,7 @@ pub(super) async fn record_spawn_request_event(
     mode: &str,
     selection: (&str, &str),
     lineage: &SpawnLineage,
+    child_delegation: Option<&str>,
 ) -> anyhow::Result<Option<Arc<crate::runtime::child_source::ChildInputReceipt>>> {
     let Some(fabric) = fabric else {
         return Ok(None);
@@ -64,6 +65,11 @@ pub(super) async fn record_spawn_request_event(
     let receipt =
         crate::runtime::child_source::record_child_input(fabric, scope, task, None, Some(metadata.to_string())).await?;
     delegation::append_task(&mut metadata, task)?;
+    // Only the task record states it. The child-input payload is read back
+    // with `deny_unknown_fields` and owns the `delegation` key.
+    if let (Some(code), Some(object)) = (child_delegation, metadata.as_object_mut()) {
+        object.insert("child_delegation".to_owned(), serde_json::Value::from(code));
+    }
     if let Err(error) = fabric
         .record_task_event(task_event_scope, task_id, "task.spawned", Some(metadata.to_string()))
         .await

@@ -8,7 +8,9 @@ use std::sync::atomic::Ordering;
 
 use anyhow::Context as _;
 
-use super::{CapabilitySearchPort, DiscoveryEntry, DiscoveryOffers, DiscoveryScope, MAX_SEARCH_HITS};
+use super::{
+    CapabilitySearchPort, DiscoveryEntry, DiscoveryOffers, DiscoveryScope, DiscoveryTurnState, MAX_SEARCH_HITS,
+};
 use crate::capability::CapabilityAvailabilityLevel;
 use crate::runtime::turn_source::TurnSourceProof;
 use crate::tools::ToolSpec;
@@ -114,6 +116,7 @@ pub(crate) fn capability_search_port(
         "turn does not expose capability search"
     );
     let entries = discovery_entries(port, proof)?;
+    let states = discovery_turn_states(port, proof, &entries)?;
     let offers = port.discovery().offers.get_or_init(Default::default);
     Ok(CapabilitySearchPort::new(Arc::new(DiscoveryScope::published(
         Arc::clone(port.catalog()),
@@ -122,7 +125,49 @@ pub(crate) fn capability_search_port(
         Arc::downgrade(offers),
         Arc::downgrade(port.execution_closed()),
         Arc::downgrade(port.execution()),
+        states,
     ))))
+}
+
+/// This turn's real admission of every discovery entry, by the same rules
+/// [`prepare_discovered_tool`] applies to a selected offer. A search hit
+/// states this, never the catalog's static approval label.
+fn discovery_turn_states(
+    port: &dyn TurnSurfacePort,
+    proof: &dyn TurnSourceProof,
+    entries: &BTreeMap<CapabilityId, DiscoveryEntry>,
+) -> anyhow::Result<BTreeMap<CapabilityId, DiscoveryTurnState>> {
+    let view = port.catalog_view();
+    let rules = rules(port, &view);
+    let model = port.resolve_model(proof)?;
+    let incoming = proof.child_scope().map(|scope| scope.gate_inputs().0);
+    let mut states = BTreeMap::new();
+    for (id, discovered) in entries {
+        let entry = view
+            .entry_any(id)
+            .context("discovery entry is absent from the catalog")?;
+        let delegation = is_delegator(&entry.public_name);
+        let state = if rules.restricts(entry) {
+            DiscoveryTurnState::Unavailable("turn_restricted")
+        } else if delegation && !port.outgoing_child() {
+            DiscoveryTurnState::Unavailable(match incoming {
+                Some(manifest) if manifest.authority.remaining_depth == 0 => "spawn_depth_exhausted",
+                Some(manifest) if !manifest.allowed.iter().any(|reference| reference.id == entry.id) => {
+                    "spawn_not_granted"
+                }
+                _ => "no_child_manifest",
+            })
+        } else {
+            let estimate = crate::cost::estimate::estimate_cost(&model, &port.config().cost, entry.schema_bytes);
+            match rules.capability(entry, &discovered.reference, delegation, estimate) {
+                PublicationAdmission::Passed => DiscoveryTurnState::Callable,
+                PublicationAdmission::ApprovalRequired => DiscoveryTurnState::ApprovalRequired,
+                PublicationAdmission::Blocked { reason_code, .. } => DiscoveryTurnState::Unavailable(reason_code),
+            }
+        };
+        states.insert(id.clone(), state);
+    }
+    Ok(states)
 }
 
 /// Discovery eligibility: the entries this turn's search may index.

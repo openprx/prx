@@ -731,7 +731,17 @@ fn admission_clone(tool: &SessionsSpawnTool) -> SessionsSpawnTool {
 /// the tool this way; a raw unit call has neither a parent grant nor an
 /// ordinary publication and must fail closed.
 async fn execute_admitted_spawn(tool: &SessionsSpawnTool, arguments: serde_json::Value) -> anyhow::Result<ToolResult> {
-    execute_admitted_spawn_with_plane(tool, arguments, false, None).await
+    execute_admitted_spawn_with_plane(tool, arguments, false, None, Vec::new()).await
+}
+
+/// `execute_admitted_spawn` with `extra` registered beside the spawn tool in
+/// the admitted parent's catalog, so a child turn can discover them.
+async fn execute_admitted_spawn_with_tools(
+    tool: &SessionsSpawnTool,
+    arguments: serde_json::Value,
+    extra: Vec<Box<dyn Tool>>,
+) -> anyhow::Result<ToolResult> {
+    execute_admitted_spawn_with_plane(tool, arguments, false, None, extra).await
 }
 
 /// `execute_admitted_spawn` with the root dispatch under `approval`, as a
@@ -741,14 +751,14 @@ async fn execute_admitted_spawn_with_approval(
     arguments: serde_json::Value,
     approval: Arc<dyn crate::tools::ApprovalStrategy>,
 ) -> anyhow::Result<ToolResult> {
-    execute_admitted_spawn_with_plane(tool, arguments, false, Some(approval)).await
+    execute_admitted_spawn_with_plane(tool, arguments, false, Some(approval), Vec::new()).await
 }
 
 async fn execute_enabled_admitted_spawn(
     tool: &SessionsSpawnTool,
     arguments: serde_json::Value,
 ) -> anyhow::Result<ToolResult> {
-    execute_admitted_spawn_with_plane(tool, arguments, true, None).await
+    execute_admitted_spawn_with_plane(tool, arguments, true, None, Vec::new()).await
 }
 
 async fn execute_admitted_spawn_with_plane(
@@ -756,6 +766,7 @@ async fn execute_admitted_spawn_with_plane(
     arguments: serde_json::Value,
     decision_enabled: bool,
     approval: Option<Arc<dyn crate::tools::ApprovalStrategy>>,
+    extra: Vec<Box<dyn Tool>>,
 ) -> anyhow::Result<ToolResult> {
     fn fixture_price() -> crate::config::schema::ModelPricing {
         crate::config::schema::ModelPricing {
@@ -892,8 +903,11 @@ async fn execute_admitted_spawn_with_plane(
     let provider = Arc::clone(tool.test_parent_provider());
     let provider_name = tool.provider_name.clone();
     let model_name = tool.model.clone();
-    let registry =
-        crate::agent::test_admission::registry_with_search(vec![crate::tools::ArcDelegatingTool::boxed(shared)]);
+    let registry = crate::agent::test_admission::registry_with_search(
+        std::iter::once(crate::tools::ArcDelegatingTool::boxed(shared))
+            .chain(extra)
+            .collect(),
+    );
     let chat_kind = match field("chat_type") {
         Some("group") => crate::channels::traits::ChatKind::Group,
         Some("thread") => crate::channels::traits::ChatKind::Thread,

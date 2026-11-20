@@ -1095,8 +1095,8 @@ pub(super) async fn run_channel_turn(
     // directly from this channel turn inherits parent_run_id = the per-turn
     // run_id (top-level lineage was previously None). spawn_depth starts at 0 and
     // is_turn_root keeps the first child's reported depth at 0 (a turn is not
-    // itself a spawn). The session scope key mirrors the spawn scope convention
-    // (channel:chat_id:sender) so children share the turn's session scope.
+    // itself a spawn). A spawned child records under its own `spawn:<run_id>`
+    // key and links back through `parent_session_key`, never this scope key.
     let turn_spawn_session_scope_key = format!("{}:{}:{}", msg.channel, msg.reply_target, msg.sender);
     // The channel surface's hidden tool names travel with the context: a
     // sub-agent spawned from this turn answers the same conversation partner, so
