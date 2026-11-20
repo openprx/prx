@@ -25,8 +25,13 @@ pub fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<
     let tz = pick(&ctx.timezone, &defaults.timezone);
     let comm_style = pick(&ctx.communication_style, &defaults.communication_style);
     let (agent, user, tz, comm_style) = (agent.as_str(), user.as_str(), tz.as_str(), comm_style.as_str());
-    std::fs::create_dir_all(workspace_dir)?;
-    for subdir in ["sessions", "memory", "state", "cron", "skills"] {
+    // Owner-only whatever the umask, as `prx init` creates them: recovery
+    // activation and cost state refuse group-writable directories.
+    crate::util::create_private_dir_all(workspace_dir)?;
+    for subdir in ["memory", "state"] {
+        crate::util::create_private_dir_all(&workspace_dir.join(subdir))?;
+    }
+    for subdir in ["sessions", "cron", "skills"] {
         std::fs::create_dir_all(workspace_dir.join(subdir))?;
     }
     let files: &[(&str, String)] = &[

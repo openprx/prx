@@ -208,12 +208,11 @@ impl Config {
 
         let config_path = openprx_dir.join("config.toml");
 
-        fs::create_dir_all(&openprx_dir)
-            .await
-            .with_context(|| config_dir_creation_error(&openprx_dir))?;
-        fs::create_dir_all(&workspace_dir)
-            .await
-            .context("Failed to create workspace directory")?;
+        // Created owner-only whatever the umask: recovery activation and the
+        // ingress lease refuse a group-writable config or workspace directory.
+        // An existing directory is left as it is and refused with its reason.
+        crate::util::create_private_dir_all(&openprx_dir).with_context(|| config_dir_creation_error(&openprx_dir))?;
+        crate::util::create_private_dir_all(&workspace_dir).context("Failed to create workspace directory")?;
 
         if config_path.exists() {
             crate::config::files::recover_unfinished_config_generation(&config_path, &workspace_dir)

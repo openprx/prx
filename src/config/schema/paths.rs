@@ -194,7 +194,7 @@ pub(crate) async fn persist_active_workspace_config_dir_at(config_dir: &Path, de
         return Ok(());
     }
 
-    fs::create_dir_all(&default_config_dir).await.with_context(|| {
+    crate::util::create_private_dir_all(default_config_dir).with_context(|| {
         format!(
             "Failed to create default config directory: {}",
             default_config_dir.display()

@@ -1352,8 +1352,8 @@ async fn commit_mutation_locked(
         .config_path
         .parent()
         .context("Config path must have a parent directory")?;
-    fs::create_dir_all(parent)
-        .await
+    // Owner-only whatever the umask (see `Config::load_or_init_with_config_dir`).
+    crate::util::create_private_dir_all(parent)
         .with_context(|| format!("Failed to create config directory: {}", parent.display()))?;
     let _transaction_lock = crate::self_system::evolution::safety_utils::acquire_file_lock(&plan.config_path).await?;
 

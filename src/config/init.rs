@@ -1090,9 +1090,14 @@ fn finish_after_commit(
     identity: Option<&crate::identity::scaffold::ProjectContext>,
 ) -> Result<()> {
     write_managed_defaults(target_dir, managed_defaults)?;
-    std::fs::create_dir_all(workspace_dir)
+    // The workspace and its memory directory are created owner-only whatever
+    // the umask: recovery activation refuses a group-writable ancestor of the
+    // memory directory and a memory directory that is not 0700.
+    crate::util::create_private_dir_all(workspace_dir)
         .with_context(|| format!("Failed to create workspace in {}", target_dir.display()))?;
-    for subdir in &["sessions", "memory", "cron", "skills"] {
+    crate::util::create_private_dir_all(&workspace_dir.join("memory"))
+        .with_context(|| format!("Failed to create workspace/memory in {}", target_dir.display()))?;
+    for subdir in &["sessions", "cron", "skills"] {
         std::fs::create_dir_all(workspace_dir.join(subdir))
             .with_context(|| format!("Failed to create workspace/{subdir} in {}", target_dir.display()))?;
     }
