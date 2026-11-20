@@ -32,6 +32,12 @@ pub struct ChatTurn {
     /// the handoff sanitizing exception.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub context_handoff: bool,
+    /// The runtime's record of the tool calls this assistant reply made,
+    /// replayed to the provider with the reply. `None` for every turn that
+    /// was not recorded through a driver turn (user turns, untracked paths,
+    /// turns saved before the record existed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_evidence: Option<crate::agent::tool_evidence::TurnToolEvidence>,
 }
 
 /// Condensed record of a tool call for session replay.
@@ -352,6 +358,7 @@ impl ChatSession {
             timestamp: Utc::now(),
             tool_calls: Vec::new(),
             context_handoff: false,
+            tool_evidence: None,
         });
         self.updated_at = Utc::now();
 
@@ -369,6 +376,7 @@ impl ChatSession {
             timestamp: Utc::now(),
             tool_calls,
             context_handoff: false,
+            tool_evidence: None,
         });
         self.updated_at = Utc::now();
     }

@@ -65,6 +65,20 @@ impl SystemPromptBuilder {
         }
     }
 
+    /// The builder of a session whose assistant turns carry tool evidence:
+    /// the rule that explains the evidence marker follows the task section's
+    /// tool-use rules (or ends the prompt when there is no task section).
+    #[must_use]
+    pub fn with_tool_evidence_rule(mut self) -> Self {
+        let at = self
+            .sections
+            .iter()
+            .position(|section| section.name() == "task")
+            .map_or(self.sections.len(), |index| index.saturating_add(1));
+        self.sections.insert(at, Box::new(ToolEvidenceSection));
+        self
+    }
+
     pub fn add_section(mut self, section: Box<dyn PromptSection>) -> Self {
         self.sections.push(section);
         self
@@ -118,6 +132,8 @@ pub struct SkillsSection;
 pub struct WorkspaceSection;
 pub struct RuntimeSection;
 pub struct DateTimeSection;
+/// The tool-evidence rule (`tool_evidence::TOOL_EVIDENCE_PROMPT_RULE`).
+pub struct ToolEvidenceSection;
 
 impl PromptSection for IdentitySection {
     fn name(&self) -> &str {
@@ -189,6 +205,16 @@ impl PromptSection for TaskSection {
                     .to_string(),
             )
         }
+    }
+}
+
+impl PromptSection for ToolEvidenceSection {
+    fn name(&self) -> &str {
+        "tool_evidence"
+    }
+
+    fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
+        Ok(crate::agent::tool_evidence::TOOL_EVIDENCE_PROMPT_RULE.to_owned())
     }
 }
 

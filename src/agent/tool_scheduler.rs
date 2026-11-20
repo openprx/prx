@@ -1,5 +1,6 @@
 use crate::agent::execution_policy::{is_write_tool, preview_tool_arguments};
 use crate::agent::tool_call_parser::{ParsedToolCall, unparseable_native_arguments};
+use crate::agent::tool_evidence::ToolCallOutcome;
 use crate::agent::tool_result_recording::{ObservedToolResult, ToolResultRecorder};
 use crate::agent::turn_contracts::{
     ChatMode, ToolLoopCancelled, ToolLoopEvent, ToolLoopRuntimeAdapter, emit_tool_loop_event,
@@ -192,6 +193,7 @@ async fn execute_one_unrecorded(
                 success: false,
                 duration_ms: 0,
                 result: result.clone(),
+                outcome: ToolCallOutcome::Refused,
             },
         )
         .await?;
@@ -214,6 +216,7 @@ async fn execute_one_unrecorded(
                 success: false,
                 duration_ms: 0,
                 result: result.clone(),
+                outcome: ToolCallOutcome::Refused,
             },
         )
         .await?;
@@ -253,6 +256,7 @@ async fn execute_one_unrecorded(
                 success: false,
                 duration_ms: 0,
                 result: result.clone(),
+                outcome: ToolCallOutcome::Refused,
             },
         )
         .await?;
@@ -279,6 +283,7 @@ async fn execute_one_unrecorded(
                 success: true,
                 duration_ms: 0,
                 result: result.clone(),
+                outcome: ToolCallOutcome::PlanOnly,
             },
         )
         .await?;
@@ -298,6 +303,7 @@ async fn execute_one_unrecorded(
                         success: false,
                         duration_ms: 0,
                         result: result.clone(),
+                        outcome: ToolCallOutcome::Refused,
                     },
                 )
                 .await?;
@@ -324,6 +330,7 @@ async fn execute_one_unrecorded(
     // that an unsuccessful shell command actually started.
     let executed = outcome.result.is_some() && outcome.process.as_ref().map_or(success, |process| process.started);
     let status = outcome.status;
+    let approval_denial_cause = outcome.approval_denial_cause;
     let result = outcome.model_content;
     emit_tool_loop_event(
         adapter,
@@ -333,6 +340,7 @@ async fn execute_one_unrecorded(
             success,
             duration_ms: outcome.duration_ms,
             result: result.clone(),
+            outcome: ToolCallOutcome::from_status(status, approval_denial_cause),
         },
     )
     .await?;

@@ -214,6 +214,28 @@ pub fn build_system_prompt_with_mode(
     bootstrap_max_chars: Option<usize>,
     native_tools: bool,
 ) -> String {
+    build_system_prompt_with_builder(
+        crate::agent::prompt::SystemPromptBuilder::with_defaults(),
+        workspace_dir,
+        model_name,
+        skills,
+        identity_config,
+        bootstrap_max_chars,
+        native_tools,
+    )
+}
+
+/// [`build_system_prompt_with_mode`] compiled by `builder`: the canonical
+/// sections, plus any section a caller's session adds to them.
+pub(crate) fn build_system_prompt_with_builder(
+    builder: crate::agent::prompt::SystemPromptBuilder,
+    workspace_dir: &std::path::Path,
+    model_name: &str,
+    skills: &[crate::skills::Skill],
+    identity_config: Option<&crate::config::IdentityConfig>,
+    bootstrap_max_chars: Option<usize>,
+    native_tools: bool,
+) -> String {
     let context = crate::agent::prompt::PromptContext {
         workspace_dir,
         model_name,
@@ -222,11 +244,8 @@ pub fn build_system_prompt_with_mode(
         bootstrap_max_chars,
         native_tools,
     };
-    crate::agent::prompt::SystemPromptBuilder::with_defaults()
-        .build(&context)
-        .unwrap_or_else(|error| {
-            tracing::error!(%error, "failed to build canonical system prompt");
-            "You are OpenPRX, a fast and efficient AI assistant built in Rust. Be helpful, concise, and direct."
-                .to_string()
-        })
+    builder.build(&context).unwrap_or_else(|error| {
+        tracing::error!(%error, "failed to build canonical system prompt");
+        "You are OpenPRX, a fast and efficient AI assistant built in Rust. Be helpful, concise, and direct.".to_string()
+    })
 }

@@ -91,6 +91,7 @@ fn sentinel_session() -> ChatSession {
                 sequence: None,
             }],
             context_handoff: false,
+            tool_evidence: None,
         },
         ChatTurn {
             role: "assistant".to_owned(),
@@ -98,6 +99,7 @@ fn sentinel_session() -> ChatSession {
             timestamp: chrono::Utc::now(),
             tool_calls: Vec::new(),
             context_handoff: false,
+            tool_evidence: None,
         },
         ChatTurn {
             role: "user".to_owned(),
@@ -105,6 +107,7 @@ fn sentinel_session() -> ChatSession {
             timestamp: chrono::Utc::now(),
             tool_calls: Vec::new(),
             context_handoff: false,
+            tool_evidence: None,
         },
         ChatTurn {
             role: "assistant".to_owned(),
@@ -112,6 +115,7 @@ fn sentinel_session() -> ChatSession {
             timestamp: chrono::Utc::now(),
             tool_calls: Vec::new(),
             context_handoff: false,
+            tool_evidence: None,
         },
     ];
     session

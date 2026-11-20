@@ -117,23 +117,76 @@ fn conversation_lines_from_turns(turns: &[ChatTurn]) -> Vec<ConversationLine> {
 /// contents of the context handoff notes the compaction code wrote (the
 /// current patch's and every earlier one the session kept); a turn equal to
 /// one of them keeps that provenance.
+///
+/// `evidence` is the tool evidence per index of `history`
+/// ([`turn_evidence_by_history_index`], with the patch applied); a durable
+/// message keeps the evidence at its index.
 fn durable_turns_from_compacted_history(
     history: &[ChatMessage],
     handoff_notes: &std::collections::HashSet<String>,
+    evidence: &[Option<crate::agent::tool_evidence::TurnToolEvidence>],
 ) -> Vec<ChatTurn> {
     let timestamp = chrono::Utc::now();
     history
         .iter()
-        .filter(|message| crate::agent::turn_contracts::is_durable_turn_message(message))
-        .map(|message| ChatTurn {
+        .enumerate()
+        .filter(|(_, message)| crate::agent::turn_contracts::is_durable_turn_message(message))
+        .map(|(index, message)| ChatTurn {
             role: message.role.clone(),
             content: message.content.clone(),
             timestamp,
             tool_calls: Vec::new(),
             context_handoff: crate::agent::compaction::is_context_handoff_message(message)
                 && handoff_notes.contains(&message.content),
+            tool_evidence: evidence.get(index).cloned().flatten(),
         })
         .collect()
+}
+
+/// The tool evidence of `turns` per index of the reducer `history` they are
+/// stored as, and the history index where the two first disagree (if any).
+///
+/// The history's non-system messages are matched, in order, with the user
+/// and assistant turns: each pair must have the same role and the history
+/// message must be the turn's stored form ([`stored_turn_message`]). From
+/// the first mismatch on nothing is carried: a lost record is safe, a record
+/// attached to the wrong reply is not.
+///
+/// [`stored_turn_message`]: crate::agent::turn_contracts::stored_turn_message
+fn turn_evidence_by_history_index(
+    history: &[ChatMessage],
+    turns: &[ChatTurn],
+) -> (
+    Vec<Option<crate::agent::tool_evidence::TurnToolEvidence>>,
+    Option<usize>,
+) {
+    let mut evidence = vec![None; history.len()];
+    if turns.iter().all(|turn| turn.tool_evidence.is_none()) {
+        return (evidence, None);
+    }
+    let mut stored_turns = turns
+        .iter()
+        .filter(|turn| turn.role == "user" || turn.role == "assistant");
+    for (index, message) in history.iter().enumerate() {
+        if message.role == "system" {
+            continue;
+        }
+        let aligned = stored_turns.next().filter(|turn| {
+            turn.role == message.role
+                && if turn.role == "user" {
+                    crate::agent::turn_contracts::neutralize_reserved_markers(&turn.content) == message.content
+                } else {
+                    turn.content == message.content
+                }
+        });
+        let Some(turn) = aligned else {
+            return (evidence, Some(index));
+        };
+        if let Some(slot) = evidence.get_mut(index) {
+            slot.clone_from(&turn.tool_evidence);
+        }
+    }
+    (evidence, None)
 }
 
 /// The contents of the handoff notes `turns` carry with compaction
@@ -743,6 +796,9 @@ pub struct TaskToolBuffer {
     pub pending_tool_cards: Vec<usize>,
     pub tool_calls: Vec<crate::chat::session::ToolCallSummary>,
     pub tool_args: std::collections::HashMap<ToolInvocationKey, String>,
+    /// The tool evidence of the driver turn running under this key. `None`
+    /// means untracked: only `StartLLMTurn` starts a record.
+    pub evidence: Option<crate::agent::tool_evidence::TurnToolEvidence>,
 }
 
 /// Cancellation / shutdown control state.
@@ -840,18 +896,30 @@ impl ControlState {
         self.tool_buffers.entry(key).or_default()
     }
 
-    fn take_tool_calls(&mut self, key: ToolTaskKey) -> Vec<crate::chat::session::ToolCallSummary> {
+    /// Take the tool summaries and the tool evidence recorded under `key`
+    /// for the assistant turn being recorded. The buffer is dropped once it
+    /// holds nothing else.
+    fn take_tool_record(
+        &mut self,
+        key: ToolTaskKey,
+    ) -> (
+        Vec<crate::chat::session::ToolCallSummary>,
+        Option<crate::agent::tool_evidence::TurnToolEvidence>,
+    ) {
         let Some(buffer) = self.tool_buffers.get_mut(&key) else {
-            return Vec::new();
+            return (Vec::new(), None);
         };
         let calls = std::mem::take(&mut buffer.tool_calls);
+        let evidence = buffer.evidence.take();
         buffer.tool_args.clear();
-        let remove_buffer =
-            buffer.pending_tool_cards.is_empty() && buffer.tool_calls.is_empty() && buffer.tool_args.is_empty();
+        let remove_buffer = buffer.pending_tool_cards.is_empty()
+            && buffer.tool_calls.is_empty()
+            && buffer.tool_args.is_empty()
+            && buffer.evidence.is_none();
         if remove_buffer {
             self.tool_buffers.remove(&key);
         }
-        calls
+        (calls, evidence)
     }
 
     fn clear_tool_buffer(&mut self, key: ToolTaskKey) {
@@ -1318,6 +1386,12 @@ impl ChatState {
                 duration_ms,
                 result,
             } => self.reduce_tool_finished(task_id, sequence, tool_call_id, name, success, duration_ms, result),
+            Action::ToolOutcomeRecorded {
+                task_id,
+                tool_call_id,
+                name,
+                outcome,
+            } => self.reduce_tool_outcome_recorded(task_id, &tool_call_id, &name, outcome),
             Action::ToolProgress { iteration } => self.reduce_tool_progress(iteration),
             Action::ToolApprovalRequested {
                 task_id,
@@ -1458,6 +1532,8 @@ const fn ui_dirty_for(action: &Action) -> bool {
         | Action::StreamUsageMetered { .. }
         | Action::ProviderTurnReadyForCommit { .. } => false,
         Action::ToolProgress { .. } => true,
+        // Tool evidence is session state the snapshot does not show.
+        Action::ToolOutcomeRecorded { .. } => false,
         // Foreground approval writes pending view + focus.
         Action::ToolApprovalRequested { .. }
         | Action::ToolApprovalReceived { .. }

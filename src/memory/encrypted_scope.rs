@@ -1468,6 +1468,7 @@ mod tests {
                     timestamp: at,
                     tool_calls: Vec::new(),
                     context_handoff: false,
+                    tool_evidence: None,
                 });
             }
             let json = session.to_json().expect("test: serialize the chat session");

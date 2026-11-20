@@ -150,6 +150,7 @@ async fn nested_chain() -> Chain {
             timestamp: chrono::Utc::now(),
             tool_calls: Vec::new(),
             context_handoff: false,
+            tool_evidence: None,
         })
         .collect();
     Chain {
@@ -776,4 +777,89 @@ async fn a_branch_of_a_session_with_queued_turns_and_a_handoff_copies_then_switc
     .expect(
         "a_branch_of_a_session_with_queued_turns_and_a_handoff_copies_then_switches_exactly exceeded TEST_DEADLINE",
     );
+}
+
+/// One successful `shell` call, as a driver turn records it.
+fn shell_ok_evidence() -> crate::agent::tool_evidence::TurnToolEvidence {
+    let mut evidence = crate::agent::tool_evidence::TurnToolEvidence::default();
+    evidence.record("shell", crate::agent::tool_evidence::ToolCallOutcome::Ok);
+    evidence
+}
+
+#[tokio::test]
+async fn branch_and_resume_render_the_same_evidence() {
+    tokio::time::timeout(TEST_DEADLINE, async {
+        let temp = TempDir::new().expect("test: tempdir");
+        let mut source = session::ChatSession::new("test-provider", "test-model");
+        source.add_user_turn("run echo ev-1");
+        source.add_assistant_turn("EV-1", Vec::new());
+        if let Some(turn) = source.turns.last_mut() {
+            turn.tool_evidence = Some(shell_ok_evidence());
+        }
+        source.add_user_turn("say ev-2");
+        source.add_assistant_turn("EV-2", Vec::new());
+        if let Some(turn) = source.turns.last_mut() {
+            turn.tool_evidence = Some(crate::agent::tool_evidence::TurnToolEvidence::default());
+        }
+        source.add_user_turn("an old turn");
+        source.add_assistant_turn("saved before evidence existed", Vec::new());
+        let source_view = crate::chat::session_store::provider_view_for_session(&source, Some("sys"));
+
+        let keep = 4;
+        let branch = branched_chat_session_from(&source, keep, "test-provider", "test-model");
+        {
+            let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).expect("test: sqlite"));
+            crate::chat::session_store::save_session(memory.as_ref(), &branch)
+                .await
+                .expect("test: save the branch");
+        }
+        let (_memory, resumed) = restart_and_resume(temp.path(), &branch.id).await;
+        let branch_view = crate::chat::session_store::provider_view_for_session(&resumed, Some("sys"));
+
+        let contents = |view: &[ChatMessage]| view.iter().map(|message| message.content.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            contents(&branch_view),
+            contents(
+                source_view
+                    .get(..=keep)
+                    .expect("test: source view holds the copied turns")
+            ),
+            "a saved, restarted branch replays the copied turns with the source's exact bytes"
+        );
+        assert_eq!(
+            branch_view.get(2).map(|message| message.content.as_str()),
+            Some("EV-1\n\n[tool evidence: shell ok]"),
+            "the copied tool turn carries its evidence"
+        );
+        assert_eq!(
+            branch_view.get(4).map(|message| message.content.as_str()),
+            Some("EV-2\n\n[tool evidence: none]"),
+            "the copied tool-less turn says none"
+        );
+        assert_eq!(
+            source_view.last().map(|message| message.content.as_str()),
+            Some("saved before evidence existed"),
+            "a turn without a record renders nothing"
+        );
+        assert!(
+            resumed
+                .turns
+                .iter()
+                .all(|turn| !turn.content.contains("[tool evidence:")),
+            "the saved turn text never holds evidence"
+        );
+
+        let canonical =
+            crate::chat::session_store::persisted_history_for_current_turn(&resumed, "sys", "the next request");
+        let projected =
+            crate::agent::turn_history::project(&canonical, &crate::agent::turn_history::ProjectionInputs::default())
+                .into_messages();
+        assert_eq!(
+            contents(projected.get(..=keep).expect("test: projection holds the copied turns")),
+            contents(&branch_view),
+            "the projection of the canonical history renders the same bytes as the resumed view"
+        );
+    })
+    .await
+    .expect("branch_and_resume_render_the_same_evidence exceeded TEST_DEADLINE");
 }

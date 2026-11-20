@@ -1363,8 +1363,28 @@ fn adopt_committed_turn(
     }
     history.push(pending.history_user_message.clone());
     if let Some(reply) = reply {
-        history.push(ChatMessage::assistant(reply.to_owned()));
+        history.push(committed_reply_message(&acked, reply));
     }
+}
+
+/// The provider-view message of a committed reply: `reply` rendered with the
+/// tool evidence of the snapshot's newest turn when that turn is this reply
+/// (an `assistant` turn holding exactly `reply`); otherwise the bare reply,
+/// since evidence that cannot be tied to the reply is never attached to it.
+#[cfg(feature = "terminal-tui")]
+pub(super) fn committed_reply_message(acked: &crate::chat::acked_session::AckedSession, reply: &str) -> ChatMessage {
+    let evidence = acked
+        .session
+        .turns
+        .last()
+        .filter(|turn| turn.role == "assistant" && turn.content == reply)
+        .map(|turn| turn.tool_evidence.as_ref());
+    if evidence.is_none() {
+        tracing::debug!("committed reply is not the snapshot's newest assistant turn; replayed without tool evidence");
+    }
+    ChatMessage::assistant(
+        crate::agent::tool_evidence::render_assistant_content(reply, evidence.flatten()).into_owned(),
+    )
 }
 
 /// A worker turn that failed or was cancelled: settled in order after the

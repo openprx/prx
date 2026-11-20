@@ -2,7 +2,7 @@
 
 use super::{
     ChatState, Effect, ToolTaskKey, conversation_lines_from_turns, durable_turns_from_compacted_history,
-    handoff_note_contents,
+    handoff_note_contents, turn_evidence_by_history_index,
 };
 use crate::chat::action::{CompactReason, ProviderUsageRecordKind};
 use crate::chat::session::{ChatSession, MainSessionTokenUsageRecord, MainSessionTokenUsageSummary};
@@ -317,6 +317,7 @@ impl ChatState {
             timestamp: now,
             tool_calls: Vec::new(),
             context_handoff: false,
+            tool_evidence: None,
         });
         // On the first user turn with an empty title, set it automatically (as session.add_user_turn does)
         if self.session.title.is_empty() {
@@ -355,13 +356,14 @@ impl ChatState {
         task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
         content: String,
     ) -> Vec<Effect> {
-        let tool_calls = self.control.take_tool_calls(ToolTaskKey::from_task_id(task_id));
+        let (tool_calls, tool_evidence) = self.control.take_tool_record(ToolTaskKey::from_task_id(task_id));
         self.session.turns.push(crate::chat::session::ChatTurn {
             role: "assistant".to_string(),
             content: content.clone(),
             timestamp: chrono::Utc::now(),
             tool_calls,
             context_handoff: false,
+            tool_evidence,
         });
         self.session.history.push(ChatMessage::assistant(content));
         vec![Effect::LogTrace {
@@ -506,6 +508,9 @@ impl ChatState {
         compaction_config: &crate::config::AgentCompactionConfig,
     ) -> Vec<Effect> {
         let history = &mut self.session.history;
+        // The tool evidence of each stored turn, by its index in the history
+        // the patch describes; carried to the turns the patch keeps.
+        let (mut evidence, misaligned_at) = turn_evidence_by_history_index(history, &self.session.turns);
         if let Err(error) = crate::agent::compaction::apply_compaction_patch_exact(history, &patch) {
             // The patch does not describe the reducer's history: nothing is
             // changed and nothing is saved.
@@ -522,6 +527,17 @@ impl ChatState {
                     reason: format!("the compaction does not describe the session history ({error})"),
                 },
             ];
+        }
+        // The patch's own messages (its replacement and the loop notes it
+        // appends right after it) carry no evidence.
+        // An applied patch's range lies inside the history the evidence was
+        // indexed by; anything else carries nothing.
+        let (range_start, range_end) = (patch.range_start(), patch.range_end());
+        if range_start <= range_end && range_end <= evidence.len() {
+            let inserted = patch.replacement.len().saturating_add(patch.append_after.len());
+            evidence.splice(range_start..range_end, std::iter::repeat_n(None, inserted));
+        } else {
+            evidence = vec![None; history.len()];
         }
         let budget = crate::agent::context_budget::plan_context_budget(
             history,
@@ -542,7 +558,7 @@ impl ChatState {
         // trim is a per-request projection of the provider view. A result
         // still over budget is recorded in the trace and trimmed per request.
         self.session.compaction_epoch = self.session.compaction_epoch.saturating_add(1);
-        self.session.turns = durable_turns_from_compacted_history(history, &handoff_notes);
+        self.session.turns = durable_turns_from_compacted_history(history, &handoff_notes, &evidence);
         // The reducer history takes the canonical form every published
         // snapshot produces (leading system prompt plus the durable turns), so
         // a later guard built from acknowledged turns describes it. Loop notes
@@ -567,7 +583,14 @@ impl ChatState {
 
         let range_start_index: usize = patch.range_start();
         let range_end_index: usize = patch.range_end();
-        vec![
+        let mut effects = Vec::with_capacity(4);
+        if misaligned_at.is_some() {
+            effects.push(Effect::LogTrace {
+                level: tracing::Level::WARN,
+                msg: "HistoryCompactionPatchApplied tool evidence not carried from the first history message that does not match the stored turns".to_owned(),
+            });
+        }
+        effects.extend([
             Effect::LogTrace {
                 level: tracing::Level::INFO,
                 msg: format!(
@@ -580,7 +603,8 @@ impl ChatState {
             },
             Effect::SaveSession(self.session_commit()),
             Effect::RequestRedraw,
-        ]
+        ]);
+        effects
     }
 
     /// `Action::HistoryCompactionDegraded` — one user-visible line per turn when

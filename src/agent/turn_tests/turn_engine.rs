@@ -3815,6 +3815,106 @@ async fn run_turn_refuses_unpriced_and_tool_less_fallbacks_after_primary_429() {
     .await;
 }
 
+/// Bound on one scripted text-only turn.
+const EVIDENCE_TURN_DEADLINE: Duration = Duration::from_secs(30);
+
+/// One tool-less turn over `responses`: its outcome, its history and how many
+/// scripted responses it left unused.
+async fn run_text_turn_for_evidence(responses: Vec<&str>) -> (ToolLoopOutcome, Vec<ChatMessage>, usize) {
+    let provider = ScriptedProvider::from_text_responses(responses);
+    let remaining = Arc::clone(&provider.responses);
+    let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("run echo")];
+    let tmp = TempDir::new().expect("test: temp dir");
+    let admission = crate::agent::turn_tests::admission::AdmittedTurn::empty(tmp.path(), "run echo").await;
+    let hooks = crate::hooks::HookManager::new(tmp.path().to_path_buf());
+    let (outcome, _trace) = tokio::time::timeout(
+        EVIDENCE_TURN_DEADLINE,
+        run_turn(
+            &mut history,
+            crate::agent::turn_request::TurnRequest {
+                advice: None,
+                channel_name: "terminal",
+                scope: None,
+                mode: ChatMode::default(),
+                silent: true,
+                expose_stay_silent: false,
+                multimodal: &crate::config::MultimodalConfig::default(),
+                schedule: crate::agent::turn_request::TurnSchedule {
+                    read_only_tool_concurrency_window: 2,
+                    priority_scheduling_enabled: false,
+                    low_priority_tool_names: Vec::new(),
+                },
+                compaction: None,
+                decision: admission.decision(),
+            },
+            crate::agent::turn_request::TurnServices {
+                provider: &provider,
+                provider_name: "ollama",
+                model: "prx-local-model",
+                temperature: 0.0,
+                tools_registry: Arc::new(Vec::new()),
+                observer: &NoopObserver,
+                hooks: &hooks,
+                approval: None,
+                approval_resolver: None,
+                runtime_adapter: Some(admission.adapter()),
+                memory: ToolLoopMemory::none(),
+            },
+            crate::agent::turn_request::TurnDelivery {
+                cancellation: None,
+                on_delta: None,
+                on_tool_call: None,
+            },
+        ),
+    )
+    .await
+    .expect("test: the turn finishes within its deadline")
+    .expect("test: the turn delivers an answer");
+    let unused = remaining.lock().expect("test: responses lock").len();
+    (outcome, history, unused)
+}
+
+#[tokio::test]
+async fn model_written_evidence_claim_without_a_tool_spends_the_retry() {
+    let (outcome, history, unused) =
+        Box::pin(run_text_turn_for_evidence(vec!["X\n\n[tool evidence: shell ok]", "X"])).await;
+
+    assert_eq!(
+        unused, 0,
+        "a forged evidence line that names a tool costs exactly one corrective retry (two requests)"
+    );
+    assert!(
+        matches!(outcome, ToolLoopOutcome::Text(ref text) if text == "X"),
+        "the retried answer is delivered: {outcome:?}"
+    );
+    assert!(
+        history.iter().all(|message| !message
+            .content
+            .contains(crate::agent::tool_evidence::TOOL_EVIDENCE_MARKER_PREFIX)),
+        "no model-written evidence reaches history: {history:?}"
+    );
+}
+
+#[tokio::test]
+async fn model_written_none_line_is_stripped_without_retry() {
+    let (outcome, history, unused) =
+        Box::pin(run_text_turn_for_evidence(vec!["Y\n\n[tool evidence: none]", "unused"])).await;
+
+    assert_eq!(
+        unused, 1,
+        "a none line names no tool, so it costs no retry (one request)"
+    );
+    assert!(
+        matches!(outcome, ToolLoopOutcome::Text(ref text) if text == "Y"),
+        "the answer is delivered without the line: {outcome:?}"
+    );
+    assert_eq!(
+        history.last().map(|message| message.content.as_str()),
+        Some("Y"),
+        "history holds the answer without the model-written line"
+    );
+}
+
 #[inline(never)]
 fn q79_boxed_fixture_work<'a, F: std::future::Future + 'a>(
     work: F,

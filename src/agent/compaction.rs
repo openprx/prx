@@ -2108,7 +2108,8 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
     // preserved verbatim" section asks it to. A summary is replayed on every
     // later turn and is persisted as compaction audit, so clean it in both
     // grains before it is measured, stored or inserted.
-    let summary = strip_assistant_fabricated_tool_markers(&summary).into_owned();
+    let summary = strip_assistant_fabricated_tool_markers(&summary);
+    let summary = crate::agent::tool_evidence::strip_model_written_tool_evidence(&summary).into_owned();
     let original_source = source_history.get(start..compact_end).unwrap_or(&[]);
     let fidelity_status = compaction_summary_fidelity_status(&summary, config.mode, original_source);
     persist_compaction_audit(

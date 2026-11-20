@@ -273,6 +273,37 @@ impl ChatState {
         ]
     }
 
+    /// `Action::ToolOutcomeRecorded` — add one call to the tool evidence of
+    /// the driver turn running under `task_id`. A key without a started
+    /// record is untracked (no `StartLLMTurn` began it): nothing is recorded,
+    /// so no turn is given evidence it did not earn.
+    pub(super) fn reduce_tool_outcome_recorded(
+        &mut self,
+        task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+        tool_call_id: &str,
+        name: &str,
+        outcome: crate::agent::tool_evidence::ToolCallOutcome,
+    ) -> Vec<Effect> {
+        let tool_key = ToolTaskKey::from_task_id(task_id);
+        if let Some(evidence) = self
+            .control
+            .tool_buffers
+            .get_mut(&tool_key)
+            .and_then(|buffer| buffer.evidence.as_mut())
+        {
+            evidence.record(name, outcome);
+            return Vec::new();
+        }
+        vec![Effect::LogTrace {
+            level: tracing::Level::DEBUG,
+            msg: format!(
+                "ToolOutcomeRecorded untracked tool={} call={}",
+                crate::agent::diagnostics::text_class(name),
+                crate::agent::diagnostics::text_class(tool_call_id)
+            ),
+        }]
+    }
+
     /// `Action::ToolProgress` — progress notification (RequestRedraw + LogTrace only).
     ///
     /// The UI does not render the progress field separately yet; the Action is kept for future

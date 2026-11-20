@@ -63,6 +63,7 @@ use crate::agent::stream_buffer::StreamBoundaryBuffer;
 use crate::agent::tool_call_parser::{
     looks_like_unparsed_tool_call_syntax, parse_structured_tool_calls, parse_tool_calls,
 };
+use crate::agent::tool_evidence::{claims_tool_evidence, strip_model_written_tool_evidence};
 #[cfg(test)]
 use crate::agent::tool_result_recording::INTERRUPTED_TOOL_RESULT;
 use crate::agent::tool_result_recording::{
@@ -1523,7 +1524,12 @@ async fn run_turn_unguarded(
                 // be replayed, compacted or summarized. Inline-aware: a marker
                 // this branch leaves in a sentence is replayed on every later
                 // turn, which is exactly how the shape gets imitated.
-                let history_text = strip_assistant_fabricated_tool_markers(&response_text);
+                // An evidence line the model wrote is never replayed either:
+                // only the runtime writes tool evidence.
+                let history_text = match strip_assistant_fabricated_tool_markers(&response_text) {
+                    Cow::Borrowed(text) => strip_model_written_tool_evidence(text),
+                    Cow::Owned(text) => Cow::Owned(strip_model_written_tool_evidence(&text).into_owned()),
+                };
                 let assistant_history_content = if resp.tool_calls.is_empty() {
                     history_text.into_owned()
                 } else {
@@ -1806,8 +1812,12 @@ async fn run_turn_unguarded(
             // about work that did not happen; spend the one corrective retry on
             // it (the same budget the summary-only path uses, so a response that
             // is nothing but a marker still costs at most one retry).
+            // A model-written tool-evidence line that names tools is the same
+            // kind of claim.
             let fabricated_marker = contains_assistant_fabricated_tool_marker(&response_text)
-                || contains_assistant_fabricated_tool_marker(&display_text);
+                || contains_assistant_fabricated_tool_marker(&display_text)
+                || claims_tool_evidence(&response_text)
+                || claims_tool_evidence(&display_text);
             if fabricated_marker && !executed_any_tool_call && !tool_summary_retry_attempted {
                 tracing::warn!(
                     provider = %crate::providers::redact_endpoint_userinfo(provider_name),
@@ -1826,6 +1836,15 @@ async fn run_turn_unguarded(
                 if let Cow::Owned(cleaned) = strip_assistant_fabricated_tool_markers(&display_text) {
                     display_text = cleaned;
                 }
+                if display_text.trim().is_empty() {
+                    anyhow::bail!("model returned a tool-summary-only response after one corrective retry");
+                }
+            }
+            // Tool evidence is written by the runtime only: every evidence
+            // line the model wrote is dropped before delivery and history,
+            // a `none` line included.
+            if let Cow::Owned(cleaned) = strip_model_written_tool_evidence(&display_text) {
+                display_text = cleaned;
                 if display_text.trim().is_empty() {
                     anyhow::bail!("model returned a tool-summary-only response after one corrective retry");
                 }

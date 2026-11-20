@@ -188,6 +188,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             tool_calls: Vec::new(),
             context_handoff,
+            tool_evidence: None,
         }
     }
 

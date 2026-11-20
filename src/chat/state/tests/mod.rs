@@ -992,6 +992,7 @@ fn loading_fresh_session_clears_visible_title_turns_and_token_usage() {
         timestamp: chrono::Utc::now(),
         tool_calls: Vec::new(),
         context_handoff: false,
+        tool_evidence: None,
     });
     state.ui.turn_count = 1;
     state.ui.token_usage_summary = MainSessionTokenUsageSummary {
@@ -1255,6 +1256,10 @@ mod p3b_task_aware_cancel_tokens;
 
 #[cfg(test)]
 mod p3c_task_aware_usage;
+
+// Cross-turn tool evidence: recorded by driver turns, carried through compaction.
+#[cfg(feature = "terminal-tui")]
+mod tool_evidence;
 
 // ─── S4-A Commit 1: UiSnapshot + reduce_tracked unit tests ────────────────
 

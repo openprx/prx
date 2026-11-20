@@ -43,7 +43,7 @@ use super::provider_turns::{
 #[cfg(feature = "terminal-tui")]
 use super::provider_turns::{
     PendingOrderedProviderTurnCommit, PerTurnContext, ProviderTurnFinalizerEvent, ProviderTurnFinalizerResult,
-    ProviderTurnTerminalPlan, apply_ready_ordered_provider_turn_commits,
+    ProviderTurnTerminalPlan, apply_ready_ordered_provider_turn_commits, committed_reply_message,
     drain_provider_turn_finalizer_events_and_publish, enqueue_provider_turn_finalizer_event,
     finalize_all_per_turn_contexts_as_cancelled, finalize_ready_per_turn_contexts,
     provider_turn_terminal_plan_from_completion, resolve_provider_turn_completion,
@@ -102,7 +102,7 @@ use super::{
 };
 use crate::agent::context_recall::increment_recalled_useful_counts;
 use crate::agent::document_ingest::DocumentIngestRuntime;
-use crate::agent::runtime_prompt::build_runtime_system_prompt;
+use crate::agent::runtime_prompt::build_chat_system_prompt;
 use crate::agent::turn_contracts::ScopeContext;
 use crate::agent::turn_contracts::ToolCallNotification;
 use crate::agent::turn_contracts::is_tool_loop_cancelled;
@@ -3159,7 +3159,7 @@ Retry with a compatible model: /provider {shown} <model>",
         let selected_skills = admitted_binding.prompt_skills()?;
         // Publish only this turn's selected metadata. Previous turns do not
         // grant continued Skill exposure; the prompt builder orders entries.
-        let system_prompt = build_runtime_system_prompt(&config, model_name, &selected_skills, native_tools);
+        let system_prompt = build_chat_system_prompt(&config, model_name, &selected_skills, native_tools);
         // An ordered, acknowledged read before this turn builds its sources
         // and copies its provider view: every action sent before it (another
         // turn's compaction whose finalization is still pending included) is
@@ -3927,7 +3927,7 @@ Retry with a compatible model: /provider {shown} <model>",
                     // 1) Write the final text accumulated by the driver's stream back into the LLM
                     //    history (aligned with the legacy tail
                     //    `history.push(ChatMessage::assistant(...))`).
-                    history.push(ChatMessage::assistant(final_text.clone()));
+                    history.push(committed_reply_message(&chat_dispatcher.session_reader().acked(), &final_text));
                     // 2) finalize_draft: deliver the text to the terminal channel so the user sees
                     //    it (the driver path does not go through the delta_tx → draft_updater chain,
                     //    it finalizes directly).

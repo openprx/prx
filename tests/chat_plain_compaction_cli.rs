@@ -252,7 +252,7 @@ fn assert_switch_request_keeps_the_tail(sandbox: &Sandbox, requests: &[serde_jso
         let verbatim = earlier.contains(&message)
             || message["content"]
                 .as_str()
-                .is_some_and(|content| stored.iter().any(|row| row == content));
+                .is_some_and(|content| stored.iter().any(|row| row == without_tool_evidence(content)));
         assert!(verbatim, "a tail message is not carried verbatim: {message}");
     }
     let note = compaction_script::handoff_note(&requests[index]).expect("test: handoff note");
@@ -267,6 +267,14 @@ fn assert_switch_request_keeps_the_tail(sandbox: &Sandbox, requests: &[serde_jso
             .any(|message| message.to_string().contains(compaction_script::CODENAME)),
         "the planted fact left the context with the cold prefix: {current}"
     );
+}
+
+/// `text` without the runtime's tool-evidence line: a replayed assistant
+/// reply is its stored text plus that line, which is never stored.
+fn without_tool_evidence(text: &str) -> &str {
+    text.rfind("\n\n[tool evidence: ")
+        .filter(|at| text[*at..].ends_with(']') && !text[*at + 2..].contains('\n'))
+        .map_or(text, |at| &text[..at])
 }
 
 /// The lookup returned exactly the stored planted row.
@@ -989,7 +997,7 @@ fn an_overflow_recovery_after_the_preflight_is_adopted_by_the_session() {
     );
     for ((sent_role, sent_text), (saved_role, saved_text)) in sent.iter().zip(expected) {
         assert!(
-            sent_role == saved_role && sent_text.ends_with(saved_text.as_str()),
+            sent_role == saved_role && without_tool_evidence(sent_text).ends_with(saved_text.as_str()),
             "the ordinary request matches the saved session turn for turn\nsent: {sent:?}\nsaved: {expected:?}"
         );
     }
@@ -1197,7 +1205,7 @@ fn a_mid_turn_preflight_trim_leaves_the_session_and_the_next_request_in_agreemen
     );
     for ((sent_role, sent_text), (saved_role, saved_text)) in sent.iter().zip(expected) {
         assert!(
-            sent_role == saved_role && sent_text.ends_with(saved_text.as_str()),
+            sent_role == saved_role && without_tool_evidence(sent_text).ends_with(saved_text.as_str()),
             "the ordinary request matches the saved session turn for turn\nsent: {sent:?}\nsaved: {expected:?}"
         );
     }
@@ -2599,5 +2607,80 @@ fn a_queued_input_does_not_degrade_the_next_switch() {
         !output.stdout.contains(LOSSY_NOTICE),
         "no lossy trim is announced: {}",
         output.stdout
+    );
+}
+
+/// The evidence a replayed `file_read` reply carries.
+const FILE_READ_EVIDENCE: &str = "\n\n[tool evidence: file_read ok]";
+
+/// Cross-turn tool evidence through an automatic switch, over real HTTP/SSE
+/// and real SQLite: tool turns drive the session past a small window until
+/// one switch, then an ordinary turn. The switch has exact provenance, every
+/// tool turn the handoff kept is replayed with its evidence, and the turns
+/// folded into the handoff carry none (the handoff note holds no evidence).
+#[test]
+fn switch_keeps_exact_provenance_and_evidence_of_kept_turns() {
+    let sandbox = Sandbox::new();
+    write_filler_files(&sandbox.workspace, SWITCH_FILLERS);
+    let server = LoopbackOpenAi::start(MODEL, Some((11, 7)), script_with_multi_read());
+    set_window(&sandbox, &server, compaction_script::SMALL_WINDOW_TOKENS);
+    let mut chat = HeldChat::spawn(&sandbox, &[]);
+    let mut replies = 1;
+    chat.turn(PLANT, replies);
+    let mut next_file = 0;
+    while switch_event_counts(&sandbox.workspace).0 < 1 && next_file < SWITCH_FILLERS {
+        replies += 1;
+        chat.turn(&read_line(next_file), replies);
+        next_file += 1;
+    }
+    replies += 1;
+    chat.turn(ORDINARY, replies);
+    let output = chat.exit();
+    assert_clean(
+        &output,
+        "tool turns through one automatic switch, then an ordinary turn",
+    );
+
+    let (handoffs, unavailable) = switch_event_counts(&sandbox.workspace);
+    assert!(handoffs >= 1, "the tool turns drove the session to a switch");
+    assert_eq!(unavailable, 0, "the switch did not degrade to handoff_unavailable");
+    let requests = server.requests();
+    let ordinary = requests
+        .iter()
+        .find(|request| newest_user_text(request).contains(ORDINARY))
+        .expect("the ordinary turn reached the provider");
+    let note = compaction_script::handoff_note(ordinary).expect("the post-switch request carries the handoff");
+    assert_eq!(
+        note["provenance_status"], "exact",
+        "the switch resolved exact provenance over the acknowledged turns: {note}"
+    );
+    let assistants: Vec<String> = ordinary["messages"]
+        .as_array()
+        .expect("request messages")
+        .iter()
+        .filter(|message| message["role"] == "assistant")
+        .map(message_text)
+        .collect();
+    let kept_reads: Vec<&String> = assistants.iter().filter(|text| text.starts_with(READ_DONE)).collect();
+    assert!(
+        !kept_reads.is_empty(),
+        "the handoff kept at least one tool turn verbatim: {assistants:?}"
+    );
+    assert!(
+        kept_reads.iter().all(|text| text.ends_with(FILE_READ_EVIDENCE)),
+        "every kept tool turn is replayed with its evidence: {kept_reads:?}"
+    );
+    assert!(
+        assistants
+            .iter()
+            .filter(|text| text.contains(compaction_script::HANDOFF_START))
+            .all(|text| !text.contains("[tool evidence:")),
+        "the folded turns carry no evidence: the handoff note holds none: {assistants:?}"
+    );
+    assert!(
+        !assistants
+            .iter()
+            .any(|text| text.starts_with(&compaction_script::read_done(0))),
+        "the first tool turn was folded into the handoff, not kept: {assistants:?}"
     );
 }

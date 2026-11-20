@@ -2,7 +2,7 @@
 
 use super::chat_events::chat_runtime_envelope;
 use super::{sanitize, session};
-use crate::agent::runtime_prompt::build_runtime_system_prompt;
+use crate::agent::runtime_prompt::build_chat_system_prompt;
 use crate::config::Config;
 use crate::llm::route_decision::ProviderExecutionOutcome;
 use crate::memory::Memory;
@@ -346,18 +346,47 @@ pub(super) fn session_turns_to_history(session: &session::ChatSession) -> Vec<Ch
         .collect()
 }
 
+/// The provider view of `session`'s stored turns: [`session_turns_to_history`]
+/// with every assistant reply rendered with its tool evidence by the one
+/// renderer, so a resumed or switched view holds the bytes the turn had
+/// in-process.
+pub(super) fn session_turns_to_provider_view(session: &session::ChatSession) -> Vec<ChatMessage> {
+    let mut view = session_turns_to_history(session);
+    let stored_turns = session
+        .turns
+        .iter()
+        .filter(|turn| turn.role == "user" || turn.role == "assistant");
+    for (message, turn) in view.iter_mut().zip(stored_turns) {
+        if message.role == "assistant"
+            && let std::borrow::Cow::Owned(rendered) =
+                crate::agent::tool_evidence::render_assistant_content(&message.content, turn.tool_evidence.as_ref())
+        {
+            message.content = rendered;
+        }
+    }
+    view
+}
+
+/// Each stored turn as the canonical history takes it: role, text and tool
+/// evidence.
+fn acknowledged_turns(
+    session: &session::ChatSession,
+) -> impl Iterator<Item = (&str, &str, Option<&crate::agent::tool_evidence::TurnToolEvidence>)> {
+    session
+        .turns
+        .iter()
+        .map(|turn| (turn.role.as_str(), turn.content.as_str(), turn.tool_evidence.as_ref()))
+}
+
 /// The canonical history of `session`'s acknowledged turns under
 /// `system_prompt`: the form the reducer holds and a guard must describe.
 fn acknowledged_canonical_history(
     session: &session::ChatSession,
     system_prompt: &str,
 ) -> crate::agent::turn_history::CanonicalHistory {
-    crate::agent::turn_history::CanonicalHistory::from_acknowledged(
+    crate::agent::turn_history::CanonicalHistory::from_acknowledged_turns(
         Some(system_prompt),
-        session
-            .turns
-            .iter()
-            .map(|turn| (turn.role.as_str(), turn.content.as_str())),
+        acknowledged_turns(session),
     )
 }
 
@@ -379,18 +408,14 @@ pub(super) fn canonical_history_of_acked(
     acked: &crate::chat::acked_session::AckedSession,
     leading_system: Option<&str>,
 ) -> crate::agent::turn_history::CanonicalHistory {
-    let turns = acked
-        .session
-        .turns
-        .iter()
-        .map(|turn| (turn.role.as_str(), turn.content.as_str()));
+    let turns = acknowledged_turns(&acked.session);
     match acked.open_request {
-        Some(open) => crate::agent::turn_history::CanonicalHistory::from_acknowledged_with_request(
+        Some(open) => crate::agent::turn_history::CanonicalHistory::from_acknowledged_turns_with_request(
             leading_system,
             turns,
             open.turn,
         ),
-        None => crate::agent::turn_history::CanonicalHistory::from_acknowledged(leading_system, turns),
+        None => crate::agent::turn_history::CanonicalHistory::from_acknowledged_turns(leading_system, turns),
     }
 }
 
@@ -441,11 +466,12 @@ pub(super) fn leading_system_prompt_for_session(
     if config.skill_rag.available() {
         return None;
     }
-    Some(build_runtime_system_prompt(config, model_name, skills, native_tools))
+    Some(build_chat_system_prompt(config, model_name, skills, native_tools))
 }
 
 /// The provider view of `session`: `leading_system_prompt` (if any) followed
-/// by its stored turns, the same messages the reducer rebuilds on load.
+/// by its stored turns, the same messages the reducer rebuilds on load, each
+/// assistant reply with its tool evidence.
 pub(super) fn provider_view_for_session(
     session: &session::ChatSession,
     leading_system_prompt: Option<&str>,
@@ -454,7 +480,7 @@ pub(super) fn provider_view_for_session(
     if let Some(prompt) = leading_system_prompt {
         history.push(ChatMessage::system(prompt.to_owned()));
     }
-    history.extend(session_turns_to_history(session));
+    history.extend(session_turns_to_provider_view(session));
     history
 }
 

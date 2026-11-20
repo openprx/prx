@@ -446,6 +446,8 @@ pub(crate) enum ToolLoopEvent {
         success: bool,
         duration_ms: u64,
         result: String,
+        /// How the call ended, recorded as the reply's tool evidence.
+        outcome: crate::agent::tool_evidence::ToolCallOutcome,
     },
 }
 

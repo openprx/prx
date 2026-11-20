@@ -1443,6 +1443,10 @@ pub struct ToolExecutionOutcome {
     pub duration_ms: u64,
     #[serde(default)]
     pub replayed: bool,
+    /// The typed reason of an `ApprovalDenied` outcome; `None` for every
+    /// other status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_denial_cause: Option<ApprovalDenialCause>,
 }
 
 impl ToolExecutionOutcome {
@@ -2993,7 +2997,7 @@ impl ToolExecutionService {
             )
             .await;
             let model_content = approval_denied_model_content(&reason, &descriptor.public_name);
-            return self.finish(
+            let mut outcome = self.finish(
                 &command,
                 &context,
                 input_sha256,
@@ -3006,6 +3010,8 @@ impl ToolExecutionService {
                 None,
                 started,
             );
+            outcome.approval_denial_cause = Some(ApprovalDenialCause::NoResolver);
+            return outcome;
         }
         if decision == ToolExecutionDecision::Ask && !prx_operator_ask && channel_gate.is_some() {
             let approval_resolution: std::pin::Pin<
@@ -3039,7 +3045,7 @@ impl ToolExecutionService {
                 )
                 .await;
                 let model_content = approval_denied_model_content(&reason, &descriptor.public_name);
-                return self.finish(
+                let mut outcome = self.finish(
                     &command,
                     &context,
                     input_sha256,
@@ -3052,6 +3058,8 @@ impl ToolExecutionService {
                     None,
                     started,
                 );
+                outcome.approval_denial_cause = Some(ApprovalDenialCause::ChannelDenied);
+                return outcome;
             }
             self.record_approval_resolution(&command, &context, &input_sha256, ApprovalVerdict::Approved, None, None)
                 .await;
@@ -3092,7 +3100,7 @@ impl ToolExecutionService {
                     )
                     .await;
                     let model_content = approval_denied_model_content(&reason, &descriptor.public_name);
-                    return self.finish(
+                    let mut outcome = self.finish(
                         &command,
                         &context,
                         input_sha256,
@@ -3105,6 +3113,8 @@ impl ToolExecutionService {
                         None,
                         started,
                     );
+                    outcome.approval_denial_cause = Some(cause);
+                    return outcome;
                 }
                 ToolApprovalDecision::Cancelled { reason } => {
                     // An approval-ledger route that is still awaiting a grant
@@ -3670,6 +3680,7 @@ impl ToolExecutionService {
             preparation,
             duration_ms,
             replayed: false,
+            approval_denial_cause: None,
         }
     }
 }

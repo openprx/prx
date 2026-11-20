@@ -313,3 +313,204 @@ fn a_refresh_aside_moves_into_the_projection_after_its_replacement() {
         "the aside follows the summary it was written after: {projected:?}"
     );
 }
+
+/// Tool evidence of one successful `shell` call.
+fn shell_ok() -> TurnToolEvidence {
+    let mut evidence = TurnToolEvidence::default();
+    evidence.record("shell", crate::agent::tool_evidence::ToolCallOutcome::Ok);
+    evidence
+}
+
+/// Acknowledged turns with evidence on both assistant replies (and on a user
+/// turn, which must be ignored), plus the request.
+fn canonical_with_evidence(evidence: &TurnToolEvidence) -> CanonicalHistory {
+    let none = TurnToolEvidence::default();
+    CanonicalHistory::from_acknowledged_turns(
+        Some("sys"),
+        [
+            ("user", "q1", Some(evidence)),
+            ("assistant", "a1", Some(evidence)),
+            ("user", "q2", None),
+            ("assistant", "a2", Some(&none)),
+        ],
+    )
+    .with_raw_request("request")
+}
+
+fn projected(canonical: &CanonicalHistory) -> Vec<ChatMessage> {
+    project(canonical, &ProjectionInputs::default()).into_messages()
+}
+
+#[test]
+fn project_renders_evidence_only_on_acknowledged_assistant_messages() {
+    let evidence = shell_ok();
+    let mut canonical = canonical_with_evidence(&evidence);
+    canonical.append_turn_messages(&native_round("c1"));
+
+    let view = projected(&canonical);
+
+    assert_eq!(
+        contents(&view),
+        vec![
+            "sys",
+            "q1",
+            "a1\n\n[tool evidence: shell ok]",
+            "q2",
+            "a2\n\n[tool evidence: none]",
+            "request",
+            r#"{"content":"","tool_calls":[{"id":"c1","name":"file_read"}]}"#,
+            r#"{"tool_call_id":"c1","content":"result"}"#,
+        ],
+        "only acknowledged assistant replies carry their evidence; user turns, the request and the round do not"
+    );
+    assert_eq!(
+        contents(canonical.messages()),
+        vec![
+            "sys",
+            "q1",
+            "a1",
+            "q2",
+            "a2",
+            "request",
+            r#"{"content":"","tool_calls":[{"id":"c1","name":"file_read"}]}"#,
+            r#"{"tool_call_id":"c1","content":"result"}"#,
+        ],
+        "the canonical history holds the stored text only"
+    );
+    assert_eq!(
+        view.len(),
+        canonical.len(),
+        "evidence adds no message, so view and canonical indices stay aligned"
+    );
+    assert_eq!(
+        view.get(2).map(|message| message.content.clone()),
+        Some(crate::agent::tool_evidence::render_assistant_content("a1", Some(&evidence)).into_owned()),
+        "the projection uses the one renderer"
+    );
+}
+
+#[test]
+fn splice_eviction_and_lift_keep_evidence_aligned() {
+    let evidence = shell_ok();
+
+    // A durable patch over [q1, a1] keeps a2's evidence at its new index.
+    let mut patched = canonical_with_evidence(&evidence);
+    let guard = crate::agent::compaction::compaction_patch_guard_for(patched.messages(), 1, 3)
+        .expect("test: the range lies inside the history");
+    patched
+        .apply_patch_with_refresh_aside(&crate::agent::turn_contracts::CompactionPatch {
+            replacement: vec![ChatMessage::assistant("summary")],
+            append_after: vec![ChatMessage::user(format!(
+                "{} aside",
+                crate::agent::turn_contracts::POST_COMPACTION_REFRESH_MARKER
+            ))],
+            guard,
+        })
+        .expect("test: the patch describes its source");
+    assert_eq!(
+        patched.evidence.len(),
+        patched.messages.len(),
+        "the patch keeps one evidence slot per message"
+    );
+    let lifted = patched.lift_refresh_notes();
+    assert_eq!(lifted.len(), 1, "the aside is lifted out of the history");
+    assert_eq!(
+        contents(&projected(&patched)),
+        vec!["sys", "summary", "q2", "a2\n\n[tool evidence: none]", "request"],
+        "the replacement has no evidence and the retained reply keeps its own after the lift"
+    );
+
+    // A page eviction of [q1, a1] (and a tool result behind it) shifts the
+    // evidence with its message.
+    let mut evicted = canonical_with_evidence(&evidence);
+    evicted.messages.insert(
+        3,
+        ChatMessage {
+            role: "tool".to_owned(),
+            content: "orphan result".to_owned(),
+        },
+    );
+    evicted.origins.insert(3, MessageOrigin::TurnRound);
+    evicted.evidence.insert(3, None);
+    let eviction = crate::agent::context_paging::OsPagingEviction {
+        start: 1,
+        end: 3,
+        breadcrumb: ChatMessage::assistant("breadcrumb"),
+    };
+    assert!(evicted.apply_page_eviction(&eviction), "test: the eviction applies");
+    assert_eq!(
+        contents(&projected(&evicted)),
+        vec!["sys", "breadcrumb", "q2", "a2\n\n[tool evidence: none]", "request"],
+        "the evicted reply's evidence leaves with it and the kept reply keeps its own"
+    );
+    assert_eq!(evicted.evidence.len(), evicted.messages.len(), "slots stay aligned");
+
+    // A splice whose lists disagree in length is refused.
+    let mut broken = canonical_with_evidence(&evidence);
+    broken.evidence.pop();
+    assert!(
+        !broken.splice(1, 2, &[ChatMessage::assistant("x")], MessageOrigin::Acknowledged),
+        "a splice over misaligned evidence is refused"
+    );
+    assert_eq!(
+        contents(broken.messages()).get(1),
+        Some(&"q1"),
+        "a refused splice changes nothing"
+    );
+}
+
+#[test]
+fn reducer_form_keeps_evidence_of_kept_turns() {
+    let evidence = shell_ok();
+    let mut canonical = canonical_with_evidence(&evidence);
+    canonical.append_turn_messages(&native_round("c1"));
+
+    let reducer_form = canonical.reducer_form();
+
+    assert_eq!(
+        contents(&projected(&reducer_form)),
+        vec![
+            "sys",
+            "q1",
+            "a1\n\n[tool evidence: shell ok]",
+            "q2",
+            "a2\n\n[tool evidence: none]"
+        ],
+        "the reducer form keeps each acknowledged reply's evidence and drops the request and the round"
+    );
+}
+
+#[test]
+fn guard_and_equality_ignore_evidence() {
+    let evidence = shell_ok();
+    let with_evidence = canonical_with_evidence(&evidence);
+    let without_evidence = CanonicalHistory::from_acknowledged(
+        Some("sys"),
+        [("user", "q1"), ("assistant", "a1"), ("user", "q2"), ("assistant", "a2")],
+    )
+    .with_raw_request("request");
+
+    assert_eq!(
+        with_evidence, without_evidence,
+        "equality compares the stored messages, never the evidence"
+    );
+    assert_eq!(
+        with_evidence.guard(),
+        without_evidence.guard(),
+        "a guard describes the stored bytes, so a patch built without evidence still applies"
+    );
+    assert_eq!(
+        with_evidence.guard_from(2),
+        without_evidence.guard_from(2),
+        "a partial guard ignores the evidence too"
+    );
+    assert!(
+        same_messages(with_evidence.messages(), without_evidence.messages()),
+        "the canonical messages are byte-identical"
+    );
+    assert_eq!(
+        with_evidence.tool_round_companions(),
+        without_evidence.tool_round_companions(),
+        "provenance-based folding does not see the evidence"
+    );
+}

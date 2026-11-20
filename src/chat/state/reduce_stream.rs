@@ -48,15 +48,15 @@ impl ChatState {
             .session
             .turns
             .iter()
-            .map(|turn| (turn.role.as_str(), turn.content.as_str()));
+            .map(|turn| (turn.role.as_str(), turn.content.as_str(), turn.tool_evidence.as_ref()));
         if let Some(open) = self.open_request() {
-            return crate::agent::turn_history::CanonicalHistory::from_acknowledged_with_request(
+            return crate::agent::turn_history::CanonicalHistory::from_acknowledged_turns_with_request(
                 leading_system,
                 turns,
                 open.turn,
             );
         }
-        let source = crate::agent::turn_history::CanonicalHistory::from_acknowledged(leading_system, turns);
+        let source = crate::agent::turn_history::CanonicalHistory::from_acknowledged_turns(leading_system, turns);
         match history.last().filter(|message| message.role == "user") {
             Some(pending) => source.with_raw_request(&pending.content),
             None => source,
@@ -176,6 +176,10 @@ impl ChatState {
         self.stream.last_duration_ms = None;
         self.control
             .clear_tool_buffer(ToolTaskKey::from_task_id(provider_turn_task_id));
+        // A driver turn records the tool evidence of its reply.
+        self.control
+            .tool_buffer_mut(ToolTaskKey::from_task_id(provider_turn_task_id))
+            .evidence = Some(crate::agent::tool_evidence::TurnToolEvidence::default());
         self.control
             .register_turn_cancel(ToolTaskKey::from_task_id(provider_turn_task_id), cancel.clone());
         self.control.generating = true;
@@ -234,6 +238,10 @@ impl ChatState {
         );
         self.control
             .clear_tool_buffer(ToolTaskKey::from_task_id(provider_turn_task_id));
+        // A driver turn records the tool evidence of its reply.
+        self.control
+            .tool_buffer_mut(ToolTaskKey::from_task_id(provider_turn_task_id))
+            .evidence = Some(crate::agent::tool_evidence::TurnToolEvidence::default());
         self.control
             .register_turn_cancel(ToolTaskKey::from_task_id(provider_turn_task_id), cancel.clone());
         self.control.generating = true;

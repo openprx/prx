@@ -301,3 +301,52 @@ fn ctrl_c_at_prompt_cancels_turn() {
         "the line after Ctrl-C reached the chat as a turn: {last_user}"
     );
 }
+
+/// The assistant message texts of one recorded provider request, in order.
+fn assistant_texts(request: &serde_json::Value) -> Vec<String> {
+    request["messages"]
+        .as_array()
+        .map(|messages| {
+            messages
+                .iter()
+                .filter(|message| message["role"] == "assistant")
+                .filter_map(|message| message["content"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn denied_shell_is_replayed_as_denied_evidence() {
+    let sandbox = Sandbox::new();
+    let (server, mut pty) = start(
+        &sandbox,
+        Box::new(|index, _| match index {
+            0 => Scripted::tool(
+                "call-shell",
+                "shell",
+                &serde_json::json!({"command": "echo t5-shell-deny"}),
+            ),
+            1 => Scripted::text("SHELL-DENIED"),
+            _ => Scripted::text("NEXT-OK"),
+        }),
+    );
+    pty.send("run echo t5-shell-deny\r");
+    pty.read_until(0, PROMPT);
+    let mark = pty.mark();
+    pty.send("n\r");
+    pty.read_until(mark, "SHELL-DENIED");
+    let mark = pty.mark();
+    pty.send("what did that command print\r");
+    pty.read_until(mark, "NEXT-OK");
+    pty.send("/exit\r");
+    assert_eq!(pty.wait_exit(), Some(0), "chat exits cleanly");
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 3, "the tool call, the denied reply and the next turn");
+    assert_eq!(
+        assistant_texts(&requests[2]),
+        ["SHELL-DENIED\n\n[tool evidence: shell denied(user_rejected)]"],
+        "the next request replays the reply with the denial the runtime recorded"
+    );
+}

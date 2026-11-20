@@ -30,6 +30,41 @@ pub(crate) fn build_runtime_system_prompt(
     skills: &[crate::skills::Skill],
     native_tools: bool,
 ) -> String {
+    build_runtime_system_prompt_with(
+        crate::agent::prompt::SystemPromptBuilder::with_defaults(),
+        config,
+        model_name,
+        skills,
+        native_tools,
+    )
+}
+
+/// The system prompt of an interactive chat session. In a build whose chat
+/// turns run through the reducer driver (`terminal-tui`), every assistant
+/// turn is replayed with its tool evidence, so the prompt states what the
+/// evidence marker is ([`crate::agent::tool_evidence::TOOL_EVIDENCE_PROMPT_RULE`]).
+/// The paragraph is fixed text: it never changes the prompt between turns,
+/// and it is part of the system message every budget estimate counts.
+pub(crate) fn build_chat_system_prompt(
+    config: &Config,
+    model_name: &str,
+    skills: &[crate::skills::Skill],
+    native_tools: bool,
+) -> String {
+    #[cfg(feature = "terminal-tui")]
+    let builder = crate::agent::prompt::SystemPromptBuilder::with_defaults().with_tool_evidence_rule();
+    #[cfg(not(feature = "terminal-tui"))]
+    let builder = crate::agent::prompt::SystemPromptBuilder::with_defaults();
+    build_runtime_system_prompt_with(builder, config, model_name, skills, native_tools)
+}
+
+fn build_runtime_system_prompt_with(
+    builder: crate::agent::prompt::SystemPromptBuilder,
+    config: &Config,
+    model_name: &str,
+    skills: &[crate::skills::Skill],
+    native_tools: bool,
+) -> String {
     let bootstrap_max_chars = if config.agent.compact_context { Some(6000) } else { None };
     let skills = if crate::tools::capability::policy::core_dependency_is_available(
         "skill_read",
@@ -40,7 +75,8 @@ pub(crate) fn build_runtime_system_prompt(
     } else {
         &[]
     };
-    crate::channels::build_system_prompt_with_mode(
+    crate::channels::build_system_prompt_with_builder(
+        builder,
         &config.workspace_dir,
         model_name,
         skills,

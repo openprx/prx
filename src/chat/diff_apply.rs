@@ -718,6 +718,7 @@ mod tests {
                 timestamp: chrono::Utc::now(),
                 tool_calls: Vec::new(),
                 context_handoff: false,
+                tool_evidence: None,
             },
             ChatTurn {
                 role: "user".to_string(),
@@ -725,6 +726,7 @@ mod tests {
                 timestamp: chrono::Utc::now(),
                 tool_calls: Vec::new(),
                 context_handoff: false,
+                tool_evidence: None,
             },
         ];
         let latest = latest_fenced_diff(&turns, 1).unwrap_or_default();

@@ -2816,15 +2816,29 @@ impl crate::agent::turn_contracts::ToolLoopEventSink for ReduxToolLoopEventSink 
                 success,
                 duration_ms,
                 result,
-            } => Action::ToolFinished {
-                task_id: self.provider_turn_task_id,
-                sequence: None,
-                tool_call_id: Some(tool_call_id),
-                name,
-                success,
-                duration_ms,
-                result: Some(result),
-            },
+                outcome,
+            } => {
+                // The outcome reaches the reducer before the card update: one
+                // sender awaits each send, so the order holds.
+                self.action_tx
+                    .send(Action::ToolOutcomeRecorded {
+                        task_id: self.provider_turn_task_id,
+                        tool_call_id: tool_call_id.clone(),
+                        name: name.clone(),
+                        outcome,
+                    })
+                    .await
+                    .map_err(|_| anyhow::anyhow!("chat action channel closed"))?;
+                Action::ToolFinished {
+                    task_id: self.provider_turn_task_id,
+                    sequence: None,
+                    tool_call_id: Some(tool_call_id),
+                    name,
+                    success,
+                    duration_ms,
+                    result: Some(result),
+                }
+            }
         };
         self.action_tx
             .send(action)

@@ -27,8 +27,10 @@
 //! canonical history, copied lazily at the first step that reshapes the view.
 
 use crate::agent::context_paging::inject_recalled_context;
+use crate::agent::tool_evidence::{TurnToolEvidence, render_assistant_content};
 use crate::agent::turn_contracts::{inbound_user_message, stored_turn_message};
 use crate::providers::ChatMessage;
+use std::sync::Arc;
 
 /// Whether two message lists carry the same roles and bytes in the same order.
 pub(crate) fn same_messages(left: &[ChatMessage], right: &[ChatMessage]) -> bool {
@@ -80,11 +82,19 @@ enum MessageOrigin {
 /// compaction's tool round-trip folding tell an acknowledged turn from this
 /// turn's transient tool traffic by that provenance, never by the message's
 /// text (an acknowledged answer may itself read like a tool-call envelope).
+///
+/// An acknowledged assistant message may carry its turn's tool evidence. The
+/// evidence is never part of the message bytes (guards, equality and
+/// provenance see the stored text); only [`project`] renders it, so every
+/// view built from the same turns holds the same bytes.
 #[derive(Debug, Clone)]
 pub(crate) struct CanonicalHistory {
     messages: Vec<ChatMessage>,
     /// One origin per message, index for index.
     origins: Vec<MessageOrigin>,
+    /// One evidence slot per message, index for index; only an acknowledged
+    /// assistant message's slot can be filled.
+    evidence: Vec<Option<Arc<TurnToolEvidence>>>,
 }
 
 impl PartialEq for CanonicalHistory {
@@ -96,7 +106,12 @@ impl PartialEq for CanonicalHistory {
 impl CanonicalHistory {
     fn with_origin(messages: Vec<ChatMessage>, origin: MessageOrigin) -> Self {
         let origins = vec![origin; messages.len()];
-        Self { messages, origins }
+        let evidence = vec![None; messages.len()];
+        Self {
+            messages,
+            origins,
+            evidence,
+        }
     }
 
     /// The acknowledged session: `leading_system` (if any), then each stored
@@ -108,7 +123,34 @@ impl CanonicalHistory {
     where
         I: IntoIterator<Item = (&'a str, &'a str)>,
     {
-        Self::from_stored_turns(leading_system, turns, None)
+        Self::from_stored_turns(
+            leading_system,
+            turns.into_iter().map(|(role, content)| (role, content, None)),
+            None,
+        )
+    }
+
+    /// As [`Self::from_acknowledged`], with each stored turn's tool evidence:
+    /// an `assistant` turn keeps it, every other turn's is ignored.
+    pub(crate) fn from_acknowledged_turns<'a, I>(leading_system: Option<&str>, turns: I) -> Self
+    where
+        I: IntoIterator<Item = (&'a str, &'a str, Option<&'a TurnToolEvidence>)>,
+    {
+        Self::from_stored_turns(leading_system, shared_evidence(turns), None)
+    }
+
+    /// A snapshot that holds the turn's admitted request at `request_turn`
+    /// (see `from_acknowledged_with_request`), with each stored turn's tool
+    /// evidence (kept on `assistant` turns only).
+    pub(crate) fn from_acknowledged_turns_with_request<'a, I>(
+        leading_system: Option<&str>,
+        turns: I,
+        request_turn: usize,
+    ) -> Self
+    where
+        I: IntoIterator<Item = (&'a str, &'a str, Option<&'a TurnToolEvidence>)>,
+    {
+        Self::from_stored_turns(leading_system, shared_evidence(turns), Some(request_turn))
     }
 
     /// A snapshot that holds the turn's admitted request (a compaction saved
@@ -120,6 +162,9 @@ impl CanonicalHistory {
     /// once, exactly as for a request appended by [`Self::with_raw_request`].
     /// The message bytes are the stored turn's, which the reducer's own
     /// history holds, so a guard over this history describes the reducer's.
+    /// Production callers use [`Self::from_acknowledged_turns_with_request`],
+    /// which also carries the turns' tool evidence.
+    #[cfg(test)]
     pub(crate) fn from_acknowledged_with_request<'a, I>(
         leading_system: Option<&str>,
         turns: I,
@@ -128,19 +173,24 @@ impl CanonicalHistory {
     where
         I: IntoIterator<Item = (&'a str, &'a str)>,
     {
-        Self::from_stored_turns(leading_system, turns, Some(request_turn))
+        Self::from_stored_turns(
+            leading_system,
+            turns.into_iter().map(|(role, content)| (role, content, None)),
+            Some(request_turn),
+        )
     }
 
     fn from_stored_turns<'a, I>(leading_system: Option<&str>, turns: I, request_turn: Option<usize>) -> Self
     where
-        I: IntoIterator<Item = (&'a str, &'a str)>,
+        I: IntoIterator<Item = (&'a str, &'a str, Option<Arc<TurnToolEvidence>>)>,
     {
         let mut messages: Vec<ChatMessage> = leading_system
             .map(|prompt| ChatMessage::system(prompt.to_owned()))
             .into_iter()
             .collect();
         let mut origins = vec![MessageOrigin::Acknowledged; messages.len()];
-        for (index, (role, content)) in turns.into_iter().enumerate() {
+        let mut evidence = vec![None; messages.len()];
+        for (index, (role, content, turn_evidence)) in turns.into_iter().enumerate() {
             if !matches!(role, "user" | "assistant") {
                 continue;
             }
@@ -151,8 +201,13 @@ impl CanonicalHistory {
             };
             messages.push(stored_turn_message(role.to_owned(), content.to_owned()));
             origins.push(origin);
+            evidence.push(turn_evidence.filter(|_| role == "assistant"));
         }
-        Self { messages, origins }
+        Self {
+            messages,
+            origins,
+            evidence,
+        }
     }
 
     /// `self` with the turn's plain request appended as inbound user text.
@@ -160,6 +215,7 @@ impl CanonicalHistory {
     pub(crate) fn with_raw_request(mut self, request: &str) -> Self {
         self.messages.push(inbound_user_message(request));
         self.origins.push(MessageOrigin::Request);
+        self.evidence.push(None);
         self
     }
 
@@ -186,18 +242,26 @@ impl CanonicalHistory {
         self.messages.extend_from_slice(appended);
         self.origins
             .extend(std::iter::repeat_n(MessageOrigin::TurnRound, appended.len()));
+        self.evidence.extend(std::iter::repeat_n(None, appended.len()));
     }
 
     /// Replace `self[start..end]` with `replacement`, every new message of
-    /// `origin`. `false` (and `self` unchanged) when the range is not inside
-    /// the history.
+    /// `origin` and without evidence. `false` (and `self` unchanged) when the
+    /// range is not inside the history or the per-message lists disagree in
+    /// length.
     fn splice(&mut self, start: usize, end: usize, replacement: &[ChatMessage], origin: MessageOrigin) -> bool {
-        if start > end || end > self.messages.len() || self.origins.len() != self.messages.len() {
+        if start > end
+            || end > self.messages.len()
+            || self.origins.len() != self.messages.len()
+            || self.evidence.len() != self.messages.len()
+        {
             return false;
         }
         self.messages.splice(start..end, replacement.iter().cloned());
         self.origins
             .splice(start..end, std::iter::repeat_n(origin, replacement.len()));
+        self.evidence
+            .splice(start..end, std::iter::repeat_n(None, replacement.len()));
         true
     }
 
@@ -293,6 +357,7 @@ impl CanonicalHistory {
         );
         if restored {
             self.origins.push(MessageOrigin::Request);
+            self.evidence.push(None);
         }
         restored
     }
@@ -315,6 +380,9 @@ impl CanonicalHistory {
             if behind < self.origins.len() {
                 self.origins.remove(behind);
             }
+            if behind < self.evidence.len() {
+                self.evidence.remove(behind);
+            }
         }
         true
     }
@@ -325,16 +393,24 @@ impl CanonicalHistory {
         let mut lifted = Vec::new();
         let mut kept = Vec::with_capacity(self.messages.len());
         let mut kept_origins = Vec::with_capacity(self.origins.len());
-        for (message, origin) in self.messages.drain(..).zip(self.origins.drain(..)) {
+        let mut kept_evidence = Vec::with_capacity(self.evidence.len());
+        for ((message, origin), evidence) in self
+            .messages
+            .drain(..)
+            .zip(self.origins.drain(..))
+            .zip(self.evidence.drain(..))
+        {
             if origin == MessageOrigin::RefreshAside {
                 lifted.push((kept.len(), message));
             } else {
                 kept.push(message);
                 kept_origins.push(origin);
+                kept_evidence.push(evidence);
             }
         }
         self.messages = kept;
         self.origins = kept_origins;
+        self.evidence = kept_evidence;
         lifted
     }
 
@@ -393,10 +469,15 @@ impl CanonicalHistory {
                     MessageOrigin::CallerSupplied => Some(index) != caller_pending,
                     MessageOrigin::Request | MessageOrigin::TurnRound | MessageOrigin::RefreshAside => false,
                 };
-                (acknowledged && crate::agent::turn_contracts::is_durable_turn_message(message))
-                    .then_some((message.role.as_str(), message.content.as_str()))
+                (acknowledged && crate::agent::turn_contracts::is_durable_turn_message(message)).then(|| {
+                    (
+                        message.role.as_str(),
+                        message.content.as_str(),
+                        self.evidence.get(index).cloned().flatten(),
+                    )
+                })
             });
-        Self::from_acknowledged(leading_system, turns)
+        Self::from_stored_turns(leading_system, turns, None)
     }
 
     /// A canonical history a test states message by message (no recorded
@@ -419,6 +500,21 @@ impl CanonicalHistory {
         canonical.append_turn_messages(round);
         canonical
     }
+}
+
+/// Stored turns with their tool evidence shared, ready for the canonical
+/// history (one copy per evidence record; later clones of the history share
+/// it).
+fn shared_evidence<'a, I>(turns: I) -> impl Iterator<Item = (&'a str, &'a str, Option<Arc<TurnToolEvidence>>)>
+where
+    I: IntoIterator<Item = (&'a str, &'a str, Option<&'a TurnToolEvidence>)>,
+{
+    turns.into_iter().map(|(role, content, evidence)| {
+        let evidence = evidence
+            .filter(|_| role == "assistant")
+            .map(|evidence| Arc::new(evidence.clone()));
+        (role, content, evidence)
+    })
 }
 
 /// The refresh aside a durable compaction appends after its replacement, and
@@ -479,6 +575,16 @@ impl ProviderView {
 /// skill metadata is stripped when suppressed.
 pub(crate) fn project(canonical: &CanonicalHistory, inputs: &ProjectionInputs) -> ProviderView {
     let mut messages = canonical.messages.clone();
+    // Each acknowledged assistant reply is shown with its tool evidence, by
+    // the one renderer, before anything is inserted (indices still align).
+    for (message, evidence) in messages.iter_mut().zip(&canonical.evidence) {
+        if let Some(evidence) = evidence.as_deref()
+            && message.role == "assistant"
+            && let std::borrow::Cow::Owned(rendered) = render_assistant_content(&message.content, Some(evidence))
+        {
+            message.content = rendered;
+        }
+    }
     if let Some((plain, enriched)) = &inputs.enriched_request
         && let Some(request) = messages
             .iter_mut()

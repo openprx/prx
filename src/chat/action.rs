@@ -441,6 +441,14 @@ pub enum Action {
         duration_ms: u64,
         result: Option<String>,
     },
+    /// How a driver turn's tool call ended. Sent just before its
+    /// `ToolFinished`; the reducer records it as the reply's tool evidence.
+    ToolOutcomeRecorded {
+        task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+        tool_call_id: String,
+        name: String,
+        outcome: crate::agent::tool_evidence::ToolCallOutcome,
+    },
     /// Tool call progress
     ToolProgress { iteration: usize },
     /// **S3 T3-1**: the driver asks the UI to approve a tool call (triggered in supervised autonomy
@@ -730,6 +738,7 @@ impl Action {
             Self::StreamCancelled { .. } => "StreamCancelled",
             Self::ToolStarted { .. } => "ToolStarted",
             Self::ToolFinished { .. } => "ToolFinished",
+            Self::ToolOutcomeRecorded { .. } => "ToolOutcomeRecorded",
             Self::ToolProgress { .. } => "ToolProgress",
             Self::ToolApprovalRequested { .. } => "ToolApprovalRequested",
             Self::ToolApprovalReceived { .. } => "ToolApprovalReceived",
