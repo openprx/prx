@@ -1345,6 +1345,7 @@ mod inspect {
     /// One row that is not reconciled. It carries identifiers only, never input content.
     #[derive(Debug, Clone)]
     pub(crate) struct UnsettledIngressRow {
+        pub(crate) workspace_id: String,
         pub(crate) owner_id: String,
         pub(crate) source: String,
         pub(crate) run_id: String,
@@ -1430,6 +1431,7 @@ mod inspect {
                     .map(|time| time.with_timezone(&chrono::Utc)),
                 lock: probe_lock(&workspace, &canonical, &namespace, &lifetime)?,
                 cause: cause.as_deref().and_then(OrphanCause::from_code),
+                workspace_id: workspace,
             });
         }
         Ok(inspection)

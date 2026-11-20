@@ -3,7 +3,10 @@
 //! Read-only: the store is opened read-only and nothing is created, repaired
 //! or settled. Rows carry identifiers only, never message content. A row that
 //! is `pending` while its lifetime is no longer live (its lock is present but
-//! not held, or missing) is an error; the report then exits nonzero.
+//! not held, or missing) is an error; the report then exits nonzero. A row
+//! recorded under another workspace (for example a store copied from another
+//! state directory) is listed as `workspace=foreign` and is never an error:
+//! only the configured workspace's rows decide the exit code.
 use super::{Config, DiagItem, DoctorReport};
 
 const CATEGORY: &str = "ingress";
@@ -25,7 +28,7 @@ fn check_ingress(config: &Config, items: &mut Vec<DiagItem>) {
         crate::memory::effective_memory_backend_name(&config.memory.backend, Some(&config.storage.provider.config));
     match crate::memory::classify_memory_backend(&backend) {
         crate::memory::MemoryBackendKind::Sqlite | crate::memory::MemoryBackendKind::Lucid => {
-            sqlite_rows(&crate::schema_migration::memory_db_path(config), items);
+            sqlite_rows(config, items);
         }
         crate::memory::MemoryBackendKind::Postgres => items.push(DiagItem::warn(
             CATEGORY,
@@ -42,8 +45,9 @@ fn check_ingress(config: &Config, items: &mut Vec<DiagItem>) {
 }
 
 #[cfg(unix)]
-fn sqlite_rows(database: &std::path::Path, items: &mut Vec<DiagItem>) {
-    let inspection = match crate::memory::sqlite::inspect_unsettled_ingress(database) {
+fn sqlite_rows(config: &Config, items: &mut Vec<DiagItem>) {
+    let database = crate::schema_migration::memory_db_path(config);
+    let inspection = match crate::memory::sqlite::inspect_unsettled_ingress(&database) {
         Ok(inspection) => inspection,
         Err(error) => {
             items.push(DiagItem::error(
@@ -58,8 +62,9 @@ fn sqlite_rows(database: &std::path::Path, items: &mut Vec<DiagItem>) {
         return;
     }
     let now = chrono::Utc::now();
+    let workspace = config.workspace_dir.to_string_lossy();
     for row in &inspection.rows {
-        items.push(row_item(row, now));
+        items.push(row_item(row, &workspace, now));
     }
     if inspection.truncated {
         items.push(DiagItem::warn(
@@ -73,8 +78,14 @@ fn sqlite_rows(database: &std::path::Path, items: &mut Vec<DiagItem>) {
 }
 
 /// One row: identifiers, state, age and lock reachability; never content.
+/// `workspace` is the configured workspace id; a row of any other workspace is
+/// marked foreign and reported as a warning only.
 #[cfg(unix)]
-fn row_item(row: &crate::memory::sqlite::UnsettledIngressRow, now: chrono::DateTime<chrono::Utc>) -> DiagItem {
+fn row_item(
+    row: &crate::memory::sqlite::UnsettledIngressRow,
+    workspace: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> DiagItem {
     use crate::memory::ingress_recovery::IngressRecoveryState;
     use crate::memory::sqlite::IngressLockReach;
     let state = match row.state {
@@ -89,15 +100,18 @@ fn row_item(row: &crate::memory::sqlite::UnsettledIngressRow, now: chrono::DateT
         .cause
         .map(|cause| format!(" cause={}", cause.as_str()))
         .unwrap_or_default();
+    let foreign = row.workspace_id != workspace;
     let message = format!(
-        "owner={} source={} run={} state={state}{cause} age={age} lock={}",
+        "owner={} source={} run={} state={state}{cause} age={age} lock={}{}",
         row.owner_id,
         row.source,
         row.run_id,
-        row.lock.as_str()
+        row.lock.as_str(),
+        if foreign { " workspace=foreign" } else { "" }
     );
-    // Pending while no live lifetime holds it: nothing will settle it.
-    if row.state == IngressRecoveryState::Pending && row.lock != IngressLockReach::Held {
+    // Pending while no live lifetime holds it: nothing will settle it. Only
+    // the configured workspace's rows count; this process cannot settle others.
+    if !foreign && row.state == IngressRecoveryState::Pending && row.lock != IngressLockReach::Held {
         DiagItem::error(CATEGORY, message)
     } else {
         DiagItem::warn(CATEGORY, message)
@@ -106,7 +120,7 @@ fn row_item(row: &crate::memory::sqlite::UnsettledIngressRow, now: chrono::DateT
 
 /// Other systems have no SQLite ingress locks, so no ingress row exists there.
 #[cfg(not(unix))]
-fn sqlite_rows(_database: &std::path::Path, items: &mut Vec<DiagItem>) {
+fn sqlite_rows(_config: &Config, items: &mut Vec<DiagItem>) {
     items.push(DiagItem::ok(
         CATEGORY,
         "SQLite ingress recovery requires Unix file locks; no ingress rows are recorded on this system",
