@@ -91,6 +91,7 @@ mod input_queue;
 mod line_approval;
 mod model_commands;
 mod output;
+mod plain_queue;
 mod provider_turns;
 mod pty_attach;
 mod run;

@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 pub(crate) mod prompt_line;
+mod stdin_lines;
 
 // ── Reply-only stdout ───────────────────────────────────────────────────────
 
@@ -1017,24 +1018,21 @@ async fn terminal_input_loop(mut tx: crate::runtime::h2_entry::TerminalInputSink
         // early return through every `?` site.
         #[allow(clippy::redundant_closure_call)]
         let outcome = (move || -> Result<()> {
-            use std::io::BufRead as _;
-
             let stdin_is_tty = io::stdin().is_terminal();
             // On a terminal an approval prompt claims its answer from this
             // thread instead of racing it for the same line.
             let _tty_guard = stdin_is_tty.then(prompt_line::TtyInputLoopGuard::enter);
-            let stdin = io::stdin();
-            let mut lines = stdin.lock().lines();
+            let mut lines = stdin_lines::StdinLines::open(stdin_is_tty);
             loop {
                 if stdin_is_tty {
                     print!("prx> ");
                     let _ = io::stdout().flush();
                 }
-                let line = match lines.next() {
-                    Some(Ok(line)) => line,
-                    Some(Err(_)) | None => break,
+                let Some((line, typed_ahead)) = lines.next_line() else {
+                    break;
                 };
-                let Some(line) = prompt_line::deliver(line) else {
+                let read = prompt_line::LineRead::finished(typed_ahead);
+                let Some(line) = prompt_line::deliver(line, read) else {
                     continue;
                 };
                 let trimmed = line.trim().to_string();

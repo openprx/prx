@@ -98,18 +98,25 @@ impl AnswerLineSource for ControllingTerminal {
             Ok(tty) => tty,
             Err(error) => return AnswerRead::NoTerminal(error),
         };
-        eprint!("Approve {tool} {}? [y/N/a] ", summary(args));
-        let _ = std::io::stderr().flush();
+        let show_prompt = || {
+            eprint!("Approve {tool} {}? [y/N/a] ", summary(args));
+            let _ = std::io::stderr().flush();
+        };
 
         let answer = if crate::channels::terminal::prompt_line::tty_input_loop_active() {
             // The chat input thread owns the terminal stdin; take its next line.
+            // The claim comes before the prompt, so only a line typed after
+            // the prompt appeared can answer it.
             drop(tty);
-            let Some(mut claimed) = crate::channels::terminal::prompt_line::claim_next_line() else {
+            let claimed = crate::channels::terminal::prompt_line::claim_next_line();
+            show_prompt();
+            let Some(mut claimed) = claimed else {
                 tracing::warn!(tool = %crate::agent::diagnostics::text_class(tool), "terminal approval prompt already active; denying");
                 return AnswerRead::Unavailable;
             };
             wait_for_answer(claimed.line(), still_waiting).await
         } else {
+            show_prompt();
             match TtyReader::spawn(tty) {
                 Ok(mut reader) => {
                     let answer = wait_for_answer(reader.line(), still_waiting).await;

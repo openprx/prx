@@ -5,13 +5,46 @@
 //! would race that thread for the operator's answer. Instead the prompt claims
 //! the next line here and the input thread delivers it to the prompt rather
 //! than to the chat.
+//!
+//! A prompt answers only with input typed after it claimed the line: a line
+//! that was already waiting when its read began, or whose read returned before
+//! the claim, stays chat input.
 
 use parking_lot::Mutex;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-static CLAIM: LazyLock<Mutex<Option<tokio::sync::oneshot::Sender<String>>>> = LazyLock::new(|| Mutex::new(None));
+static CLAIM: LazyLock<Mutex<Option<Claim>>> = LazyLock::new(|| Mutex::new(None));
 static TTY_INPUT_LOOP_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Orders claims against line reads: every claim and every finished read
+/// takes the next tick.
+static LINE_CLOCK: AtomicU64 = AtomicU64::new(0);
+
+fn tick() -> u64 {
+    LINE_CLOCK.fetch_add(1, Ordering::SeqCst)
+}
+
+struct Claim {
+    sender: tokio::sync::oneshot::Sender<String>,
+    placed_at: u64,
+}
+
+/// How the input thread read one line.
+pub(super) struct LineRead {
+    typed_ahead: bool,
+    returned_at: u64,
+}
+
+impl LineRead {
+    /// Called as soon as a read returned a line. `typed_ahead` is true when
+    /// input was already waiting when the read began.
+    pub(super) fn finished(typed_ahead: bool) -> Self {
+        Self {
+            typed_ahead,
+            returned_at: tick(),
+        }
+    }
+}
 
 /// True while the chat input thread reads lines from a terminal stdin.
 pub(crate) fn tty_input_loop_active() -> bool {
@@ -53,7 +86,7 @@ impl Drop for ClaimedLine {
         // Close first so the slot's sender reports closed for this claim.
         self.receiver.close();
         let mut claim = CLAIM.lock();
-        if claim.as_ref().is_some_and(tokio::sync::oneshot::Sender::is_closed) {
+        if claim.as_ref().is_some_and(|claim| claim.sender.is_closed()) {
             claim.take();
         }
     }
@@ -63,20 +96,28 @@ impl Drop for ClaimedLine {
 /// prompt already holds the claim.
 pub(crate) fn claim_next_line() -> Option<ClaimedLine> {
     let mut claim = CLAIM.lock();
-    if claim.as_ref().is_some_and(|sender| !sender.is_closed()) {
+    if claim.as_ref().is_some_and(|claim| !claim.sender.is_closed()) {
         return None;
     }
     let (sender, receiver) = tokio::sync::oneshot::channel();
-    *claim = Some(sender);
+    *claim = Some(Claim {
+        sender,
+        placed_at: tick(),
+    });
     Some(ClaimedLine { receiver })
 }
 
 /// Called by the input thread for every line it reads: returns the line back
-/// when no live prompt claimed it, so the chat receives it.
-pub(super) fn deliver(line: String) -> Option<String> {
-    let sender = CLAIM.lock().take();
-    match sender {
-        Some(sender) => sender.send(line).err(),
+/// when no live prompt claimed it, or when it was typed before the claim, so
+/// the chat receives it.
+pub(super) fn deliver(line: String, read: LineRead) -> Option<String> {
+    let mut claim = CLAIM.lock();
+    let answers_claim = !read.typed_ahead && claim.as_ref().is_some_and(|claim| claim.placed_at < read.returned_at);
+    if !answers_claim {
+        return Some(line);
+    }
+    match claim.take() {
+        Some(claim) => claim.sender.send(line).err(),
         None => Some(line),
     }
 }
@@ -88,21 +129,28 @@ mod tests {
     /// One process-global slot: the cases run in sequence in one test.
     #[tokio::test]
     async fn claimed_line_goes_to_the_prompt_and_unclaimed_lines_to_the_chat() {
-        assert_eq!(deliver("hello".to_owned()).as_deref(), Some("hello"));
+        assert_eq!(
+            deliver("hello".to_owned(), LineRead::finished(false)).as_deref(),
+            Some("hello")
+        );
 
         let mut claimed = claim_next_line().expect("first claim");
         assert!(
             claim_next_line().is_none(),
             "a second prompt cannot claim the same line"
         );
-        assert_eq!(deliver("y".to_owned()), None, "the claimed line is consumed");
+        assert_eq!(
+            deliver("y".to_owned(), LineRead::finished(false)),
+            None,
+            "the claimed line is consumed"
+        );
         assert_eq!(claimed.line().await.as_deref(), Some("y"));
         drop(claimed);
 
         let abandoned = claim_next_line().expect("claim after release");
         drop(abandoned);
         assert_eq!(
-            deliver("next".to_owned()).as_deref(),
+            deliver("next".to_owned(), LineRead::finished(false)).as_deref(),
             Some("next"),
             "an abandoned claim returns the line to the chat"
         );

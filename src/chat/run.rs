@@ -29,6 +29,7 @@ use super::input_queue::{
     pop_next_visible_input_task_with_scheduler, publish_main_queue_status, requeue_post_route_admission_rejected_input,
 };
 use super::output::{print_fallback_chat_output, render_response, should_resend_on_finalize_failure};
+use super::plain_queue::{lines_queued_since, settle_queued_lines};
 use super::provider_turns::{
     OrderedCommitTerminal, PROVIDER_TURN_LIFECYCLE_CHANNEL_CAPACITY, ProviderTurnCompletionContext,
     ProviderTurnCompletionEvent, acknowledged_session_barrier, dispatch_final_usage,
@@ -404,8 +405,12 @@ async fn run_internal(
     // S4-B: Pure is the only supported run path; non-Pure values are warned about and forced up.
     #[cfg(feature = "terminal-tui")]
     let top_redux_mode: ReduxMode = { ReduxMode::from_env() };
+    // The plain REPL runs one turn of the session at a time; later lines queue.
+    // Typed lines (terminal stdin) are acknowledged and bounded; piped input
+    // keeps every line.
+    let plain_typed_queue = plain_mode && std::io::IsTerminal::is_terminal(&std::io::stdin());
     #[cfg(feature = "terminal-tui")]
-    let max_concurrent_visible_turns = config.chat.max_concurrent_visible_turns.max(1);
+    let max_concurrent_visible_turns = if plain_mode { 1 } else { config.chat.max_concurrent_visible_turns.max(1) };
     #[cfg(not(feature = "terminal-tui"))]
     let max_concurrent_visible_turns = 1usize;
     #[cfg(feature = "terminal-tui")]
@@ -908,6 +913,7 @@ async fn run_internal(
                         dispatcher: &chat_dispatcher,
                         redraw_tx: redraw_tx_for_main.as_ref(),
                     };
+                    let queued_from = input_backlog.len();
                     process_active_turn_input_batch(
                         msg,
                         &mut emit_active_turn_output,
@@ -926,9 +932,14 @@ async fn run_internal(
                         daemon_control,
                     )
                     .await;
+                    if plain_typed_queue {
+                        let added = lines_queued_since(&input_backlog, queued_from);
+                        settle_queued_lines(&mut input_backlog, &mut turn_scheduler, &added);
+                    }
                     publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
                     continue;
                 }
+                let queued_from = input_backlog.len();
                 enqueue_input_message_with_scheduler(
                     &mut input_backlog,
                     &mut turn_scheduler,
@@ -941,14 +952,19 @@ async fn run_internal(
                     Some(&mut turn_scheduler),
                     chat_session.session().turns.len(),
                 );
+                let added = lines_queued_since(&input_backlog, queued_from);
                 publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
-                if let Some(next) = pop_next_visible_input_task_with_scheduler(
+                let next = pop_next_visible_input_task_with_scheduler(
                     &mut input_backlog,
                     &mut turn_scheduler,
                     &provider_turn_workers,
                     visible_input_admission_kind,
                     max_concurrent_visible_turns,
-                ) {
+                );
+                if plain_typed_queue {
+                    settle_queued_lines(&mut input_backlog, &mut turn_scheduler, &added);
+                }
+                if let Some(next) = next {
                     // The enqueue snapshot above reports this item as queued.
                     // Publish again after dequeue so fast slash commands, which
                     // never enter the provider-turn path, cannot leave a stale
@@ -3763,6 +3779,7 @@ Retry with a compatible model: /provider {shown} <model>",
                                 dispatcher: &chat_dispatcher,
                                 redraw_tx: redraw_tx_for_main.as_ref(),
                             };
+                            let queued_from = input_backlog.len();
                             process_active_turn_input_batch(
                                 msg,
                                 &mut emit_chat_output,
@@ -3781,6 +3798,10 @@ Retry with a compatible model: /provider {shown} <model>",
                                 daemon_control,
                             )
                             .await;
+                            if plain_typed_queue {
+                                let added = lines_queued_since(&input_backlog, queued_from);
+                                settle_queued_lines(&mut input_backlog, &mut turn_scheduler, &added);
+                            }
                             publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
                         }
                     }
