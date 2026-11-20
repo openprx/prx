@@ -906,17 +906,24 @@ impl CandidatePool {
     }
 }
 
-/// Whether `error` is the fail-fast error of a backend without the method.
-fn is_fail_fast_error(error: &anyhow::Error) -> bool {
+/// Whether a paging `error` leaves the pool unproven rather than failing the
+/// read: the fail-fast error of a backend without the method, or a page the
+/// backend could not return whole ([`crate::memory::traits::SessionPageIncomplete`]).
+fn is_unproven_page_error(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<crate::memory::erasure::Unsupported>()
         .is_some_and(|unsupported| unsupported.0 == "fabric operation")
+        || error
+            .downcast_ref::<crate::memory::traits::SessionPageIncomplete>()
+            .is_some()
 }
 
 /// Every own user/assistant row of the session (§3.1): the newest page, then
 /// older pages until a short page proves the session's first row was read.
+/// Every page, the newest included, is read through
+/// `load_session_context_before`, which reports rows it would have to drop.
 /// `Ok(Err(TurnAmbiguous))` when completeness cannot be proven: the rows read
-/// reached [`POOL_MAX_ROWS`] or the backend cannot page.
+/// reached [`POOL_MAX_ROWS`], the backend cannot page, or a page is incomplete.
 async fn load_complete_pool(
     mem: &dyn Memory,
     principal: &MemoryPrincipal,
@@ -940,7 +947,12 @@ async fn load_pool_within(
     let mut pool = CandidatePool::default();
     let mut rows_read = 0usize;
     let mut oldest: Option<i64> = None;
-    let mut page = mem.load_recent_session_context(query()).await?;
+    // The newest page is "below" the largest possible id.
+    let mut page = match mem.load_session_context_before(query(), i64::MAX).await {
+        Ok(page) => page,
+        Err(error) if is_unproven_page_error(&error) => return Ok(Err(ProvenanceGap::TurnAmbiguous)),
+        Err(error) => return Err(error),
+    };
     loop {
         let page_len = page.len();
         rows_read = rows_read.saturating_add(page_len);
@@ -959,7 +971,7 @@ async fn load_pool_within(
         };
         page = match mem.load_session_context_before(query(), before_id).await {
             Ok(page) => page,
-            Err(error) if is_fail_fast_error(&error) => return Ok(Err(ProvenanceGap::TurnAmbiguous)),
+            Err(error) if is_unproven_page_error(&error) => return Ok(Err(ProvenanceGap::TurnAmbiguous)),
             Err(error) => return Err(error),
         };
     }

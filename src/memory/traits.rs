@@ -948,6 +948,15 @@ pub struct SharedContextQuery {
     pub include_roles: Vec<String>,
 }
 
+/// [`Memory::load_session_context_before`] could not return a page that is
+/// provably complete: the store holds rows in it that this backend cannot read
+/// (counted, never shown).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("session context page is not provably complete: {unreadable_rows} stored rows could not be read")]
+pub struct SessionPageIncomplete {
+    pub unreadable_rows: usize,
+}
+
 /// Query for recent current-session events visible to an agent turn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionContextQuery {
@@ -2333,6 +2342,9 @@ pub trait Memory: Send + Sync {
     /// Rows of `query` (hard-filtered by its session key, same visibility rules as
     /// `load_recent_session_context`) with `id < before_id`, newest first, at most
     /// `query.limit`. Backends without an ordered event log return the fail-fast error.
+    /// A backend that would have to drop stored rows it cannot read returns
+    /// [`SessionPageIncomplete`] instead, so a short page always means the store
+    /// holds no older row.
     async fn load_session_context_before(
         &self,
         query: SessionContextQuery,

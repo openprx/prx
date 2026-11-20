@@ -2352,8 +2352,9 @@ async fn switch_provenance_refuses_a_cold_pair_repeated_in_the_retained_tail_bey
     );
 }
 
-/// A store that forwards the newest-page read but cannot page older rows (the
-/// trait's fail-fast default for `load_session_context_before`).
+/// A store that forwards the newest-page read of `load_recent_session_context`
+/// but has the trait's fail-fast default for `load_session_context_before`,
+/// through which the provenance pool reads every page.
 struct FirstPageOnlyMemory {
     inner: Arc<dyn Memory>,
 }

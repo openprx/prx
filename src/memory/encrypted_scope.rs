@@ -1063,11 +1063,17 @@ impl Memory for EncryptedScope {
         before_id: i64,
     ) -> anyhow::Result<Vec<crate::memory::MessageEvent>> {
         let events = self.inner.load_session_context_before(query, before_id).await?;
-        Ok(events
-            .into_iter()
-            .filter(|event| self.owns_event(event))
-            .map(|event| self.reveal(event))
-            .collect())
+        // A page is complete only on what the store holds: dropping a row this
+        // scope cannot open would make a short page look like the session start.
+        let unreadable_rows: usize = events.iter().filter(|event| !self.owns_event(event)).count();
+        if unreadable_rows > 0 {
+            tracing::warn!(
+                unreadable_rows,
+                "session context page holds rows this scope cannot decrypt; it is not provably complete"
+            );
+            return Err(crate::memory::traits::SessionPageIncomplete { unreadable_rows }.into());
+        }
+        Ok(events.into_iter().map(|event| self.reveal(event)).collect())
     }
 
     async fn append_memory_event(
@@ -1528,5 +1534,200 @@ mod tests {
         })
         .await
         .expect("the scope snapshot test finishes within SNAPSHOT_SCOPE_DEADLINE");
+    }
+
+    /// Bound on one provenance-through-the-scope test (real SQLite, ~500 rows).
+    const SCOPE_PROVENANCE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+    const SCOPE_WORKSPACE: &str = "workspace-scope-provenance";
+
+    /// The switch builder needs a provider; switch mode never calls it.
+    struct UnusedProvider;
+
+    #[async_trait]
+    impl crate::providers::Provider for UnusedProvider {
+        async fn chat_with_system(
+            &self,
+            _system: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Err(anyhow::anyhow!("test: the provider is never called"))
+        }
+
+        async fn chat(
+            &self,
+            _request: crate::providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<crate::providers::ChatResponse> {
+            Err(anyhow::anyhow!("test: the provider is never called"))
+        }
+    }
+
+    /// A chat session whose rows are written through an encrypted scope over a
+    /// real SQLite store, plus one row the scope cannot decrypt.
+    struct ScopedSession {
+        _workspace: tempfile::TempDir,
+        _keys: tempfile::TempDir,
+        inner: Arc<dyn Memory>,
+        scope: Arc<dyn Memory>,
+        envelope: crate::runtime::envelope::RuntimeEnvelope,
+    }
+
+    impl ScopedSession {
+        fn new() -> Self {
+            let workspace = tempfile::TempDir::new().expect("test: workspace");
+            let keys = tempfile::TempDir::new().expect("test: key dir");
+            let inner: Arc<dyn Memory> =
+                Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("test: real sqlite memory"));
+            let crypto = Arc::new(AccountCrypto::new(keys.path(), keys.path(), true));
+            crypto.unlock("acct-a").expect("test: unlock");
+            let scope = create_ramflux_scoped_memory(Arc::clone(&inner), crypto, "acct-a", "acct-a/conv-1");
+            let envelope = crate::runtime::envelope::RuntimeEnvelope::chat_canonical(
+                SCOPE_WORKSPACE,
+                "scope-provenance",
+                crate::memory::MemoryVisibility::Workspace,
+            );
+            Self {
+                _workspace: workspace,
+                _keys: keys,
+                inner,
+                scope,
+                envelope,
+            }
+        }
+
+        /// One sealed user/assistant pair through the scope.
+        async fn pair(&self, question: &str, answer: &str) -> (String, String) {
+            let fabric = crate::memory::MemoryFabric::new(Arc::clone(&self.scope), SCOPE_WORKSPACE);
+            let run = self
+                .envelope
+                .clone()
+                .with_run_id(format!("run-{}", uuid::Uuid::new_v4()));
+            fabric
+                .record_inbound_user_message(
+                    run.message_scope(),
+                    question,
+                    Some(format!("scope-input-{}", uuid::Uuid::new_v4())),
+                    None,
+                )
+                .await
+                .expect("test: record a sealed user row");
+            fabric
+                .record_assistant_message(run.message_scope(), answer)
+                .await
+                .expect("test: record a sealed assistant row");
+            (question.to_string(), answer.to_string())
+        }
+
+        /// A row under the same session key the scope cannot decrypt (written
+        /// to the inner store directly, not sealed by this scope).
+        async fn undecryptable_row(&self) {
+            crate::memory::MemoryFabric::new(Arc::clone(&self.inner), SCOPE_WORKSPACE)
+                .record_inbound_user_message(
+                    self.envelope.clone().with_run_id("foreign-run").message_scope(),
+                    "a row this scope cannot open",
+                    Some("scope-foreign-input".to_string()),
+                    None,
+                )
+                .await
+                .expect("test: record an undecryptable row");
+        }
+
+        /// Assert the cold window `(question, answer)` is refused as ambiguous
+        /// and no switch row is written.
+        async fn assert_switch_refused(&self, cold: (String, String)) {
+            let history = vec![
+                crate::providers::ChatMessage::system("sys"),
+                crate::providers::ChatMessage::user(cold.0),
+                crate::providers::ChatMessage::assistant(cold.1),
+                crate::providers::ChatMessage::user(format!("tail question {}", "padding ".repeat(20))),
+            ];
+            let resolution = crate::agent::compaction::resolve_compaction_event_provenance_detailed(
+                self.scope.as_ref(),
+                self.envelope.memory_principal(),
+                history.get(1..3).expect("test: cold window"),
+                crate::agent::compaction::RoundCompanions::Acknowledged,
+            )
+            .await
+            .expect("test: the provenance read succeeds");
+            assert_eq!(
+                resolution,
+                crate::agent::compaction::ProvenanceResolution::Unavailable(
+                    crate::agent::compaction::ProvenanceGap::TurnAmbiguous
+                ),
+                "a page holding an undecryptable row leaves the pool unproven"
+            );
+            let audit = crate::agent::document_ingest::DocumentIngestRuntime::from_envelope(
+                Arc::clone(&self.scope),
+                &self.envelope,
+            );
+            let config = crate::config::AgentCompactionConfig {
+                mode: crate::config::AgentCompactionMode::Switch,
+                reserve_tokens: 1,
+                keep_recent_messages: 1,
+                memory_flush: false,
+                max_context_tokens: 50,
+                max_context_tokens_explicit: true,
+                os_paging: crate::config::OsPagingConfig::default(),
+            };
+            let patch = crate::agent::compaction::build_configurable_compaction_patch(
+                &history,
+                &UnusedProvider,
+                "model",
+                &config,
+                Some(&audit),
+                "scope_provenance",
+            )
+            .await
+            .expect("test: the switch builder runs");
+            assert!(patch.is_none(), "no switch is built without exact provenance");
+            let switch_rows = self
+                .inner
+                .list_message_events_since(&self.envelope.memory_principal(), 0, 5000)
+                .await
+                .expect("test: list stored rows")
+                .into_iter()
+                .filter(|event| event.event_type == "context.switch.created")
+                .count();
+            assert_eq!(switch_rows, 0, "no context.switch.created row is written");
+        }
+    }
+
+    fn padded(label: &str) -> String {
+        format!("{label} {}", "padding ".repeat(20))
+    }
+
+    #[tokio::test]
+    async fn an_undecryptable_row_in_an_older_page_leaves_the_provenance_pool_unproven() {
+        tokio::time::timeout(SCOPE_PROVENANCE_DEADLINE, async {
+            let session = ScopedSession::new();
+            let cold = session
+                .pair(&padded("the oldest question"), &padded("the oldest answer"))
+                .await;
+            session.undecryptable_row().await;
+            // A full newest page of readable rows: the foreign row is only in page 2.
+            for pair in 0..250 {
+                session
+                    .pair(&format!("later question {pair}"), &format!("later answer {pair}"))
+                    .await;
+            }
+            session.assert_switch_refused(cold).await;
+        })
+        .await
+        .expect("an_undecryptable_row_in_an_older_page_leaves_the_provenance_pool_unproven exceeded its deadline");
+    }
+
+    #[tokio::test]
+    async fn an_undecryptable_row_in_the_newest_page_leaves_the_provenance_pool_unproven() {
+        tokio::time::timeout(SCOPE_PROVENANCE_DEADLINE, async {
+            let session = ScopedSession::new();
+            let cold = session.pair(&padded("the question"), &padded("the answer")).await;
+            session.undecryptable_row().await;
+            session.assert_switch_refused(cold).await;
+        })
+        .await
+        .expect("an_undecryptable_row_in_the_newest_page_leaves_the_provenance_pool_unproven exceeded its deadline");
     }
 }
