@@ -2443,18 +2443,27 @@ impl ResponseGate {
 fn script_holding_the_first_queued_line(gate: std::sync::Arc<ResponseGate>) -> Script {
     let mut base = compaction_script::script();
     Box::new(move |index, request| {
-        let newest = newest_user_text(request);
-        let last_is_user = request["messages"]
-            .as_array()
-            .and_then(|messages| messages.last())
-            .is_some_and(|message| message["role"] == "user");
-        if last_is_user && newest.contains(QUEUED_FIRST) {
+        let messages = request["messages"].as_array().cloned().unwrap_or_default();
+        // A tool result belongs to a later turn's round trip: the base script answers it.
+        let not_a_tool_result = messages.last().is_some_and(|message| message["role"] != "tool");
+        // The line itself is the last line of the newest user message; the
+        // session context above it may quote earlier lines.
+        let line = messages
+            .iter()
+            .rev()
+            .find(|message| message["role"] == "user")
+            .and_then(|message| message["content"].as_str())
+            .and_then(|content| content.lines().last())
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        if not_a_tool_result && line == QUEUED_FIRST {
             if !gate.held.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 gate.hold();
             }
             return Scripted::text(QUEUED_FIRST_REPLY);
         }
-        if last_is_user && newest.contains(QUEUED_SECOND) {
+        if not_a_tool_result && line == QUEUED_SECOND {
             return Scripted::text(QUEUED_SECOND_REPLY);
         }
         base(index, request)
@@ -2533,7 +2542,13 @@ fn a_queued_input_does_not_degrade_the_next_switch() {
         ("assistant", QUEUED_SECOND_REPLY),
     ]
     .map(|(role, content)| {
-        stored_row_id(&sandbox, role, content).unwrap_or_else(|| panic!("the {role} row `{content}` is stored"))
+        stored_row_id(&sandbox, role, content).unwrap_or_else(|| {
+            panic!(
+                "the {role} row `{content}` is stored; assistant rows: {:?}; newest user texts: {:?}",
+                loopback_openai::assistant_messages(&sandbox.workspace),
+                server.requests().iter().map(newest_user_text).collect::<Vec<_>>()
+            )
+        })
     });
 
     let mut next_file = 0;
