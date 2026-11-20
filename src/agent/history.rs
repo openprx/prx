@@ -44,6 +44,7 @@ pub(super) const DEFAULT_MAX_HISTORY_MESSAGES: usize = 300;
 /// strand a tool result; native providers reject a tool message that has no
 /// matching `tool_calls` ahead of it, which would turn a survivable trim into
 /// a failed turn.
+#[cfg(test)]
 pub(super) fn drop_orphan_tool_results_at(history: &mut Vec<ChatMessage>, from: usize) {
     while history.len() > from && history.get(from).is_some_and(|message| message.role == "tool") {
         history.remove(from);
@@ -52,26 +53,6 @@ pub(super) fn drop_orphan_tool_results_at(history: &mut Vec<ChatMessage>, from: 
 
 pub(super) fn history_non_system_start(history: &[ChatMessage]) -> usize {
     usize::from(history.first().is_some_and(|message| message.role == "system"))
-}
-
-fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
-    // Nothing to trim if within limit
-    let has_system = history.first().map_or(false, |m| m.role == "system");
-    let non_system_count = if has_system { history.len() - 1 } else { history.len() };
-
-    if non_system_count <= max_history {
-        return;
-    }
-
-    let start: usize = if has_system { 1 } else { 0 };
-    let to_remove = non_system_count - max_history;
-    history.drain(start..start + to_remove);
-    drop_orphan_tool_results_at(history, start);
-}
-
-/// Aggressive trim fallback: keep only the most recent non-system messages.
-pub(super) fn apply_aggressive_trim(history: &mut Vec<ChatMessage>, keep_recent: usize) {
-    trim_history(history, keep_recent.max(1));
 }
 
 /// Position of the latest real user turn, skipping internal bookkeeping

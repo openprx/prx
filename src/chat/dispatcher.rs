@@ -2066,7 +2066,7 @@ async fn apply_redux_context_rollover(
     )
     .await
     {
-        Ok(Some(patch)) => patch,
+        Ok(crate::agent::compaction::CompactionBuild::Patch(patch)) => patch,
         // A `switch` rollover that cannot produce an exact handoff must not end
         // the turn. Failing the draft here left every session containing tool
         // calls answering each user message with the same non-retryable error
@@ -2076,7 +2076,12 @@ async fn apply_redux_context_rollover(
         // no patch at all: the caller's trim is the whole remediation, and it is
         // lossy. Summary mode returns `None` when there is simply nothing to
         // compact, which is not a degradation.
-        Ok(None) => {
+        // The turn already spent its automatic switch budget (§3.2): the
+        // request is fitted by the turn's own budget, nothing is degraded here.
+        Ok(crate::agent::compaction::CompactionBuild::Suppressed) => {
+            return Ok(ContextRolloverOutcome::default());
+        }
+        Ok(crate::agent::compaction::CompactionBuild::NotNeeded | crate::agent::compaction::CompactionBuild::NoProgress { .. }) => {
             let degraded = matches!(config.mode, crate::config::AgentCompactionMode::Switch);
             if degraded {
                 tracing::warn!(
@@ -2199,12 +2204,7 @@ async fn apply_redux_context_rollover(
         // untrimmed compacted source, which is what the session adopts below.
         let before_trim = history.len();
         let mut projection_guard = compaction_guard_history.messages().to_vec();
-        let trimmed: bool = trim_redux_driver_context_budget_after_rollover(
-            history,
-            &mut projection_guard,
-            config,
-            Some(replacement_len),
-        );
+        let trimmed: bool = trim_redux_driver_context_budget_after_rollover(history, &mut projection_guard, config);
         degraded_dropped = before_trim.saturating_sub(history.len());
         tracing::warn!(
             used_tokens = budget.used_tokens,
@@ -2404,38 +2404,33 @@ async fn send_redux_context_window_update(
     Ok(())
 }
 
+/// The redux rollover's fit over the provider projection (§3.3). The fit keeps
+/// the turn's request itself, so no restore follows it. A window the fit cannot
+/// hold is logged here and left to the turn's own preflight, which fails it
+/// with the typed budget error before any provider call.
 fn trim_redux_driver_context_budget_after_rollover(
     history: &mut Vec<crate::providers::traits::ChatMessage>,
     compaction_guard_history: &mut Vec<crate::providers::traits::ChatMessage>,
     config: &crate::config::AgentCompactionConfig,
-    replacement_len: Option<usize>,
 ) -> bool {
-    let current_request =
-        crate::agent::context_preflight::capture_current_turn_request_with_source(history, compaction_guard_history);
     let histories_matched_before_trim = history.len() == compaction_guard_history.len()
         && history
             .iter()
             .zip(compaction_guard_history.iter())
             .all(|(left, right)| left.role == right.role && left.content == right.content);
-    let trimmed = if let Some(replacement_len) = replacement_len {
-        crate::agent::context_budget::trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
-            history,
-            config,
-            replacement_len,
-        )
-    } else {
-        crate::agent::context_budget::trim_history_to_context_budget(history, config)
+    let limit = config.max_context_tokens.saturating_sub(config.reserve_tokens);
+    let trimmed = match crate::agent::context_budget::fit_plain_window(history, limit, "redux_preflight") {
+        Ok(report) => report.reduced,
+        Err(error) => {
+            let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+            tracing::warn!(
+                error_len,
+                error_sha256,
+                "redux context fit could not hold the window; the turn's preflight decides"
+            );
+            false
+        }
     };
-    crate::agent::context_preflight::restore_current_turn_request(
-        history,
-        current_request,
-        "redux_preflight",
-        if replacement_len.is_some() {
-            crate::agent::context_preflight::RestoredRequestPosition::Tail
-        } else {
-            crate::agent::context_preflight::RestoredRequestPosition::AboveEverythingLeftStanding
-        },
-    );
     if histories_matched_before_trim {
         *compaction_guard_history = history.clone();
     }
@@ -2889,12 +2884,7 @@ async fn drive_start_turn_stream(
                 // A projection of this request: the guard source stays the
                 // canonical history the turn builds its durable compactions from.
                 let mut projection_guard = compaction_guard_history.messages().to_vec();
-                trim_redux_driver_context_budget_after_rollover(
-                    &mut history,
-                    &mut projection_guard,
-                    config,
-                    replacement_len,
-                );
+                trim_redux_driver_context_budget_after_rollover(&mut history, &mut projection_guard, config);
             }
             caller_rollover = replacement_len.is_some()
                 || !crate::agent::turn_history::same_messages(&history, &view_before_rollover);

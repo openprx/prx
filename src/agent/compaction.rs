@@ -1,4 +1,6 @@
-use crate::agent::context_budget::estimate_history_tokens;
+use crate::agent::context_budget::{
+    budgeted_tokens, estimate_history_tokens, estimate_history_tokens_with_source,
+};
 use crate::agent::document_ingest::DocumentIngestRuntime;
 use crate::agent::response_guard::strip_assistant_fabricated_tool_markers;
 use crate::agent::turn_contracts::{
@@ -15,9 +17,6 @@ use sha2::Digest;
 use std::collections::HashSet;
 use std::fmt::Write;
 use uuid::Uuid;
-
-/// Keep this many most-recent non-system messages after compaction.
-pub(super) const COMPACTION_KEEP_RECENT_MESSAGES: usize = 20;
 
 /// Safety cap for compaction source transcript passed to the summarizer.
 const COMPACTION_MAX_SOURCE_CHARS: usize = 12_000;
@@ -891,18 +890,21 @@ async fn persist_context_switch(
 /// calls permanently unusable once it crossed the hard limit. Degrading is
 /// lossy, so it is recorded durably next to the compaction audit trail instead
 /// of only being logged.
-pub(crate) async fn persist_context_switch_degradation(
+pub(crate) async fn persist_context_degradation_with_details(
     audit: Option<&DocumentIngestRuntime>,
     trigger: &'static str,
     reason: &'static str,
     before_tokens: usize,
     after_tokens: usize,
     hard_limit: usize,
+    // Counts of the fit's steps (`folded_rounds`, `removed_messages`), carried
+    // into the payload next to the token figures.
+    details: &[(&'static str, usize)],
 ) {
     let Some(audit) = audit else {
         return;
     };
-    let detail = serde_json::json!({
+    let mut detail = serde_json::json!({
         "trigger": trigger,
         "reason": reason,
         "before_used_tokens": before_tokens,
@@ -910,21 +912,26 @@ pub(crate) async fn persist_context_switch_degradation(
         "hard_limit_tokens": hard_limit,
         "fallback": "token_aware_trim",
     });
-    // One event per turn. The key is derived from the turn rather than from the
-    // event id it is attached to: a fresh `Uuid` in both places made every write
-    // a guaranteed insert and left the idempotency key unable to reject
-    // anything, including a retry of this very call from a second runtime built
-    // for the same turn.
-    if audit.degradation_recorded.load(std::sync::atomic::Ordering::SeqCst) {
+    if let Some(object) = detail.as_object_mut() {
+        for (key, value) in details {
+            object.insert((*key).to_string(), serde_json::json!(value));
+        }
+    }
+    // One event per (turn, reason) (§3.4). The claim and the durable key are both
+    // scoped by reason, so an earlier `handoff_unavailable` never suppresses a
+    // later `inflight_tool_rounds_folded`. The key is still derived from the turn,
+    // not from a fresh id, so a retry from a second runtime built for the same
+    // turn is rejected by the backend.
+    if audit.degradation_recorded.lock().contains(&reason) {
         tracing::debug!(
             trigger,
             reason,
-            "context switch degradation already recorded for this turn"
+            "context compaction degradation already recorded for this turn"
         );
         return;
     }
     let degraded_event_id = Uuid::new_v4().to_string();
-    let idempotency_key = format!("context-compaction-degraded:{}", audit.turn_key);
+    let idempotency_key = format!("context-compaction-degraded:{}:{reason}", audit.turn_key);
     if let Err(error) = audit
         .memory
         .append_message_event(crate::memory::MessageEventInput {
@@ -975,10 +982,29 @@ pub(crate) async fn persist_context_switch_degradation(
             "failed to append context switch degradation event"
         );
     } else {
-        audit
-            .degradation_recorded
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        audit.degradation_recorded.lock().push(reason);
     }
+}
+
+/// [`persist_context_degradation_with_details`] without step counts.
+pub(crate) async fn persist_context_switch_degradation(
+    audit: Option<&DocumentIngestRuntime>,
+    trigger: &'static str,
+    reason: &'static str,
+    before_tokens: usize,
+    after_tokens: usize,
+    hard_limit: usize,
+) {
+    persist_context_degradation_with_details(
+        audit,
+        trigger,
+        reason,
+        before_tokens,
+        after_tokens,
+        hard_limit,
+        &[],
+    )
+    .await;
 }
 
 async fn persist_compaction_audit(
@@ -1186,6 +1212,45 @@ impl CompactionDemand {
     }
 }
 
+/// What the builder decided for one compaction demand.
+pub(crate) enum CompactionBuild {
+    /// No patch: nothing to compact for this demand, or no exact handoff could
+    /// be produced (the caller degrades as it always did).
+    NotNeeded,
+    /// A patch that replaces the cold window.
+    Patch(CompactionPatch),
+    /// A `switch` whose handoff does not reclaim tokens (I1). Nothing was
+    /// persisted, and the turn must not try another switch.
+    NoProgress { before_tokens: usize, after_tokens: usize },
+    /// An automatic `switch` this admitted turn already spent (§3.2): it
+    /// succeeded or made no progress earlier in the turn. Nothing is built, and
+    /// nothing is reported as a degradation; the turn fits its request instead.
+    Suppressed,
+}
+
+/// The candidate canonical history a switch leaves: the cold window
+/// `start..compact_end` replaced by `handoff`, with the turn's request restored
+/// at the tail when the cold window took it, as the caller applies it. Built
+/// with `take`/`skip`, so no index can panic.
+fn switch_candidate_messages(
+    source_history: &[ChatMessage],
+    start: usize,
+    compact_end: usize,
+    handoff: &ChatMessage,
+    trigger: &'static str,
+) -> Vec<ChatMessage> {
+    let mut candidate = Vec::with_capacity(source_history.len());
+    candidate.extend(source_history.iter().take(start).cloned());
+    candidate.push(handoff.clone());
+    candidate.extend(source_history.iter().skip(compact_end).cloned());
+    crate::agent::context_preflight::restore_current_turn_request(
+        &mut candidate,
+        crate::agent::context_preflight::capture_current_turn_request(source_history),
+        trigger,
+    );
+    candidate
+}
+
 #[cfg(test)]
 pub(crate) async fn build_configurable_compaction_patch(
     history: &[ChatMessage],
@@ -1196,8 +1261,17 @@ pub(crate) async fn build_configurable_compaction_patch(
     trigger: &'static str,
 ) -> Result<Option<CompactionPatch>> {
     let source = crate::agent::turn_history::CanonicalHistory::from_test_messages(history.to_vec());
-    build_configurable_compaction_patch_with_source_history(history, &source, provider, model, config, audit, trigger)
-        .await
+    match build_configurable_compaction_patch_with_source_history(history, &source, provider, model, config, audit, trigger)
+        .await?
+    {
+        CompactionBuild::Patch(patch) => Ok(Some(patch)),
+        CompactionBuild::NotNeeded => Ok(None),
+        CompactionBuild::NoProgress {
+            before_tokens,
+            after_tokens,
+        } => anyhow::bail!("context switch made no progress: {before_tokens} -> {after_tokens} tokens"),
+        CompactionBuild::Suppressed => anyhow::bail!("context switch suppressed: the turn spent its switch budget"),
+    }
 }
 
 pub(crate) async fn build_configurable_compaction_patch_with_source_history(
@@ -1208,12 +1282,22 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
     config: &crate::config::AgentCompactionConfig,
     audit: Option<&DocumentIngestRuntime>,
     trigger: &'static str,
-) -> Result<Option<CompactionPatch>> {
+) -> Result<CompactionBuild> {
     let Some(limit) = compaction_trigger_limit(config) else {
-        return Ok(None);
+        return Ok(CompactionBuild::NotNeeded);
     };
     if !CompactionDemand::from_trigger(trigger).is_forced() && estimate_history_tokens(budget_history) <= limit {
-        return Ok(None);
+        return Ok(CompactionBuild::NotNeeded);
+    }
+    // §3.2: one successful automatic switch, or one NoProgress, per admitted
+    // turn. Manual `/compact` is outside the budget and always builds.
+    let automatic_switch = trigger != MANUAL_COMPACT_TRIGGER;
+    if automatic_switch
+        && matches!(config.mode, crate::config::AgentCompactionMode::Switch)
+        && audit.is_some_and(DocumentIngestRuntime::automatic_switch_spent)
+    {
+        tracing::debug!(trigger, "context switch suppressed: this turn has already spent its switch budget");
+        return Ok(CompactionBuild::Suppressed);
     }
 
     let source_history = source.messages();
@@ -1224,13 +1308,13 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
     let start = if has_system { 1 } else { 0 };
     let non_system_count = source_history.len().saturating_sub(start);
     if non_system_count <= 1 {
-        return Ok(None);
+        return Ok(CompactionBuild::NotNeeded);
     }
 
     let requested_keep_recent = config.keep_recent_messages.max(1).min(non_system_count);
     let requested_compact_count = non_system_count.saturating_sub(requested_keep_recent);
     if requested_compact_count == 0 {
-        return Ok(None);
+        return Ok(CompactionBuild::NotNeeded);
     }
     // Never cut inside a tool round-trip: an orphan `role="tool"` result whose
     // requesting assistant message was compacted away is rejected by every
@@ -1239,7 +1323,7 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
         compaction_boundary_without_orphan_tool_results(&companions, start, start + requested_compact_count);
     let compact_count = compact_end.saturating_sub(start);
     if compact_count == 0 {
-        return Ok(None);
+        return Ok(CompactionBuild::NotNeeded);
     }
     let keep_recent = source_history.len().saturating_sub(compact_end);
     let compacted_source_messages = source_history.get(start..compact_end);
@@ -1251,7 +1335,7 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
         attach_compaction_event_provenance(audit, source_messages, compacted_companions, source).await;
     }
     let Some(guard) = compaction_patch_guard_for(source_history, start, compact_end) else {
-        return Ok(None);
+        return Ok(CompactionBuild::NotNeeded);
     };
     let timestamp = chrono::Utc::now().to_rfc3339();
 
@@ -1261,7 +1345,7 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
                 trigger,
                 "context switch skipped because durable transcript scope is unavailable"
             );
-            return Ok(None);
+            return Ok(CompactionBuild::NotNeeded);
         };
         let Some(source) = audit_source.as_ref().filter(|source| {
             matches!(
@@ -1280,10 +1364,10 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
                 trigger,
                 "context switch skipped because exact transcript provenance is unavailable"
             );
-            return Ok(None);
+            return Ok(CompactionBuild::NotNeeded);
         };
         let Some(range) = source.source_event_range.as_ref() else {
-            return Ok(None);
+            return Ok(CompactionBuild::NotNeeded);
         };
         let (from_generation, parent_handoff_event_id) = context_handoff_lineage(source_history);
         let to_generation = from_generation.saturating_add(1);
@@ -1336,11 +1420,42 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
                 referenced_events = source.source_event_ids.len(),
                 "context switch skipped because the handoff note is oversized or does not validate"
             );
-            return Ok(None);
+            return Ok(CompactionBuild::NotNeeded);
         }
-        persist_context_switch(audit, trigger, source, &handoff_event_id, &handoff_message, &note_json).await?;
-        return Ok(Some(CompactionPatch {
-            replacement: vec![ChatMessage::assistant(handoff_message)],
+        // Progress (I1): a switch must reclaim tokens or not happen. Both sides
+        // use the budgeted estimator; the after side is the candidate canonical
+        // history with the handoff in place of the cold window and the request
+        // restored at the tail, exactly as the caller applies it.
+        let handoff = ChatMessage::assistant(handoff_message);
+        let before_tokens = budgeted_tokens(estimate_history_tokens_with_source(source_history));
+        let after_tokens = budgeted_tokens(estimate_history_tokens_with_source(&switch_candidate_messages(
+            source_history,
+            start,
+            compact_end,
+            &handoff,
+            trigger,
+        )));
+        if after_tokens >= before_tokens {
+            tracing::warn!(
+                trigger,
+                before_tokens,
+                after_tokens,
+                "context switch skipped because the handoff does not reclaim tokens"
+            );
+            if automatic_switch {
+                audit.mark_automatic_switch_spent();
+            }
+            return Ok(CompactionBuild::NoProgress {
+                before_tokens,
+                after_tokens,
+            });
+        }
+        persist_context_switch(audit, trigger, source, &handoff_event_id, &handoff.content, &note_json).await?;
+        if automatic_switch {
+            audit.mark_automatic_switch_spent();
+        }
+        return Ok(CompactionBuild::Patch(CompactionPatch {
+            replacement: vec![handoff],
             append_after: Vec::new(),
             guard,
         }));
@@ -1351,7 +1466,7 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
         .map(bounded_compaction_projection)
         .unwrap_or_default();
     if source_projection.is_empty() {
-        return Ok(None);
+        return Ok(CompactionBuild::NotNeeded);
     }
 
     // FU-02c-AUX-SENDS: compaction summarizer is exempt from admit_provider_send.
@@ -1462,7 +1577,7 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
             }
             truncate_with_ellipsis(&summary, COMPACTION_MAX_SUMMARY_CHARS)
         }
-        crate::config::AgentCompactionMode::Switch | crate::config::AgentCompactionMode::Off => return Ok(None),
+        crate::config::AgentCompactionMode::Switch | crate::config::AgentCompactionMode::Off => return Ok(CompactionBuild::NotNeeded),
     };
     // The summarizer reads the very turns that may still carry a fabricated
     // marker and is free to copy one into its output — the "recent turns
@@ -1491,7 +1606,7 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
     // rules may have been summarized and should re-read workspace instructions.
     let append_after = vec![post_compaction_refresh_aside()];
 
-    Ok(Some(CompactionPatch {
+    Ok(CompactionBuild::Patch(CompactionPatch {
         replacement,
         append_after,
         guard,
@@ -1531,8 +1646,8 @@ pub(super) async fn apply_configurable_compaction_over_view(
     config: &crate::config::AgentCompactionConfig,
     audit: Option<&DocumentIngestRuntime>,
     trigger: &'static str,
-) -> Result<Option<usize>> {
-    let Some(patch) = build_configurable_compaction_patch_with_source_history(
+) -> Result<CompactionApply> {
+    let patch = match build_configurable_compaction_patch_with_source_history(
         budget_history,
         source,
         provider,
@@ -1542,13 +1657,37 @@ pub(super) async fn apply_configurable_compaction_over_view(
         trigger,
     )
     .await?
-    else {
-        return Ok(None);
+    {
+        CompactionBuild::Patch(patch) => patch,
+        CompactionBuild::NotNeeded => return Ok(CompactionApply::NotNeeded),
+        CompactionBuild::Suppressed => return Ok(CompactionApply::Suppressed),
+        CompactionBuild::NoProgress {
+            before_tokens,
+            after_tokens,
+        } => {
+            return Ok(CompactionApply::NoProgress {
+                before_tokens,
+                after_tokens,
+            });
+        }
     };
     crate::agent::idle::beat(crate::agent::idle::ProgressKind::Compaction);
     let replacement_len = patch.replacement.len();
     source.apply_patch_with_refresh_aside(&patch)?;
-    Ok(Some(replacement_len))
+    Ok(CompactionApply::Applied(replacement_len))
+}
+
+/// What [`apply_configurable_compaction_over_view`] did to the canonical history.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum CompactionApply {
+    /// Nothing applied; see [`CompactionBuild::NotNeeded`].
+    NotNeeded,
+    /// Applied; the replacement's length in the canonical history.
+    Applied(usize),
+    /// A switch that did not reclaim tokens; nothing was applied.
+    NoProgress { before_tokens: usize, after_tokens: usize },
+    /// An automatic switch the turn already spent; nothing was applied.
+    Suppressed,
 }
 
 #[cfg(test)]

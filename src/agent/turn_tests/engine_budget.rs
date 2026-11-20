@@ -11,6 +11,7 @@
 )]
 
 use super::*;
+use crate::agent::turn_tests::{budget_exhausted_of, window_for_protected_floor};
 use crate::agent::turn_tests::business_tool_specs_of;
 
 /// The only part of the appended prompt sections the preflight cannot pin
@@ -1142,19 +1143,20 @@ async fn an_oversized_tool_payload_never_trims_away_the_current_user_message() {
         )
         .await
         .map(|(outcome, _trace)| outcome.into_text())
-        .expect("an unfittable request keeps the existing provider-side fallback, not a new rejection");
+        .expect_err("the schemas and the request alone exceed the window: a typed exhaustion");
 
-        assert_eq!(result, "done");
+        let (needed, limit) = budget_exhausted_of(&result).expect("test: a typed BudgetExhausted");
+        assert!(needed > limit, "the protected floor (schemas and request) does not fit");
         assert_eq!(
             calls.load(Ordering::SeqCst),
-            1,
-            "there is no context-budget rejection path: the provider is still reached"
+            0,
+            "an exhausted window is refused before any provider call"
         );
         assert!(
             history
                 .iter()
                 .any(|message| message.role == "user" && message.content.contains(CURRENT_TURN_MARKER)),
-            "the current turn's user message must survive a window too small to hold the schemas"
+            "the current turn's user message is never trimmed, even when the window cannot hold it"
         );
     })
     .await;
@@ -1286,12 +1288,18 @@ async fn the_inline_tool_result_budget_aims_at_the_reserved_window() {
 }
 
 /// Room the mid-turn fixtures leave beside the history: enough that the
-/// first iteration fits the reserved window with nothing to spare, and far
-/// less than one tool round adds, so only the round can push the turn over.
-const MID_TURN_SATURATED_SLACK_TOKENS: usize = 8;
+/// first iteration fits the reserved window and the protected floor (the
+/// request and the newest round, which the fit never folds or removes) fits
+/// too, and far less than the next tool round adds, so only the round can
+/// push the turn over.
+const MID_TURN_SATURATED_SLACK_TOKENS: usize = 64;
 
 /// Room the control fixture leaves: more than a whole tool round, so the
 /// mid-turn trim never fires and history must come out untouched.
+/// Room the skill-rebuild fixture leaves: the round must be larger than this so
+/// the second request compacts, while the older exchange carries the floor.
+const SKILL_REBUILD_SLACK_TOKENS: usize = 8;
+
 const MID_TURN_UNSATURATED_SLACK_TOKENS: usize = 4_096;
 
 /// A window that holds exactly this history plus `slack_tokens` once the
@@ -1318,16 +1326,17 @@ fn mid_turn_floor_fixture_config(
     }
 }
 
-/// Premise for the saturated mid-turn fixtures: freeing the older exchange
-/// alone could not have satisfied the trim, so it had to reach the
-/// question.
+/// Premise for the saturated mid-turn fixtures: the older exchange had to go
+/// for the window to hold the request, and removing it alone is enough, so
+/// the fit stops at the question and keeps it.
 ///
 /// The older exchange's absence proves only that *a* trim ran. If the
 /// fixture's arithmetic drifted so the trim stopped right after that
 /// exchange, the question would never have been removed, and the
 /// "restored exactly once" assertions would pass while proving nothing
 /// about the floor (R-B6i R3). So the history the trim faced, minus the
-/// older exchange, must still exceed the limit the mid-turn trim enforces.
+/// older exchange, must fit the limit the mid-turn trim enforces: the older
+/// exchange is the one thing the fit removes, and the question stays.
 /// It is rebuilt from the second request with the fixture's own system
 /// prompt, because the served system message also carries the rendered
 /// tool instructions the reserved window already accounts for.
@@ -1339,10 +1348,9 @@ fn assert_the_trim_had_to_reach_the_question(second: &[ChatMessage], reserved: &
     let tokens = estimate_history_tokens(&without_the_older_exchange);
     let limit = reserved.max_context_tokens.saturating_sub(reserved.reserve_tokens);
     assert!(
-        tokens > limit,
-        "premise: the history minus the older exchange ({tokens} tokens) must still exceed the \
-             mid-turn limit ({limit}), or the trim stopped before the question and this fixture \
-             proves nothing about the floor"
+        tokens <= limit,
+        "premise: the history minus the older exchange ({tokens} tokens) must fit the mid-turn \
+             limit ({limit}): the fit removes the older exchange and keeps the question"
     );
 }
 
@@ -1449,7 +1457,7 @@ async fn the_mid_turn_trim_keeps_a_prompt_guided_request_for_the_next_iteration(
         // proves the window really saturated and the trim really ran.
         let mut history = vec![
             ChatMessage::system("stable base system prompt"),
-            ChatMessage::user(format!("{OLDER_TURN_MARKER} settled earlier")),
+            ChatMessage::user(format!("{OLDER_TURN_MARKER} settled earlier {}", "settled-bulk ".repeat(60))),
             ChatMessage::assistant("settled"),
             ChatMessage::user(question.clone()),
         ];
@@ -1982,15 +1990,18 @@ async fn a_trim_only_preflight_opens_the_prompt_guided_second_request_on_the_que
         assert_the_trim_had_to_reach_the_question(second, &reserved);
         assert_eq!(
             role_sequence(second),
-            vec!["system", "user", "assistant", "user"],
+            // The fit stops as soon as the request fits, so the older exchange's
+            // reply may stay in front of the question; the question still sits above
+            // the round it triggered.
+            vec!["system", "assistant", "user", "assistant", "user"],
             "the question belongs above the round it triggered: the transcript must open on the \
                  user's question, not on the assistant turn that answered it"
         );
         assert!(
             second
-                .get(1)
+                .get(2)
                 .is_some_and(|message| message.content.contains(QUESTION_MARKER)),
-            "the `user` turn opening the transcript must be the question itself"
+            "the question is the user turn right after the older exchange's reply"
         );
         assert!(
             !second
@@ -2119,15 +2130,15 @@ async fn a_trim_only_preflight_opens_the_native_second_request_on_the_question()
         assert_the_trim_had_to_reach_the_question(second, &reserved);
         assert_eq!(
             role_sequence(second),
-            vec!["system", "user", "assistant", "tool"],
+            vec!["system", "assistant", "user", "assistant", "tool"],
             "the question belongs above the round it triggered: the transcript must open on the \
                  user's question, not on the assistant envelope that requested the tool"
         );
         assert!(
             second
-                .get(1)
+                .get(2)
                 .is_some_and(|message| message.content.contains(QUESTION_MARKER)),
-            "the `user` turn opening the transcript must be the question itself"
+            "the question is the user turn right after the older exchange's reply"
         );
         assert_eq!(
             first_orphan_tool_index(second),
@@ -2226,30 +2237,30 @@ async fn preflight_compacts_before_provider_call_when_over_hard_limit() {
     )
     .await
     .map(|(outcome, _trace)| outcome.into_text())
-    .expect("preflight should keep provider call within budget");
+    .expect_err("one turn is the request, and the request alone is larger than the window");
 
-    assert_eq!(result, "done");
-    // Changed with the current-request floor. One fixture turn is larger
-    // than the main window on its own, and the last of them is
-    // this turn's request: the preflight frees everything else and keeps
-    // it, so the bound is the window plus exactly that request instead of
-    // the window alone.
+    // The request is the protected floor and is larger than the window on its
+    // own: the preflight frees everything else, then refuses with a typed
+    // exhaustion before any provider call.
     let current_request_tokens = budgeted_tokens(estimate_history_tokens_with_source(&[ChatMessage::user(format!(
         "turn 23 {}",
         "long context ".repeat(4096)
     ))]));
     assert!(current_request_tokens > fixture_main_window);
+    let (needed, limit) = budget_exhausted_of(&result).expect("test: a typed BudgetExhausted");
+    assert!(needed > limit, "the request does not fit the window");
+    assert_eq!(
+        first_call_tokens.load(Ordering::SeqCst),
+        0,
+        "an exhausted window never reaches the provider"
+    );
     assert!(
         !history.iter().any(|message| message.content.starts_with("turn 0 ")),
-        "the older turns must still be compacted away before the provider is reached"
+        "the older turns must still be compacted away before the exhaustion is reported"
     );
     assert!(
         history.iter().any(|message| message.content.starts_with("turn 23 ")),
-        "the current turn's request must reach the provider"
-    );
-    assert!(
-        first_call_tokens.load(Ordering::SeqCst) <= fixture_main_window.saturating_add(current_request_tokens),
-        "first provider call must be the main hard limit plus at most the current request"
+        "the current turn's request is never trimmed away"
     );
 }
 
@@ -2555,7 +2566,10 @@ async fn skill_metadata_stays_suppressed_across_an_in_turn_rebuild() {
             let question = format!("{QUESTION_MARKER} Use file_read. {}", "question-bulk ".repeat(1600));
             let mut history = vec![
                 ChatMessage::system(format!("stable base system prompt\n{SKILLS_BLOCK}")),
-                ChatMessage::user(format!("{OLDER_TURN_MARKER} settled earlier")),
+                // The older turn is bulk the summary can reclaim: the protected floor
+                // (system, request, newest round) must fit the window while the full
+                // second-iteration view does not, or nothing is compacted.
+                ChatMessage::user(format!("{OLDER_TURN_MARKER} settled earlier {}", "older-bulk ".repeat(400))),
                 ChatMessage::assistant("settled"),
                 ChatMessage::user(question.clone()),
             ];
@@ -2567,7 +2581,7 @@ async fn skill_metadata_stays_suppressed_across_an_in_turn_rebuild() {
             let mut config = decision_sized_fixture_config(mid_turn_floor_fixture_config(
                 &first_view,
                 tool_surface,
-                MID_TURN_SATURATED_SLACK_TOKENS,
+                SKILL_REBUILD_SLACK_TOKENS,
             ));
             config.mode = crate::config::AgentCompactionMode::Safeguard;
             let reserved = reserve_request_tool_surface(&fixture_main_compaction(&config), tool_surface);

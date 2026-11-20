@@ -11,6 +11,7 @@
 )]
 
 use super::*;
+use crate::agent::turn_tests::{budget_exhausted_of, window_for_protected_floor};
 use crate::agent::compaction::{CONTEXT_COMPACTION_DEGRADED_EVENT_TYPE, apply_configurable_compaction};
 use crate::agent::context_preflight::preflight_context_budget_before_provider_call;
 use crate::agent::document_ingest::DocumentIngestRuntime;
@@ -127,6 +128,7 @@ fn token_aware_trim_never_strands_a_tool_result() {
     let fixture = tool_roundtrip_history_fixture(10);
     // Sweep the whole budget range so at least some limits cut exactly on a
     // tool result; the lossy fallback must be safe at every one of them.
+    let mut fitted_windows = 0usize;
     for max_context_tokens in (60..=1400).step_by(20) {
         let config = crate::config::AgentCompactionConfig {
             mode: crate::config::AgentCompactionMode::Switch,
@@ -138,7 +140,14 @@ fn token_aware_trim_never_strands_a_tool_result() {
             os_paging: crate::config::OsPagingConfig::default(),
         };
         let mut history = fixture.clone();
-        trim_history_to_context_budget(&mut history, &config);
+        let limit = config.max_context_tokens.saturating_sub(config.reserve_tokens);
+        match crate::agent::context_budget::fit_plain_window(&mut history, limit, "test_fixture") {
+            Ok(_) => fitted_windows += 1,
+            // The protected floor is larger than this window: a typed exhaustion.
+            // The reduced view is still checked below: it must never strand a result.
+            Err(crate::agent::turn_contracts::ContextCapacityError::BudgetExhausted { .. }) => {}
+            Err(other) => panic!("unexpected fit error at max_context_tokens={max_context_tokens}: {other}"),
+        }
         assert_eq!(
             first_orphan_tool_index(&history),
             None,
@@ -150,6 +159,7 @@ fn token_aware_trim_never_strands_a_tool_result() {
             "the leading system prompt must survive every trim"
         );
     }
+    assert!(fitted_windows > 0, "the sweep must cover windows whose floor fits");
 }
 
 #[tokio::test]
@@ -177,7 +187,7 @@ async fn legacy_preflight_preserving_trim_falls_back_when_summary_alone_exceeds_
         os_paging: crate::config::OsPagingConfig::default(),
     };
 
-    let budget = preflight_context_budget_before_provider_call(
+    let Err(error) = preflight_context_budget_before_provider_call(
         &mut history,
         &provider,
         "model",
@@ -187,25 +197,25 @@ async fn legacy_preflight_preserving_trim_falls_back_when_summary_alone_exceeds_
         "test_preflight",
     )
     .await
-    .unwrap();
+    else {
+        panic!("the request alone is over the window, so the preflight must report exhaustion");
+    };
+    let (needed, limit) = budget_exhausted_of(&error).expect("test: a typed BudgetExhausted");
+    assert_eq!(limit, 80, "the window is max_context_tokens minus the reserve");
+    assert!(needed > limit, "the floor is the request, which does not fit");
     let final_budget = plan_context_budget(&history, &config, PRE_TURN_FLUSH_THRESHOLD);
 
     assert!(
         final_budget.over_hard_limit,
         "the floor is the request, so the history left is over the limit"
     );
-    assert!(
-        budget.over_hard_limit,
-        "the returned snapshot must report the over-limit history it actually left"
-    );
+    // The unfit summary is not protected: the fit deletes it before it gives up.
     assert!(
         !history.iter().any(|msg| msg.content.contains("SUMMARY_TOO_LARGE")),
         "plain trim floor may delete an unfit summary instead of sending an oversized prompt"
     );
-    // Changed with the current-request floor: the floor fallback still
-    // deletes the unfit summary and every older turn, but it stops at the
-    // turn's own request, so the result is a request over the limit rather
-    // than a prompt with no question in it.
+    // The protected floor is the request: it is never trimmed, so exhaustion
+    // reports the request instead of a prompt with no question in it.
     assert!(
         history.iter().any(|msg| msg.content.contains("trim-candidate-7")),
         "the current turn's request survives the floor fallback"
@@ -396,7 +406,7 @@ async fn the_preflight_floor_preserves_a_prompt_guided_request_not_the_tool_resu
         "the fixture must reach the trim, or nothing is preserved"
     );
 
-    let budget = preflight_context_budget_before_provider_call(
+    let Err(error) = preflight_context_budget_before_provider_call(
         &mut history,
         &provider,
         "model",
@@ -406,7 +416,11 @@ async fn the_preflight_floor_preserves_a_prompt_guided_request_not_the_tool_resu
         "test_preflight",
     )
     .await
-    .expect("test: the preflight keeps the turn on the provider-side fallback");
+    else {
+        panic!("the question alone is over the window: the preflight must report exhaustion");
+    };
+    let (needed, limit) = budget_exhausted_of(&error).expect("test: a typed BudgetExhausted");
+    assert!(needed > limit, "a preserved request larger than the window is reported as such");
 
     assert!(
         history
@@ -421,10 +435,6 @@ async fn the_preflight_floor_preserves_a_prompt_guided_request_not_the_tool_resu
             .count(),
         1,
         "the request may be restored once, never duplicated"
-    );
-    assert!(
-        budget.over_hard_limit,
-        "a preserved request larger than the window is reported as such"
     );
 }
 
@@ -444,6 +454,7 @@ async fn the_preflight_restores_a_request_a_compaction_summarized_away() {
     };
     let mut history = vec![
         ChatMessage::system("sys"),
+        ChatMessage::user(format!("older-front-bulk {}", "front-bulk ".repeat(120))),
         ChatMessage::user(format!("{QUESTION_MARKER} {}", "question-bulk ".repeat(120))),
         ChatMessage::assistant("Checking that now."),
         ChatMessage::user(format!(
@@ -451,12 +462,15 @@ async fn the_preflight_restores_a_request_a_compaction_summarized_away() {
             crate::agent::turn_contracts::TOOL_RESULTS_PREFIX
         )),
     ];
+    // The request fits with headroom for a summary; the older front range is
+    // what the compaction writes over, so the window is over budget.
+    let window = window_for_protected_floor(&[history[0].clone(), history[2].clone()], 10, 150);
     let config = crate::config::AgentCompactionConfig {
         mode: crate::config::AgentCompactionMode::Safeguard,
         reserve_tokens: 10,
         keep_recent_messages: 1,
         memory_flush: false,
-        max_context_tokens: 260,
+        max_context_tokens: window,
         max_context_tokens_explicit: true,
         ..crate::config::AgentCompactionConfig::default()
     };
@@ -686,4 +700,249 @@ async fn a_user_turn_opening_like_the_refresh_aside_is_not_read_as_bookkeeping()
         "premise: the turn's own message is still in history, so the floor had something to \
              protect and chose to protect nothing rather than the wrong thing"
     );
+}
+
+/// The fit fixtures (T-C): each one is sized so exactly one step makes the
+/// window fit, which proves that step and nothing before it changed the view.
+mod fit_steps {
+    use crate::agent::compaction::format_context_handoff_message;
+    use crate::agent::context_budget::{FitDemand, FitReport, budgeted_history_tokens, fit_request_window};
+    use crate::agent::history::build_native_assistant_history;
+    use crate::agent::turn_contracts::ContextCapacityError;
+    use crate::agent::turn_history::{RoundTag, ViewSlot};
+    use crate::providers::ChatMessage;
+    use crate::providers::ToolCall;
+
+    const OUTPUT: &str = "tool-output-line ";
+
+    /// One complete native round of two messages (the envelope, its result).
+    fn native_round(batch: u64, complete: bool, output: &str) -> [(ChatMessage, ViewSlot); 2] {
+        let call = ToolCall {
+            id: format!("call-{batch}"),
+            name: "shell".to_string(),
+            arguments: "{}".to_string(),
+        };
+        let envelope = ChatMessage::assistant(build_native_assistant_history("", std::slice::from_ref(&call), None));
+        let result = ChatMessage::tool(
+            serde_json::json!({"tool_call_id": format!("call-{batch}"), "content": output}).to_string(),
+        );
+        let tag = |envelope| RoundTag {
+            batch,
+            envelope,
+            complete,
+            size: 2,
+        };
+        [
+            (envelope, ViewSlot::Round(tag(true))),
+            (result, ViewSlot::Round(tag(false))),
+        ]
+    }
+
+    fn window(parts: Vec<(ChatMessage, ViewSlot)>) -> (Vec<ChatMessage>, Vec<ViewSlot>) {
+        parts.into_iter().unzip()
+    }
+
+    fn fit(messages: &mut Vec<ChatMessage>, slots: &mut Vec<ViewSlot>, limit: usize) -> Result<FitReport, ContextCapacityError> {
+        fit_request_window(messages, slots, limit, FitDemand::Budget, "fit_steps_test")
+    }
+
+    fn total(messages: &[ChatMessage]) -> usize {
+        budgeted_history_tokens(messages)
+    }
+
+    /// Step A: the window's older turns go first, and nothing else is touched.
+    #[test]
+    fn step_a_removes_only_the_turns_older_than_the_request() {
+        let old = [
+            (ChatMessage::user("old question"), ViewSlot::Acknowledged),
+            (ChatMessage::assistant("old answer"), ViewSlot::Acknowledged),
+        ];
+        let rest = [
+            (ChatMessage::system("sys"), ViewSlot::Acknowledged),
+            (ChatMessage::user("current request"), ViewSlot::Acknowledged),
+        ];
+        let fitted_view: Vec<ChatMessage> = vec![ChatMessage::system("sys"), ChatMessage::user("current request")];
+        let limit = total(&fitted_view);
+        let mut all = vec![rest[0].clone()];
+        all.extend(old);
+        all.push(rest[1].clone());
+        let (mut messages, mut slots) = window(all);
+        let report = fit(&mut messages, &mut slots, limit).expect("step A fits");
+        assert_eq!(report.folded_rounds, 0, "step A folds nothing");
+        assert_eq!(report.removed_messages, 0, "step A does not count as C or D");
+        assert_eq!(messages.len(), 2, "exactly the older turns went: {messages:?}");
+        assert_eq!(messages[1].content, "current request");
+    }
+
+    /// Step B: an in-flight round's results are folded, oldest first, and the
+    /// round's envelope, its tool_call_id and the newest rounds are left alone.
+    #[test]
+    fn step_b_folds_the_oldest_eligible_round_and_keeps_the_envelopes() {
+        let big = OUTPUT.repeat(40);
+        let mut parts = vec![
+            (ChatMessage::system("sys"), ViewSlot::Acknowledged),
+            (ChatMessage::user("current request"), ViewSlot::Acknowledged),
+        ];
+        parts.extend(native_round(0, true, &big));
+        parts.extend(native_round(1, true, &big));
+        parts.extend(native_round(2, true, &big));
+        let (mut messages, mut slots) = window(parts);
+        let before = total(&messages);
+        let report = fit(&mut messages, &mut slots, before - 1).expect("folding the oldest round fits");
+        assert_eq!(report.folded_rounds, 1, "one round folds: {report:?}");
+        assert_eq!(report.removed_messages, 0);
+        assert_eq!(report.removed_rounds, 0);
+        assert_eq!(messages.len(), 8, "folding keeps every message");
+        let folded: serde_json::Value =
+            serde_json::from_str(&messages[3].content).expect("the folded result stays a JSON object");
+        assert_eq!(folded["tool_call_id"], "call-0", "tool_call_id is untouched");
+        assert!(
+            folded["content"]
+                .as_str()
+                .is_some_and(|content| content.starts_with("[tool result folded to fit the context:")),
+            "the content is the fold marker: {folded}"
+        );
+        assert!(messages[3].content.contains("bytes dropped"), "the marker names the dropped bytes");
+        assert!(messages[5].content.contains(OUTPUT), "the newer round keeps its output");
+    }
+
+    /// Step C: a whole acknowledged message between the handoff and the request
+    /// goes, oldest first; the handoff and tool-shaped messages stay.
+    #[test]
+    fn step_c_removes_acknowledged_turns_between_the_handoff_and_the_request() {
+        let handoff = format_context_handoff_message("{}");
+        let parts = vec![
+            (ChatMessage::system("sys"), ViewSlot::Acknowledged),
+            (ChatMessage::assistant(handoff.clone()), ViewSlot::Acknowledged),
+            (ChatMessage::user("acked question ".repeat(20)), ViewSlot::Acknowledged),
+            (ChatMessage::assistant("acked answer"), ViewSlot::Acknowledged),
+            (ChatMessage::user("current request"), ViewSlot::Acknowledged),
+        ];
+        let (mut messages, mut slots) = window(parts);
+        let limit = total(&messages) - 1;
+        let report = fit(&mut messages, &mut slots, limit).expect("step C fits");
+        assert_eq!(report.removed_messages, 1, "one acknowledged turn goes: {report:?}");
+        assert_eq!(report.folded_rounds, 0);
+        assert!(messages.iter().any(|message| message.content == handoff), "the handoff stays");
+        assert!(messages.iter().all(|message| message.content != "acked question ".repeat(20)));
+        assert_eq!(messages.last().map(|message| message.content.as_str()), Some("current request"));
+    }
+
+    /// Step D: an unprotected round whose fold cannot reduce it is removed
+    /// whole, its envelope and every result; the newest two rounds stay.
+    #[test]
+    fn step_d_removes_a_whole_unprotected_round_when_folding_cannot_reduce_it() {
+        let mut parts = vec![
+            (ChatMessage::system("sys"), ViewSlot::Acknowledged),
+            (ChatMessage::user("current request"), ViewSlot::Acknowledged),
+        ];
+        // A one-byte result: the fold marker is longer, so folding cannot reduce it.
+        parts.extend(native_round(0, true, "x"));
+        parts.extend(native_round(1, true, &OUTPUT.repeat(40)));
+        parts.extend(native_round(2, true, &OUTPUT.repeat(40)));
+        let (mut messages, mut slots) = window(parts);
+        let limit = total(&messages) - 1;
+        let report = fit(&mut messages, &mut slots, limit).expect("step D fits");
+        assert_eq!(report.removed_rounds, 1, "the round goes whole: {report:?}");
+        assert_eq!(report.removed_messages, 2, "its envelope and its result both go");
+        assert!(messages.iter().all(|message| !message.content.contains("call-0")), "no part of batch 0 remains");
+        assert_eq!(messages.len(), 6, "the two newest rounds and the request remain");
+    }
+
+    /// Step D2: when the floor does not fit with the unprotected rounds gone,
+    /// the protected completed rounds are folded, the older first, and nothing
+    /// is removed. A floor that still does not fit after both folds is exhausted.
+    #[test]
+    fn step_d2_folds_the_protected_rounds_older_first_and_removes_nothing() {
+        let build = || {
+            let mut parts = vec![
+                (ChatMessage::system("sys"), ViewSlot::Acknowledged),
+                (ChatMessage::user("current request"), ViewSlot::Acknowledged),
+            ];
+            parts.extend(native_round(0, true, &OUTPUT.repeat(40)));
+            parts.extend(native_round(1, true, &OUTPUT.repeat(40)));
+            window(parts)
+        };
+        // Only the older protected round has to fold for this limit.
+        let (mut messages, mut slots) = build();
+        let limit = total(&messages) - 1;
+        let report = fit(&mut messages, &mut slots, limit).expect("folding the older protected round fits");
+        assert_eq!(report.folded_rounds, 1, "only the older protected round folds: {report:?}");
+        assert_eq!(report.removed_messages, 0, "D2 removes nothing");
+        assert_eq!(messages.len(), 6, "every protected message stays");
+        assert!(messages[3].content.contains("bytes dropped"), "the older result is folded");
+        assert!(messages[5].content.contains(OUTPUT), "the newest result keeps its output");
+
+        // A limit no fold can reach: both protected results fold, then exhaustion.
+        let (mut messages, mut slots) = build();
+        let error = fit(&mut messages, &mut slots, 1).expect_err("the folded floor still exceeds one token");
+        assert!(matches!(error, ContextCapacityError::BudgetExhausted { limit: 1, needed } if needed > 1));
+        assert_eq!(messages.len(), 6, "exhaustion removes nothing");
+        assert!(messages[3].content.contains("bytes dropped"), "the older protected result folded");
+        assert!(messages[5].content.contains("bytes dropped"), "the newest protected result folded too");
+        assert!(messages[2].content.contains("call-0"), "the envelope and its tool_call_id stay");
+    }
+
+    /// A round the fit may not touch: an incomplete round is never folded or
+    /// removed, so a window that needs it removed is the typed error.
+    #[test]
+    fn an_incomplete_round_is_never_touched_and_its_floor_is_reported() {
+        let mut parts = vec![
+            (ChatMessage::system("sys"), ViewSlot::Acknowledged),
+            (ChatMessage::user("current request"), ViewSlot::Acknowledged),
+        ];
+        parts.extend(native_round(0, false, &OUTPUT.repeat(40)));
+        let (mut messages, mut slots) = window(parts);
+        let before = messages.clone();
+        let error = fit(&mut messages, &mut slots, 1).expect_err("the incomplete round is protected");
+        assert!(matches!(error, ContextCapacityError::BudgetExhausted { limit: 1, .. }));
+        assert_eq!(messages.len(), before.len(), "the incomplete round stays");
+        assert_eq!(messages[2].content, before[2].content);
+    }
+
+    /// Fewer than two completed rounds: every completed round is protected.
+    #[test]
+    fn with_fewer_than_two_completed_rounds_every_round_is_protected() {
+        let mut parts = vec![
+            (ChatMessage::system("sys"), ViewSlot::Acknowledged),
+            (ChatMessage::user("current request"), ViewSlot::Acknowledged),
+        ];
+        parts.extend(native_round(0, true, &OUTPUT.repeat(40)));
+        let (mut messages, mut slots) = window(parts);
+        let error = fit(&mut messages, &mut slots, 1).expect_err("the only round is protected");
+        assert!(matches!(error, ContextCapacityError::BudgetExhausted { .. }));
+        assert_eq!(messages.len(), 4, "nothing was folded or removed");
+    }
+
+    /// The no-handoff case: step A runs front first up to the request.
+    #[test]
+    fn without_a_handoff_step_a_runs_front_first_up_to_the_request() {
+        let parts = vec![
+            (ChatMessage::system("sys"), ViewSlot::Acknowledged),
+            (ChatMessage::user("first question"), ViewSlot::Acknowledged),
+            (ChatMessage::assistant("first answer"), ViewSlot::Acknowledged),
+            (ChatMessage::user("current request"), ViewSlot::Acknowledged),
+        ];
+        let (mut messages, mut slots) = window(parts);
+        let limit = total(&messages) - 1;
+        let report = fit(&mut messages, &mut slots, limit).expect("the oldest turn goes");
+        assert!(report.reduced);
+        assert_eq!(messages[1].content, "first answer", "the oldest turn went first");
+        assert_eq!(messages.last().map(|message| message.content.as_str()), Some("current request"));
+    }
+
+    /// A summary the safeguard mode wrote is not protected: it is dropped like
+    /// any other older turn.
+    #[test]
+    fn a_safeguard_summary_is_dropped_like_any_older_turn() {
+        let parts = vec![
+            (ChatMessage::system("sys"), ViewSlot::Acknowledged),
+            (ChatMessage::assistant("[Compaction summary]\nkept facts"), ViewSlot::Acknowledged),
+            (ChatMessage::user("current request"), ViewSlot::Acknowledged),
+        ];
+        let (mut messages, mut slots) = window(parts);
+        let limit = total(&messages) - 1;
+        fit(&mut messages, &mut slots, limit).expect("the summary goes");
+        assert!(messages.iter().all(|message| !message.content.contains("kept facts")));
+    }
 }

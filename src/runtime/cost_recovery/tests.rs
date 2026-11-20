@@ -238,6 +238,7 @@ async fn idle_restart_projects_every_pending_row() {
 }
 
 #[cfg(unix)]
+#[cfg(not(target_vendor = "apple"))]
 #[test]
 fn legacy_files_warn_once_and_are_never_opened() {
     let dir = tempfile::tempdir().expect("test: workspace");

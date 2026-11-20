@@ -459,6 +459,25 @@ const _: () = {
 /// Reserve used by the context-budget fixtures below.
 pub(super) const CONTEXT_BUDGET_FIXTURE_RESERVE_TOKENS: usize = 64;
 
+/// The `max_context_tokens` whose window holds `protected` (the floor of a
+/// fixture) with `headroom` tokens to spare, reserve included. A fixture built
+/// this way fits its floor and still has older messages to trim.
+pub(super) fn window_for_protected_floor(protected: &[ChatMessage], reserve_tokens: usize, headroom: usize) -> usize {
+    crate::agent::context_budget::budgeted_history_tokens(protected)
+        .saturating_add(headroom)
+        .saturating_add(reserve_tokens)
+}
+
+/// The `(needed, limit)` of a `BudgetExhausted` error, when `error` is one.
+pub(super) fn budget_exhausted_of(error: &anyhow::Error) -> Option<(usize, usize)> {
+    match error.downcast_ref::<crate::agent::turn_contracts::ContextCapacityError>()? {
+        crate::agent::turn_contracts::ContextCapacityError::BudgetExhausted { needed, limit } => {
+            Some((*needed, *limit))
+        }
+        _ => None,
+    }
+}
+
 pub(super) fn tool_specs_of(tools: &[Box<dyn Tool>]) -> Vec<crate::tools::ToolSpec> {
     crate::tools::ToolCatalog::from_tools(tools.iter().map(|tool| tool.as_ref())).tool_specs()
 }

@@ -104,17 +104,21 @@ async fn redux_compaction_keeps_enrichment_only_trim_fallback() {
         crate::agent::compaction::compaction_patch_guard_matches(&reducer_history, &patch.guard),
         "fallback-preserving patch must still be guarded by reducer persisted source"
     );
+    // The turn's request is protected whole: its request-local enrichment is
+    // part of it, so the fit never removes it.
     assert!(
-        !driver_history
+        driver_history
             .iter()
             .any(|message| message.content.contains("RECENT_ENRICHMENT_ONLY")),
-        "trim may remove request-local enrichment"
+        "the protected request keeps its request-local enrichment"
     );
     assert!(
         driver_history
             .iter()
-            .any(|message| message.role == "user" && message.content == "current @huge.txt"),
-        "the admitted raw request must survive without its request-local enrichment"
+            .filter(|message| message.role == "user" && message.content.starts_with("current @huge.txt"))
+            .count()
+            == 1,
+        "the admitted request survives once, whole and with its enrichment"
     );
 }
 
@@ -227,7 +231,6 @@ async fn redux_driver_preserve_trim_floor_preserves_fitting_summary_and_matches_
         &mut driver_history,
         &mut projection_guard,
         &config,
-        Some(replacement_len),
     );
 
     let patch = match action_rx.recv().await.expect("patch action") {
@@ -1138,7 +1141,7 @@ async fn tui_preflight_irreducible_request_fails_before_provider() {
 #[test]
 fn tui_preflight_trim_preserves_current_request() {
     use crate::providers::ChatMessage;
-    for replacement_len in [None, Some(1)] {
+    {
         let request = "live request ".repeat(500);
         let mut history = vec![
             ChatMessage::system("sys"),
@@ -1151,7 +1154,7 @@ fn tui_preflight_trim_preserves_current_request() {
             reserve_tokens: 10,
             ..crate::config::AgentCompactionConfig::default()
         };
-        trim_redux_driver_context_budget_after_rollover(&mut history, &mut guard, &config, replacement_len);
+        trim_redux_driver_context_budget_after_rollover(&mut history, &mut guard, &config);
         assert_eq!(
             history
                 .iter()

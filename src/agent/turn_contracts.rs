@@ -276,6 +276,10 @@ pub enum ContextCapacityError {
         used_tokens: usize,
         available_tokens: usize,
     },
+    #[error(
+        "This turn no longer fits the context window (needed {needed}, limit {limit} tokens). Raise [agent.compaction] max_context_tokens or start a branch."
+    )]
+    BudgetExhausted { needed: usize, limit: usize },
 }
 
 #[derive(Debug)]

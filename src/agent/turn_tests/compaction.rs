@@ -401,9 +401,24 @@ async fn configurable_context_switch_can_roll_over_repeatedly_with_generation_li
         .await
         .unwrap();
     history.push(second_assistant);
+    // The turn's request stays in the hot window: a request the cold window
+    // holds comes back at the tail, so it could never be reclaimed (§3.1).
+    let current = ChatMessage::user("current request");
+    fabric
+        .record_inbound_user_message(
+            envelope.message_scope(),
+            current.content.clone(),
+            Some("repeat-switch-current".into()),
+            None,
+        )
+        .await
+        .unwrap();
+    history.push(current);
 
+    // The second rollover is the next admitted turn: its own audit, its own budget.
+    let second_audit = DocumentIngestRuntime::from_envelope(Arc::clone(&memory), &envelope);
     assert!(
-        apply_configurable_compaction(&mut history, &provider, "model", &config, Some(&audit), "second")
+        apply_configurable_compaction(&mut history, &provider, "model", &config, Some(&second_audit), "second")
             .await
             .unwrap(),
         "a prior handoff must remain exact provenance for the next rollover"
@@ -498,7 +513,7 @@ async fn persist_durable_transcript(
                 .record_inbound_user_message(
                     envelope.message_scope(),
                     message.content.clone(),
-                    Some(format!("tool-roundtrip-source-{index}")),
+                    Some(format!("tool-roundtrip-source-{index}-{}", message.content)),
                     None,
                 )
                 .await
@@ -1698,7 +1713,8 @@ async fn the_preflight_builds_its_durable_compaction_from_the_canonical_history_
             Some(&audit),
             "test_capture_trim",
         )
-        .await;
+        .await
+        .expect("the preflight trim fits the window");
 
         let before = compaction
             .source
@@ -1733,4 +1749,326 @@ async fn the_preflight_builds_its_durable_compaction_from_the_canonical_history_
 /// provenance (as a caller without a session): read by the round-trip shape.
 fn shape_companions(messages: &[ChatMessage]) -> Vec<bool> {
     crate::agent::turn_history::CanonicalHistory::from_test_messages(messages.to_vec()).tool_round_companions()
+}
+
+/// The `switch` the progress guard (I1) must refuse: a cold window smaller
+/// than the handoff that would replace it, durably backed so the refusal is
+/// the guard's and not a provenance failure.
+fn no_progress_switch_config() -> crate::config::AgentCompactionConfig {
+    crate::config::AgentCompactionConfig {
+        mode: crate::config::AgentCompactionMode::Switch,
+        reserve_tokens: 1,
+        keep_recent_messages: 2,
+        memory_flush: false,
+        max_context_tokens: 50,
+        max_context_tokens_explicit: true,
+        os_paging: crate::config::OsPagingConfig::default(),
+    }
+}
+
+async fn switch_events(memory: &Arc<dyn Memory>, envelope: &RuntimeEnvelope) -> usize {
+    memory
+        .list_message_events_recent(&envelope.memory_principal(), 64)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|event| event.event_type == "context.switch.created")
+        .count()
+}
+
+/// T-A, tool-loop shape: a one-round cold window folds to a handoff that is
+/// larger than the window, so the builder returns `NoProgress`, persists no
+/// switch, and the control window of many rounds still switches.
+#[tokio::test]
+async fn a_switch_whose_handoff_cannot_shrink_a_tool_loop_window_is_refused_before_it_persists() {
+    let temp = TempDir::new().unwrap();
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
+    let envelope = RuntimeEnvelope::agent("workspace-no-progress-tools", "run-no-progress-tools");
+    let audit = DocumentIngestRuntime::from_envelope(Arc::clone(&memory), &envelope);
+    let fabric = MemoryFabric::new(Arc::clone(&memory), "workspace-no-progress-tools");
+    let provider = ScriptedProvider::from_text_responses(vec!["MODEL_SUMMARY_MUST_NOT_RUN"]);
+    let config = no_progress_switch_config();
+    let round = |index: usize, output: &str| {
+        let call = ToolCall {
+            id: format!("call-{index}"),
+            name: "shell".to_string(),
+            arguments: "{}".to_string(),
+        };
+        [
+            ChatMessage::assistant(build_native_assistant_history("", std::slice::from_ref(&call), None)),
+            ChatMessage::tool(serde_json::json!({"tool_call_id": format!("call-{index}"), "content": output}).to_string()),
+        ]
+    };
+
+    let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("q")];
+    history.extend(round(0, "r"));
+    history.push(ChatMessage::user("next question"));
+    history.push(ChatMessage::assistant("next answer"));
+    persist_durable_transcript(&fabric, &envelope, &history).await;
+    let source = crate::agent::turn_history::CanonicalHistory::from_test_messages(history.clone());
+    let outcome = build_configurable_compaction_patch_with_source_history(
+        &history,
+        &source,
+        &provider,
+        "model",
+        &config,
+        Some(&audit),
+        crate::agent::compaction::MANUAL_COMPACT_TRIGGER,
+    )
+    .await
+    .expect("a refused switch is an outcome, not an error");
+    assert!(
+        matches!(
+            outcome,
+            CompactionBuild::NoProgress { before_tokens, after_tokens } if after_tokens >= before_tokens
+        ),
+        "a handoff larger than its one-round window must be refused as NoProgress"
+    );
+    assert_eq!(
+        switch_events(&memory, &envelope).await,
+        0,
+        "a refused switch must persist no context.switch.created event"
+    );
+
+    // Control, in its own store so its durable turns do not duplicate the
+    // ones above: a cold window of many large rounds reclaims tokens and
+    // switches.
+    let control_temp = TempDir::new().unwrap();
+    let control_memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(control_temp.path()).unwrap());
+    let control_envelope = RuntimeEnvelope::agent("workspace-no-progress-control", "run-no-progress-control");
+    let control_audit = DocumentIngestRuntime::from_envelope(Arc::clone(&control_memory), &control_envelope);
+    let control_fabric = MemoryFabric::new(Arc::clone(&control_memory), "workspace-no-progress-control");
+    let big = "tool-output ".repeat(60);
+    let mut control = vec![ChatMessage::system("sys"), ChatMessage::user("q")];
+    for index in 0..12 {
+        control.extend(round(index, &big));
+    }
+    control.push(ChatMessage::user("next question"));
+    control.push(ChatMessage::assistant("next answer"));
+    persist_durable_transcript(&control_fabric, &control_envelope, &control).await;
+    let control_source = crate::agent::turn_history::CanonicalHistory::from_test_messages(control.clone());
+    let switched = build_configurable_compaction_patch_with_source_history(
+        &control,
+        &control_source,
+        &provider,
+        "model",
+        &config,
+        Some(&control_audit),
+        crate::agent::compaction::MANUAL_COMPACT_TRIGGER,
+    )
+    .await
+    .expect("the control switch must not error");
+    assert!(
+        matches!(switched, CompactionBuild::Patch(_)),
+        "a window whose handoff reclaims tokens must still switch"
+    );
+    assert_eq!(
+        switch_events(&control_memory, &control_envelope).await,
+        1,
+        "the control switch is persisted once"
+    );
+}
+
+/// T-A, no-tools shape: a short acknowledged window (two turns) smaller than
+/// its handoff is refused the same way.
+#[tokio::test]
+async fn a_switch_whose_handoff_cannot_shrink_a_short_acknowledged_window_is_refused() {
+    let temp = TempDir::new().unwrap();
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
+    let envelope = RuntimeEnvelope::agent("workspace-no-progress-plain", "run-no-progress-plain");
+    let audit = DocumentIngestRuntime::from_envelope(Arc::clone(&memory), &envelope);
+    let fabric = MemoryFabric::new(Arc::clone(&memory), "workspace-no-progress-plain");
+    let provider = ScriptedProvider::from_text_responses(vec!["MODEL_SUMMARY_MUST_NOT_RUN"]);
+    let history = vec![
+        ChatMessage::system("sys"),
+        ChatMessage::user("a"),
+        ChatMessage::assistant("b"),
+        ChatMessage::user("c"),
+        ChatMessage::assistant("d"),
+    ];
+    persist_durable_transcript(&fabric, &envelope, &history).await;
+    let source = crate::agent::turn_history::CanonicalHistory::from_test_messages(history.clone());
+    let outcome = build_configurable_compaction_patch_with_source_history(
+        &history,
+        &source,
+        &provider,
+        "model",
+        &no_progress_switch_config(),
+        Some(&audit),
+        crate::agent::compaction::MANUAL_COMPACT_TRIGGER,
+    )
+    .await
+    .expect("a refused switch is an outcome, not an error");
+    assert!(
+        matches!(
+            outcome,
+            CompactionBuild::NoProgress { before_tokens, after_tokens } if after_tokens >= before_tokens
+        ),
+        "a two-turn window smaller than its handoff must be refused as NoProgress"
+    );
+    assert_eq!(switch_events(&memory, &envelope).await, 0, "no switch event may be persisted");
+}
+
+/// A window a switch reclaims: one question, twelve large tool rounds, then a
+/// durable pair. `tag` keeps each window's durable text distinct, so each
+/// window's provenance resolves on its own.
+fn reclaiming_window(tag: &str) -> Vec<ChatMessage> {
+    let big = "tool-output ".repeat(60);
+    let mut history = vec![ChatMessage::system("sys"), ChatMessage::user(format!("question {tag}"))];
+    for index in 0..12 {
+        let call = ToolCall {
+            id: format!("call-{tag}-{index}"),
+            name: "shell".to_string(),
+            arguments: "{}".to_string(),
+        };
+        history.push(ChatMessage::assistant(build_native_assistant_history(
+            "",
+            std::slice::from_ref(&call),
+            None,
+        )));
+        history.push(ChatMessage::tool(
+            serde_json::json!({"tool_call_id": format!("call-{tag}-{index}"), "content": big}).to_string(),
+        ));
+    }
+    history.push(ChatMessage::user(format!("next {tag}")));
+    history.push(ChatMessage::assistant(format!("answer {tag}")));
+    history
+}
+
+/// T-G (§3.2): an admitted turn spends one automatic switch. A redux rollover
+/// that switched suppresses the later preflight and overflow switches of the
+/// same turn; manual `/compact` stays outside the budget; a refused switch
+/// spends the budget too; the next admitted turn starts fresh.
+#[tokio::test]
+async fn one_admitted_turn_spends_one_automatic_switch_and_the_next_turn_starts_fresh() {
+    let temp = TempDir::new().unwrap();
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
+    let envelope = RuntimeEnvelope::agent("workspace-switch-budget", "run-switch-budget");
+    let fabric = MemoryFabric::new(Arc::clone(&memory), "workspace-switch-budget");
+    let provider = ScriptedProvider::from_text_responses(vec!["MODEL_SUMMARY_MUST_NOT_RUN"]);
+    let config = no_progress_switch_config();
+    let window_a = reclaiming_window("a");
+    let window_b = reclaiming_window("b");
+    persist_durable_transcript(&fabric, &envelope, &window_a).await;
+    persist_durable_transcript(&fabric, &envelope, &window_b).await;
+    let build = BudgetedBuild { provider: &provider, config: &config };
+
+    // Turn one: the redux rollover spends the budget.
+    let turn_one = DocumentIngestRuntime::from_envelope(Arc::clone(&memory), &envelope);
+    assert!(
+        matches!(build.call(&window_a, "redux_preflight", &turn_one).await, CompactionBuild::Patch(_)),
+        "the turn's first automatic switch must succeed"
+    );
+    assert_eq!(switch_events(&memory, &envelope).await, 1);
+    assert!(
+        matches!(build.call(&window_b, "pre_provider_call", &turn_one).await, CompactionBuild::Suppressed),
+        "the preflight of the same turn must not switch again"
+    );
+    assert!(
+        matches!(build.call(&window_b, "overflow_retry", &turn_one).await, CompactionBuild::Suppressed),
+        "the overflow recovery of the same turn must not switch again"
+    );
+    assert_eq!(switch_events(&memory, &envelope).await, 1, "suppressed attempts persist nothing");
+    assert!(
+        matches!(
+            build.call(&window_b, crate::agent::compaction::MANUAL_COMPACT_TRIGGER, &turn_one).await,
+            CompactionBuild::Patch(_)
+        ),
+        "manual /compact is outside the automatic budget"
+    );
+    assert_eq!(switch_events(&memory, &envelope).await, 2);
+
+    // Turn two is admitted with its own runtime, so its budget is fresh.
+    let turn_two = DocumentIngestRuntime::from_envelope(Arc::clone(&memory), &envelope);
+    assert!(
+        matches!(build.call(&window_b, "pre_provider_call", &turn_two).await, CompactionBuild::Patch(_)),
+        "the next admitted turn must get a fresh switch budget"
+    );
+    assert_eq!(switch_events(&memory, &envelope).await, 3);
+
+    // A refused switch spends the budget as well.
+    let short = vec![
+        ChatMessage::system("sys"),
+        ChatMessage::user("x"),
+        ChatMessage::assistant("y"),
+        ChatMessage::user("z"),
+        ChatMessage::assistant("w"),
+    ];
+    let turn_three = DocumentIngestRuntime::from_envelope(Arc::clone(&memory), &envelope);
+    persist_durable_transcript(&fabric, &envelope, &short).await;
+    assert!(
+        matches!(build.call(&short, "overflow_retry", &turn_three).await, CompactionBuild::NoProgress { .. }),
+        "the short window must be refused as NoProgress"
+    );
+    assert!(
+        matches!(build.call(&window_a, "pre_provider_call", &turn_three).await, CompactionBuild::Suppressed),
+        "a NoProgress spends the budget for the rest of the turn"
+    );
+    assert_eq!(switch_events(&memory, &envelope).await, 3, "refused attempts persist nothing");
+}
+
+/// Runs the builder for one turn's audit, with the budget-test provider and config.
+struct BudgetedBuild<'a> {
+    provider: &'a dyn Provider,
+    config: &'a crate::config::AgentCompactionConfig,
+}
+
+impl BudgetedBuild<'_> {
+    async fn call(&self, history: &[ChatMessage], trigger: &'static str, audit: &DocumentIngestRuntime) -> CompactionBuild {
+        let source = crate::agent::turn_history::CanonicalHistory::from_test_messages(history.to_vec());
+        build_configurable_compaction_patch_with_source_history(
+            history,
+            &source,
+            self.provider,
+            "model",
+            self.config,
+            Some(audit),
+            trigger,
+        )
+        .await
+        .expect("a budgeted switch outcome is not an error")
+    }
+}
+
+/// T-D (§3.4): one degradation event per (turn, reason). An earlier
+/// `handoff_unavailable` never suppresses a fold of the same turn, and a repeat
+/// of either reason inside the turn is claimed rather than written again.
+#[tokio::test]
+async fn a_fold_is_recorded_beside_an_earlier_degradation_of_the_same_turn() {
+    let temp = TempDir::new().unwrap();
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
+    let envelope = RuntimeEnvelope::agent("workspace-degradation-reasons", "run-degradation-reasons");
+    let audit = DocumentIngestRuntime::from_envelope(Arc::clone(&memory), &envelope);
+    let fold = || {
+        persist_context_degradation_with_details(
+            Some(&audit),
+            "test_reasons",
+            crate::agent::context_budget::INFLIGHT_ROUNDS_FOLDED_REASON,
+            100,
+            60,
+            50,
+            &[("folded_rounds", 2), ("removed_messages", 0)],
+        )
+    };
+    persist_context_switch_degradation(Some(&audit), "test_reasons", "handoff_unavailable", 100, 80, 50).await;
+    fold().await;
+    persist_context_switch_degradation(Some(&audit), "test_reasons", "handoff_unavailable", 100, 80, 50).await;
+    fold().await;
+    let degraded: Vec<String> = memory
+        .list_message_events_recent(&envelope.memory_principal(), 64)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.event_type == CONTEXT_COMPACTION_DEGRADED_EVENT_TYPE)
+        .map(|event| event.content)
+        .collect();
+    assert_eq!(degraded.len(), 2, "one event per (turn, reason): {degraded:?}");
+    assert!(
+        degraded.iter().any(|content| content.contains("inflight_tool_rounds_folded")),
+        "the fold is recorded: {degraded:?}"
+    );
+    assert!(
+        degraded.iter().any(|content| content.contains("handoff_unavailable")),
+        "the earlier degradation is kept: {degraded:?}"
+    );
 }

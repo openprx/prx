@@ -365,7 +365,7 @@ async fn redux_driver_preflight_uses_provider_summary_before_first_stream_reques
                 reserve_tokens: 10,
                 keep_recent_messages: 2,
                 memory_flush: false,
-                max_context_tokens: 160,
+                max_context_tokens: 320,
                 max_context_tokens_explicit: true,
                 ..crate::config::AgentCompactionConfig::default()
             };
@@ -430,10 +430,10 @@ async fn redux_driver_preflight_uses_provider_summary_before_first_stream_reques
                         max_context_tokens: Some(max),
                     } => {
                         saw_context_update = true;
-                        assert_eq!(max, 160);
+                        assert_eq!(max, 320);
                         assert!(
-                            used <= 150,
-                            "context window update must reflect compacted budget: {used}"
+                            used <= 310,
+                            "context window update must reflect compacted budget within the 310-token input limit: {used}"
                         );
                     }
                     Action::SystemMessageAdded { text } => {
@@ -472,8 +472,8 @@ async fn redux_driver_preflight_uses_provider_summary_before_first_stream_reques
                 "first stream request must not contain old lossy compact marker"
             );
             assert!(
-                first_tokens.load(AtomicOrdering::SeqCst) <= 150,
-                "redux first provider call must be below literal hard limit 150 tokens"
+                first_tokens.load(AtomicOrdering::SeqCst) <= 310,
+                "redux first provider call must be below literal hard limit 310 tokens"
             );
             Ok::<_, anyhow::Error>(())
         })

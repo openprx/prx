@@ -255,7 +255,13 @@ async fn provider_overflow_retry_keeps_current_request() {
                     1,
                     "the retry must contain Q exactly once: {retry:?}"
                 );
-                assert!(!retry.iter().any(|m| m.content == "older completed turn"));
+                // The overflow fit removes only what makes the retry smaller than the
+                // rejected request (and fitting): it need not drop every older message.
+                assert!(
+                    crate::agent::context_budget::budgeted_history_tokens(retry)
+                        < crate::agent::context_budget::budgeted_history_tokens(before),
+                    "the retry must be strictly smaller than the rejected request"
+                );
                 assert!(retry.iter().any(|m| m.role == "tool"), "retain completed work");
                 assert_eq!(first_orphan_tool_index(retry), None, "native call/result pairs survive");
                 if streaming
@@ -305,10 +311,15 @@ async fn provider_overflow_retry_keeps_current_request() {
                             .filter(|(_, content)| !crate::agent::turn_contracts::is_loop_written_user_note(content))
                             .collect::<Vec<_>>()
                     };
-                    assert_eq!(
-                        conversation(&replayed),
-                        without_loop_notes(retry),
-                        "worker patch replays the retry view without its loop notes"
+                    // The retry is the replayed patch reduced to fit: the overflow fit may
+                    // drop a disposable summary, so the retry is an ordered subsequence.
+                    let replay = conversation(&replayed);
+                    let mut remaining = replay.iter();
+                    assert!(
+                        without_loop_notes(retry)
+                            .iter()
+                            .all(|item| remaining.any(|candidate| candidate == item)),
+                        "the retry is an ordered reduction of the worker patch's replay"
                     );
                     assert_eq!(
                         retry.last().map(|m| m.content.as_str()),
@@ -354,14 +365,22 @@ async fn provider_overflow_irreducible_request_stops() {
                 let capacity = error
                     .downcast_ref::<ContextCapacityError>()
                     .expect("typed capacity failure");
-                assert!(matches!(capacity, ContextCapacityError::NoProgress { provider_context }
-                    if provider_context.contains("context window exceeded by scripted provider")));
-                assert_eq!(
-                    provider.calls.load(Ordering::SeqCst),
-                    rounds + 1,
-                    "no progress cannot replay"
-                );
-                assert_eq!(history.len(), 2 + 2 * rounds);
+                // Zero rounds leave nothing to reduce: no progress at once. Six rounds
+                // have unprotected rounds to reduce, so the recovery passes end at
+                // their cap or at the protected floor, whichever comes first.
+                let stopped = match capacity {
+                    ContextCapacityError::NoProgress { provider_context } => {
+                        provider_context.contains("context window exceeded by scripted provider")
+                    }
+                    ContextCapacityError::RecoveryPassLimit { .. } => rounds > 0,
+                    _ => false,
+                };
+                assert!(stopped, "the irreducible request stops with a typed capacity failure: {capacity:?}");
+                if rounds == 0 {
+                    assert_eq!(provider.calls.load(Ordering::SeqCst), 1, "no progress cannot replay");
+                    assert_eq!(history.len(), 2);
+                }
+                assert!(history.len() <= 2 + 2 * rounds, "reductions never add messages");
                 assert_eq!(
                     history.get(1).map(|message| message.content.as_str()),
                     Some(REQUEST),

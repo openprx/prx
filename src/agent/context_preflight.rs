@@ -1,11 +1,12 @@
-use crate::agent::compaction::{apply_configurable_compaction_over_view, persist_context_switch_degradation};
+use crate::agent::compaction::{
+    CompactionApply, apply_configurable_compaction_over_view, persist_context_degradation_with_details,
+};
 use crate::agent::context_budget::{
-    ContextBudgetSnapshot, PRE_TURN_FLUSH_THRESHOLD, budgeted_request_tool_tokens, budgeted_tokens,
+    ContextBudgetSnapshot, FitDemand, PRE_TURN_FLUSH_THRESHOLD, budgeted_request_tool_tokens, budgeted_tokens,
     estimate_budgeted_request_tokens, plan_context_budget, reserve_request_tool_surface, token_source_label,
-    trim_history_to_context_budget, trim_history_to_context_budget_preserving_compaction_replacement_with_floor,
 };
 use crate::agent::document_ingest::DocumentIngestRuntime;
-use crate::agent::history::{history_non_system_start, latest_user_query_index};
+use crate::agent::history::latest_user_query_index;
 use crate::agent::turn_history::TurnHistory;
 use crate::providers::{ChatMessage, Provider};
 use anyhow::Result;
@@ -33,12 +34,12 @@ pub(super) async fn preflight_context_budget_before_provider_call(
         trigger,
     )
     .await?;
-    if compaction.replacement_len.is_some() {
+    if compaction.source.is_some() {
         turn_history.finish_durable_compaction(history);
         let projected = turn_history.project(history);
-        turn_history.reshape(history, |view| *view = projected);
+        turn_history.adopt(history, projected);
     }
-    Ok(preflight_trim_projection(history, &mut turn_history, &config, &compaction, audit, trigger).await)
+    preflight_trim_projection(history, &mut turn_history, &config, &compaction, audit, trigger).await
 }
 
 /// The compaction config one provider request is budgeted with. The
@@ -66,8 +67,6 @@ pub(super) struct PreflightCompaction {
     /// The canonical history before the summary or handoff this phase applied
     /// to it; taken by the caller that reports the compaction.
     pub(super) source: Option<crate::agent::turn_history::CanonicalHistory>,
-    /// The applied replacement's length in the provider view.
-    pub(super) replacement_len: Option<usize>,
     /// Why a `switch` rollover could not stay lossless.
     degraded_reason: Option<&'static str>,
 }
@@ -111,7 +110,6 @@ pub(super) async fn preflight_durable_compaction(
         return Ok(PreflightCompaction::default());
     }
     let is_switch = matches!(config.mode, crate::config::AgentCompactionMode::Switch);
-    let replacement_offset = turn_history.replacement_offset();
     let canonical = turn_history.canonical_mut(view);
     let before = canonical.clone();
     // The request is the turn's own message: summary compaction cuts at the
@@ -127,17 +125,18 @@ pub(super) async fn preflight_durable_compaction(
     // Measured on the provider view the gate saw, built from and applied to
     // the canonical history.
     match apply_configurable_compaction_over_view(canonical, view, provider, model, config, audit, trigger).await {
-        Ok(Some(replacement_len)) => {
+        Ok(CompactionApply::Applied(_)) => {
             canonical.restore_request_at_tail(request, trigger);
             Ok(PreflightCompaction {
                 source: Some(before),
-                replacement_len: Some(replacement_len.saturating_add(replacement_offset)),
                 degraded_reason: None,
             })
         }
-        Ok(None) => Ok(PreflightCompaction {
+        // A switch that does not reclaim tokens is no handoff: the turn
+        // degrades to the trim, as for any other handoff that is unavailable.
+        Ok(CompactionApply::Suppressed) => Ok(PreflightCompaction::default()),
+        Ok(CompactionApply::NotNeeded | CompactionApply::NoProgress { .. }) => Ok(PreflightCompaction {
             source: None,
-            replacement_len: None,
             degraded_reason: is_switch.then_some("handoff_unavailable"),
         }),
         Err(error) => {
@@ -155,7 +154,6 @@ pub(super) async fn preflight_durable_compaction(
             );
             Ok(PreflightCompaction {
                 source: None,
-                replacement_len: None,
                 degraded_reason: Some("handoff_failed"),
             })
         }
@@ -173,66 +171,58 @@ pub(super) async fn preflight_trim_projection(
     compaction: &PreflightCompaction,
     audit: Option<&DocumentIngestRuntime>,
     trigger: &'static str,
-) -> ContextBudgetSnapshot {
+) -> Result<ContextBudgetSnapshot> {
     let budget = plan_context_budget(view, config, PRE_TURN_FLUSH_THRESHOLD);
     if !budget.over_hard_limit {
-        return budget;
+        return Ok(budget);
     }
     let is_switch = matches!(config.mode, crate::config::AgentCompactionMode::Switch);
-    let replacement_len = compaction.replacement_len;
     let degraded_reason = compaction
         .degraded_reason
         .or_else(|| is_switch.then_some("over_hard_limit_after_handoff"));
-    // With a tool surface larger than the whole window every trim below runs
-    // down to its floor. The current turn's user message is the request
-    // itself: answering a question that is no longer in the transcript is
-    // worse than serving an over-budget request, which the provider-side
-    // overflow retry already covers. Which message is the request, and why it
-    // is not simply the last `user` one, is `capture_current_turn_request`.
-    // Only a compaction that replaced a front range put a summary above the
-    // request, and only then must the request land after it.
-    let restore_position = if replacement_len.is_some() {
-        RestoredRequestPosition::Tail
-    } else {
-        RestoredRequestPosition::AboveEverythingLeftStanding
-    };
-    let trimmed: bool = turn_history.reshape(view, |view| {
-        let current_request = capture_current_turn_request(view);
-        let applied = if let Some(replacement_len) = replacement_len {
-            trim_history_to_context_budget_preserving_compaction_replacement_with_floor(view, config, replacement_len)
-        } else {
-            trim_history_to_context_budget(view, config)
-        };
-        restore_current_turn_request(view, current_request, trigger, restore_position);
-        applied
-    });
+    // The one fit (§3.3): the request, the newest handoff and the newest two
+    // completed rounds are kept whatever the window's history says.
+    let limit = config.max_context_tokens.saturating_sub(config.reserve_tokens);
+    let report = turn_history.fit_view(view, limit, FitDemand::Budget, trigger)?;
     let after = plan_context_budget(view, config, PRE_TURN_FLUSH_THRESHOLD);
     tracing::warn!(
         before_used_tokens = budget.used_tokens,
         after_used_tokens = after.used_tokens,
         hard_limit = after.available_input_tokens,
-        trimmed,
+        folded_rounds = report.folded_rounds,
+        removed_messages = report.removed_messages,
         mode = ?config.mode,
-        "context budget preflight applied token-aware trim"
+        "context budget preflight applied the context fit"
     );
+    let details = [
+        ("folded_rounds", report.folded_rounds),
+        ("removed_messages", report.removed_messages),
+    ];
     if let Some(degraded) = degraded_reason {
-        let reason: &'static str = degraded;
-        tracing::warn!(
-            trigger,
-            reason,
-            "context switch degraded to a lossy token-aware trim so the turn can continue"
-        );
-        persist_context_switch_degradation(
+        persist_context_degradation_with_details(
             audit,
             trigger,
-            reason,
+            degraded,
             budget.used_tokens,
             after.used_tokens,
             after.available_input_tokens,
+            &details,
         )
         .await;
     }
-    after
+    if report.folded_rounds > 0 {
+        persist_context_degradation_with_details(
+            audit,
+            trigger,
+            crate::agent::context_budget::INFLIGHT_ROUNDS_FOLDED_REASON,
+            budget.used_tokens,
+            after.used_tokens,
+            after.available_input_tokens,
+            &details,
+        )
+        .await;
+    }
+    Ok(after)
 }
 
 /// The turn's own request, captured before a context-budget removal can take
@@ -248,84 +238,11 @@ impl CapturedTurnRequest {
     pub(crate) fn into_message(self) -> ChatMessage {
         self.message
     }
-}
 
-/// Where a restored request goes back into history.
-///
-/// **One rule, and it is the same rule at both call sites: the request returns
-/// above everything the removal left standing — unless that removal was a
-/// summary compaction which *replaced* a front range, and only then it returns
-/// at the tail.** The discriminator is what the removal did, so each call site
-/// passes the variant its own removal earned rather than guessing from the
-/// shape of the history afterwards.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum RestoredRequestPosition {
-    /// **Summary compaction replaced a front range: the request returns at the
-    /// tail.**
-    ///
-    /// This is the one removal that *writes* as well as deletes. The summary it
-    /// puts at the front of the replacement covers the conversation the request
-    /// came after, and the refresh aside follows it, so the slot the request
-    /// held now points inside or before a summary it belongs *after*. The tail
-    /// is the only position that keeps that order. It cannot split a round trip
-    /// either — appending after everything cannot fall between an assistant
-    /// `tool_calls` envelope and the `tool` results answering it.
-    ///
-    /// **The shape this keeps, by design (D-011).** Here ordering wins over
-    /// role alternation: the request served after a replacing compaction
-    /// still opens on the summary's `assistant` turn, and prompt-guided the
-    /// refresh aside, a `[Tool results]` block (from the second iteration
-    /// on) and the request follow as adjacent `user` turns. That is the one
-    /// exception to the shape [`Self::AboveEverythingLeftStanding`] repairs.
-    /// If it is ever to be closed, the position is immediately after the
-    /// refresh aside, not the tail.
-    ///
-    /// Used by the preflight, and only on the compaction-replaced path.
-    Tail,
-    /// **Every other removal deletes only: the request returns above everything
-    /// left standing**, at the front of the non-system region.
-    ///
-    /// Used by the mid-turn trim, and by the preflight whenever no compaction
-    /// replaced a range. The mid-turn trim always, and the preflight from the
-    /// second iteration on, run on a history whose tail is the tool round just
-    /// executed — an assistant `tool_calls` envelope plus `tool` results in
-    /// native mode, an assistant turn plus a `[Tool results]` user block in
-    /// prompt-guided mode — and there the tail is the wrong end (on the
-    /// preflight's first iteration the tail is the request itself, and the two
-    /// positions coincide):
-    ///
-    /// - It is not where the request belongs. A delete-only trim walks forward
-    ///   from a fixed index at or ahead of the front, so every message still
-    ///   standing came after the request; the front of the non-system region is
-    ///   the position the request actually held relative to all of them.
-    /// - Appending would break the shape. Prompt-guided, the tail is already a
-    ///   `user` message, so a second one produces the adjacent `user, user` pair
-    ///   no provider in this crate coalesces and strict chat templates reject
-    ///   (see [`append_corrective_aside`]); native, the dialects that carry a
-    ///   tool result as a user turn (`providers/anthropic.rs`,
-    ///   `providers/bedrock.rs`, `providers/gemini.rs`) produce the same pair.
-    ///   Appending also leaves the round's `assistant` turn as the first
-    ///   non-system message, which the dialects that validate the opening role
-    ///   reject outright.
-    /// - It would cost the round. The request is what the next trim has to free
-    ///   first if anything must go, and it is the one message that trim can put
-    ///   back. Left at the tail it is the *last* candidate, so that trim eats
-    ///   the assistant envelope instead and drops the tool results with it — the
-    ///   turn keeps its question and loses the work it just paid for.
-    ///
-    /// Inserting at the front cannot split a round trip either: the trim's
-    /// closing orphan sweep guarantees the first non-system message is not a
-    /// `tool` result, so there is no envelope above the insertion point to
-    /// separate from its answers.
-    AboveEverythingLeftStanding,
-}
-
-impl RestoredRequestPosition {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Tail => "tail",
-            Self::AboveEverythingLeftStanding => "above_everything_left_standing",
-        }
+    /// The request's index in a history of `history_len` messages, the history it was
+    /// captured from (or a history that kept it in place).
+    pub(crate) fn index_in(&self, history_len: usize) -> Option<usize> {
+        history_len.checked_sub(self.messages_after.saturating_add(1))
     }
 }
 
@@ -397,35 +314,18 @@ pub(crate) fn capture_current_turn_request_with_source(
     Some(captured)
 }
 
-/// Put the turn's own request back when the removal it was captured for took
-/// it.
+/// Put the turn's own request back at the tail when the removal it was captured
+/// for took it. Only a durable compaction removes the request now: the context
+/// fit keeps it.
 ///
-/// **Identity is positional, not textual.** Every removal either side of this
-/// call walks forward from a fixed index at or ahead of the front, so nothing
-/// behind a surviving request is ever removed: compaction replaces a range that
-/// starts at the first non-system message, `trim_history_token_aware` removes
-/// repeatedly at the first non-system index, and
-/// `trim_history_to_context_budget_preserving_compaction_replacement` — the one
-/// removal that is *not* front-first — removes repeatedly at `start +
-/// replacement_len`, deliberately behind the summary it preserves, but still
-/// only ever forwards from there. A request that survived therefore still has
-/// exactly the messages that followed it behind it and can only be at
-/// `len - messages_after - 1`. Comparing that one slot means an older
-/// byte-identical message ("yes", "continue") can neither suppress the restore
-/// nor make it duplicate the request, which a content-equality search over the
-/// whole history can.
-///
-/// **Termination.** At most one message goes back, it was in history when the
-/// capture ran, and it goes back only when the removal took it — so a
-/// capture/remove/restore round is never net-lengthening, and the request the
-/// caller deleted for good is not in history to be captured again.
-///
-/// The insertion rule is [`RestoredRequestPosition`].
+/// **Identity is positional, not textual.** A request that survived sits at
+/// `len - messages_after - 1`, so an older byte-identical message ("yes",
+/// "continue") can neither suppress the restore nor make it duplicate the
+/// request. At most one message goes back, and only when the removal took it.
 pub(crate) fn restore_current_turn_request(
     history: &mut Vec<ChatMessage>,
     captured: Option<CapturedTurnRequest>,
     trigger: &'static str,
-    position: RestoredRequestPosition,
 ) -> bool {
     let Some(captured) = captured else {
         return false;
@@ -438,30 +338,11 @@ pub(crate) fn restore_current_turn_request(
     if survived {
         return false;
     }
-    let restored_at: &'static str = position.as_str();
     tracing::warn!(
         trigger,
-        restored_at,
-        "the context budget removed the current turn's request; restoring it over the budget"
+        "the context budget removed the current turn's request; restoring it at the tail"
     );
-    let message = captured.restore_message.unwrap_or(captured.message);
-    match position {
-        RestoredRequestPosition::Tail => history.push(message),
-        RestoredRequestPosition::AboveEverythingLeftStanding => {
-            // `history_non_system_start` inspects `history[0]` only, so "the
-            // front of the non-system region" is exact for the leading system
-            // prompt and no more. With OS-paging recall active and the default
-            // `RetrievalInjectionRole::System`, `inject_recalled_context` puts a
-            // *second* system message at index 1 and the request is inserted
-            // above it. That is safe only because
-            // `coalesce_system_messages_at_front` hoists and merges it on the
-            // prepared copy before the request is serialized — without that
-            // pass this insert would hand a strict template a system message
-            // that is not the first transcript item.
-            let index = history_non_system_start(history).min(history.len());
-            history.insert(index, message);
-        }
-    }
+    history.push(captured.restore_message.unwrap_or(captured.message));
     true
 }
 

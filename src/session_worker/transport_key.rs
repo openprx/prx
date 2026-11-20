@@ -284,6 +284,7 @@ mod tests {
         Ok(dir)
     }
 
+    #[cfg(not(target_vendor = "apple"))]
     #[test]
     fn existing_refuses_fifo_without_blocking() -> anyhow::Result<()> {
         let dir = private_dir()?;

@@ -19,35 +19,30 @@ use tokio_util::sync::CancellationToken;
 #[cfg(test)]
 use crate::agent::compaction::is_tool_roundtrip_companion;
 use crate::agent::compaction::{
-    COMPACTION_KEEP_RECENT_MESSAGES, apply_configurable_compaction_over_view,
+    CompactionApply, CompactionBuild, apply_configurable_compaction_over_view,
     build_configurable_compaction_patch_with_source_history, is_context_handoff_message,
     persist_context_switch_degradation,
 };
 #[cfg(test)]
-use crate::agent::context_budget::budgeted_request_tool_tokens;
-#[cfg(test)]
 use crate::agent::context_budget::{APPENDED_SECTION_FRAMING_TOKENS, TOKEN_HEURISTIC_BUDGET_MULTIPLIER};
 use crate::agent::context_budget::{
-    PRE_TURN_FLUSH_THRESHOLD, RequestToolSurfaceCounts, budgeted_tokens, estimate_budgeted_request_tokens,
-    estimate_history_tokens, estimate_history_tokens_with_source, estimate_request_tokens, plan_context_budget,
-    reserve_request_tool_surface, token_source_label, trim_history_to_context_budget,
-    trim_history_to_context_budget_preserving_compaction_replacement_with_floor, trim_history_token_aware,
+    FitDemand, PRE_TURN_FLUSH_THRESHOLD, RequestToolSurfaceCounts, budgeted_history_tokens,
+    budgeted_request_tool_tokens, budgeted_tokens, estimate_budgeted_request_tokens, estimate_history_tokens,
+    estimate_history_tokens_with_source, estimate_request_tokens, plan_context_budget, reserve_request_tool_surface,
+    token_source_label,
 };
 use crate::agent::context_paging::{
-    context_mode_uses_os_paging, inject_recalled_context, plan_os_paging, recall_context_pages,
+    context_mode_uses_os_paging, plan_os_paging, recall_context_pages,
 };
 use crate::agent::context_preflight::{
-    RestoredRequestPosition, capture_current_turn_request, preflight_config, preflight_durable_compaction,
-    preflight_trim_projection, restore_current_turn_request,
+    capture_current_turn_request, preflight_config, preflight_durable_compaction, preflight_trim_projection,
 };
 use crate::agent::diagnostics::{redact_sensitive_json_keys, scrub_credentials, tool_parse_log_digest};
 #[cfg(test)]
 use crate::agent::document_ingest::drop_untrusted_external_results;
 use crate::agent::document_ingest::{persist_tool_output_document, persist_untrusted_external_copy};
 use crate::agent::execution_policy::{AgentToolRuntimeInputs, build_agent_tool_runtime_adapter};
-use crate::agent::history::{
-    apply_aggressive_trim, build_native_assistant_history, coalesce_system_messages_at_front, latest_user_query,
-};
+use crate::agent::history::{build_native_assistant_history, coalesce_system_messages_at_front, latest_user_query};
 use crate::agent::provider_round::{is_stream_failure_after_model_output, run_streaming_provider_turn};
 #[cfg(test)]
 use crate::agent::response_guard::{
@@ -266,17 +261,20 @@ async fn rederive_provider_view(
                 crate::plugins::capabilities::middleware::MiddlewareStage::Inbound,
                 serde_json::json!({
                     "channel": channel_name,
-                    "messages": &projected,
+                    "messages": projected.messages(),
                 }),
             )
             .await;
-        middleware_messages(&projected, &transformed).unwrap_or(projected)
+        match middleware_messages(projected.messages(), &transformed) {
+            Some(messages) => projected.with_messages(messages),
+            None => projected,
+        }
     } else {
         projected
     };
     #[cfg(not(feature = "wasm-plugins"))]
     let _ = (hooks, channel_name);
-    turn_history.reshape(history, |view| *view = projected);
+    turn_history.adopt(history, projected);
 }
 
 /// The bytes an accepted turn delivers once outbound middleware has had its say.
@@ -508,7 +506,7 @@ async fn run_turn_unguarded(
         if let Some(query) = latest_user_query(history).map(ToString::to_string) {
             if let Some(recalled) = recall_context_pages(&query, config, document_ingest.as_ref()).await {
                 // A projection: the canonical history never holds the page.
-                turn_history.reshape(history, |view| inject_recalled_context(view, recalled.clone()));
+                turn_history.insert_recalled_page(history, recalled.clone());
                 turn_history.record_recalled_page(recalled);
             }
         }
@@ -567,7 +565,7 @@ async fn run_turn_unguarded(
             )
             .await
             {
-                Ok(Some(_)) => {
+                Ok(CompactionApply::Applied(_)) => {
                     report_durable_compaction(
                         &runtime_adapter,
                         before,
@@ -577,7 +575,7 @@ async fn run_turn_unguarded(
                     .await?;
                     rederive_provider_view(&mut turn_history, history, hooks, channel_name).await;
                 }
-                Ok(None) => {}
+                Ok(CompactionApply::NotNeeded | CompactionApply::NoProgress { .. } | CompactionApply::Suppressed) => {}
                 Err(error) => {
                     let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
                     tracing::warn!(error_len, error_sha256, "Pre-turn compaction failed");
@@ -858,7 +856,7 @@ async fn run_turn_unguarded(
                 document_ingest.as_ref(),
                 "pre_provider_call",
             )
-            .await;
+            .await?;
             Some((
                 budget.used_tokens,
                 estimate_budgeted_request_tokens(budget.measurement(), tool_surface),
@@ -871,6 +869,7 @@ async fn run_turn_unguarded(
         // what puts the handoff into history, and the iteration that receives
         // the handoff is the one that has to publish the recovery tool the
         // handoff tells the model to call.
+        let tool_reserve_before_lookup = budgeted_request_tool_tokens(tool_surface);
         let context_lookup_required = compaction_config
             .is_some_and(|config| matches!(config.mode, crate::config::AgentCompactionMode::Switch))
             && history.iter().any(is_context_handoff_message);
@@ -922,6 +921,31 @@ async fn run_turn_unguarded(
                 &tool_catalog,
                 &tool_specs,
             );
+        }
+        // The lookup tool was published after the preflight planned this window,
+        // so the same history is fitted again against the larger reserve. Nothing
+        // is switched here: the turn's switch budget is not touched (§3.1).
+        if let Some(config) = compaction_config
+            && budgeted_request_tool_tokens(tool_surface) != tool_reserve_before_lookup
+        {
+            let reserved = preflight_config(config, tool_surface);
+            let limit = reserved.max_context_tokens.saturating_sub(reserved.reserve_tokens);
+            let report = turn_history.fit_view(history, limit, FitDemand::Budget, "lookup_published")?;
+            if report.folded_rounds > 0 {
+                crate::agent::compaction::persist_context_degradation_with_details(
+                    document_ingest.as_ref(),
+                    "lookup_published",
+                    crate::agent::context_budget::INFLIGHT_ROUNDS_FOLDED_REASON,
+                    report.tokens,
+                    report.tokens,
+                    limit,
+                    &[
+                        ("folded_rounds", report.folded_rounds),
+                        ("removed_messages", report.removed_messages),
+                    ],
+                )
+                .await;
+            }
         }
 
         let image_marker_count = multimodal::count_image_markers(history);
@@ -1584,21 +1608,23 @@ async fn run_turn_unguarded(
                         .into());
                     }
                     overflow_recovery_passes += 1;
-                    let messages_before_compaction = history.len();
-                    let tokens_before_compaction = estimate_history_tokens(history);
                     tracing::warn!("Context overflow detected; running compaction and retrying LLM call");
-                    // The handoff or summary is built from and applied to the canonical
-                    // history and reported to the session authority; every trim below is
-                    // this retry's projection of the provider view only, so the session
-                    // keeps the turns a later handoff can still recover.
-                    let mut durable_applied = false;
+                    // A provider rejection is authoritative: the retry must be strictly
+                    // smaller than the rejected request, even when the local estimate
+                    // already fits (§3.3).
+                    let rejected_tokens = budgeted_history_tokens(history);
+                    let limit = compaction_config.map_or(usize::MAX, |config| {
+                        let reserved = preflight_config(config, tool_surface);
+                        reserved.max_context_tokens.saturating_sub(reserved.reserve_tokens)
+                    });
+                    let mut overflow_degraded: Option<&'static str> = None;
                     if let Some(config) = compaction_config {
-                        let mut before_trim = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
-                        let mut degraded_reason = None;
+                        // The handoff or summary is built from and applied to the canonical
+                        // history and reported to the session authority. Every trim below
+                        // is this retry's projection of the provider view only.
                         let canonical = turn_history.canonical_mut(history);
                         let canonical_request = capture_current_turn_request(canonical.messages());
-                        // Budgeted on the overflowed provider view, built from
-                        // the canonical history.
+                        // Budgeted on the overflowed provider view, built from the canonical history.
                         let compaction = match build_configurable_compaction_patch_with_source_history(
                             history,
                             canonical,
@@ -1610,39 +1636,37 @@ async fn run_turn_unguarded(
                         )
                         .await
                         {
-                            Ok(Some(patch)) => {
+                            Ok(CompactionBuild::Patch(patch)) => {
                                 crate::agent::idle::beat(crate::agent::idle::ProgressKind::Compaction);
                                 let mut compacted = canonical.clone();
                                 match compacted.apply_patch_with_refresh_aside(&patch) {
                                     Ok(()) => {
                                         // The whole resulting history, request included, is what
-                                        // the session adopts: restoring the request only in the
-                                        // view would leave the saved history without it. A
-                                        // refresh aside moves into the projection when the
-                                        // compaction is finished.
+                                        // the session adopts.
                                         compacted.restore_request_at_tail(canonical_request, "overflow_retry");
-                                        Some((std::mem::replace(canonical, compacted), patch.replacement.len()))
+                                        Some(std::mem::replace(canonical, compacted))
                                     }
                                     Err(error) => {
                                         warn_overflow_patch_refused(&error);
-                                        degraded_reason = Some("handoff_unavailable");
+                                        overflow_degraded = Some("handoff_unavailable");
                                         None
                                     }
                                 }
                             }
-                            Ok(None) => {
-                                degraded_reason = Some("handoff_unavailable");
+                            // The turn already spent its switch budget (§3.2): no handoff, nothing reported.
+                            Ok(CompactionBuild::Suppressed) => None,
+                            Ok(CompactionBuild::NotNeeded | CompactionBuild::NoProgress { .. }) => {
+                                overflow_degraded = Some("handoff_unavailable");
                                 None
                             }
                             Err(error) => {
                                 let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
                                 tracing::warn!(error_len, error_sha256, "Overflow retry compaction failed");
-                                degraded_reason = Some("handoff_failed");
+                                overflow_degraded = Some("handoff_failed");
                                 None
                             }
                         };
-                        if let Some((before, replacement_floor)) = compaction {
-                            durable_applied = true;
+                        if let Some(before) = compaction {
                             report_durable_compaction(
                                 &runtime_adapter,
                                 Some(before),
@@ -1651,108 +1675,45 @@ async fn run_turn_unguarded(
                             )
                             .await?;
                             rederive_provider_view(&mut turn_history, history, hooks, channel_name).await;
-                            if runtime_adapter.stream_provider {
-                                let switch_mode = matches!(config.mode, crate::config::AgentCompactionMode::Switch);
-                                let budget = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
-                                before_trim = budget;
-                                if switch_mode && budget.over_hard_limit {
-                                    degraded_reason = Some("over_hard_limit_after_handoff");
-                                }
-                                if !switch_mode || budget.over_hard_limit {
-                                    let floor = replacement_floor.saturating_add(turn_history.replacement_offset());
-                                    turn_history.reshape(history, |view| {
-                                        let request = capture_current_turn_request(view);
-                                        trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
-                                            view, config, floor,
-                                        );
-                                        restore_current_turn_request(
-                                            view,
-                                            request,
-                                            "overflow_retry",
-                                            RestoredRequestPosition::Tail,
-                                        );
-                                    });
-                                }
-                            }
-                        } else {
-                            let stream_provider = runtime_adapter.stream_provider;
-                            let handoff_failed = degraded_reason == Some("handoff_failed");
-                            turn_history.reshape(history, |view| {
-                                let request = capture_current_turn_request(view);
-                                if handoff_failed {
-                                    apply_aggressive_trim(view, config.keep_recent_messages);
-                                } else {
-                                    trim_overflow_without_handoff(
-                                        view,
-                                        config,
-                                        stream_provider,
-                                        messages_before_compaction,
-                                        tokens_before_compaction,
-                                    );
-                                }
-                                restore_current_turn_request(
-                                    view,
-                                    request,
-                                    "overflow_retry",
-                                    RestoredRequestPosition::AboveEverythingLeftStanding,
-                                );
-                            });
                         }
-                        if matches!(config.mode, crate::config::AgentCompactionMode::Switch)
-                            && let Some(reason) = degraded_reason
-                        {
-                            let after_trim = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
-                            persist_context_switch_degradation(
-                                document_ingest.as_ref(),
-                                "overflow_retry",
-                                reason,
-                                before_trim.used_tokens,
-                                after_trim.used_tokens,
-                                after_trim.available_input_tokens,
-                            )
-                            .await;
-                        }
-                    } else {
-                        turn_history.reshape(history, |view| {
-                            let request = capture_current_turn_request(view);
-                            apply_aggressive_trim(view, COMPACTION_KEEP_RECENT_MESSAGES);
-                            restore_current_turn_request(
-                                view,
-                                request,
-                                "overflow_retry",
-                                RestoredRequestPosition::AboveEverythingLeftStanding,
-                            );
-                        });
                     }
-                    // A view re-derived from the compacted canonical history can be
-                    // larger than the view that overflowed, which held this turn's
-                    // earlier trims: this retry then trims its projection as well.
-                    if durable_applied
-                        && let Some(config) = compaction_config
-                        && history.len() >= messages_before_compaction
-                        && estimate_history_tokens(history) >= tokens_before_compaction
+                    let report = turn_history.fit_view(
+                        history,
+                        limit,
+                        FitDemand::ProviderOverflow { rejected_tokens },
+                        "overflow_retry",
+                    )?;
+                    let after_fit = budgeted_history_tokens(history);
+                    if let Some(config) = compaction_config
+                        && matches!(config.mode, crate::config::AgentCompactionMode::Switch)
+                        && let Some(reason) = overflow_degraded
                     {
-                        let stream_provider = runtime_adapter.stream_provider;
-                        turn_history.reshape(history, |view| {
-                            let request = capture_current_turn_request(view);
-                            trim_overflow_without_handoff(
-                                view,
-                                config,
-                                stream_provider,
-                                messages_before_compaction,
-                                tokens_before_compaction,
-                            );
-                            restore_current_turn_request(
-                                view,
-                                request,
-                                "overflow_retry",
-                                RestoredRequestPosition::Tail,
-                            );
-                        });
+                        persist_context_switch_degradation(
+                            document_ingest.as_ref(),
+                            "overflow_retry",
+                            reason,
+                            rejected_tokens,
+                            after_fit,
+                            limit,
+                        )
+                        .await;
                     }
-                    let made_progress = history.len() < messages_before_compaction
-                        || estimate_history_tokens(history) < tokens_before_compaction;
-                    if !made_progress {
+                    if report.folded_rounds > 0 {
+                        crate::agent::compaction::persist_context_degradation_with_details(
+                            document_ingest.as_ref(),
+                            "overflow_retry",
+                            crate::agent::context_budget::INFLIGHT_ROUNDS_FOLDED_REASON,
+                            rejected_tokens,
+                            after_fit,
+                            limit,
+                            &[
+                                ("folded_rounds", report.folded_rounds),
+                                ("removed_messages", report.removed_messages),
+                            ],
+                        )
+                        .await;
+                    }
+                    if !report.strictly_smaller {
                         return Err(crate::agent::turn_contracts::ContextCapacityError::NoProgress {
                             provider_context: crate::providers::sanitize_api_error(&format!("{e:#}")),
                         }
@@ -2245,6 +2206,9 @@ async fn run_turn_unguarded(
             }
         }
         executed.commit(result_messages);
+        // The round is one recorded batch: its identity survives projection,
+        // trimming and durable compaction (§3.4).
+        turn_history.record_tool_batch(history, true);
 
         // P1-4: Token-aware mid-turn trim (primary) + count-based safety net (secondary).
         //
@@ -2261,23 +2225,29 @@ async fn run_turn_unguarded(
         // without the question it was asked. Captured inside the branch, so a
         // round that needs no trim still clones nothing.
         if let Some(reserved_config) = reserved_config.as_ref() {
-            let mid_turn_tokens = estimate_history_tokens(history);
             let mid_turn_limit: usize = reserved_config
                 .max_context_tokens
                 .saturating_sub(reserved_config.reserve_tokens);
-            if mid_turn_tokens > mid_turn_limit {
-                tracing::warn!(mid_turn_tokens, mid_turn_limit, "Mid-turn token trim triggered");
-                // A projection: the canonical history keeps the trimmed turns.
-                turn_history.reshape(history, |view| {
-                    let current_request = capture_current_turn_request(view);
-                    trim_history_token_aware(view, mid_turn_limit);
-                    restore_current_turn_request(
-                        view,
-                        current_request,
+            if budgeted_history_tokens(history) > mid_turn_limit {
+                tracing::warn!(mid_turn_limit, "Mid-turn token trim triggered");
+                // The one fit (§3.3), over the provider view: the canonical history keeps every turn.
+                let before = budgeted_history_tokens(history);
+                let report = turn_history.fit_view(history, mid_turn_limit, FitDemand::Budget, "mid_turn_trim")?;
+                if report.folded_rounds > 0 {
+                    crate::agent::compaction::persist_context_degradation_with_details(
+                        document_ingest.as_ref(),
                         "mid_turn_trim",
-                        RestoredRequestPosition::AboveEverythingLeftStanding,
-                    );
-                });
+                        crate::agent::context_budget::INFLIGHT_ROUNDS_FOLDED_REASON,
+                        before,
+                        report.tokens,
+                        mid_turn_limit,
+                        &[
+                            ("folded_rounds", report.folded_rounds),
+                            ("removed_messages", report.removed_messages),
+                        ],
+                    )
+                    .await;
+                }
             }
         }
         if let Some(tool_name) = repeated_unrecoverable {
@@ -2377,25 +2347,6 @@ fn warn_overflow_patch_refused(error: &crate::agent::turn_contracts::CompactionP
                 "overflow compaction patch guard mismatch; trimming without a handoff"
             );
         }
-    }
-}
-
-/// The overflow retry's trim when no handoff can be applied: budget trim for
-/// streaming providers, aggressive trim when that made no progress.
-fn trim_overflow_without_handoff(
-    history: &mut Vec<ChatMessage>,
-    config: &crate::config::AgentCompactionConfig,
-    stream_provider: bool,
-    messages_before_compaction: usize,
-    tokens_before_compaction: usize,
-) {
-    if stream_provider {
-        trim_history_to_context_budget(history, config);
-    }
-    if !stream_provider
-        || history.len() == messages_before_compaction && estimate_history_tokens(history) >= tokens_before_compaction
-    {
-        apply_aggressive_trim(history, config.keep_recent_messages);
     }
 }
 

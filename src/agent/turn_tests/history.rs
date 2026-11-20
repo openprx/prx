@@ -11,6 +11,7 @@
 )]
 
 use super::*;
+use crate::agent::turn_tests::{budget_exhausted_of, window_for_protected_floor};
 use crate::agent::context_preflight::preflight_context_budget_before_provider_call;
 use crate::agent::tool_call_parser::parse_tool_calls;
 use crate::agent::turn_tests::{SystemSummaryProvider, first_orphan_tool_index};
@@ -41,118 +42,87 @@ fn parse_tool_calls_handles_openai_format_multiple_calls() {
     assert_eq!(calls[1].name, "file_read");
 }
 
+/// Over budget, the fit keeps the leading system prompt and the turn's request
+/// and drops the oldest turns first. (Replaces the count-based trim tests: the
+/// fit is token-budgeted, and it never removes the request.)
 #[test]
-fn trim_history_preserves_system_prompt() {
-    let mut history = vec![ChatMessage::system("system prompt")];
-    for i in 0..DEFAULT_MAX_HISTORY_MESSAGES + 20 {
-        history.push(ChatMessage::user(format!("msg {i}")));
+fn fit_keeps_the_system_prompt_and_the_request_and_drops_the_oldest_turns_first() {
+    let mut history = vec![crate::providers::ChatMessage::system("system prompt")];
+    for i in 0..40 {
+        history.push(crate::providers::ChatMessage::user(format!("msg {i}")));
+        history.push(crate::providers::ChatMessage::assistant(format!("reply {i}")));
     }
-    let original_len = history.len();
-    assert!(original_len > DEFAULT_MAX_HISTORY_MESSAGES + 1);
-
-    trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
-
-    // System prompt preserved
+    let full = crate::agent::context_budget::budgeted_history_tokens(&history);
+    let mut slots = vec![crate::agent::turn_history::ViewSlot::Acknowledged; history.len()];
+    let report = crate::agent::context_budget::fit_request_window(
+        &mut history,
+        &mut slots,
+        full / 2,
+        crate::agent::context_budget::FitDemand::Budget,
+        "fit_test",
+    )
+    .expect("acknowledged turns always fit by dropping older turns");
+    assert!(report.reduced, "a window over its budget must be reduced");
     assert_eq!(history[0].role, "system");
     assert_eq!(history[0].content, "system prompt");
-    // Trimmed to limit
-    assert_eq!(history.len(), DEFAULT_MAX_HISTORY_MESSAGES + 1); // +1 for system
-    // Most recent messages preserved
-    let last = &history[history.len() - 1];
-    assert_eq!(last.content, format!("msg {}", DEFAULT_MAX_HISTORY_MESSAGES + 19));
+    assert!(crate::agent::context_budget::budgeted_history_tokens(&history) <= full / 2);
+    assert_ne!(history[1].content, "msg 0", "the oldest turns go first");
+    assert!(
+        history.iter().any(|message| message.content == "msg 39"),
+        "the turn's request is never dropped"
+    );
+    assert_eq!(history.last().map(|message| message.content.as_str()), Some("reply 39"));
 }
 
+/// A window that already fits is left exactly as it is.
 #[test]
-fn trim_history_noop_when_within_limit() {
+fn fit_leaves_a_window_that_already_fits_untouched() {
     let mut history = vec![
-        ChatMessage::system("sys"),
-        ChatMessage::user("hello"),
-        ChatMessage::assistant("hi"),
+        crate::providers::ChatMessage::system("sys"),
+        crate::providers::ChatMessage::user("hello"),
+        crate::providers::ChatMessage::assistant("hi"),
     ];
-    trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
-    assert_eq!(history.len(), 3);
+    let before = history.clone();
+    let mut slots = vec![crate::agent::turn_history::ViewSlot::Acknowledged; history.len()];
+    let report = crate::agent::context_budget::fit_request_window(
+        &mut history,
+        &mut slots,
+        usize::MAX,
+        crate::agent::context_budget::FitDemand::Budget,
+        "fit_test",
+    )
+    .expect("a window within its budget fits");
+    assert!(!report.reduced);
+    assert_eq!(history.len(), before.len());
+    assert_eq!(history[2].content, before[2].content);
 }
 
+/// A protected floor that cannot fit is the typed budget error, with both
+/// values in the window's units, never a silent over-budget request.
 #[test]
-fn trim_history_with_no_system_prompt() {
-    // Recovery: History without system prompt should trim correctly
-    let mut history = vec![];
-    for i in 0..DEFAULT_MAX_HISTORY_MESSAGES + 20 {
-        history.push(ChatMessage::user(format!("msg {i}")));
+fn fit_refuses_a_protected_floor_that_cannot_fit_with_the_needed_and_limit_values() {
+    let mut history = vec![
+        crate::providers::ChatMessage::system("sys"),
+        crate::providers::ChatMessage::user("a very long request ".repeat(40)),
+    ];
+    let mut slots = vec![crate::agent::turn_history::ViewSlot::Acknowledged; history.len()];
+    let error = crate::agent::context_budget::fit_request_window(
+        &mut history,
+        &mut slots,
+        1,
+        crate::agent::context_budget::FitDemand::Budget,
+        "fit_test",
+    )
+    .expect_err("the request alone exceeds a one-token window");
+    match error {
+        crate::agent::turn_contracts::ContextCapacityError::BudgetExhausted { needed, limit } => {
+            assert_eq!(limit, 1);
+            assert!(needed > 1, "needed must be the floor's budgeted tokens, got {needed}");
+        }
+        other => panic!("expected BudgetExhausted, got {other:?}"),
     }
-    trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
-    assert_eq!(history.len(), DEFAULT_MAX_HISTORY_MESSAGES);
 }
 
-#[test]
-fn trim_history_preserves_role_ordering() {
-    // Recovery: After trimming, role ordering should remain consistent
-    let mut history = vec![ChatMessage::system("system")];
-    for i in 0..DEFAULT_MAX_HISTORY_MESSAGES + 10 {
-        history.push(ChatMessage::user(format!("user {i}")));
-        history.push(ChatMessage::assistant(format!("assistant {i}")));
-    }
-    trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
-    assert_eq!(history[0].role, "system");
-    assert_eq!(history[history.len() - 1].role, "assistant");
-}
-
-#[test]
-fn trim_history_with_only_system_prompt() {
-    // Recovery: Only system prompt should not be trimmed
-    let mut history = vec![ChatMessage::system("system prompt")];
-    trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
-    assert_eq!(history.len(), 1);
-}
-
-#[test]
-fn trim_history_empty_history() {
-    let mut history: Vec<crate::providers::ChatMessage> = vec![];
-    trim_history(&mut history, 10);
-    assert!(history.is_empty());
-}
-
-#[test]
-fn trim_history_system_only() {
-    let mut history = vec![crate::providers::ChatMessage::system("system prompt")];
-    trim_history(&mut history, 10);
-    assert_eq!(history.len(), 1);
-    assert_eq!(history[0].role, "system");
-}
-
-#[test]
-fn trim_history_exactly_at_limit() {
-    let mut history = vec![
-        crate::providers::ChatMessage::system("system"),
-        crate::providers::ChatMessage::user("msg 1"),
-        crate::providers::ChatMessage::assistant("reply 1"),
-    ];
-    trim_history(&mut history, 2); // 2 non-system messages = exactly at limit
-    assert_eq!(history.len(), 3, "should not trim when exactly at limit");
-}
-
-#[test]
-fn trim_history_removes_oldest_non_system() {
-    let mut history = vec![
-        crate::providers::ChatMessage::system("system"),
-        crate::providers::ChatMessage::user("old msg"),
-        crate::providers::ChatMessage::assistant("old reply"),
-        crate::providers::ChatMessage::user("new msg"),
-        crate::providers::ChatMessage::assistant("new reply"),
-    ];
-    trim_history(&mut history, 2);
-    assert_eq!(history.len(), 3); // system + 2 kept
-    assert_eq!(history[0].role, "system");
-    assert_eq!(history[1].content, "new msg");
-}
-
-/// Compaction is off here, so the only removal is a delete-only trim and the
-/// request goes back above everything it left standing. Two things are being
-/// pinned at once: that position — on a delete-only trim every survivor came
-/// after the request, so the front of the non-system region is where the
-/// request actually stood relative to all of them — and the invariant it
-/// must not break, that no restored message may fall between an assistant
-/// `tool_calls` envelope and the `tool` results answering it.
 #[tokio::test]
 async fn the_restored_request_never_splits_a_native_tool_round_trip() {
     const QUESTION_MARKER: &str = "native-pairing-request-marker";
@@ -183,12 +153,15 @@ async fn the_restored_request_never_splits_a_native_tool_round_trip() {
     history.push(ChatMessage::tool(
         serde_json::json!({"tool_call_id": "call-1", "content": "ok"}).to_string(),
     ));
+    // The floor is the system prompt, the request and the newest native round
+    // (the assistant envelope and its result); the three older turns are the trim.
+    let protected = [history[0].clone(), history[4].clone(), history[5].clone(), history[6].clone()];
     let config = crate::config::AgentCompactionConfig {
         mode: crate::config::AgentCompactionMode::Off,
         reserve_tokens: 10,
         keep_recent_messages: 2,
         memory_flush: false,
-        max_context_tokens: 90,
+        max_context_tokens: window_for_protected_floor(&protected, 10, 8),
         max_context_tokens_explicit: true,
         ..crate::config::AgentCompactionConfig::default()
     };

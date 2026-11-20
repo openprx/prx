@@ -11,6 +11,7 @@
 )]
 
 use super::*;
+use crate::agent::turn_tests::{budget_exhausted_of, window_for_protected_floor};
 #[cfg(test)]
 use crate::agent::compaction::post_compaction_refresh_aside;
 use crate::agent::turn_contracts::POST_COMPACTION_REFRESH_MARKER;
@@ -80,7 +81,7 @@ async fn legacy_preflight_preserving_trim_keeps_compaction_summary_when_recent_s
         os_paging: crate::config::OsPagingConfig::default(),
     };
 
-    let budget = preflight_context_budget_before_provider_call(
+    let Err(error) = preflight_context_budget_before_provider_call(
         &mut history,
         &provider,
         "model",
@@ -90,13 +91,16 @@ async fn legacy_preflight_preserving_trim_keeps_compaction_summary_when_recent_s
         "test_preflight",
     )
     .await
-    .unwrap();
-
+    else {
+        panic!("the request alone is over the window: the preflight must report exhaustion");
+    };
+    let (needed, limit) = budget_exhausted_of(&error).expect("test: a typed BudgetExhausted");
+    assert_eq!(limit, 110, "the window is max_context_tokens minus the reserve");
+    assert!(needed > limit, "the request alone does not fit");
+    // The summary is not protected: under this floor it is deleted, not kept.
     assert!(
-        history
-            .iter()
-            .any(|msg| msg.content.contains("[Context compacted at") && msg.content.contains("SUMMARY_SURVIVES")),
-        "preserving fallback must keep the just-created compaction summary"
+        !history.iter().any(|msg| msg.content.contains("SUMMARY_SURVIVES")),
+        "a safeguard summary is disposable under the protected floor"
     );
     assert!(
         !history.iter().any(|msg| msg.content.contains("old-or-recent-8")),
@@ -110,10 +114,6 @@ async fn legacy_preflight_preserving_trim_keeps_compaction_summary_when_recent_s
     assert!(
         history.iter().any(|msg| msg.content.contains("old-or-recent-9")),
         "the current turn's request is the floor of every trim"
-    );
-    assert!(
-        budget.over_hard_limit,
-        "a request larger than the literal hard limit 110 is reported as such, not trimmed away"
     );
 }
 
@@ -133,6 +133,7 @@ async fn a_compaction_that_replaced_a_front_range_returns_the_request_after_the_
     };
     let mut history = vec![
         ChatMessage::system("sys"),
+        ChatMessage::user(format!("older-front-bulk {}", "front-bulk ".repeat(120))),
         ChatMessage::user(format!("{QUESTION_MARKER} {}", "question-bulk ".repeat(120))),
         ChatMessage::assistant("Checking that now."),
         ChatMessage::user(format!(
@@ -140,12 +141,15 @@ async fn a_compaction_that_replaced_a_front_range_returns_the_request_after_the_
             crate::agent::turn_contracts::TOOL_RESULTS_PREFIX
         )),
     ];
+    // The request fits with headroom for the summary the replacing compaction
+    // writes over the older front range.
+    let window = window_for_protected_floor(&[history[0].clone(), history[2].clone()], 10, 150);
     let config = crate::config::AgentCompactionConfig {
         mode: crate::config::AgentCompactionMode::Safeguard,
         reserve_tokens: 10,
         keep_recent_messages: 1,
         memory_flush: false,
-        max_context_tokens: 260,
+        max_context_tokens: window,
         max_context_tokens_explicit: true,
         ..crate::config::AgentCompactionConfig::default()
     };

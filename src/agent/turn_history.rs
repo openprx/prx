@@ -26,7 +26,9 @@
 //! agent entry) reports nothing to a session authority; its history is its
 //! canonical history, copied lazily at the first step that reshapes the view.
 
+use crate::agent::context_budget::{FitDemand, FitReport, fit_request_window};
 use crate::agent::context_paging::inject_recalled_context;
+use crate::agent::turn_contracts::ContextCapacityError;
 use crate::agent::turn_contracts::{inbound_user_message, stored_turn_message};
 use crate::providers::ChatMessage;
 
@@ -51,14 +53,55 @@ enum MessageOrigin {
     /// The turn's raw request: canonical, but pending until the ordered commit.
     Request,
     /// Appended by this turn's tool loop: tool-call envelopes, tool results,
-    /// the loop's result blocks. Transient until the turn commits.
-    TurnRound,
+    /// the loop's result blocks. Transient until the turn commits. `Some` when
+    /// the engine recorded the round as one batch ([`TurnHistory::record_tool_batch`]).
+    TurnRound(Option<RoundTag>),
     /// The refresh aside a summary appends after its replacement. A
     /// projection: [`TurnHistory::finish_durable_compaction`] lifts it out.
     RefreshAside,
     /// History of a caller with no acknowledged session store, which arrived
     /// without provenance.
     CallerSupplied,
+}
+
+/// One tool round of this turn: a batch of the assistant's tool calls and the
+/// results that answer them, recorded when the engine appended it (§3.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RoundTag {
+    /// The batch's identity; the batches of one turn are numbered in order.
+    pub(crate) batch: u64,
+    /// Whether this is the batch's first message: the assistant envelope
+    /// (native) or response (prompt-guided).
+    pub(crate) envelope: bool,
+    /// Whether every result of the batch was appended.
+    pub(crate) complete: bool,
+    /// How many messages the batch holds when it was recorded.
+    pub(crate) size: usize,
+}
+
+/// What a message of the provider view is, for the context fit (§3.3, §3.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ViewSlot {
+    /// An acknowledged turn, a durable replacement, the caller's own message,
+    /// or a message of this turn that was never recorded as a round.
+    Acknowledged,
+    /// One message of a recorded tool round.
+    Round(RoundTag),
+    /// A projection the canonical history does not hold: the refresh aside
+    /// and the recalled page.
+    Other,
+}
+
+impl MessageOrigin {
+    fn view_slot(self) -> ViewSlot {
+        match self {
+            Self::Acknowledged | Self::Request | Self::CallerSupplied | Self::TurnRound(None) => {
+                ViewSlot::Acknowledged
+            }
+            Self::TurnRound(Some(tag)) => ViewSlot::Round(tag),
+            Self::RefreshAside => ViewSlot::Other,
+        }
+    }
 }
 
 /// The canonical history (I-CANON): the acknowledged session, as the reducer
@@ -185,7 +228,7 @@ impl CanonicalHistory {
     fn append_turn_messages(&mut self, appended: &[ChatMessage]) {
         self.messages.extend_from_slice(appended);
         self.origins
-            .extend(std::iter::repeat_n(MessageOrigin::TurnRound, appended.len()));
+            .extend(std::iter::repeat_n(MessageOrigin::TurnRound(None), appended.len()));
     }
 
     /// Replace `self[start..end]` with `replacement`, every new message of
@@ -275,11 +318,9 @@ impl CanonicalHistory {
     }
 
     /// Put the turn's request back at the tail when a durable compaction
-    /// folded it away ([`restore_current_turn_request`] at
-    /// [`RestoredRequestPosition::Tail`]). Whether it was restored.
+    /// folded it away ([`restore_current_turn_request`]). Whether it was restored.
     ///
     /// [`restore_current_turn_request`]: crate::agent::context_preflight::restore_current_turn_request
-    /// [`RestoredRequestPosition::Tail`]: crate::agent::context_preflight::RestoredRequestPosition::Tail
     pub(crate) fn restore_request_at_tail(
         &mut self,
         captured: Option<crate::agent::context_preflight::CapturedTurnRequest>,
@@ -289,7 +330,6 @@ impl CanonicalHistory {
             &mut self.messages,
             captured,
             trigger,
-            crate::agent::context_preflight::RestoredRequestPosition::Tail,
         );
         if restored {
             self.origins.push(MessageOrigin::Request);
@@ -351,7 +391,7 @@ impl CanonicalHistory {
             .iter()
             .zip(&self.origins)
             .map(|(message, origin)| match origin {
-                MessageOrigin::TurnRound | MessageOrigin::CallerSupplied => {
+                MessageOrigin::TurnRound(_) | MessageOrigin::CallerSupplied => {
                     crate::agent::compaction::is_tool_roundtrip_companion(message)
                 }
                 MessageOrigin::Acknowledged | MessageOrigin::Request | MessageOrigin::RefreshAside => false,
@@ -391,7 +431,7 @@ impl CanonicalHistory {
                 let acknowledged = match origin {
                     MessageOrigin::Acknowledged => true,
                     MessageOrigin::CallerSupplied => Some(index) != caller_pending,
-                    MessageOrigin::Request | MessageOrigin::TurnRound | MessageOrigin::RefreshAside => false,
+                    MessageOrigin::Request | MessageOrigin::TurnRound(_) | MessageOrigin::RefreshAside => false,
                 };
                 (acknowledged && crate::agent::turn_contracts::is_durable_turn_message(message))
                     .then_some((message.role.as_str(), message.content.as_str()))
@@ -460,13 +500,48 @@ impl ProjectionInputs {
 }
 
 /// The provider projection of a canonical history. Built only by
-/// [`project`]; it never converts back.
+/// [`project`]; it never converts back. `slots` is index for index with
+/// `messages`.
 #[derive(Debug, Clone)]
 pub(crate) struct ProviderView {
     messages: Vec<ChatMessage>,
+    slots: Vec<ViewSlot>,
 }
 
 impl ProviderView {
+    fn from_parts(messages: Vec<ChatMessage>, slots: Vec<ViewSlot>) -> Self {
+        if slots.len() == messages.len() {
+            Self { messages, slots }
+        } else {
+            Self::untracked(&messages)
+        }
+    }
+
+    /// A view whose slots are not known: every message is acknowledged.
+    pub(crate) fn untracked(messages: &[ChatMessage]) -> Self {
+        Self {
+            messages: messages.to_vec(),
+            slots: vec![ViewSlot::Acknowledged; messages.len()],
+        }
+    }
+
+    pub(crate) fn messages(&self) -> &[ChatMessage] {
+        &self.messages
+    }
+
+    /// The same slots over `messages` when the count still matches; otherwise
+    /// the slots are unknown and every message is acknowledged.
+    pub(crate) fn with_messages(self, messages: Vec<ChatMessage>) -> Self {
+        if messages.len() == self.slots.len() {
+            Self {
+                messages,
+                slots: self.slots,
+            }
+        } else {
+            Self::untracked(&messages)
+        }
+    }
+
     pub(crate) fn into_messages(self) -> Vec<ChatMessage> {
         self.messages
     }
@@ -479,6 +554,7 @@ impl ProviderView {
 /// skill metadata is stripped when suppressed.
 pub(crate) fn project(canonical: &CanonicalHistory, inputs: &ProjectionInputs) -> ProviderView {
     let mut messages = canonical.messages.clone();
+    let mut slots: Vec<ViewSlot> = canonical.origins.iter().map(|origin| origin.view_slot()).collect();
     if let Some((plain, enriched)) = &inputs.enriched_request
         && let Some(request) = messages
             .iter_mut()
@@ -490,14 +566,22 @@ pub(crate) fn project(canonical: &CanonicalHistory, inputs: &ProjectionInputs) -
     for (offset, (at, note)) in inputs.refresh_notes.iter().enumerate() {
         let index = at.saturating_add(offset).min(messages.len());
         messages.insert(index, note.clone());
+        slots.insert(index.min(slots.len()), ViewSlot::Other);
     }
     if let Some(page) = &inputs.recalled_page {
+        let index = recalled_page_index(&messages);
         inject_recalled_context(&mut messages, page.clone());
+        slots.insert(index.min(slots.len()), ViewSlot::Other);
     }
     if inputs.suppress_skill_metadata {
         crate::agent::runtime_prompt::suppress_unreadable_skill_metadata(&mut messages);
     }
-    ProviderView { messages }
+    ProviderView::from_parts(messages, slots)
+}
+
+/// Where a recalled page is inserted: directly after the leading system prompt.
+fn recalled_page_index(messages: &[ChatMessage]) -> usize {
+    usize::from(messages.first().is_some_and(|message| message.role == "system"))
 }
 
 /// One turn's canonical history and the projection state of its provider view.
@@ -512,6 +596,10 @@ pub(crate) struct TurnHistory {
     /// See [`Self::caller_rollover_current`].
     caller_rollover_current: bool,
     projection: ProjectionInputs,
+    /// The slot of every message of the provider view, index for index.
+    view_slots: Vec<ViewSlot>,
+    /// The number the next recorded tool round takes.
+    next_batch: u64,
     #[cfg(feature = "wasm-plugins")]
     inbound_middleware_applied: bool,
 }
@@ -536,6 +624,8 @@ impl TurnHistory {
             canonical,
             absorbed_view_len: view.len(),
             projection: ProjectionInputs::default().with_enriched_request(plain_request, enriched_request),
+            view_slots: vec![ViewSlot::Acknowledged; view.len()],
+            next_batch: 0,
             #[cfg(feature = "wasm-plugins")]
             inbound_middleware_applied: false,
         }
@@ -563,6 +653,7 @@ impl TurnHistory {
                 canonical
             },
         );
+        self.view_slots.resize(view.len(), ViewSlot::Acknowledged);
         if absorbed_any {
             self.caller_rollover_current = false;
         }
@@ -581,8 +672,72 @@ impl TurnHistory {
     ) -> R {
         self.catch_up(view);
         let result = step(view);
+        if view.len() != self.view_slots.len() {
+            // The step changed the window's shape outside the fit. The slots
+            // are unknown from here: no message is a round or a removable turn
+            // until a new round is recorded, so nothing unproven is folded.
+            self.view_slots = vec![ViewSlot::Acknowledged; view.len()];
+        }
         self.absorbed_view_len = view.len();
         result
+    }
+
+    /// Insert the recalled context page into the view (a projection, directly
+    /// after the system prompt) and record its slot.
+    pub(crate) fn insert_recalled_page(&mut self, view: &mut Vec<ChatMessage>, page: ChatMessage) {
+        self.catch_up(view);
+        let index = recalled_page_index(view);
+        inject_recalled_context(view, page);
+        self.view_slots.insert(index.min(self.view_slots.len()), ViewSlot::Other);
+        self.absorbed_view_len = view.len();
+    }
+
+    /// Record the tool round the engine just appended to the view as one batch.
+    /// The batch is the view's appends since the last reshape. Its identity is
+    /// written to the canonical history too, so it survives a durable
+    /// compaction (§3.4).
+    pub(crate) fn record_tool_batch(&mut self, view: &[ChatMessage], complete: bool) {
+        let start = self.absorbed_view_len;
+        self.catch_up(view);
+        let size = view.len().saturating_sub(start);
+        if size == 0 {
+            return;
+        }
+        let batch = self.next_batch;
+        self.next_batch = self.next_batch.saturating_add(1);
+        let Some(canonical) = self.canonical.as_mut() else {
+            return;
+        };
+        let canonical_start = canonical.messages.len().saturating_sub(size);
+        for offset in 0..size {
+            let tag = RoundTag {
+                batch,
+                envelope: offset == 0,
+                complete,
+                size,
+            };
+            if let Some(origin) = canonical.origins.get_mut(canonical_start.saturating_add(offset)) {
+                *origin = MessageOrigin::TurnRound(Some(tag));
+            }
+            if let Some(slot) = self.view_slots.get_mut(start.saturating_add(offset)) {
+                *slot = ViewSlot::Round(tag);
+            }
+        }
+    }
+
+    /// Fit the provider view to `limit` (the one fit of §3.3). The slots travel
+    /// with the view, and only the view changes.
+    pub(crate) fn fit_view(
+        &mut self,
+        view: &mut Vec<ChatMessage>,
+        limit: usize,
+        demand: FitDemand,
+        trigger: &'static str,
+    ) -> Result<FitReport, ContextCapacityError> {
+        self.catch_up(view);
+        let report = fit_request_window(view, &mut self.view_slots, limit, demand, trigger);
+        self.absorbed_view_len = view.len();
+        report
     }
 
     /// The canonical history, caught up with `view`, for a durable compaction
@@ -634,24 +789,24 @@ impl TurnHistory {
         self.inbound_middleware_applied
     }
 
-    /// How many messages the projection inserts ahead of a compaction's
-    /// replacement (the recalled page sits right after the system prompt), so a
-    /// trim of the view preserves the same replacement.
-    pub(crate) fn replacement_offset(&self) -> usize {
-        usize::from(self.projection.recalled_page.is_some())
-    }
-
     /// The provider view of the canonical history ([`project`]) before any
     /// per-request trim and before the inbound middleware (which is async and
     /// runs in the turn engine).
-    pub(crate) fn project(&mut self, view: &[ChatMessage]) -> Vec<ChatMessage> {
+    pub(crate) fn project(&mut self, view: &[ChatMessage]) -> ProviderView {
         // Only a durable compaction re-derives the view.
         self.caller_rollover_current = false;
         self.catch_up(view);
         self.canonical.as_ref().map_or_else(
-            || view.to_vec(),
-            |canonical| project(canonical, &self.projection).into_messages(),
+            || ProviderView::untracked(view),
+            |canonical| project(canonical, &self.projection),
         )
+    }
+
+    /// Make `projected` the provider view: its messages and slots replace the view's.
+    pub(crate) fn adopt(&mut self, view: &mut Vec<ChatMessage>, projected: ProviderView) {
+        *view = projected.messages;
+        self.view_slots = projected.slots;
+        self.absorbed_view_len = view.len();
     }
 }
 

@@ -60,7 +60,7 @@ fn the_projection_reapplies_the_recalled_page_and_the_skill_suppression() {
     let projected = turn_history.project(&view);
 
     assert_eq!(
-        contents(&projected),
+        contents(projected.messages()),
         vec!["intro\n", "recalled", "request"],
         "the projection strips the skill metadata and inserts the recalled page after the system prompt"
     );
@@ -68,11 +68,6 @@ fn the_projection_reapplies_the_recalled_page_and_the_skill_suppression() {
         contents(turn_history.canonical(&view))[0],
         system,
         "the canonical system prompt keeps the skill metadata"
-    );
-    assert_eq!(
-        turn_history.replacement_offset(),
-        1,
-        "the recalled page shifts a compaction's replacement by one message"
     );
 }
 
@@ -107,7 +102,7 @@ fn a_caller_rollover_stays_current_until_the_turn_appends_or_compacts() {
         true,
     );
     let projected = compacted.project(&compacted_view);
-    compacted.reshape(&mut compacted_view, |view| *view = projected);
+    compacted.adopt(&mut compacted_view, projected);
     assert!(
         !compacted.caller_rollover_current(&compacted_view),
         "a re-derived view ends the caller rollover"
@@ -137,7 +132,7 @@ fn an_enriched_request_lives_only_in_the_projection() {
         "the canonical history is the acknowledged turns plus the plain request, without any enrichment"
     );
     assert_eq!(
-        contents(&turn_history.project(&view)),
+        contents(turn_history.project(&view).messages()),
         vec!["sys", "old question", "old answer", "[memory] request"],
         "the projection shows only the current request enriched; older-turn enrichment is not carried"
     );
@@ -304,7 +299,7 @@ fn a_refresh_aside_moves_into_the_projection_after_its_replacement() {
         vec!["sys", "summary", "request"],
         "the reported canonical history holds no refresh aside"
     );
-    let projected = turn_history.project(&view);
+    let projected = turn_history.project(&view).into_messages();
     assert_eq!(projected.len(), 4, "the projection adds the aside back: {projected:?}");
     assert!(
         projected[2]
