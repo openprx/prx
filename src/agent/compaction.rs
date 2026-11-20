@@ -1522,6 +1522,21 @@ pub(crate) async fn resolve_compaction_event_provenance_detailed(
     source_messages: &[ChatMessage],
     companions: RoundCompanions<'_>,
 ) -> anyhow::Result<ProvenanceResolution> {
+    resolve_provenance_with_kept(mem, principal, source_messages, companions, &[]).await
+}
+
+/// [`resolve_compaction_event_provenance_detailed`] for `source_messages`
+/// resolved together with `kept`: acknowledged messages after the source,
+/// in history order, each of which claims a row of its own. The assignment
+/// must be unique over source and `kept` together; only the source's rows
+/// are returned.
+async fn resolve_provenance_with_kept(
+    mem: &dyn Memory,
+    principal: MemoryPrincipal,
+    source_messages: &[ChatMessage],
+    companions: RoundCompanions<'_>,
+    kept: &[&ChatMessage],
+) -> anyhow::Result<ProvenanceResolution> {
     if principal.session_key.is_none() || source_messages.is_empty() {
         return Ok(ProvenanceResolution::Unavailable(ProvenanceGap::NoSessionKey));
     }
@@ -1545,6 +1560,9 @@ pub(crate) async fn resolve_compaction_event_provenance_detailed(
     {
         return Ok(ProvenanceResolution::Unavailable(ProvenanceGap::NonTranscriptSource));
     }
+    let source_count = durable_messages.len();
+    let mut joint_messages = durable_messages;
+    joint_messages.extend_from_slice(kept);
 
     // Only the session's own rows (canonical key): rows under the legacy key
     // (child or worker traffic) never take part.
@@ -1552,15 +1570,20 @@ pub(crate) async fn resolve_compaction_event_provenance_detailed(
         legacy_session_key: None,
         ..principal
     };
-    let forms = SourceForms::new(&durable_messages);
+    let forms = SourceForms::new(&joint_messages);
     let pool = match load_complete_pool(mem, &principal, &forms).await? {
         Ok(pool) => pool,
         Err(gap) => return Ok(ProvenanceResolution::Unavailable(gap)),
     };
-    let matched = match resolve_in_pool(&durable_messages, pool) {
+    let mut matched = match resolve_in_pool(&joint_messages, pool) {
         Ok(matched) => matched,
         Err(gap) => return Ok(ProvenanceResolution::Unavailable(gap)),
     };
+    // One row per message in history order: the source's rows lead.
+    if matched.len() != joint_messages.len() {
+        return Ok(ProvenanceResolution::Unavailable(ProvenanceGap::TurnUnmatched));
+    }
+    matched.truncate(source_count);
 
     let Some((first_row_id, first_event_id)) = matched.iter().min_by_key(|(id, _)| *id) else {
         return Ok(ProvenanceResolution::Unavailable(ProvenanceGap::TurnUnmatched));
@@ -1587,9 +1610,10 @@ async fn attach_compaction_event_provenance(
     audit: &DocumentIngestRuntime,
     source_messages: &[ChatMessage],
     companions: RoundCompanions<'_>,
+    kept_acknowledged: &[&ChatMessage],
     source: &mut CompactionAuditSource,
 ) {
-    match resolve_compaction_event_provenance_detailed(
+    let resolution = match resolve_compaction_event_provenance_detailed(
         &*audit.memory,
         audit.memory_principal(),
         source_messages,
@@ -1597,6 +1621,43 @@ async fn attach_compaction_event_provenance(
     )
     .await
     {
+        // The cold window alone is ambiguous: resolve it together with the
+        // kept acknowledged messages, each of which claims its own row. Only a
+        // unique joint assignment is exact; anything else stays ambiguous.
+        Ok(ProvenanceResolution::Unavailable(ProvenanceGap::TurnAmbiguous)) if !kept_acknowledged.is_empty() => {
+            match resolve_provenance_with_kept(
+                &*audit.memory,
+                audit.memory_principal(),
+                source_messages,
+                companions,
+                kept_acknowledged,
+            )
+            .await
+            {
+                Ok(ProvenanceResolution::Exact(provenance)) => {
+                    tracing::debug!(
+                        kept_messages = kept_acknowledged.len(),
+                        "cold window provenance resolved jointly with the kept messages"
+                    );
+                    Ok(ProvenanceResolution::Exact(provenance))
+                }
+                Ok(ProvenanceResolution::Unavailable(_)) => {
+                    Ok(ProvenanceResolution::Unavailable(ProvenanceGap::TurnAmbiguous))
+                }
+                Err(error) => {
+                    let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+                    tracing::debug!(
+                        error_len,
+                        error_sha256,
+                        "failed to resolve compaction provenance jointly with the kept messages"
+                    );
+                    Ok(ProvenanceResolution::Unavailable(ProvenanceGap::TurnAmbiguous))
+                }
+            }
+        }
+        other => other,
+    };
+    match resolution {
         Ok(ProvenanceResolution::Exact(provenance)) => {
             source.source_event_ids = provenance.source_event_ids;
             source.source_event_range = Some(provenance.covered_range);
@@ -2109,10 +2170,28 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
     let compacted_source_messages = source_history.get(start..compact_end);
     let compacted_companions = RoundCompanions::Marked(companions.get(start..compact_end).unwrap_or_default());
     let mut audit_source = audit.and_then(|_| compacted_source_messages.map(build_compaction_audit_source));
-    if let (Some(audit), Some(source_messages), Some(source)) =
+    if let (Some(audit), Some(source_messages), Some(audit_source)) =
         (audit, compacted_source_messages, audit_source.as_mut())
     {
-        attach_compaction_event_provenance(audit, source_messages, compacted_companions, source).await;
+        // The kept messages that claim their own rows in a joint resolution:
+        // acknowledged turns only (never the pending request, this turn's
+        // unstored reply or its tool round-trip traffic).
+        let acknowledged = source.acknowledged_flags();
+        let kept_acknowledged = source_history
+            .iter()
+            .zip(&acknowledged)
+            .skip(compact_end)
+            .filter(|(message, acknowledged)| **acknowledged && matches!(message.role.as_str(), "user" | "assistant"))
+            .map(|(message, _)| message)
+            .collect::<Vec<_>>();
+        attach_compaction_event_provenance(
+            audit,
+            source_messages,
+            compacted_companions,
+            &kept_acknowledged,
+            audit_source,
+        )
+        .await;
     }
     let Some(guard) = compaction_patch_guard_for(source_history, start, compact_end) else {
         return Ok(CompactionBuild::NotNeeded);

@@ -238,6 +238,16 @@ impl CanonicalHistory {
         self.messages.len()
     }
 
+    /// Per message, index for index, whether it is an acknowledged message
+    /// ([`MessageOrigin::Acknowledged`]): never the pending request, this
+    /// turn's tool loop output, a refresh aside or caller-supplied history.
+    pub(crate) fn acknowledged_flags(&self) -> Vec<bool> {
+        self.origins
+            .iter()
+            .map(|origin| *origin == MessageOrigin::Acknowledged)
+            .collect()
+    }
+
     /// Absorb the raw messages this turn appended to its provider view.
     fn append_turn_messages(&mut self, appended: &[ChatMessage]) {
         self.messages.extend_from_slice(appended);
