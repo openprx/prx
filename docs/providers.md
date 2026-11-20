@@ -1037,6 +1037,19 @@ explicit signal from the upstream.
 - **Retries never depend on the header.** A 429/503 without `Retry-After` is
   still retried on the same provider/model up to `reliability.provider_retries`,
   on both the streaming and the non-streaming path, before any failover.
+- **Overload responses have their own schedule.** An HTTP 429 or 503, or an
+  error body whose type/code says overloaded or rate limited (for example
+  `engine_overloaded`), received before any content was streamed is retried
+  on the same provider/model at most 2 times (fewer if
+  `reliability.provider_retries` is lower), waiting 2 s and then 6 s. A
+  `Retry-After` replaces that wait, capped at 30 s per wait. Each retry prints
+  one operator notice, `Provider overloaded; retrying (<n>/2).` (the `2` is the
+  lower of 2 and `provider_retries`), on stderr in
+  `--plain` and `--message` and as a system line in the TUI. The wait ends
+  when the turn is cancelled. After the last failure the turn fails as before;
+  a failure after partial output is never retried, and the retry resends the
+  same provider request, so no tool runs again. The ceiling and jitter rules
+  below apply to the other retryable failures.
 - **Backoff is jittered.** Local exponential waits are spread over
   `[nominal/2, nominal]`; an honored `Retry-After` gets a small additive spread
   (never shorter than the server asked). Without this, requests throttled in the

@@ -141,6 +141,53 @@ fn is_rate_limited(err: &anyhow::Error) -> bool {
     msg.contains("429") && (msg.contains("Too Many") || msg.contains("rate") || msg.contains("limit"))
 }
 
+/// Most in-place retries of one candidate after an overload response.
+const OVERLOAD_MAX_RETRIES: u32 = 2;
+
+/// Wait before each overload retry when the upstream sent no `Retry-After`.
+const OVERLOAD_RETRY_WAITS_MS: [u64; 2] = [2_000, 6_000];
+
+/// Longest wait an overload retry honors from a `Retry-After` hint.
+const OVERLOAD_MAX_WAIT_MS: u64 = 30_000;
+
+/// The wait before overload retry `retry` (1-based): the upstream's
+/// `Retry-After` capped at [`OVERLOAD_MAX_WAIT_MS`], else the fixed schedule.
+fn overload_wait_ms(retry: u32, hint_ms: Option<u64>) -> u64 {
+    hint_ms.map_or_else(
+        || {
+            usize::try_from(retry.saturating_sub(1))
+                .ok()
+                .and_then(|index| OVERLOAD_RETRY_WAITS_MS.get(index).copied())
+                .unwrap_or(OVERLOAD_MAX_WAIT_MS)
+        },
+        |hint| hint.min(OVERLOAD_MAX_WAIT_MS),
+    )
+}
+
+/// Whether a provider error text names an overload: HTTP 503, or an error
+/// body whose type/code says overloaded or rate limited (`engine_overloaded`,
+/// `overloaded_error`, `rate_limit_exceeded`).
+fn names_overload(lower: &str) -> bool {
+    lower.contains("(503") || lower.contains("http 503") || lower.contains("overloaded") || lower.contains("rate_limit")
+}
+
+/// Whether a retryable buffered failure is an overload response (HTTP 429 or
+/// 503, or an overloaded / rate-limited error body). Callers have already
+/// ruled out non-retryable errors, business 429s included.
+fn is_overload(err: &anyhow::Error) -> bool {
+    if let Some(status) = err.downcast_ref::<reqwest::Error>().and_then(reqwest::Error::status) {
+        return matches!(status.as_u16(), 429 | 503);
+    }
+    is_rate_limited(err) || names_overload(&err.to_string().to_lowercase())
+}
+
+/// The operator notice for overload retry `retry` (1-based) of a chain that
+/// allows `max_retries` in-place retries.
+fn notice_overload_retry(retry: u32, max_retries: u32) {
+    let total = OVERLOAD_MAX_RETRIES.min(max_retries);
+    crate::runtime::operator_notice::emit(&format!("Provider overloaded; retrying ({retry}/{total})."));
+}
+
 /// Business error codes observed on 429 responses where retrying is futile
 /// (Z.AI / GLM: plan does not cover the model, insufficient balance).
 const NON_RETRYABLE_RATE_LIMIT_CODES: [u16; 2] = [1113, 1311];
@@ -767,6 +814,22 @@ impl ReliableProvider {
         if ctx.rate_limited {
             rate_limit::record_rate_limited(ctx.provider_name, ctx.model, false, hint_ms.is_some());
         }
+        if ctx.overload {
+            let wait = overload_wait_ms(ctx.attempt, hint_ms);
+            tracing::warn!(
+                provider = ctx.provider_name,
+                model = ctx.model,
+                attempt = ctx.attempt,
+                wait_ms = wait,
+                retry_after_ms = hint_ms,
+                reason = ctx.failure_reason,
+                "Provider overloaded, retrying"
+            );
+            notice_overload_retry(ctx.attempt, self.max_retries);
+            self.rate_limit_gate.note_rate_limited(ctx.gate_key, wait);
+            tokio::time::sleep(Duration::from_millis(wait)).await;
+            return true;
+        }
         match plan_retry_wait(backoff_ms, err) {
             RetryWait::HintExceedsCap(requested_ms) => {
                 tracing::warn!(
@@ -839,6 +902,8 @@ struct RetryContext<'a> {
     failure_reason: &'static str,
     error_detail: &'a str,
     rate_limited: bool,
+    /// The failure is an overload response: fixed waits and an operator notice.
+    overload: bool,
 }
 
 /// Compute the (jittered) wait before retrying the same provider/model.
@@ -1116,7 +1181,9 @@ impl Provider for ReliableProvider {
                                 break;
                             }
 
-                            if attempt < self.max_retries {
+                            // An overload is retried at most twice, on its own schedule.
+                            let overload = is_overload(&e);
+                            if attempt < self.max_retries && (!overload || attempt < OVERLOAD_MAX_RETRIES) {
                                 let ctx = RetryContext {
                                     provider_name,
                                     gate_key: member_key,
@@ -1125,6 +1192,7 @@ impl Provider for ReliableProvider {
                                     failure_reason,
                                     error_detail: &error_detail,
                                     rate_limited,
+                                    overload,
                                 };
                                 if !self.wait_before_retry(&ctx, backoff_ms, &e).await {
                                     break;
@@ -1141,6 +1209,9 @@ impl Provider for ReliableProvider {
                                     member_key,
                                     hint.unwrap_or(backoff_ms).min(MAX_HONORED_RETRY_AFTER_MS),
                                 );
+                                break;
+                            } else {
+                                break;
                             }
                         }
                     }
@@ -1277,7 +1348,9 @@ impl Provider for ReliableProvider {
                                 break;
                             }
 
-                            if attempt < self.max_retries {
+                            // An overload is retried at most twice, on its own schedule.
+                            let overload = is_overload(&e);
+                            if attempt < self.max_retries && (!overload || attempt < OVERLOAD_MAX_RETRIES) {
                                 let ctx = RetryContext {
                                     provider_name,
                                     gate_key: member_key,
@@ -1286,6 +1359,7 @@ impl Provider for ReliableProvider {
                                     failure_reason,
                                     error_detail: &error_detail,
                                     rate_limited,
+                                    overload,
                                 };
                                 if !self.wait_before_retry(&ctx, backoff_ms, &e).await {
                                     break;
@@ -1302,6 +1376,9 @@ impl Provider for ReliableProvider {
                                     member_key,
                                     hint.unwrap_or(backoff_ms).min(MAX_HONORED_RETRY_AFTER_MS),
                                 );
+                                break;
+                            } else {
+                                break;
                             }
                         }
                     }
@@ -1504,7 +1581,9 @@ impl Provider for ReliableProvider {
                                 break;
                             }
 
-                            if attempt < self.max_retries {
+                            // An overload is retried at most twice, on its own schedule.
+                            let overload = is_overload(&e);
+                            if attempt < self.max_retries && (!overload || attempt < OVERLOAD_MAX_RETRIES) {
                                 let ctx = RetryContext {
                                     provider_name,
                                     gate_key: member_key,
@@ -1513,6 +1592,7 @@ impl Provider for ReliableProvider {
                                     failure_reason,
                                     error_detail: &error_detail,
                                     rate_limited,
+                                    overload,
                                 };
                                 if !self.wait_before_retry(&ctx, backoff_ms, &e).await {
                                     break;
@@ -1529,6 +1609,9 @@ impl Provider for ReliableProvider {
                                     member_key,
                                     hint.unwrap_or(backoff_ms).min(MAX_HONORED_RETRY_AFTER_MS),
                                 );
+                                break;
+                            } else {
+                                break;
                             }
                         }
                     }
@@ -1706,7 +1789,9 @@ impl Provider for ReliableProvider {
                                 break;
                             }
 
-                            if attempt < self.max_retries {
+                            // An overload is retried at most twice, on its own schedule.
+                            let overload = is_overload(&e);
+                            if attempt < self.max_retries && (!overload || attempt < OVERLOAD_MAX_RETRIES) {
                                 let ctx = RetryContext {
                                     provider_name,
                                     gate_key: member_key,
@@ -1715,6 +1800,7 @@ impl Provider for ReliableProvider {
                                     failure_reason,
                                     error_detail: &error_detail,
                                     rate_limited,
+                                    overload,
                                 };
                                 if !self.wait_before_retry(&ctx, backoff_ms, &e).await {
                                     break;
@@ -1731,6 +1817,9 @@ impl Provider for ReliableProvider {
                                     member_key,
                                     hint.unwrap_or(backoff_ms).min(MAX_HONORED_RETRY_AFTER_MS),
                                 );
+                                break;
+                            } else {
+                                break;
                             }
                         }
                     }
@@ -2102,6 +2191,22 @@ fn classify_stream_error(err: &super::traits::StreamError) -> StreamFailureClass
     StreamFailureClass::Retryable
 }
 
+/// Whether a retryable pre-content stream failure is an overload response:
+/// HTTP 429 or 503, or an in-stream error whose type/code says overloaded or
+/// rate limited.
+fn stream_error_is_overload(err: &super::traits::StreamError, class: StreamFailureClass) -> bool {
+    use super::traits::StreamError;
+    match (class, err) {
+        (StreamFailureClass::RateLimited, _) => true,
+        (StreamFailureClass::Retryable, StreamError::RateLimited { status, .. }) => *status == 503,
+        (StreamFailureClass::Retryable, StreamError::Http(http)) => http.status().is_some_and(|s| s.as_u16() == 503),
+        (StreamFailureClass::Retryable, StreamError::Provider(message) | StreamError::InvalidSse(message)) => {
+            names_overload(&message.to_lowercase())
+        }
+        _ => false,
+    }
+}
+
 /// Extract a Retry-After value (in milliseconds) from a streaming error.
 ///
 /// Prefers the **structured** `retry_after_ms` field carried by
@@ -2364,11 +2469,36 @@ where
                                 );
                                 rate_limited_seen = true;
                             }
+                            // An overload is retried at most twice, on its own schedule.
+                            let overload = stream_error_is_overload(&err, class);
                             let retry_in_place =
                                 matches!(class, StreamFailureClass::RateLimited | StreamFailureClass::Retryable)
                                     && !skips_in_place_retry(&err)
-                                    && pre_content_retries < max_retries;
+                                    && pre_content_retries < max_retries
+                                    && (!overload || pre_content_retries < OVERLOAD_MAX_RETRIES);
 
+                            if retry_in_place && overload {
+                                let retry = pre_content_retries + 1;
+                                let wait = overload_wait_ms(retry, hint_ms);
+                                tracing::warn!(
+                                    provider = %attempt.provider_name,
+                                    model = %attempt.model,
+                                    attempt = retry,
+                                    wait_ms = wait,
+                                    retry_after_ms = hint_ms,
+                                    "Provider overloaded before content; retrying same provider/model"
+                                );
+                                notice_overload_retry(retry, max_retries);
+                                gate.note_rate_limited(&attempt.member_key, wait);
+                                // Cancelling the turn drops the receiver and ends the wait.
+                                tokio::select! {
+                                    () = tx.closed() => return,
+                                    () = tokio::time::sleep(Duration::from_millis(wait)) => {}
+                                }
+                                pre_content_retries = retry;
+                                last_error = Some(err);
+                                continue 'candidate;
+                            }
                             if retry_in_place {
                                 match plan_wait_from_hint(backoff_ms, hint_ms) {
                                     RetryWait::Sleep(wait) => {
