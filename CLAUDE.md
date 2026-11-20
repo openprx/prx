@@ -12,11 +12,11 @@ When the module is written, run these local gates on a warm, persistent target, 
 source ~/.cargo/env
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings          # add --all-features only for feature-gated changes
-cargo test --lib <module::path>                    # the task's named tests + the touched module
+cargo test --lib <module::path>                    # the existing tests of the touched module
 cargo test --test architecture_boundaries          # fast boundary guard
 ```
 
-Add the module's real-component tests (a real process and real wire bytes; never a shared store or synthetic bytes). Tests accept the business logic; there are no break-the-fix checks. After the module lands, it gets a real test on QA (real binary built from main, real provider keys); a failure is the next task.
+Do not write test code (owner 2026-11-20): a lane writes business logic only. It keeps the existing tests compiling and passing with the smallest mechanical edit, deletes a test that asserts behaviour the change intentionally replaces, and lists every such edit in its report. A change is verified by a real test: a debug `prx` built from the branch, run against real providers on an isolated state directory. After the module lands, it gets a real test again on a binary built from main; a failure is the next task.
 
 A lane does not run the whole-workspace suite, mutation batches or stress loops. The full gate is the controller's local full gate (the ci-run.yml gate set plus supply-chain checks, run on the build hosts); it runs once on the finished, rebased branch.
 
@@ -166,7 +166,7 @@ The canonical panic and test rules (Google Rust Style Guide plus PRX resource li
 - See `AGENTS.md` for full architecture protocol
 - Extend via trait implementation + factory registration
 - One concern per module, one concern per PR
-- Branch workflow: one module per branch. The lane runs the scoped gates above plus every test it wrote or changed and the suites it touched (feature-gated backends with their feature on), then reports. The controller rebases the branch onto `origin/main` and runs the local full gate; when it is green, `main` is pushed directly (fast-forward) and the branch is deleted. There is no PR, no code review after coding, no merge queue and no post-submit stage; GitHub CI runs on `main` after the push and covers what the local gate cannot (Windows). A change to Windows-only code, installers or `.github/workflows` goes through a PR and GitHub CI first. Right after landing, run the module's real test against a binary built from `main`. A red `main` or a failed real test becomes the next task. Three strikes: the same failure signature a third time stops all retries and guess-fixes; write a root-cause note naming the violated invariant, fix against it, and turn the lesson into a flow rule the same day. Compare an infra-looking CI failure (exit 143, OOM, timeout) with main's config and a passing PR's command before calling it a flake.
+- Branch workflow: one module per branch. The lane writes no test code; it runs the scoped gates above and the existing suites it touched (feature-gated backends with their feature on), then reports, and the branch gets its real test. The controller rebases the branch onto `origin/main` and runs the local full gate; when it is green, `main` is pushed directly (fast-forward) and the branch is deleted. There is no PR, no code review after coding, no merge queue and no post-submit stage; GitHub CI runs on `main` after the push and covers what the local gate cannot (Windows). A change to Windows-only code, installers or `.github/workflows` goes through a PR and GitHub CI first. Right after landing, run the module's real test against a binary built from `main`. A red `main` or a failed real test becomes the next task. Three strikes: the same failure signature a third time stops all retries and guess-fixes; write a root-cause note naming the violated invariant, fix against it, and turn the lesson into a flow rule the same day. Compare an infra-looking CI failure (exit 143, OOM, timeout) with main's config and a passing PR's command before calling it a flake.
 
 ## Commit Style
 
