@@ -2399,3 +2399,190 @@ fn one_automatic_switch_per_admitted_turn_across_sequential_tool_rounds() {
         "the sequential turn ran its {SEQUENTIAL_ROUNDS} tool rounds: {sequential_rounds} provider calls"
     );
 }
+
+/// The line whose response the queued-input case holds.
+const QUEUED_FIRST: &str = "QUEUED-FIRST say first";
+/// The line sent right after it, while its turn is still running.
+const QUEUED_SECOND: &str = "QUEUED-SECOND say second";
+/// Reply to [`QUEUED_FIRST`].
+const QUEUED_FIRST_REPLY: &str = "FIRST-REPLY-OK";
+/// Reply to [`QUEUED_SECOND`].
+const QUEUED_SECOND_REPLY: &str = "SECOND-REPLY-OK";
+/// Longest the first line's response is held.
+const HOLD_BOUND: Duration = Duration::from_secs(10);
+
+/// Holds one response until the test releases it, at most [`HOLD_BOUND`].
+#[derive(Default)]
+struct ResponseGate {
+    released: parking_lot::Mutex<bool>,
+    signal: parking_lot::Condvar,
+    held: std::sync::atomic::AtomicBool,
+}
+
+impl ResponseGate {
+    fn hold(&self) {
+        let deadline = Instant::now() + HOLD_BOUND;
+        let mut released = self.released.lock();
+        while !*released {
+            let now = Instant::now();
+            if now >= deadline {
+                return;
+            }
+            let _ = self.signal.wait_for(&mut released, deadline - now);
+        }
+    }
+
+    fn release(&self) {
+        *self.released.lock() = true;
+        self.signal.notify_all();
+    }
+}
+
+/// The compaction script, except that the first request of [`QUEUED_FIRST`]
+/// is held on `gate` and both queued lines get their own reply.
+fn script_holding_the_first_queued_line(gate: std::sync::Arc<ResponseGate>) -> Script {
+    let mut base = compaction_script::script();
+    Box::new(move |index, request| {
+        let newest = newest_user_text(request);
+        let last_is_user = request["messages"]
+            .as_array()
+            .and_then(|messages| messages.last())
+            .is_some_and(|message| message["role"] == "user");
+        if last_is_user && newest.contains(QUEUED_FIRST) {
+            if !gate.held.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                gate.hold();
+            }
+            return Scripted::text(QUEUED_FIRST_REPLY);
+        }
+        if last_is_user && newest.contains(QUEUED_SECOND) {
+            return Scripted::text(QUEUED_SECOND_REPLY);
+        }
+        base(index, request)
+    })
+}
+
+/// The event id of the newest own `message.created` row with `role` and
+/// exactly `content`, if one is stored.
+fn stored_row_id(sandbox: &Sandbox, role: &str, content: &str) -> Option<String> {
+    let database = rusqlite::Connection::open_with_flags(
+        sandbox.workspace.join("memory/brain.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .ok()?;
+    database
+        .query_row(
+            "SELECT event_id FROM message_events WHERE event_type = 'message.created' AND role = ?1 \
+             AND content = ?2 AND (idempotency_key IS NULL OR idempotency_key NOT LIKE 'branch-copy:%') \
+             ORDER BY id DESC LIMIT 1",
+            [role, content],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+}
+
+/// Whether `needles` appear in `haystack` in this relative order.
+fn in_relative_order(haystack: &[String], needles: &[String]) -> bool {
+    let mut rest = haystack.iter();
+    needles.iter().all(|needle| rest.any(|item| item == needle))
+}
+
+/// A line sent while the previous turn is still running is stored before that
+/// turn's reply, so store order differs from transcript order; the next
+/// automatic switch still resolves exact provenance (no lossy degradation),
+/// references both turns in history order, and a later lookup recovers the
+/// planted fact.
+#[test]
+fn a_queued_input_does_not_degrade_the_next_switch() {
+    let sandbox = Sandbox::new();
+    write_filler_files(&sandbox.workspace, SWITCH_FILLERS);
+    let gate = std::sync::Arc::new(ResponseGate::default());
+    let server = LoopbackOpenAi::start(
+        MODEL,
+        Some((11, 7)),
+        script_holding_the_first_queued_line(std::sync::Arc::clone(&gate)),
+    );
+    set_window(&sandbox, &server, RECALL_WINDOW_TOKENS);
+    let mut chat = HeldChat::spawn(&sandbox, &[]);
+    let mut replies = 1;
+    chat.turn(PLANT, replies);
+
+    chat.command(QUEUED_FIRST);
+    chat.command(QUEUED_SECOND);
+    let started = Instant::now();
+    let first_reply_before_second_input = loop {
+        if stored_row_id(&sandbox, "user", QUEUED_SECOND).is_some() {
+            break stored_row_id(&sandbox, "assistant", QUEUED_FIRST_REPLY).is_some();
+        }
+        assert!(
+            started.elapsed() < TURN_DEADLINE,
+            "the second line's input row was not stored within TURN_DEADLINE"
+        );
+        std::thread::sleep(POLL);
+    };
+    assert!(
+        !first_reply_before_second_input,
+        "the second line's input row is stored while the first turn is still running"
+    );
+    gate.release();
+    replies += 2;
+    wait_for_replies(&sandbox, replies);
+    let queued_rows = [
+        ("user", QUEUED_FIRST),
+        ("assistant", QUEUED_FIRST_REPLY),
+        ("user", QUEUED_SECOND),
+        ("assistant", QUEUED_SECOND_REPLY),
+    ]
+    .map(|(role, content)| {
+        stored_row_id(&sandbox, role, content).unwrap_or_else(|| panic!("the {role} row `{content}` is stored"))
+    });
+
+    let mut next_file = 0;
+    while compaction_script::stored_handoffs(&sandbox.workspace).is_empty() && next_file < SWITCH_FILLERS {
+        replies += 1;
+        chat.turn(&read_line(next_file), replies);
+        next_file += 1;
+    }
+    replies += 1;
+    chat.turn(RECALL, replies);
+    let output = chat.exit();
+
+    assert_clean(&output, "queued input run");
+    let (handoffs, unavailable) = switch_event_counts(&sandbox.workspace);
+    assert!(handoffs >= 1, "a switch handoff is stored; stdout: {}", output.stdout);
+    assert_eq!(
+        unavailable, 0,
+        "no handoff_unavailable degradation is stored; stderr: {}",
+        output.stderr
+    );
+    let exact = compaction_script::stored_handoffs(&sandbox.workspace)
+        .into_iter()
+        .filter(|handoff| {
+            matches!(
+                handoff.note["provenance_status"].as_str(),
+                Some("exact" | "exact_with_tool_roundtrips")
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(!exact.is_empty(), "a handoff records exact provenance");
+    assert!(
+        exact
+            .iter()
+            .any(|handoff| in_relative_order(&referenced_event_ids(&handoff.note), &queued_rows)),
+        "a handoff references both queued turns in history order {queued_rows:?}: {:?}",
+        exact
+            .iter()
+            .map(|handoff| referenced_event_ids(&handoff.note))
+            .collect::<Vec<_>>()
+    );
+    assert_lookup_returned_the_stored_row(&sandbox, &server);
+    assert!(
+        output.stdout.contains(RECALLED),
+        "the lookup recovered the planted fact; stdout: {}",
+        output.stdout
+    );
+    assert!(
+        !output.stdout.contains(LOSSY_NOTICE),
+        "no lossy trim is announced: {}",
+        output.stdout
+    );
+}

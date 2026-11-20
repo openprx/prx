@@ -816,6 +816,14 @@ impl Memory for LucidMemory {
         self.local.load_recent_session_context(query).await
     }
 
+    async fn load_session_context_before(
+        &self,
+        query: SessionContextQuery,
+        before_id: i64,
+    ) -> anyhow::Result<Vec<MessageEvent>> {
+        self.local.load_session_context_before(query, before_id).await
+    }
+
     async fn append_memory_event(&self, input: MemoryEventInput) -> anyhow::Result<MemoryEvent> {
         self.local.append_memory_event(input).await
     }

@@ -1569,6 +1569,28 @@ impl SqliteMemory {
         &self,
         query: SessionContextQuery,
     ) -> anyhow::Result<Vec<MessageEvent>> {
+        let mut events = self.session_context_page(query, None).await?;
+        events.reverse();
+        Ok(events)
+    }
+
+    /// `load_recent_session_context` restricted to rows below `before_id`,
+    /// newest first (the paging read of a complete provenance pool).
+    pub(super) async fn load_session_context_before_impl(
+        &self,
+        query: SessionContextQuery,
+        before_id: i64,
+    ) -> anyhow::Result<Vec<MessageEvent>> {
+        self.session_context_page(query, Some(before_id)).await
+    }
+
+    /// The session-context statement, newest first. `before_id` adds one
+    /// trailing bind (`AND id < ?N`) after every other placeholder.
+    async fn session_context_page(
+        &self,
+        query: SessionContextQuery,
+        before_id: Option<i64>,
+    ) -> anyhow::Result<Vec<MessageEvent>> {
         let Some(session_key) = query.principal.session_key.clone() else {
             return Ok(Vec::new());
         };
@@ -1625,6 +1647,9 @@ impl SqliteMemory {
         // OV-C: `workspace` is owner-qualified for an owner-isolated reader;
         // every other reader's statement is byte-identical.
         let shared_tiers_arm = crate::memory::owner_predicate::session_context_shared_tiers(&owner_fragment);
+        let before_fragment = before_id.map_or_else(String::new, |_| {
+            format!(" AND id < ?{}", first_role_index + include_roles.len())
+        });
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MessageEvent>> {
             let reader = pool.read()?;
@@ -1653,7 +1678,7 @@ impl SqliteMemory {
                            OR (?6 IS NOT NULL AND sender = ?6)
                        ){owner_required_fragment})
                        OR (visibility = 'system' AND ?7)
-                   )
+                   ){before_fragment}
                  ORDER BY id DESC
                  LIMIT ?8",
                 session_fragment = session_fragment.sql,
@@ -1680,11 +1705,12 @@ impl SqliteMemory {
             for role in &include_roles {
                 bind.push(role);
             }
+            if let Some(before_id) = &before_id {
+                bind.push(before_id);
+            }
             let rows = stmt.query_map(bind.as_slice(), Self::message_event_from_row)?;
 
-            let mut events = rows.collect::<Result<Vec<_>, _>>()?;
-            events.reverse();
-            Ok(events)
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
         .await?
     }

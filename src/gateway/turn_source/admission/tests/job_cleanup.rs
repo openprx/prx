@@ -66,6 +66,13 @@ impl Memory for BlockedAdmissionMemory {
     ) -> anyhow::Result<Vec<crate::memory::MessageEvent>> {
         self.inner.load_recent_session_context(query).await
     }
+    async fn load_session_context_before(
+        &self,
+        query: crate::memory::SessionContextQuery,
+        before_id: i64,
+    ) -> anyhow::Result<Vec<crate::memory::MessageEvent>> {
+        self.inner.load_session_context_before(query, before_id).await
+    }
     async fn append_message_event(
         &self,
         input: crate::memory::MessageEventInput,

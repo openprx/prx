@@ -2175,129 +2175,17 @@ impl Memory for PostgresMemory {
     }
 
     async fn load_recent_session_context(&self, query: SessionContextQuery) -> Result<Vec<MessageEvent>> {
-        let Some(session_key) = query.principal.session_key.clone() else {
-            return Ok(Vec::new());
-        };
-        let client = self.client.clone();
-        let qualified_message_events_table = self.qualified_message_events_table.clone();
-        let principal = query.principal;
-        let after_id = query.since_event_id.unwrap_or(0);
-        let limit_i64 = i64::try_from(query.limit.max(1)).unwrap_or(i64::MAX);
-        let system_allowed = Self::is_system_principal(&principal);
-        let include_roles = query
-            .include_roles
-            .into_iter()
-            .map(|role| role.trim().to_ascii_lowercase())
-            .filter(|role| !role.is_empty())
-            .collect::<std::collections::BTreeSet<_>>();
+        let mut events = self.session_context_page(query, None).await?;
+        events.reverse();
+        Ok(events)
+    }
 
-        let legacy_session_keys = Self::legacy_session_key_params(&principal);
-        // Canonical key keeps its `$3` binding; legacy key(s) bind at trailing
-        // placeholders starting at `$9` (after limit at `$8`). The top-level
-        // `session_key` hard filter becomes an `IN (...)` read-merge union.
-        let mut session_indices = vec![3usize];
-        for offset in 0..legacy_session_keys.len() {
-            session_indices.push(9 + offset);
-        }
-        let session_fragment =
-            crate::memory::session_predicate::session_key_match_fragment(PG_DIALECT, &session_indices);
-        let owner_index = Self::owner_index(9, legacy_session_keys.len());
-        let owner_fragment = crate::memory::owner_predicate::owner_match_suffix(
-            PG_DIALECT,
-            owner_index,
-            principal.require_owner_match,
-            crate::memory::owner_predicate::has_owner_id(&principal),
-        );
-        // OV-E (OQ-1): the `private` arm requires the owner for every reader,
-        // isolated or not, and admits nothing to a reader without one. Same
-        // placeholder as `owner_fragment`, so one bound value serves both.
-        let owner_required_fragment = crate::memory::owner_predicate::owner_match_suffix(
-            PG_DIALECT,
-            owner_index,
-            true,
-            crate::memory::owner_predicate::has_owner_id(&principal),
-        );
-        let first_role_index = owner_index + usize::from(owner_required_fragment.bound_owner);
-        let role_fragment = if include_roles.is_empty() {
-            "TRUE".to_string()
-        } else {
-            format!(
-                "role IN ({})",
-                (first_role_index..first_role_index + include_roles.len())
-                    .map(|index| format!("${index}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        };
-        // OV-C: `workspace` is owner-qualified for an owner-isolated reader;
-        // every other reader's statement is byte-identical.
-        let shared_tiers_arm = crate::memory::owner_predicate::session_context_shared_tiers(&owner_fragment);
-
-        tokio::task::spawn_blocking(move || -> Result<Vec<MessageEvent>> {
-            let stmt = format!(
-                "
-                SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
-                       parent_session_key, run_id, parent_run_id, agent_id, persona_id,
-                       sender, recipient, role, event_type, source_ref_json, subject_ref_json,
-                       goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
-                       content, content_hash, raw_payload_json, visibility, created_at, updated_at
-                FROM {qualified_message_events_table}
-                WHERE id > $1
-                  AND workspace_id = $2
-                  AND {session_fragment}
-                  AND {role_fragment}
-                  AND (
-                      {shared_tiers_arm}
-                      OR (visibility = 'agent' AND (
-                          ($4::TEXT IS NOT NULL AND agent_id = $4)
-                          OR ($5::TEXT IS NOT NULL AND persona_id = $5)
-                      ))
-                      OR (visibility = 'session'{owner_fragment})
-                      OR (visibility = 'private' AND (
-                          ($4::TEXT IS NOT NULL AND agent_id = $4)
-                          OR ($5::TEXT IS NOT NULL AND persona_id = $5)
-                          OR ($6::TEXT IS NOT NULL AND sender = $6)
-                      ){owner_required_fragment})
-                      OR (visibility = 'system' AND $7::BOOLEAN)
-                  )
-                ORDER BY id DESC
-                LIMIT $8
-                ",
-                session_fragment = session_fragment.sql,
-                role_fragment = role_fragment,
-                owner_fragment = owner_fragment.sql,
-                owner_required_fragment = owner_required_fragment.sql,
-            );
-            let rows = client.with_client(|client| {
-                let mut bind: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![
-                    &after_id,
-                    &principal.workspace_id,
-                    &session_key,
-                    &principal.agent_id,
-                    &principal.persona_id,
-                    &principal.sender,
-                    &system_allowed,
-                    &limit_i64,
-                ];
-                for key in &legacy_session_keys {
-                    bind.push(key);
-                }
-                if owner_required_fragment.bound_owner {
-                    bind.push(&principal.owner_id);
-                }
-                for role in &include_roles {
-                    bind.push(role);
-                }
-                Ok(client.query(&stmt, &bind)?)
-            })?;
-            let mut events = rows
-                .iter()
-                .map(Self::row_to_message_event)
-                .collect::<Result<Vec<MessageEvent>>>()?;
-            events.reverse();
-            Ok(events)
-        })
-        .await?
+    async fn load_session_context_before(
+        &self,
+        query: SessionContextQuery,
+        before_id: i64,
+    ) -> Result<Vec<MessageEvent>> {
+        self.session_context_page(query, Some(before_id)).await
     }
 
     async fn append_memory_event(&self, input: MemoryEventInput) -> Result<MemoryEvent> {
@@ -3859,5 +3747,142 @@ impl Memory for PostgresMemory {
             .await
             .unwrap_or(Ok(false))
             .unwrap_or(false)
+    }
+}
+
+impl PostgresMemory {
+    /// The session-context statement, newest first. `before_id` adds one
+    /// trailing bind (`AND id < $N`) after every other placeholder.
+    async fn session_context_page(
+        &self,
+        query: SessionContextQuery,
+        before_id: Option<i64>,
+    ) -> Result<Vec<MessageEvent>> {
+        let Some(session_key) = query.principal.session_key.clone() else {
+            return Ok(Vec::new());
+        };
+        let client = self.client.clone();
+        let qualified_message_events_table = self.qualified_message_events_table.clone();
+        let principal = query.principal;
+        let after_id = query.since_event_id.unwrap_or(0);
+        let limit_i64 = i64::try_from(query.limit.max(1)).unwrap_or(i64::MAX);
+        let system_allowed = Self::is_system_principal(&principal);
+        let include_roles = query
+            .include_roles
+            .into_iter()
+            .map(|role| role.trim().to_ascii_lowercase())
+            .filter(|role| !role.is_empty())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        let legacy_session_keys = Self::legacy_session_key_params(&principal);
+        // Canonical key keeps its `$3` binding; legacy key(s) bind at trailing
+        // placeholders starting at `$9` (after limit at `$8`). The top-level
+        // `session_key` hard filter becomes an `IN (...)` read-merge union.
+        let mut session_indices = vec![3usize];
+        for offset in 0..legacy_session_keys.len() {
+            session_indices.push(9 + offset);
+        }
+        let session_fragment =
+            crate::memory::session_predicate::session_key_match_fragment(PG_DIALECT, &session_indices);
+        let owner_index = Self::owner_index(9, legacy_session_keys.len());
+        let owner_fragment = crate::memory::owner_predicate::owner_match_suffix(
+            PG_DIALECT,
+            owner_index,
+            principal.require_owner_match,
+            crate::memory::owner_predicate::has_owner_id(&principal),
+        );
+        // OV-E (OQ-1): the `private` arm requires the owner for every reader,
+        // isolated or not, and admits nothing to a reader without one. Same
+        // placeholder as `owner_fragment`, so one bound value serves both.
+        let owner_required_fragment = crate::memory::owner_predicate::owner_match_suffix(
+            PG_DIALECT,
+            owner_index,
+            true,
+            crate::memory::owner_predicate::has_owner_id(&principal),
+        );
+        let first_role_index = owner_index + usize::from(owner_required_fragment.bound_owner);
+        let role_fragment = if include_roles.is_empty() {
+            "TRUE".to_string()
+        } else {
+            format!(
+                "role IN ({})",
+                (first_role_index..first_role_index + include_roles.len())
+                    .map(|index| format!("${index}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        // OV-C: `workspace` is owner-qualified for an owner-isolated reader;
+        // every other reader's statement is byte-identical.
+        let shared_tiers_arm = crate::memory::owner_predicate::session_context_shared_tiers(&owner_fragment);
+        let before_fragment = before_id.map_or_else(String::new, |_| {
+            format!(" AND id < ${}", first_role_index + include_roles.len())
+        });
+
+        tokio::task::spawn_blocking(move || -> Result<Vec<MessageEvent>> {
+            let stmt = format!(
+                "
+                SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
+                       parent_session_key, run_id, parent_run_id, agent_id, persona_id,
+                       sender, recipient, role, event_type, source_ref_json, subject_ref_json,
+                       goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
+                       content, content_hash, raw_payload_json, visibility, created_at, updated_at
+                FROM {qualified_message_events_table}
+                WHERE id > $1
+                  AND workspace_id = $2
+                  AND {session_fragment}
+                  AND {role_fragment}
+                  AND (
+                      {shared_tiers_arm}
+                      OR (visibility = 'agent' AND (
+                          ($4::TEXT IS NOT NULL AND agent_id = $4)
+                          OR ($5::TEXT IS NOT NULL AND persona_id = $5)
+                      ))
+                      OR (visibility = 'session'{owner_fragment})
+                      OR (visibility = 'private' AND (
+                          ($4::TEXT IS NOT NULL AND agent_id = $4)
+                          OR ($5::TEXT IS NOT NULL AND persona_id = $5)
+                          OR ($6::TEXT IS NOT NULL AND sender = $6)
+                      ){owner_required_fragment})
+                      OR (visibility = 'system' AND $7::BOOLEAN)
+                  ){before_fragment}
+                ORDER BY id DESC
+                LIMIT $8
+                ",
+                session_fragment = session_fragment.sql,
+                role_fragment = role_fragment,
+                owner_fragment = owner_fragment.sql,
+                owner_required_fragment = owner_required_fragment.sql,
+            );
+            let rows = client.with_client(|client| {
+                let mut bind: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![
+                    &after_id,
+                    &principal.workspace_id,
+                    &session_key,
+                    &principal.agent_id,
+                    &principal.persona_id,
+                    &principal.sender,
+                    &system_allowed,
+                    &limit_i64,
+                ];
+                for key in &legacy_session_keys {
+                    bind.push(key);
+                }
+                if owner_required_fragment.bound_owner {
+                    bind.push(&principal.owner_id);
+                }
+                for role in &include_roles {
+                    bind.push(role);
+                }
+                if let Some(before_id) = &before_id {
+                    bind.push(before_id);
+                }
+                Ok(client.query(&stmt, &bind)?)
+            })?;
+            rows.iter()
+                .map(Self::row_to_message_event)
+                .collect::<Result<Vec<MessageEvent>>>()
+        })
+        .await?
     }
 }

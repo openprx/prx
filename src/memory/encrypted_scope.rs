@@ -1057,6 +1057,19 @@ impl Memory for EncryptedScope {
             .collect())
     }
 
+    async fn load_session_context_before(
+        &self,
+        query: crate::memory::SessionContextQuery,
+        before_id: i64,
+    ) -> anyhow::Result<Vec<crate::memory::MessageEvent>> {
+        let events = self.inner.load_session_context_before(query, before_id).await?;
+        Ok(events
+            .into_iter()
+            .filter(|event| self.owns_event(event))
+            .map(|event| self.reveal(event))
+            .collect())
+    }
+
     async fn append_memory_event(
         &self,
         mut input: crate::memory::MemoryEventInput,

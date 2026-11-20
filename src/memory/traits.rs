@@ -2330,6 +2330,21 @@ pub trait Memory: Send + Sync {
         ))
     }
 
+    /// Rows of `query` (hard-filtered by its session key, same visibility rules as
+    /// `load_recent_session_context`) with `id < before_id`, newest first, at most
+    /// `query.limit`. Backends without an ordered event log return the fail-fast error.
+    async fn load_session_context_before(
+        &self,
+        query: SessionContextQuery,
+        before_id: i64,
+    ) -> anyhow::Result<Vec<MessageEvent>> {
+        let _ = (query, before_id);
+        Err(crate::memory::fabric::fail_fast(
+            self.name(),
+            "load_session_context_before",
+        ))
+    }
+
     /// Append a memory outbox event.
     async fn append_memory_event(&self, input: MemoryEventInput) -> anyhow::Result<MemoryEvent> {
         let _ = input;

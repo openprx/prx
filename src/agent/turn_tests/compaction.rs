@@ -1744,3 +1744,738 @@ async fn the_preflight_builds_its_durable_compaction_from_the_canonical_history_
 fn shape_companions(messages: &[ChatMessage]) -> Vec<bool> {
     crate::agent::turn_history::CanonicalHistory::from_test_messages(messages.to_vec()).tool_round_companions()
 }
+
+// ---------------------------------------------------------------------------
+// Exact switch provenance when store order differs from transcript order
+// (REQ-BRANCH-PROVENANCE-LOSSY-TRIM, T1-T5e).
+// ---------------------------------------------------------------------------
+
+/// Bound for one provenance test, its real SQLite work and its cleanup.
+const PROVENANCE_TEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+const PROVENANCE_WORKSPACE: &str = "workspace-provenance";
+/// Most pages read while counting stored switch rows.
+const SWITCH_ROW_PAGE_BOUND: usize = 64;
+
+/// One chat session on a real SQLite store, written through the real fabric.
+struct ProvenanceStore {
+    _temp: TempDir,
+    memory: Arc<dyn Memory>,
+    fabric: MemoryFabric,
+    session: RuntimeEnvelope,
+    session_id: String,
+}
+
+impl ProvenanceStore {
+    fn new(session_id: &str) -> Self {
+        let temp = TempDir::new().expect("test: tempdir");
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).expect("test: sqlite"));
+        let fabric = MemoryFabric::new(Arc::clone(&memory), PROVENANCE_WORKSPACE);
+        let session = RuntimeEnvelope::chat_canonical(
+            PROVENANCE_WORKSPACE,
+            session_id,
+            crate::memory::MemoryVisibility::Workspace,
+        );
+        Self {
+            _temp: temp,
+            memory,
+            fabric,
+            session,
+            session_id: session_id.to_string(),
+        }
+    }
+
+    /// The chat envelope of one turn: `Some(run)` is the turn's run id (the
+    /// chat contract D8-2); `None` writes a row without a run id.
+    fn turn(&self, run: Option<&str>) -> RuntimeEnvelope {
+        run.map_or_else(|| self.session.clone(), |run| self.session.clone().with_run_id(run))
+    }
+
+    async fn user(&self, run: Option<&str>, text: &str) -> MessageEvent {
+        self.fabric
+            .record_inbound_user_message(
+                self.turn(run).message_scope(),
+                text,
+                Some(format!("provenance-input-{}", uuid::Uuid::new_v4())),
+                None,
+            )
+            .await
+            .expect("test: record user row")
+    }
+
+    async fn assistant(&self, run: Option<&str>, text: &str) -> MessageEvent {
+        self.fabric
+            .record_assistant_message(self.turn(run).message_scope(), text)
+            .await
+            .expect("test: record assistant row")
+    }
+
+    /// `pairs` unrelated user/assistant pairs, each with its own run.
+    async fn unrelated_rows(&self, label: &str, pairs: usize) {
+        for pair in 0..pairs {
+            let run = format!("{label}-run-{pair}");
+            self.user(Some(run.as_str()), &format!("{label} unrelated question {pair}"))
+                .await;
+            self.assistant(Some(run.as_str()), &format!("{label} unrelated answer {pair}"))
+                .await;
+        }
+    }
+
+    fn audit(&self) -> DocumentIngestRuntime {
+        DocumentIngestRuntime::from_envelope(Arc::clone(&self.memory), &self.session)
+    }
+
+    /// The real switch builder over `history`, keeping `keep_recent` messages.
+    async fn build(&self, history: &[ChatMessage], keep_recent: usize) -> Option<CompactionPatch> {
+        let provider = ScriptedProvider::from_text_responses(vec!["MODEL_SUMMARY_MUST_NOT_RUN"]);
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Switch,
+            reserve_tokens: 1,
+            keep_recent_messages: keep_recent,
+            memory_flush: false,
+            max_context_tokens: 50,
+            max_context_tokens_explicit: true,
+            os_paging: crate::config::OsPagingConfig::default(),
+        };
+        let audit = self.audit();
+        build_configurable_compaction_patch(history, &provider, "model", &config, Some(&audit), "test_provenance")
+            .await
+            .expect("test: the switch builder runs")
+    }
+
+    async fn detailed(&self, cold: &[ChatMessage]) -> ProvenanceResolution {
+        resolve_compaction_event_provenance_detailed(
+            self.memory.as_ref(),
+            self.session.memory_principal(),
+            cold,
+            RoundCompanions::Acknowledged,
+        )
+        .await
+        .expect("test: the provenance read succeeds")
+    }
+
+    /// Every stored `context.switch.created` row of the store.
+    async fn switch_rows(&self) -> Vec<MessageEvent> {
+        let principal = self.session.memory_principal();
+        let mut cursor = 0_i64;
+        let mut rows = Vec::new();
+        for _ in 0..SWITCH_ROW_PAGE_BOUND {
+            let page = self
+                .memory
+                .list_message_events_since(&principal, cursor, 500)
+                .await
+                .expect("test: list stored rows");
+            let Some(last) = page.last() else {
+                return rows;
+            };
+            cursor = last.id;
+            rows.extend(
+                page.into_iter()
+                    .filter(|event| event.event_type == "context.switch.created"),
+            );
+        }
+        panic!("test: the store has more than {SWITCH_ROW_PAGE_BOUND} pages of rows");
+    }
+
+    /// Read the note's rows back through the real lookup tool.
+    async fn lookup(&self, note: &serde_json::Value) -> Vec<String> {
+        use crate::tools::traits::Tool as _;
+        let arguments = note.pointer("/lookup/arguments").expect("test: lookup arguments");
+        let result =
+            crate::tools::transcript_history_lookup::TranscriptHistoryLookupTool::new(Arc::clone(&self.memory))
+                .execute(serde_json::json!({
+                    "event_ids": arguments.get("event_ids"),
+                    "first_row_id": arguments.get("first_row_id"),
+                    "last_row_id": arguments.get("last_row_id"),
+                    "_zc_scope_trusted": true,
+                    "_zc_scope": {
+                        "workspace_id": self.session.workspace_id,
+                        "session_key": self.session.session_key,
+                        "channel": self.session.channel,
+                        "sender": self.session.sender,
+                        "owner_id": self.session.resolved_owner_id()
+                    }
+                }))
+                .await
+                .expect("test: the lookup runs");
+        assert!(result.success, "the lookup succeeds: {:?}", result.error);
+        let output: serde_json::Value = serde_json::from_str(&result.output).expect("test: lookup output JSON");
+        output
+            .get("events")
+            .and_then(serde_json::Value::as_array)
+            .expect("test: lookup events")
+            .iter()
+            .filter_map(|event| event.get("content").and_then(serde_json::Value::as_str))
+            .map(str::to_string)
+            .collect()
+    }
+}
+
+/// A transcript text long enough that a few messages cross the 50-token window.
+fn padded(label: &str) -> String {
+    format!("{label} {}", "padding ".repeat(20))
+}
+
+/// The validated note of a switch patch.
+fn switch_note(patch: &CompactionPatch) -> serde_json::Value {
+    let handoff = patch.replacement.first().expect("test: the patch carries the handoff");
+    validated_context_handoff_note(&handoff.content).expect("test: the handoff note validates")
+}
+
+fn note_event_ids(note: &serde_json::Value) -> Vec<String> {
+    note.pointer("/lookup/arguments/event_ids")
+        .and_then(serde_json::Value::as_array)
+        .expect("test: lookup event ids")
+        .iter()
+        .map(|id| id.as_str().expect("test: string event id").to_string())
+        .collect()
+}
+
+fn ids_of(events: &[&MessageEvent]) -> Vec<String> {
+    events.iter().map(|event| event.event_id.clone()).collect()
+}
+
+/// Assert `patch` is an exact switch whose note references `expected` in
+/// history order and whose lookup returns their texts.
+async fn assert_exact_switch(store: &ProvenanceStore, patch: Option<CompactionPatch>, expected: &[&MessageEvent]) {
+    let patch = patch.expect("test: an exact cold window yields a switch patch");
+    let note = switch_note(&patch);
+    assert_eq!(
+        note.get("provenance_status").and_then(serde_json::Value::as_str),
+        Some("exact"),
+        "the handoff records exact provenance: {note}"
+    );
+    assert_eq!(
+        note_event_ids(&note),
+        ids_of(expected),
+        "the handoff references the cold rows in history order"
+    );
+    let contents = store.lookup(&note).await;
+    for event in expected {
+        assert!(
+            contents.contains(&event.content),
+            "the lookup returns the referenced row `{}`: {contents:?}",
+            event.content
+        );
+    }
+    assert_eq!(
+        store.switch_rows().await.len(),
+        1,
+        "exactly one switch row is persisted"
+    );
+}
+
+/// Assert the cold window resolves to `gap`, the builder refuses the switch
+/// and no switch row is persisted.
+async fn assert_refused_switch(
+    store: &ProvenanceStore,
+    history: &[ChatMessage],
+    keep_recent: usize,
+    gap: ProvenanceGap,
+) {
+    let cold = history
+        .get(1..history.len() - keep_recent)
+        .expect("test: the cold window is in range");
+    assert_eq!(
+        store.detailed(cold).await,
+        ProvenanceResolution::Unavailable(gap),
+        "the detailed resolver names the gap"
+    );
+    assert!(
+        store.build(history, keep_recent).await.is_none(),
+        "the builder refuses a switch without exact provenance"
+    );
+    assert!(
+        store.switch_rows().await.is_empty(),
+        "no context.switch.created row is persisted"
+    );
+}
+
+#[tokio::test]
+async fn switch_provenance_is_exact_when_a_queued_input_precedes_the_previous_reply() {
+    tokio::time::timeout(PROVENANCE_TEST_DEADLINE, async {
+        let store = ProvenanceStore::new("t1-queued-input");
+        let u1 = store.user(Some("r1"), &padded("first question")).await;
+        let u2 = store.user(Some("r2"), &padded("queued question")).await;
+        let a1 = store.assistant(Some("r1"), &padded("first answer")).await;
+        let a2 = store.assistant(Some("r2"), &padded("queued answer")).await;
+        let u3 = store.user(Some("r3"), &padded("third question")).await;
+        let a3 = store.assistant(Some("r3"), &padded("third answer")).await;
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user(u1.content.clone()),
+            ChatMessage::assistant(a1.content.clone()),
+            ChatMessage::user(u2.content.clone()),
+            ChatMessage::assistant(a2.content.clone()),
+            ChatMessage::user(u3.content.clone()),
+            ChatMessage::assistant(a3.content.clone()),
+        ];
+
+        let patch = store.build(&history, 2).await;
+
+        assert_exact_switch(&store, patch, &[&u1, &a1, &u2, &a2]).await;
+    })
+    .await
+    .expect("switch_provenance_is_exact_when_a_queued_input_precedes_the_previous_reply exceeded its deadline");
+}
+
+#[tokio::test]
+async fn switch_provenance_ignores_child_rows_under_the_legacy_key() {
+    tokio::time::timeout(PROVENANCE_TEST_DEADLINE, async {
+        let store = ProvenanceStore::new("t2-child-rows");
+        let u1 = store.user(Some("r1"), &padded("parent question")).await;
+        let child =
+            RuntimeEnvelope::sessions_spawn(PROVENANCE_WORKSPACE, format!("chat:{}", store.session_id), "child-run")
+                .with_parent_run_id("r1");
+        let mut child_ids = Vec::new();
+        // One child input repeats the parent's text: it still never enters.
+        for text in [u1.content.clone(), padded("child task")] {
+            let event = store
+                .fabric
+                .record_inbound_user_message(
+                    child.message_scope(),
+                    text,
+                    Some(format!("provenance-child-{}", uuid::Uuid::new_v4())),
+                    None,
+                )
+                .await
+                .expect("test: record child user row");
+            child_ids.push(event.event_id);
+        }
+        let child_reply = store
+            .fabric
+            .record_assistant_message(child.message_scope(), padded("child result"))
+            .await
+            .expect("test: record child assistant row");
+        child_ids.push(child_reply.event_id);
+        let a1 = store.assistant(Some("r1"), &padded("parent answer")).await;
+        let u2 = store.user(Some("r2"), &padded("second question")).await;
+        let a2 = store.assistant(Some("r2"), &padded("second answer")).await;
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user(u1.content.clone()),
+            ChatMessage::assistant(a1.content.clone()),
+            ChatMessage::user(u2.content.clone()),
+            ChatMessage::assistant(a2.content.clone()),
+            ChatMessage::user(padded("tail question")),
+        ];
+
+        let patch = store.build(&history, 1).await;
+
+        let note = switch_note(patch.as_ref().expect("test: a switch patch"));
+        assert!(
+            note_event_ids(&note).iter().all(|id| !child_ids.contains(id)),
+            "no child row under the legacy key is referenced"
+        );
+        assert_exact_switch(&store, patch, &[&u1, &a1, &u2, &a2]).await;
+    })
+    .await
+    .expect("switch_provenance_ignores_child_rows_under_the_legacy_key exceeded its deadline");
+}
+
+#[tokio::test]
+async fn switch_provenance_skips_the_input_row_of_a_failed_turn() {
+    tokio::time::timeout(PROVENANCE_TEST_DEADLINE, async {
+        let store = ProvenanceStore::new("t3-failed-turn");
+        let u1 = store.user(Some("r1"), &padded("first question")).await;
+        let a1 = store.assistant(Some("r1"), &padded("first answer")).await;
+        store
+            .user(Some("r-failed"), &padded("a request whose turn failed"))
+            .await;
+        let u2 = store.user(Some("r2"), &padded("second question")).await;
+        let a2 = store.assistant(Some("r2"), &padded("second answer")).await;
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user(u1.content.clone()),
+            ChatMessage::assistant(a1.content.clone()),
+            ChatMessage::user(u2.content.clone()),
+            ChatMessage::assistant(a2.content.clone()),
+            ChatMessage::user(padded("tail question")),
+        ];
+
+        let patch = store.build(&history, 1).await;
+
+        assert_exact_switch(&store, patch, &[&u1, &a1, &u2, &a2]).await;
+    })
+    .await
+    .expect("switch_provenance_skips_the_input_row_of_a_failed_turn exceeded its deadline");
+}
+
+#[tokio::test]
+async fn switch_provenance_rejects_a_contiguous_window_that_contradicts_run_ids() {
+    tokio::time::timeout(PROVENANCE_TEST_DEADLINE, async {
+        let store = ProvenanceStore::new("t3a-run-ids");
+        let question = padded("repeated question");
+        let user = store.user(Some("r1"), &question).await;
+        let failed = store.user(Some("r2"), &question).await;
+        let reply = store.assistant(Some("r1"), &padded("the answer")).await;
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user(question.clone()),
+            ChatMessage::assistant(reply.content.clone()),
+            ChatMessage::user(padded("tail question")),
+        ];
+
+        let patch = store.build(&history, 1).await;
+
+        let note = switch_note(patch.as_ref().expect("test: a switch patch"));
+        assert!(
+            !note_event_ids(&note).contains(&failed.event_id),
+            "the window's failed duplicate input is not referenced"
+        );
+        assert_exact_switch(&store, patch, &[&user, &reply]).await;
+    })
+    .await
+    .expect("switch_provenance_rejects_a_contiguous_window_that_contradicts_run_ids exceeded its deadline");
+}
+
+#[tokio::test]
+async fn switch_provenance_refuses_a_window_justified_only_by_adjacency() {
+    tokio::time::timeout(PROVENANCE_TEST_DEADLINE, async {
+        let store = ProvenanceStore::new("t3b-adjacency");
+        let question = padded("repeated question");
+        store.user(Some("r1"), &question).await;
+        store.user(None, &question).await;
+        let reply = store.assistant(Some("r1"), &padded("the answer")).await;
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user(question.clone()),
+            ChatMessage::assistant(reply.content.clone()),
+            ChatMessage::user(padded("tail question")),
+        ];
+
+        assert_refused_switch(&store, &history, 1, ProvenanceGap::TurnAmbiguous).await;
+    })
+    .await
+    .expect("switch_provenance_refuses_a_window_justified_only_by_adjacency exceeded its deadline");
+}
+
+#[tokio::test]
+async fn switch_provenance_orders_identical_turns_by_commit_order() {
+    tokio::time::timeout(PROVENANCE_TEST_DEADLINE, async {
+        let store = ProvenanceStore::new("t4-identical-turns");
+        let question = padded("Run echo t5-shell-deny");
+        let answer = padded("t5-shell-deny");
+        let first_user = store.user(Some("r1"), &question).await;
+        let queued_user = store.user(Some("r2"), &padded("queued question")).await;
+        let first_reply = store.assistant(Some("r1"), &answer).await;
+        let queued_reply = store.assistant(Some("r2"), &padded("queued answer")).await;
+        let again_user = store.user(Some("r3"), &question).await;
+        let again_reply = store.assistant(Some("r3"), &answer).await;
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user(question.clone()),
+            ChatMessage::assistant(answer.clone()),
+            ChatMessage::user(queued_user.content.clone()),
+            ChatMessage::assistant(queued_reply.content.clone()),
+            ChatMessage::user(question.clone()),
+            ChatMessage::assistant(answer.clone()),
+            ChatMessage::user(padded("tail question")),
+        ];
+
+        let patch = store.build(&history, 1).await;
+
+        assert_exact_switch(
+            &store,
+            patch,
+            &[
+                &first_user,
+                &first_reply,
+                &queued_user,
+                &queued_reply,
+                &again_user,
+                &again_reply,
+            ],
+        )
+        .await;
+    })
+    .await
+    .expect("switch_provenance_orders_identical_turns_by_commit_order exceeded its deadline");
+}
+
+#[tokio::test]
+async fn switch_provenance_refuses_a_trailing_input_it_cannot_tell_from_a_failed_duplicate() {
+    tokio::time::timeout(PROVENANCE_TEST_DEADLINE, async {
+        let store = ProvenanceStore::new("t5-trailing-input");
+        let u1 = store.user(Some("r1"), &padded("first question")).await;
+        let a1 = store.assistant(Some("r1"), &padded("first answer")).await;
+        store.user(Some("r2"), "n").await;
+        store.user(Some("r-orphan"), "n").await;
+        let reply = store.assistant(Some("r2"), &padded("declined")).await;
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user(u1.content.clone()),
+            ChatMessage::assistant(a1.content.clone()),
+            ChatMessage::user("n"),
+            ChatMessage::assistant(reply.content.clone()),
+        ];
+
+        assert_refused_switch(&store, &history, 1, ProvenanceGap::TurnAmbiguous).await;
+    })
+    .await
+    .expect("switch_provenance_refuses_a_trailing_input_it_cannot_tell_from_a_failed_duplicate exceeded its deadline");
+}
+
+#[tokio::test]
+async fn switch_provenance_never_lets_a_missing_run_id_eliminate_a_competitor() {
+    tokio::time::timeout(PROVENANCE_TEST_DEADLINE, async {
+        let store = ProvenanceStore::new("t5a-missing-run");
+        let question = padded("repeated question");
+        let answer = padded("repeated answer");
+        store.user(Some("r1"), &question).await;
+        store.user(None, &question).await;
+        store.user(Some("rx"), &padded("unrelated question")).await;
+        store.assistant(Some("rx"), &padded("unrelated answer")).await;
+        store.assistant(None, &answer).await;
+        store.assistant(Some("r1"), &answer).await;
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user(question.clone()),
+            ChatMessage::assistant(answer.clone()),
+            ChatMessage::user(padded("tail question")),
+        ];
+
+        assert_refused_switch(&store, &history, 1, ProvenanceGap::TurnAmbiguous).await;
+    })
+    .await
+    .expect("switch_provenance_never_lets_a_missing_run_id_eliminate_a_competitor exceeded its deadline");
+}
+
+/// A pool of `pairs` user/assistant rows in store order; `text` names the
+/// pair's text and `run` its run id.
+fn pool_pairs(pairs: usize, text: impl Fn(usize) -> usize, run: impl Fn(usize) -> Option<String>) -> Vec<PoolRow> {
+    let mut rows = Vec::new();
+    for pair in 0..pairs {
+        for (offset, role) in [(0, PoolRole::User), (1, PoolRole::Assistant)] {
+            let rank = pair * 2 + offset;
+            rows.push(PoolRow {
+                id: i64::try_from(rank + 1).expect("test: small row id"),
+                event_id: format!("row-{rank}"),
+                role,
+                run_id: run(pair),
+                // Message 2k is the user and 2k+1 the assistant of text k.
+                matches: vec![text(pair) * 2 + offset],
+                store_rank: rank,
+            });
+        }
+    }
+    rows
+}
+
+#[test]
+fn switch_provenance_reports_an_exhausted_search_as_ambiguous() {
+    const PAIRS: usize = 30;
+    const SMALL_BUDGET: usize = 40;
+    // Identical run-less pairs: every user row matches every user message.
+    let identical_messages = (0..PAIRS)
+        .flat_map(|_| {
+            [
+                ChatMessage::user("same question"),
+                ChatMessage::assistant("same answer"),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let identical_segment = identical_messages.iter().collect::<Vec<_>>();
+    let mut identical_pool = pool_pairs(PAIRS, |_| 0, |_| None);
+    for row in &mut identical_pool {
+        let offset = usize::from(row.role == PoolRole::Assistant);
+        row.matches = (0..PAIRS).map(|pair| pair * 2 + offset).collect();
+    }
+    assert_eq!(
+        match_segment_within(&identical_segment, 0, &identical_pool, &HashSet::new(), SMALL_BUDGET)
+            .map(|rows| rows.len()),
+        Err(ProvenanceGap::TurnAmbiguous),
+        "a search that runs out of budget is ambiguous"
+    );
+
+    // Unique pairs: one admissible assignment, found within the full budget
+    // but not within the small one.
+    let unique_messages = (0..PAIRS)
+        .flat_map(|pair| {
+            [
+                ChatMessage::user(format!("question {pair}")),
+                ChatMessage::assistant(format!("answer {pair}")),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let unique_segment = unique_messages.iter().collect::<Vec<_>>();
+    let unique_pool = pool_pairs(PAIRS, |pair| pair, |_| None);
+    assert_eq!(
+        match_segment_within(&unique_segment, 0, &unique_pool, &HashSet::new(), SMALL_BUDGET).map(|rows| rows.len()),
+        Err(ProvenanceGap::TurnAmbiguous),
+        "an exhausted budget never yields a guess, even when one assignment exists"
+    );
+    assert_eq!(
+        match_segment(&unique_segment, 0, &unique_pool, &HashSet::new())
+            .map(|rows| rows.iter().map(|row| row.id).collect::<Vec<_>>()),
+        Ok((1..=i64::try_from(PAIRS * 2).expect("test: small row id")).collect::<Vec<_>>()),
+        "the full budget proves the unique assignment"
+    );
+}
+
+#[tokio::test]
+async fn switch_provenance_refuses_a_cold_pair_repeated_in_the_retained_tail_beyond_the_first_page() {
+    tokio::time::timeout(PROVENANCE_TEST_DEADLINE, async {
+        let store = ProvenanceStore::new("t5c-retained-repeat");
+        let question = padded("repeated question");
+        let answer = padded("repeated answer");
+        let cold_user = store.user(Some("r1"), &question).await;
+        let cold_reply = store.assistant(Some("r1"), &answer).await;
+        store.unrelated_rows("before", 249).await;
+        let retained_user = store.user(Some("r2"), &question).await;
+        let retained_reply = store.assistant(Some("r2"), &answer).await;
+        store.unrelated_rows("after", 249).await;
+        assert_eq!(
+            (retained_user.id - cold_user.id, retained_reply.id - cold_reply.id),
+            (500, 500),
+            "the retained pair lies 500 rows after the cold pair"
+        );
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user(question.clone()),
+            ChatMessage::assistant(answer.clone()),
+            ChatMessage::user(question.clone()),
+            ChatMessage::assistant(answer.clone()),
+            ChatMessage::user(padded("tail question")),
+        ];
+
+        assert_refused_switch(&store, &history, 3, ProvenanceGap::TurnAmbiguous).await;
+        for row in store.switch_rows().await {
+            assert!(
+                !row.content.contains(&retained_user.event_id) && !row.content.contains(&retained_reply.event_id),
+                "the retained rows never appear in a persisted note"
+            );
+        }
+    })
+    .await
+    .expect(
+        "switch_provenance_refuses_a_cold_pair_repeated_in_the_retained_tail_beyond_the_first_page exceeded its deadline",
+    );
+}
+
+/// A store that forwards the newest-page read but cannot page older rows (the
+/// trait's fail-fast default for `load_session_context_before`).
+struct FirstPageOnlyMemory {
+    inner: Arc<dyn Memory>,
+}
+
+#[async_trait]
+impl Memory for FirstPageOnlyMemory {
+    fn name(&self) -> &str {
+        "first-page-only"
+    }
+    async fn store(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.inner.store(key, content, category, session_id).await
+    }
+    async fn recall(&self, query: &str, limit: usize, session_id: Option<&str>) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.inner.recall(query, limit, session_id).await
+    }
+    async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+        self.inner.get(key).await
+    }
+    async fn list(
+        &self,
+        category: Option<&MemoryCategory>,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.inner.list(category, session_id).await
+    }
+    async fn forget(&self, key: &str) -> anyhow::Result<bool> {
+        self.inner.forget(key).await
+    }
+    async fn count(&self) -> anyhow::Result<usize> {
+        self.inner.count().await
+    }
+    async fn health_check(&self) -> bool {
+        self.inner.health_check().await
+    }
+    async fn load_recent_session_context(
+        &self,
+        query: crate::memory::SessionContextQuery,
+    ) -> anyhow::Result<Vec<MessageEvent>> {
+        self.inner.load_recent_session_context(query).await
+    }
+}
+
+#[tokio::test]
+async fn switch_provenance_pages_past_the_first_window_and_resolves_exact() {
+    tokio::time::timeout(PROVENANCE_TEST_DEADLINE, async {
+        let store = ProvenanceStore::new("t5d-paging");
+        let cold_user = store.user(Some("r1"), &padded("the oldest question")).await;
+        let cold_reply = store.assistant(Some("r1"), &padded("the oldest answer")).await;
+        store.unrelated_rows("later", 499).await;
+        store.user(Some("r-tail"), &padded("tail question")).await;
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user(cold_user.content.clone()),
+            ChatMessage::assistant(cold_reply.content.clone()),
+            ChatMessage::user(padded("tail question")),
+        ];
+        let cold = history.get(1..3).expect("test: cold window");
+
+        let paging_only = FirstPageOnlyMemory {
+            inner: Arc::clone(&store.memory),
+        };
+        assert_eq!(
+            resolve_compaction_event_provenance_detailed(
+                &paging_only,
+                store.session.memory_principal(),
+                cold,
+                RoundCompanions::Acknowledged,
+            )
+            .await
+            .expect("test: the first page reads"),
+            ProvenanceResolution::Unavailable(ProvenanceGap::TurnAmbiguous),
+            "a backend that cannot page leaves the pool unproven"
+        );
+
+        let patch = store.build(&history, 1).await;
+
+        assert_exact_switch(&store, patch, &[&cold_user, &cold_reply]).await;
+    })
+    .await
+    .expect("switch_provenance_pages_past_the_first_window_and_resolves_exact exceeded its deadline");
+}
+
+#[tokio::test]
+async fn switch_provenance_refuses_a_session_past_the_pool_bound() {
+    tokio::time::timeout(PROVENANCE_TEST_DEADLINE, async {
+        const SMALL_POOL_MAX_ROWS: usize = 1_000;
+        let store = ProvenanceStore::new("t5e-pool-bound");
+        store.unrelated_rows("bounded", 600).await;
+        let messages = [ChatMessage::user("bounded unrelated question 0")];
+        let durable = messages.iter().collect::<Vec<_>>();
+        let forms = SourceForms::new(&durable);
+        let principal = MemoryPrincipal {
+            legacy_session_key: None,
+            ..store.session.memory_principal()
+        };
+
+        let bounded = load_pool_within(store.memory.as_ref(), &principal, &forms, SMALL_POOL_MAX_ROWS)
+            .await
+            .expect("test: the pool reads");
+        assert_eq!(
+            bounded.err(),
+            Some(ProvenanceGap::TurnAmbiguous),
+            "a session past the pool bound has an unproven pool"
+        );
+
+        let complete = load_complete_pool(store.memory.as_ref(), &principal, &forms)
+            .await
+            .expect("test: the pool reads")
+            .expect("test: the default bound reads the whole session");
+        assert_eq!(
+            complete.message_ids.len(),
+            1_200,
+            "the default bound pages to the session's first row"
+        );
+        assert_eq!(complete.messages.len(), 1, "only the matching row is kept");
+    })
+    .await
+    .expect("switch_provenance_refuses_a_session_past_the_pool_bound exceeded its deadline");
+}

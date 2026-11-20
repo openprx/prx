@@ -641,3 +641,139 @@ async fn the_largest_supported_handoff_survives_a_restart_and_a_branch_copy() {
     .await
     .expect("the_largest_supported_handoff_survives_a_restart_and_a_branch_copy exceeded TEST_DEADLINE");
 }
+
+/// Every event id stored under `envelope`'s canonical session key.
+async fn session_event_ids(memory: &Arc<dyn Memory>, envelope: &RuntimeEnvelope) -> Vec<String> {
+    memory
+        .list_message_events_since(&envelope.memory_principal(), 0, 5000)
+        .await
+        .expect("test: list session rows")
+        .into_iter()
+        .filter(|event| event.session_key.as_deref() == Some(envelope.session_key.as_str()))
+        .map(|event| event.event_id)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_branch_of_a_session_with_queued_turns_and_a_handoff_copies_then_switches_exactly() {
+    tokio::time::timeout(TEST_DEADLINE, async {
+        let temp = TempDir::new().expect("test: tempdir");
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).expect("test: sqlite"));
+        let fabric = MemoryFabric::new(Arc::clone(&memory), WORKSPACE);
+        let mut source_session = session::ChatSession::new("test-provider", "test-model");
+        let source = chat_runtime_envelope(WORKSPACE, &format!("chat:{}", source_session.id));
+        let mut history = vec![ChatMessage::system("sys")];
+        record_pairs(&fabric, &source, &mut history, 0, 6).await;
+        compact(&mut history, &memory, &source, "first").await;
+
+        // Two queued turns: the second input is admitted before the first
+        // reply commits, so store order differs from transcript order.
+        let first_question = format!("queued question one {}", "padding ".repeat(20));
+        let second_question = format!("queued question two {}", "padding ".repeat(20));
+        let first_answer = format!("queued answer one {}", "detail ".repeat(20));
+        let second_answer = format!("queued answer two {}", "detail ".repeat(20));
+        for (run, question) in [("queued-run-1", &first_question), ("queued-run-2", &second_question)] {
+            fabric
+                .record_inbound_user_message(
+                    source.clone().with_run_id(run).message_scope(),
+                    question.clone(),
+                    Some(format!("branch-copy-queued-{run}")),
+                    None,
+                )
+                .await
+                .expect("test: record queued user");
+        }
+        for (run, answer) in [("queued-run-1", &first_answer), ("queued-run-2", &second_answer)] {
+            fabric
+                .record_assistant_message(source.clone().with_run_id(run).message_scope(), answer.clone())
+                .await
+                .expect("test: record queued assistant");
+        }
+        history.extend([
+            ChatMessage::user(first_question.clone()),
+            ChatMessage::assistant(first_answer.clone()),
+            ChatMessage::user(second_question.clone()),
+            ChatMessage::assistant(second_answer.clone()),
+        ]);
+        record_pairs(&fabric, &source, &mut history, 1, 1).await;
+        source_session.turns = history
+            .iter()
+            .skip(1)
+            .map(|message| session::ChatTurn {
+                role: message.role.clone(),
+                content: message.content.clone(),
+                timestamp: chrono::Utc::now(),
+                tool_calls: Vec::new(),
+                context_handoff: false,
+            })
+            .collect();
+        assert!(
+            source_session
+                .turns
+                .first()
+                .is_some_and(|turn| parse_context_handoff_note(&turn.content).is_some()),
+            "the source keeps its handoff turn"
+        );
+
+        let keep = source_session.turns.len();
+        let mut branch = branched_chat_session_from(&source_session, keep, "test-provider", "test-model");
+        copy_branch_transcript(memory.as_ref(), WORKSPACE, &source_session.id, &mut branch)
+            .await
+            .expect("the branch copy of queued retained turns commits");
+        let target = chat_runtime_envelope(WORKSPACE, &format!("chat:{}", branch.id));
+
+        let mut branch_history = vec![ChatMessage::system("sys")];
+        branch_history.extend(branch.turns.iter().map(|turn| ChatMessage {
+            role: turn.role.clone(),
+            content: turn.content.clone(),
+        }));
+        let audit = DocumentIngestRuntime::from_envelope(Arc::clone(&memory), &target);
+        let patch = build_configurable_compaction_patch(
+            &branch_history,
+            &UnusedProvider,
+            "model",
+            &switch_config(),
+            Some(&audit),
+            "branch_switch",
+        )
+        .await
+        .expect("test: build the branch patch")
+        .expect("a compaction in the branch yields an exact switch patch");
+        let handoff = patch.replacement.first().expect("test: the patch carries the handoff");
+        let note = crate::agent::compaction::validated_context_handoff_note(&handoff.content)
+            .expect("test: the branch handoff note validates");
+        assert_eq!(
+            note.get("provenance_status").and_then(serde_json::Value::as_str),
+            Some("exact"),
+            "the branch switch records exact provenance: {note}"
+        );
+
+        let referenced = note
+            .pointer("/lookup/arguments/event_ids")
+            .and_then(serde_json::Value::as_array)
+            .expect("test: lookup event ids")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let source_ids = session_event_ids(&memory, &source).await;
+        let branch_ids = session_event_ids(&memory, &target).await;
+        assert!(
+            referenced
+                .iter()
+                .all(|id| branch_ids.contains(id) && !source_ids.contains(id)),
+            "the branch handoff references the branch's copies only"
+        );
+        let contents = looked_up_contents(&lookup(&memory, &target, &note).await);
+        for text in [&first_question, &first_answer, &second_question, &second_answer] {
+            assert!(
+                contents.contains(text),
+                "the branch lookup returns the copied queued turn `{text}`"
+            );
+        }
+    })
+    .await
+    .expect(
+        "a_branch_of_a_session_with_queued_turns_and_a_handoff_copies_then_switches_exactly exceeded TEST_DEADLINE",
+    );
+}

@@ -913,6 +913,14 @@ impl Memory for SqliteMemory {
         self.load_recent_session_context_impl(query).await
     }
 
+    async fn load_session_context_before(
+        &self,
+        query: SessionContextQuery,
+        before_id: i64,
+    ) -> anyhow::Result<Vec<MessageEvent>> {
+        self.load_session_context_before_impl(query, before_id).await
+    }
+
     async fn append_memory_event(&self, input: MemoryEventInput) -> anyhow::Result<MemoryEvent> {
         self.append_memory_event_impl(input).await
     }
