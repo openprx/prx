@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use super::{Cadence, CostOutboxProjector, PassObserver, PassReport, run_pass, warn_legacy_files};
+use super::{Cadence, CostOutboxProjector, PassObserver, PassReport, run_pass};
 use crate::agent::terminal::{bind_terminal_fixture, completed_commit, finalize_turn, priced_cost_config};
 use crate::memory::fabric::MemoryFabric;
 use crate::memory::recovery_authority::RecoveryCostState;
@@ -255,8 +255,8 @@ fn legacy_files_warn_once_and_are_never_opened() {
         let mut logged = Vec::new();
         for _restart in 0..3 {
             let warned = std::sync::atomic::AtomicBool::new(false);
-            let first = warn_legacy_files(&warned, &probe);
-            let second = warn_legacy_files(&warned, &probe);
+            let first = super::warn_legacy_files(&warned, &probe);
+            let second = super::warn_legacy_files(&warned, &probe);
             logged.push((first, second));
         }
         let _ = sender.send(logged);
@@ -268,7 +268,7 @@ fn legacy_files_warn_once_and_are_never_opened() {
 
     let clean = tempfile::tempdir().expect("test: clean workspace");
     let warned = std::sync::atomic::AtomicBool::new(false);
-    assert!(!warn_legacy_files(&warned, clean.path()));
+    assert!(!super::warn_legacy_files(&warned, clean.path()));
     assert!(!clean.path().join("self").exists(), "detection creates nothing");
 }
 
