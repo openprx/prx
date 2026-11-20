@@ -284,6 +284,8 @@ mod tests {
         Ok(dir)
     }
 
+    // rustix does not expose mkfifoat on Apple targets.
+    #[cfg(not(target_vendor = "apple"))]
     #[test]
     fn existing_refuses_fifo_without_blocking() -> anyhow::Result<()> {
         let dir = private_dir()?;

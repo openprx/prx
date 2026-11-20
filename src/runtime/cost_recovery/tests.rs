@@ -237,7 +237,8 @@ async fn idle_restart_projects_every_pending_row() {
     }
 }
 
-#[cfg(unix)]
+// rustix does not expose mkfifoat on Apple targets.
+#[cfg(all(unix, not(target_vendor = "apple")))]
 #[test]
 fn legacy_files_warn_once_and_are_never_opened() {
     let dir = tempfile::tempdir().expect("test: workspace");
