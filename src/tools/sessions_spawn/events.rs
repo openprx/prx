@@ -79,6 +79,46 @@ pub(super) async fn record_spawn_request_event(
     Ok(receipt)
 }
 
+/// The single durable terminal row of a process worker that ended without its
+/// own result because its owner went away. Keyed by run, so the owner-exit
+/// path and the start-up sweep together append at most one row per run.
+pub(super) async fn record_owner_loss_terminal(
+    fabric: &MemoryFabric,
+    scope: MessageEventScope,
+    run_id: &str,
+    reason: super::OwnerLossReason,
+) -> anyhow::Result<()> {
+    let key = owner_loss_terminal_key(run_id);
+    let code = reason.code();
+    let event = fabric
+        .record_worker_result_idempotent(
+            scope,
+            format!("Sub-agent process ended without a result: {code}; cleanup and provider usage remain unconfirmed"),
+            Some(
+                json!({
+                    "success": false,
+                    "error": code,
+                    "reason": code,
+                    "unconfirmed": true,
+                })
+                .to_string(),
+            ),
+            key.clone(),
+        )
+        .await?;
+    // A disabled event recorder returns a synthetic row (id 0): nothing durable.
+    anyhow::ensure!(
+        event.id == 0
+            || (event.idempotency_key.as_deref() == Some(key.as_str()) && event.run_id.as_deref() == Some(run_id)),
+        "owner-loss terminal row differs from its run"
+    );
+    Ok(())
+}
+
+fn owner_loss_terminal_key(run_id: &str) -> String {
+    format!("worker:{run_id}:owner-loss-terminal")
+}
+
 pub(super) async fn record_spawn_result_event(
     fabric: Option<&MemoryFabric>,
     scope: MessageEventScope,

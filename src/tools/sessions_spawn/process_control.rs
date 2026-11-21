@@ -56,6 +56,93 @@ pub(super) fn new_process_mode_run(seed: ProcessModeRunSeed<'_>) -> SubAgentRun 
     }
 }
 
+/// Why a process worker ended without its own result because its owner went
+/// away. A closed set: each code is the exact text of the durable terminal row
+/// and of the run's termination reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnerLossReason {
+    /// The owning process exited and stopped the worker first.
+    OwnerExited,
+    /// The owning process is gone; a later start found the retained snapshot.
+    OwnerGone,
+}
+
+impl OwnerLossReason {
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::OwnerExited => "owner_exited",
+            Self::OwnerGone => "owner_gone",
+        }
+    }
+}
+
+/// Process-mode runs owned by this process, so an exiting owner can stop
+/// them. Entries are weak: a finished run is pruned on the next registration
+/// or stop, so the list never outgrows the live runs.
+static OWNED_PROCESS_RUNS: parking_lot::Mutex<Vec<std::sync::Weak<ProcessRunControl>>> =
+    parking_lot::const_mutex(Vec::new());
+
+fn owned_run_is_live(control: &ProcessRunControl) -> bool {
+    !control.recovery_only && control.finalization().is_none()
+}
+
+/// Record a process-mode run this process owns.
+pub(super) fn track_owned_process_run(control: &Arc<ProcessRunControl>) {
+    let mut runs = OWNED_PROCESS_RUNS.lock();
+    runs.retain(|run| run.upgrade().is_some_and(|run| owned_run_is_live(&run)));
+    runs.push(Arc::downgrade(control));
+}
+
+/// What an exiting owner did to its running process-mode children.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OwnerExitSummary {
+    /// Running children asked to stop.
+    pub requested: usize,
+    /// Children whose owner published a finalization within the bound.
+    pub finalized: usize,
+}
+
+/// Stop every running process-mode child this process owns before it exits.
+///
+/// Each child gets the existing termination request with the closed reason
+/// [`OwnerLossReason::OwnerExited`]; its sole owner then signals, reaps and
+/// records a durable terminal row before it publishes finalization. A child
+/// that already finished keeps its real outcome. All requests run at once and
+/// the whole stop is bounded by `bound`; a child still pending after it is
+/// left to the start-up sweep of the next process.
+pub async fn stop_owned_process_runs(bound: std::time::Duration) -> OwnerExitSummary {
+    let controls: Vec<Arc<ProcessRunControl>> = {
+        let mut runs = OWNED_PROCESS_RUNS.lock();
+        runs.retain(|run| run.upgrade().is_some_and(|run| owned_run_is_live(&run)));
+        runs.iter().filter_map(std::sync::Weak::upgrade).collect()
+    };
+    if controls.is_empty() {
+        return OwnerExitSummary::default();
+    }
+    let reason = OwnerLossReason::OwnerExited.code();
+    let requests = futures_util::future::join_all(
+        controls
+            .iter()
+            .map(|control| control.request_termination_with_timeout(reason, bound)),
+    );
+    let finalized = tokio::time::timeout(bound, requests).await.map_or(0, |results| {
+        results
+            .iter()
+            .filter(|result| matches!(result, ProcessTerminationRequestResult::Finalized(_)))
+            .count()
+    });
+    let summary = OwnerExitSummary {
+        requested: controls.len(),
+        finalized,
+    };
+    tracing::info!(
+        requested = summary.requested,
+        finalized = summary.finalized,
+        "exiting owner stopped its process-mode children"
+    );
+    summary
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProcessFinalization {
     Natural,

@@ -442,6 +442,26 @@ impl MemoryFabric {
             .await
     }
 
+    /// Record a worker result under a stable idempotency key, so a writer
+    /// that may run again (an owner-loss terminal) appends it at most once.
+    pub async fn record_worker_result_idempotent(
+        &self,
+        scope: MessageEventScope,
+        content: impl Into<String>,
+        raw_payload_json: Option<String>,
+        idempotency_key: impl Into<String>,
+    ) -> anyhow::Result<MessageEvent> {
+        self.record_message_event(
+            scope,
+            "event",
+            "worker.result.created",
+            content,
+            Some(idempotency_key.into()),
+            raw_payload_json,
+        )
+        .await
+    }
+
     /// Append structured runtime timeline events such as RouteDecision and
     /// ProviderExecutionOutcome records into the shared message fabric.
     pub async fn record_runtime_event(

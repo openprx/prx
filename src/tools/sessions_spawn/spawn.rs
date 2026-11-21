@@ -1,16 +1,16 @@
 use super::delegation;
 use super::{
     AllowedToolProxy, AnnounceOrigin, DEFAULT_SUB_AGENT_SYSTEM_PROMPT, HistoryEntry, MemoryScope, OutboundNotice,
-    ProcessFinalization, ProcessModeRunSeed, ProcessRunControl, ProcessWorkerOutcome, SPAWN_EXECUTION_CONTEXT,
-    STEER_CHANNEL_CAPACITY, SessionsSpawnTool, SpawnExecutionContext, SpawnScope, SubAgentRun, SubAgentStatus,
-    TaskRunControl, TerminationCause, boxed_spawn_field, commit_process_terminal_state,
+    OwnerLossReason, ProcessFinalization, ProcessModeRunSeed, ProcessRunControl, ProcessWorkerOutcome,
+    SPAWN_EXECUTION_CONTEXT, STEER_CHANNEL_CAPACITY, SessionsSpawnTool, SpawnExecutionContext, SpawnScope, SubAgentRun,
+    SubAgentStatus, TaskRunControl, TerminationCause, boxed_spawn_field, commit_process_terminal_state,
     current_spawn_execution_context, deliver_or_withhold_notice, exited_without_result_reason, format_announce_message,
     new_process_mode_run, normalize_process_memory_strategy, parse_memory_scope, parse_spawn_scope, process_terminal,
-    record_spawn_request_event, record_spawn_result_event, refresh_tools_for_explicit_allowlist,
-    register_killable_process_run, resolve_tools_for_agent, run_sub_agent_process, run_sub_agent_task,
-    running_run_count, spawn_event_scope, spawn_lineage, spawn_session_key, spawn_started_text,
-    sub_agent_reported_failure, task_failure_reason, task_terminal, termination_cause, watch_process_mode_monitor,
-    watch_task_mode_monitor,
+    record_owner_loss_terminal, record_spawn_request_event, record_spawn_result_event,
+    refresh_tools_for_explicit_allowlist, register_killable_process_run, resolve_tools_for_agent,
+    resolve_worker_workspace_root, run_sub_agent_process, run_sub_agent_task, running_run_count, spawn_event_scope,
+    spawn_lineage, spawn_session_key, spawn_started_text, sub_agent_reported_failure, task_failure_reason,
+    task_terminal, termination_cause, watch_process_mode_monitor, watch_task_mode_monitor,
 };
 use crate::providers;
 use crate::runtime::child_source::publication::ChildDelegation;
@@ -845,20 +845,8 @@ impl SessionsSpawnTool {
             let provider_name = resolved_provider_name;
             let route_hint = selected_route_hint;
             let workspace_root = child_model_config.workspace_dir.clone();
-            let worker_workspace_root = spawn_config
-                .worker_workspace_root
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(|value| {
-                    let path = std::path::PathBuf::from(value);
-                    if path.is_absolute() {
-                        path
-                    } else {
-                        workspace_root.join(path)
-                    }
-                })
-                .unwrap_or_else(|| workspace_root.join("workers"));
+            let worker_workspace_root =
+                resolve_worker_workspace_root(spawn_config.worker_workspace_root.as_deref(), &workspace_root);
             let active_runs = self.active_runs.clone();
             // Resolve the announce channel from the *per-turn* channel name bound
             // to this run (the launching message's scope), not the shared active
@@ -1192,6 +1180,41 @@ impl SessionsSpawnTool {
                             };
 
                             let announce = format_announce_message(&rid, &status, &result_text);
+                            // An exiting owner waits only for finalization, so the run's
+                            // durable terminal row is written before the commit publishes it.
+                            let owner_exiting = monitor_process_control.termination_reason().as_deref()
+                                == Some(OwnerLossReason::OwnerExited.code());
+                            if owner_exiting {
+                                if matches!(finalization, ProcessFinalization::Terminated | ProcessFinalization::Unconfirmed) {
+                                    if let Some(fabric) = process_memory_fabric.as_ref() {
+                                        if let Err(error) = record_owner_loss_terminal(
+                                            fabric,
+                                            process_result_scope.clone(),
+                                            &rid,
+                                            OwnerLossReason::OwnerExited,
+                                        )
+                                        .await
+                                        {
+                                            tracing::error!(
+                                                run_id = %rid,
+                                                error = %crate::agent::diagnostics::error_class(&error),
+                                                "owner-exit terminal row remains unconfirmed"
+                                            );
+                                        }
+                                    }
+                                } else if finalization == ProcessFinalization::Natural {
+                                    // Finished on its own within the bound: its real outcome.
+                                    record_spawn_result_event(
+                                        process_memory_fabric.as_ref(),
+                                        process_result_scope.clone(),
+                                        &result_text,
+                                        &status,
+                                        &process_lineage,
+                                        None,
+                                    )
+                                    .await;
+                                }
+                            }
                             if let Err(error) = commit_process_terminal_state(
                                 &active_runs,
                                 &rid,
@@ -1207,7 +1230,7 @@ impl SessionsSpawnTool {
                                 tracing::error!(run_id = %rid, error = %error, "process terminal registry commit remains unconfirmed");
                                 return;
                             }
-                            if finalization == ProcessFinalization::Unconfirmed {
+                            if finalization == ProcessFinalization::Unconfirmed || owner_exiting {
                                 return;
                             }
                             record_spawn_result_event(

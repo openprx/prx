@@ -58,7 +58,9 @@ use self::child_lifecycle::{
 };
 #[cfg(test)]
 use self::child_lifecycle::{drain_worker_stream, pump_worker_steer_frames};
-use self::events::{record_spawn_request_event, record_spawn_result_event, spawn_event_scope};
+use self::events::{
+    record_owner_loss_terminal, record_spawn_request_event, record_spawn_result_event, spawn_event_scope,
+};
 pub(crate) use self::failure::KILLED_BY_USER_REASON;
 use self::failure::{
     EXITED_WITHOUT_RESULT_PREFIX, PANICKED_BEFORE_RESULT_SUFFIX, TERMINATED_BEFORE_RESULT_SUFFIX, TerminationCause,
@@ -84,7 +86,10 @@ use self::owned_process::{
     hold_unresolved_child_ownership, relinquish_process_group_after_leader_exit, run_owned_child_phase,
     start_kill_and_reap_direct_child, terminate_owned_child,
 };
-pub(crate) use self::process_control::{ProcessFinalization, ProcessRunControl, ProcessTerminationRequestResult};
+pub use self::process_control::{OwnerExitSummary, stop_owned_process_runs};
+pub(crate) use self::process_control::{
+    OwnerLossReason, ProcessFinalization, ProcessRunControl, ProcessTerminationRequestResult,
+};
 use self::process_control::{ProcessModeRunSeed, new_process_mode_run};
 #[cfg(test)]
 use self::process_mode::classify_worker_output;
@@ -116,6 +121,7 @@ pub(crate) use self::worker_capability::{SESSION_WORKER_CAP_ENV, SESSION_WORKER_
 use self::worker_capability::{
     SESSION_WORKER_CAP_TTL_SECS, capability_now_unix, compute_worker_capability_with_key, manifest_signing_payload,
 };
+pub(crate) use self::worker_manifest::resolve_worker_workspace_root;
 use self::worker_manifest::{
     build_session_worker_cli_args, build_session_worker_manifest, copy_dir_recursive,
     normalize_process_memory_strategy, private_worker_memory_db_path, shared_worker_memory_db_path,

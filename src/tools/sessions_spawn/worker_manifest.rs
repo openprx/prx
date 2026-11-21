@@ -9,6 +9,27 @@ use crate::providers;
 use crate::session_worker::protocol::WorkerManifest;
 use anyhow::Context as _;
 
+/// The directory process workers get their `<run_id>/` workspaces in:
+/// `sessions_spawn.worker_workspace_root` (relative to the workspace) or
+/// `<workspace>/workers`. The spawn path, the start-up sweep and `prx doctor`
+/// all resolve it here.
+pub(crate) fn resolve_worker_workspace_root(
+    configured: Option<&str>,
+    workspace_root: &std::path::Path,
+) -> std::path::PathBuf {
+    configured.map(str::trim).filter(|value| !value.is_empty()).map_or_else(
+        || workspace_root.join("workers"),
+        |value| {
+            let path = std::path::PathBuf::from(value);
+            if path.is_absolute() {
+                path
+            } else {
+                workspace_root.join(path)
+            }
+        },
+    )
+}
+
 pub(super) fn copy_dir_recursive(source: &std::path::Path, destination: &std::path::Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(destination)?;
     for entry in std::fs::read_dir(source)? {

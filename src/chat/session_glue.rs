@@ -487,7 +487,7 @@ pub(super) async fn shutdown_child_sessions_for_exit(
     chat_dispatcher: &dispatcher::ChatDispatcher,
     commits: &dispatcher::TurnCompletionSignal,
 ) -> anyhow::Result<crate::chat::sessions::runtime::ShutdownReport> {
-    let report = chat_sessions.shutdown_all("chat-exit").await;
+    let report = chat_sessions.shutdown_for_owner_exit("chat-exit").await;
     for persisted in report
         .summaries
         .iter()

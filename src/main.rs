@@ -1681,7 +1681,15 @@ fn main() -> std::process::ExitCode {
     };
     // Publish the real cap so blocking-pool saturation is measured against it.
     openprx::runtime::blocking::configure(max_blocking_threads);
-    let result = runtime.block_on(async_main(cli));
+    let result = runtime.block_on(async {
+        let result = Box::pin(async_main(cli)).await;
+        // Every exit path (REPL /exit, one-shot end, Ctrl-C/SIGTERM through the
+        // shutdown token, daemon shutdown, a process worker's own return) lands
+        // here: stop and reap the process-mode children this process owns,
+        // within the same bound, before the runtime drops their monitors.
+        openprx::tools::sessions_spawn::stop_owned_process_runs(RUNTIME_SHUTDOWN_TIMEOUT).await;
+        result
+    });
     runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,

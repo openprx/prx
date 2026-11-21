@@ -18,7 +18,8 @@ use super::model::{
 };
 use super::shell::ShellSession;
 use crate::tools::sessions_spawn::{
-    ProcessFinalization, ProcessTerminationRequestResult, SubAgentRun, SubAgentStatus, TaskFinalization,
+    OwnerLossReason, ProcessFinalization, ProcessTerminationRequestResult, SubAgentRun, SubAgentStatus,
+    TaskFinalization,
 };
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Duration, Utc};
@@ -616,6 +617,18 @@ impl ChatSessionsHandle {
     /// Terminate every live child and clear finalized live registry entries.
     /// Process runs whose owner has not confirmed reap remain registered.
     pub async fn shutdown_all(&mut self, reason: &str) -> ShutdownReport {
+        self.shutdown_all_with_process_reason(reason, reason).await
+    }
+
+    /// Chat exit: the owner is leaving, so its process-mode runs stop with the
+    /// closed owner-exit reason and leave a durable terminal row. Task runs
+    /// keep `reason`.
+    pub async fn shutdown_for_owner_exit(&mut self, reason: &str) -> ShutdownReport {
+        self.shutdown_all_with_process_reason(reason, OwnerLossReason::OwnerExited.code())
+            .await
+    }
+
+    async fn shutdown_all_with_process_reason(&mut self, reason: &str, process_reason: &str) -> ShutdownReport {
         let views = self.snapshot().await;
         let summaries = views
             .iter()
@@ -671,7 +684,7 @@ impl ChatSessionsHandle {
             }
         }
         for control in process_controls {
-            if control.request_termination(reason).await
+            if control.request_termination(process_reason).await
                 == ProcessTerminationRequestResult::Finalized(ProcessFinalization::Terminated)
             {
                 aborted_agents = aborted_agents.saturating_add(1);
