@@ -1287,7 +1287,7 @@ async fn run_owned_manifest(
         )
         .map_err(anyhow::Error::msg)?;
     let worker_result_event = match memory_fabric
-        .record_worker_result(
+        .record_worker_result_idempotent(
             worker_event_scope.clone(),
             crate::agent::terminal::redact_persisted_text(&event_content),
             Some(
@@ -1301,6 +1301,7 @@ async fn run_owned_manifest(
                 }))
                 .to_string(),
             ),
+            crate::session_worker::protocol::worker_result_key(&manifest.run_id),
         )
         .await
     {

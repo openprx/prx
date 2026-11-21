@@ -59,7 +59,8 @@ use self::child_lifecycle::{
 #[cfg(test)]
 use self::child_lifecycle::{drain_worker_stream, pump_worker_steer_frames};
 use self::events::{
-    record_owner_loss_terminal, record_spawn_request_event, record_spawn_result_event, spawn_event_scope,
+    record_owner_loss_terminal, record_spawn_request_event, record_spawn_result_event, record_spawn_result_event_keyed,
+    spawn_event_scope,
 };
 pub(crate) use self::failure::KILLED_BY_USER_REASON;
 use self::failure::{

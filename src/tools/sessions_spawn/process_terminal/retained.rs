@@ -175,6 +175,8 @@ async fn launch_of(fabric: &MemoryFabric, workspace: &Path, run: &str) -> anyhow
 struct SweepSummary {
     retained: usize,
     settled: usize,
+    /// Settled folders whose run already had its own result row.
+    had_result: usize,
     owner_alive: usize,
     unverified: usize,
     deferred: usize,
@@ -236,16 +238,28 @@ pub(super) async fn sweep_retained_worker_folders(
             summary.owner_alive += 1;
             continue;
         }
-        if let Err(error) =
-            super::super::record_owner_loss_terminal(fabric, launch.scope, &folder.run_id, OwnerLossReason::OwnerGone)
-                .await
+        // The run's single result key decides atomically in the store: a row
+        // the worker already wrote wins and this write adds nothing.
+        let created = match super::super::record_owner_loss_terminal(
+            fabric,
+            launch.scope,
+            &folder.run_id,
+            OwnerLossReason::OwnerGone,
+        )
+        .await
         {
-            tracing::warn!(
-                error = %crate::agent::diagnostics::error_class(&error),
-                "owner-gone terminal row remains unconfirmed; folder kept"
-            );
-            summary.unverified += 1;
-            continue;
+            Ok(created) => created,
+            Err(error) => {
+                tracing::warn!(
+                    error = %crate::agent::diagnostics::error_class(&error),
+                    "owner-gone terminal row remains unconfirmed; folder kept"
+                );
+                summary.unverified += 1;
+                continue;
+            }
+        };
+        if !created {
+            summary.had_result += 1;
         }
         match remove_snapshot_folder(&folder) {
             Ok(()) => summary.settled += 1,
@@ -261,6 +275,7 @@ pub(super) async fn sweep_retained_worker_folders(
     tracing::info!(
         retained = summary.retained,
         settled = summary.settled,
+        had_result = summary.had_result,
         owner_alive = summary.owner_alive,
         unverified = summary.unverified,
         deferred = summary.deferred,

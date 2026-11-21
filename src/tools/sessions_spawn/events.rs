@@ -79,30 +79,31 @@ pub(super) async fn record_spawn_request_event(
     Ok(receipt)
 }
 
-/// The single durable terminal row of a process worker that ended without its
-/// own result because its owner went away. Keyed by run, so the owner-exit
-/// path and the start-up sweep together append at most one row per run.
+/// The terminal row of a process worker that ended without its own result
+/// because its owner went away. It shares the run's single result key
+/// ([`crate::session_worker::protocol::worker_result_key`]), so if the worker
+/// (or its monitor) already recorded a result, the store keeps that row and
+/// this write adds nothing. Returns whether this call created the row.
 pub(super) async fn record_owner_loss_terminal(
     fabric: &MemoryFabric,
     scope: MessageEventScope,
     run_id: &str,
     reason: super::OwnerLossReason,
-) -> anyhow::Result<()> {
-    let key = owner_loss_terminal_key(run_id);
+) -> anyhow::Result<bool> {
+    let key = crate::session_worker::protocol::worker_result_key(run_id);
     let code = reason.code();
+    let payload = json!({
+        "success": false,
+        "error": code,
+        "reason": code,
+        "unconfirmed": true,
+    })
+    .to_string();
     let event = fabric
         .record_worker_result_idempotent(
             scope,
             format!("Sub-agent process ended without a result: {code}; cleanup and provider usage remain unconfirmed"),
-            Some(
-                json!({
-                    "success": false,
-                    "error": code,
-                    "reason": code,
-                    "unconfirmed": true,
-                })
-                .to_string(),
-            ),
+            Some(payload.clone()),
             key.clone(),
         )
         .await?;
@@ -110,13 +111,9 @@ pub(super) async fn record_owner_loss_terminal(
     anyhow::ensure!(
         event.id == 0
             || (event.idempotency_key.as_deref() == Some(key.as_str()) && event.run_id.as_deref() == Some(run_id)),
-        "owner-loss terminal row differs from its run"
+        "process worker result row differs from its run"
     );
-    Ok(())
-}
-
-fn owner_loss_terminal_key(run_id: &str) -> String {
-    format!("worker:{run_id}:owner-loss-terminal")
+    Ok(event.id > 0 && event.raw_payload_json.as_deref() == Some(payload.as_str()))
 }
 
 pub(super) async fn record_spawn_result_event(
@@ -126,6 +123,21 @@ pub(super) async fn record_spawn_result_event(
     status: &SubAgentStatus,
     lineage: &SpawnLineage,
     terminal_event_type: Option<&str>,
+) {
+    record_spawn_result_event_keyed(fabric, scope, result_text, status, lineage, terminal_event_type, None).await;
+}
+
+/// [`record_spawn_result_event`] with the result row under `result_key`. A
+/// process-mode monitor passes its run's single result key, so its row and
+/// the worker's own row collapse into one (the first writer wins).
+pub(super) async fn record_spawn_result_event_keyed(
+    fabric: Option<&MemoryFabric>,
+    scope: MessageEventScope,
+    result_text: &str,
+    status: &SubAgentStatus,
+    lineage: &SpawnLineage,
+    terminal_event_type: Option<&str>,
+    result_key: Option<String>,
 ) {
     let Some(fabric) = fabric else {
         return;
@@ -143,24 +155,27 @@ pub(super) async fn record_spawn_result_event(
     };
     // The result and task records carry the sub-agent's reply or error text:
     // redacted like the terminal commit (D-053).
-    if let Err(error) = fabric
-        .record_worker_result(
-            scope,
-            crate::agent::terminal::redact_persisted_text(result_text),
-            Some(
-                crate::agent::terminal::redact_persisted_json(json!({
-                    "success": success,
-                    "error": error,
-                    "owner_id": lineage.owner_id,
-                    "topic_id": lineage.topic_id,
-                    "parent_task_id": lineage.parent_task_id,
-                    "source_message_event_id": lineage.source_message_event_id
-                }))
-                .to_string(),
-            ),
-        )
-        .await
-    {
+    let content = crate::agent::terminal::redact_persisted_text(result_text);
+    let payload = Some(
+        crate::agent::terminal::redact_persisted_json(json!({
+            "success": success,
+            "error": error,
+            "owner_id": lineage.owner_id,
+            "topic_id": lineage.topic_id,
+            "parent_task_id": lineage.parent_task_id,
+            "source_message_event_id": lineage.source_message_event_id
+        }))
+        .to_string(),
+    );
+    let recorded = match result_key {
+        Some(key) => {
+            fabric
+                .record_worker_result_idempotent(scope, content, payload, key)
+                .await
+        }
+        None => fabric.record_worker_result(scope, content, payload).await,
+    };
+    if let Err(error) = recorded {
         tracing::warn!("failed to record sessions_spawn result event: {error}");
     }
     let task_event_type = terminal_event_type.unwrap_or(if success { "task.completed" } else { "task.failed" });

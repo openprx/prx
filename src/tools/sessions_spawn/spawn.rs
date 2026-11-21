@@ -6,7 +6,7 @@ use super::{
     SubAgentStatus, TaskRunControl, TerminationCause, boxed_spawn_field, commit_process_terminal_state,
     current_spawn_execution_context, deliver_or_withhold_notice, exited_without_result_reason, format_announce_message,
     new_process_mode_run, normalize_process_memory_strategy, parse_memory_scope, parse_spawn_scope, process_terminal,
-    record_owner_loss_terminal, record_spawn_request_event, record_spawn_result_event,
+    record_owner_loss_terminal, record_spawn_request_event, record_spawn_result_event, record_spawn_result_event_keyed,
     refresh_tools_for_explicit_allowlist, register_killable_process_run, resolve_tools_for_agent,
     resolve_worker_workspace_root, run_sub_agent_process, run_sub_agent_task, running_run_count, spawn_event_scope,
     spawn_lineage, spawn_session_key, spawn_started_text, sub_agent_reported_failure, task_failure_reason,
@@ -1204,13 +1204,14 @@ impl SessionsSpawnTool {
                                     }
                                 } else if finalization == ProcessFinalization::Natural {
                                     // Finished on its own within the bound: its real outcome.
-                                    record_spawn_result_event(
+                                    record_spawn_result_event_keyed(
                                         process_memory_fabric.as_ref(),
                                         process_result_scope.clone(),
                                         &result_text,
                                         &status,
                                         &process_lineage,
                                         None,
+                                        Some(crate::session_worker::protocol::worker_result_key(&rid)),
                                     )
                                     .await;
                                 }
@@ -1233,13 +1234,16 @@ impl SessionsSpawnTool {
                             if finalization == ProcessFinalization::Unconfirmed || owner_exiting {
                                 return;
                             }
-                            record_spawn_result_event(
+                            // One result row per run: the worker's own row, if it wrote one,
+                            // already holds the run's key and this write adds nothing.
+                            record_spawn_result_event_keyed(
                                 process_memory_fabric.as_ref(),
                                 process_result_scope,
                                 &result_text,
                                 &status,
                                 &process_lineage,
                                 (finalization == ProcessFinalization::Terminated).then_some("task.killed"),
+                                Some(crate::session_worker::protocol::worker_result_key(&rid)),
                             )
                             .await;
 

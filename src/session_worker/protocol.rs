@@ -242,6 +242,15 @@ impl WorkerManifest {
     }
 }
 
+/// The one idempotency key of every `worker.result.created` row of a process
+/// worker run: the worker's own result, its parent monitor's result and an
+/// owner-loss terminal all use it, so the store's
+/// `UNIQUE(workspace_id, idempotency_key)` keeps exactly one row per run and
+/// the first writer wins.
+pub fn worker_result_key(run_id: &str) -> String {
+    format!("worker:{run_id}:result")
+}
+
 /// Compute a stable generation for the complete on-disk configuration source.
 ///
 /// Both the parent and worker call this exact implementation. File names and
