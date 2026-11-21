@@ -219,13 +219,14 @@ pub(super) async fn post_keyed_session(
 
 /// Whether `session_id` names a session created by `session_key`: its row
 /// carries the channel [`crate::memory::CALLER_KEYED_SESSION_CHANNEL`], which
-/// only that route writes. `None` when the row could not be read. Ids outside
-/// the caller-key grammar are never looked up.
+/// only that route writes. `None` when the row could not be read; a backend
+/// without the lookup holds no such session. Ids outside the caller-key
+/// grammar are never looked up.
 async fn keyed_session(state: &AppState, session_id: &str) -> Option<bool> {
     if !is_caller_session_key(session_id) {
         return Some(false);
     }
-    match state.mem.conversation_session_owner(session_id).await {
+    match session_origin(state, session_id).await {
         Ok(row) => Some(row.is_some_and(|row| row.channel == crate::memory::CALLER_KEYED_SESSION_CHANNEL)),
         Err(error) => {
             tracing::warn!(
@@ -234,6 +235,25 @@ async fn keyed_session(state: &AppState, session_id: &str) -> Option<bool> {
             );
             None
         }
+    }
+}
+
+/// The origin row of `session_id`. A backend that keeps no session origin
+/// holds no caller-keyed session (the claim needs the same support), so its
+/// refusal reads as no row.
+async fn session_origin(
+    state: &AppState,
+    session_id: &str,
+) -> anyhow::Result<Option<crate::memory::ConversationSessionOwner>> {
+    match state.mem.conversation_session_owner(session_id).await {
+        Err(error)
+            if error
+                .chain()
+                .any(|cause| cause.is::<crate::memory::erasure::Unsupported>()) =>
+        {
+            Ok(None)
+        }
+        other => other,
     }
 }
 
@@ -247,7 +267,7 @@ pub(super) async fn require_session_owner(
     owner_id: &str,
     rf_shaped: bool,
 ) -> Result<(), Box<Response>> {
-    match state.mem.conversation_session_owner(session_id).await {
+    match session_origin(state, session_id).await {
         Ok(Some(row)) if row.channel == crate::memory::CALLER_KEYED_SESSION_CHANNEL => {
             if row.owner_id.as_deref() == Some(owner_id) {
                 Ok(())
