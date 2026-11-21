@@ -421,6 +421,15 @@ reads Main's rows only, also in a session it shares with named agents. A
 terminal `prx chat` turn is the local operator's view: it runs under no
 partition and is outside this invariant.
 
+**Child runs.** A child run (`sessions_spawn` in task or process mode,
+`delegate`, and every nested child) writes under the partition of its root
+turn's agent, so a named agent's children are its own rows; Main's children
+are unchanged. `sessions_list`, `sessions_history`, `session_status`,
+`subagents` and `sessions_send` show a named agent only the runs it started.
+`spawn_batch`, `join`, `chat_sessions` and `chat_assign` answer a named agent
+with `spawn_action_unpartitioned`; a child whose root partition cannot be
+determined is refused with `child_partition_unresolved`.
+
 **History labels.** `GET /api/sessions/{session_id}/messages` on a
 caller-keyed session returns
 `[{"role","content","timestamp","message_id","agent"}]`, where `agent` is

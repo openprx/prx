@@ -20,13 +20,12 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 /// Tools no target can reach until an audited inventory extension. `cron` and
-/// `xin` act on the host's scheduler and background-task stores. The spawn
-/// family would write a target's child rows unstamped, into Main's partition,
-/// and `subagents` acts on child runs the target never started. The exclusion
-/// applies to the published surface whatever the allowlist says, wildcard
-/// included.
-pub(in crate::gateway::api) const TARGET_EXCLUDED_TOOLS: [&str; 5] =
-    ["cron", "xin", "sessions_spawn", "delegate", "subagents"];
+/// `xin` act on the host's scheduler and background-task stores (owner
+/// question Q11). The spawn family is reachable: a target's child rows carry
+/// its partition (MA-01b5), and `subagents` sees only the runs it started. The
+/// exclusion applies to the published surface whatever the allowlist says,
+/// wildcard included.
+pub(in crate::gateway::api) const TARGET_EXCLUDED_TOOLS: [&str; 2] = ["cron", "xin"];
 
 /// The `agent` field exactly as the request carried it.
 #[derive(Debug, Clone, PartialEq, Eq)]
