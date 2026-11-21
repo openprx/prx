@@ -23,6 +23,151 @@ pub(crate) fn resolve_request_path(root: &Path, request: &str) -> std::io::Resul
     Ok(std::path::absolute(root)?.join(crate::config::expand_home(Path::new(request))))
 }
 
+/// The below-Full confinement of a file_write or file_edit target, run by the
+/// tool's precheck and again at execute time. The outer error is a policy
+/// refusal; the inner one is a target that does not resolve (reported by
+/// execution). Returns the resolved target, whose parent is inside the
+/// workspace and which is not a symlink that resolves outside it.
+pub(crate) async fn confine_file_target(
+    security: &SecurityPolicy,
+    root: &Path,
+    path: &str,
+    allow_missing_parent: bool,
+) -> Result<std::io::Result<PathBuf>, PathRefusalReason> {
+    security.check_path_at(root, path)?;
+    let target = match super::approval_operation::resolve_file_target(root, path, allow_missing_parent).await {
+        Ok(target) => target,
+        Err(error) => return Ok(Err(error)),
+    };
+    let Some(parent) = target.parent() else {
+        return Ok(Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "file parent missing",
+        )));
+    };
+    if !security.is_resolved_path_allowed(parent) {
+        return Err(PathRefusalReason::SymlinkEscape);
+    }
+    // The write itself refuses any symlink (O_NOFOLLOW); one that resolves
+    // outside the workspace is refused here already, so before approval.
+    if tokio::fs::symlink_metadata(&target)
+        .await
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        // A dangling link has no resolved target to judge; the O_NOFOLLOW
+        // open refuses it at execute time.
+        if let Ok(resolved) = tokio::fs::canonicalize(&target).await {
+            if !security.is_resolved_path_allowed(&resolved) {
+                return Err(PathRefusalReason::SymlinkEscape);
+            }
+        }
+    }
+    Ok(Ok(target))
+}
+
+/// Closed reasons a path is refused below Full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathRefusalReason {
+    /// Parent traversal, encoded traversal or a NUL byte.
+    InvalidPath,
+    /// The path is, or lies under, a configured forbidden path.
+    ForbiddenPath,
+    /// The path resolves outside the workspace while `workspace_only` is set.
+    OutsideWorkspace,
+    /// The path is written inside the workspace, but a symlink resolves it outside.
+    SymlinkEscape,
+    /// A shell path argument is built from a variable or expansion.
+    DynamicShellArgument,
+    /// A shell argument runs an active substitution.
+    ActiveShellSubstitution,
+}
+
+impl PathRefusalReason {
+    /// Stable payload-free code, safe for log fields and audit rows.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidPath => "invalid_path",
+            Self::ForbiddenPath => "forbidden_path",
+            Self::OutsideWorkspace => "outside_workspace",
+            Self::SymlinkEscape => "symlink_escape",
+            Self::DynamicShellArgument => "dynamic_shell_argument",
+            Self::ActiveShellSubstitution => "active_shell_substitution",
+        }
+    }
+
+    /// Operator-visible refusal of a file tool path. It names the path, so it
+    /// belongs in the tool result only, never in a log field.
+    fn file_message(self, path: &str) -> String {
+        match self {
+            Self::InvalidPath => format!("Path not allowed: {path} is not a valid path (parent traversal or NUL byte)"),
+            Self::ForbiddenPath => format!("Path not allowed: {path} is a forbidden path"),
+            Self::OutsideWorkspace => format!("Path not allowed: {path} is outside the workspace"),
+            Self::SymlinkEscape => {
+                format!("Path not allowed: {path} resolves outside the workspace through a symlink")
+            }
+            Self::DynamicShellArgument => format!("Path not allowed: {path} is a dynamic path"),
+            Self::ActiveShellSubstitution => format!("Path not allowed: {path} runs a shell substitution"),
+        }
+    }
+
+    /// Operator-visible refusal of a shell path argument.
+    fn shell_message(self, argument: &str) -> String {
+        match self {
+            Self::InvalidPath => format!("invalid path argument (parent traversal or NUL byte): {argument}"),
+            Self::ForbiddenPath => format!("forbidden path argument: {argument}"),
+            Self::OutsideWorkspace => format!("path argument is outside the workspace: {argument}"),
+            Self::SymlinkEscape => {
+                format!("path argument resolves outside the workspace through a symlink: {argument}")
+            }
+            Self::DynamicShellArgument => format!("forbidden dynamic path argument: {argument}"),
+            Self::ActiveShellSubstitution => "forbidden active shell substitution".to_owned(),
+        }
+    }
+}
+
+/// A typed path refusal with its operator-visible text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathRefusal {
+    reason: PathRefusalReason,
+    message: String,
+}
+
+impl PathRefusal {
+    #[must_use]
+    pub fn file(reason: PathRefusalReason, path: &str) -> Self {
+        Self {
+            reason,
+            message: reason.file_message(path),
+        }
+    }
+
+    #[must_use]
+    pub fn shell(reason: PathRefusalReason, argument: &str) -> Self {
+        Self {
+            reason,
+            message: reason.shell_message(argument),
+        }
+    }
+
+    #[must_use]
+    pub const fn reason(&self) -> PathRefusalReason {
+        self.reason
+    }
+
+    /// Operator-visible text; may name the path.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for PathRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
 impl SecurityPolicy {
     /// Legacy callers execute relative to the workspace.
     pub fn is_path_allowed(&self, path: &str) -> bool {
@@ -31,38 +176,40 @@ impl SecurityPolicy {
 
     /// Check the same absolute request path that native execution will resolve.
     pub(crate) fn is_path_allowed_at(&self, root: &Path, path: &str) -> bool {
-        let Ok(target) = resolve_request_path(root, path) else {
-            return false;
-        };
+        self.check_path_at(root, path).is_ok()
+    }
+
+    /// The lexical path policy below Full. A path is allowed exactly when it
+    /// resolves inside the workspace (with `workspace_only`) and outside the
+    /// forbidden paths, however it is written: relative, absolute or `~`.
+    /// Symlinks are the caller's canonical check (`is_resolved_path_allowed`).
+    pub(crate) fn check_path_at(&self, root: &Path, path: &str) -> Result<(), PathRefusalReason> {
+        let target = resolve_request_path(root, path).map_err(|_| PathRefusalReason::InvalidPath)?;
         let lower = path.to_lowercase();
         if lower.contains("..%2f") || lower.contains("%2f..") {
-            return false;
-        }
-        let expanded = crate::config::expand_home(Path::new(path));
-        if self.workspace_only && expanded.is_absolute() {
-            return false;
+            return Err(PathRefusalReason::InvalidPath);
         }
         let fold = |path: &Path| PathBuf::from(path.to_string_lossy().to_lowercase());
-        let Ok(workspace_root) = std::path::absolute(&self.workspace_dir) else {
-            return false;
-        };
+        let workspace_root =
+            std::path::absolute(&self.workspace_dir).map_err(|_| PathRefusalReason::OutsideWorkspace)?;
         let workspace = fold(&workspace_root);
+        let inside_workspace = target.starts_with(&workspace_root);
         for forbidden in &self.forbidden_paths {
-            let Ok(forbidden) = resolve_request_path(root, forbidden) else {
-                return false;
-            };
-            // Preserve main's allowance for a relative workspace path when the
-            // workspace itself is under a default forbidden ancestor (e.g. /tmp).
-            // A working root outside that workspace receives no such exemption.
-            let workspace_ancestor = !expanded.is_absolute()
-                && fold(&target).starts_with(&workspace)
+            let forbidden = resolve_request_path(root, forbidden).map_err(|_| PathRefusalReason::ForbiddenPath)?;
+            // A workspace under a default forbidden ancestor (e.g. /tmp) keeps
+            // its own paths. A forbidden path inside the workspace still wins,
+            // and a path outside the workspace receives no such exemption.
+            let workspace_ancestor = inside_workspace
                 && workspace.starts_with(fold(&forbidden))
                 && !fold(&forbidden).starts_with(&workspace);
             if !workspace_ancestor && fold(&target).starts_with(fold(&forbidden)) {
-                return false;
+                return Err(PathRefusalReason::ForbiddenPath);
             }
         }
-        !self.workspace_only || target.starts_with(workspace_root)
+        if self.workspace_only && !inside_workspace {
+            return Err(PathRefusalReason::OutsideWorkspace);
+        }
+        Ok(())
     }
 
     /// Check canonical containment after resolving existing filesystem ancestors.

@@ -13,9 +13,21 @@ fn is_env_assignment(word: &str) -> bool {
 }
 
 enum CommandPathViolation {
-    Forbidden(String),
+    Path(String, crate::security::PathRefusalReason),
     Dynamic(String),
     ActiveSubstitution,
+}
+
+impl CommandPathViolation {
+    /// One typed refusal for the orchestration validator and the shell backend.
+    fn into_refusal(self) -> crate::security::PathRefusal {
+        use crate::security::{PathRefusal, PathRefusalReason};
+        match self {
+            Self::Path(path, reason) => PathRefusal::shell(reason, &path),
+            Self::Dynamic(token) => PathRefusal::shell(PathRefusalReason::DynamicShellArgument, &token),
+            Self::ActiveSubstitution => PathRefusal::shell(PathRefusalReason::ActiveShellSubstitution, ""),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,8 +119,10 @@ fn forbidden_path_argument_inner(
                     || candidate.starts_with("../")
                     || candidate.starts_with("~/")
                     || (candidate.contains('/') && !candidate.chars().any(char::is_whitespace));
-                if looks_like_path && !policy.is_path_allowed_at(root, candidate) {
-                    return Some(CommandPathViolation::Forbidden(candidate.to_string()));
+                if looks_like_path {
+                    if let Err(reason) = policy.check_path_at(root, candidate) {
+                        return Some(CommandPathViolation::Path(candidate.to_string(), reason));
+                    }
                 }
                 index += 1;
             }
@@ -210,8 +224,10 @@ fn code_payload_violation(
             || candidate.starts_with("./")
             || candidate.starts_with("../")
             || candidate.starts_with("~/");
-        if looks_like_path && !policy.is_path_allowed_at(root, candidate) {
-            return Some(CommandPathViolation::Forbidden(candidate.to_string()));
+        if looks_like_path {
+            if let Err(reason) = policy.check_path_at(root, candidate) {
+                return Some(CommandPathViolation::Path(candidate.to_string(), reason));
+            }
         }
     }
     None
@@ -1624,11 +1640,7 @@ impl SecurityPolicy {
             crate::security::path_policy::effective_root(execution_root, self),
             command,
         ) {
-            return Err(match violation {
-                CommandPathViolation::Forbidden(path) => format!("forbidden path argument: {path}"),
-                CommandPathViolation::Dynamic(token) => format!("forbidden dynamic path argument: {token}"),
-                CommandPathViolation::ActiveSubstitution => "forbidden active shell substitution".to_string(),
-            });
+            return Err(violation.into_refusal().to_string());
         }
 
         if !self.is_command_allowed(command) {
@@ -1771,13 +1783,13 @@ impl SecurityPolicy {
     /// Check static shell path arguments against the process directory.
     /// The orchestration validator retains its dynamic-expression restrictions;
     /// this backend check preserves generic shell expansion support.
-    pub(crate) fn validate_command_paths_at(&self, root: &Path, command: &str) -> Result<(), String> {
-        match forbidden_path_argument_inner(self, root, command, 0, false) {
-            None => Ok(()),
-            Some(CommandPathViolation::Forbidden(path)) => Err(format!("forbidden path argument: {path}")),
-            Some(CommandPathViolation::Dynamic(token)) => Err(format!("forbidden dynamic path argument: {token}")),
-            Some(CommandPathViolation::ActiveSubstitution) => Err("forbidden active shell substitution".into()),
-        }
+    pub(crate) fn validate_command_paths_at(
+        &self,
+        root: &Path,
+        command: &str,
+    ) -> Result<(), crate::security::PathRefusal> {
+        forbidden_path_argument_inner(self, root, command, 0, false)
+            .map_or(Ok(()), |violation| Err(violation.into_refusal()))
     }
 
     /// Check if autonomy level permits any action at all
@@ -3689,7 +3701,7 @@ mod tests {
     }
 
     #[test]
-    fn absolute_paths_blocked_when_workspace_only() {
+    fn absolute_paths_outside_workspace_blocked_when_workspace_only() {
         let p = default_policy();
         assert!(!p.is_path_allowed("/etc/passwd"));
         assert!(!p.is_path_allowed("/root/.ssh/id_rsa"));
@@ -4660,7 +4672,7 @@ mod tests {
     }
 
     #[test]
-    fn checklist_workspace_only_blocks_all_absolute() {
+    fn checklist_workspace_only_blocks_absolute_paths_outside_workspace() {
         let p = SecurityPolicy {
             workspace_only: true,
             ..SecurityPolicy::default()
