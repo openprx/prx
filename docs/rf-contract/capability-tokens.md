@@ -174,19 +174,20 @@ without a level reads back Main's level, the one it runs at.
 
 A `POST /api/sessions` is **rf-shaped** when its JSON body carries
 `session_key`. A `POST /api/sessions/{session_id}/message` is rf-shaped when
-the session id is a caller session key (below) or the JSON body carries any rf
-field (`client_message_id`, `deliver`, `chat`, `sender`, `mentions`,
-`reply_to`); it is then validated as the whole rf message body, so a body
-without `client_message_id`, a plain `{"message"}` or a multipart body sent to
-a caller-keyed session is `400 field_invalid`. Only a request to a PRX session
-(`console-…`, or a PRX key with `:`) whose body has none of the rf fields is a
-Console request, and it keeps its previous behaviour and body. rf-shaped
+the session was created by `session_key` (PRX marks such a session at creation)
+or the JSON body carries any rf field (`client_message_id`, `deliver`, `chat`,
+`sender`, `mentions`, `reply_to`); it is then validated as the whole rf message
+body, so a body without `client_message_id`, a plain `{"message"}` or a
+multipart body sent to a caller-keyed session is `400 field_invalid`. Any
+other message request is a Console request and keeps its previous behaviour
+and body. rf-shaped
 requests need a paired bearer: with pairing off they are `401 auth_failed`.
 They take no query parameter, except `mode=async` on the message route. Every
 error is in the coded shape. They share the shared API rate limit.
 
 **Session keys.** `session_key` matches `[A-Za-z0-9_-]{8,128}` and does not
-start with `console-`. The session id is the key itself. A caller-keyed session
+start with `console-`. The session id is the key itself; the session lists with
+`channel` `rf` in `GET /api/sessions`. A caller-keyed session
 belongs to the owner that created it: a message or a messages listing
 (`GET /api/sessions/{session_id}/messages`) on it by another owner is
 `404 session_unknown`, exactly like a key that does not exist.
