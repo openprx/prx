@@ -411,7 +411,7 @@ async fn target_allowlist_semantics() {
     );
     let surface = explicit.surface();
     assert_eq!(surface.allowed_tools, Some(BTreeSet::from(["file_read".to_owned()])));
-    let excluded = BTreeSet::from(["cron".to_owned(), "xin".to_owned()]);
+    let excluded = BTreeSet::from(["cron", "delegate", "sessions_spawn", "subagents", "xin"].map(str::to_owned));
     assert_eq!(surface.excluded_names, excluded);
     let inherit = ToolAllowlist::Inherit.surface();
     assert_eq!(inherit.allowed_tools, None);

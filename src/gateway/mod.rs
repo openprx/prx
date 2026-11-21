@@ -1630,7 +1630,12 @@ fn build_gateway_turn_runtime(
         #[cfg(feature = "wasm-plugins")]
         plugin_runtime,
     )?;
-    Arc::try_unwrap(state.ready()?).map_err(|_| anyhow::anyhow!("new gateway turn runtime was unexpectedly shared"))
+    match state {
+        GatewayTurnState::Ready(generation) => {
+            Arc::try_unwrap(generation).map_err(|_| anyhow::anyhow!("new gateway turn runtime was unexpectedly shared"))
+        }
+        GatewayTurnState::NotReady(standby) => Err(TurnNotReady(standby.reason).into()),
+    }
 }
 
 /// The runtime of `generation` around its already resolved default chat
