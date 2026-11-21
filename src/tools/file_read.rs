@@ -114,6 +114,29 @@ impl FileReadTool {
         crate::security::path_policy::effective_root(self.working_root.as_deref(), &self.security)
     }
 
+    /// The one below-Full path policy for this tool, run by the precheck and
+    /// again at execute time. The outer error is a policy refusal; the inner
+    /// one is a target that does not resolve (reported by execution).
+    async fn confine(
+        &self,
+        path: &str,
+    ) -> Result<std::io::Result<std::path::PathBuf>, crate::security::PathRefusalReason> {
+        use crate::security::PathRefusalReason;
+        let root = self.working_root();
+        self.security.check_path_at(root, path)?;
+        let full_path = crate::security::path_policy::resolve_request_path(root, path)
+            .map_err(|_| PathRefusalReason::InvalidPath)?;
+        // Resolve before reading to block symlink escapes.
+        let resolved = match tokio::fs::canonicalize(&full_path).await {
+            Ok(resolved) => resolved,
+            Err(error) => return Ok(Err(error)),
+        };
+        if !self.security.is_resolved_path_allowed(&resolved) {
+            return Err(PathRefusalReason::SymlinkEscape);
+        }
+        Ok(Ok(resolved))
+    }
+
     async fn execute_operation(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         if let Some(expected) = &self.controlled_filesystem {
             anyhow::ensure!(
@@ -136,50 +159,35 @@ impl FileReadTool {
             .ok_or_else(|| anyhow::anyhow!("Missing 'path' parameter"))?;
 
         let full = super::effective_autonomy::current() == Some(crate::security::AutonomyLevel::Full);
-        // Security check: validate path is within workspace
-        if !full && !self.security.is_path_allowed_at(self.working_root(), path) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Path not allowed by security policy: {path}")),
-            });
-        }
-
-        // Full still rejects parent traversal through the shared resolver.
-        let full_path = if full {
+        let resolved_path = if full {
+            // Full still rejects parent traversal through the shared resolver.
             match crate::security::approval_operation::resolve_file_target(self.working_root(), path, false).await {
-                Ok(path) => path,
-                Err(error) => {
+                Ok(full_path) => tokio::fs::canonicalize(&full_path).await,
+                Err(error) => Err(error),
+            }
+        } else {
+            // Below Full: the same confinement the precheck ran, re-checked now.
+            match self.confine(path).await {
+                Ok(resolved) => resolved,
+                Err(reason) => {
                     return Ok(ToolResult {
                         success: false,
                         output: String::new(),
-                        error: Some(format!("Failed to resolve file path: {error}")),
+                        error: Some(crate::security::PathRefusal::file(reason, path).to_string()),
                     });
                 }
             }
-        } else {
-            crate::security::path_policy::resolve_request_path(self.working_root(), path)?
         };
-
-        // Resolve path before reading to block symlink escapes.
-        let resolved_path = match tokio::fs::canonicalize(&full_path).await {
-            Ok(p) => p,
-            Err(e) => {
+        let resolved_path = match resolved_path {
+            Ok(path) => path,
+            Err(error) => {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(format!("Failed to resolve file path: {e}")),
+                    error: Some(format!("Failed to resolve file path: {error}")),
                 });
             }
         };
-
-        if !full && !self.security.is_resolved_path_allowed(&resolved_path) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Resolved path escapes workspace: {}", resolved_path.display())),
-            });
-        }
 
         if self.is_protected_memory_markdown(&resolved_path) {
             return Ok(ToolResult {
@@ -305,6 +313,20 @@ impl Tool for FileReadTool {
     fn catalog_availability_is_configured(&self) -> bool {
         // FileRead uses the Tool default Ready availability in both ACL modes.
         true
+    }
+
+    async fn path_precheck(&self, args: &serde_json::Value) -> Result<(), crate::security::PathRefusal> {
+        // A controlled tool runs only through its private filesystem resolver.
+        if self.controlled_filesystem.is_some() {
+            return Ok(());
+        }
+        let Some(path) = args.get("path").and_then(serde_json::Value::as_str) else {
+            return Ok(());
+        };
+        self.confine(path)
+            .await
+            .map(|_| ())
+            .map_err(|reason| crate::security::PathRefusal::file(reason, path))
     }
 
     async fn execute_with_cancellation(
@@ -551,7 +573,7 @@ mod tests {
         let result = tool.execute(json!({"path": "escape.txt"})).await.unwrap();
 
         assert!(!result.success);
-        assert!(result.error.as_deref().unwrap_or("").contains("escapes workspace"));
+        assert!(result.error.as_deref().unwrap_or("").contains("through a symlink"));
 
         let _ = tokio::fs::remove_dir_all(&root).await;
     }

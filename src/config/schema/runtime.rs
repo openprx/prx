@@ -466,7 +466,7 @@ mod workdir_tests {
                         .expect("test: read result");
                 assert_eq!(
                     result.error.as_deref(),
-                    Some("Path not allowed by security policy: target"),
+                    Some("Path not allowed: target is a forbidden path"),
                     "test: the forbidden real root must be refused: {result:?}"
                 );
             }

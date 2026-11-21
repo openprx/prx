@@ -289,6 +289,10 @@ impl Tool for ArcDelegatingTool {
         self.inner.execute_with_cancellation(args, cancellation).await
     }
 
+    async fn path_precheck(&self, args: &serde_json::Value) -> Result<(), crate::security::PathRefusal> {
+        self.inner.path_precheck(args).await
+    }
+
     async fn refresh(&self) -> anyhow::Result<()> {
         self.inner.refresh().await
     }

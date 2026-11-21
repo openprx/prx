@@ -93,7 +93,7 @@ impl ShellTool {
                         result: ToolResult {
                             success: false,
                             output: String::new(),
-                            error: Some(error),
+                            error: Some(error.to_string()),
                         },
                         process: None,
                     });
@@ -195,6 +195,17 @@ impl Tool for ShellTool {
     ) -> anyhow::Result<ToolInvocationResult> {
         anyhow::ensure!(name == self.name(), "unsupported shell tool name");
         self.execute_inner(args, cancellation).await
+    }
+
+    async fn path_precheck(&self, args: &serde_json::Value) -> Result<(), crate::security::PathRefusal> {
+        // The same check `execute_inner` re-runs below Full at execute time.
+        let (Some(policy), Some(command)) = (
+            self.path_policy.as_ref(),
+            args.get("command").and_then(serde_json::Value::as_str),
+        ) else {
+            return Ok(());
+        };
+        policy.validate_command_paths_at(&self.workspace_dir, command)
     }
 
     fn name(&self) -> &str {

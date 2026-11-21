@@ -61,6 +61,14 @@ pub trait ToolBackend: Send + Sync {
     ) -> anyhow::Result<Option<(String, crate::acl::approval_grant::RiskLevel)>> {
         Ok(None)
     }
+    /// Read-only below-Full path precheck; see [`Tool::path_precheck`].
+    async fn path_precheck(
+        &self,
+        _public_name: &str,
+        _arguments: &serde_json::Value,
+    ) -> Result<(), crate::security::PathRefusal> {
+        Ok(())
+    }
     /// Defaults closed for aliases, plugins and unaudited backends.
     fn supports_owner_filesystem(&self) -> bool {
         false
@@ -174,6 +182,18 @@ impl ToolBackend for SharedRegistryToolAdapter {
             .ok_or_else(|| anyhow::anyhow!("approval tool unavailable"))?;
         anyhow::ensure!(public_name == tool.name(), "approval alias is unsupported");
         tool.resolve_approval_operation(arguments).await
+    }
+    async fn path_precheck(
+        &self,
+        public_name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<(), crate::security::PathRefusal> {
+        // The root precheck reads the root's arguments; an alias is checked
+        // by its backend at execute time.
+        match self.tool() {
+            Some(tool) if public_name == tool.name() => tool.path_precheck(arguments).await,
+            _ => Ok(()),
+        }
     }
     fn root_name(&self) -> &str {
         &self.root_name
@@ -290,6 +310,17 @@ impl ToolBackend for LegacyToolAdapter {
     ) -> anyhow::Result<Option<(String, crate::acl::approval_grant::RiskLevel)>> {
         anyhow::ensure!(public_name == self.tool.name(), "approval alias is unsupported");
         self.tool.resolve_approval_operation(arguments).await
+    }
+    async fn path_precheck(
+        &self,
+        public_name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<(), crate::security::PathRefusal> {
+        if public_name == self.tool.name() {
+            self.tool.path_precheck(arguments).await
+        } else {
+            Ok(())
+        }
     }
     fn root_name(&self) -> &str {
         self.tool.name()
@@ -2966,6 +2997,39 @@ impl ToolExecutionService {
                 None,
                 started,
             );
+        }
+        // Below Full, a path the tool's own policy refuses never reaches an
+        // approval prompt or a reservation (the structural-validation intent
+        // above). The backend re-checks at execute time with the same
+        // function. A private owner filesystem has its own resolver.
+        if effective_level != crate::security::AutonomyLevel::Full && private_filesystem.is_none() {
+            if let Err(refusal) = resolved
+                .backend
+                .path_precheck(&descriptor.public_name, &command.arguments)
+                .await
+            {
+                // The audit error stays payload-free; only the model-visible
+                // result names the path.
+                let error = format!("path refused before approval ({})", refusal.reason().as_str());
+                let model_content = format!(
+                    "Error: {}. The {} call did not run.",
+                    refusal.message(),
+                    descriptor.public_name
+                );
+                return self.finish(
+                    &command,
+                    &context,
+                    input_sha256,
+                    Some(descriptor),
+                    Some(decision),
+                    ToolExecutionStatus::Denied,
+                    model_content,
+                    None,
+                    Some(error),
+                    None,
+                    started,
+                );
+            }
         }
 
         let mut runtime_approval_granted = false;

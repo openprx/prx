@@ -329,8 +329,8 @@ async fn int_ts_05_file_read_rejects_symlink_escape() {
     );
     let err = result.error.as_deref().unwrap_or("");
     assert!(
-        err.contains("escapes workspace"),
-        "test: expected 'escapes workspace' in error, got: {err}"
+        err.contains("through a symlink"),
+        "test: expected 'through a symlink' in error, got: {err}"
     );
 }
 

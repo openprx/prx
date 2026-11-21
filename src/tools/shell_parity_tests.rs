@@ -582,7 +582,7 @@ async fn working_root_forbidden_file_matrix() {
                     let expected = if readonly_mutation {
                         "Action blocked: autonomy is read-only".to_owned()
                     } else {
-                        format!("Path not allowed by security policy: {path}")
+                        format!("Path not allowed: {path} is a forbidden path")
                     };
                     assert_eq!(
                         result.error.as_deref(),

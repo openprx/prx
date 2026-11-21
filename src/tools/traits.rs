@@ -192,6 +192,15 @@ pub trait Tool: Send + Sync {
         Ok(None)
     }
 
+    /// Read-only path precheck that the execution service runs below Full
+    /// before any approval prompt or reservation. A tool that implements it
+    /// must call the same path policy it applies at execute time, and still
+    /// re-checks there: a file can change between precheck and execution.
+    /// It must not execute, create files, reserve, or grant authority.
+    async fn path_precheck(&self, _args: &serde_json::Value) -> Result<(), crate::security::PathRefusal> {
+        Ok(())
+    }
+
     /// Execute the tool with an optional cancellation token.
     ///
     /// The default implementation races the existing `execute` future against

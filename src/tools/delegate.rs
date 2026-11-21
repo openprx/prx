@@ -1714,6 +1714,14 @@ impl Tool for ToolArcRef {
         self.inner.resolve_approval_operation(args).await
     }
 
+    async fn path_precheck(&self, args: &serde_json::Value) -> Result<(), crate::security::PathRefusal> {
+        // Same root scoping as the approval resolver above.
+        if self.name() != self.inner.name() {
+            return Ok(());
+        }
+        self.inner.path_precheck(args).await
+    }
+
     fn tier(&self) -> ToolTier {
         self.inner.tier()
     }

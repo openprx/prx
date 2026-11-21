@@ -83,39 +83,36 @@ impl FileWriteTool {
         }
 
         let full = super::effective_autonomy::current() == Some(crate::security::AutonomyLevel::Full);
-        // Security check: validate path is within workspace
-        if !full && !self.security.is_path_allowed_at(self.working_root(), path) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Path not allowed by security policy: {path}")),
-            });
-        }
-
-        let resolved_target =
-            match crate::security::approval_operation::resolve_file_target(self.working_root(), path, true).await {
+        let resolved_target = if full {
+            crate::security::approval_operation::resolve_file_target(self.working_root(), path, true).await
+        } else {
+            // Below Full: the same confinement the precheck ran, re-checked now.
+            match crate::security::path_policy::confine_file_target(&self.security, self.working_root(), path, true)
+                .await
+            {
                 Ok(target) => target,
-                Err(error) => {
+                Err(reason) => {
                     return Ok(ToolResult {
                         success: false,
                         output: String::new(),
-                        error: Some(format!("Failed to resolve file path: {error}")),
+                        error: Some(crate::security::PathRefusal::file(reason, path).to_string()),
                     });
                 }
-            };
+            }
+        };
+        let resolved_target = match resolved_target {
+            Ok(target) => target,
+            Err(error) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to resolve file path: {error}")),
+                });
+            }
+        };
         let resolved_parent = resolved_target
             .parent()
             .ok_or_else(|| anyhow::anyhow!("file parent missing"))?;
-        if !full && !self.security.is_resolved_path_allowed(resolved_parent) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Resolved path escapes workspace: {}",
-                    resolved_parent.display()
-                )),
-            });
-        }
         let (operation_name, risk, launch_file, git_control) = crate::security::approval_operation::file_operation(
             self.name(),
             &self.security.workspace_dir,
@@ -284,6 +281,20 @@ impl Tool for FileWriteTool {
 
     fn supports_owner_filesystem(&self) -> bool {
         true
+    }
+
+    async fn path_precheck(&self, args: &serde_json::Value) -> Result<(), crate::security::PathRefusal> {
+        // A controlled tool runs only through its private filesystem resolver.
+        if self.controlled_filesystem.is_some() {
+            return Ok(());
+        }
+        let Some(path) = args.get("path").and_then(serde_json::Value::as_str) else {
+            return Ok(());
+        };
+        crate::security::path_policy::confine_file_target(&self.security, self.working_root(), path, true)
+            .await
+            .map(|_| ())
+            .map_err(|reason| crate::security::PathRefusal::file(reason, path))
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -683,7 +694,7 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result.error.as_deref().unwrap_or("").contains("escapes workspace"));
+        assert!(result.error.as_deref().unwrap_or("").contains("through a symlink"));
         assert!(!outside.join("hijack.txt").exists());
 
         let _ = tokio::fs::remove_dir_all(&root).await;

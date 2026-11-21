@@ -184,6 +184,15 @@ impl Tool for AllowedToolProxy {
         }
     }
 
+    async fn path_precheck(&self, args: &serde_json::Value) -> Result<(), crate::security::PathRefusal> {
+        // Root-scoped like the approval resolver; file and shell tools have
+        // no argument rewrite.
+        match self.find_source_tool() {
+            Some(tool) if self.public_name == tool.name() => tool.path_precheck(args).await,
+            _ => Ok(()),
+        }
+    }
+
     fn tier(&self) -> crate::tools::ToolTier {
         self.find_source_tool()
             .map_or(crate::tools::ToolTier::Standard, Tool::tier)
