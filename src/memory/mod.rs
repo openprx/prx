@@ -54,13 +54,13 @@ pub use traits::CALLER_KEYED_SESSION_CHANNEL;
 pub use traits::LifecycleState;
 pub use traits::Memory;
 pub use traits::{
-    AgentPartition, AgentScopeRefused, AgentScopeUnsupported, ChatProfile, CompactionRun, CompactionRunInput,
-    CompactionSourceEventRange, ConversationSessionOwner, ConversationSessionSummary, ConversationTurn,
-    DocumentChunkRecord, DocumentIngestInput, DocumentRecord, DocumentSearchResult, MemoryCategory, MemoryDraft,
-    MemoryDraftInput, MemoryEntry, MemoryEvent, MemoryEventInput, MemoryLink, MemoryLinkInput, MemoryPrincipal,
-    MemoryReadMode, MemoryStoreMetadata, MemoryVisibility, MessageEvent, MessageEventInput, MessageEventSource,
-    MessageEventSubject, PartitionKey, RetrievalTrace, RetrievalTraceInput, RetrievedContextItem, SessionClaim,
-    SessionContextQuery, SharedContextQuery,
+    AgentPartition, AgentPartitionUnreadable, AgentScopeRefused, AgentScopeUnsupported, ChatProfile, CompactionRun,
+    CompactionRunInput, CompactionSourceEventRange, ConversationSessionOwner, ConversationSessionSummary,
+    ConversationTurn, DocumentChunkRecord, DocumentIngestInput, DocumentRecord, DocumentSearchResult, MemoryCategory,
+    MemoryDraft, MemoryDraftInput, MemoryEntry, MemoryEvent, MemoryEventInput, MemoryLink, MemoryLinkInput,
+    MemoryPrincipal, MemoryReadMode, MemoryStoreMetadata, MemoryVisibility, MessageEvent, MessageEventInput,
+    MessageEventSource, MessageEventSubject, PartitionKey, RetrievalTrace, RetrievalTraceInput, RetrievedContextItem,
+    SessionClaim, SessionContextQuery, SharedContextQuery,
 };
 
 #[cfg(test)]

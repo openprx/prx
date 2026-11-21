@@ -926,6 +926,14 @@ impl Memory for LucidMemory {
         self.local.get_document_chunk(chunk_id).await
     }
 
+    async fn get_document_chunk_scoped(
+        &self,
+        chunk_id: &str,
+        principal: &MemoryPrincipal,
+    ) -> anyhow::Result<Option<DocumentChunkRecord>> {
+        self.local.get_document_chunk_scoped(chunk_id, principal).await
+    }
+
     async fn link_memory_source(&self, input: MemoryLinkInput) -> anyhow::Result<MemoryLink> {
         self.local.link_memory_source(input).await
     }

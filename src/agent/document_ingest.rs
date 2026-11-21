@@ -202,7 +202,8 @@ impl DocumentIngestRuntime {
             owner_id: self.owner_id.clone(),
             require_owner_match: self.require_owner_match,
             legacy_session_key: self.legacy_session_key.clone(),
-            agent_partition: None,
+            // MA-01h: reads made for the turn stay in its agent partition.
+            agent_partition: self.agent_partition.clone(),
         }
     }
 }

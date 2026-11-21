@@ -103,6 +103,52 @@ pub(super) fn vector_candidate_query(
 /// per recall would bury the turn logs, so it is latched per process.
 static VECTOR_CANDIDATE_CAP_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// `memories.ma_scope_id` qualified by the `m` alias of the FTS joins.
+const MEMORY_ALIAS_SCOPE_COLUMN: &str = "m.ma_scope_id";
+
+/// MA-01h: the partition conjunct on a `memories` column with bare `?`
+/// markers, for statements whose scope predicate binds positionally.
+fn memory_partition_conjunct(column: &str, partition: Option<&crate::memory::AgentPartition>) -> (String, Vec<Value>) {
+    let (sql, values) = super::events::partition_conjunct(column, partition, || "?".to_string());
+    (sql, values.into_iter().map(Value::from).collect())
+}
+
+/// The ids among `ids` whose `memories` row lies in `partition`.
+fn partition_visible_memory_ids(
+    conn: &Connection,
+    ids: &[&str],
+    partition: &crate::memory::AgentPartition,
+) -> anyhow::Result<std::collections::HashSet<String>> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let (partition_sql, partition_values) = memory_partition_conjunct(super::events::MA_SCOPE_COLUMN, Some(partition));
+    let placeholders = vec!["?"; ids.len()].join(",");
+    let sql = format!("SELECT id FROM memories WHERE id IN ({placeholders}){partition_sql}");
+    let mut values = ids.iter().map(|id| Value::from((*id).to_string())).collect::<Vec<_>>();
+    values.extend(partition_values);
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(values), |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Keep only the entries whose row lies in `partition`; `None` keeps all.
+fn retain_partition_entries(
+    conn: &Connection,
+    entries: Vec<MemoryEntry>,
+    partition: Option<&crate::memory::AgentPartition>,
+) -> anyhow::Result<Vec<MemoryEntry>> {
+    let Some(partition) = partition else {
+        return Ok(entries);
+    };
+    let ids = entries.iter().map(|entry| entry.id.as_str()).collect::<Vec<_>>();
+    let visible = partition_visible_memory_ids(conn, &ids, partition)?;
+    Ok(entries
+        .into_iter()
+        .filter(|entry| visible.contains(&entry.id))
+        .collect())
+}
+
 impl SqliteMemory {
     pub(super) fn open_rehearsal_reader(db_path: &Path, deadline: std::time::Instant) -> anyhow::Result<Connection> {
         anyhow::ensure!(std::time::Instant::now() < deadline, "rehearsal count deadline expired");
@@ -1094,6 +1140,25 @@ impl SqliteMemory {
         Ok(())
     }
 
+    /// Keep only the entries whose row lies in `partition` (MA-01h); `None`
+    /// keeps all.
+    async fn retain_in_partition(
+        &self,
+        entries: Vec<MemoryEntry>,
+        partition: Option<crate::memory::AgentPartition>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        if partition.is_none() || entries.is_empty() {
+            return Ok(entries);
+        }
+        let pool = self.pool.clone();
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
+            let reader = pool.read()?;
+            let conn = reader.connection()?;
+            retain_partition_entries(&conn, entries, partition.as_ref())
+        })
+        .await?
+    }
+
     pub(super) async fn recall_impl(
         &self,
         query: &str,
@@ -1339,14 +1404,17 @@ impl SqliteMemory {
             let mut allowed_ids = std::collections::HashSet::new();
             if !entries.is_empty() {
                 let id_placeholders = (0..entries.len()).map(|_| "?").collect::<Vec<_>>().join(",");
+                let (partition_sql, partition_params) =
+                    memory_partition_conjunct(super::events::MA_SCOPE_COLUMN, context.agent_partition.as_ref());
                 let sql = format!(
-                    "SELECT id, source_event_id FROM memories WHERE id IN ({id_placeholders}) AND ({scope_sql})"
+                    "SELECT id, source_event_id FROM memories WHERE id IN ({id_placeholders}) AND ({scope_sql}){partition_sql}"
                 );
                 let mut params = entries
                     .iter()
                     .map(|entry| Value::from(entry.id.clone()))
                     .collect::<Vec<_>>();
                 params.extend(scope_params);
+                params.extend(partition_params);
                 let mut stmt = conn.prepare(&sql)?;
                 let rows = stmt.query_map(params_from_iter(params), |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
@@ -1399,15 +1467,18 @@ impl SqliteMemory {
             let principal = sqlite_read_principal(&conn, &context);
             anyhow::ensure!(std::time::Instant::now() < deadline, "rehearsal count deadline expired");
             let (scope_sql, scope_params) = principal.build_sql_scope();
+            let (partition_sql, partition_params) =
+                memory_partition_conjunct(MEMORY_ALIAS_SCOPE_COLUMN, context.agent_partition.as_ref());
             let sql = format!(
                 "SELECT m.content FROM memories_fts f JOIN memories m ON m.rowid = f.rowid \
-                 WHERE memories_fts MATCH ? AND ({scope_sql}) \
+                 WHERE memories_fts MATCH ? AND ({scope_sql}){partition_sql} \
                  AND length(CAST(m.content AS BLOB)) <= 4096 \
                  ORDER BY bm25(memories_fts) LIMIT ?"
             );
-            let mut params = Vec::with_capacity(scope_params.len() + 2);
+            let mut params = Vec::with_capacity(scope_params.len() + partition_params.len() + 2);
             params.push(Value::from(fts_query));
             params.extend(scope_params);
+            params.extend(partition_params);
             params.push(Value::from(i64::from(limit) * 3));
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(params_from_iter(params), |row| row.get::<_, String>(0))?;
@@ -1449,9 +1520,11 @@ impl SqliteMemory {
             let conn = Self::open_rehearsal_reader(&db_path, deadline)?;
             let principal = sqlite_read_principal(&conn, &context);
             let (scope_sql, scope_params) = principal.build_sql_scope();
+            let (partition_sql, partition_params) =
+                memory_partition_conjunct(MEMORY_ALIAS_SCOPE_COLUMN, context.agent_partition.as_ref());
             let sql = format!(
                 "SELECT m.id, m.content, m.created_at, m.source_event_id, m.key, m.category, m.session_id FROM memories_fts f JOIN memories m ON m.rowid = f.rowid \
-                 WHERE memories_fts MATCH ? AND ({scope_sql}) \
+                 WHERE memories_fts MATCH ? AND ({scope_sql}){partition_sql} \
                  AND length(CAST(m.id AS BLOB)) <= 128 \
                  AND length(CAST(m.content AS BLOB)) <= 4096 \
                  AND length(CAST(m.created_at AS BLOB)) <= 64 \
@@ -1461,9 +1534,10 @@ impl SqliteMemory {
                  AND (? IS NULL OR m.session_id = ?) \
                  ORDER BY bm25(memories_fts) LIMIT ?"
             );
-            let mut params = Vec::with_capacity(scope_params.len() + 4);
+            let mut params = Vec::with_capacity(scope_params.len() + partition_params.len() + 4);
             params.push(Value::from(fts_query));
             params.extend(scope_params);
+            params.extend(partition_params);
             params.push(session_id.clone().map(Value::from).unwrap_or(Value::Null));
             params.push(session_id.map(Value::from).unwrap_or(Value::Null));
             params.push(Value::from(i64::from(limit) * 3));
@@ -1506,7 +1580,12 @@ impl SqliteMemory {
         } else {
             mode
         };
+        // MA-01h: the partition is not an ACL tier; Observe mode never reads
+        // past it.
         let unrestricted = self.recall(query, limit, session_id).await?;
+        let unrestricted = self
+            .retain_in_partition(unrestricted, context.agent_partition.clone())
+            .await?;
         let scoped = self
             .recall_with_context(query, limit, session_id, Some(&context))
             .await?;
@@ -1556,6 +1635,7 @@ impl SqliteMemory {
                         });
                     }
                 }
+                let rows = retain_partition_entries(&conn, rows, context.agent_partition.as_ref())?;
                 Ok((rows, principal))
             })
             .await??;
@@ -1659,12 +1739,15 @@ impl SqliteMemory {
             let conn = reader.connection()?;
             let principal = sqlite_read_principal(&conn, &context);
             let (scope_sql, scope_params) = principal.build_sql_scope();
-            let mut query_params = Vec::with_capacity(scope_params.len() + 1);
+            let (partition_sql, partition_params) =
+                memory_partition_conjunct(super::events::MA_SCOPE_COLUMN, context.agent_partition.as_ref());
+            let mut query_params = Vec::with_capacity(scope_params.len() + partition_params.len() + 1);
             query_params.push(Value::from(key.clone()));
             query_params.extend(scope_params);
+            query_params.extend(partition_params);
             let sql = format!(
                 "SELECT id, key, content, category, created_at, session_id, useful_count
-                 FROM memories WHERE key = ?1 AND ({scope_sql}) LIMIT 1"
+                 FROM memories WHERE key = ?1 AND ({scope_sql}){partition_sql} LIMIT 1"
             );
             let entry = conn
                 .query_row(&sql, params_from_iter(query_params), |row| {
@@ -1711,6 +1794,11 @@ impl SqliteMemory {
         };
         let scoped = self.get_with_context(key, Some(&context)).await?;
         let unrestricted = self.get(key).await?;
+        // MA-01h: as in `recall_with_context_mode`, Observe never reads past the partition.
+        let unrestricted = self
+            .retain_in_partition(unrestricted.into_iter().collect(), context.agent_partition.clone())
+            .await?
+            .pop();
         let selected = match mode {
             MemoryReadMode::Enforce => scoped.clone(),
             MemoryReadMode::Observe => unrestricted.clone(),
@@ -1866,14 +1954,21 @@ impl SqliteMemory {
             // the template order is preserved.
             let owner_anchor = Self::forget_owner_anchor(&context);
             let owner_guard = Self::forget_owner_guard(&context, scope_params.len() + 2);
-            let mut query_params = Vec::with_capacity(scope_params.len() + 2);
+            // MA-01h: a partitioned caller deletes only a row of its own partition.
+            // The conjunct's bare markers follow every numbered one.
+            let (partition_sql, partition_params) =
+                memory_partition_conjunct(super::events::MA_SCOPE_COLUMN, context.agent_partition.as_ref());
+            let mut query_params = Vec::with_capacity(scope_params.len() + partition_params.len() + 2);
             query_params.push(Value::from(key.clone()));
             query_params.extend(scope_params);
             if let (true, Some(owner)) = (owner_guard.bound_owner, owner_anchor.as_deref()) {
                 query_params.push(Value::from(owner.to_string()));
             }
+            query_params.extend(partition_params);
             let owner_guard_sql = owner_guard.sql;
-            let query = format!("SELECT id FROM memories WHERE key = ?1 AND ({scope_sql}){owner_guard_sql} LIMIT 1");
+            let query = format!(
+                "SELECT id FROM memories WHERE key = ?1 AND ({scope_sql}){owner_guard_sql}{partition_sql} LIMIT 1"
+            );
             let visible_id = conn
                 .query_row(&query, params_from_iter(query_params), |row| row.get::<_, String>(0))
                 .optional()?;

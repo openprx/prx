@@ -699,6 +699,24 @@ impl Memory for SqliteMemory {
         self.list_conversation_sessions_impl(limit, offset, channel).await
     }
 
+    async fn list_owner_conversation_sessions(
+        &self,
+        owner_id: &str,
+        limit: usize,
+        offset: usize,
+        channel: Option<&str>,
+    ) -> anyhow::Result<Vec<ConversationSessionSummary>> {
+        self.list_owner_conversation_sessions_impl(owner_id, limit, offset, channel)
+            .await
+    }
+
+    async fn conversation_turn_agent_keys(
+        &self,
+        turn_ids: &[i64],
+    ) -> anyhow::Result<std::collections::HashMap<i64, String>> {
+        self.conversation_turn_agent_keys_impl(turn_ids).await
+    }
+
     async fn get_conversation_session(&self, session_key: &str) -> anyhow::Result<Option<ConversationSessionSummary>> {
         self.get_conversation_session_impl(session_key).await
     }
@@ -1140,6 +1158,14 @@ impl Memory for SqliteMemory {
 
     async fn get_document_chunk(&self, chunk_id: &str) -> anyhow::Result<Option<DocumentChunkRecord>> {
         self.get_document_chunk_impl(chunk_id).await
+    }
+
+    async fn get_document_chunk_scoped(
+        &self,
+        chunk_id: &str,
+        principal: &MemoryPrincipal,
+    ) -> anyhow::Result<Option<DocumentChunkRecord>> {
+        self.get_document_chunk_scoped_impl(chunk_id, principal).await
     }
 
     async fn link_memory_source(&self, input: MemoryLinkInput) -> anyhow::Result<MemoryLink> {

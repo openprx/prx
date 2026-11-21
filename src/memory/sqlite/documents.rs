@@ -8,10 +8,13 @@ use crate::memory::traits::{
     RetrievalTraceInput,
 };
 use chrono::{Local, Utc};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, params, params_from_iter, types::Value};
 use uuid::Uuid;
 
 use super::{SQLITE_DIALECT, SqliteMemory};
+
+/// `document_chunks.ma_scope_id` qualified by the `c` alias of the search joins.
+const CHUNK_SCOPE_COLUMN: &str = "c.ma_scope_id";
 
 impl SqliteMemory {
     fn document_owner_for_principal(principal: &MemoryPrincipal) -> Option<String> {
@@ -342,6 +345,12 @@ impl SqliteMemory {
         let principal = principal.clone();
         let owner_id = Self::document_owner_for_principal(&principal);
         let visibility_guard = Self::document_visibility_guard(&principal);
+        // MA-01h: the partition binds after `?4`.
+        let (partition_sql, partition_values) = super::events::partition_conjunct(
+            CHUNK_SCOPE_COLUMN,
+            principal.agent_partition.as_ref(),
+            super::events::numbered_placeholders(5),
+        );
         crate::runtime::blocking::spawn_blocking(
             move || -> anyhow::Result<Vec<crate::memory::traits::DecisionDocumentHit>> {
                 let conn = Self::open_rehearsal_reader(&db_path, deadline)?;
@@ -353,24 +362,28 @@ impl SqliteMemory {
                  WHERE document_chunks_fts MATCH ?1
                    AND c.workspace_id = ?2 AND d.workspace_id = ?2
                    AND (d.visibility IN ('global', 'workspace'){visibility_guard}
-                        OR (?3 IS NOT NULL AND c.owner_id = ?3))
+                        OR (?3 IS NOT NULL AND c.owner_id = ?3)){partition_sql}
                    AND length(CAST(c.chunk_id AS BLOB)) <= 128
                    AND length(CAST(c.document_id AS BLOB)) <= 128
                    AND length(CAST(c.content AS BLOB)) <= 4096
                    AND length(CAST(c.created_at AS BLOB)) <= 64
                  ORDER BY bm25(document_chunks_fts), c.chunk_id LIMIT ?4"
                 ))?;
-                let rows = stmt.query_map(
-                    params![fts_query, principal.workspace_id, owner_id, i64::from(limit)],
-                    |row| {
-                        Ok(crate::memory::traits::DecisionDocumentHit {
-                            chunk_id: row.get(0)?,
-                            document_id: row.get(1)?,
-                            content: row.get(2)?,
-                            created_at: row.get(3)?,
-                        })
-                    },
-                )?;
+                let mut values = vec![
+                    Value::from(fts_query),
+                    Value::from(principal.workspace_id.clone()),
+                    Value::from(owner_id),
+                    Value::from(i64::from(limit)),
+                ];
+                values.extend(partition_values.into_iter().map(Value::from));
+                let rows = stmt.query_map(params_from_iter(values), |row| {
+                    Ok(crate::memory::traits::DecisionDocumentHit {
+                        chunk_id: row.get(0)?,
+                        document_id: row.get(1)?,
+                        content: row.get(2)?,
+                        created_at: row.get(3)?,
+                    })
+                })?;
                 let hits = rows.collect::<rusqlite::Result<Vec<_>>>()?;
                 anyhow::ensure!(
                     std::time::Instant::now() < deadline,
@@ -410,6 +423,18 @@ impl SqliteMemory {
         let embedding_model = self.embedding_model_name();
         let embedding_dimensions = self.embedder.dimensions();
         let embedding_dimensions_i64 = self.embedding_dimensions_i64();
+        // MA-01h: the partition binds after the last fixed placeholder of each
+        // statement (`?4` for the keyword search, `?5` for the vector scan).
+        let (keyword_partition_sql, keyword_partition_values) = super::events::partition_conjunct(
+            CHUNK_SCOPE_COLUMN,
+            principal.agent_partition.as_ref(),
+            super::events::numbered_placeholders(5),
+        );
+        let (vector_partition_sql, vector_partition_values) = super::events::partition_conjunct(
+            CHUNK_SCOPE_COLUMN,
+            principal.agent_partition.as_ref(),
+            super::events::numbered_placeholders(6),
+        );
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<DocumentSearchResult>> {
             let reader = pool.read()?;
@@ -431,11 +456,18 @@ impl SqliteMemory {
                        AND (
                            d.visibility IN ('global', 'workspace'){visibility_guard}
                            OR (?3 IS NOT NULL AND c.owner_id = ?3)
-                       )
+                       ){keyword_partition_sql}
                      ORDER BY score ASC
                      LIMIT ?4",
                 ))?;
-                let rows = stmt.query_map(params![fts_query, principal.workspace_id, owner_id, limit], |row| {
+                let mut values = vec![
+                    Value::from(fts_query),
+                    Value::from(principal.workspace_id.clone()),
+                    Value::from(owner_id.clone()),
+                    Value::from(limit),
+                ];
+                values.extend(keyword_partition_values.into_iter().map(Value::from));
+                let rows = stmt.query_map(params_from_iter(values), |row| {
                     let chunk = Self::document_chunk_from_row(row)?;
                     let score: f32 = row.get(14)?;
                     let source_kind: Option<String> = row.get(15)?;
@@ -469,16 +501,18 @@ impl SqliteMemory {
                        AND (
                            d.visibility IN ('global', 'workspace'){visibility_guard}
                            OR (?5 IS NOT NULL AND c.owner_id = ?5)
-                       )",
+                       ){vector_partition_sql}",
                 ))?;
+                let mut values = vec![
+                    Value::from(embedding_provider),
+                    Value::from(embedding_model),
+                    Value::from(embedding_dimensions_i64),
+                    Value::from(principal.workspace_id.clone()),
+                    Value::from(owner_id),
+                ];
+                values.extend(vector_partition_values.into_iter().map(Value::from));
                 let rows = stmt.query_map(
-                    params![
-                        embedding_provider,
-                        embedding_model,
-                        embedding_dimensions_i64,
-                        principal.workspace_id,
-                        owner_id
-                    ],
+                    params_from_iter(values),
                     |row| {
                         let chunk = Self::document_chunk_from_row(row)?;
                         let embedding_blob: Vec<u8> = row.get(14)?;
@@ -543,6 +577,43 @@ impl SqliteMemory {
                  WHERE chunk_id = ?1
                  LIMIT 1",
                 params![chunk_id],
+                Self::document_chunk_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+        .await?
+    }
+
+    /// One chunk by id, only when its row lies in the principal's partition
+    /// (MA-01h); an unpartitioned principal reads as `get_document_chunk_impl`.
+    pub(super) async fn get_document_chunk_scoped_impl(
+        &self,
+        chunk_id: &str,
+        principal: &MemoryPrincipal,
+    ) -> anyhow::Result<Option<DocumentChunkRecord>> {
+        let pool = self.pool.clone();
+        let chunk_id = chunk_id.to_string();
+        let (partition_sql, partition_values) = super::events::partition_conjunct(
+            super::events::MA_SCOPE_COLUMN,
+            principal.agent_partition.as_ref(),
+            super::events::numbered_placeholders(2),
+        );
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Option<DocumentChunkRecord>> {
+            let reader = pool.read()?;
+            let conn = reader.connection()?;
+            let mut values = vec![Value::from(chunk_id)];
+            values.extend(partition_values.into_iter().map(Value::from));
+            conn.query_row(
+                &format!(
+                    "SELECT id, chunk_id, document_id, workspace_id, owner_id, topic_id, task_id,
+                        chunk_index, heading, content, content_sha256, source_anchor,
+                        token_estimate, created_at
+                 FROM document_chunks
+                 WHERE chunk_id = ?1{partition_sql}
+                 LIMIT 1"
+                ),
+                params_from_iter(values),
                 Self::document_chunk_from_row,
             )
             .optional()

@@ -54,6 +54,19 @@ impl std::fmt::Display for AgentScopeRefused {
 
 impl std::error::Error for AgentScopeRefused {}
 
+/// A runtime-authenticated scope whose agent partition cannot be read: a
+/// partitioned read refuses instead of reading unpartitioned (MA-01h).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentPartitionUnreadable;
+
+impl std::fmt::Display for AgentPartitionUnreadable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("the agent partition of this call cannot be determined")
+    }
+}
+
+impl std::error::Error for AgentPartitionUnreadable {}
+
 /// Where a recalled entry came from, as known to the backend that returned it.
 ///
 /// Not serialized: it is a runtime fact about the read, never wire data.
@@ -1995,6 +2008,28 @@ pub trait Memory: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// List the persisted conversation sessions of one owner, ordered by most
+    /// recently updated. A backend that lists no sessions lists none here.
+    async fn list_owner_conversation_sessions(
+        &self,
+        owner_id: &str,
+        limit: usize,
+        offset: usize,
+        channel: Option<&str>,
+    ) -> anyhow::Result<Vec<ConversationSessionSummary>> {
+        let _ = (owner_id, limit, offset, channel);
+        Ok(Vec::new())
+    }
+
+    /// The agent key of each stored conversation turn among `turn_ids`
+    /// (MA-01h): `m` for a Main row (stamped Main or unstamped) and
+    /// `n:<name>` for a named agent's row. A backend that keeps no agent
+    /// scopes cannot label rows.
+    async fn conversation_turn_agent_keys(&self, turn_ids: &[i64]) -> anyhow::Result<HashMap<i64, String>> {
+        let _ = turn_ids;
+        Err(AgentScopeUnsupported.into())
+    }
+
     /// Get one persisted conversation session by key.
     async fn get_conversation_session(&self, session_key: &str) -> anyhow::Result<Option<ConversationSessionSummary>> {
         let _ = session_key;
@@ -2685,6 +2720,19 @@ pub trait Memory: Send + Sync {
     async fn get_document_chunk(&self, chunk_id: &str) -> anyhow::Result<Option<DocumentChunkRecord>> {
         let _ = chunk_id;
         Err(crate::memory::document::fail_fast(self.name(), "get_document_chunk"))
+    }
+
+    /// Retrieve one document chunk by id only when it lies in the principal's
+    /// agent partition (MA-01h). A backend that keeps no agent scopes holds
+    /// only Main rows: it refuses a Named partition and reads as
+    /// [`Memory::get_document_chunk`] otherwise.
+    async fn get_document_chunk_scoped(
+        &self,
+        chunk_id: &str,
+        principal: &MemoryPrincipal,
+    ) -> anyhow::Result<Option<DocumentChunkRecord>> {
+        principal.reject_named_scope()?;
+        self.get_document_chunk(chunk_id).await
     }
 
     /// Link a memory/event/summary to a source document chunk.

@@ -9,35 +9,67 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// One parenthesised conjunct after existing predicates. Empty when `None`.
-pub(crate) fn agent_partition_clause(principal: &MemoryPrincipal, first_placeholder: usize) -> (String, Vec<String>) {
-    let Some(partition) = principal.agent_partition.as_ref() else {
+/// The agent-scope column every partitioned store carries.
+pub(crate) const MA_SCOPE_COLUMN: &str = "ma_scope_id";
+
+/// One parenthesised conjunct on `column` after existing predicates, with its
+/// bound values in placeholder order. Empty when `partition` is `None`.
+///
+/// Named: rows of exactly (workspace, owner, `n:<name>`, incarnation). Main:
+/// unstamped rows and rows of a Main scope in the workspace. `placeholder`
+/// yields the next bind marker (`?N` or `?`); `column` is a constant.
+pub(crate) fn partition_conjunct(
+    column: &str,
+    partition: Option<&crate::memory::AgentPartition>,
+    mut placeholder: impl FnMut() -> String,
+) -> (String, Vec<String>) {
+    let Some(partition) = partition else {
         return (String::new(), Vec::new());
     };
     match &partition.key {
-        PartitionKey::Named { name, incarnation } => (
-            format!(
-                " AND (ma_scope_id IN (SELECT scope_id FROM agent_scopes WHERE workspace_id=?{n} AND owner_id=?{n1} AND agent_key=?{n2} AND incarnation=?{n3}))",
-                n = first_placeholder,
-                n1 = first_placeholder + 1,
-                n2 = first_placeholder + 2,
-                n3 = first_placeholder + 3,
-            ),
-            vec![
-                partition.workspace_id.clone(),
-                partition.owner_id.clone(),
-                format!("n:{}", name.as_str()),
-                incarnation.to_string(),
-            ],
-        ),
-        PartitionKey::Main => (
-            format!(
-                " AND (ma_scope_id IS NULL OR ma_scope_id IN (SELECT scope_id FROM agent_scopes WHERE workspace_id=?{n} AND agent_key='m'))",
-                n = first_placeholder,
-            ),
-            vec![partition.workspace_id.clone()],
-        ),
+        PartitionKey::Named { name, incarnation } => {
+            let (workspace, owner, key, generation) = (placeholder(), placeholder(), placeholder(), placeholder());
+            (
+                format!(
+                    " AND ({column} IN (SELECT scope_id FROM agent_scopes WHERE workspace_id={workspace} AND owner_id={owner} AND agent_key={key} AND incarnation={generation}))"
+                ),
+                vec![
+                    partition.workspace_id.clone(),
+                    partition.owner_id.clone(),
+                    format!("n:{}", name.as_str()),
+                    incarnation.to_string(),
+                ],
+            )
+        }
+        PartitionKey::Main => {
+            let workspace = placeholder();
+            (
+                format!(
+                    " AND ({column} IS NULL OR {column} IN (SELECT scope_id FROM agent_scopes WHERE workspace_id={workspace} AND agent_key='m'))"
+                ),
+                vec![partition.workspace_id.clone()],
+            )
+        }
     }
+}
+
+/// Numbered bind markers `?first`, `?first+1`, ...
+pub(crate) fn numbered_placeholders(first: usize) -> impl FnMut() -> String {
+    let mut next = first;
+    move || {
+        let marker = format!("?{next}");
+        next += 1;
+        marker
+    }
+}
+
+/// [`partition_conjunct`] on `ma_scope_id` for the principal's partition.
+pub(crate) fn agent_partition_clause(principal: &MemoryPrincipal, first_placeholder: usize) -> (String, Vec<String>) {
+    partition_conjunct(
+        MA_SCOPE_COLUMN,
+        principal.agent_partition.as_ref(),
+        numbered_placeholders(first_placeholder),
+    )
 }
 
 pub(crate) const fn conversation_turns_ordering(recorded_order: bool) -> &'static str {
@@ -716,6 +748,78 @@ impl SqliteMemory {
         .await?
     }
 
+    /// `list_conversation_sessions_impl` restricted to the sessions whose
+    /// stored owner is `owner_id`.
+    pub(super) async fn list_owner_conversation_sessions_impl(
+        &self,
+        owner_id: &str,
+        limit: usize,
+        offset: usize,
+        channel: Option<&str>,
+    ) -> anyhow::Result<Vec<ConversationSessionSummary>> {
+        let pool = self.pool.clone();
+        let limit = Self::sanitize_conversation_limit(limit);
+        let offset = Self::sanitize_conversation_offset(offset);
+        let owner_id = owner_id.to_string();
+        let channel = channel.map(str::to_string);
+
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<ConversationSessionSummary>> {
+            let reader = pool.read()?;
+            let conn = reader.connection()?;
+            let mut stmt = conn.prepare(
+                "SELECT session_key, channel, sender, created_at, updated_at, message_count, last_message_preview
+                 FROM sessions
+                 WHERE owner_id = ?1 AND (?2 IS NULL OR channel = ?2)
+                 ORDER BY updated_at DESC
+                 LIMIT ?3 OFFSET ?4",
+            )?;
+            let rows = stmt.query_map(params![owner_id, channel, limit, offset], |row| {
+                let message_count: i64 = row.get(5)?;
+                Ok(ConversationSessionSummary {
+                    session_key: row.get(0)?,
+                    channel: row.get(1)?,
+                    sender: row.get(2)?,
+                    created_at: row.get(3)?,
+                    updated_at: row.get(4)?,
+                    message_count: u64::try_from(message_count).unwrap_or(0),
+                    last_message_preview: row.get(6)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
+        .await?
+    }
+
+    /// The agent key of each conversation turn among `turn_ids`: the key of its
+    /// stamped scope, or `m` for an unstamped (Main) row.
+    pub(super) async fn conversation_turn_agent_keys_impl(
+        &self,
+        turn_ids: &[i64],
+    ) -> anyhow::Result<std::collections::HashMap<i64, String>> {
+        if turn_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let pool = self.pool.clone();
+        let turn_ids = turn_ids.to_vec();
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<std::collections::HashMap<i64, String>> {
+            let reader = pool.read()?;
+            let conn = reader.connection()?;
+            let placeholders = vec!["?"; turn_ids.len()].join(",");
+            let mut stmt = conn.prepare(&format!(
+                "SELECT turn.id, COALESCE(scope.agent_key, 'm')
+                 FROM conversation_turns turn
+                 LEFT JOIN agent_scopes scope ON scope.scope_id = turn.ma_scope_id
+                 WHERE turn.id IN ({placeholders})"
+            ))?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(turn_ids.iter()), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<Result<std::collections::HashMap<_, _>, _>>()
+                .map_err(Into::into)
+        })
+        .await?
+    }
+
     pub(super) async fn get_conversation_session_impl(
         &self,
         session_key: &str,
@@ -1161,6 +1265,12 @@ impl SqliteMemory {
             crate::memory::owner_predicate::has_owner_id(&principal),
         );
 
+        // MA-01h: the partition binds after every other placeholder.
+        let (partition_sql, partition_values) = agent_partition_clause(
+            &principal,
+            Self::owner_index(8, legacy_session_keys.len()) + usize::from(owner_required_fragment.bound_owner),
+        );
+
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MessageEvent>> {
             let reader = pool.read()?;
             let conn = reader.connection()?;
@@ -1190,7 +1300,7 @@ impl SqliteMemory {
                                OR (visibility = 'system' AND ?6)
                            )
                        )
-                   )
+                   ){partition_sql}
                  ORDER BY id DESC
                  LIMIT ?7",
                 session_fragment = session_fragment.sql,
@@ -1211,6 +1321,9 @@ impl SqliteMemory {
             }
             if owner_required_fragment.bound_owner {
                 bind.push(&principal.owner_id);
+            }
+            for value in &partition_values {
+                bind.push(value);
             }
             let rows = stmt.query_map(bind.as_slice(), Self::message_event_from_row)?;
 
@@ -1262,6 +1375,11 @@ impl SqliteMemory {
             crate::memory::owner_predicate::has_owner_id(&principal),
         );
 
+        let (partition_sql, partition_values) = agent_partition_clause(
+            &principal,
+            Self::owner_index(12, legacy_session_keys.len()) + usize::from(owner_required_fragment.bound_owner),
+        );
+
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MessageEvent>> {
             let reader = pool.read()?;
             let conn = reader.connection()?;
@@ -1298,7 +1416,7 @@ impl SqliteMemory {
                                OR (visibility = 'system' AND ?6)
                            )
                        )
-                 )
+                 ){partition_sql}
                  ORDER BY created_at ASC, id ASC
                  LIMIT ?11",
                 session_fragment = session_fragment.sql,
@@ -1323,6 +1441,9 @@ impl SqliteMemory {
             }
             if owner_required_fragment.bound_owner {
                 bind.push(&principal.owner_id);
+            }
+            for value in &partition_values {
+                bind.push(value);
             }
             let rows = stmt.query_map(bind.as_slice(), Self::message_event_from_row)?;
             rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1368,6 +1489,11 @@ impl SqliteMemory {
             crate::memory::owner_predicate::has_owner_id(&principal),
         );
 
+        let (partition_sql, partition_values) = agent_partition_clause(
+            &principal,
+            Self::owner_index(9, legacy_session_keys.len()) + usize::from(owner_required_fragment.bound_owner),
+        );
+
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MessageEvent>> {
             let reader = pool.read()?;
             let conn = reader.connection()?;
@@ -1398,7 +1524,7 @@ impl SqliteMemory {
                                OR (visibility = 'system' AND ?7)
                            )
                        )
-                   )
+                   ){partition_sql}
                  ORDER BY id DESC
                  LIMIT ?8",
                 session_fragment = session_fragment.sql,
@@ -1420,6 +1546,9 @@ impl SqliteMemory {
             }
             if owner_required_fragment.bound_owner {
                 bind.push(&principal.owner_id);
+            }
+            for value in &partition_values {
+                bind.push(value);
             }
             let rows = stmt.query_map(bind.as_slice(), Self::message_event_from_row)?;
 
@@ -1495,6 +1624,11 @@ impl SqliteMemory {
         // every other reader's statement is byte-identical.
         let shared_tiers_arm = crate::memory::owner_predicate::session_context_shared_tiers(&owner_fragment);
 
+        let (partition_sql, partition_values) = agent_partition_clause(
+            &principal,
+            Self::owner_index(9, legacy_session_keys.len()) + usize::from(owner_required_fragment.bound_owner),
+        );
+
         crate::runtime::blocking::spawn_blocking(
             move || -> anyhow::Result<Vec<crate::memory::traits::DecisionSessionHit>> {
                 let conn = Self::open_rehearsal_reader(&db_path, deadline)?;
@@ -1527,7 +1661,7 @@ impl SqliteMemory {
                        ){owner_required_fragment})
                        OR (visibility = 'system' AND ?7)
                    )
-                   AND role IN ('user', 'assistant') AND event_type = 'message.created'
+                   AND role IN ('user', 'assistant') AND event_type = 'message.created'{partition_sql}
                    AND length(CAST(event_id AS BLOB)) <= 128
                    AND length(CAST(content AS BLOB)) <= 4096
                    AND length(CAST(created_at AS BLOB)) <= 64
@@ -1552,6 +1686,9 @@ impl SqliteMemory {
                 }
                 if owner_required_fragment.bound_owner {
                     bind.push(&principal.owner_id);
+                }
+                for value in &partition_values {
+                    bind.push(value);
                 }
                 let rows = stmt.query_map(bind.as_slice(), |row| {
                     Ok(crate::memory::traits::DecisionSessionHit {
@@ -1658,6 +1795,11 @@ impl SqliteMemory {
         let before_fragment = before_id.map_or_else(String::new, |_| {
             format!(" AND id < ?{}", first_role_index + include_roles.len())
         });
+        // MA-01h: the partition binds after every other placeholder.
+        let (partition_sql, partition_values) = agent_partition_clause(
+            &principal,
+            first_role_index + include_roles.len() + usize::from(before_id.is_some()),
+        );
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MessageEvent>> {
             let reader = pool.read()?;
@@ -1686,7 +1828,7 @@ impl SqliteMemory {
                            OR (?6 IS NOT NULL AND sender = ?6)
                        ){owner_required_fragment})
                        OR (visibility = 'system' AND ?7)
-                   ){before_fragment}
+                   ){before_fragment}{partition_sql}
                  ORDER BY id DESC
                  LIMIT ?8",
                 session_fragment = session_fragment.sql,
@@ -1715,6 +1857,9 @@ impl SqliteMemory {
             }
             if let Some(before_id) = &before_id {
                 bind.push(before_id);
+            }
+            for value in &partition_values {
+                bind.push(value);
             }
             let rows = stmt.query_map(bind.as_slice(), Self::message_event_from_row)?;
 
@@ -1812,6 +1957,9 @@ impl SqliteMemory {
             crate::memory::owner_predicate::has_owner_id(&principal),
         );
 
+        let (partition_sql, partition_values) =
+            agent_partition_clause(&principal, 8 + usize::from(owner_required_fragment.bound_owner));
+
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEvent>> {
             let reader = pool.read()?;
             let conn = reader.connection()?;
@@ -1841,7 +1989,7 @@ impl SqliteMemory {
                                 OR (visibility = 'system' AND ?6)
                             )
                         )
-                    )
+                    ){partition_sql}
                   ORDER BY id ASC
                   LIMIT ?7",
                 owner_fragment = owner_fragment.sql,
@@ -1858,6 +2006,9 @@ impl SqliteMemory {
             ];
             if owner_required_fragment.bound_owner {
                 bind.push(&principal.owner_id);
+            }
+            for value in &partition_values {
+                bind.push(value);
             }
             let rows = stmt.query_map(bind.as_slice(), Self::memory_event_from_row)?;
             rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1891,6 +2042,9 @@ impl SqliteMemory {
             crate::memory::owner_predicate::has_owner_id(&principal),
         );
 
+        let (partition_sql, partition_values) =
+            agent_partition_clause(&principal, 7 + usize::from(owner_required_fragment.bound_owner));
+
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEvent>> {
             let reader = pool.read()?;
             let conn = reader.connection()?;
@@ -1919,7 +2073,7 @@ impl SqliteMemory {
                                 OR (visibility = 'system' AND ?5)
                             )
                         )
-                    )
+                    ){partition_sql}
                   ORDER BY id DESC
                   LIMIT ?6",
                 owner_fragment = owner_fragment.sql,
@@ -1935,6 +2089,9 @@ impl SqliteMemory {
             ];
             if owner_required_fragment.bound_owner {
                 bind.push(&principal.owner_id);
+            }
+            for value in &partition_values {
+                bind.push(value);
             }
             let rows = stmt.query_map(bind.as_slice(), Self::memory_event_from_row)?;
             rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
