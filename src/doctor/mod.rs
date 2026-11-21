@@ -1556,11 +1556,22 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
 
     // Reliability: fallback providers
     for fb in &config.reliability.fallback_providers {
+        // The runtime builds a fallback member other than the primary with no
+        // released credential (its own env/OAuth store, providers/mod.rs
+        // `create_provider_with_options(name, None, ..)`), so the check uses
+        // the same; a member that is the default provider runs on the primary.
+        let is_default = crate::providers::ProviderId::of(fb)
+            == crate::providers::ProviderId::of(crate::providers::selection::default_provider(config));
+        let credential = if is_default {
+            crate::providers::selection::credential_for(config, fb)
+        } else {
+            crate::providers::credentials::CredentialRef::ProviderStore
+        };
         if let Some(reason) = provider_validation_error(
             config,
             fb,
             crate::providers::selection::default_model(config),
-            crate::providers::selection::credential_for(config, fb),
+            credential,
         ) {
             items.push(DiagItem::warn(
                 cat,
