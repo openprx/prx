@@ -10,6 +10,8 @@
 //! | default selection | `default_provider`/`default_model` (chat), `memory.embedding_provider`/`embedding_model` (embeddings) |
 //! | route | one `[[model_routes]]` (chat) or `[[embedding_routes]]` (embeddings) entry, keyed by `hint` |
 //! | agent binding | `agents.<name>.provider`/`model` |
+//! | agent | one `[agents.<name>]` entry: created or replaced, or disabled on retirement |
+//! | targeted-agents switch | `gateway.targeted_agents` |
 //!
 //! [`ManagementService::plan`] turns the change into a candidate
 //! configuration and hands it to [`ConfigTransactions`]: one staging, one
@@ -127,6 +129,28 @@ pub enum ManagedChange {
         provider: String,
         model: String,
     },
+    /// Create a named agent, or replace every field `spec` carries; the
+    /// fields it does not carry (credential, temperature, identity, depth,
+    /// memory scope, spawn flag) are kept.
+    PutAgent { agent: String, spec: AgentSpec },
+    /// Retire a named agent: it stays configured, disabled, until its purge.
+    RetireAgent { agent: String },
+    /// Set `gateway.targeted_agents` (takes effect at the next restart).
+    SetTargetedAgents { enabled: bool },
+}
+
+/// The caller-owned fields of a named agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSpec {
+    pub provider: String,
+    pub model: String,
+    /// `None` means PRX composes the prompt; `Some("")` is stored as is.
+    pub prompt: Option<String>,
+    pub autonomy: crate::security::AutonomyLevel,
+    /// `["*"]` inherits Main's tools, names allow exactly those, empty
+    /// means no tools.
+    pub tools: Vec<String>,
+    pub enabled: bool,
 }
 
 /// Why a management operation was refused. No variant carries a credential
@@ -1681,6 +1705,28 @@ fn candidate(current: &Config, change: &ManagedChange) -> Result<Config, ManageE
             entry.provider = provider;
             entry.model = model;
         }
+        ManagedChange::PutAgent { agent, spec } => {
+            let (provider, _) = provider_arg(&spec.provider)?;
+            let model = non_empty(&spec.model, "the model")?;
+            let entry = next
+                .agents
+                .entry(agent.clone())
+                .or_insert_with(|| crate::config::DelegateAgentConfig::on(provider.clone(), model.clone()));
+            entry.provider = provider;
+            entry.model = model;
+            entry.system_prompt.clone_from(&spec.prompt);
+            entry.autonomy = Some(spec.autonomy);
+            entry.agentic = !spec.tools.is_empty();
+            entry.allowed_tools.clone_from(&spec.tools);
+            entry.enabled = spec.enabled;
+        }
+        ManagedChange::RetireAgent { agent } => {
+            next.agents
+                .get_mut(agent)
+                .ok_or_else(|| ManageError::NotFound(format!("agent `{agent}`")))?
+                .enabled = false;
+        }
+        ManagedChange::SetTargetedAgents { enabled } => next.gateway.targeted_agents = *enabled,
     }
     Ok(next)
 }

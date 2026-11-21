@@ -42,8 +42,9 @@ use crate::config::files::ConfigRevisionConflict;
 use crate::config::manage::credentials::CredentialReferenceError;
 use crate::config::manage::service::redact_provider_text;
 use crate::config::manage::{
-    ConfigActor, ConfigChangeSummary, ConfigTransactionError, ManageError, ManagedChange, ManagedPlan,
-    ManagementService, NotAppliedOutcome, RiskReason, RollbackRequest, RootCredential, SelectionOperation, render_plan,
+    ConfigActor, ConfigChangeSummary, ConfigTransactionError, ConfigTransactionOutcome, ManageError, ManagedChange,
+    ManagedPlan, ManagementService, NotAppliedOutcome, RiskReason, RollbackRequest, RootCredential, SelectionOperation,
+    render_plan,
 };
 use crate::config::schema::ProviderModelConfig;
 use crate::security::policy::{AutonomyLevel, ResourceRiskLevel};
@@ -204,7 +205,9 @@ const fn operation_name(change: &ManagedChange) -> &'static str {
         ManagedChange::AddRoute { .. } | ManagedChange::UpdateRoute { .. } | ManagedChange::RemoveRoute { .. } => {
             "gateway_api:routes:update"
         }
-        ManagedChange::BindAgent { .. } => "gateway_api:agents:update",
+        ManagedChange::BindAgent { .. } | ManagedChange::PutAgent { .. } => "gateway_api:agents:update",
+        ManagedChange::RetireAgent { .. } => "gateway_api:agents:retire",
+        ManagedChange::SetTargetedAgents { .. } => "gateway_api:gateway:targeted-agents",
     }
 }
 
@@ -336,6 +339,38 @@ pub(super) async fn apply_change(state: &AppState, change: ManagedChange, write:
         Ok(plan) => commit(state, &service, plan, &write, &Commit::typed(operation)).await,
         Err(error) => manage_error_response(error, None, &verbatim),
     }
+}
+
+/// Plan and commit a typed change for the owner bearer (A4): no autonomy
+/// level is consulted. Everything else is [`commit`]'s path: the caller's
+/// `If-Match` must name the revision the plan was read from, and a
+/// high-risk plan needs the confirmation bound to that revision.
+///
+/// # Errors
+///
+/// The plan's refusal, a stale `If-Match` (`Conflict`), or the
+/// transaction's refusal.
+pub(super) async fn commit_as_owner(
+    state: &AppState,
+    change: &ManagedChange,
+    write: &Write,
+) -> Result<ConfigTransactionOutcome, ManageError> {
+    let service = service(state);
+    let plan = service.plan(change, ACTOR).await?;
+    if let Some(expected) = write.if_match.as_deref()
+        && plan.revision() != Some(expected)
+    {
+        return Err(ManageError::Transaction(ConfigTransactionError::Conflict(
+            ConfigRevisionConflict {
+                expected: expected.to_string(),
+                actual: plan.revision().unwrap_or_default().to_string(),
+            },
+        )));
+    }
+    service
+        .apply(plan, ACTOR, write.confirmed_revision())
+        .await
+        .map_err(|error| write.explain(error))
 }
 
 /// What a commit adds around the plan: the operation it is authorized
@@ -1330,13 +1365,6 @@ mod tests {
             "add_route" => (Method::POST, "/api/routes".to_string(), body),
             "set_default" => (Method::PUT, "/api/defaults".to_string(), body),
             "add_provider" => (Method::POST, "/api/providers".to_string(), body),
-            "bind_agent" => {
-                let agent = at(change, "/agent").as_str().map(str::to_string).unwrap_or_default();
-                if let Some(object) = body.as_object_mut() {
-                    object.remove("agent");
-                }
-                (Method::PUT, format!("/api/agents/{agent}"), body)
-            }
             "add_model" => (Method::POST, "/api/models".to_string(), body),
             other => panic!("test: no object endpoint for {other}"),
         }
@@ -1350,7 +1378,8 @@ mod tests {
     /// F-3 contract (with PMM-E E-2): the CLI prints `ManagedPlan::text()`
     /// and the service's refusal verbatim (pinned by
     /// `manage_cli::…the_cli_prints_the_services_plan_and_refusal_text_byte_for_byte`,
-    /// over these same five changes and refusal). The Gateway's `plan` is
+    /// over these changes, `bind_agent` and the refusal; `bind_agent` has no
+    /// object endpoint here any more). The Gateway's `plan` is
     /// byte-identical to that text on the dry run, on `/api/config/apply`
     /// and on the object endpoint (D-089 7), and its `error` on all three;
     /// nothing is written by a dry run or a refusal.
@@ -1382,14 +1411,6 @@ mod tests {
                 json!({"kind": "add_provider", "provider": "openrouter"}),
                 ManagedChange::AddProvider {
                     provider: "openrouter".into(),
-                },
-            ),
-            (
-                json!({"kind": "bind_agent", "agent": "coder", "provider": "openai", "model": "gpt-5.6"}),
-                ManagedChange::BindAgent {
-                    agent: "coder".into(),
-                    provider: "openai".into(),
-                    model: "gpt-5.6".into(),
                 },
             ),
             (
@@ -1492,11 +1513,6 @@ mod tests {
                 Method::POST,
                 "/api/config/apply",
                 Some(json!({"change": {"kind": "remove_route", "hint": "fast"}})),
-            ),
-            (
-                Method::PUT,
-                "/api/agents/coder",
-                Some(json!({"provider": "openai", "model": "gpt-5.6"})),
             ),
         ] {
             let (status, reply) = served.call_if_match(method.clone(), path, &old, body).await;

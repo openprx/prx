@@ -3,7 +3,7 @@
 //! retirement, reconcile). Erase and purge behaviour live in later parts.
 
 use super::SqliteMemory;
-use crate::memory::agent_registry::{AgentRefusal, AgentRegistry, RetiredIncarnation};
+use crate::memory::agent_registry::{AgentRefusal, AgentRegistry, LiveIncarnation, RetiredIncarnation};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -353,6 +353,32 @@ impl AgentRegistry for SqliteMemory {
         )?;
         tx.commit()?;
         Ok(Ok(incarnation))
+    }
+
+    fn live_incarnation(
+        &self,
+        workspace_id: &str,
+        owner_id: &str,
+        agent_key: &str,
+    ) -> anyhow::Result<Option<LiveIncarnation>> {
+        let reader = self.pool.read()?;
+        let live = reader
+            .connection()?
+            .query_row(
+                "SELECT incarnation, state = 'retiring' FROM agent_incarnations
+                 WHERE workspace_id = ?1 AND owner_id = ?2 AND agent_key = ?3
+                   AND state IN ('active', 'retiring')
+                 ORDER BY state = 'retiring' DESC LIMIT 1",
+                params![workspace_id, owner_id, agent_key],
+                |row| {
+                    Ok(LiveIncarnation {
+                        incarnation: row.get(0)?,
+                        retiring: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(live)
     }
 
     fn retire_removed(

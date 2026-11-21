@@ -1,5 +1,6 @@
 //! The rf contract's feature gate (AC-2): `GET /api/capabilities` and
-//! `GET /api/agents/catalog`.
+//! `GET /api/agents/catalog`, and the guard every rf contract route shares
+//! (the agent routes of AC-1a1 are in `agents.rs`).
 //!
 //! Both are reads. They change no configuration, write no store and are not
 //! gated by autonomy. Neither body carries a credential, a key id or a URL
@@ -25,7 +26,7 @@ use crate::tools::capability::contract::SideEffectClass;
 use axum::{
     Json,
     extract::{Request, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{HeaderValue, Method, StatusCode, Uri, header},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -35,7 +36,12 @@ use std::borrow::Cow;
 
 /// The tokens effective in this running daemon, sorted ascending. A token is
 /// listed only when its whole earliest usable form is on main.
-const CAPABILITY_TOKENS: [&str; 2] = ["agent_catalog_v1", "capabilities_v1"];
+const CAPABILITY_TOKENS: [&str; 4] = [
+    "agent_catalog_v1",
+    "agent_crud_v1",
+    "agent_main_readback_v1",
+    "capabilities_v1",
+];
 
 /// Tokens present in this build but switched off or pending a restart,
 /// sorted ascending.
@@ -96,7 +102,7 @@ struct CatalogBody {
     prx_version: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     revision: Option<String>,
-    capabilities: [&'static str; 2],
+    capabilities: [&'static str; CAPABILITY_TOKENS.len()],
     models: Vec<CatalogModel>,
     tools: Vec<CatalogTool>,
     reserved_names: [&'static str; 2],
@@ -129,21 +135,36 @@ impl IntoResponse for CatalogError {
 }
 
 /// The rf contract's coded error body.
-fn coded_error(status: StatusCode, code: &str, message: &str) -> Response {
-    (
-        status,
-        Json(serde_json::json!({ "error": { "code": code, "message": message } })),
-    )
-        .into_response()
+pub(super) fn coded_error(status: StatusCode, code: &str, message: &str) -> Response {
+    coded_error_with(status, code, message, None)
 }
 
-/// The authentication and query guard of the two routes. A credential in
-/// the query string is refused as `401 auth_failed` (even beside a valid
-/// bearer); then the bearer is checked exactly as the shared
-/// authentication does; then any other query parameter is `400
-/// field_invalid`, since neither route takes one. Nothing of the URL is
-/// echoed or logged.
-pub(super) async fn guard(State(state): State<AppState>, request: Request, next: Next) -> Response {
+/// The coded error body with the one extra field its code carries
+/// (`current_revision` of a 409, `revision` of a 428).
+pub(super) fn coded_error_with(
+    status: StatusCode,
+    code: &str,
+    message: &str,
+    extra: Option<(&'static str, &str)>,
+) -> Response {
+    let mut error = serde_json::json!({ "code": code, "message": message });
+    if let (Some((key, value)), Some(object)) = (extra, error.as_object_mut()) {
+        object.insert(key.to_owned(), serde_json::Value::String(value.to_owned()));
+    }
+    (status, Json(serde_json::json!({ "error": error }))).into_response()
+}
+
+/// The one query parameter an rf contract route takes, on writes only.
+const CONFIRM_QUERY_KEY: &str = "confirm_high_risk";
+
+/// The authentication and query guard of the rf contract routes. A
+/// credential in the query string is refused as `401 auth_failed` (even
+/// beside a valid bearer); then the bearer is checked exactly as the shared
+/// authentication does, and its principal is handed to the handler; then
+/// any query parameter is `400 field_invalid`, except one
+/// `confirm_high_risk=true|false` on a `PUT` or `DELETE`. Nothing of the URL
+/// is echoed or logged.
+pub(super) async fn guard(State(state): State<AppState>, mut request: Request, next: Next) -> Response {
     let query = request.uri().query().unwrap_or_default();
     let pairs = query
         .split('&')
@@ -163,21 +184,40 @@ pub(super) async fn guard(State(state): State<AppState>, request: Request, next:
             "a credential is never accepted in a URL; send the bearer token in the Authorization header",
         );
     }
-    if super::authenticated_principal(&state, request.headers()).is_none() {
+    let Some(principal) = super::authenticated_principal(&state, request.headers()) else {
         return coded_error(
             StatusCode::UNAUTHORIZED,
             "auth_failed",
             "a valid bearer token is required",
         );
-    }
-    if !pairs.is_empty() {
+    };
+    let write = matches!(*request.method(), Method::PUT | Method::DELETE);
+    let confirm_only = write
+        && pairs.len() == 1
+        && pairs
+            .iter()
+            .all(|(key, value)| key == CONFIRM_QUERY_KEY && (value == "true" || value == "false"));
+    if !pairs.is_empty() && !confirm_only {
         return coded_error(
             StatusCode::BAD_REQUEST,
             "field_invalid",
-            "this route takes no query parameters",
+            "the only query parameter is confirm_high_risk=true|false, on PUT and DELETE",
         );
     }
+    request.extensions_mut().insert(principal);
     next.run(request).await
+}
+
+/// Whether the request confirms a high-risk change
+/// (`?confirm_high_risk=true`, as [`guard`] admitted it).
+pub(super) fn confirms_high_risk(uri: &Uri) -> bool {
+    uri.query().is_some_and(|query| {
+        query.split('&').any(|pair| {
+            pair.split_once('=').is_some_and(|(key, value)| {
+                decode(key).eq_ignore_ascii_case(CONFIRM_QUERY_KEY) && decode(value) == "true"
+            })
+        })
+    })
 }
 
 fn decode(text: &str) -> String {
@@ -185,16 +225,21 @@ fn decode(text: &str) -> String {
     urlencoding::decode(&spaced).map_or_else(|_| spaced.clone(), Cow::into_owned)
 }
 
-/// Any method other than `GET` (and `HEAD`) on the two routes.
+/// Any method other than `GET` (and `HEAD`) on a read-only route.
 pub(super) async fn method_not_allowed() -> Response {
+    method_not_allowed_allowing("GET,HEAD")
+}
+
+/// `405 method_not_allowed` naming the methods the route takes.
+pub(super) fn method_not_allowed_allowing(allow: &'static str) -> Response {
     let mut response = coded_error(
         StatusCode::METHOD_NOT_ALLOWED,
         "method_not_allowed",
-        "this route accepts only GET",
+        &format!("this route accepts only {allow}"),
     );
     response
         .headers_mut()
-        .insert(header::ALLOW, HeaderValue::from_static("GET,HEAD"));
+        .insert(header::ALLOW, HeaderValue::from_static(allow));
     response
 }
 
@@ -245,6 +290,14 @@ async fn assemble_catalog(state: &AppState) -> Result<CatalogBody, CatalogError>
     let canonical = serde_json::to_vec(&body).map_err(|_| CatalogError::Encode)?;
     body.revision = Some(hex::encode(Sha256::digest(&canonical)));
     Ok(body)
+}
+
+/// The names of the catalog's `tools`, sorted; `None` when the surface
+/// could not be published.
+pub(super) async fn catalog_tool_names(state: &AppState) -> Option<Vec<String>> {
+    let runtime = state.pin_turn_runtime();
+    let tools = published_tools(state, &runtime).await.ok()?;
+    Some(tools.into_iter().map(|tool| tool.name).collect())
 }
 
 /// Main's published tool surface without the tools no target can reach,

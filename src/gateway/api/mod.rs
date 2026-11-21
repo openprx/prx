@@ -10,6 +10,7 @@ use axum::{
     routing::{any, delete, get, patch, post, put},
 };
 
+mod agents;
 mod capabilities;
 mod causal;
 mod channels;
@@ -110,8 +111,6 @@ pub fn router(state: AppState) -> Router<AppState> {
             "/routes/{hint}",
             patch(models::patch_route).delete(models::delete_route),
         )
-        .route("/agents", get(models::get_agents))
-        .route("/agents/{name}", put(models::put_agent))
         .route("/config/plans", post(manage::post_plan))
         .route("/config/apply", post(manage::post_apply))
         .route("/config/history", get(manage::get_history))
@@ -175,7 +174,6 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/config/schema", get(config::get_config_schema))
         .route("/config", post(config::post_config))
         .route("/config", put(config::post_config))
-        .route("/config/reload", post(config::post_config_reload))
         // Phase 2: read-only endpoints
         .route("/hooks", get(hooks::get_hooks))
         .route("/mcp/servers", get(mcp::get_mcp_servers))
@@ -244,8 +242,9 @@ pub fn router(state: AppState) -> Router<AppState> {
             auth_middleware,
         ));
 
-    // The rf contract routes (AC-2): their own guard gives every error the
-    // contract's coded shape; the bearer check is the shared one.
+    // The rf contract routes (AC-2, AC-1a1): their own guard gives every
+    // error the contract's coded shape; the bearer check is the shared one,
+    // and it alone authorises them (no autonomy level is consulted).
     let rf_contract_routes = Router::new()
         .route(
             "/capabilities",
@@ -253,7 +252,31 @@ pub fn router(state: AppState) -> Router<AppState> {
         )
         .route(
             "/agents/catalog",
-            get(capabilities::get_catalog).fallback(capabilities::method_not_allowed),
+            get(capabilities::get_catalog)
+                .put(agents::reserved_name)
+                .delete(agents::reserved_name)
+                .fallback(capabilities::method_not_allowed),
+        )
+        .route(
+            "/agents",
+            get(agents::get_agents).fallback(capabilities::method_not_allowed),
+        )
+        .route(
+            "/agents/{name}",
+            get(agents::get_agent)
+                .put(agents::put_agent)
+                .delete(agents::delete_agent)
+                .fallback(agents::agent_method_not_allowed),
+        )
+        .route(
+            "/gateway/targeted-agents",
+            get(agents::get_targeted_agents)
+                .put(agents::put_targeted_agents)
+                .fallback(agents::switch_method_not_allowed),
+        )
+        .route(
+            "/config/reload",
+            post(config::post_config_reload).fallback(config::reload_method_not_allowed),
         )
         .route_layer(middleware::from_fn_with_state(state.clone(), capabilities::guard));
 

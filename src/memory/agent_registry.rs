@@ -6,6 +6,22 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Registry key of Main.
+pub const MAIN_AGENT_KEY: &str = "m";
+
+/// Main never depends on config: its row's config revision is the hash of
+/// this constant.
+pub const MAIN_REVISION_PREIMAGE: &str = "prx.ma.main.v1";
+
+/// The live row of one (workspace, owner, key): its retiring row if there is
+/// one, else its active row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveIncarnation {
+    pub incarnation: String,
+    /// Retired, purge pending: no turn and no new mint.
+    pub retiring: bool,
+}
+
 /// Why a resolve minted nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentRefusal {
@@ -36,6 +52,14 @@ pub trait AgentRegistry: Send + Sync {
         config_revision: &str,
         admit: &dyn Fn() -> Result<(), AgentRefusal>,
     ) -> anyhow::Result<Result<String, AgentRefusal>>;
+
+    /// The live row of (workspace, owner, key), if any; nothing is written.
+    fn live_incarnation(
+        &self,
+        workspace_id: &str,
+        owner_id: &str,
+        agent_key: &str,
+    ) -> anyhow::Result<Option<LiveIncarnation>>;
 
     /// Set `retiring` on every active row of `agent_keys` in one workspace, for
     /// every owner, in one transaction, and return the rows it flipped.

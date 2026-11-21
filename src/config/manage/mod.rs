@@ -32,7 +32,9 @@ pub(crate) mod validate;
 pub use history::{ConfigActor, ConfigHistory, HistoryRecord, RecordStatus};
 pub use plan::{ChangeKind, ConfigChangeEntry, ConfigChangeRisk, ConfigChangeSummary, RiskReason};
 pub use render::render_plan;
-pub use service::{ManageError, ManagedChange, ManagedPlan, ManagementService, RootCredential, SelectionOperation};
+pub use service::{
+    AgentSpec, ManageError, ManagedChange, ManagedPlan, ManagementService, RootCredential, SelectionOperation,
+};
 pub use transaction::{
     ApplyOptions, ConfigChange, ConfigPlan, ConfigTransactionError, ConfigTransactionOutcome, ConfigTransactions,
     NotAppliedOutcome, RollbackRequest, Settlement, WatcherActivation, WatcherOutcome,

@@ -1,5 +1,5 @@
-//! Model, default, route and agent-binding endpoints (SP-PMM §2.8,
-//! PMM-F-2).
+//! Model, default and route endpoints (SP-PMM §2.8, PMM-F-2). The agent
+//! routes are the rf contract's (`agents.rs`).
 //!
 //! | Endpoint | Service call |
 //! | --- | --- |
@@ -8,7 +8,6 @@
 //! | `GET /api/defaults` | the chat and embedding defaults |
 //! | `PUT /api/defaults` | `ManagedChange::SetDefault` |
 //! | `GET`/`POST /api/routes`, `PATCH`/`DELETE /api/routes/{hint}` | `ManagedChange::{AddRoute, UpdateRoute, RemoveRoute}` |
-//! | `GET /api/agents`, `PUT /api/agents/{name}` | `ManagedChange::BindAgent` |
 //!
 //! A model id can contain `/` (`openai/gpt-4o`), so it travels in the query
 //! or the body, never in the path. Every write is authorized at Low risk
@@ -353,53 +352,6 @@ pub async fn delete_route(
     .await
 }
 
-/// `GET /api/agents`: every delegate agent's model binding.
-pub async fn get_agents(State(state): State<AppState>) -> Response {
-    let config = manage::service(&state).config();
-    let mut agents = config.agents.iter().collect::<Vec<_>>();
-    agents.sort_by(|left, right| left.0.cmp(right.0));
-    let agents = agents
-        .into_iter()
-        .map(|(name, agent)| {
-            json!({
-                "name": name,
-                "provider": redact_provider_text(&agent.provider),
-                "model": agent.model,
-            })
-        })
-        .collect::<Vec<_>>();
-    Json(json!({"agents": agents})).into_response()
-}
-
-/// The body of `PUT /api/agents/{name}`.
-#[derive(Deserialize)]
-pub struct BindAgentBody {
-    provider: String,
-    model: String,
-}
-
-/// `PUT /api/agents/{name}`: bind an existing agent to a provider and
-/// model (its other settings are not touched).
-pub async fn put_agent(
-    State(state): State<AppState>,
-    Path(agent): Path<String>,
-    Query(query): Query<WriteQuery>,
-    headers: HeaderMap,
-    Json(body): Json<BindAgentBody>,
-) -> Response {
-    let write = write_of!(query, headers);
-    manage::apply_change(
-        &state,
-        ManagedChange::BindAgent {
-            agent,
-            provider: body.provider,
-            model: body.model,
-        },
-        write,
-    )
-    .await
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::test_support::{at, json, serve_config};
@@ -444,8 +396,8 @@ mod tests {
     }
 
     /// F-2: a model id with `/` round-trips through the body (declaration,
-    /// route, default, agent binding), through the query of `GET
-    /// /api/models`, and back out of every read.
+    /// route, default), through the query of `GET /api/models`, and back out
+    /// of every read.
     #[tokio::test]
     async fn a_model_id_with_a_slash_round_trips_through_query_and_body() {
         let served = serve_config(|config| {
@@ -519,14 +471,6 @@ mod tests {
         let (status, reply) = served
             .call(
                 Method::PUT,
-                "/api/agents/coder",
-                Some(json!({"provider": "openrouter", "model": MODEL})),
-            )
-            .await;
-        assert_eq!(status, 200, "{reply}");
-        let (status, reply) = served
-            .call(
-                Method::PUT,
                 "/api/defaults",
                 Some(json!({"provider": "openrouter", "model": MODEL})),
             )
@@ -537,8 +481,6 @@ mod tests {
         assert_eq!(at(&json(&reply), "/chat/model"), MODEL, "{reply}");
         let (_, reply) = served.call(Method::GET, "/api/routes?operation=chat", None).await;
         assert_eq!(at(&json(&reply), "/routes/0/model"), MODEL, "{reply}");
-        let (_, reply) = served.call(Method::GET, "/api/agents", None).await;
-        assert_eq!(at(&json(&reply), "/agents/0/model"), MODEL, "{reply}");
 
         // The route and the declaration change by their keys (hint in the
         // path, provider and model in the body).

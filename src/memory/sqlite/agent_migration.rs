@@ -7,10 +7,8 @@
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::SqliteMemory;
+use crate::memory::agent_registry::MAIN_REVISION_PREIMAGE;
 use crate::memory::{AgentPartition, AgentScopeRefused, PartitionKey};
-
-/// Main (K=`m`) never depends on config: its revision is this constant's hash.
-const MAIN_REVISION_PREIMAGE: &str = "prx.ma.main.v1";
 
 const EVENT_PENDING: &str = "e.agent_id IS NULL AND e.source = 'console' AND e.ma_scope_id IS NULL";
 

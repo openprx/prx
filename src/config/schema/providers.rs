@@ -52,6 +52,30 @@ pub struct DelegateAgentConfig {
     pub autonomy: Option<super::AutonomyLevel>,
 }
 
+impl DelegateAgentConfig {
+    /// An agent on `provider` and `model` with every other field at its
+    /// serde default.
+    #[must_use]
+    pub const fn on(provider: String, model: String) -> Self {
+        Self {
+            provider,
+            model,
+            system_prompt: None,
+            api_key: None,
+            credential_ref: None,
+            temperature: None,
+            max_depth: default_max_depth(),
+            agentic: false,
+            allowed_tools: Vec::new(),
+            identity_dir: None,
+            memory_scope: None,
+            spawn_enabled: None,
+            enabled: default_agent_enabled(),
+            autonomy: None,
+        }
+    }
+}
+
 pub(super) const fn default_agent_enabled() -> bool {
     true
 }

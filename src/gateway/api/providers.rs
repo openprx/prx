@@ -410,11 +410,6 @@ mod tests {
             (Method::DELETE, "/api/routes/fast", None),
             (Method::GET, "/api/agents", None),
             (
-                Method::PUT,
-                "/api/agents/coder",
-                Some(json!({"provider": "openai", "model": "gpt-4o"})),
-            ),
-            (
                 Method::POST,
                 "/api/config/plans",
                 Some(json!({"change": {"kind": "add_provider", "provider": "openrouter"}})),

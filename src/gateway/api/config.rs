@@ -11,43 +11,60 @@ use serde_json::Value;
 use std::{path::PathBuf, sync::Arc};
 use tracing::warn;
 
-/// POST /api/config/reload — hot-reload configuration from config.toml (authenticated).
+/// `POST /api/config/reload`: activate the configuration files as they are
+/// now (an rf contract route, `agent_crud_v1`). The owner bearer alone
+/// authorises it; no autonomy level is consulted (A4). Errors are coded; a
+/// failed load is reported without quoting the files.
 pub async fn post_config_reload(State(state): State<AppState>) -> Response {
-    use crate::tools::Tool as _;
-    // The reload's own authorization gate reads the sole active generation.
-    // Otherwise a prior reload
-    // that tightened autonomy / `security.audit` would not constrain the next
-    // reload's authz. Build via the shared `build_security_policy` helper so this
-    // site cannot drift from the audit-wiring baseline (BUG-D1-01 class).
-    let config_snapshot = state.config.load_full();
-    let security = crate::runtime::bootstrap::build_security_policy(&config_snapshot);
-    let tool = crate::tools::ConfigReloadTool::with_security(Arc::clone(&state.config), security);
-    match tool.execute(serde_json::json!({})).await {
-        Ok(result) if result.success => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "success": true,
-                "message": result.output,
-            })),
-        )
-            .into_response(),
-        Ok(result) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "success": false,
-                "error": result.error.unwrap_or_else(|| "Unknown error".into()),
-            })),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "success": false,
-                "error": e.to_string(),
-            })),
-        )
-            .into_response(),
-    }
+    let manager = Arc::clone(&state.config);
+    let reloaded = crate::runtime::blocking::spawn_blocking(move || {
+        manager.reload_from_disk(crate::config::ConfigReloadTrigger::Tool)
+    })
+    .await;
+    let report = match reloaded {
+        Ok(Ok(report)) => report,
+        Ok(Err(_)) | Err(_) => {
+            warn!("config reload refused or failed");
+            return super::capabilities::coded_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_unavailable",
+                "the configuration files could not be loaded and activated; the running configuration is unchanged",
+            );
+        }
+    };
+    let output = serde_json::json!({
+        "status": report.status(),
+        "active_generation": report.active_generation.0,
+        "active_source_revision": report.active_source_revision.fingerprint_sha256,
+        "desired_source_revision": report.desired_source_revision.fingerprint_sha256,
+        "changed": report.changed,
+        "applied": report.applied,
+        "rebuilt": report.rebuilt,
+        "restarted": report.restarted,
+        "restart_required": report.restart_required,
+        "participant_acks": report.participant_acks,
+    });
+    serde_json::to_string_pretty(&output).map_or_else(
+        |_| {
+            super::capabilities::coded_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_unavailable",
+                "the reload report could not be encoded",
+            )
+        },
+        |message| {
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "success": true, "message": message })),
+            )
+                .into_response()
+        },
+    )
+}
+
+/// Any method other than `POST` on `/api/config/reload`.
+pub(super) async fn reload_method_not_allowed() -> Response {
+    super::capabilities::method_not_allowed_allowing("POST")
 }
 
 use crate::config::credential_slots::{CredentialSlot, CredentialValue, SlotError, validate_credential};
