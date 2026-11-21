@@ -13,53 +13,27 @@ use tracing::warn;
 
 /// `POST /api/config/reload`: activate the configuration files as they are
 /// now (an rf contract route, `agent_crud_v1`). The owner bearer alone
-/// authorises it; no autonomy level is consulted (A4). Errors are coded; a
-/// failed load is reported without quoting the files.
+/// authorises it (A4): the reload tool runs under its own default policy,
+/// never one built from Main's autonomy level. Errors are coded; a failed
+/// load is reported without quoting the files.
 pub async fn post_config_reload(State(state): State<AppState>) -> Response {
-    let manager = Arc::clone(&state.config);
-    let reloaded = crate::runtime::blocking::spawn_blocking(move || {
-        manager.reload_from_disk(crate::config::ConfigReloadTrigger::Tool)
-    })
-    .await;
-    let report = match reloaded {
-        Ok(Ok(report)) => report,
-        Ok(Err(_)) | Err(_) => {
+    use crate::tools::Tool as _;
+    let tool = crate::tools::ConfigReloadTool::new(Arc::clone(&state.config));
+    match tool.execute(serde_json::json!({})).await {
+        Ok(result) if result.success => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "success": true, "message": result.output })),
+        )
+            .into_response(),
+        Ok(_) | Err(_) => {
             warn!("config reload refused or failed");
-            return super::capabilities::coded_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "storage_unavailable",
-                "the configuration files could not be loaded and activated; the running configuration is unchanged",
-            );
-        }
-    };
-    let output = serde_json::json!({
-        "status": report.status(),
-        "active_generation": report.active_generation.0,
-        "active_source_revision": report.active_source_revision.fingerprint_sha256,
-        "desired_source_revision": report.desired_source_revision.fingerprint_sha256,
-        "changed": report.changed,
-        "applied": report.applied,
-        "rebuilt": report.rebuilt,
-        "restarted": report.restarted,
-        "restart_required": report.restart_required,
-        "participant_acks": report.participant_acks,
-    });
-    serde_json::to_string_pretty(&output).map_or_else(
-        |_| {
             super::capabilities::coded_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "storage_unavailable",
-                "the reload report could not be encoded",
+                "the configuration files could not be loaded and activated; the running configuration is unchanged",
             )
-        },
-        |message| {
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({ "success": true, "message": message })),
-            )
-                .into_response()
-        },
-    )
+        }
+    }
 }
 
 /// Any method other than `POST` on `/api/config/reload`.
