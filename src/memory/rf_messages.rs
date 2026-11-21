@@ -63,6 +63,15 @@ impl RfRunTerminal {
             Self::Cancelled => "cancelled",
         }
     }
+
+    /// The closed code next to a `failed` status: `interrupted` for a run
+    /// ended by interruption, none for every other terminal.
+    pub const fn code(self) -> Option<&'static str> {
+        match self {
+            Self::Interrupted => Some("interrupted"),
+            Self::Succeeded | Self::Failed | Self::Cancelled => None,
+        }
+    }
 }
 
 /// One stored attempt, with its run's terminal read in the same statement.

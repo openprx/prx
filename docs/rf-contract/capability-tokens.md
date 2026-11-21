@@ -291,6 +291,7 @@ have no `replayed` field.
 |---|---|
 | same key, same request, `turn` still running | `200 {"run_id","job_id","status":"running","replayed":true}` |
 | same key, same request, `turn` ended | `200 {"run_id","job_id","status":"succeeded"\|"failed"\|"cancelled","replayed":true}`, from PRX's durable terminal record; `job_id` may already be unknown to `GET /api/jobs` |
+| same key, same request, `turn` ended by interruption | `200 {"run_id","job_id","status":"failed","code":"interrupted","replayed":true}` |
 | same key, same request, `context` | `200 {"message_id","status":"recorded","replayed":true}` with the original `message_id` |
 | same key, different request | `409 idempotency_conflict`; nothing is written |
 | same key, same request, PRX died during the turn | `202 {"run_id","job_id","attempt","previous_run_id"}`: a new attempt (restart rule below) |
@@ -306,8 +307,14 @@ ended (PRX proves it by taking that process's ingress lock) starts a new
 attempt: `202` with the new `run_id` and `job_id`, `attempt` (2 for the first
 retry; it counts the attempts of this key) and `previous_run_id`. In the same
 transaction the interrupted attempt gets its terminal: status `failed`, error
-code `interrupted`. The interrupted attempt may have executed tools; nothing
-is rolled back. Two concurrent resends after a crash start one attempt; the
+code `interrupted`. Wherever PRX reports that run (the replay answer and both
+cancel answers) it says `"status":"failed","code":"interrupted"`; `code` is a
+closed value and is omitted for every other outcome. The interrupted attempt
+may have executed tools; nothing is rolled back, and its rows stay in the
+session's history: after an interruption the session shows the input once per
+attempt. Every attempt's input carries the same `client_message_id` in its
+caller-context block, and PRX's record of the key names each attempt's input
+row. Two concurrent resends after a crash start one attempt; the
 other gets a replay answer or `409 session_busy`. A turn PRX cannot prove
 ended (its process still holds the lock) reads as `running`.
 
@@ -323,8 +330,8 @@ the purge of the agent incarnation.
 
 | Route | Answer |
 |---|---|
-| `POST /api/sessions/{session_id}/runs/{run_id}/cancel` | `200 {"run_id","status"}`: `cancelling` (stop requested), `cancelled` (stopped), or for a run that already ended its terminal status `succeeded`, `failed` or `cancelled`; a run whose process died is given its `interrupted` terminal and answers `failed`. No such run of this owner in this session: `404 run_unknown` |
-| `POST /api/jobs/{job_id}/cancel` | for the job of an rf turn while this process knows the job: `200 {"job_id","run_id","status"}` with the statuses above; an evicted job, a job from before a restart or another owner's: `404 job_unknown` (the outcome is unknown, never "not run"). Console jobs keep their previous answer |
+| `POST /api/sessions/{session_id}/runs/{run_id}/cancel` | `200 {"run_id","status"}`: `cancelling` (stop requested), `cancelled` (stopped), or for a run that already ended its terminal status `succeeded`, `failed` or `cancelled` (with `"code":"interrupted"` for an interrupted run); a run whose process died is given its `interrupted` terminal and answers `failed` with that code. No such run of this owner in this session: `404 run_unknown` |
+| `POST /api/jobs/{job_id}/cancel` | for the job of an rf turn while this process knows the job: `200 {"job_id","run_id","status"}` with the statuses above; an evicted job, a job from before a restart or another owner's: `404 job_unknown` (the outcome is unknown, never "not run"). A job id PRX has never issued for an rf run gets the legacy Console body (`404 {"error":"no job with id …"}`); rf uses the run route. Console jobs keep their previous answer |
 
 `job_id` is only a hint: the durable id is `run_id`.
 

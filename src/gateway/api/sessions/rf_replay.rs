@@ -58,6 +58,38 @@ fn job_unknown() -> Response {
     )
 }
 
+/// What an rf run reports: its status and, for a run ended by interruption,
+/// the closed code `interrupted`, read from its durable attempt row.
+#[derive(Clone, Copy)]
+struct RunOutcome {
+    status: &'static str,
+    code: Option<&'static str>,
+}
+
+impl RunOutcome {
+    const fn of(terminal: RfRunTerminal) -> Self {
+        Self {
+            status: terminal.status(),
+            code: terminal.code(),
+        }
+    }
+
+    const fn plain(status: &'static str) -> Self {
+        Self { status, code: None }
+    }
+
+    /// `body` with `status`, and `code` when there is one.
+    fn answer(self, mut body: serde_json::Value) -> Response {
+        if let Some(object) = body.as_object_mut() {
+            object.insert("status".to_owned(), self.status.into());
+            if let Some(code) = self.code {
+                object.insert("code".to_owned(), code.into());
+            }
+        }
+        Json(body).into_response()
+    }
+}
+
 /// An rf `turn` on its way from admission to its job.
 pub(super) struct RfTurn {
     /// The (session, agent) slot, held until the job's work ends.
@@ -126,15 +158,11 @@ pub(super) async fn lookup(state: &AppState, key: &RfMessageKey, request_hash: &
         );
     };
     match turn_status(state, &key.workspace_id, &attempt, &run.run_id).await {
-        Ok(Some(status)) => Lookup::Answer(
-            Json(serde_json::json!({
-                "run_id": run.run_id,
-                "job_id": run.job_id,
-                "status": status,
-                "replayed": true,
-            }))
-            .into_response(),
-        ),
+        Ok(Some(outcome)) => Lookup::Answer(outcome.answer(serde_json::json!({
+            "run_id": run.run_id,
+            "job_id": run.job_id,
+            "replayed": true,
+        }))),
         Ok(None) => Lookup::Restart(attempt),
         Err(response) => Lookup::Answer(*response),
     }
@@ -146,15 +174,15 @@ async fn turn_status(
     workspace: &str,
     attempt: &RfAttempt,
     run_id: &str,
-) -> Result<Option<&'static str>, Box<Response>> {
+) -> Result<Option<RunOutcome>, Box<Response>> {
     if let Some(terminal) = attempt.terminal {
-        return Ok(Some(terminal.status()));
+        return Ok(Some(RunOutcome::of(terminal)));
     }
     if !matches!(
         live_run(workspace, &attempt.session_key, &attempt.agent_key, run_id, false),
         LiveRun::Absent
     ) {
-        return Ok(Some("running"));
+        return Ok(Some(RunOutcome::plain("running")));
     }
     // Not finished by any durable row and not live here: either its process
     // is gone (restart), or it is still held by a live process, or its job
@@ -163,7 +191,7 @@ async fn turn_status(
     Ok(if admitting_process_gone(state, workspace, attempt).await? {
         None
     } else {
-        Some("running")
+        Some(RunOutcome::plain("running"))
     })
 }
 
@@ -231,12 +259,12 @@ pub(super) async fn refused_context(
 /// `cancelling`); a run whose admitting process is gone gets its terminal
 /// `interrupted` (`failed`); a run held by another live process, or ended
 /// here without a confirmed terminal, is `cancelling`.
-async fn cancel_run(state: &AppState, workspace: &str, attempt: RfAttempt) -> Result<&'static str, Box<Response>> {
+async fn cancel_run(state: &AppState, workspace: &str, attempt: RfAttempt) -> Result<RunOutcome, Box<Response>> {
     let Some(run) = attempt.run.clone() else {
         return Err(Box::new(run_unknown()));
     };
     if let Some(terminal) = attempt.terminal {
-        return Ok(terminal.status());
+        return Ok(RunOutcome::of(terminal));
     }
     match live_run(workspace, &attempt.session_key, &attempt.agent_key, &run.run_id, true) {
         LiveRun::Job(job) => {
@@ -244,21 +272,22 @@ async fn cancel_run(state: &AppState, workspace: &str, attempt: RfAttempt) -> Re
                 crate::runtime::registry::kill(work, true).await;
             }
             let ended = jobs::snapshot(job).is_some_and(|snapshot| snapshot.status == "cancelled");
-            return Ok(if ended { "cancelled" } else { "cancelling" });
+            return Ok(RunOutcome::plain(if ended { "cancelled" } else { "cancelling" }));
         }
         // The job starts after admission; it is killed as soon as it exists.
-        LiveRun::Admitting => return Ok("cancelling"),
+        LiveRun::Admitting => return Ok(RunOutcome::plain("cancelling")),
         LiveRun::Absent => {}
     }
     if !admitting_process_gone(state, workspace, &attempt).await? {
-        return Ok("cancelling");
+        return Ok(RunOutcome::plain("cancelling"));
     }
     match state
         .mem
         .interrupt_rf_run(workspace, &attempt.owner_id, &run.run_id)
         .await
     {
-        Ok(true) => Ok(RfRunTerminal::Interrupted.status()),
+        // The mark was just committed: the attempt row now reads interrupted.
+        Ok(true) => Ok(RunOutcome::of(RfRunTerminal::Interrupted)),
         // A terminal row landed first: answer it.
         Ok(false) => {
             let lookup = RfAttemptLookup::Run {
@@ -269,7 +298,7 @@ async fn cancel_run(state: &AppState, workspace: &str, attempt: RfAttempt) -> Re
             Ok(read(state, workspace, lookup)
                 .await?
                 .and_then(|attempt| attempt.terminal)
-                .map_or(RfRunTerminal::Interrupted.status(), RfRunTerminal::status))
+                .map_or(RunOutcome::of(RfRunTerminal::Interrupted), RunOutcome::of))
         }
         Err(error) => {
             tracing::warn!(
@@ -322,7 +351,7 @@ pub(in crate::gateway::api) async fn post_run_cancel(
         Err(response) => return *response,
     };
     match cancel_run(&state, &workspace, attempt).await {
-        Ok(status) => Json(serde_json::json!({ "run_id": run_id, "status": status })).into_response(),
+        Ok(outcome) => outcome.answer(serde_json::json!({ "run_id": run_id })),
         Err(response) => *response,
     }
 }
@@ -377,9 +406,7 @@ pub(in crate::gateway::api) async fn rf_job_cancel(
         return Some(job_unknown());
     };
     Some(match cancel_run(state, &workspace, attempt).await {
-        Ok(status) => {
-            Json(serde_json::json!({ "job_id": job.to_string(), "run_id": run_id, "status": status })).into_response()
-        }
+        Ok(outcome) => outcome.answer(serde_json::json!({ "job_id": job.to_string(), "run_id": run_id })),
         Err(response) => *response,
     })
 }
