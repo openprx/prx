@@ -305,7 +305,25 @@ impl IngressRecorder {
         owned_store_read(&self.owner, move || work(recorder)).await
     }
 
-    pub(crate) async fn append(self: &Arc<Self>, mut input: MessageEventInput) -> anyhow::Result<MessageEvent> {
+    pub(crate) async fn append(self: &Arc<Self>, input: MessageEventInput) -> anyhow::Result<MessageEvent> {
+        Box::pin(self.append_with(input, None)).await
+    }
+
+    /// [`Self::append`] that writes the rf attempt row in the input's
+    /// transaction (AC-1b2a).
+    pub(crate) async fn append_admitting(
+        self: &Arc<Self>,
+        input: MessageEventInput,
+        admission: crate::memory::RfAdmission,
+    ) -> anyhow::Result<MessageEvent> {
+        Box::pin(self.append_with(input, Some(admission))).await
+    }
+
+    async fn append_with(
+        self: &Arc<Self>,
+        mut input: MessageEventInput,
+        admission: Option<crate::memory::RfAdmission>,
+    ) -> anyhow::Result<MessageEvent> {
         let _ = self
             .run_id
             .set(input.run_id.clone().context("durable ingress requires run identity")?);
@@ -373,17 +391,32 @@ impl IngressRecorder {
         };
         // Only a fault of the store on this new row fails the append; it names
         // this run and the store for the operator.
-        let appended = self
-            .memory
-            .append_ingress_input(
-                input,
-                capsule.clone(),
-                self.lifetime.clone(),
-                self.deadline,
-                Some(attestation),
-            )
-            .await
-            .with_context(|| self.diagnostic(&capsule.run_id))?;
+        let appended = match admission {
+            Some(admission) => {
+                self.memory
+                    .append_ingress_input_admitting(
+                        input,
+                        capsule.clone(),
+                        self.lifetime.clone(),
+                        self.deadline,
+                        Some(attestation),
+                        admission,
+                    )
+                    .await
+            }
+            None => {
+                self.memory
+                    .append_ingress_input(
+                        input,
+                        capsule.clone(),
+                        self.lifetime.clone(),
+                        self.deadline,
+                        Some(attestation),
+                    )
+                    .await
+            }
+        }
+        .with_context(|| self.diagnostic(&capsule.run_id))?;
         match appended {
             IngressAppendOutcome::Inserted(event) => {
                 let verified = {

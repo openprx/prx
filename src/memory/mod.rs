@@ -22,6 +22,7 @@ pub mod postgres;
 pub mod principal;
 pub mod recovery_authority;
 pub mod retrieval;
+pub mod rf_messages;
 pub(crate) mod router_history;
 pub mod session_predicate;
 pub mod snapshot;
@@ -44,6 +45,9 @@ pub use principal::MemoryWriteContext;
 pub use router_history::{
     RouterHistoryCommitReceipt, RouterHistoryDomain, RouterHistoryRead, RouterHistoryReadEvidence, RouterHistoryRow,
     RouterHistoryWriteEvidence,
+};
+pub use rf_messages::{
+    RfAdmission, RfAdmissionRefused, RfAttempt, RfAttemptLookup, RfMessageKey, RfRun, RfRunTerminal,
 };
 pub use sqlite::SqliteMemory;
 pub use traits::CALLER_KEYED_SESSION_CHANNEL;

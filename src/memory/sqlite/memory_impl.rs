@@ -752,8 +752,47 @@ impl Memory for SqliteMemory {
         deadline: std::time::Instant,
         attestation: Option<crate::memory::ingress_recovery::IngressAttestation>,
     ) -> anyhow::Result<crate::memory::ingress_recovery::IngressAppendOutcome> {
-        self.append_ingress_input_impl(input, capsule, lifetime, deadline, attestation)
+        self.append_ingress_input_impl(input, capsule, lifetime, deadline, attestation, None)
             .await
+    }
+
+    async fn append_ingress_input_admitting(
+        &self,
+        input: MessageEventInput,
+        capsule: crate::memory::ingress_recovery::IngressCapsule,
+        lifetime: Arc<dyn crate::memory::ingress_recovery::IngressLifetime>,
+        deadline: std::time::Instant,
+        attestation: Option<crate::memory::ingress_recovery::IngressAttestation>,
+        admission: crate::memory::RfAdmission,
+    ) -> anyhow::Result<crate::memory::ingress_recovery::IngressAppendOutcome> {
+        self.append_ingress_input_impl(input, capsule, lifetime, deadline, attestation, Some(admission))
+            .await
+    }
+
+    async fn append_message_event_admitting(
+        &self,
+        input: MessageEventInput,
+        admission: crate::memory::RfAdmission,
+    ) -> anyhow::Result<MessageEvent> {
+        Box::pin(self.append_attested_event(input, None, None, Some(admission)))
+            .await?
+            .map(|(event, _)| event)
+            .ok_or_else(|| anyhow::anyhow!("an admitted rf input hit a tombstoned key"))
+    }
+
+    async fn rf_message_attempt(
+        &self,
+        workspace_id: &str,
+        lookup: crate::memory::RfAttemptLookup,
+    ) -> anyhow::Result<Option<crate::memory::RfAttempt>> {
+        let pool = self.pool.clone();
+        let workspace_id = workspace_id.to_owned();
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Option<crate::memory::RfAttempt>> {
+            let reader = pool.read()?;
+            let conn = reader.connection()?;
+            super::rf_messages::read(conn, &workspace_id, &lookup)
+        })
+        .await?
     }
 
     async fn list_ingress_recovery_candidates(

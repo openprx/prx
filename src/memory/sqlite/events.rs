@@ -216,7 +216,7 @@ impl SqliteMemory {
     ) -> anyhow::Result<(MessageEvent, bool)> {
         // The attested append future carries the whole input, the mutation and the
         // blocking closure; keep it on the heap so callers' futures stay small.
-        Box::pin(self.append_attested_event(input, mutation, repair_deadline))
+        Box::pin(self.append_attested_event(input, mutation, repair_deadline, None))
             .await?
             .context("only an ingress input can hit a tombstone without an error")
     }
@@ -225,12 +225,14 @@ impl SqliteMemory {
     /// input is tombstoned (any other tombstoned input is `StableKeyTombstoned`).
     /// Every stable-key user input runs the tombstone fence inside it. An attested
     /// ingress input also writes its pending attestation and transport index row,
-    /// under FULL synchronization, so a crash leaves all of them or none.
+    /// under FULL synchronization, so a crash leaves all of them or none. An rf
+    /// admission writes its attempt row in the same transaction (AC-1b2a).
     pub(super) async fn append_attested_event(
         &self,
         input: MessageEventInput,
         mutation: Option<crate::memory::ingress_recovery::AtomicIngressMutation>,
         repair_deadline: Option<std::time::Instant>,
+        admission: Option<crate::memory::rf_messages::RfAdmission>,
     ) -> anyhow::Result<Option<(MessageEvent, bool)>> {
         input.validate()?;
         let pool = self.pool.clone();
@@ -297,6 +299,10 @@ impl SqliteMemory {
                 }
                 if let (true, Some((capsule, attestation)), Some(keys)) = (inserted, attested, &keys) {
                     recovery_authority::attest_ingress(&tx, keys, capsule, attestation, &event)?;
+                }
+                if let Some(admission) = &admission {
+                    let lifetime = mutation.as_ref().map(|operation| operation.lease().token());
+                    super::rf_messages::admit(&tx, admission, &event, inserted, lifetime)?;
                 }
                 if let (Some(owner), Some(deadline)) = (&repair_owner, repair_deadline) {
                     ingress_recovery::validate_owner(&tx, owner, &event.workspace_id, deadline)?;
@@ -874,6 +880,7 @@ impl SqliteMemory {
         lifetime: Arc<dyn crate::memory::ingress_recovery::IngressLifetime>,
         deadline: std::time::Instant,
         attestation: Option<crate::memory::ingress_recovery::IngressAttestation>,
+        admission: Option<crate::memory::rf_messages::RfAdmission>,
     ) -> anyhow::Result<crate::memory::ingress_recovery::IngressAppendOutcome> {
         use crate::memory::ingress_recovery::IngressAppendOutcome;
         let mut attestation = attestation;
@@ -891,6 +898,7 @@ impl SqliteMemory {
                     attestation,
                 }),
                 None,
+                admission,
             ))
             .await?
             {

@@ -363,6 +363,35 @@ impl MemoryFabric {
         .await
     }
 
+    /// [`Self::record_inbound_user_message`] that also writes the rf attempt
+    /// row in the input event's transaction (AC-1b2a). With user-message
+    /// recording off no input event exists to carry it: refused
+    /// ([`crate::memory::RfAdmissionRefused::Unrecorded`]), nothing written.
+    pub(crate) async fn record_admitted_user_message(
+        &self,
+        scope: MessageEventScope,
+        content: impl Into<String>,
+        idempotency_key: Option<String>,
+        admission: crate::memory::RfAdmission,
+    ) -> anyhow::Result<MessageEvent> {
+        if !self.should_record_role("user") {
+            return Err(crate::memory::RfAdmissionRefused::Unrecorded.into());
+        }
+        let mut input = self.event_input(
+            scope,
+            "user",
+            "message.created",
+            content.into(),
+            idempotency_key,
+            None,
+        );
+        if let Some(ingress) = &self.ingress {
+            return Box::pin(ingress.append_admitting(input, admission)).await;
+        }
+        input.event_id = Some(uuid::Uuid::new_v4().to_string());
+        self.memory.append_message_event_admitting(input, admission).await
+    }
+
     /// Best-effort form of [`Self::record_inbound_user_message`] for issuers that
     /// may proceed unrecorded when the decision plane is off. Persistence trouble
     /// degrades to `Ok(None)`, but an input key that is already accepted is never

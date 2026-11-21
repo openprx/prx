@@ -2131,6 +2131,49 @@ pub trait Memory: Send + Sync {
         Err(crate::memory::fabric::fail_fast(self.name(), "append_ingress_input"))
     }
 
+    /// [`Self::append_ingress_input`] that also writes the rf attempt row in
+    /// the same transaction (AC-1b2a); a refused attempt rolls everything back
+    /// with [`super::rf_messages::RfAdmissionRefused`].
+    async fn append_ingress_input_admitting(
+        &self,
+        input: MessageEventInput,
+        capsule: super::ingress_recovery::IngressCapsule,
+        lifetime: std::sync::Arc<dyn super::ingress_recovery::IngressLifetime>,
+        deadline: std::time::Instant,
+        attestation: Option<crate::memory::ingress_recovery::IngressAttestation>,
+        admission: super::rf_messages::RfAdmission,
+    ) -> anyhow::Result<super::ingress_recovery::IngressAppendOutcome> {
+        let _ = (input, capsule, lifetime, deadline, admission);
+        super::ingress_recovery::refuse_attestation(attestation.as_ref())?;
+        Err(crate::memory::fabric::fail_fast(
+            self.name(),
+            "append_ingress_input_admitting",
+        ))
+    }
+
+    /// Append a new input event and its rf attempt row in one transaction.
+    async fn append_message_event_admitting(
+        &self,
+        input: MessageEventInput,
+        admission: super::rf_messages::RfAdmission,
+    ) -> anyhow::Result<MessageEvent> {
+        let _ = (input, admission);
+        Err(crate::memory::fabric::fail_fast(
+            self.name(),
+            "append_message_event_admitting",
+        ))
+    }
+
+    /// One rf attempt with its run's durable terminal, read in one statement.
+    async fn rf_message_attempt(
+        &self,
+        workspace_id: &str,
+        lookup: super::rf_messages::RfAttemptLookup,
+    ) -> anyhow::Result<Option<super::rf_messages::RfAttempt>> {
+        let _ = (workspace_id, lookup);
+        Err(crate::memory::fabric::fail_fast(self.name(), "rf_message_attempt"))
+    }
+
     async fn list_ingress_recovery_candidates(
         &self,
         scope: &super::ingress_recovery::IngressRecoveryScope,
