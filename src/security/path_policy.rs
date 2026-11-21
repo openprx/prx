@@ -83,19 +83,6 @@ pub enum PathRefusalReason {
 }
 
 impl PathRefusalReason {
-    /// Stable payload-free code, safe for log fields and audit rows.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::InvalidPath => "invalid_path",
-            Self::ForbiddenPath => "forbidden_path",
-            Self::OutsideWorkspace => "outside_workspace",
-            Self::SymlinkEscape => "symlink_escape",
-            Self::DynamicShellArgument => "dynamic_shell_argument",
-            Self::ActiveShellSubstitution => "active_shell_substitution",
-        }
-    }
-
     /// Operator-visible refusal of a file tool path. It names the path, so it
     /// belongs in the tool result only, never in a log field.
     fn file_message(self, path: &str) -> String {

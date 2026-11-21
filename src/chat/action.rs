@@ -494,6 +494,15 @@ pub enum Action {
         cause: crate::tools::ApprovalDenialCause,
         reason: String,
     },
+    /// A tool call was refused before any approval prompt (execution policy
+    /// or path precheck) and did not run. `reason` is the refusal text the
+    /// model also reads; it may name the path and is never logged.
+    ToolCallRefused {
+        task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+        tool_id: String,
+        name: String,
+        reason: String,
+    },
     /// Clear any visible approval prompt without approving anything.
     ///
     /// Used when a session switch fail-closes outstanding approval routes before
@@ -744,6 +753,7 @@ impl Action {
             Self::ToolApprovalReceived { .. } => "ToolApprovalReceived",
             Self::ToolApprovalUnanswered { .. } => "ToolApprovalUnanswered",
             Self::ToolApprovalDenied { .. } => "ToolApprovalDenied",
+            Self::ToolCallRefused { .. } => "ToolCallRefused",
             Self::ToolApprovalCleared => "ToolApprovalCleared",
             Self::StreamRetryAttempt { .. } => "StreamRetryAttempt",
             Self::SessionLoaded { .. } => "SessionLoaded",

@@ -257,6 +257,36 @@ impl ApprovalRouter {
     }
 }
 
+/// Chat bridge for calls refused before approval: the reducer shows the
+/// notice (TUI line, or stderr in line mode).
+struct ChatRefusalNotice {
+    task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    action_tx: mpsc::Sender<Action>,
+}
+
+#[async_trait]
+impl crate::tools::execution::ToolRefusalNotice for ChatRefusalNotice {
+    async fn refused(&self, operation_id: &str, tool: &str, text: &str) {
+        if let Err(error) = self
+            .action_tx
+            .send(Action::ToolCallRefused {
+                task_id: self.task_id,
+                tool_id: operation_id.to_owned(),
+                name: tool.to_owned(),
+                reason: text.to_owned(),
+            })
+            .await
+        {
+            let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+            tracing::debug!(
+                error_len,
+                error_sha256,
+                "tool call refusal notice not delivered: action channel closed"
+            );
+        }
+    }
+}
+
 /// TUI bridge for the common tool-execution approval stage.
 struct ChatTuiApprovalStrategy {
     task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
@@ -2032,6 +2062,16 @@ impl EffectExecutor {
                     crate::chat::terminal_approval::announce_denied(&name, &reason);
                 }
             }
+            Effect::AnnounceToolRefused { name, reason } => {
+                // Same surface rule as `AnnounceToolDenied`.
+                #[cfg(feature = "terminal-tui")]
+                let interactive_tui = self.redraw_slot.lock().is_some() || deps.redraw_tx.is_some();
+                #[cfg(not(feature = "terminal-tui"))]
+                let interactive_tui = false;
+                if !interactive_tui {
+                    crate::chat::terminal_approval::announce_refused(&name, &reason);
+                }
+            }
             Effect::Quit => {
                 // shutdown signal: the real cancel + drop implicit protocol is finished off by chat::run
                 tracing::info!("effect: Quit -> shutdown.cancel()");
@@ -2617,9 +2657,13 @@ fn chat_tool_execution_service(
             cancellation,
             policy,
         }),
-        Arc::new(ChatToolExecutionPreparation { task_id, action_tx }),
+        Arc::new(ChatToolExecutionPreparation {
+            task_id,
+            action_tx: action_tx.clone(),
+        }),
         Arc::new(TracingToolExecutionAudit),
-    );
+    )
+    .with_refusal_notice(Arc::new(ChatRefusalNotice { task_id, action_tx }));
     // The chat memory backend is whatever the operator configured; the ledger is
     // resolved from it so a non-ledger backend still gets a durable ledger
     // instead of refusing every side-effecting tool.

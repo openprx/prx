@@ -335,6 +335,9 @@ pub enum Effect {
     /// Tell a line-mode operator that a tool call was refused at approval and
     /// did not run (stderr). The TUI shows the reducer's notice line instead.
     AnnounceToolDenied { name: String, reason: String },
+    /// Tell a line-mode operator that a tool call was refused before approval
+    /// and did not run (stderr). The TUI shows the reducer's notice line instead.
+    AnnounceToolRefused { name: String, reason: String },
     /// Exit the main loop gracefully
     Quit,
 }
@@ -362,6 +365,7 @@ impl Effect {
             Self::RequestApproval { .. } => "RequestApproval",
             Self::ResolveApproval { .. } => "ResolveApproval",
             Self::AnnounceToolDenied { .. } => "AnnounceToolDenied",
+            Self::AnnounceToolRefused { .. } => "AnnounceToolRefused",
             Self::Quit => "Quit",
         }
     }
@@ -1410,6 +1414,13 @@ impl ChatState {
                 self.push_tool_denied_notice(&name, &reason);
                 reduce_tools::tool_approval_denied_effects(&tool_id, name, reason)
             }
+            Action::ToolCallRefused {
+                tool_id, name, reason, ..
+            } => {
+                #[cfg(feature = "terminal-tui")]
+                self.push_tool_refused_notice(&name, &reason);
+                reduce_tools::tool_call_refused_effects(&tool_id, name, reason)
+            }
             Action::ToolApprovalCleared => self.reduce_tool_approval_cleared(),
             Action::StreamRetryAttempt { attempt, reason } => self.reduce_stream_retry_attempt(attempt, &reason),
 
@@ -1539,6 +1550,7 @@ const fn ui_dirty_for(action: &Action) -> bool {
         | Action::ToolApprovalReceived { .. }
         | Action::ToolApprovalUnanswered { .. }
         | Action::ToolApprovalDenied { .. }
+        | Action::ToolCallRefused { .. }
         | Action::ToolApprovalCleared => true,
 
         // Session: SessionLoaded rebuilds history and may force a UI reset; SessionSaved/Switched do not

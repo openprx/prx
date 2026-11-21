@@ -218,6 +218,12 @@ pub(crate) fn announce_denied(tool: &str, reason: &str) {
     eprintln!("Denied {tool}: {reason} — the call did not run.");
 }
 
+/// Tell a line-mode operator that a tool call was refused before approval and
+/// did not run.
+pub(crate) fn announce_refused(tool: &str, reason: &str) {
+    eprintln!("Refused {tool}: {reason} — the call did not run.");
+}
+
 /// A one-line argument summary with control characters removed.
 fn summary(args: &str) -> String {
     let printable: String = args.chars().map(|ch| if ch.is_control() { ' ' } else { ch }).collect();

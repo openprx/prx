@@ -8,6 +8,8 @@
 pub(crate) mod admission;
 mod approval_record;
 mod approval_route;
+mod refusal_record;
+pub(crate) use refusal_record::ToolRefusalNotice;
 
 use super::schema::ToolSchemaDialect;
 use super::traits::{Tool, ToolCategory, ToolResult, ToolSpec, ToolTier, is_tool_cancelled_result};
@@ -1806,6 +1808,7 @@ pub struct ToolExecutionService {
     preparation: Arc<dyn ToolExecutionPreparation>,
     audit: Arc<dyn ToolExecutionAuditSink>,
     idempotency_memory: Option<Arc<dyn Memory>>,
+    refusal_notice: Option<Arc<dyn ToolRefusalNotice>>,
     #[cfg(test)]
     post_reservation_gate: Option<Arc<TestPostReservationGate>>,
 }
@@ -1862,6 +1865,7 @@ impl ToolExecutionService {
             preparation,
             audit,
             idempotency_memory: None,
+            refusal_notice: None,
             #[cfg(test)]
             post_reservation_gate: None,
         }
@@ -1932,6 +1936,14 @@ impl ToolExecutionService {
                 "tool execution idempotency is unavailable for this memory backend"
             );
         }
+        self
+    }
+
+    /// Show the operator each call refused before approval (plain stderr
+    /// line or TUI notice).
+    #[must_use]
+    pub(crate) fn with_refusal_notice(mut self, notice: Arc<dyn ToolRefusalNotice>) -> Self {
+        self.refusal_notice = Some(notice);
         self
     }
 
@@ -2984,6 +2996,14 @@ impl ToolExecutionService {
                 "tool '{}' is not permitted under the current execution policy",
                 descriptor.public_name
             );
+            self.record_call_refusal(
+                &command,
+                &context,
+                &input_sha256,
+                refusal_record::ToolCallRefusalReason::PolicyDenied,
+                &error,
+            )
+            .await;
             return self.finish(
                 &command,
                 &context,
@@ -3008,9 +3028,12 @@ impl ToolExecutionService {
                 .path_precheck(&descriptor.public_name, &command.arguments)
                 .await
             {
-                // The audit error stays payload-free; only the model-visible
-                // result names the path.
-                let error = format!("path refused before approval ({})", refusal.reason().as_str());
+                // The audit error and the durable row stay payload-free; only
+                // the model-visible result and the operator notice name the path.
+                let reason = refusal_record::ToolCallRefusalReason::from(refusal.reason());
+                self.record_call_refusal(&command, &context, &input_sha256, reason, refusal.message())
+                    .await;
+                let error = format!("call refused before approval: {}", reason.as_str());
                 let model_content = format!(
                     "Error: {}. The {} call did not run.",
                     refusal.message(),

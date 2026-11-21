@@ -58,6 +58,16 @@ impl ApprovalResolver for TerminalApprovalResolver {
     }
 }
 
+/// Line mode prints a call refused before approval on stderr.
+struct TerminalRefusalNotice;
+
+#[async_trait]
+impl crate::tools::execution::ToolRefusalNotice for TerminalRefusalNotice {
+    async fn refused(&self, _operation_id: &str, tool: &str, text: &str) {
+        super::terminal_approval::announce_refused(tool, text);
+    }
+}
+
 /// The tool execution service of one line-mode turn: the run approval
 /// strategy over the session's approval manager (its "always" allowlist
 /// lasts for the session) and the terminal prompt, which reads its answers
@@ -87,7 +97,8 @@ pub(super) fn line_tool_execution_service(
         strategy,
         Arc::new(AdapterOwnedPreparation),
         Arc::new(TracingToolExecutionAudit),
-    );
+    )
+    .with_refusal_notice(Arc::new(TerminalRefusalNotice));
     // As on the reducer path: the ledger comes from the configured memory
     // backend, or a dedicated store when that backend keeps no event log.
     match crate::memory::tool_execution_ledger(memory, &policy.workspace_dir) {
