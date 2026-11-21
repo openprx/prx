@@ -783,6 +783,7 @@ const DISPATCHER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_
 
 pub(super) async fn finish_chat_session(
     shutdown: &CancellationToken,
+    dispatcher_stop: &CancellationToken,
     chat_dispatcher: dispatcher::ChatDispatcher,
     dispatcher_handle: tokio::task::JoinHandle<dispatcher::DispatcherStats>,
     #[cfg(feature = "terminal-tui")] terminal_guard: &Option<TerminalGuard>,
@@ -794,10 +795,14 @@ pub(super) async fn finish_chat_session(
     //    the chat_dispatcher sender clone it holds (otherwise action_rx would never close naturally
     //    and dispatcher_handle.await would hang).
     // 2. drop(chat_dispatcher) releases the sender held by the main path.
-    // 3. dispatcher_handle.await finishes the teardown — the shutdown.cancelled() arm of the select!
-    //    fires immediately and the dispatcher exits. The RUNTIME_SHUTDOWN_TIMEOUT (2s) at
+    // 3. dispatcher_stop.cancel() stops the dispatcher: the caller reaches this point only after the
+    //    exit sequence's last ordered commit was acknowledged, so its stop arm only drains what is
+    //    still queued and exits. `shutdown` does not stop it, because a cancelled turn is settled
+    //    through it after `shutdown` fired.
+    // 4. dispatcher_handle.await finishes the teardown. The RUNTIME_SHUTDOWN_TIMEOUT (2s) at
     //    main.rs:866 remains as the fallback (do not change it).
     shutdown.cancel();
+    dispatcher_stop.cancel();
     drop(chat_dispatcher);
     // Bounded like the turn service shutdown (run.rs): a drain effect that never settles must not hang the exit.
     let drain = match tokio::time::timeout(DISPATCHER_DRAIN_TIMEOUT, dispatcher_handle).await {
@@ -927,7 +932,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let stalled = tokio::spawn(std::future::pending::<dispatcher::DispatcherStats>());
 
-        let result = finish_chat_session(&shutdown, dispatcher, stalled, &None, false).await;
+        let result = finish_chat_session(&shutdown, &CancellationToken::new(), dispatcher, stalled, &None, false).await;
 
         assert!(
             result.is_err(),

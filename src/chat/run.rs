@@ -520,11 +520,20 @@ async fn run_internal(
         provider_name, model_name, &initial_session, &config, top_redux_mode,
     );
 
+    // The session authority outlives `shutdown`: shutdown cancels turns, and
+    // the exit sequence still settles them (and records the final usage and
+    // child exit summaries) through the dispatcher. It stops only in
+    // `finish_chat_session`, after the last of those commits; the guard stops
+    // it on an early error return as well, so no dispatcher task outlives this
+    // scope.
+    let dispatcher_stop = CancellationToken::new();
+    let _dispatcher_stop_on_exit = dispatcher_stop.clone().drop_guard();
+
     #[cfg(feature = "terminal-tui")]
     let dispatcher_handle = dispatcher::spawn_dispatcher_task_full(
         dispatcher_shadow_state,
         chat_action_rx,
-        shutdown.clone(),
+        dispatcher_stop.clone(),
         effect_executor,
         Some(turn_signal.clone()),
         snapshot_tx_for_dispatcher,
@@ -533,7 +542,7 @@ async fn run_internal(
     let dispatcher_handle = dispatcher::spawn_dispatcher_task_with_signal(
         dispatcher_shadow_state,
         chat_action_rx,
-        shutdown.clone(),
+        dispatcher_stop.clone(),
         effect_executor,
         Some(turn_signal.clone()),
     );
@@ -4909,7 +4918,7 @@ Retry with a compatible model: /provider {shown} <model>",
         )
     });
     let finished = startup::finish_chat_session(
-        &shutdown, chat_dispatcher, dispatcher_handle,
+        &shutdown, &dispatcher_stop, chat_dispatcher, dispatcher_handle,
         #[cfg(feature = "terminal-tui")] &terminal_guard,
         plain_mode_turn_failed && one_shot.is_none(),
     ).await;
