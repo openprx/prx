@@ -1918,6 +1918,7 @@ async fn run_gateway_inner(
         &config.workspace_dir,
         memory::EmbeddingRootCredential::from_config(&config),
     )?);
+    let scrub_memory = Arc::clone(&mem);
     let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::from(runtime::create_runtime(&config.runtime)?);
     // FIX-P1-31: honour the configured `security.audit` block on the gate audit path.
     // Built via the shared `build_security_policy` helper so this site cannot drift
@@ -2408,6 +2409,17 @@ async fn run_gateway_inner(
     hooks_for_shutdown.drain_for_shutdown().await;
     if let Some(projector) = cost_projector {
         projector.stop().await;
+    }
+    // AC-1b2b: a clean stop leaves no deleted rf content in the WAL.
+    match scrub_memory.scrub_deleted_wal().await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!("deleted rf content stays in brain.db-wal at stop; it is scrubbed at the next open")
+        }
+        Err(error) => tracing::warn!(
+            error = %crate::agent::diagnostics::error_class(&error),
+            "deleted rf content WAL scrub failed at stop"
+        ),
     }
     health_shutdown.cancel();
     let _ = health_heartbeat.await;

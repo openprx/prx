@@ -428,6 +428,15 @@ impl SqliteMemory {
         let pool = Arc::new(pool);
         RawSqliteConnectionPool::publish_metrics(&pool);
         let pool = Arc::new(SqliteConnectionPool::new(pool)?);
+        // Deleted rf content a previous process left in the WAL (AC-1b2b).
+        match rf_delete::scrub(&pool) {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!("deleted rf content stays in brain.db-wal while another process reads it"),
+            Err(error) => tracing::warn!(
+                error = %crate::agent::diagnostics::error_class(&error),
+                "deleted rf content WAL scrub failed at open"
+            ),
+        }
 
         Ok(Self {
             pool,

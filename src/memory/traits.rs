@@ -2252,6 +2252,13 @@ pub trait Memory: Send + Sync {
         Err(crate::memory::fabric::fail_fast(self.name(), "rf_settle_deleted"))
     }
 
+    /// Empty the WAL of deleted rf content when a delete left it pending
+    /// (AC-1b2b); `true` when nothing is pending afterwards. Backends
+    /// without a WAL hold nothing pending.
+    async fn scrub_deleted_wal(&self) -> anyhow::Result<bool> {
+        Ok(true)
+    }
+
     /// [`Self::list_console_conversation_turns`] with deleted tombstones.
     async fn list_rf_history_turns(
         &self,

@@ -32,6 +32,50 @@ fn checkpoint_truncate(conn: &mut rusqlite::Connection) -> anyhow::Result<i64> {
     queried.context("wal_checkpoint(TRUNCATE)")
 }
 
+/// `wal_checkpoint(TRUNCATE)` retried within `budget`: secure_delete clears
+/// freed pages and TRUNCATE empties the WAL (VACUUM is unnecessary: deleted
+/// content is already overwritten). The writer is dropped between attempts so
+/// a turn that holds a read snapshot can finish and release it. An error when
+/// the WAL still holds frames at the end of the budget.
+pub(super) fn truncate_wal(pool: &super::SqliteConnectionPool, budget: std::time::Duration) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + budget;
+    let mut last_busy = -1_i64;
+    loop {
+        let outcome = {
+            let mut conn = pool.write();
+            checkpoint_truncate(&mut conn)
+        };
+        match outcome {
+            Ok(0) => return Ok(()),
+            Ok(busy) => last_busy = busy,
+            Err(error) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(error);
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("wal_checkpoint(TRUNCATE) left {last_busy} frames in the wal");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+/// After a delete committed: empty the WAL of the deleted content now, or
+/// leave the content-free pending mark for the next settle (AC-1b2b).
+fn scrub_after_delete(pool: &super::SqliteConnectionPool) {
+    match super::rf_delete::scrub(pool) {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(
+            "deleted rf content stays in brain.db-wal until a reader releases its snapshot; the next settle retries"
+        ),
+        Err(error) => tracing::warn!(
+            error = %crate::agent::diagnostics::error_class(&error),
+            "deleted rf content WAL scrub failed; the next settle retries"
+        ),
+    }
+}
+
 #[async_trait]
 impl Memory for SqliteMemory {
     fn child_session_store(&self) -> Option<&dyn crate::memory::child_sessions::ChildSessionStore> {
@@ -386,34 +430,7 @@ impl Memory for SqliteMemory {
 
     async fn checkpoint_wal(&self) -> anyhow::Result<()> {
         let pool = self.pool.clone();
-        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
-            // secure_delete clears freed pages and TRUNCATE empties the WAL.
-            // VACUUM is unnecessary: deleted content is already overwritten.
-            // Drop the writer between attempts so a turn that holds a read
-            // snapshot can finish and release it.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
-            let mut last_busy = -1_i64;
-            loop {
-                let outcome = {
-                    let mut conn = pool.write();
-                    checkpoint_truncate(&mut conn)
-                };
-                match outcome {
-                    Ok(0) => return Ok(()),
-                    Ok(busy) => last_busy = busy,
-                    Err(error) => {
-                        if std::time::Instant::now() >= deadline {
-                            return Err(error);
-                        }
-                    }
-                }
-                if std::time::Instant::now() >= deadline {
-                    anyhow::bail!("wal_checkpoint(TRUNCATE) left {last_busy} frames in the wal");
-                }
-                std::thread::sleep(std::time::Duration::from_millis(25));
-            }
-        })
-        .await?
+        crate::runtime::blocking::spawn_blocking(move || truncate_wal(&pool, std::time::Duration::from_secs(4))).await?
     }
 
     async fn forget_with_context(&self, key: &str, context: Option<&MemoryWriteContext>) -> anyhow::Result<bool> {
@@ -829,8 +846,11 @@ impl Memory for SqliteMemory {
     ) -> anyhow::Result<Vec<crate::memory::RfDeletedAgent>> {
         let pool = self.pool.clone();
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<crate::memory::RfDeletedAgent>> {
-            let conn = pool.write();
-            super::rf_delete::delete_message(&conn, &request)
+            let deleted = super::rf_delete::delete_message(&pool.write(), &request)?;
+            if !deleted.is_empty() {
+                scrub_after_delete(&pool);
+            }
+            Ok(deleted)
         })
         .await?
     }
@@ -850,8 +870,12 @@ impl Memory for SqliteMemory {
             run_id.to_owned(),
         );
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<crate::memory::RfReplyDelete> {
-            let conn = pool.write();
-            super::rf_delete::delete_reply(&conn, &workspace_id, &owner_id, &session_key, &run_id)
+            let outcome =
+                super::rf_delete::delete_reply(&pool.write(), &workspace_id, &owner_id, &session_key, &run_id)?;
+            if matches!(outcome, crate::memory::RfReplyDelete::Deleted { .. }) {
+                scrub_after_delete(&pool);
+            }
+            Ok(outcome)
         })
         .await?
     }
@@ -867,10 +891,17 @@ impl Memory for SqliteMemory {
         let (workspace_id, owner_id, session_key) =
             (workspace_id.to_owned(), owner_id.to_owned(), session_key.to_owned());
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
-            let conn = pool.write();
-            super::rf_delete::settle(&conn, &workspace_id, &owner_id, &session_key, &live_runs)
+            super::rf_delete::settle(&pool.write(), &workspace_id, &owner_id, &session_key, &live_runs)?;
+            // Also finishes a scrub an earlier delete could not complete.
+            scrub_after_delete(&pool);
+            Ok(())
         })
         .await?
+    }
+
+    async fn scrub_deleted_wal(&self) -> anyhow::Result<bool> {
+        let pool = self.pool.clone();
+        crate::runtime::blocking::spawn_blocking(move || super::rf_delete::scrub(&pool)).await?
     }
 
     async fn list_rf_history_turns(

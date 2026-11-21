@@ -27,6 +27,13 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 
 /// Idempotent DDL, run after the attempt table exists.
 pub(super) fn init_schema(conn: &Connection) -> anyhow::Result<()> {
+    // One content-free row while deleted content may still sit in WAL frames.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS rf_wal_scrub_pending (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            since TEXT NOT NULL
+        ) STRICT;",
+    )?;
     for (table, column, definition) in [
         ("rf_message_attempts", "deleted_at", "TEXT"),
         ("rf_message_attempts", "reply_deleted_at", "TEXT"),
@@ -179,6 +186,7 @@ pub(super) fn delete_message(conn: &Connection, request: &RfMessageDelete) -> an
         }
     }
     refresh_preview(&tx, &request.session_key)?;
+    mark_scrub(&tx, &now)?;
     tx.commit()?;
     Ok(agents)
 }
@@ -239,6 +247,7 @@ pub(super) fn delete_reply(
     erase(&tx, &target, Side::Reply, &attempt)?;
     record_deleted(&tx, &target, Side::Reply, &attempt, &client_message_id)?;
     refresh_preview(&tx, session_key)?;
+    mark_scrub(&tx, &now)?;
     tx.commit()?;
     Ok(RfReplyDelete::Deleted { job_id })
 }
@@ -300,6 +309,7 @@ pub(super) fn settle(
     }
     if settled {
         refresh_preview(&tx, session_key)?;
+        mark_scrub(&tx, &now)?;
         tx.commit()?;
     }
     Ok(())
@@ -397,14 +407,22 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
     )?;
     let mut ids = rows.into_iter().map(|row| row.event_id).collect::<Vec<_>>();
     let direct = serde_json::to_string(&ids)?;
-    for statement in [
+    let mut forgotten = tx.execute(
         "DELETE FROM memories WHERE source_event_id IN (SELECT value FROM json_each(?1))",
+        params![direct],
+    )?;
+    for statement in [
         "DELETE FROM memory_drafts WHERE source_event_id IN (SELECT value FROM json_each(?1))",
         "DELETE FROM memory_links WHERE message_event_id IN (SELECT value FROM json_each(?1))",
     ] {
         tx.execute(statement, params![direct])?;
     }
-    ids.extend(erase_compactions(tx, target, &direct)?);
+    ids.extend(erase_compactions(tx, target, &direct, &mut forgotten)?);
+    if forgotten > 0 {
+        // FTS5 keeps a deleted row's terms in its segments until a merge;
+        // a rebuild drops them as well as their tombstones.
+        tx.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')", [])?;
+    }
     {
         let mut statement = tx.prepare(
             "SELECT event_id FROM message_events
@@ -438,7 +456,12 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
 
 /// Compaction summaries built from a deleted event: the summary text, its
 /// memory row and the summary event (returned, for tombstoning).
-fn erase_compactions(tx: &Connection, target: &Target<'_>, ids: &str) -> anyhow::Result<Vec<String>> {
+fn erase_compactions(
+    tx: &Connection,
+    target: &Target<'_>,
+    ids: &str,
+    forgotten: &mut usize,
+) -> anyhow::Result<Vec<String>> {
     let runs = {
         let mut statement = tx.prepare(
             "SELECT run_id, summary_memory_key,
@@ -467,7 +490,7 @@ fn erase_compactions(tx: &Connection, target: &Target<'_>, ids: &str) -> anyhow:
             params![target.workspace_id, run_id],
         )?;
         if let Some(key) = memory_key {
-            tx.execute("DELETE FROM memories WHERE key = ?1", params![key])?;
+            *forgotten = forgotten.saturating_add(tx.execute("DELETE FROM memories WHERE key = ?1", params![key])?);
         }
         summaries.extend(summary_event);
     }
@@ -542,4 +565,46 @@ fn refresh_preview(tx: &Connection, session_key: &str) -> anyhow::Result<()> {
         ],
     )?;
     Ok(())
+}
+
+/// Note, in the delete's transaction, that its old row images may sit in
+/// WAL frames until a truncating checkpoint runs.
+fn mark_scrub(tx: &Connection, now: &str) -> anyhow::Result<()> {
+    tx.execute(
+        "INSERT OR IGNORE INTO rf_wal_scrub_pending (singleton, since) VALUES (1, ?1)",
+        params![now],
+    )?;
+    Ok(())
+}
+
+/// The longest one scrub waits for readers to leave the WAL.
+const SCRUB_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// Empty the WAL of deleted content when a delete left the mark: a
+/// truncating checkpoint, then the mark is cleared (its own frame holds only
+/// the mark table's page) and the WAL truncated again, best effort. `false`
+/// when a reader kept the checkpoint from completing within the budget; the
+/// mark stays for the next settle, open or clean stop.
+pub(super) fn scrub(pool: &super::SqliteConnectionPool) -> anyhow::Result<bool> {
+    let pending: bool = pool
+        .write()
+        .query_row("SELECT EXISTS(SELECT 1 FROM rf_wal_scrub_pending)", [], |row| {
+            row.get(0)
+        })?;
+    if !pending {
+        return Ok(true);
+    }
+    if super::memory_impl::truncate_wal(pool, SCRUB_BUDGET).is_err() {
+        return Ok(false);
+    }
+    pool.write().execute("DELETE FROM rf_wal_scrub_pending", [])?;
+    // The deleted content is gone; a failure here leaves only the mark
+    // table's page in the WAL.
+    if let Err(error) = super::memory_impl::truncate_wal(pool, SCRUB_BUDGET) {
+        tracing::debug!(
+            error = %crate::agent::diagnostics::error_class(&error),
+            "WAL truncation after the scrub mark was cleared did not complete"
+        );
+    }
+    Ok(true)
 }
