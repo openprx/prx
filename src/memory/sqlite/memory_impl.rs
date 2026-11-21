@@ -508,6 +508,77 @@ impl Memory for SqliteMemory {
         .await?
     }
 
+    async fn claim_conversation_session(
+        &self,
+        session_key: &str,
+        owner_id: &str,
+    ) -> anyhow::Result<crate::memory::SessionClaim> {
+        anyhow::ensure!(
+            !session_key.is_empty() && !owner_id.is_empty(),
+            "session identity is empty"
+        );
+        let pool = self.pool.clone();
+        let session_key = session_key.to_owned();
+        let owner_id = owner_id.to_owned();
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<crate::memory::SessionClaim> {
+            let now = Utc::now().to_rfc3339();
+            let conn = pool.write();
+            let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+            let inserted = tx.execute(
+                "INSERT INTO sessions
+                (session_key, channel, sender, owner_id, created_at, updated_at, message_count, last_message_preview)
+                VALUES (?1, 'console', ?2, ?2, ?3, ?3, 0, '')
+                ON CONFLICT(session_key) DO NOTHING",
+                params![session_key, owner_id, now],
+            )?;
+            let claim = if inserted == 1 {
+                crate::memory::SessionClaim::Created
+            } else {
+                let (channel, owner): (String, Option<String>) = tx.query_row(
+                    "SELECT channel, owner_id FROM sessions WHERE session_key = ?1",
+                    params![session_key],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                if channel == "console" && owner.as_deref() == Some(owner_id.as_str()) {
+                    crate::memory::SessionClaim::Existing
+                } else {
+                    crate::memory::SessionClaim::OtherOwner
+                }
+            };
+            tx.commit()?;
+            Ok(claim)
+        })
+        .await?
+    }
+
+    async fn conversation_session_owner(
+        &self,
+        session_key: &str,
+    ) -> anyhow::Result<Option<crate::memory::ConversationSessionOwner>> {
+        use rusqlite::OptionalExtension;
+        let pool = self.pool.clone();
+        let session_key = session_key.to_owned();
+        crate::runtime::blocking::spawn_blocking(
+            move || -> anyhow::Result<Option<crate::memory::ConversationSessionOwner>> {
+                let reader = pool.read()?;
+                let conn = reader.connection()?;
+                Ok(conn
+                    .query_row(
+                        "SELECT channel, owner_id FROM sessions WHERE session_key = ?1",
+                        params![session_key],
+                        |row| {
+                            Ok(crate::memory::ConversationSessionOwner {
+                                channel: row.get(0)?,
+                                owner_id: row.get(1)?,
+                            })
+                        },
+                    )
+                    .optional()?)
+            },
+        )
+        .await?
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn append_conversation_turn(
         &self,

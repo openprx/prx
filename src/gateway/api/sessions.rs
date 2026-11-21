@@ -27,6 +27,8 @@ const MAX_UPLOAD_FILES: usize = 10;
 const MAX_UPLOAD_FILE_SIZE_BYTES: usize = 20 * 1024 * 1024;
 const UPLOADS_DIR_NAME: &str = "uploads";
 
+mod rf_message;
+pub(super) use rf_message::{create_route_auth, message_route_auth};
 mod target;
 pub(super) use target::TARGET_EXCLUDED_TOOLS;
 use target::{
@@ -1119,16 +1121,25 @@ async fn parse_message_from_request(state: &AppState, request: Request) -> Resul
     }
 }
 
+/// `{}` creates a Console session as before; `{"session_key"}` is the rf
+/// get-or-create (AC-1b1). Present-or-absent is kept apart from `null`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct CreateSessionRequest {}
+pub(super) struct CreateSessionRequest {
+    #[serde(default, deserialize_with = "present_value")]
+    session_key: Option<serde_json::Value>,
+}
 
 pub async fn post_session(
     State(state): State<AppState>,
     axum::Extension(principal): axum::Extension<super::ApiPrincipal>,
     headers: HeaderMap,
-    Json(_body): Json<CreateSessionRequest>,
+    uri: axum::http::Uri,
+    Json(body): Json<CreateSessionRequest>,
 ) -> Response {
+    if let Some(key) = body.session_key {
+        return rf_message::post_keyed_session(&state, &principal, &headers, &uri, key).await;
+    }
     if !super::owner_authenticated(&state, &headers)
         && let Err(error) =
             super::authorize_resource_mutation(&state, "gateway_api:sessions:create", ResourceRiskLevel::Low)
@@ -1239,6 +1250,12 @@ pub async fn get_session_messages(
     Query(query): Query<SessionMessagesQuery>,
     axum::Extension(api_principal): axum::Extension<super::ApiPrincipal>,
 ) -> impl IntoResponse {
+    if rf_message::is_caller_session_key(&session_id)
+        && let Err(response) =
+            rf_message::require_session_owner(&state, &session_id, &api_principal.owner_id, false).await
+    {
+        return *response;
+    }
     let Some(session) = (match state.mem.get_conversation_session(&session_id).await {
         Ok(session) => session,
         Err(error) => {
@@ -1491,6 +1508,14 @@ pub async fn post_session_message(
     Path(session_id): Path<String>,
     request: Request,
 ) -> impl IntoResponse {
+    // A body with `client_message_id` is an rf message (AC-1b1); any other
+    // request takes the Console path below, unchanged.
+    let (request, unreadable) = match rf_message::classify(&state, request).await {
+        rf_message::MessageShape::Rf(parts, body) => {
+            return rf_message::post_rf_message(state, session_id, parts, body).await;
+        }
+        rf_message::MessageShape::Console { request, unreadable } => (request, unreadable),
+    };
     let Some(api_principal) = request.extensions().get::<super::ApiPrincipal>().cloned() else {
         return json_error(StatusCode::UNAUTHORIZED, "Authenticated API principal missing");
     };
@@ -1498,6 +1523,10 @@ pub async fn post_session_message(
         Ok(runtime) => runtime,
         Err(refusal) => return super::provider_not_ready(refusal),
     };
+    if unreadable {
+        // The body could not be buffered: the JSON parser's own refusal.
+        return json_error(StatusCode::BAD_REQUEST, "Invalid JSON payload");
+    }
     let headers = request.headers().clone();
     let owner_authenticated = super::owner_authenticated(&state, &headers);
     let async_mode = jobs::wants_async(request.uri().query(), &headers);
@@ -1529,6 +1558,7 @@ pub async fn post_session_message(
             async_mode,
             uploads,
             owner_authenticated,
+            rf_slot: None,
         },
     )
     .await
@@ -1816,6 +1846,9 @@ struct ConsoleSubmission {
     /// message and the saved reply as before A4, and the turn is
     /// owner-isolated.
     owner_authenticated: bool,
+    /// Set for an rf message turn: the (session, agent) turn slot it holds
+    /// until its job ends, which also selects the `{run_id, job_id}` answer.
+    rf_slot: Option<rf_message::TurnSlot>,
 }
 
 async fn submit_console_message(
@@ -1830,6 +1863,7 @@ async fn submit_console_message(
         async_mode,
         uploads,
         owner_authenticated,
+        rf_slot,
     } = submission;
     let SelectedTurn {
         runtime: turn_runtime,
@@ -1857,12 +1891,20 @@ async fn submit_console_message(
         )
             .into_response();
     };
+    if rf_slot.is_none()
+        && rf_message::is_caller_session_key(&session_id)
+        && let Err(response) =
+            rf_message::require_session_owner(&state, &session_id, &api_principal.owner_id, false).await
+    {
+        return *response;
+    }
     // Q10: the only place a Console turn's isolation is decided. A paired
     // bearer is the install owner and gets the terminal's tool rules at the
     // turn's own level; any other caller (pairing off) stays owner-isolated.
     // A controlled H2 launch binds only isolated Gateway sources, so it keeps
     // isolation.
     let owner_isolated = !owner_authenticated || turn_runtime.publication_slot.controlled.is_some();
+    let run_id = uuid::Uuid::new_v4().to_string();
     let runtime_envelope = console_runtime_envelope_for_workspace(
         turn_runtime
             .config_generation
@@ -1880,7 +1922,7 @@ async fn submit_console_message(
     } else {
         runtime_envelope
     }
-    .with_run_id(uuid::Uuid::new_v4().to_string())
+    .with_run_id(run_id.clone())
     .with_config_generation(&turn_runtime.config_generation);
 
     if let Err(error) = recover_console_history(&state, &turn_runtime, &api_principal, &session_id).await {
@@ -1998,12 +2040,23 @@ async fn submit_console_message(
     // turn mid-flight, after its side effects had already begun. It therefore
     // runs as a detached job: visible in `prx tasks list`, killable by id, and
     // still there when the client comes back.
-    let job = jobs::submit_with_cleanup(
-        jobs::KIND_SESSION_MESSAGE,
-        format!("gateway:session_message:{session_id}"),
-        run_console_message_job(turn_runtime, state, message, turns, source, target),
-        Some(cleanup_receiver),
-    );
+    let work = run_console_message_job(turn_runtime, state, message, turns, source, target);
+    let label = format!("gateway:session_message:{session_id}");
+    if let Some(slot) = rf_slot {
+        // The slot is released exactly when the job's work ends or is dropped.
+        let job = jobs::submit_run_with_cleanup(
+            jobs::KIND_SESSION_MESSAGE,
+            label,
+            async move {
+                let _slot = slot;
+                work.await
+            },
+            Some(cleanup_receiver),
+            Some(std::sync::Arc::from(run_id.as_str())),
+        );
+        return rf_message::turn_accepted(&run_id, &job.job_id());
+    }
+    let job = jobs::submit_with_cleanup(jobs::KIND_SESSION_MESSAGE, label, work, Some(cleanup_receiver));
     // The job owns the turn now; hand the uploaded files over with it.
     uploads.release();
 

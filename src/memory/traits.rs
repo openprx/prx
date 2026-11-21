@@ -258,6 +258,24 @@ pub struct ConversationSessionSummary {
     pub last_message_preview: String,
 }
 
+/// How claiming a caller-keyed Console session ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionClaim {
+    /// No row held the key; it is now a Console session of the claimant.
+    Created,
+    /// The key already names a Console session of the same owner.
+    Existing,
+    /// The key names a session of another owner (or a non-Console session).
+    OtherOwner,
+}
+
+/// The channel and owner of one stored session row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationSessionOwner {
+    pub channel: String,
+    pub owner_id: Option<String>,
+}
+
 /// A persisted conversation turn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationTurn {
@@ -1884,6 +1902,27 @@ pub trait Memory: Send + Sync {
         Err(crate::memory::fabric::fail_fast(
             self.name(),
             "create_conversation_session",
+        ))
+    }
+
+    /// Get-or-create an empty Console session under a caller-chosen key, in
+    /// one transaction: a new row is owned by `owner_id`; an existing row is
+    /// compared, never changed.
+    async fn claim_conversation_session(&self, session_key: &str, owner_id: &str) -> anyhow::Result<SessionClaim> {
+        let _ = (session_key, owner_id);
+        Err(crate::memory::fabric::fail_fast(
+            self.name(),
+            "claim_conversation_session",
+        ))
+    }
+
+    /// The channel and owner of the session row `session_key`; `None` when
+    /// no row holds it.
+    async fn conversation_session_owner(&self, session_key: &str) -> anyhow::Result<Option<ConversationSessionOwner>> {
+        let _ = session_key;
+        Err(crate::memory::fabric::fail_fast(
+            self.name(),
+            "conversation_session_owner",
         ))
     }
 

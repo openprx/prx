@@ -96,7 +96,7 @@ pub(super) enum TargetError {
 }
 
 impl TargetError {
-    const fn status(self) -> StatusCode {
+    pub(super) const fn status(self) -> StatusCode {
         match self {
             Self::Invalid | Self::ToolsInvalid => StatusCode::BAD_REQUEST,
             Self::Unknown => StatusCode::NOT_FOUND,

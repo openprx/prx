@@ -134,15 +134,10 @@ pub fn router(state: AppState) -> Router<AppState> {
     let protected_routes = Router::new()
         .route("/status", get(status::get_status))
         .route("/identity",get(identity::get_identity))
-        .route("/sessions", get(sessions::get_sessions).post(sessions::post_session))
         .route("/sessions/approvals", get(sessions::get_session_approvals))
         .route(
             "/sessions/{id}/messages",
             get(sessions::get_session_messages),
-        )
-        .route(
-            "/sessions/{id}/message",
-            post(sessions::post_session_message),
         )
         .route(
             "/sessions/{id}/approvals/{decision_id}",
@@ -242,6 +237,22 @@ pub fn router(state: AppState) -> Router<AppState> {
             auth_middleware,
         ));
 
+    // The two session routes that also take rf-shaped requests (AC-1b1). Their
+    // bearer check is the shared one; a refused request whose body is
+    // rf-shaped gets the coded `401 auth_failed`, any other the shared body.
+    let session_create_route = Router::new()
+        .route("/sessions", get(sessions::get_sessions).post(sessions::post_session))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            sessions::create_route_auth,
+        ));
+    let session_message_route = Router::new()
+        .route("/sessions/{id}/message", post(sessions::post_session_message))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            sessions::message_route_auth,
+        ));
+
     // The rf contract routes (AC-2, AC-1a1): their own guard gives every
     // error the contract's coded shape; the bearer check is the shared one,
     // and it alone authorises them (no autonomy level is consulted).
@@ -311,6 +322,8 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/logs/stream", get(logs::ws_handler))
         .route("/sessions/media", get(sessions::get_session_media))
         .merge(protected_routes)
+        .merge(session_create_route)
+        .merge(session_message_route)
         .merge(rf_contract_routes)
         .route_layer(middleware::from_fn_with_state(
             state,
@@ -472,13 +485,18 @@ pub(super) fn owner_authenticated(state: &AppState, headers: &HeaderMap) -> bool
     state.pairing.require_pairing() && state.pairing.is_authenticated(&extract_resource_auth_token(headers))
 }
 
+/// The shared body of a request the bearer check refused.
+fn unauthorized_response() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({"error": "Unauthorized"})),
+    )
+        .into_response()
+}
+
 async fn auth_middleware(State(state): State<AppState>, mut request: Request, next: Next) -> Response {
     let Some(principal) = authenticated_principal(&state, request.headers()) else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "Unauthorized"})),
-        )
-            .into_response();
+        return unauthorized_response();
     };
     request.extensions_mut().insert(principal);
     next.run(request).await

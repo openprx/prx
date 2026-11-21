@@ -36,11 +36,14 @@ use std::borrow::Cow;
 
 /// The tokens effective in this running daemon, sorted ascending. A token is
 /// listed only when its whole earliest usable form is on main.
-const CAPABILITY_TOKENS: [&str; 4] = [
+const CAPABILITY_TOKENS: [&str; 7] = [
     "agent_catalog_v1",
     "agent_crud_v1",
     "agent_main_readback_v1",
     "capabilities_v1",
+    "message_context_delivery_v1",
+    "message_target_v1",
+    "session_key_v1",
 ];
 
 /// Tokens present in this build but switched off or pending a restart,
@@ -51,7 +54,7 @@ const AVAILABLE_TOKENS: &[&str] = &[];
 const CAPABILITIES_API: u32 = 1;
 
 /// Session-key prefixes PRX mints itself (`console-<uuid>`).
-const RESERVED_SESSION_KEY_PREFIXES: [&str; 1] = ["console-"];
+pub(super) const RESERVED_SESSION_KEY_PREFIXES: [&str; 1] = ["console-"];
 
 /// Session-key prefixes reserved for callers: PRX never mints one.
 const CALLER_RESERVED_SESSION_KEY_PREFIXES: [&str; 1] = ["rf-"];
@@ -222,6 +225,62 @@ pub(super) async fn guard(State(state): State<AppState>, mut request: Request, n
     }
     request.extensions_mut().insert(principal);
     next.run(request).await
+}
+
+/// The query and authentication rule of an rf-shaped session request (a
+/// `POST /api/sessions` with `session_key`, a message with
+/// `client_message_id`), in [`guard`]'s order: a credential in the query is
+/// `401 auth_failed`; a caller that is not owner-authenticated (pairing off)
+/// is `401 auth_failed`; any query parameter is `400 field_invalid`, except
+/// one `mode=async` when `admit_async`. `None` admits the request.
+pub(super) fn rf_session_refusal(
+    query: Option<&str>,
+    owner_authenticated: bool,
+    admit_async: bool,
+) -> Option<Response> {
+    let pairs = query
+        .unwrap_or_default()
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            (decode(key).to_ascii_lowercase(), decode(value))
+        })
+        .collect::<Vec<_>>();
+    if pairs
+        .iter()
+        .any(|(key, value)| CREDENTIAL_QUERY_KEYS.contains(&key.as_str()) || super::manage::looks_secret(value))
+    {
+        return Some(coded_error(
+            StatusCode::UNAUTHORIZED,
+            "auth_failed",
+            "a credential is never accepted in a URL; send the bearer token in the Authorization header",
+        ));
+    }
+    if !owner_authenticated {
+        return Some(coded_error(
+            StatusCode::UNAUTHORIZED,
+            "auth_failed",
+            "a paired bearer token is required; these requests are refused while pairing is off",
+        ));
+    }
+    let async_only = admit_async
+        && pairs.len() == 1
+        && pairs
+            .iter()
+            .all(|(key, value)| key == "mode" && value.eq_ignore_ascii_case("async"));
+    if !pairs.is_empty() && !async_only {
+        return Some(coded_error(
+            StatusCode::BAD_REQUEST,
+            "field_invalid",
+            if admit_async {
+                "the only query parameter is mode=async"
+            } else {
+                "this request takes no query parameter"
+            },
+        ));
+    }
+    None
 }
 
 /// Whether the request confirms a high-risk change

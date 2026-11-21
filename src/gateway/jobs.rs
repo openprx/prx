@@ -211,6 +211,11 @@ impl JobHandle {
         })
     }
 
+    /// The job id `GET /api/jobs/{id}` takes.
+    pub(super) fn job_id(&self) -> String {
+        self.id.to_string()
+    }
+
     /// Block until the job reaches a terminal phase and return its result.
     ///
     /// Dropping this future does **not** stop the job: that is the whole point
@@ -239,6 +244,9 @@ pub(super) struct JobSnapshot {
     pub http_status: Option<u16>,
     pub result: Option<serde_json::Value>,
     pub error: Option<String>,
+    /// The run of an rf-shaped message turn; absent for every other job.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 /// One stored job. `phase_tx` stays alive as long as the record does, which is
@@ -254,6 +262,7 @@ struct JobRecord {
     finished_at: Option<Instant>,
     output: Option<JobOutput>,
     error: Option<String>,
+    run_id: Option<Arc<str>>,
     phase_tx: watch::Sender<JobPhase>,
 }
 
@@ -274,6 +283,7 @@ impl JobRecord {
             http_status: self.output.as_ref().map(|output| output.status.as_u16()),
             result: self.output.as_ref().map(|output| output.body.clone()),
             error: self.error.clone(),
+            run_id: self.run_id.as_deref().map(str::to_owned),
         }
     }
 }
@@ -383,6 +393,21 @@ pub(super) fn submit_with_cleanup<F>(
 where
     F: Future<Output = Result<JobOutput, String>> + Send + 'static,
 {
+    submit_run_with_cleanup(kind, label, work, initial_cleanup, None)
+}
+
+/// [`submit_with_cleanup`] for the work of one run, whose id the job's
+/// public view then carries (`run_id`).
+pub(super) fn submit_run_with_cleanup<F>(
+    kind: &'static str,
+    label: impl Into<Arc<str>>,
+    work: F,
+    initial_cleanup: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
+    run_id: Option<Arc<str>>,
+) -> JobHandle
+where
+    F: Future<Output = Result<JobOutput, String>> + Send + 'static,
+{
     let id = Uuid::new_v4();
     let label: Arc<str> = label.into();
     let job_ref = id.to_string();
@@ -415,6 +440,7 @@ where
         finished_at: None,
         output: None,
         error: None,
+        run_id,
         phase_tx,
     });
 
@@ -638,6 +664,7 @@ mod tests {
                     finished_at: None,
                     output: None,
                     error: None,
+                    run_id: None,
                     phase_tx,
                 },
             );
