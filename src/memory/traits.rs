@@ -2174,6 +2174,13 @@ pub trait Memory: Send + Sync {
         Err(crate::memory::fabric::fail_fast(self.name(), "rf_message_attempt"))
     }
 
+    /// Give an rf run its terminal `interrupted` in one transaction, only
+    /// while it has no terminal row; `false` when it has one.
+    async fn interrupt_rf_run(&self, workspace_id: &str, owner_id: &str, run_id: &str) -> anyhow::Result<bool> {
+        let _ = (workspace_id, owner_id, run_id);
+        Err(crate::memory::fabric::fail_fast(self.name(), "interrupt_rf_run"))
+    }
+
     async fn list_ingress_recovery_candidates(
         &self,
         scope: &super::ingress_recovery::IngressRecoveryScope,

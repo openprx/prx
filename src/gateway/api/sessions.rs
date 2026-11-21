@@ -30,6 +30,7 @@ const UPLOADS_DIR_NAME: &str = "uploads";
 mod rf_message;
 pub(super) use rf_message::{create_route_auth, message_route_auth};
 mod rf_replay;
+pub(super) use rf_replay::{post_run_cancel, rf_job_cancel};
 mod target;
 pub(super) use target::TARGET_EXCLUDED_TOOLS;
 use target::{
@@ -2122,7 +2123,8 @@ async fn submit_console_message(
     let label = format!("gateway:session_message:{session_id}");
     if let Some(rf) = rf {
         let accepted = rf.accepted();
-        let (job_id, slot) = (rf.job_id, rf.slot);
+        let (slot_key, job_id) = (rf.slot.key().to_owned(), rf.job_id);
+        let slot = rf.slot;
         // The slot is released exactly when the job's work ends or is dropped.
         jobs::submit_run_with_cleanup(
             jobs::KIND_SESSION_MESSAGE,
@@ -2134,6 +2136,12 @@ async fn submit_console_message(
             Some(cleanup_receiver),
             Some((std::sync::Arc::from(run_id.as_str()), job_id)),
         );
+        if rf_message::attach_job(&slot_key, job_id)
+            && let Some(work_id) = jobs::work_id_of(job_id)
+        {
+            // A cancel by run id arrived while the input was being admitted.
+            tokio::spawn(crate::runtime::registry::kill(work_id, true));
+        }
         return accepted;
     }
     let job = jobs::submit_with_cleanup(jobs::KIND_SESSION_MESSAGE, label, work, Some(cleanup_receiver));

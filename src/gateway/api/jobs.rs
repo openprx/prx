@@ -12,8 +12,9 @@ use crate::gateway::jobs;
 use crate::security::policy::ResourceRiskLevel;
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Request, State},
     http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
 };
 use serde::Serialize;
 use uuid::Uuid;
@@ -60,22 +61,33 @@ pub(super) struct JobCancelResponse {
     targets: Vec<String>,
 }
 
+/// `POST /api/jobs/{id}/cancel`. The job of an rf run answers in the rf
+/// contract's coded shape (AC-1b2a, [`super::sessions::rf_job_cancel`]);
+/// every other job keeps the Console behaviour and body below.
+pub async fn post_job_cancel(State(state): State<AppState>, Path(id): Path<String>, request: Request) -> Response {
+    let (parts, _) = request.into_parts();
+    if let Some(response) = super::sessions::rf_job_cancel(&state, &id, &parts).await {
+        return response;
+    }
+    console_job_cancel(&state, &parts.headers, &id).await.into_response()
+}
+
 /// A caller authenticated by a paired bearer cancels without Main's level
 /// being consulted; with pairing off the pre-A4 gate applies.
-pub async fn post_job_cancel(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
+async fn console_job_cancel(
+    state: &AppState,
+    headers: &HeaderMap,
+    id: &str,
 ) -> Result<Json<JobCancelResponse>, (StatusCode, Json<serde_json::Value>)> {
-    if !super::owner_authenticated(&state, &headers) {
+    if !super::owner_authenticated(state, headers) {
         // Ending live work is a high-risk side effect, same gate as the registry
         // kill endpoint this delegates to.
-        authorize_resource_mutation(&state, "gateway_api:jobs:cancel", ResourceRiskLevel::High)?;
+        authorize_resource_mutation(state, "gateway_api:jobs:cancel", ResourceRiskLevel::High)?;
     }
 
-    let job_id = parse_job_id(&id)?;
+    let job_id = parse_job_id(id)?;
     let Some(work_id) = jobs::work_id_of(job_id) else {
-        return Err(job_not_found(&id));
+        return Err(job_not_found(id));
     };
 
     // Cascade: a job's tool calls and child processes have no reason to outlive

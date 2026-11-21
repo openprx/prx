@@ -319,6 +319,15 @@ the purge of the agent incarnation.
 `memory.events.record_user_messages = false`, an rf message is refused with
 `500 storage_unavailable`, and nothing is written.
 
+**Cancel.**
+
+| Route | Answer |
+|---|---|
+| `POST /api/sessions/{session_id}/runs/{run_id}/cancel` | `200 {"run_id","status"}`: `cancelling` (stop requested), `cancelled` (stopped), or for a run that already ended its terminal status `succeeded`, `failed` or `cancelled`; a run whose process died is given its `interrupted` terminal and answers `failed`. No such run of this owner in this session: `404 run_unknown` |
+| `POST /api/jobs/{job_id}/cancel` | for the job of an rf turn while this process knows the job: `200 {"job_id","run_id","status"}` with the statuses above; an evicted job, a job from before a restart or another owner's: `404 job_unknown` (the outcome is unknown, never "not run"). Console jobs keep their previous answer |
+
+`job_id` is only a hint: the durable id is `run_id`.
+
 **Errors** (coded shape):
 
 - `400 field_invalid`: a bad `session_key`, a body field outside the table
@@ -337,6 +346,7 @@ the purge of the agent incarnation.
 - `409 session_busy`: a `turn` of this agent in this session is still live.
 - `409 idempotency_conflict`: the `client_message_id` was used with a
   different request.
+- `404 run_unknown`, `404 job_unknown`: see Cancel.
 - `400 agent_tools_invalid`, `409 agent_backend_unsupported`,
   `409 agent_scope_refused`: the agent's configuration, the memory backend or
   its scope registry cannot serve a targeted turn.
@@ -359,7 +369,7 @@ the purge of the agent incarnation.
 | `session_key_v1` | `POST /api/sessions` accepts a caller-chosen `session_key` | advertised (AC-1b1) |
 | `message_target_v1` | The message route accepts a target together with caller context | advertised (AC-1b1) |
 | `message_context_delivery_v1` | Caller context is delivered to the turn within published bounds, with `deliver` | advertised (AC-1b1) |
-| `message_idempotency_v1` | The message route deduplicates by an idempotency key, with the replay response, the restart rule and 7-day key retention (see Message idempotency) | advertised (AC-1b2a) |
+| `message_idempotency_v1` | The message route deduplicates by an idempotency key, with the replay response, the restart rule and 7-day key retention; cancel by run id; job cancel answers a coded `404 job_unknown` (see Message idempotency) | advertised (AC-1b2a) |
 | `message_delete_v1` | A message can be deleted | not yet |
 | `sync_snapshot_v1` | `GET /api/sync/snapshot` returns the owner's sessions and turns; an expired cursor gets `410 snapshot_expired` | not yet |
 | `sync_ws_v1` | `GET /api/sync/ws` carries the durable journal kinds with hello, welcome, ack and cursor resume, the root and parent link fields, `turn.failed{prx_restart,retryable:true}` journaled at start, the config-changed startup check and every C§4 close | not yet |

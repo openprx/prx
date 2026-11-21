@@ -295,6 +295,10 @@ pub fn router(state: AppState) -> Router<AppState> {
             "/config/reload",
             post(config::post_config_reload).fallback(config::reload_method_not_allowed),
         )
+        .route(
+            "/sessions/{id}/runs/{run_id}/cancel",
+            post(sessions::post_run_cancel).fallback(capabilities::method_not_allowed),
+        )
         .route_layer(middleware::from_fn_with_state(state.clone(), capabilities::guard));
 
     // The two mailbox endpoints, and only those two. They are authenticated

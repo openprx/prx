@@ -466,10 +466,17 @@ fn render(message: &RfMessage) -> Result<String, serde_json::Error> {
     ))
 }
 
-/// The (workspace, session, agent) turns live in this process, with their
-/// run; `session_busy` (V5), and the "live here" half of a replay's status
-/// (AC-1b2a).
-static LIVE_TURNS: LazyLock<parking_lot::Mutex<HashMap<String, String>>> = LazyLock::new(Default::default);
+/// A live rf turn of one (workspace, session, agent): its run, its job once
+/// submitted, and whether a cancel by run id arrived before the job.
+struct LiveTurn {
+    run_id: String,
+    job: Option<uuid::Uuid>,
+    cancel_requested: bool,
+}
+
+/// The (workspace, session, agent) turns live in this process; `session_busy`
+/// (V5), and the "live here" half of a replay's status (AC-1b2a).
+static LIVE_TURNS: LazyLock<parking_lot::Mutex<HashMap<String, LiveTurn>>> = LazyLock::new(Default::default);
 
 fn slot_key(workspace: &str, session_id: &str, agent: &str) -> String {
     format!("{workspace}\0{session_id}\0{agent}")
@@ -485,11 +492,19 @@ impl TurnSlot {
         match LIVE_TURNS.lock().entry(key.clone()) {
             Entry::Occupied(_) => None,
             Entry::Vacant(vacant) => {
-                vacant.insert(run_id.to_owned());
+                vacant.insert(LiveTurn {
+                    run_id: run_id.to_owned(),
+                    job: None,
+                    cancel_requested: false,
+                });
                 // Built only when claimed: a dropped slot releases its key.
                 Some(Self(key))
             }
         }
+    }
+
+    pub(super) fn key(&self) -> &str {
+        &self.0
     }
 }
 
@@ -499,12 +514,33 @@ impl Drop for TurnSlot {
     }
 }
 
-/// Whether `run_id` is the live turn of its (session, agent) here.
-pub(super) fn live_run(workspace: &str, session_id: &str, agent: &str, run_id: &str) -> bool {
-    LIVE_TURNS
-        .lock()
-        .get(&slot_key(workspace, session_id, agent))
-        .is_some_and(|live| live == run_id)
+/// Record the job that now runs the slot's turn; `true` when a cancel by run
+/// id arrived while the input was being admitted.
+pub(super) fn attach_job(slot: &str, job: uuid::Uuid) -> bool {
+    LIVE_TURNS.lock().get_mut(slot).is_some_and(|turn| {
+        turn.job = Some(job);
+        turn.cancel_requested
+    })
+}
+
+/// Whether a run is live in this process.
+pub(super) enum LiveRun {
+    Absent,
+    /// Its input is being admitted; no job exists yet.
+    Admitting,
+    Job(uuid::Uuid),
+}
+
+/// Whether `run_id` is the live turn of its (session, agent) here; with
+/// `cancel`, a cancel is recorded so a job that starts later is killed.
+pub(super) fn live_run(workspace: &str, session_id: &str, agent: &str, run_id: &str, cancel: bool) -> LiveRun {
+    match LIVE_TURNS.lock().get_mut(&slot_key(workspace, session_id, agent)) {
+        Some(turn) if turn.run_id == run_id => {
+            turn.cancel_requested |= cancel;
+            turn.job.map_or(LiveRun::Admitting, LiveRun::Job)
+        }
+        _ => LiveRun::Absent,
+    }
 }
 
 /// Every validated body field, in a fixed order, for the request hash.

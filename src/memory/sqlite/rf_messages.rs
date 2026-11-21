@@ -6,7 +6,7 @@
 
 use crate::memory::MessageEvent;
 use crate::memory::rf_messages::{RfAdmission, RfAdmissionRefused, RfAttempt, RfAttemptLookup, RfRun, run_terminal};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 /// Idempotent DDL. Called from schema init.
 pub(super) fn init_schema(conn: &Connection) -> anyhow::Result<()> {
@@ -220,4 +220,12 @@ pub(super) fn read(conn: &Connection, workspace_id: &str, lookup: &RfAttemptLook
         attempt.terminal = run_terminal(final_payload.as_deref(), admission_failure.as_deref(), interrupted)?;
     }
     Ok(Some(attempt))
+}
+
+/// [`interrupt`] in its own IMMEDIATE transaction.
+pub(super) fn interrupt_run(conn: &Connection, workspace_id: &str, owner_id: &str, run_id: &str) -> anyhow::Result<bool> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let marked = interrupt(&tx, workspace_id, owner_id, run_id)?;
+    tx.commit()?;
+    Ok(marked)
 }

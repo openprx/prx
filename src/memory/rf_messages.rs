@@ -49,8 +49,8 @@ pub enum RfRunTerminal {
     Succeeded,
     Failed,
     Cancelled,
-    /// Ended by the restart rule after the admitting process died;
-    /// reported as `failed`.
+    /// Ended by the restart rule or a cancel after the admitting process
+    /// died; reported as `failed`.
     Interrupted,
 }
 
