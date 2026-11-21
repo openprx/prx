@@ -828,7 +828,7 @@ mod tests {
         let id = at_str(&created, "/id");
         assert_ne!(id, "");
         assert!(created.get("approval_grant_json").is_none());
-        let owner = ApiPrincipal::of_token(super::super::test_support::TOKEN).owner_id;
+        let owner = ApiPrincipal::for_tests().owner_id;
         assert_eq!(at(&created, "/owner_id").as_str(), Some(owner.as_str()));
 
         let config = served.state.config.load_full();
@@ -997,7 +997,7 @@ mod tests {
         assert!(denied.contains("approval grant"), "{denied}");
 
         let config = served.state.config.load_full();
-        let owner = ApiPrincipal::of_token(super::super::test_support::TOKEN).owner_id;
+        let owner = ApiPrincipal::for_tests().owner_id;
         let job = cron::add_shell_job_with_lineage_and_approval_grant(
             &config,
             Some("seeded".to_string()),

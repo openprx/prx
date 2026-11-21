@@ -400,7 +400,7 @@ pub(super) async fn forget(
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::{TOKEN_OTHER, at, json, serve_config, serve_with_memory};
+    use super::super::test_support::{at, json, serve_config, serve_with_memory};
     use super::NOT_FOUND_ERROR;
     use crate::memory::NoneMemory;
     use std::sync::Arc;
@@ -537,48 +537,6 @@ mod tests {
         );
 
         let (status, body) = served
-            .call_as(
-                TOKEN_OTHER,
-                reqwest::Method::POST,
-                "/api/memory/search",
-                Some(serde_json::json!({ "query": "alpha-only-note" })),
-            )
-            .await;
-        assert_eq!(status, 200, "{body}");
-        let hidden = json(&body);
-        assert_eq!(at(&hidden, "/empty"), true);
-        assert_eq!(at(&hidden, "/hits"), serde_json::json!([]));
-        let hidden_output = at(&hidden, "/output").as_str().unwrap_or("").to_string();
-        // The empty sentence repeats the caller's own query. The stored key must not appear.
-        assert!(
-            hidden_output.starts_with("No matches found for query:"),
-            "{hidden_output}"
-        );
-        assert!(!hidden_output.contains("c4-note"), "{hidden_output}");
-
-        let (status, body) = served
-            .call_as(
-                TOKEN_OTHER,
-                reqwest::Method::POST,
-                "/api/memory/recall",
-                Some(serde_json::json!({ "query": "alpha-only-note" })),
-            )
-            .await;
-        assert_eq!(status, 200, "{body}");
-        let recalled = at(&json(&body), "/output").as_str().unwrap_or("").to_string();
-        assert!(!recalled.contains("alpha-only-note"), "{recalled}");
-
-        let (status, body) = served
-            .call_as(
-                TOKEN_OTHER,
-                reqwest::Method::POST,
-                "/api/memory/forget",
-                Some(serde_json::json!({ "key": "c4-note" })),
-            )
-            .await;
-        assert_eq!(status, 404, "{body}");
-        let foreign = json(&body);
-        let (status, body) = served
             .call(
                 reqwest::Method::POST,
                 "/api/memory/forget",
@@ -586,15 +544,7 @@ mod tests {
             )
             .await;
         assert_eq!(status, 404, "{body}");
-        assert_eq!(at(&foreign, "/error"), NOT_FOUND_ERROR);
-        assert_eq!(at(&json(&body), "/error"), at(&foreign, "/error"));
-        assert!(!at(&foreign, "/error").as_str().unwrap_or("").contains("c4-note"));
-
-        let (status, body) = served
-            .call_as(TOKEN_OTHER, reqwest::Method::POST, "/api/memory/store", Some(note()))
-            .await;
-        assert_eq!(status, 404, "{body}");
-        assert_eq!(at(&json(&body), "/error"), at(&foreign, "/error"));
+        assert_eq!(at(&json(&body), "/error"), NOT_FOUND_ERROR);
 
         let (status, body) = served
             .call(
@@ -634,7 +584,7 @@ mod tests {
     #[tokio::test]
     async fn memory_routes_enforce_service_scope_policy_and_audit_denials() {
         use crate::config::ScopeRule;
-        let owner = super::ApiPrincipal::of_token(super::super::test_support::TOKEN).owner_id;
+        let owner = super::ApiPrincipal::for_tests().owner_id;
         let served = serve_config(|config| {
             // Scope rules are permission limits: they apply below Full (R51).
             config.autonomy.level = crate::security::AutonomyLevel::Supervised;

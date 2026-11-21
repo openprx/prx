@@ -86,6 +86,32 @@ sorted ascending, with no duplicates.
 - `caller_reserved_session_key_prefixes`: prefixes reserved for callers, which
   PRX never mints (`rf-`).
 
+## Route: owner (`owner_id_stable_v1`)
+
+One install has one owner. Every bearer that is a paired token of this
+install acts for one owner id, `api:install:<32 lowercase hex>`. PRX creates
+it once per state directory, at the first gateway start, from the OS random
+source, and keeps it in `<workspace>/self/runtime/install_owner` (mode
+`0600`). It does not change across token rotation, revocation of another
+token, re-pairing or daemon restarts, so sessions, agent incarnations,
+memories and approvals made with one paired token are the same rows for
+every other paired token. Requests while pairing is off are always the owner
+`api:local`, whatever bearer they send; webhook credentials, channel senders
+and MCP callers keep their own identities and never act as this owner.
+Copying the state directory copies the owner. Rows written before this token
+under a per-token owner `api:<32 hex>` are not migrated and are no longer
+reachable. A malformed id file, or one readable by group or others, refuses
+gateway start-up; it is never regenerated.
+
+`GET /api/owner` returns `200 {"owner_id":"api:install:<32 hex>"}` to a paired
+bearer. The id is not a secret; the body carries nothing else. It uses the
+rf contract guard and the shared API rate limit. Errors, in the coded shape:
+
+- `401 auth_failed`: a missing or invalid bearer, a credential in the query
+  string, or any request while pairing is off.
+- `405 method_not_allowed`: any method other than `GET` or `HEAD`.
+- `400 field_invalid`: any query parameter.
+
 ## Routes: agents (`agent_crud_v1`, `agent_main_readback_v1`)
 
 `agent_crud_v1` covers `GET /api/agents`, `GET`/`PUT`/`DELETE
@@ -285,7 +311,7 @@ and a resent `context` is stored again. Deduplication and replay are
 | `agent_crud_v1` | The agent routes above: `GET /api/agents`, `GET`, `PUT` and `DELETE /api/agents/{name}` with If-Match, the config revision, an incarnation and `status`; `GET`/`PUT /api/gateway/targeted-agents`; the owner-bearer-only `POST /api/config/reload`. `DELETE` retires the agent (the purge is `agent_memory_purge_v1`) | advertised since 39509eb97 |
 | `agent_main_readback_v1` | `GET /api/agents/main` reads back Main's configuration | advertised since 39509eb97 |
 | `agent_limits_v1` | `limits {max_concurrent_turns, max_cost_per_day_cents}` on an agent `PUT` (unset by default; card AC-LIM) | not yet |
-| `owner_id_stable_v1` | The owner id stays the same for one install across bearer-token rotation | not yet |
+| `owner_id_stable_v1` | Every paired bearer acts for one install owner id that survives bearer rotation, re-pairing, restarts and additional paired devices; `GET /api/owner` returns it (see Route: owner) | advertised (HOST-1a) |
 | `session_key_v1` | `POST /api/sessions` accepts a caller-chosen `session_key` | advertised (AC-1b1) |
 | `message_target_v1` | The message route accepts a target together with caller context | advertised (AC-1b1) |
 | `message_context_delivery_v1` | Caller context is delivered to the turn within published bounds, with `deliver` | advertised (AC-1b1) |

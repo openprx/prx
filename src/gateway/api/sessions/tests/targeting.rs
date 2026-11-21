@@ -57,7 +57,7 @@ fn http_request(body: serde_json::Value) -> Request {
         .expect("test: request");
     request
         .extensions_mut()
-        .insert(super::super::super::ApiPrincipal::of_token("prx-test-token"));
+        .insert(super::super::super::ApiPrincipal::for_tests());
     request
 }
 
@@ -736,7 +736,7 @@ async fn drive(
                         None => (parent, None),
                     };
 
-                    let principal = super::super::super::ApiPrincipal::of_token("prx-test-token");
+                    let principal = super::super::super::ApiPrincipal::for_tests();
                     let envelope = console_runtime_envelope_for_workspace(
                         workspace.to_string_lossy().to_string(),
                         "console-targeted-session",
@@ -970,7 +970,7 @@ fn multipart_request(body: String) -> Request {
         .expect("test: request");
     request
         .extensions_mut()
-        .insert(super::super::super::ApiPrincipal::of_token("prx-test-token"));
+        .insert(super::super::super::ApiPrincipal::for_tests());
     request
 }
 
@@ -1332,7 +1332,7 @@ async fn sqlite_targeted_scope_supported() {
         .workspace_dir
         .to_string_lossy()
         .into_owned();
-    let owner = super::super::super::ApiPrincipal::of_token("prx-test-token").owner_id;
+    let owner = super::super::super::ApiPrincipal::for_tests().owner_id;
     stamp_console_rows(std::path::Path::new(&workspace), &workspace, &owner, SESSION);
 
     let named = history_reader(&workspace, SESSION, named_partition(&workspace, &owner, "x", TARGET_U));
@@ -1354,7 +1354,7 @@ async fn sqlite_targeted_scope_supported() {
     assert!(main_labels.contains(&"main-row") && main_labels.contains(&"null-row"));
     assert!(!main_labels.contains(&"x-only"));
 
-    let api_principal = super::super::super::ApiPrincipal::of_token("prx-test-token");
+    let api_principal = super::super::super::ApiPrincipal::for_tests();
     let selected = super::super::select_turn_target(
         &fixture.state,
         fixture.state.pin_turn_runtime(),
@@ -1490,7 +1490,7 @@ async fn agent_partition_reaches_every_writer_input() {
                 inner: crate::tools::file_read::FileReadTool::new(security, false),
             }) as ToolBox]);
             let workspace = workspace_dir.to_string_lossy().into_owned();
-            let owner = super::super::super::ApiPrincipal::of_token("prx-test-token").owner_id;
+            let owner = super::super::super::ApiPrincipal::for_tests().owner_id;
             stamp_console_rows(std::path::Path::new(&workspace), &workspace, &owner, SESSION);
 
             let named = named_partition(&workspace, &owner, "x", TARGET_U);
@@ -1660,7 +1660,7 @@ async fn memory_writes_carry_scope() {
         .workspace_dir
         .to_string_lossy()
         .into_owned();
-    let owner = super::super::super::ApiPrincipal::of_token("prx-test-token").owner_id;
+    let owner = super::super::super::ApiPrincipal::for_tests().owner_id;
     seed_named_x(std::path::Path::new(&workspace), &workspace, &owner, SESSION);
     let conn = brain(&workspace);
 
@@ -2181,7 +2181,7 @@ async fn complete_memory_family_scope_stamps() {
                 .workspace_dir
                 .to_string_lossy()
                 .into_owned();
-            let owner = super::super::super::ApiPrincipal::of_token("prx-test-token").owner_id;
+            let owner = super::super::super::ApiPrincipal::for_tests().owner_id;
             seed_named_x(std::path::Path::new(&workspace), &workspace, &owner, SESSION);
             let named = named_partition(&workspace, &owner, "x", TARGET_U);
             let main = main_partition(&workspace, &owner);
@@ -2546,7 +2546,7 @@ async fn documents_writes_carry_scope() {
                 .workspace_dir
                 .to_string_lossy()
                 .into_owned();
-            let owner = super::super::super::ApiPrincipal::of_token("prx-test-token").owner_id;
+            let owner = super::super::super::ApiPrincipal::for_tests().owner_id;
             seed_named_x(std::path::Path::new(&workspace), &workspace, &owner, SESSION);
             let named = named_partition(&workspace, &owner, "x", TARGET_U);
             let main = main_partition(&workspace, &owner);
@@ -2841,7 +2841,7 @@ async fn topics_writes_carry_scope() {
                 .workspace_dir
                 .to_string_lossy()
                 .into_owned();
-            let owner = super::super::super::ApiPrincipal::of_token("prx-test-token").owner_id;
+            let owner = super::super::super::ApiPrincipal::for_tests().owner_id;
             seed_named_x(std::path::Path::new(&workspace), &workspace, &owner, SESSION);
             let main = main_partition(&workspace, &owner);
             let shared = "prx shared topic collision body for named isolation";

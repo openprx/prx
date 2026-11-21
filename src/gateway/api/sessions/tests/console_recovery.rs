@@ -87,7 +87,7 @@ async fn console_reply_interrupted_before_projection_is_restored_once_after_rest
                 let mut restarted = test_app_state_with_config(config, Arc::new(CapturingProvider::default()));
                 restarted.mem = Arc::new(crate::memory::SqliteMemory::new(tmp.path()).expect("test: reopened sqlite"));
                 let runtime = console_test_runtime(&restarted);
-                let api_principal = super::super::super::ApiPrincipal::of_token("prx-test-token");
+                let api_principal = super::super::super::ApiPrincipal::for_tests();
                 let interrupted = restarted
                     .mem
                     .list_conversation_turns(&principal, session_id, 50, 0)

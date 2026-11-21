@@ -15,6 +15,7 @@ pub mod audit;
 pub mod decision_id;
 pub mod git_launch;
 pub mod inbound_gate;
+pub mod install_owner;
 pub mod op_id;
 pub mod pairing;
 pub(crate) mod path_policy;

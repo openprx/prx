@@ -8,7 +8,6 @@ use crate::config::{
 };
 use std::sync::mpsc;
 
-const TOKEN: &str = "prx-agent-registry-token";
 const SESSION: &str = "no-such-session";
 
 fn agent(temperature: f64, enabled: bool) -> DelegateAgentConfig {
@@ -132,7 +131,7 @@ struct Harness {
 }
 
 fn owner_id() -> String {
-    super::super::api::ApiPrincipal::of_token(TOKEN).owner_id
+    super::super::api::ApiPrincipal::for_tests().owner_id
 }
 
 fn db(dir: &std::path::Path) -> rusqlite::Connection {
@@ -254,7 +253,7 @@ async fn send(state: AppState, body: axum::body::Body) -> (u16, Option<String>) 
         .expect("test: request");
     request
         .extensions_mut()
-        .insert(super::super::api::ApiPrincipal::of_token(TOKEN));
+        .insert(super::super::api::ApiPrincipal::for_tests());
     let response = super::super::api::post_session_message(
         axum::extract::State(state),
         axum::extract::Path(SESSION.to_owned()),

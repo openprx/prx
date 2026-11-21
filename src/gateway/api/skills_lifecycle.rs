@@ -353,7 +353,7 @@ pub(super) async fn rollback(
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::{TOKEN, at, json, serve_config};
+    use super::super::test_support::{at, json, serve_config};
     use super::*;
 
     fn enable(owner: String) -> impl FnOnce(&mut crate::config::Config) {
@@ -397,7 +397,7 @@ mod tests {
 
     #[tokio::test]
     async fn lifecycle_routes_enforce_service_scope_policy_and_audit_denials() {
-        let owner = ApiPrincipal::of_token(TOKEN).owner_id;
+        let owner = ApiPrincipal::for_tests().owner_id;
         let served = serve_config(|config| {
             // Scope rules are permission limits: they apply below Full (R51).
             config.autonomy.level = crate::security::AutonomyLevel::Supervised;
@@ -466,7 +466,7 @@ mod tests {
     #[tokio::test]
     async fn lifecycle_reads_use_read_capabilities_and_cancel_requires_service_approval() {
         let served = serve_config(|config| {
-            enable(ApiPrincipal::of_token(TOKEN).owner_id)(config);
+            enable(ApiPrincipal::for_tests().owner_id)(config);
             config.autonomy.level = crate::security::AutonomyLevel::Supervised;
         })
         .await;
@@ -513,7 +513,7 @@ mod tests {
         assert_eq!(status, 503, "{body}");
         assert_eq!(at(&json(&body), "/success"), false);
 
-        let owner = ApiPrincipal::of_token(TOKEN).owner_id;
+        let owner = ApiPrincipal::for_tests().owner_id;
         let served = serve_config(enable(owner)).await;
         let (status, body) = served
             .call(reqwest::Method::GET, "/api/skills/lifecycle/status", None)

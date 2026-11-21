@@ -32,7 +32,7 @@ async fn unauthenticated_identity_has_no_evidence_sideeffect_and_response_has_no
     let (status, body) = served.call(reqwest::Method::GET, "/api/identity", None).await;
     assert_eq!(status, 200, "{body}");
     let value: serde_json::Value = serde_json::from_str(&body).unwrap();
-    let expected_principal = ApiPrincipal::of_token(TOKEN);
+    let expected_principal = ApiPrincipal::for_tests();
     assert_eq!(
         value.get("principal_id").and_then(serde_json::Value::as_str),
         Some(expected_principal.owner_id.as_str())
@@ -43,13 +43,13 @@ async fn unauthenticated_identity_has_no_evidence_sideeffect_and_response_has_no
         assert!(value.get(forbidden).is_none());
     }
     assert_eq!(value.as_object().unwrap().len(), 4);
-    verify_startup_identity(&config, &ApiPrincipal::of_token(TOKEN).owner_id)
+    verify_startup_identity(&config, &ApiPrincipal::for_tests().owner_id)
         .await
         .unwrap();
     let mut changed = (*config).clone();
     changed.gateway.paired_tokens = vec!["different-existing-token".into()];
     assert!(
-        verify_startup_identity(&changed, &ApiPrincipal::of_token(TOKEN).owner_id)
+        verify_startup_identity(&changed, &ApiPrincipal::for_tests().owner_id)
             .await
             .is_err()
     );
@@ -60,7 +60,7 @@ async fn startup_identity_requires_existing_private_mac_and_never_repairs_missin
     let (status, body) = served.call(reqwest::Method::GET, "/api/identity", None).await;
     assert_eq!(status, 200, "{body}");
     let config = served.state.config.load_full();
-    let principal = ApiPrincipal::of_token(TOKEN).owner_id;
+    let principal = ApiPrincipal::for_tests().owner_id;
     let key = config.workspace_dir.join("self/runtime/runtime.key");
     std::fs::remove_file(&key).unwrap();
     assert!(verify_startup_identity(&config, &principal).await.is_err());
@@ -73,12 +73,21 @@ async fn tampered_descriptor_cannot_select_another_owner_or_principal() {
     let served = fixture().await;
     assert_eq!(served.call(reqwest::Method::GET, "/api/identity", None).await.0, 200);
     let config = served.state.config.load_full();
-    let principal = ApiPrincipal::of_token(TOKEN).owner_id;
+    let principal = ApiPrincipal::for_tests().owner_id;
     let store = existing_store(&config).unwrap();
     let path = store
         .root()
-        .join("application-evidence/authenticated-api-identity-v1")
-        .join(format!("{}.json", hex::encode(Sha256::digest(principal.as_bytes()))));
+        .join("application-evidence/authenticated-api-identity-v2")
+        .join(format!(
+            "{}.json",
+            hex::encode(Sha256::digest(
+                format!(
+                    "prx-identity-evidence-v2\0{principal}\0{}\0",
+                    crate::security::pairing::hash_token(TOKEN)
+                )
+                .as_bytes()
+            ))
+        ));
     let original = std::fs::read(&path).unwrap();
     let mut value: serde_json::Value = serde_json::from_slice(&original).unwrap();
     *value.get_mut("body").unwrap().get_mut("store_owner").unwrap() = serde_json::json!("owner:other");

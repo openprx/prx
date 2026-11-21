@@ -11,6 +11,7 @@
 // Safety: parking_lot::Mutex is correct here — all lock scopes are synchronous
 // (no .await while holding the guard). The async `try_pair` delegates to
 // `spawn_blocking` which runs the blocking `try_pair_blocking` on a thread pool.
+use super::install_owner::InstallOwnerId;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -40,6 +41,9 @@ pub struct PairingGuard {
     paired_tokens: Arc<Mutex<HashSet<String>>>,
     /// Brute-force protection: per-client failed attempt counter + lockout time.
     failed_attempts: Arc<Mutex<HashMap<String, (u32, Option<Instant>)>>>,
+    /// The owner every paired bearer acts for (HOST-1a). The gateway sets it
+    /// at start-up; a guard without it authenticates no API owner.
+    install_owner: Option<InstallOwnerId>,
 }
 
 impl PairingGuard {
@@ -66,7 +70,20 @@ impl PairingGuard {
             pairing_code: Arc::new(Mutex::new(code)),
             paired_tokens: Arc::new(Mutex::new(tokens)),
             failed_attempts: Arc::new(Mutex::new(HashMap::new())),
+            install_owner: None,
         }
+    }
+
+    /// The guard with the install owner every paired bearer acts for.
+    #[must_use]
+    pub fn with_install_owner(mut self, owner: InstallOwnerId) -> Self {
+        self.install_owner = Some(owner);
+        self
+    }
+
+    /// The install owner, when the gateway set one.
+    pub const fn install_owner(&self) -> Option<&InstallOwnerId> {
+        self.install_owner.as_ref()
     }
 
     /// The one-time pairing code (only set when no tokens exist yet).

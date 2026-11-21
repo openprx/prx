@@ -1,5 +1,6 @@
 use super::AppState;
 use crate::config::Config;
+use crate::security::install_owner::InstallOwnerId;
 use crate::security::policy::ResourceRiskLevel;
 use axum::{
     Json, Router,
@@ -29,6 +30,7 @@ mod mcp;
 mod memory;
 mod models;
 mod operations_tools;
+mod owner;
 mod plugins;
 mod providers;
 mod runtime;
@@ -273,6 +275,10 @@ pub fn router(state: AppState) -> Router<AppState> {
             get(agents::get_agents).fallback(capabilities::method_not_allowed),
         )
         .route(
+            "/owner",
+            get(owner::get_owner).fallback(capabilities::method_not_allowed),
+        )
+        .route(
             "/agents/{name}",
             get(agents::get_agent)
                 .put(agents::put_agent)
@@ -424,57 +430,62 @@ pub(super) fn extract_resource_auth_token(headers: &HeaderMap) -> String {
 }
 
 /// Who an authenticated API request acts for (SP-CDP-A 5.14, D-040 OQ-A10):
-/// the owner of the rows it may read. It is derived from the bearer that
-/// passed [`auth_middleware`] and inserted into the request's extensions.
+/// the owner of the rows it may read. It is resolved when the request
+/// passes [`auth_middleware`] and inserted into the request's extensions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ApiPrincipal {
-    /// `api:<digest>`: SHA-256 over `prx-api-owner-v1 \0 token`, truncated
-    /// to 128 bits, so it is stable per token, distinct across tokens, and
-    /// never the at-rest verifier of `gateway.paired_tokens` (the plain
-    /// digest). `api:local` when pairing is off and no token was sent.
+    /// The install owner id `api:install:<32 hex>` for every paired bearer
+    /// (HOST-1a: one owner per install, the same across bearer rotation,
+    /// re-pairing and restarts); `api:local` for every request while pairing
+    /// is off, whatever bearer it sends.
     pub(super) owner_id: String,
 }
 
-/// Domain separator of the API owner digest (D-040 OQ-A10).
-const API_OWNER_DIGEST_DOMAIN: &str = "prx-api-owner-v1";
-
-/// The owner of a request that sent no token (pairing off).
+/// The owner of every request while pairing is off.
 const LOCAL_OWNER_ID: &str = "api:local";
 
 impl ApiPrincipal {
-    /// The principal of a request that presented `token`.
-    pub(super) fn of_token(token: &str) -> Self {
-        use sha2::{Digest, Sha256};
-        if token.is_empty() {
-            return Self {
-                owner_id: LOCAL_OWNER_ID.to_string(),
-            };
-        }
-        let mut hasher = Sha256::new();
-        hasher.update(API_OWNER_DIGEST_DOMAIN.as_bytes());
-        hasher.update([0u8]);
-        hasher.update(token.as_bytes());
-        let digest = hex::encode(hasher.finalize());
+    /// The principal of every request while pairing is off.
+    fn local() -> Self {
         Self {
-            owner_id: format!("api:{}", digest.get(..32).unwrap_or(digest.as_str())),
+            owner_id: LOCAL_OWNER_ID.to_owned(),
         }
     }
 
-    /// The tokenless principal of a request with pairing off. It is never
+    /// The principal of a paired bearer.
+    fn install(owner: &InstallOwnerId) -> Self {
+        Self {
+            owner_id: owner.as_str().to_owned(),
+        }
+    }
+
+    /// The principal a paired bearer gets from the gateway test fixtures.
+    #[cfg(test)]
+    pub(super) fn for_tests() -> Self {
+        Self::install(&InstallOwnerId::for_tests())
+    }
+
+    /// The principal of a request with pairing off. It is never
     /// owner-authenticated, so its Console turns stay owner-isolated.
     pub(super) fn is_local(&self) -> bool {
         self.owner_id == LOCAL_OWNER_ID
     }
 }
 
-/// The principal of a request whose bearer (or same-origin cookie) passes
-/// the pairing check; `None` when it does not.
+/// The principal of a request that passes the pairing check; `None` when it
+/// does not. With pairing off every request is `api:local` and any bearer it
+/// carries is ignored; with pairing on a paired bearer (or its same-origin
+/// cookie) acts for the install owner.
 fn authenticated_principal(state: &AppState, headers: &HeaderMap) -> Option<ApiPrincipal> {
-    let provided_token = extract_resource_auth_token(headers);
-    if state.pairing.require_pairing() && !state.pairing.is_authenticated(&provided_token) {
+    if !state.pairing.require_pairing() {
+        return Some(ApiPrincipal::local());
+    }
+    if !state.pairing.is_authenticated(&extract_resource_auth_token(headers)) {
         return None;
     }
-    Some(ApiPrincipal::of_token(&provided_token))
+    // The gateway always sets the install owner at start-up; a guard
+    // without one authenticates nobody rather than inventing an owner.
+    state.pairing.install_owner().map(ApiPrincipal::install)
 }
 
 /// Whether this request was authenticated by a paired bearer: pairing is

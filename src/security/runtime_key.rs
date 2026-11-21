@@ -429,7 +429,9 @@ fn create_private_dir(dir: &Path) -> Result<(), String> {
         .map_err(|error| format!("cannot create {}: {error}", dir.display()))
 }
 
-fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+/// Create `path` new with mode `0600` (never readable by others, not even
+/// for a moment), write `bytes` and sync it. Also used by the install owner.
+pub(super) fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -464,7 +466,8 @@ fn restrict_file(file: &std::fs::File, metadata: &std::fs::Metadata, path: &Path
     Ok(())
 }
 
-fn sync_dir(dir: &Path) -> Result<(), String> {
+/// Sync a directory so a new link in it survives a crash.
+pub(super) fn sync_dir(dir: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         std::fs::File::open(dir)

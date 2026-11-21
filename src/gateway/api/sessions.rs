@@ -2924,7 +2924,7 @@ mod tests {
                 Arc::new(crate::memory::SqliteMemory::new(&state.config.pin().effective.workspace_dir).unwrap());
         }
         let runtime = console_test_runtime(state);
-        let principal = super::super::ApiPrincipal::of_token("prx-test-token");
+        let principal = super::super::ApiPrincipal::for_tests();
         let envelope = envelope
             .with_run_id(uuid::Uuid::new_v4().to_string())
             .with_config_generation(&runtime.config_generation)
@@ -3350,7 +3350,7 @@ mod tests {
                     crate::tokens::count::count_tokens(&payload) > 31_000,
                     "the paired payload must overrun the narrow main-turn window"
                 );
-                let principal = super::super::ApiPrincipal::of_token("prx-test-token");
+                let principal = super::super::ApiPrincipal::for_tests();
                 let filesystem = crate::tools::owner_filesystem::OwnerFilesystem::open(
                     &private, workspace.to_string_lossy().as_ref(), &principal.owner_id, &workspace,
                 ).unwrap();
@@ -3870,7 +3870,7 @@ mod tests {
                 limit: None,
                 cursor: None,
             }),
-            axum::Extension(super::super::ApiPrincipal::of_token("prx-owner-token")),
+            axum::Extension(super::super::ApiPrincipal::for_tests()),
         )
         .await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
@@ -4009,7 +4009,7 @@ mod tests {
             .publish(&runtime, &state)
             .await
             .expect("test: decision plane publishes");
-        let principal = super::super::ApiPrincipal::of_token("prx-owner-token");
+        let principal = super::super::ApiPrincipal::for_tests();
         let response = super::get_session_approvals(
             State(state.clone()),
             Query(ApprovalInboxQuery {
@@ -4105,7 +4105,7 @@ mod tests {
                 limit: None,
                 cursor: None,
             }),
-            axum::Extension(super::super::ApiPrincipal::of_token("prx-owner-token")),
+            axum::Extension(super::super::ApiPrincipal::for_tests()),
         )
         .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);

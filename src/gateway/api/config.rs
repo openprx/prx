@@ -994,7 +994,10 @@ mod tests {
             hooks: Arc::new(HookManager::new(workspace)),
             webhook_token_hash: None,
             webhook_signing_secret: None,
-            pairing: Arc::new(PairingGuard::new(true, &[TOKEN.to_string()])),
+            pairing: Arc::new(
+                PairingGuard::new(true, &[TOKEN.to_string()])
+                    .with_install_owner(crate::security::install_owner::InstallOwnerId::for_tests()),
+            ),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(10_000, 10_000, 10_000, 10_000)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),

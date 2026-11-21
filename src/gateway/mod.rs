@@ -1848,6 +1848,12 @@ async fn run_gateway_inner(
              [gateway] allow_public_bind = true in config.toml (NOT recommended)."
         );
     }
+    // ── Install owner (HOST-1a): every paired bearer acts for it. Loaded
+    // before the listener binds, so an unusable id file leaves no route
+    // answering; it is never regenerated.
+    let install_owner = crate::security::install_owner::load_or_create(&config.workspace_dir)
+        .context("gateway start-up refused: the install owner id is unusable")?;
+    tracing::info!(owner_id = %install_owner, "install owner id loaded");
     let addr: SocketAddr = format!("{host}:{port}").parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let actual_port = listener.local_addr()?.port();
@@ -2136,10 +2142,10 @@ async fn run_gateway_inner(
         .map(Arc::from);
 
     // ── Pairing guard ──────────────────────────────────────
-    let pairing = Arc::new(PairingGuard::new(
-        config.gateway.require_pairing,
-        &config.gateway.paired_tokens,
-    ));
+    let pairing = Arc::new(
+        PairingGuard::new(config.gateway.require_pairing, &config.gateway.paired_tokens)
+            .with_install_owner(install_owner),
+    );
     let rate_limit_max_keys = normalize_max_keys(config.gateway.rate_limit_max_keys, RATE_LIMIT_MAX_KEYS_DEFAULT);
     let rate_limiter = Arc::new(GatewayRateLimiter::new(
         config.gateway.pair_rate_limit_per_minute,
