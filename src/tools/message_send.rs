@@ -696,7 +696,7 @@ impl Tool for MessageSendTool {
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         // Security guard: autonomy check
-        if !self.security.can_act() {
+        if !crate::tools::effective_autonomy::call_policy(&self.security).can_act() {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -735,12 +735,14 @@ impl Tool for MessageSendTool {
                 };
                 let operation_name = message_send_operation(destination.name(), &recipient);
                 let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
-                if let Err(error) = SideEffectGate::new(&self.security).authorize_resource_operation(
-                    self.name(),
-                    &operation_name,
-                    ResourceRiskLevel::Medium,
-                    approval_grant.as_ref(),
-                ) {
+                if let Err(error) = SideEffectGate::new(&crate::tools::effective_autonomy::call_policy(&self.security))
+                    .authorize_resource_operation(
+                        self.name(),
+                        &operation_name,
+                        ResourceRiskLevel::Medium,
+                        approval_grant.as_ref(),
+                    )
+                {
                     return Ok(ToolResult {
                         success: false,
                         output: String::new(),
@@ -1173,7 +1175,7 @@ impl Tool for DaemonMessageSendTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        if !self.security.can_act() {
+        if !crate::tools::effective_autonomy::call_policy(&self.security).can_act() {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -1233,12 +1235,9 @@ impl Tool for DaemonMessageSendTool {
 
         let operation = message_send_operation(channel, recipient);
         let approval = ApprovalGrant::from_runtime_args(self.name(), &args);
-        if let Err(error) = SideEffectGate::new(self.security.as_ref()).authorize_resource_operation(
-            self.name(),
-            &operation,
-            ResourceRiskLevel::Medium,
-            approval.as_ref(),
-        ) {
+        if let Err(error) = SideEffectGate::new(&crate::tools::effective_autonomy::call_policy(&self.security))
+            .authorize_resource_operation(self.name(), &operation, ResourceRiskLevel::Medium, approval.as_ref())
+        {
             return refuse(error);
         }
 

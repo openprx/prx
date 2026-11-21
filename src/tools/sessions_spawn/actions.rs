@@ -130,13 +130,14 @@ impl SessionsSpawnTool {
                         // suspended approval resolver's pending await along with it.
                         SubAgentStatus::Running | SubAgentStatus::AwaitingInput { .. } => {
                             let operation_name = format!("sessions_spawn:kill:{run_id}");
-                            if let Err(error) = SideEffectGate::new(self.security.as_ref())
-                                .authorize_resource_operation(
-                                    self.name(),
-                                    &operation_name,
-                                    ResourceRiskLevel::Medium,
-                                    approval_grant,
-                                )
+                            if let Err(error) =
+                                SideEffectGate::new(&crate::tools::effective_autonomy::call_policy(&self.security))
+                                    .authorize_resource_operation(
+                                        self.name(),
+                                        &operation_name,
+                                        ResourceRiskLevel::Medium,
+                                        approval_grant,
+                                    )
                             {
                                 return Ok(ToolResult {
                                     success: false,
@@ -450,12 +451,15 @@ impl SessionsSpawnTool {
                         });
                     };
                     let operation_name = format!("sessions_spawn:steer:{run_id}");
-                    if let Err(error) = SideEffectGate::new(self.security.as_ref()).authorize_resource_operation(
-                        self.name(),
-                        &operation_name,
-                        ResourceRiskLevel::Low,
-                        approval_grant,
-                    ) {
+                    if let Err(error) =
+                        SideEffectGate::new(&crate::tools::effective_autonomy::call_policy(&self.security))
+                            .authorize_resource_operation(
+                                self.name(),
+                                &operation_name,
+                                ResourceRiskLevel::Low,
+                                approval_grant,
+                            )
+                    {
                         return Ok(ToolResult {
                             success: false,
                             output: String::new(),

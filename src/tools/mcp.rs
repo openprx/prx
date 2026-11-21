@@ -1694,7 +1694,7 @@ impl Tool for McpTool {
                 error: Some(format!("Unknown MCP action '{action}'")),
             });
         }
-        if !self.security.can_act() {
+        if !crate::tools::effective_autonomy::call_policy(&self.security).can_act() {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -1745,12 +1745,9 @@ impl Tool for McpTool {
         // name for a discovered tool, the root name for a root call. The
         // operation id stays root-based so one approval never crosses targets.
         let approval_grant = ApprovalGrant::from_runtime_args(name, &args);
-        if let Err(error) = SideEffectGate::new(&self.security).authorize_resource_operation(
-            name,
-            &operation_name,
-            ResourceRiskLevel::High,
-            approval_grant.as_ref(),
-        ) {
+        if let Err(error) = SideEffectGate::new(&crate::tools::effective_autonomy::call_policy(&self.security))
+            .authorize_resource_operation(name, &operation_name, ResourceRiskLevel::High, approval_grant.as_ref())
+        {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),

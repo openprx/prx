@@ -211,12 +211,14 @@ impl Tool for ChatProfileUpdateTool {
         let target_ref = format!("{channel}:{chat_id}");
         let operation_name = op_id::op_id(self.name(), "update", &[&target_ref]);
         let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
-        if let Err(error) = SideEffectGate::new(&self.security).authorize_resource_operation(
-            self.name(),
-            &operation_name,
-            ResourceRiskLevel::Medium,
-            approval_grant.as_ref(),
-        ) {
+        if let Err(error) = SideEffectGate::new(&crate::tools::effective_autonomy::call_policy(&self.security))
+            .authorize_resource_operation(
+                self.name(),
+                &operation_name,
+                ResourceRiskLevel::Medium,
+                approval_grant.as_ref(),
+            )
+        {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),

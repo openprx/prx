@@ -70,8 +70,10 @@ pub fn catalog_for(config: &Config) -> CatalogView {
 /// The credential a selection of `provider` uses when nothing more specific
 /// is configured for it: the root connection (`api_key`, `api_url` and
 /// `reliability.api_keys`, as one unit) when `provider` is the configured
-/// default provider's identity and the root holds something, and otherwise
-/// the provider's own store, so no configured credential is released to it.
+/// default provider's identity and the root holds something; otherwise the
+/// `cred-<name>` reference stored for `provider`, when there is one; and
+/// otherwise the provider's own store. The root is never released to another
+/// provider, and a reference is used only for the provider it was issued for.
 #[must_use]
 pub fn credential_for(config: &Config, provider: &str) -> CredentialRef {
     let root_holds_material = [config.api_key.as_deref(), config.api_url.as_deref()]
@@ -82,7 +84,7 @@ pub fn credential_for(config: &Config, provider: &str) -> CredentialRef {
     let is_default = ProviderId::of(provider) == ProviderId::of(default_provider(config));
     if root_holds_material && is_default {
         CredentialRef::LegacyInline(LegacySlot::Root)
-    } else if is_default && let Some(reference) = default_credential_reference(config, provider) {
+    } else if let Some(reference) = stored_credential_reference(config, provider) {
         reference
     } else {
         CredentialRef::ProviderStore
@@ -90,16 +92,16 @@ pub fn credential_for(config: &Config, provider: &str) -> CredentialRef {
 }
 
 /// The credential reference `prx providers credential set <provider>` stores
-/// under its default name (`cred-<catalog name>`), when the configured default
-/// provider has one and it was issued for that provider. Used only when the
-/// root holds no connection material, so the precedence is: any root
-/// `api_key`, rotation key or `api_url`, then `cred-<name>`, then the
-/// provider's own store. A missing or foreign
+/// under its default name (`cred-<catalog name>`), when `provider` has one and
+/// it was issued for that provider. For the default provider it is used only
+/// when the root holds no connection material, so the precedence is: any root
+/// `api_key`, rotation key or `api_url` (default provider only), then
+/// `cred-<name>`, then the provider's own store. A missing or foreign
 /// reference means no reference. An unreadable store is reported with a
 /// warning (never the value) and falls back to the provider store. The store
 /// is read on each call, not cached, so a credential stored a moment ago is
 /// used by the next provider construction.
-fn default_credential_reference(config: &Config, provider: &str) -> Option<CredentialRef> {
+fn stored_credential_reference(config: &Config, provider: &str) -> Option<CredentialRef> {
     use crate::config::manage::credentials::{CredentialReferenceError, CredentialReferences};
     let name = ProviderId::of(provider).catalog_name()?.to_ascii_lowercase();
     let id = CredentialReferences::id_for(&name).ok()?;

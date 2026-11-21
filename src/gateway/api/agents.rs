@@ -301,7 +301,7 @@ fn named_readback(
             model: agent.model.clone(),
             prompt: agent.system_prompt.clone(),
             // A hand-written agent without a level runs at Main's.
-            autonomy: agent.autonomy.unwrap_or(snapshot.config.autonomy.level),
+            autonomy: crate::security::agent_level::agent_level(agent.autonomy, snapshot.config.autonomy.level),
             tools,
             enabled: Some(agent.enabled),
         },

@@ -107,7 +107,7 @@ impl FileEditTool {
             });
         }
 
-        if !self.security.can_act() {
+        if !crate::tools::effective_autonomy::call_policy(&self.security).can_act() {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -149,12 +149,9 @@ impl FileEditTool {
             &resolved_target,
         );
         let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
-        if let Err(error) = SideEffectGate::new(&self.security).authorize_resource_operation(
-            self.name(),
-            &operation_name,
-            risk,
-            approval_grant.as_ref(),
-        ) {
+        if let Err(error) = SideEffectGate::new(&crate::tools::effective_autonomy::call_policy(&self.security))
+            .authorize_resource_operation(self.name(), &operation_name, risk, approval_grant.as_ref())
+        {
             let error = if launch_file {
                 format!(
                     "{error} (a workspace launch definition: {}; writing one is a high-risk operation of its own)",

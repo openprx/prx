@@ -183,12 +183,14 @@ impl SubagentsTool {
         match &run.status {
             SubAgentStatus::Running | SubAgentStatus::AwaitingInput { .. } => {
                 let operation_name = format!("subagents:kill:{run_id}");
-                if let Err(error) = SideEffectGate::new(self.security.as_ref()).authorize_resource_operation(
-                    self.name(),
-                    &operation_name,
-                    ResourceRiskLevel::Medium,
-                    approval_grant,
-                ) {
+                if let Err(error) = SideEffectGate::new(&crate::tools::effective_autonomy::call_policy(&self.security))
+                    .authorize_resource_operation(
+                        self.name(),
+                        &operation_name,
+                        ResourceRiskLevel::Medium,
+                        approval_grant,
+                    )
+                {
                     return Ok(ToolResult {
                         success: false,
                         output: String::new(),
@@ -348,12 +350,15 @@ impl SubagentsTool {
                 SubAgentStatus::Running | SubAgentStatus::AwaitingInput { .. } => {
                     if let Some(ref tx) = run.steer_tx {
                         let operation_name = format!("subagents:steer:{run_id}");
-                        if let Err(error) = SideEffectGate::new(self.security.as_ref()).authorize_resource_operation(
-                            self.name(),
-                            &operation_name,
-                            ResourceRiskLevel::Low,
-                            approval_grant,
-                        ) {
+                        if let Err(error) =
+                            SideEffectGate::new(&crate::tools::effective_autonomy::call_policy(&self.security))
+                                .authorize_resource_operation(
+                                    self.name(),
+                                    &operation_name,
+                                    ResourceRiskLevel::Low,
+                                    approval_grant,
+                                )
+                        {
                             return Ok(ToolResult {
                                 success: false,
                                 output: String::new(),

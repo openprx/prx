@@ -186,12 +186,14 @@ impl Tool for SessionsSendTool {
 
         let operation_name = format!("sessions_send:steer:{run_id}");
         let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
-        if let Err(error) = SideEffectGate::new(self.security.as_ref()).authorize_resource_operation(
-            self.name(),
-            &operation_name,
-            ResourceRiskLevel::Low,
-            approval_grant.as_ref(),
-        ) {
+        if let Err(error) = SideEffectGate::new(&crate::tools::effective_autonomy::call_policy(&self.security))
+            .authorize_resource_operation(
+                self.name(),
+                &operation_name,
+                ResourceRiskLevel::Low,
+                approval_grant.as_ref(),
+            )
+        {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),

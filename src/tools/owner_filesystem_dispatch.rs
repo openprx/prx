@@ -114,6 +114,7 @@ async fn apply_file_operation_inner(
         filesystem.resolve_existing(path)?
     };
     if operation != NativeFileOperation::Read {
+        let security = crate::tools::effective_autonomy::call_policy(security);
         ensure!(security.can_act(), "action blocked: autonomy is read-only");
         let (operation, risk, _, _) = crate::security::approval_operation::file_operation(
             tool,
@@ -121,7 +122,7 @@ async fn apply_file_operation_inner(
             target.operation_target(),
         );
         let grant = crate::security::policy::ApprovalGrant::from_runtime_args(tool, &arguments);
-        SideEffectGate::new(security)
+        SideEffectGate::new(&security)
             .authorize_resource_operation(tool, &operation, risk, grant.as_ref())
             .map_err(anyhow::Error::msg)?;
     }

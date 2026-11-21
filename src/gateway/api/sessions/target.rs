@@ -148,12 +148,6 @@ impl ToolAllowlist {
     }
 }
 
-/// `min(agent, main)` with `ReadOnly < Supervised < Full`; an unset agent
-/// level inherits Main's.
-pub(super) fn effective_autonomy(agent: Option<AutonomyLevel>, main: AutonomyLevel) -> AutonomyLevel {
-    agent.map_or(main, |level| level.min(main))
-}
-
 fn allowlist_for(agent: &DelegateAgentConfig) -> Result<ToolAllowlist, TargetError> {
     if !agent.agentic {
         return Ok(ToolAllowlist::None);
@@ -214,7 +208,7 @@ pub(super) fn resolve_target(config: &Config, target: &TurnTarget) -> Result<Opt
     let tools = allowlist_for(agent)?;
     Ok(Some(TargetPlan {
         name: name.clone(),
-        autonomy: effective_autonomy(agent.autonomy, config.autonomy.level),
+        autonomy: crate::security::agent_level::agent_level(agent.autonomy, config.autonomy.level),
         agent: agent.clone(),
         tools,
     }))
@@ -289,8 +283,8 @@ fn target_system_prompt(config: &Config, agent: &DelegateAgentConfig) -> String 
 
 /// Derive the pinned runtime for a resolved target. It shares the generation,
 /// registry and cleanup owner of `parent` and replaces the provider binding,
-/// model, temperature and decision slot (capped security policy and the
-/// target's own tool surface).
+/// model, temperature and decision slot (the security policy at the target's
+/// own level and its own tool surface).
 pub(super) fn prepare_target(
     parent: &TurnRuntimeGeneration,
     plan: &TargetPlan,
@@ -300,9 +294,9 @@ pub(super) fn prepare_target(
         .map_err(|error| TargetUnavailable(crate::security::redaction::redact_secrets(&format!("{error:#}"))))?;
     let model = resolved.model().to_owned();
     let binding = Arc::new(GatewayProviderBinding::new(Arc::clone(&provider), resolved));
-    let mut capped = (**config).clone();
-    capped.autonomy.level = plan.autonomy;
-    let security = crate::runtime::bootstrap::build_security_policy(&capped);
+    let mut own_level = (**config).clone();
+    own_level.autonomy.level = plan.autonomy;
+    let security = crate::runtime::bootstrap::build_security_policy(&own_level);
     let runtime = TurnRuntimeGeneration {
         provider_binding: Some(binding),
         publication_slot: Arc::new(parent.publication_slot.targeted(security, plan.tools.surface())),

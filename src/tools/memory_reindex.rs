@@ -39,12 +39,14 @@ impl Tool for MemoryReindexTool {
         let memory_view = crate::memory::active_view::select(&self.memory);
         let operation_name = "memory_reindex:rebuild";
         let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
-        if let Err(error) = SideEffectGate::new(&self.security).authorize_resource_operation(
-            self.name(),
-            operation_name,
-            ResourceRiskLevel::Medium,
-            approval_grant.as_ref(),
-        ) {
+        if let Err(error) = SideEffectGate::new(&crate::tools::effective_autonomy::call_policy(&self.security))
+            .authorize_resource_operation(
+                self.name(),
+                operation_name,
+                ResourceRiskLevel::Medium,
+                approval_grant.as_ref(),
+            )
+        {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),

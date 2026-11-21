@@ -129,12 +129,14 @@ impl Tool for MemoryForgetTool {
             key,
         );
         let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
-        if let Err(error) = SideEffectGate::new(&self.security).authorize_resource_operation(
-            self.name(),
-            &operation_name,
-            ResourceRiskLevel::High,
-            approval_grant.as_ref(),
-        ) {
+        if let Err(error) = SideEffectGate::new(&crate::tools::effective_autonomy::call_policy(&self.security))
+            .authorize_resource_operation(
+                self.name(),
+                &operation_name,
+                ResourceRiskLevel::High,
+                approval_grant.as_ref(),
+            )
+        {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),

@@ -57,7 +57,7 @@ impl NodesTool {
     }
 
     fn require_write_access(&self) -> Option<ToolResult> {
-        if !self.security.can_act() {
+        if !crate::tools::effective_autonomy::call_policy(&self.security).can_act() {
             return Some(ToolResult {
                 success: false,
                 output: String::new(),
@@ -74,7 +74,7 @@ impl NodesTool {
         risk: ResourceRiskLevel,
         approval_grant: Option<&ApprovalGrant>,
     ) -> Option<ToolResult> {
-        SideEffectGate::new(self.security.as_ref())
+        SideEffectGate::new(&crate::tools::effective_autonomy::call_policy(&self.security))
             .authorize_resource_operation(self.name(), operation_name, risk, approval_grant)
             .err()
             .map(|error| ToolResult {

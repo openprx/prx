@@ -762,8 +762,7 @@ impl Tool for ComposioTool {
             }
 
             "execute" => {
-                if let Err(error) = self
-                    .security
+                if let Err(error) = crate::tools::effective_autonomy::call_policy(&self.security)
                     .enforce_tool_operation(ToolOperation::Act, "composio.execute")
                 {
                     return Ok(ToolResult {
@@ -786,12 +785,14 @@ impl Tool for ComposioTool {
                 // approval for one action cannot authorize another (op per d03).
                 let operation_name = op_id::op_id(self.name(), "execute", &[action_name]);
                 let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
-                if let Err(error) = SideEffectGate::new(&self.security).authorize_resource_operation(
-                    self.name(),
-                    &operation_name,
-                    ResourceRiskLevel::High,
-                    approval_grant.as_ref(),
-                ) {
+                if let Err(error) = SideEffectGate::new(&crate::tools::effective_autonomy::call_policy(&self.security))
+                    .authorize_resource_operation(
+                        self.name(),
+                        &operation_name,
+                        ResourceRiskLevel::High,
+                        approval_grant.as_ref(),
+                    )
+                {
                     return Ok(ToolResult {
                         success: false,
                         output: String::new(),
@@ -824,8 +825,7 @@ impl Tool for ComposioTool {
             }
 
             "connect" => {
-                if let Err(error) = self
-                    .security
+                if let Err(error) = crate::tools::effective_autonomy::call_policy(&self.security)
                     .enforce_tool_operation(ToolOperation::Act, "composio.connect")
                 {
                     return Ok(ToolResult {
@@ -848,12 +848,14 @@ impl Tool for ComposioTool {
                 let connect_target = app.or(auth_config_id).unwrap_or("");
                 let operation_name = op_id::op_id(self.name(), "connect", &[connect_target]);
                 let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
-                if let Err(error) = SideEffectGate::new(&self.security).authorize_resource_operation(
-                    self.name(),
-                    &operation_name,
-                    ResourceRiskLevel::High,
-                    approval_grant.as_ref(),
-                ) {
+                if let Err(error) = SideEffectGate::new(&crate::tools::effective_autonomy::call_policy(&self.security))
+                    .authorize_resource_operation(
+                        self.name(),
+                        &operation_name,
+                        ResourceRiskLevel::High,
+                        approval_grant.as_ref(),
+                    )
+                {
                     return Ok(ToolResult {
                         success: false,
                         output: String::new(),

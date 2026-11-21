@@ -135,7 +135,7 @@ impl SkillsManageTool {
         {
             return Err(refusal());
         }
-        SideEffectGate::new(self.security.as_ref())
+        SideEffectGate::new(&crate::tools::effective_autonomy::call_policy(&self.security))
             .authorize_resource_operation(self.name(), &operation, risk, grant.as_ref())
             .map_err(|error| ToolResult {
                 success: false,
@@ -143,7 +143,8 @@ impl SkillsManageTool {
                 error: Some(error),
             })?;
         if required
-            && self.security.autonomy == crate::security::AutonomyLevel::Full
+            && crate::tools::effective_autonomy::call_policy(&self.security).autonomy
+                == crate::security::AutonomyLevel::Full
             && !grant.as_ref().is_some_and(ApprovalGrant::consume_single_use)
         {
             return Err(refusal());

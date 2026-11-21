@@ -4,11 +4,10 @@
 //!
 //! A turn picks its credential in one of these ways, and each is listed as a
 //! candidate reference by [`selection_references`]:
-//! - the provider's own selection, [`credential_for`]: the root connection or
-//!   `cred-<name>` for the configured default provider, otherwise the
-//!   provider's own store (a non-reference auth profile or OAuth login). A
-//!   `cred-<name>` reference stored for a non-default provider is used only
-//!   where something references it;
+//! - the provider's own selection, [`credential_for`]: the root connection
+//!   for the configured default provider, then the `cred-<name>` reference
+//!   stored for this provider (any provider), otherwise the provider's own
+//!   store (a non-reference auth profile or OAuth login);
 //! - a `[[model_routes]]` entry for this provider and model (`hint:<route>`):
 //!   its inline `api_key`, else its `credential_ref`, else the provider's own
 //!   selection (`selection::check_with`);

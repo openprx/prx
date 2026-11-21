@@ -171,7 +171,7 @@ impl SkillExecuteTool {
         // Approval was taken once, by the orchestration boundary, for the
         // `skill_execute` call itself. The gate here refuses a read-only
         // installation and writes the audit record bound to the run identity.
-        SideEffectGate::new(self.security.as_ref())
+        SideEffectGate::new(&crate::tools::effective_autonomy::call_policy(&self.security))
             .authorize_resource_operation(self.name(), &operation, ResourceRiskLevel::Low, None)
             .map_err(|error| anyhow::anyhow!("Managed skill '{skill_name}' tool '{tool_name}' was refused: {error}"))?;
 

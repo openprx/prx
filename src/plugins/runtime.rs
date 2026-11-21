@@ -886,7 +886,7 @@ impl PluginManageTool {
         args: &serde_json::Value,
     ) -> Result<(), ToolResult> {
         let grant = ApprovalGrant::from_runtime_args("wasm_plugins_manage", args);
-        SideEffectGate::new(self.security.as_ref())
+        SideEffectGate::new(&crate::tools::effective_autonomy::call_policy(&self.security))
             .authorize_resource_operation("wasm_plugins_manage", operation, risk, grant.as_ref())
             .map(|_| ())
             .map_err(|error| ToolResult {
@@ -1695,12 +1695,14 @@ impl Tool for PluginReloadTool {
             .ok_or_else(|| anyhow::anyhow!("Missing non-empty 'name' parameter"))?;
         let operation_name = op_id::op_id(self.name(), "reload", &[name]);
         let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
-        if let Err(error) = SideEffectGate::new(&self.security).authorize_resource_operation(
-            self.name(),
-            &operation_name,
-            ResourceRiskLevel::Low,
-            approval_grant.as_ref(),
-        ) {
+        if let Err(error) = SideEffectGate::new(&crate::tools::effective_autonomy::call_policy(&self.security))
+            .authorize_resource_operation(
+                self.name(),
+                &operation_name,
+                ResourceRiskLevel::Low,
+                approval_grant.as_ref(),
+            )
+        {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),

@@ -17,7 +17,8 @@ use crate::tools::memory_store::MemoryStoreTool;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::super::target::{AgentField, TargetError, ToolAllowlist, TurnTarget, effective_autonomy, resolve_target};
+use super::super::target::{AgentField, TargetError, ToolAllowlist, TurnTarget, resolve_target};
+use crate::security::agent_level::agent_level as effective_autonomy;
 
 fn agent(agentic: bool, allowed_tools: &[&str]) -> DelegateAgentConfig {
     DelegateAgentConfig {
@@ -240,10 +241,10 @@ fn target_autonomy_is_capped() {
     use AutonomyLevel::{Full, ReadOnly, Supervised};
     for (agent_level, main, expected) in [
         (None, Supervised, Supervised),
-        (Some(Full), Supervised, Supervised),
+        (Some(Full), Supervised, Full),
         (Some(ReadOnly), Full, ReadOnly),
         (Some(Supervised), Full, Supervised),
-        (Some(Full), ReadOnly, ReadOnly),
+        (Some(Full), ReadOnly, Full),
         (Some(Full), Full, Full),
     ] {
         assert_eq!(effective_autonomy(agent_level, main), expected);
@@ -256,13 +257,13 @@ fn target_autonomy_is_capped() {
     let plan = resolve_target(&config, &named("worker"))
         .expect("test: resolves")
         .expect("test: a named plan");
-    assert_eq!(plan.autonomy, Supervised, "a sub-agent never exceeds Main");
+    assert_eq!(plan.autonomy, Full, "a named agent runs at its own level");
     // The policy the target's turn is published with carries that level.
     let mut snapshot = config.clone();
     snapshot.autonomy.level = plan.autonomy;
     assert_eq!(
         crate::runtime::bootstrap::build_security_policy(&snapshot).autonomy,
-        Supervised
+        Full
     );
 
     config.agents.get_mut("worker").expect("test: worker").autonomy = Some(ReadOnly);
@@ -915,9 +916,9 @@ async fn targeted_turn_cannot_dispatch_excluded_or_unlisted_tool() {
 #[tokio::test]
 async fn targeted_turn_approval_call_ends_denied_without_pending_state() {
     // The turn runs `file_read` under a run policy that makes every call ask
-    // first. The agent asks for Full, but is capped at Main's level.
+    // first. The agent runs at its own Supervised level.
     let mut worker = agent(true, &["file_read"]);
-    worker.autonomy = Some(AutonomyLevel::Full);
+    worker.autonomy = Some(AutonomyLevel::Supervised);
     let calls = vec![("file_read", serde_json::json!({"path": "probe.txt"}))];
     let input = "file_read probe.txt: show the probe file";
 

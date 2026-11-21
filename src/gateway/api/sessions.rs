@@ -8,7 +8,6 @@ use crate::memory::MemoryFabric;
 use crate::observability::NoopObserver;
 use crate::providers::ChatMessage;
 use crate::runtime::envelope::RuntimeEnvelope;
-use crate::security::policy::ResourceRiskLevel;
 use axum::{
     Json,
     body::Body,
@@ -619,8 +618,8 @@ async fn run_console_runtime_turn(
     // the same snapshot, so the turn stays internally consistent.
     let mut config_snapshot = (*turn_runtime.config_generation.effective).clone();
     if let Some(target) = target {
-        // Autonomy = min(sub-agent, main); the same cap the target's decision
-        // slot publishes its tool policy with.
+        // The target's own level (`agent_level`); the same level the target's
+        // decision slot publishes its tool policy with.
         config_snapshot.autonomy.level = target.autonomy;
     }
     let provider_label = turn_runtime
@@ -962,9 +961,6 @@ async fn parse_multipart_message(state: &AppState, request: Request) -> Result<P
                     ));
                 }
 
-                super::authorize_resource_mutation(state, "gateway_api:sessions:upload", ResourceRiskLevel::Low)
-                    .map_err(|error| error.into_response())?;
-
                 if !uploads_root_prepared {
                     fs::create_dir_all(&uploads_root).await.map_err(|error| {
                         tracing::error!("Failed to create uploads directory: {error}");
@@ -1061,11 +1057,6 @@ pub async fn post_session(
     axum::Extension(principal): axum::Extension<super::ApiPrincipal>,
     Json(_body): Json<CreateSessionRequest>,
 ) -> Response {
-    if let Err(error) =
-        super::authorize_resource_mutation(&state, "gateway_api:sessions:create", ResourceRiskLevel::Low)
-    {
-        return error.into_response();
-    }
     let session_id = format!("console-{}", uuid::Uuid::new_v4());
     if let Err(error) = state
         .mem
@@ -1402,12 +1393,6 @@ enum DecisionApprovalChange {
     Revoke,
 }
 
-fn console_decision_control_policy(config: &crate::config::Config) -> Result<(), &'static str> {
-    crate::security::SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
-        .enforce_tool_operation(crate::security::policy::ToolOperation::Act, "console decision control")
-        .map_err(|_| "Decision control is not permitted by policy")
-}
-
 pub async fn post_session_message(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
@@ -1457,7 +1442,6 @@ pub async fn post_session_message(
 #[derive(Debug)]
 enum TargetRefusal {
     Selector(TargetError),
-    Forbidden((StatusCode, Json<serde_json::Value>)),
     Unavailable(TargetUnavailable),
     RegistryMissing,
 }
@@ -1465,12 +1449,6 @@ enum TargetRefusal {
 impl From<TargetError> for TargetRefusal {
     fn from(error: TargetError) -> Self {
         Self::Selector(error)
-    }
-}
-
-impl From<(StatusCode, Json<serde_json::Value>)> for TargetRefusal {
-    fn from(error: (StatusCode, Json<serde_json::Value>)) -> Self {
-        Self::Forbidden(error)
     }
 }
 
@@ -1484,7 +1462,6 @@ impl IntoResponse for TargetRefusal {
     fn into_response(self) -> Response {
         match self {
             Self::Selector(error) => error.into_response(),
-            Self::Forbidden(payload) => payload.into_response(),
             Self::Unavailable(error) => error.into_response(),
             Self::RegistryMissing => json_error(StatusCode::INTERNAL_SERVER_ERROR, "Agent registry is unavailable"),
         }
@@ -1507,8 +1484,6 @@ fn select_turn_target(
             incarnation: None,
         });
     }
-    // A caller who may not post messages learns nothing about which agents exist.
-    super::authorize_resource_mutation(state, "gateway_api:sessions:message", ResourceRiskLevel::Low)?;
     let Some(plan) = resolve_target(&turn_runtime.config_generation.effective, &target)? else {
         return Ok(SelectedTurn {
             runtime: turn_runtime,
@@ -1817,12 +1792,6 @@ async fn submit_console_message(
         }
     };
 
-    if let Err(error) =
-        super::authorize_resource_mutation(&state, "gateway_api:sessions:message", ResourceRiskLevel::Low)
-    {
-        return error.into_response();
-    }
-
     let input_cancellation = tokio_util::sync::CancellationToken::new();
     let ticket = match turn_runtime.publication_slot.cleanup.register(input_cancellation) {
         Ok(ticket) => ticket,
@@ -2117,20 +2086,6 @@ async fn run_console_message_job_work(
             }
         };
         let reply = turn.reply.clone();
-
-        if let Err((status, body)) = crate::gateway::authorize_gateway_config_resource_mutation(
-            config,
-            "gateway_api:sessions:assistant_message",
-            ResourceRiskLevel::Low,
-        ) {
-            {
-                terminal_guard
-                    .finish_error(&anyhow::anyhow!("Console assistant persistence authorization denied"))
-                    .await
-                    .map_err(|_| "Console terminal cleanup persistence is unconfirmed".to_owned())?;
-            }
-            return Ok(jobs::JobOutput::new(status, body.0));
-        }
 
         let provider_outcome = crate::agent::terminal::provider_outcome_from_trace(
             &turn.route_decision,
@@ -2695,16 +2650,6 @@ mod tests {
                 .status(),
             StatusCode::UNPROCESSABLE_ENTITY
         );
-        config.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
-        let mut denied = test_app_state(config, Arc::new(CapturingProvider::default()));
-        denied.mem = memory.clone();
-        let response = super::super::router(denied.clone())
-            .with_state(denied)
-            .oneshot(request("{}"))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert_eq!(memory.list_conversation_sessions(100, 0, None).await.unwrap().len(), 1);
     }
 
     fn console_provider_fixture_config(config: &mut Config, workspace: &std::path::Path, model: &str, endpoint: &str) {
@@ -3972,11 +3917,6 @@ async fn call_approval_action(
     let runtime = state.pin_turn_runtime();
     if let Some(response) = approvals_unavailable(&runtime.config_generation.effective, state.mem.as_ref()) {
         return response;
-    }
-    if change.is_some() {
-        if let Err(message) = console_decision_control_policy(&runtime.config_generation.effective) {
-            return json_error(StatusCode::FORBIDDEN, message);
-        }
     }
     let cancellation = tokio_util::sync::CancellationToken::new();
     let cleanup =

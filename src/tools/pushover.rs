@@ -115,7 +115,7 @@ impl Tool for PushoverTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        if !self.security.can_act() {
+        if !crate::tools::effective_autonomy::call_policy(&self.security).can_act() {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -152,12 +152,14 @@ impl Tool for PushoverTool {
         // operation (op naming per design d03).
         let operation_name = op_id::op_id(self.name(), "notify", &[]);
         let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
-        if let Err(error) = SideEffectGate::new(&self.security).authorize_resource_operation(
-            self.name(),
-            &operation_name,
-            ResourceRiskLevel::High,
-            approval_grant.as_ref(),
-        ) {
+        if let Err(error) = SideEffectGate::new(&crate::tools::effective_autonomy::call_policy(&self.security))
+            .authorize_resource_operation(
+                self.name(),
+                &operation_name,
+                ResourceRiskLevel::High,
+                approval_grant.as_ref(),
+            )
+        {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),

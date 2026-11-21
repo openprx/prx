@@ -7,14 +7,8 @@
 //! status and result, and can cancel through the same runtime registry that
 //! backs `prx tasks kill`.
 
-use super::{AppState, authorize_resource_mutation};
 use crate::gateway::jobs;
-use crate::security::policy::ResourceRiskLevel;
-use axum::{
-    Json,
-    extract::{Path, State},
-    http::StatusCode,
-};
+use axum::{Json, extract::Path, http::StatusCode};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -60,14 +54,11 @@ pub(super) struct JobCancelResponse {
     targets: Vec<String>,
 }
 
+/// Owner bearer only: the route guard authenticated the caller, and Main's
+/// autonomy level is not consulted.
 pub async fn post_job_cancel(
-    State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<JobCancelResponse>, (StatusCode, Json<serde_json::Value>)> {
-    // Ending live work is a high-risk side effect, same gate as the registry
-    // kill endpoint this delegates to.
-    authorize_resource_mutation(&state, "gateway_api:jobs:cancel", ResourceRiskLevel::High)?;
-
     let job_id = parse_job_id(&id)?;
     let Some(work_id) = jobs::work_id_of(job_id) else {
         return Err(job_not_found(&id));

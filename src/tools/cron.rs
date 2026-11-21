@@ -61,7 +61,7 @@ impl CronTool {
         if let Some(r) = self.check_enabled(cfg) {
             return Some(r);
         }
-        if !self.security.can_act() {
+        if !crate::tools::effective_autonomy::call_policy(&self.security).can_act() {
             return Some(ToolResult {
                 success: false,
                 output: String::new(),
@@ -1172,7 +1172,7 @@ impl Tool for CronTool {
                 if let Some(refused) = Self::refuse_unless_caller_may_manage(&cfg, &args, job_id) {
                     return Ok(refused);
                 }
-                if !self.security.can_act() {
+                if !crate::tools::effective_autonomy::call_policy(&self.security).can_act() {
                     return Ok(ToolResult {
                         success: false,
                         output: String::new(),

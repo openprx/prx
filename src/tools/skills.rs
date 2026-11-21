@@ -834,7 +834,9 @@ impl SkillsManageTool {
             |target| format!("skills_manage:{action}:{target}"),
         );
         let grant = Self::approval_grant(args);
-        if (self.security.autonomy != crate::security::AutonomyLevel::Full || args.get("_zc_approval_grant").is_some())
+        if (crate::tools::effective_autonomy::call_policy(&self.security).autonomy
+            != crate::security::AutonomyLevel::Full
+            || args.get("_zc_approval_grant").is_some())
             && matches!(
                 action,
                 "lifecycle_publish" | "lifecycle_rollback" | "lifecycle_import_executable"
@@ -857,7 +859,7 @@ impl SkillsManageTool {
                 ));
             }
         }
-        SideEffectGate::new(self.security.as_ref())
+        SideEffectGate::new(&crate::tools::effective_autonomy::call_policy(&self.security))
             .authorize_resource_operation(self.name(), &operation, risk, grant.as_ref())
             .map(|_| ())
             .map_err(|error| {
@@ -877,7 +879,8 @@ impl SkillsManageTool {
         if matches!(
             action,
             "lifecycle_publish" | "lifecycle_rollback" | "lifecycle_import_executable"
-        ) && self.security.autonomy == crate::security::AutonomyLevel::Full
+        ) && crate::tools::effective_autonomy::call_policy(&self.security).autonomy
+            == crate::security::AutonomyLevel::Full
             && grant.is_some()
             && !grant.as_ref().is_some_and(ApprovalGrant::consume_single_use)
         {

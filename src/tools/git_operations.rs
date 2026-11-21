@@ -792,7 +792,7 @@ impl Tool for GitOperationsTool {
 
         // Check autonomy level for write operations
         if self.requires_write_access(operation) {
-            if !self.security.can_act() {
+            if !crate::tools::effective_autonomy::call_policy(&self.security).can_act() {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
@@ -800,7 +800,7 @@ impl Tool for GitOperationsTool {
                 });
             }
 
-            match self.security.autonomy {
+            match crate::tools::effective_autonomy::call_policy(&self.security).autonomy {
                 AutonomyLevel::ReadOnly => {
                     return Ok(ToolResult {
                         success: false,
@@ -825,12 +825,9 @@ impl Tool for GitOperationsTool {
                     };
                     (operation_name, risk)
                 };
-                if let Err(error) = SideEffectGate::new(self.security.as_ref()).authorize_resource_operation(
-                    self.name(),
-                    &operation_name,
-                    risk,
-                    approval_grant.as_ref(),
-                ) {
+                if let Err(error) = SideEffectGate::new(&crate::tools::effective_autonomy::call_policy(&self.security))
+                    .authorize_resource_operation(self.name(), &operation_name, risk, approval_grant.as_ref())
+                {
                     let error = if launch_definition {
                         format!(
                             "{error} (this git operation changes a workspace launch definition: hooks.json and \

@@ -123,12 +123,14 @@ impl DocumentIngestRuntime {
             .unwrap_or_else(|| "default".to_string());
         let operation_name = op_id::op_id(tool_name, "ingest", &[&owner_ref]);
         let approval_grant = ApprovalGrant::from_runtime_args(tool_name, &args);
-        if let Err(error) = SideEffectGate::new(&self.security).authorize_resource_operation(
-            tool_name,
-            &operation_name,
-            ResourceRiskLevel::Medium,
-            approval_grant.as_ref(),
-        ) {
+        if let Err(error) = SideEffectGate::new(&crate::tools::effective_autonomy::call_policy(&self.security))
+            .authorize_resource_operation(
+                tool_name,
+                &operation_name,
+                ResourceRiskLevel::Medium,
+                approval_grant.as_ref(),
+            )
+        {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
