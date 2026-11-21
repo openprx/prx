@@ -12,17 +12,33 @@ use std::{path::PathBuf, sync::Arc};
 use tracing::warn;
 
 /// `POST /api/config/reload`: activate the configuration files as they are
-/// now (an rf contract route, `agent_crud_v1`). The owner bearer alone
-/// authorises it (A4): the reload tool runs under its own default policy,
-/// never one built from Main's autonomy level. Errors are coded; a failed
-/// load is reported without quoting the files.
-pub async fn post_config_reload(State(state): State<AppState>) -> Response {
+/// now (an rf contract route, `agent_crud_v1`). A caller authenticated by a
+/// paired bearer is authorised by it alone (A4): the reload tool runs under
+/// its own default policy, never one built from Main's autonomy level. Any
+/// other caller (pairing off) gets the pre-A4 gate: the tool runs under
+/// Main's policy and a refusal answers the pre-A4 `500` body. Errors are
+/// coded; a failed load is reported without quoting the files.
+pub async fn post_config_reload(State(state): State<AppState>, headers: HeaderMap) -> Response {
     use crate::tools::Tool as _;
-    let tool = crate::tools::ConfigReloadTool::new(Arc::clone(&state.config));
+    let owner_authenticated = super::owner_authenticated(&state, &headers);
+    let tool = if owner_authenticated {
+        crate::tools::ConfigReloadTool::new(Arc::clone(&state.config))
+    } else {
+        let security = crate::runtime::bootstrap::build_security_policy(&state.config.load_full());
+        crate::tools::ConfigReloadTool::with_security(Arc::clone(&state.config), security)
+    };
     match tool.execute(serde_json::json!({})).await {
         Ok(result) if result.success => (
             StatusCode::OK,
             Json(serde_json::json!({ "success": true, "message": result.output })),
+        )
+            .into_response(),
+        Ok(result) if !owner_authenticated => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "success": false,
+                "error": result.error.unwrap_or_else(|| "Unknown error".into()),
+            })),
         )
             .into_response(),
         Ok(_) | Err(_) => {

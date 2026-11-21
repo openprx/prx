@@ -501,6 +501,10 @@ impl TurnTerminalGuard {
         Ok(receipt)
     }
 
+    pub(crate) async fn finish_error(&self, error: &anyhow::Error) -> anyhow::Result<()> {
+        self.finish_failure(error, false).await
+    }
+
     pub(crate) async fn finish_failure(&self, error: &anyhow::Error, cancelled: bool) -> anyhow::Result<()> {
         {
             let mut state = self.state.lock();

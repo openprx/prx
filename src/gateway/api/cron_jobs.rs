@@ -88,6 +88,18 @@ fn scope_args(owner_id: &str) -> Value {
     })
 }
 
+/// Who a write through this route records as the creator: the operator
+/// (`operator_cli`, so its runs keep Main's live level and hardened git) when
+/// a paired bearer authenticated the request; otherwise `agent_tool`, so a
+/// request accepted with pairing off gains nothing.
+fn route_creator(state: &AppState, headers: &axum::http::HeaderMap) -> crate::cron::JobCreator {
+    if super::owner_authenticated(state, headers) {
+        crate::cron::JobCreator::OperatorCli
+    } else {
+        crate::cron::JobCreator::AgentTool
+    }
+}
+
 fn require_owner(config: &crate::config::Config, principal: &ApiPrincipal) -> Result<CronJobLineage, ApiResponse> {
     let lineage = cron::lineage_from_trusted_scope(config, &scope_args(&principal.owner_id));
     match lineage
@@ -442,13 +454,15 @@ pub(super) async fn status(
 pub(super) async fn create_job(
     State(state): State<AppState>,
     Extension(principal): Extension<ApiPrincipal>,
+    headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> ApiResponse {
     let config = state.config.load_full();
-    let lineage = match require_owner(&config, &principal) {
+    let mut lineage = match require_owner(&config, &principal) {
         Ok(lineage) => lineage,
         Err(response) => return response,
     };
+    lineage.created_via = route_creator(&state, &headers);
     let write: JobWrite = match parse_json(&body) {
         Ok(write) => write,
         Err(response) => return response,
@@ -497,6 +511,7 @@ pub(super) async fn patch_job(
     State(state): State<AppState>,
     Extension(principal): Extension<ApiPrincipal>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> ApiResponse {
     let config = state.config.load_full();
@@ -571,7 +586,7 @@ pub(super) async fn patch_job(
         schedule: patch_schedule,
         command: command.clone(),
         name,
-        created_via: command.is_some().then_some(crate::cron::JobCreator::AgentTool),
+        created_via: command.is_some().then(|| route_creator(&state, &headers)),
         ..CronJobPatch::default()
     };
     match cron::update_job(&config, id, patch) {

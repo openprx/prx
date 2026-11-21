@@ -455,6 +455,14 @@ fn authenticated_principal(state: &AppState, headers: &HeaderMap) -> Option<ApiP
     Some(ApiPrincipal::of_token(&provided_token))
 }
 
+/// Whether this request was authenticated by a paired bearer: pairing is
+/// required and the bearer it carries is a paired token. When pairing is off
+/// every request passes [`authenticated_principal`] without a bearer, so no
+/// route grants operator rights or skips Main's level gate for it.
+pub(super) fn owner_authenticated(state: &AppState, headers: &HeaderMap) -> bool {
+    state.pairing.require_pairing() && state.pairing.is_authenticated(&extract_resource_auth_token(headers))
+}
+
 async fn auth_middleware(State(state): State<AppState>, mut request: Request, next: Next) -> Response {
     let Some(principal) = authenticated_principal(&state, request.headers()) else {
         return (

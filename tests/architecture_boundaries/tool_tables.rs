@@ -517,12 +517,12 @@ pub(super) const GATEWAY_DIRECT_TOOL_INVOCATION_GATES: &[(&str, &str)] = &[
     ),
     (
         "src/gateway/api/config.rs::post_config_reload",
-        "gate chain: the rf contract router's owner-bearer guard (A4: the owner bearer alone \
+        "gate chain: the rf contract router's owner-bearer guard (A4: a paired bearer alone \
          authorises a reload), then `ConfigReloadTool::execute` runs \
          `SideEffectGate::authorize_resource_operation(\"config_reload:reload\", Low)` against the \
-         tool's default `SecurityPolicy`, never one built from Main's autonomy level. The argument \
-         document is the empty object built here, so no caller-supplied approval grant reaches the \
-         gate",
+         tool's default `SecurityPolicy`; with pairing off (`owner_authenticated` false) the same \
+         gate runs against Main's `build_security_policy`, as before A4. The argument document is \
+         the empty object built here, so no caller-supplied approval grant reaches the gate",
     ),
 ];
 

@@ -341,36 +341,77 @@ pub(super) async fn apply_change(state: &AppState, change: ManagedChange, write:
     }
 }
 
-/// Plan and commit a typed change for the owner bearer (A4): no autonomy
-/// level is consulted. Everything else is [`commit`]'s path: the caller's
+/// Plan and commit a typed change for the owner bearer (A4): for a caller
+/// authenticated by a paired bearer no autonomy level is consulted; any
+/// other caller gets Main's level gate. Everything else is [`commit`]'s
+/// path: the caller's
 /// `If-Match` must name the revision the plan was read from, and a
 /// high-risk plan needs the confirmation bound to that revision.
 ///
 /// # Errors
 ///
-/// The plan's refusal, a stale `If-Match` (`Conflict`), or the
-/// transaction's refusal.
+/// Main's level gate, the plan's refusal, a stale `If-Match` (`Conflict`),
+/// or the transaction's refusal.
 pub(super) async fn commit_as_owner(
     state: &AppState,
     change: &ManagedChange,
     write: &Write,
-) -> Result<ConfigTransactionOutcome, ManageError> {
+    owner_authenticated: bool,
+) -> Result<ConfigTransactionOutcome, OwnerCommitError> {
+    let operation = operation_name(change);
+    // A caller not authenticated by a paired bearer gets the management
+    // gate every other write has: Main's level, before and after planning.
+    if !owner_authenticated {
+        main_level_gate(state, operation, ResourceRiskLevel::Low)?;
+    }
     let service = service(state);
     let plan = service.plan(change, ACTOR).await?;
+    if !owner_authenticated {
+        match gate_level(plan.summary()) {
+            ResourceRiskLevel::Low => {}
+            level => main_level_gate(state, operation, level)?,
+        }
+    }
     if let Some(expected) = write.if_match.as_deref()
         && plan.revision() != Some(expected)
     {
-        return Err(ManageError::Transaction(ConfigTransactionError::Conflict(
-            ConfigRevisionConflict {
+        return Err(OwnerCommitError::Manage(ManageError::Transaction(
+            ConfigTransactionError::Conflict(ConfigRevisionConflict {
                 expected: expected.to_string(),
                 actual: plan.revision().unwrap_or_default().to_string(),
-            },
+            }),
         )));
     }
     service
         .apply(plan, ACTOR, write.confirmed_revision())
         .await
-        .map_err(|error| write.explain(error))
+        .map_err(|error| OwnerCommitError::Manage(write.explain(error)))
+}
+
+/// Why [`commit_as_owner`] wrote nothing.
+pub(super) enum OwnerCommitError {
+    /// The management service's refusal.
+    Manage(ManageError),
+    /// Main's level refused a caller not authenticated by a paired bearer;
+    /// the gate's own sentence.
+    MainLevel(String),
+}
+
+impl From<ManageError> for OwnerCommitError {
+    fn from(error: ManageError) -> Self {
+        Self::Manage(error)
+    }
+}
+
+fn main_level_gate(state: &AppState, operation: &str, risk: ResourceRiskLevel) -> Result<(), OwnerCommitError> {
+    super::authorize_resource_mutation(state, operation, risk).map_err(|(_, Json(body))| {
+        OwnerCommitError::MainLevel(
+            body.get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("the operation is not permitted at this autonomy level")
+                .to_owned(),
+        )
+    })
 }
 
 /// What a commit adds around the plan: the operation it is authorized

@@ -8,6 +8,7 @@ use crate::memory::MemoryFabric;
 use crate::observability::NoopObserver;
 use crate::providers::ChatMessage;
 use crate::runtime::envelope::RuntimeEnvelope;
+use crate::security::policy::ResourceRiskLevel;
 use axum::{
     Json,
     body::Body,
@@ -903,6 +904,7 @@ async fn parse_json_message(state: &AppState, request: Request) -> Result<Parsed
 
 #[allow(clippy::result_large_err)]
 async fn parse_multipart_message(state: &AppState, request: Request) -> Result<ParsedMessage, Response> {
+    let owner_authenticated = super::owner_authenticated(state, request.headers());
     let mut multipart = Multipart::from_request(request, state)
         .await
         .map_err(|_| json_error(StatusCode::BAD_REQUEST, "Invalid multipart payload"))?;
@@ -959,6 +961,11 @@ async fn parse_multipart_message(state: &AppState, request: Request) -> Result<P
                         StatusCode::PAYLOAD_TOO_LARGE,
                         "File too large (max 20MB per file)",
                     ));
+                }
+
+                if !owner_authenticated {
+                    super::authorize_resource_mutation(state, "gateway_api:sessions:upload", ResourceRiskLevel::Low)
+                        .map_err(|error| error.into_response())?;
                 }
 
                 if !uploads_root_prepared {
@@ -1055,8 +1062,15 @@ pub(super) struct CreateSessionRequest {}
 pub async fn post_session(
     State(state): State<AppState>,
     axum::Extension(principal): axum::Extension<super::ApiPrincipal>,
+    headers: HeaderMap,
     Json(_body): Json<CreateSessionRequest>,
 ) -> Response {
+    if !super::owner_authenticated(&state, &headers)
+        && let Err(error) =
+            super::authorize_resource_mutation(&state, "gateway_api:sessions:create", ResourceRiskLevel::Low)
+    {
+        return error.into_response();
+    }
     let session_id = format!("console-{}", uuid::Uuid::new_v4());
     if let Err(error) = state
         .mem
@@ -1233,7 +1247,7 @@ pub(super) async fn get_decision_approval(
     Path((session_id, decision_id)): Path<(String, String)>,
     axum::Extension(principal): axum::Extension<super::ApiPrincipal>,
 ) -> Response {
-    call_approval_action(state, session_id, decision_id, principal, None).await
+    call_approval_action(state, session_id, decision_id, principal, None, false).await
 }
 
 const INBOX_DEFAULT_LIMIT: usize = 50;
@@ -1361,14 +1375,17 @@ pub(super) async fn post_decision_approval(
     State(state): State<AppState>,
     Path((session_id, decision_id)): Path<(String, String)>,
     axum::Extension(principal): axum::Extension<super::ApiPrincipal>,
+    headers: HeaderMap,
     Json(request): Json<DecisionApprovalRequest>,
 ) -> Response {
+    let owner_authenticated = super::owner_authenticated(&state, &headers);
     call_approval_action(
         state,
         session_id,
         decision_id,
         principal,
         Some(DecisionApprovalChange::Review(request.approved)),
+        owner_authenticated,
     )
     .await
 }
@@ -1377,13 +1394,16 @@ pub(super) async fn delete_decision_approval(
     State(state): State<AppState>,
     Path((session_id, decision_id)): Path<(String, String)>,
     axum::Extension(principal): axum::Extension<super::ApiPrincipal>,
+    headers: HeaderMap,
 ) -> Response {
+    let owner_authenticated = super::owner_authenticated(&state, &headers);
     call_approval_action(
         state,
         session_id,
         decision_id,
         principal,
         Some(DecisionApprovalChange::Revoke),
+        owner_authenticated,
     )
     .await
 }
@@ -1391,6 +1411,12 @@ pub(super) async fn delete_decision_approval(
 enum DecisionApprovalChange {
     Review(bool),
     Revoke,
+}
+
+fn console_decision_control_policy(config: &crate::config::Config) -> Result<(), &'static str> {
+    crate::security::SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
+        .enforce_tool_operation(crate::security::policy::ToolOperation::Act, "console decision control")
+        .map_err(|_| "Decision control is not permitted by policy")
 }
 
 pub async fn post_session_message(
@@ -1403,6 +1429,7 @@ pub async fn post_session_message(
     };
     let turn_runtime = state.pin_turn_runtime();
     let headers = request.headers().clone();
+    let owner_authenticated = super::owner_authenticated(&state, &headers);
     let async_mode = jobs::wants_async(request.uri().query(), &headers);
     let parsed = match parse_message_from_request(&state, request).await {
         Ok(parsed) => parsed,
@@ -1414,7 +1441,7 @@ pub async fn post_session_message(
         uploads,
     } = parsed;
 
-    let selected = match select_turn_target(&state, turn_runtime, &api_principal, agent) {
+    let selected = match select_turn_target(&state, turn_runtime, &api_principal, agent, owner_authenticated) {
         Ok(selected) => selected,
         // A refused target leaves nothing behind: dropping the guard removes
         // the files this request created, and only those.
@@ -1431,6 +1458,7 @@ pub async fn post_session_message(
             message,
             async_mode,
             uploads,
+            owner_authenticated,
         },
     )
     .await
@@ -1442,6 +1470,7 @@ pub async fn post_session_message(
 #[derive(Debug)]
 enum TargetRefusal {
     Selector(TargetError),
+    Forbidden((StatusCode, Json<serde_json::Value>)),
     Unavailable(TargetUnavailable),
     RegistryMissing,
 }
@@ -1449,6 +1478,12 @@ enum TargetRefusal {
 impl From<TargetError> for TargetRefusal {
     fn from(error: TargetError) -> Self {
         Self::Selector(error)
+    }
+}
+
+impl From<(StatusCode, Json<serde_json::Value>)> for TargetRefusal {
+    fn from(error: (StatusCode, Json<serde_json::Value>)) -> Self {
+        Self::Forbidden(error)
     }
 }
 
@@ -1462,6 +1497,7 @@ impl IntoResponse for TargetRefusal {
     fn into_response(self) -> Response {
         match self {
             Self::Selector(error) => error.into_response(),
+            Self::Forbidden(payload) => payload.into_response(),
             Self::Unavailable(error) => error.into_response(),
             Self::RegistryMissing => json_error(StatusCode::INTERNAL_SERVER_ERROR, "Agent registry is unavailable"),
         }
@@ -1475,6 +1511,7 @@ fn select_turn_target(
     turn_runtime: std::sync::Arc<crate::gateway::TurnRuntimeGeneration>,
     principal: &super::ApiPrincipal,
     agent: AgentField,
+    owner_authenticated: bool,
 ) -> Result<SelectedTurn, TargetRefusal> {
     let target = TurnTarget::from_field(agent)?;
     if matches!(target, TurnTarget::Main) {
@@ -1483,6 +1520,10 @@ fn select_turn_target(
             targeted: None,
             incarnation: None,
         });
+    }
+    if !owner_authenticated {
+        // A caller who may not post messages learns nothing about which agents exist.
+        super::authorize_resource_mutation(state, "gateway_api:sessions:message", ResourceRiskLevel::Low)?;
     }
     let Some(plan) = resolve_target(&turn_runtime.config_generation.effective, &target)? else {
         return Ok(SelectedTurn {
@@ -1517,6 +1558,7 @@ enum ConsoleTurnSource {
     Admitted {
         proof: crate::gateway::turn_source::GatewayTurnProof,
         guard: crate::gateway::turn_source::GatewayAdmissionGuard,
+        owner_authenticated: bool,
     },
 }
 
@@ -1700,6 +1742,9 @@ struct ConsoleSubmission {
     message: String,
     async_mode: bool,
     uploads: UploadGuard,
+    /// [`super::owner_authenticated`]; when false, Main's level gates the
+    /// message and the saved reply as before A4.
+    owner_authenticated: bool,
 }
 
 async fn submit_console_message(
@@ -1713,6 +1758,7 @@ async fn submit_console_message(
         message,
         async_mode,
         uploads,
+        owner_authenticated,
     } = submission;
     let SelectedTurn {
         runtime: turn_runtime,
@@ -1792,6 +1838,13 @@ async fn submit_console_message(
         }
     };
 
+    if !owner_authenticated
+        && let Err(error) =
+            super::authorize_resource_mutation(&state, "gateway_api:sessions:message", ResourceRiskLevel::Low)
+    {
+        return error.into_response();
+    }
+
     let input_cancellation = tokio_util::sync::CancellationToken::new();
     let ticket = match turn_runtime.publication_slot.cleanup.register(input_cancellation) {
         Ok(ticket) => ticket,
@@ -1854,7 +1907,11 @@ async fn submit_console_message(
             "Console input cleanup ownership is unconfirmed",
         );
     }
-    let source = ConsoleTurnSource::Admitted { proof, guard };
+    let source = ConsoleTurnSource::Admitted {
+        proof,
+        guard,
+        owner_authenticated,
+    };
 
     // Everything up to here is bounded bookkeeping. What follows is the agent
     // turn itself, which has no upper bound — tool chains, sub-agents, and
@@ -1912,10 +1969,14 @@ async fn run_console_message_job_work(
     source: ConsoleTurnSource,
     target: Option<TargetedTurn>,
 ) -> Result<jobs::JobOutput, String> {
-    let (source_proof, input_guard) = match source {
+    let (source_proof, input_guard, owner_authenticated) = match source {
         #[cfg(test)]
-        ConsoleTurnSource::Message(proof) => (proof, None),
-        ConsoleTurnSource::Admitted { proof, guard } => (proof, Some(guard)),
+        ConsoleTurnSource::Message(proof) => (proof, None, false),
+        ConsoleTurnSource::Admitted {
+            proof,
+            guard,
+            owner_authenticated,
+        } => (proof, Some(guard), owner_authenticated),
     };
     let runtime_envelope = source_proof.envelope().clone();
     let cancellation =
@@ -2086,6 +2147,22 @@ async fn run_console_message_job_work(
             }
         };
         let reply = turn.reply.clone();
+
+        if !owner_authenticated
+            && let Err((status, body)) = crate::gateway::authorize_gateway_config_resource_mutation(
+                config,
+                "gateway_api:sessions:assistant_message",
+                ResourceRiskLevel::Low,
+            )
+        {
+            {
+                terminal_guard
+                    .finish_error(&anyhow::anyhow!("Console assistant persistence authorization denied"))
+                    .await
+                    .map_err(|_| "Console terminal cleanup persistence is unconfirmed".to_owned())?;
+            }
+            return Ok(jobs::JobOutput::new(status, body.0));
+        }
 
         let provider_outcome = crate::agent::terminal::provider_outcome_from_trace(
             &turn.route_decision,
@@ -2650,6 +2727,16 @@ mod tests {
                 .status(),
             StatusCode::UNPROCESSABLE_ENTITY
         );
+        config.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
+        let mut denied = test_app_state(config, Arc::new(CapturingProvider::default()));
+        denied.mem = memory.clone();
+        let response = super::super::router(denied.clone())
+            .with_state(denied)
+            .oneshot(request("{}"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(memory.list_conversation_sessions(100, 0, None).await.unwrap().len(), 1);
     }
 
     fn console_provider_fixture_config(config: &mut Config, workspace: &std::path::Path, model: &str, endpoint: &str) {
@@ -3908,6 +3995,7 @@ async fn call_approval_action(
     id: String,
     principal: super::ApiPrincipal,
     change: Option<DecisionApprovalChange>,
+    owner_authenticated: bool,
 ) -> Response {
     use crate::security::approval_ledger::keys::RunCallAuthority;
     let authority = match RunCallAuthority::parse_call_id(&id) {
@@ -3917,6 +4005,12 @@ async fn call_approval_action(
     let runtime = state.pin_turn_runtime();
     if let Some(response) = approvals_unavailable(&runtime.config_generation.effective, state.mem.as_ref()) {
         return response;
+    }
+    if change.is_some()
+        && !owner_authenticated
+        && let Err(message) = console_decision_control_policy(&runtime.config_generation.effective)
+    {
+        return json_error(StatusCode::FORBIDDEN, message);
     }
     let cancellation = tokio_util::sync::CancellationToken::new();
     let cleanup =

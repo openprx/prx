@@ -157,6 +157,23 @@ fn refusal_of(error: ManageError) -> Refusal {
     }
 }
 
+/// [`refusal_of`], plus Main's level gate for a caller not authenticated by
+/// a paired bearer: `403 read_only` at read-only autonomy, otherwise
+/// `403 policy_denied` (the codes the skills lifecycle routes use).
+fn owner_refusal_of(error: manage::OwnerCommitError) -> Refusal {
+    match error {
+        manage::OwnerCommitError::Manage(error) => refusal_of(error),
+        manage::OwnerCommitError::MainLevel(message) => {
+            let code = if message.contains("read-only") {
+                "read_only"
+            } else {
+                "policy_denied"
+            };
+            Refusal::new(StatusCode::FORBIDDEN, code, redact_provider_text(&message))
+        }
+    }
+}
+
 /// The desired configuration and its whole-config revision, read together.
 struct Snapshot {
     config: Arc<Config>,
@@ -567,9 +584,9 @@ async fn put(
         agent: name.as_str().to_owned(),
         spec,
     };
-    manage::commit_as_owner(state, &change, &write)
+    manage::commit_as_owner(state, &change, &write, super::owner_authenticated(state, headers))
         .await
-        .map_err(refusal_of)?;
+        .map_err(owner_refusal_of)?;
     let snapshot = snapshot(state)?;
     let readback = read_named(state, &registry, &snapshot, &name)?
         .ok_or_else(|| Refusal::storage("the agent left the configuration right after it was written"))?;
@@ -621,9 +638,9 @@ async fn delete(
     let change = ManagedChange::RetireAgent {
         agent: name.as_str().to_owned(),
     };
-    manage::commit_as_owner(state, &change, &write)
+    manage::commit_as_owner(state, &change, &write, super::owner_authenticated(state, headers))
         .await
-        .map_err(refusal_of)?;
+        .map_err(owner_refusal_of)?;
     let snapshot = snapshot(state)?;
     // This owner gets a row to retire even if it never read the agent.
     if let Some(agent) = snapshot.config.agents.get(name.as_str()) {
@@ -699,9 +716,14 @@ async fn put_switch(
     let write = write_of(uri, headers)?;
     let SwitchPut { enabled } = serde_json::from_slice(body)
         .map_err(|_| Refusal::field("the body must be {\"enabled\":true|false}; nothing was written"))?;
-    manage::commit_as_owner(state, &ManagedChange::SetTargetedAgents { enabled }, &write)
-        .await
-        .map_err(refusal_of)?;
+    manage::commit_as_owner(
+        state,
+        &ManagedChange::SetTargetedAgents { enabled },
+        &write,
+        super::owner_authenticated(state, headers),
+    )
+    .await
+    .map_err(owner_refusal_of)?;
     Ok((StatusCode::OK, switch_body(state)?))
 }
 

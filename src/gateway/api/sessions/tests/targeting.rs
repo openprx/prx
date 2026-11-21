@@ -1360,6 +1360,7 @@ async fn sqlite_targeted_scope_supported() {
         fixture.state.pin_turn_runtime(),
         &api_principal,
         AgentField::Text("x".to_owned()),
+        false,
     )
     .expect("test: named target");
     assert_eq!(selected.incarnation.as_deref(), Some(TARGET_U));
