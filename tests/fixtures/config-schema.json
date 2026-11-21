@@ -2154,7 +2154,7 @@
           "default": null
         },
         "autonomy": {
-          "description": "Autonomy ceiling for targeted turns. Unset inherits the main agent's\nlevel; the effective level is `min(agent, main)`.",
+          "description": "The agent's own autonomy level for targeted turns. Unset inherits the\nmain agent's level.",
           "anyOf": [
             {
               "$ref": "#/$defs/AutonomyLevel"

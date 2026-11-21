@@ -47,7 +47,7 @@ pub struct DelegateAgentConfig {
     #[serde(default = "default_agent_enabled")]
     pub enabled: bool,
     /// The agent's own autonomy level for targeted turns. Unset inherits the
-    /// main agent's level (`security::agent_level::agent_level`).
+    /// main agent's level.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autonomy: Option<super::AutonomyLevel>,
 }
