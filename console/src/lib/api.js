@@ -34,6 +34,10 @@ function resolveErrorMessage(body, status) {
   if (body && typeof body === 'object' && typeof body.error === 'string') {
     return body.error;
   }
+  // The rf contract routes answer `{"error":{"code","message"}}`.
+  if (body && typeof body === 'object' && typeof body.error?.message === 'string') {
+    return body.error.message;
+  }
 
   return t('common.requestFailed', { status });
 }

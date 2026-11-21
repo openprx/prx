@@ -122,9 +122,9 @@
 
   function editAgent(agent) {
     agentName = agent.name;
-    agentProvider = unmasked(agent.provider);
-    agentModel = unmasked(agent.model);
-    agentMaskedPrefill = isMasked(agent.provider) || isMasked(agent.model);
+    agentProvider = unmasked(agent.config?.provider);
+    agentModel = unmasked(agent.config?.model);
+    agentMaskedPrefill = isMasked(agent.config?.provider) || isMasked(agent.config?.model);
   }
 
   function planAgent() {
@@ -362,7 +362,7 @@
       <ul class="space-y-1 text-sm">
         {#each agents as agent (agent.name)}
           <li class="flex items-center justify-between gap-2">
-            <span><span class="font-mono">{agent.name}</span>: <span class="font-mono">{agent.provider} / {agent.model}</span></span>
+            <span><span class="font-mono">{agent.name}</span>: <span class="font-mono">{agent.config?.provider} / {agent.config?.model}</span></span>
             <button
               type="button"
               onclick={() => editAgent(agent)}
