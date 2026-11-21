@@ -1101,17 +1101,16 @@ async fn run_job_command(config: &Config, job: &CronJob) -> (bool, String) {
     run_job_command_with_adapter(config, job, None, &process).await
 }
 
-/// How a cron shell job's git is treated. At an effective Full level (the
-/// carried level of the calling tool, else Main's configured level, which
-/// cron runs at) git runs plainly, as in the Full shell, whoever created the
-/// job (owner D1). Below Full (D-107 amendment): a job the operator created
+/// How a cron shell job's git is treated. At the run's Full level (the
+/// level [`job_run_level`] computed and the caller scoped around the run;
+/// unset is never Full) git runs plainly, as in the Full shell, whoever
+/// created the job (owner D1). Below Full (D-107 amendment): a job the operator created
 /// with `prx cron` (or marked with `prx cron mark-operator`) runs git
 /// hardened, warned once; a job an agent tool created, a job stored before
 /// the creator was recorded, and a failed lookup refuse it.
 fn shell_git_policy(config: &Config, job: &CronJob) -> crate::runtime::shell_process::ShellGitPolicy {
-    let level = crate::tools::effective_autonomy::current().unwrap_or(config.autonomy.level);
-    if level == crate::security::AutonomyLevel::Full {
-        return crate::tools::shell::shell_git_policy(level);
+    if crate::tools::effective_autonomy::current() == Some(crate::security::AutonomyLevel::Full) {
+        return crate::tools::shell::shell_git_policy(crate::security::AutonomyLevel::Full);
     }
     let operator = crate::cron::job_created_via(config, &job.id)
         .is_ok_and(|creator| creator == crate::cron::JobCreator::OperatorCli);
@@ -1643,14 +1642,13 @@ mod tests {
             .unwrap()
     }
 
-    /// D-107: below Full, a cron shell job an agent tool created (or one
-    /// stored before the creator was recorded) is model-driven, so a command
-    /// that runs git is refused and names the tool to use instead.
+    /// D-107: a cron shell job an agent tool created (or one stored before
+    /// the creator was recorded) is model-driven, so a command that runs git
+    /// is refused and names the tool to use instead.
     #[tokio::test]
     async fn a_cron_shell_job_that_runs_git_is_refused() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
-        config.autonomy.level = crate::security::AutonomyLevel::Supervised;
+        let config = test_config(&tmp).await;
         let job = test_job("cd . && git status");
 
         let (success, output) = run_job_command(&config, &job).await;
@@ -1659,16 +1657,15 @@ mod tests {
         assert!(output.contains("git_operations"), "{output}");
     }
 
-    /// D-107 amendment, below Full: a job the operator added with `prx cron`
-    /// runs git (hardened); the same command added through an agent tool is
-    /// refused; an agent tool rewriting the operator job's command makes it
-    /// an agent job; `mark-operator` vouches for one again.
+    /// D-107 amendment: a job the operator added with `prx cron` runs git
+    /// (hardened); the same command added through an agent tool is refused;
+    /// an agent tool rewriting the operator job's command makes it an agent
+    /// job; `mark-operator` vouches for one again.
     #[tokio::test]
     async fn only_operator_cron_jobs_run_git() {
         crate::security::git_launch::hermetic_git_for_tests();
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
-        config.autonomy.level = crate::security::AutonomyLevel::Supervised;
+        let config = test_config(&tmp).await;
         crate::cron::handle_command(
             crate::CronCommands::Add {
                 expression: "*/5 * * * *".into(),
