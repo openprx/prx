@@ -162,6 +162,12 @@ impl TurnPublication {
         );
         let mut surface_policy = surface_policy(surface, &config.tool_tiering);
         if let Some(targeted) = targeted {
+            // An explicit list is exact and has no discovery tool unless it
+            // names one, so every listed tool is published directly; the
+            // usual gates still decide which of them the turn may use.
+            if let Some(allowed) = &targeted.allowed_tools {
+                surface_policy.direct_names.extend(allowed.iter().cloned());
+            }
             surface_policy.allowed_tools = targeted.allowed_tools;
             surface_policy.excluded_names.extend(targeted.excluded_names);
         }
