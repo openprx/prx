@@ -48,9 +48,24 @@ const CAPABILITY_TOKENS: [&str; 9] = [
     "session_key_v1",
 ];
 
-/// Tokens present in this build but switched off or pending a restart,
-/// sorted ascending.
-const AVAILABLE_TOKENS: &[&str] = &[];
+/// Tokens effective only while `gateway.targeted_agents` is on in this
+/// running daemon; listed under `available` otherwise.
+const TARGETED_AGENTS_TOKEN: &str = "targeted_agents_v1";
+
+/// The effective token list of this running daemon, sorted ascending, and
+/// the tokens present in this build but switched off or pending a restart.
+fn advertised_tokens(state: &AppState) -> (Vec<&'static str>, Vec<&'static str>) {
+    let mut capabilities = CAPABILITY_TOKENS.to_vec();
+    let mut available = Vec::new();
+    // `effective` exactly as `GET /api/gateway/targeted-agents` reports it.
+    if state.config.load_full().gateway.targeted_agents {
+        capabilities.push(TARGETED_AGENTS_TOKEN);
+        capabilities.sort_unstable();
+    } else {
+        available.push(TARGETED_AGENTS_TOKEN);
+    }
+    (capabilities, available)
+}
 
 /// The version of this capabilities document.
 const CAPABILITIES_API: u32 = 1;
@@ -77,8 +92,8 @@ struct CapabilitiesBody {
     prx_version: &'static str,
     commit: &'static str,
     api: u32,
-    capabilities: &'static [&'static str],
-    available: &'static [&'static str],
+    capabilities: Vec<&'static str>,
+    available: Vec<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -107,7 +122,7 @@ struct CatalogBody {
     prx_version: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     revision: Option<String>,
-    capabilities: [&'static str; CAPABILITY_TOKENS.len()],
+    capabilities: Vec<&'static str>,
     models: Vec<CatalogModel>,
     tools: Vec<CatalogTool>,
     reserved_names: [&'static str; 2],
@@ -322,13 +337,14 @@ pub(super) fn method_not_allowed_allowing(allow: &'static str) -> Response {
 
 /// `GET /api/capabilities`: the PRX version and commit, and the tokens
 /// effective in this running daemon and those only available in this build.
-pub(super) async fn get_capabilities() -> Response {
+pub(super) async fn get_capabilities(State(state): State<AppState>) -> Response {
+    let (capabilities, available) = advertised_tokens(&state);
     Json(CapabilitiesBody {
         prx_version: PRX_VERSION,
         commit: PRX_COMMIT,
         api: CAPABILITIES_API,
-        capabilities: &CAPABILITY_TOKENS,
-        available: AVAILABLE_TOKENS,
+        capabilities,
+        available,
     })
     .into_response()
 }
@@ -355,7 +371,7 @@ async fn assemble_catalog(state: &AppState) -> Result<CatalogBody, CatalogError>
     let mut body = CatalogBody {
         prx_version: PRX_VERSION,
         revision: None,
-        capabilities: CAPABILITY_TOKENS,
+        capabilities: advertised_tokens(state).0,
         models,
         tools,
         reserved_names: RESERVED_AGENT_NAMES,

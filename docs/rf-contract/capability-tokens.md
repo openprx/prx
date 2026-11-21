@@ -362,13 +362,37 @@ the purge of the agent incarnation.
   PRX found this input already stored and did not run it again): the input
   could not be confirmed; treat the outcome as unknown.
 
+## Partition and history labels (`targeted_agents_v1`)
+
+**Invariant.** Every read made on behalf of an agent sees only rows of its own
+partition, and every row written for it carries that partition. The partition
+key is (workspace, install owner, agent, incarnation); Main is one partition
+and each named agent incarnation is another. This holds for a turn's history,
+the recalled memory and documents injected into its prompt, the memory,
+document and session tools, and the context a compaction reads. Memory and
+documents have no session term: an agent's own memory is shared across its
+chats, and no other agent (Main included) reads it. Main, through the gateway,
+reads Main's rows only, also in a session it shares with named agents.
+
+**History labels.** `GET /api/sessions/{session_id}/messages` on a
+caller-keyed session returns
+`[{"role","content","timestamp","message_id","agent"}]`, where `agent` is
+`"main"` or the agent's name on every row. `?agent=<name|main>` keeps only
+that agent's rows (with `limit`/`offset` applied after the filter); a configured
+agent with no row yet gives `[]`, and any other value is `404 agent_unknown`.
+A Console session keeps its previous body (no `agent` field, no filter).
+
+**Sessions list.** `GET /api/sessions` with a paired bearer lists only the
+install owner's sessions, so no preview shows another owner's content. With
+pairing off the listing is unchanged.
+
 ## Tokens
 
 | Token | Meaning | Status |
 |---|---|---|
 | `capabilities_v1` | `GET /api/capabilities` returns the version and the sorted token list | advertised since 85ab41f7a |
 | `agent_catalog_v1` | `GET /api/agents/catalog` returns the fields listed above | advertised since 85ab41f7a |
-| `targeted_agents_v1` | A message turn can target a named agent, with a per-agent partitioned history that reads back with an agent label and filter | not yet |
+| `targeted_agents_v1` | A message turn can target a named agent, with a per-agent partitioned history that reads back with an agent label and filter (see Partition and history labels) | in `capabilities` while `gateway.targeted_agents` is effective in the running daemon, in `available` otherwise (AC-1b3) |
 | `agent_crud_v1` | The agent routes above: `GET /api/agents`, `GET`, `PUT` and `DELETE /api/agents/{name}` with If-Match, the config revision, an incarnation and `status`; `GET`/`PUT /api/gateway/targeted-agents`; the owner-bearer-only `POST /api/config/reload`. `DELETE` retires the agent (the purge is `agent_memory_purge_v1`) | advertised since 39509eb97 |
 | `agent_main_readback_v1` | `GET /api/agents/main` reads back Main's configuration | advertised since 39509eb97 |
 | `agent_limits_v1` | `limits {max_concurrent_turns, max_cost_per_day_cents}` on an agent `PUT` (unset by default; card AC-LIM) | not yet |

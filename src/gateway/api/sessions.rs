@@ -56,6 +56,10 @@ pub(super) struct SessionMessage {
     content: String,
     timestamp: String,
     message_id: Option<String>,
+    /// The agent the row belongs to (`main` or a name), on a caller-keyed
+    /// session only; a Console session's body keeps its previous shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -71,6 +75,9 @@ pub(super) struct SessionsQuery {
 pub(super) struct SessionMessagesQuery {
     limit: Option<usize>,
     offset: Option<usize>,
+    /// On a caller-keyed session: only the rows of this agent (`main` or a
+    /// configured name).
+    agent: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1214,7 +1221,16 @@ pub async fn post_session(
         .into_response()
 }
 
-pub async fn get_sessions(State(state): State<AppState>, Query(query): Query<SessionsQuery>) -> impl IntoResponse {
+pub async fn get_sessions(
+    State(state): State<AppState>,
+    Query(query): Query<SessionsQuery>,
+    headers: axum::http::HeaderMap,
+    axum::Extension(api_principal): axum::Extension<super::ApiPrincipal>,
+) -> impl IntoResponse {
+    // MA-01h: a paired bearer (the install owner) lists only its own
+    // sessions, so no preview shows another owner's content. With pairing
+    // off the listing is unchanged.
+    let owner_filter = super::owner_authenticated(&state, &headers).then_some(api_principal.owner_id.as_str());
     let limit = normalize_limit(query.limit);
     let offset = normalize_offset(query.offset);
     let status_filter = query
@@ -1239,11 +1255,21 @@ pub async fn get_sessions(State(state): State<AppState>, Query(query): Query<Ses
     let mut filtered_offset = 0usize;
 
     loop {
-        let sessions = match state
-            .mem
-            .list_conversation_sessions(fetch_batch, source_offset, query.channel.as_deref())
-            .await
-        {
+        let listed = match owner_filter {
+            Some(owner_id) => {
+                state
+                    .mem
+                    .list_owner_conversation_sessions(owner_id, fetch_batch, source_offset, query.channel.as_deref())
+                    .await
+            }
+            None => {
+                state
+                    .mem
+                    .list_conversation_sessions(fetch_batch, source_offset, query.channel.as_deref())
+                    .await
+            }
+        };
+        let sessions = match listed {
             Ok(sessions) => sessions,
             Err(error) => {
                 tracing::error!("Failed to list conversation sessions from DB: {error}");
@@ -1336,6 +1362,9 @@ pub async fn get_session_messages(
     {
         return history_recovery_failed(&error);
     }
+    if session.channel == crate::memory::CALLER_KEYED_SESSION_CHANNEL {
+        return rf_message::rf_history(&state, &session, &api_principal, query.agent.as_deref(), limit, offset).await;
+    }
     let principal = operator_history_principal(
         &api_principal,
         &console_runtime_envelope(&state, &session_id, &session.channel, &session.sender),
@@ -1363,6 +1392,7 @@ pub async fn get_session_messages(
             content: turn.content,
             timestamp: turn.timestamp,
             message_id: turn.message_id,
+            agent: None,
         })
         .collect();
 

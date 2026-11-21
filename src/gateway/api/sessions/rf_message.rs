@@ -789,6 +789,145 @@ async fn record_context(
     }
 }
 
+/// `GET /api/sessions/{id}/messages` on a caller-keyed session (MA-01h):
+/// every row carries the agent it belongs to (`main` or a name), and
+/// `agent` keeps only that agent's rows. The caller is the session's owner
+/// (checked before this runs).
+pub(super) async fn rf_history(
+    state: &AppState,
+    session: &crate::memory::ConversationSessionSummary,
+    principal: &ApiPrincipal,
+    agent: Option<&str>,
+    limit: usize,
+    offset: usize,
+) -> Response {
+    let envelope = super::console_runtime_envelope(state, &session.session_key, &session.channel, &session.sender);
+    let mut reader = super::operator_history_principal(principal, &envelope);
+    if let Some(agent) = agent {
+        match history_filter(state, &envelope.workspace_id, &principal.owner_id, agent) {
+            Ok(Some(partition)) => reader.agent_partition = Some(partition),
+            // The agent has no incarnation for this owner, so it has no row.
+            Ok(None) => return Json(Vec::<super::SessionMessage>::new()).into_response(),
+            Err(response) => return response,
+        }
+    }
+    let turns = match state
+        .mem
+        .list_console_conversation_turns(&reader, &session.session_key, limit, offset)
+        .await
+    {
+        Ok(turns) => turns,
+        Err(error) => {
+            tracing::warn!(
+                error_kind = super::console_error_kind(&error),
+                "Caller-keyed session history read failed"
+            );
+            return storage_unavailable("the session history could not be read");
+        }
+    };
+    let ids = turns.iter().map(|turn| turn.id).collect::<Vec<_>>();
+    let keys = match state.mem.conversation_turn_agent_keys(&ids).await {
+        Ok(keys) => keys,
+        Err(error) => {
+            tracing::warn!(
+                error_kind = super::console_error_kind(&error),
+                "Caller-keyed session history labels could not be read"
+            );
+            return storage_unavailable("the session history could not be read");
+        }
+    };
+    let mut rows = Vec::with_capacity(turns.len());
+    for turn in turns {
+        // A row whose agent cannot be named is never served unlabelled.
+        let Some(label) = keys.get(&turn.id).and_then(|key| agent_label(key)) else {
+            tracing::warn!("Caller-keyed session history row carries no readable agent key");
+            return storage_unavailable("the session history could not be read");
+        };
+        rows.push(super::SessionMessage {
+            role: turn.role,
+            content: turn.content,
+            timestamp: turn.timestamp,
+            message_id: turn.message_id,
+            agent: Some(label),
+        });
+    }
+    Json(rows).into_response()
+}
+
+/// The wire label of a stored agent key: `main` for Main, the name for a
+/// named agent; `None` for any other shape.
+fn agent_label(key: &str) -> Option<String> {
+    if key == crate::memory::agent_registry::MAIN_AGENT_KEY {
+        return Some(crate::config::agent_name::MAIN_AGENT_NAME.to_owned());
+    }
+    key.strip_prefix("n:")
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+}
+
+/// The partition `?agent=` selects. `Ok(None)`: a configured agent that has
+/// no incarnation for this owner yet. `main` is Main; any other value that is
+/// not a configured agent name is `404 agent_unknown`.
+fn history_filter(
+    state: &AppState,
+    workspace_id: &str,
+    owner_id: &str,
+    agent: &str,
+) -> Result<Option<crate::memory::AgentPartition>, Response> {
+    let unknown = || {
+        coded_error(
+            StatusCode::NOT_FOUND,
+            "agent_unknown",
+            "no configured agent has this name",
+        )
+    };
+    let partition = |key| crate::memory::AgentPartition {
+        workspace_id: workspace_id.to_owned(),
+        owner_id: owner_id.to_owned(),
+        key,
+    };
+    let name = match TurnTarget::from_field(AgentField::Text(agent.to_owned())) {
+        Ok(TurnTarget::Main) => return Ok(Some(partition(crate::memory::PartitionKey::Main))),
+        Ok(TurnTarget::Named(name)) => name,
+        Err(_) => return Err(unknown()),
+    };
+    if !state.config.pin().effective.agents.contains_key(name.as_str()) {
+        return Err(unknown());
+    }
+    let Some(registry) = state.mem.agent_registry() else {
+        return Err(coded_error(
+            StatusCode::CONFLICT,
+            TargetError::BackendUnsupported.code(),
+            "the memory backend keeps no agent incarnation registry",
+        ));
+    };
+    let key = crate::gateway::agent_lifecycle::agent_key(name.as_str());
+    let live = registry
+        .live_incarnation(workspace_id, owner_id, &key)
+        .map_err(|error| {
+            tracing::warn!(
+                error_kind = super::console_error_kind(&error),
+                "Agent registry read failed"
+            );
+            storage_unavailable("the agent registry could not be read")
+        })?;
+    let Some(live) = live else {
+        return Ok(None);
+    };
+    let incarnation = uuid::Uuid::parse_str(&live.incarnation).map_err(|_| {
+        tracing::warn!(
+            error_kind = "invalid_uuid",
+            agent = name.as_str(),
+            "Agent incarnation is not a valid UUID"
+        );
+        storage_unavailable("the agent registry could not be read")
+    })?;
+    Ok(Some(partition(crate::memory::PartitionKey::Named {
+        name,
+        incarnation,
+    })))
+}
+
 async fn target_refusal(refusal: TargetRefusal) -> Response {
     let error = match refusal {
         TargetRefusal::Selector(error) => error,
