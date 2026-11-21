@@ -556,6 +556,13 @@ fn claim_semantic(
         "telemetry": commit.telemetry,
         "delivery_intent": commit.delivery_intent,
     }));
+    // The bound scope is set after redaction: restart verification compares
+    // it field by field with the persisted terminal row, which stores these
+    // identifiers unredacted.
+    semantic
+        .as_object_mut()
+        .context("terminal claim is not an object")?
+        .insert("scope".to_owned(), bound_scope(&commit.scope)?);
     if !prepared_parameters.is_empty() {
         semantic
             .as_object_mut()
@@ -591,6 +598,20 @@ fn claim_semantic(
         );
     }
     Ok((semantic, reference))
+}
+
+/// The claim's bound scope: the identity [`event_input`] persists on every
+/// terminal row (sender and recipient through the provider-label redaction).
+/// Scope fields are row identifiers, never secret-redacted: a secret-shaped
+/// `session_key` such as `console-<uuid>` must stay comparable with its row.
+fn bound_scope(scope: &MessageEventScope) -> anyhow::Result<serde_json::Value> {
+    let mut bound = terminal_semantic_scope(scope);
+    let object = bound.as_object_mut().context("terminal scope is not an object")?;
+    for (field, value) in [("sender", &scope.sender), ("recipient", &scope.recipient)] {
+        let stored = value.clone().map(crate::memory::fabric::redact_provider_label);
+        object.insert(field.to_owned(), serde_json::to_value(stored)?);
+    }
+    Ok(bound)
 }
 
 #[cfg(test)]
