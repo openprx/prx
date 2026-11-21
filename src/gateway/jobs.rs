@@ -211,11 +211,6 @@ impl JobHandle {
         })
     }
 
-    /// The job id `GET /api/jobs/{id}` takes.
-    pub(super) fn job_id(&self) -> String {
-        self.id.to_string()
-    }
-
     /// Block until the job reaches a terminal phase and return its result.
     ///
     /// Dropping this future does **not** stop the job: that is the whole point
@@ -397,18 +392,19 @@ where
 }
 
 /// [`submit_with_cleanup`] for the work of one run, whose id the job's
-/// public view then carries (`run_id`).
+/// public view then carries (`run_id`). The run's job id is minted by the
+/// caller, which records it durably before the job exists (AC-1b2a).
 pub(super) fn submit_run_with_cleanup<F>(
     kind: &'static str,
     label: impl Into<Arc<str>>,
     work: F,
     initial_cleanup: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
-    run_id: Option<Arc<str>>,
+    run: Option<(Arc<str>, Uuid)>,
 ) -> JobHandle
 where
     F: Future<Output = Result<JobOutput, String>> + Send + 'static,
 {
-    let id = Uuid::new_v4();
+    let (run_id, id) = run.map_or_else(|| (None, Uuid::new_v4()), |(run_id, id)| (Some(run_id), id));
     let label: Arc<str> = label.into();
     let job_ref = id.to_string();
     let cancel = CancellationToken::new();

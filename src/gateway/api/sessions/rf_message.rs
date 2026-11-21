@@ -6,8 +6,8 @@
 //! Console path of `sessions.rs` unchanged. rf-shaped requests need a paired
 //! bearer (pairing off is `401 auth_failed`), answer in the coded shape
 //! `{"error":{"code","message"}}`, and act only on a caller-keyed session of
-//! the caller. B1 does not deduplicate: `client_message_id` is validated and
-//! recorded in the caller-context block, and a resend runs again.
+//! the caller. A resend of the same `client_message_id` is answered from its
+//! durable attempt row (`rf_replay.rs`, AC-1b2a) and admits nothing.
 //!
 //! Sender, chat and mention metadata reaches the model only through the
 //! caller-context block rendered here from validated fields. The message
@@ -17,8 +17,9 @@
 use super::super::ApiPrincipal;
 use super::super::capabilities::{RESERVED_SESSION_KEY_PREFIXES, coded_error, rf_session_refusal};
 use super::target::{AgentField, TargetError, TurnTarget};
-use super::{ConsoleSubmission, SelectedTurn, TargetRefusal, UploadGuard};
+use super::{ConsoleSubmission, SelectedTurn, TargetRefusal, UploadGuard, rf_replay};
 use crate::gateway::AppState;
+use crate::memory::{RfAdmission, RfMessageKey, RfRun};
 use axum::{
     Json,
     body::{Body, Bytes},
@@ -28,7 +29,9 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::LazyLock;
 
 /// Caller session keys: `[A-Za-z0-9_-]{8,128}`, not a reserved prefix.
@@ -463,18 +466,30 @@ fn render(message: &RfMessage) -> Result<String, serde_json::Error> {
     ))
 }
 
-/// The (workspace, session, agent) turns that are live; `session_busy` (V5).
-static LIVE_TURNS: LazyLock<parking_lot::Mutex<HashSet<String>>> = LazyLock::new(Default::default);
+/// The (workspace, session, agent) turns live in this process, with their
+/// run; `session_busy` (V5), and the "live here" half of a replay's status
+/// (AC-1b2a).
+static LIVE_TURNS: LazyLock<parking_lot::Mutex<HashMap<String, String>>> = LazyLock::new(Default::default);
 
-/// One live rf turn of a (session, agent); released on drop.
+fn slot_key(workspace: &str, session_id: &str, agent: &str) -> String {
+    format!("{workspace}\0{session_id}\0{agent}")
+}
+
+/// One live rf turn of a (session, agent), held from before its input is
+/// admitted until its job's work ends; released on drop.
 pub(super) struct TurnSlot(String);
 
 impl TurnSlot {
-    fn claim(workspace: &str, session_id: &str, agent: &str) -> Option<Self> {
-        let key = format!("{workspace}\0{session_id}\0{agent}");
-        let claimed = LIVE_TURNS.lock().insert(key.clone());
-        // Built only when claimed: a dropped slot releases its key.
-        claimed.then(|| Self(key))
+    fn claim(workspace: &str, session_id: &str, agent: &str, run_id: &str) -> Option<Self> {
+        let key = slot_key(workspace, session_id, agent);
+        match LIVE_TURNS.lock().entry(key.clone()) {
+            Entry::Occupied(_) => None,
+            Entry::Vacant(vacant) => {
+                vacant.insert(run_id.to_owned());
+                // Built only when claimed: a dropped slot releases its key.
+                Some(Self(key))
+            }
+        }
     }
 }
 
@@ -484,13 +499,47 @@ impl Drop for TurnSlot {
     }
 }
 
-/// `202 {"run_id","job_id"}` of an admitted rf turn.
-pub(super) fn turn_accepted(run_id: &str, job_id: &str) -> Response {
-    (
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({ "run_id": run_id, "job_id": job_id })),
-    )
-        .into_response()
+/// Whether `run_id` is the live turn of its (session, agent) here.
+pub(super) fn live_run(workspace: &str, session_id: &str, agent: &str, run_id: &str) -> bool {
+    LIVE_TURNS
+        .lock()
+        .get(&slot_key(workspace, session_id, agent))
+        .is_some_and(|live| live == run_id)
+}
+
+/// Every validated body field, in a fixed order, for the request hash.
+#[derive(Serialize)]
+struct CanonicalRequest<'a> {
+    client_message_id: &'a str,
+    /// Normalised: `agent` omitted and `"main"` are both `main`.
+    agent: &'a str,
+    deliver: Deliver,
+    message: &'a str,
+    chat: &'a RfChat,
+    sender: &'a RfSender,
+    mentions: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none", rename = "reply_to")]
+    reply_target: Option<&'a str>,
+}
+
+/// I5: hex SHA-256 of a versioned prefix and the canonical JSON of the
+/// validated request. It is re-serialised from the parsed fields, so the
+/// order of fields and the whitespace of the sent JSON do not change it.
+fn request_hash(message: &RfMessage, agent: &str) -> Result<String, serde_json::Error> {
+    let canonical = serde_json::to_vec(&CanonicalRequest {
+        client_message_id: &message.client_message_id,
+        agent,
+        deliver: message.deliver,
+        message: &message.message,
+        chat: &message.chat,
+        sender: &message.sender,
+        mentions: &message.mentions,
+        reply_target: message.reply_target.as_deref(),
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"prx-rf-message-request-v1\0");
+    hasher.update(&canonical);
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// `POST /api/sessions/{id}/message` with an rf body.
@@ -552,13 +601,10 @@ pub(super) async fn post_rf_message(
         Ok(selected) => selected,
         Err(refusal) => return target_refusal(refusal).await,
     };
-    let content = match render(&message) {
-        Ok(content) => content,
-        Err(_) => return storage_unavailable("the caller context could not be encoded"),
+    let (content, request_hash) = match (render(&message), request_hash(&message, &agent_key)) {
+        (Ok(content), Ok(hash)) => (content, hash),
+        _ => return storage_unavailable("the caller context could not be encoded"),
     };
-    if message.deliver == Deliver::Context {
-        return record_context(&state, &session_id, &principal, selected, &content).await;
-    }
     let workspace = selected
         .runtime
         .config_generation
@@ -566,12 +612,47 @@ pub(super) async fn post_rf_message(
         .workspace_dir
         .to_string_lossy()
         .into_owned();
-    let Some(slot) = TurnSlot::claim(&workspace, &session_id, &agent_key) else {
-        return coded_error(
-            StatusCode::CONFLICT,
-            "session_busy",
-            "a turn of this agent in this session is still running",
-        );
+    let key = RfMessageKey {
+        workspace_id: workspace.clone(),
+        owner_id: principal.owner_id.clone(),
+        session_key: session_id.clone(),
+        agent_key: agent_key.clone(),
+        incarnation: selected.incarnation.clone().unwrap_or_default(),
+        client_message_id: message.client_message_id.clone(),
+    };
+    // The replay lookup comes after the agent checks and before
+    // `session_busy`: a replay of the running turn answers `running`.
+    let previous = match rf_replay::lookup(&state, &key, &request_hash).await {
+        rf_replay::Lookup::First => None,
+        rf_replay::Lookup::Restart(attempt) => Some(attempt),
+        rf_replay::Lookup::Answer(response) => return response,
+    };
+    if message.deliver == Deliver::Context {
+        // The hash covers `deliver`, so a context key never has a turn
+        // attempt to restart: `previous` is `None` here.
+        let admission = RfAdmission {
+            key,
+            attempt: 1,
+            request_hash,
+            run: None,
+            interrupts: None,
+        };
+        return record_context(&state, &session_id, &principal, selected, &content, admission).await;
+    }
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let job_id = uuid::Uuid::new_v4();
+    let Some(slot) = TurnSlot::claim(&workspace, &session_id, &agent_key, &run_id) else {
+        return rf_replay::session_busy();
+    };
+    let admission = RfAdmission {
+        key,
+        attempt: previous.as_ref().map_or(1, |previous| previous.attempt.saturating_add(1)),
+        request_hash,
+        run: Some(RfRun {
+            run_id: run_id.clone(),
+            job_id: job_id.to_string(),
+        }),
+        interrupts: previous.and_then(|previous| previous.run).map(|run| run.run_id),
     };
     let response = super::submit_console_message(
         state,
@@ -583,7 +664,12 @@ pub(super) async fn post_rf_message(
             async_mode: true,
             uploads: UploadGuard::default(),
             owner_authenticated,
-            rf_slot: Some(slot),
+            rf: Some(rf_replay::RfTurn {
+                slot,
+                run_id,
+                job_id,
+                admission,
+            }),
         },
     )
     .await;
@@ -591,13 +677,15 @@ pub(super) async fn post_rf_message(
 }
 
 /// `deliver:"context"`: the input becomes a user row of the session for the
-/// target, stamped like a turn's input row, and no run starts.
+/// target, stamped like a turn's input row, and no run starts. Its attempt
+/// row is written in the input event's transaction.
 async fn record_context(
     state: &AppState,
     session_id: &str,
     principal: &ApiPrincipal,
     selected: SelectedTurn,
     content: &str,
+    admission: RfAdmission,
 ) -> Response {
     let SelectedTurn {
         runtime,
@@ -642,8 +730,12 @@ async fn record_context(
     };
     let envelope = envelope.with_agent_partition(partition);
     let durable = super::console_recordable(config, state.mem.as_ref());
-    match super::append_console_turn(state, &envelope, "user", content, true, durable).await {
+    let (key, request_hash) = (admission.key.clone(), admission.request_hash.clone());
+    match super::append_admitted_console_turn(state, &envelope, content, durable, admission).await {
         Ok(message_id) => Json(serde_json::json!({ "message_id": message_id, "status": "recorded" })).into_response(),
+        Err(error) if crate::memory::RfAdmissionRefused::of(&error).is_some() => {
+            rf_replay::refused_context(state, &key, &request_hash, &error).await
+        }
         Err(error) if error.is::<crate::memory::AgentScopeRefused>() => coded_error(
             StatusCode::CONFLICT,
             "agent_scope_refused",

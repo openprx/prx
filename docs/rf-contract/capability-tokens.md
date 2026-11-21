@@ -272,10 +272,52 @@ exists: `status` is `running`, then `succeeded`, `failed` or `cancelled`, and
 the body of an rf-shaped turn carries its `run_id`. Jobs are kept in memory for
 one hour after they end and do not survive a restart.
 
-**No deduplication yet.** B1 validates `client_message_id` and records it in
-the caller-context block, but does not deduplicate: a resent `turn` runs again
-and a resent `context` is stored again. Deduplication and replay are
-`message_idempotency_v1` (not yet advertised).
+## Message idempotency (`message_idempotency_v1`)
+
+**Key.** A message is identified by (install owner, session, agent,
+incarnation, `client_message_id`). `agent` omitted and `"main"` are the same
+key; the same `client_message_id` sent to two agents is two keys. PRX stores a
+record of the key, with a SHA-256 digest of the validated request (every body
+field, `deliver` included; field order and JSON whitespace do not matter), in
+the same transaction that admits the input. Two concurrent first sends admit
+one input: the other gets the replay answer or `409 session_busy`.
+
+**Answers to a resend.** Validation runs first, in the order above (auth,
+body, readiness, session, agent); the replay lookup comes before
+`session_busy`. Every replay answer carries `"replayed": true`; first answers
+have no `replayed` field.
+
+| Resend | Answer |
+|---|---|
+| same key, same request, `turn` still running | `200 {"run_id","job_id","status":"running","replayed":true}` |
+| same key, same request, `turn` ended | `200 {"run_id","job_id","status":"succeeded"\|"failed"\|"cancelled","replayed":true}`, from PRX's durable terminal record; `job_id` may already be unknown to `GET /api/jobs` |
+| same key, same request, `context` | `200 {"message_id","status":"recorded","replayed":true}` with the original `message_id` |
+| same key, different request | `409 idempotency_conflict`; nothing is written |
+| same key, same request, PRX died during the turn | `202 {"run_id","job_id","attempt","previous_run_id"}`: a new attempt (restart rule below) |
+
+A replay never starts a run, a provider request, a context row or a second
+record, except under the restart rule. A replay of a turn whose status is
+`failed` or `cancelled` returns that status and never runs again. A user
+retry is a new `client_message_id` on rf's side.
+
+**Restart rule.** A resend of a `turn` whose attempt has no terminal record,
+is not running in this PRX process, and was admitted by a PRX process that has
+ended (PRX proves it by taking that process's ingress lock) starts a new
+attempt: `202` with the new `run_id` and `job_id`, `attempt` (2 for the first
+retry; it counts the attempts of this key) and `previous_run_id`. In the same
+transaction the interrupted attempt gets its terminal: status `failed`, error
+code `interrupted`. The interrupted attempt may have executed tools; nothing
+is rolled back. Two concurrent resends after a crash start one attempt; the
+other gets a replay answer or `409 session_busy`. A turn PRX cannot prove
+ended (its process still holds the lock) reads as `running`.
+
+**Retention.** The record is guaranteed for at least 7 days after the first
+admission (a guaranteed lower bound). Nothing in PRX deletes it earlier except
+the purge of the agent incarnation.
+
+**Recording.** The record lives with the user-message events. With
+`memory.events.record_user_messages = false`, an rf message is refused with
+`500 storage_unavailable`, and nothing is written.
 
 **Errors** (coded shape):
 
@@ -293,6 +335,8 @@ and a resent `context` is stored again. Deduplication and replay are
   runs Main).
 - `409 agent_disabled`: the agent is disabled or retired (targeted agents on).
 - `409 session_busy`: a `turn` of this agent in this session is still live.
+- `409 idempotency_conflict`: the `client_message_id` was used with a
+  different request.
 - `400 agent_tools_invalid`, `409 agent_backend_unsupported`,
   `409 agent_scope_refused`: the agent's configuration, the memory backend or
   its scope registry cannot serve a targeted turn.
@@ -315,7 +359,7 @@ and a resent `context` is stored again. Deduplication and replay are
 | `session_key_v1` | `POST /api/sessions` accepts a caller-chosen `session_key` | advertised (AC-1b1) |
 | `message_target_v1` | The message route accepts a target together with caller context | advertised (AC-1b1) |
 | `message_context_delivery_v1` | Caller context is delivered to the turn within published bounds, with `deliver` | advertised (AC-1b1) |
-| `message_idempotency_v1` | The message route deduplicates by an idempotency key, with the replay response and 7-day key retention; job cancel answers a coded `404 job_unknown` | not yet |
+| `message_idempotency_v1` | The message route deduplicates by an idempotency key, with the replay response, the restart rule and 7-day key retention (see Message idempotency) | advertised (AC-1b2a) |
 | `message_delete_v1` | A message can be deleted | not yet |
 | `sync_snapshot_v1` | `GET /api/sync/snapshot` returns the owner's sessions and turns; an expired cursor gets `410 snapshot_expired` | not yet |
 | `sync_ws_v1` | `GET /api/sync/ws` carries the durable journal kinds with hello, welcome, ack and cursor resume, the root and parent link fields, `turn.failed{prx_restart,retryable:true}` journaled at start, the config-changed startup check and every C§4 close | not yet |

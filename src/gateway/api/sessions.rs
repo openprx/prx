@@ -29,6 +29,7 @@ const UPLOADS_DIR_NAME: &str = "uploads";
 
 mod rf_message;
 pub(super) use rf_message::{create_route_auth, message_route_auth};
+mod rf_replay;
 mod target;
 pub(super) use target::TARGET_EXCLUDED_TOOLS;
 use target::{
@@ -567,6 +568,48 @@ async fn append_console_turn(
     record_message_event: bool,
     durable_projection: bool,
 ) -> anyhow::Result<String> {
+    append_console_turn_with(
+        state,
+        envelope,
+        role,
+        content,
+        record_message_event,
+        durable_projection,
+        None,
+    )
+    .await
+}
+
+/// An rf `context` input: its user event and its attempt row commit in one
+/// transaction (AC-1b2a), then it is projected like any recorded input.
+async fn append_admitted_console_turn(
+    state: &AppState,
+    envelope: &RuntimeEnvelope,
+    content: &str,
+    durable_projection: bool,
+    admission: crate::memory::RfAdmission,
+) -> anyhow::Result<String> {
+    append_console_turn_with(
+        state,
+        envelope,
+        "user",
+        content,
+        true,
+        durable_projection,
+        Some(admission),
+    )
+    .await
+}
+
+async fn append_console_turn_with(
+    state: &AppState,
+    envelope: &RuntimeEnvelope,
+    role: &str,
+    content: &str,
+    record_message_event: bool,
+    durable_projection: bool,
+    admission: Option<crate::memory::RfAdmission>,
+) -> anyhow::Result<String> {
     // The console persists its reply twice, as a message event and as the
     // transcript turn: both are redacted like the terminal commit (D-053).
     let content: std::borrow::Cow<'_, str> = if role == "assistant" {
@@ -576,14 +619,22 @@ async fn append_console_turn(
     };
     let event = if record_message_event {
         let fabric = MemoryFabric::new(state.mem.clone(), envelope.workspace_id.clone());
-        Some(if role == "assistant" {
-            fabric
-                .record_assistant_message(envelope.message_scope(), &*content)
-                .await?
-        } else {
-            fabric
-                .record_inbound_user_message(envelope.message_scope(), &*content, None, None)
-                .await?
+        Some(match admission {
+            _ if role == "assistant" => {
+                fabric
+                    .record_assistant_message(envelope.message_scope(), &*content)
+                    .await?
+            }
+            Some(admission) => {
+                fabric
+                    .record_admitted_user_message(envelope.message_scope(), &*content, None, admission)
+                    .await?
+            }
+            None => {
+                fabric
+                    .record_inbound_user_message(envelope.message_scope(), &*content, None, None)
+                    .await?
+            }
         })
     } else {
         None
@@ -1562,7 +1613,7 @@ pub async fn post_session_message(
             async_mode,
             uploads,
             owner_authenticated,
-            rf_slot: None,
+            rf: None,
         },
     )
     .await
@@ -1678,6 +1729,7 @@ impl ConsolePendingInput {
     async fn record(
         self,
         message: String,
+        rf_admission: Option<crate::memory::RfAdmission>,
     ) -> anyhow::Result<(
         crate::gateway::turn_source::GatewayTurnProof,
         crate::gateway::turn_source::GatewayAdmissionGuard,
@@ -1698,14 +1750,28 @@ impl ConsolePendingInput {
             let mut ticket = Some(self.ticket);
             let mut admission = None;
             let operation = async {
-                let event = fabric
-                    .record_inbound_user_message(
-                        self.envelope.message_scope(),
-                        message.clone(),
-                        Some(key.clone()),
-                        None,
-                    )
-                    .await?;
+                let event = match rf_admission {
+                    Some(rf_admission) => {
+                        fabric
+                            .record_admitted_user_message(
+                                self.envelope.message_scope(),
+                                message.clone(),
+                                Some(key.clone()),
+                                rf_admission,
+                            )
+                            .await?
+                    }
+                    None => {
+                        fabric
+                            .record_inbound_user_message(
+                                self.envelope.message_scope(),
+                                message.clone(),
+                                Some(key.clone()),
+                                None,
+                            )
+                            .await?
+                    }
+                };
                 anyhow::ensure!(
                     event.id <= 0
                         || (event.idempotency_key.as_deref() == Some(key.as_str())
@@ -1767,6 +1833,14 @@ impl ConsolePendingInput {
                     .take()
                     .map(|guard| (proof, guard))
                     .ok_or_else(|| anyhow::anyhow!("Console input owner did not issue a guard")),
+                // An rf admission refused inside its transaction rolled back:
+                // nothing was written, so no write is left unconfirmed.
+                Err(error) if crate::memory::RfAdmissionRefused::of(&error).is_some() => {
+                    if let Some(ticket) = ticket.take() {
+                        ticket.finish(true);
+                    }
+                    Err(error)
+                }
                 Err(_error) if fabric.ingress_already_accepted() => {
                     if let Some(ticket) = ticket.take() {
                         ticket.finish(true);
@@ -1850,9 +1924,10 @@ struct ConsoleSubmission {
     /// message and the saved reply as before A4, and the turn is
     /// owner-isolated.
     owner_authenticated: bool,
-    /// Set for an rf message turn: the (session, agent) turn slot it holds
-    /// until its job ends, which also selects the `{run_id, job_id}` answer.
-    rf_slot: Option<rf_message::TurnSlot>,
+    /// Set for an rf message turn: its (session, agent) slot, held until its
+    /// job ends, its run and job ids and its attempt row; it also selects the
+    /// `{run_id, job_id}` answer.
+    rf: Option<rf_replay::RfTurn>,
 }
 
 async fn submit_console_message(
@@ -1867,7 +1942,7 @@ async fn submit_console_message(
         async_mode,
         uploads,
         owner_authenticated,
-        rf_slot,
+        rf,
     } = submission;
     let SelectedTurn {
         runtime: turn_runtime,
@@ -1901,7 +1976,9 @@ async fn submit_console_message(
     // A controlled H2 launch binds only isolated Gateway sources, so it keeps
     // isolation.
     let owner_isolated = !owner_authenticated || turn_runtime.publication_slot.controlled.is_some();
-    let run_id = uuid::Uuid::new_v4().to_string();
+    let run_id = rf
+        .as_ref()
+        .map_or_else(|| uuid::Uuid::new_v4().to_string(), |rf| rf.run_id.clone());
     let runtime_envelope = console_runtime_envelope_for_workspace(
         turn_runtime
             .config_generation
@@ -1980,8 +2057,12 @@ async fn submit_console_message(
         envelope: runtime_envelope,
         ticket,
     };
-    let (proof, mut guard) = match pending.record(message.clone()).await {
+    let admission = rf.as_ref().map(|rf| rf.admission.clone());
+    let (proof, mut guard) = match pending.record(message.clone(), admission).await {
         Ok(admission) => admission,
+        Err(error) if crate::memory::RfAdmissionRefused::of(&error).is_some() => {
+            return rf_replay::refused_admission(&state, rf, &error).await;
+        }
         Err(error) if error.is::<crate::runtime::ingress_recovery::AlreadyAccepted>() => {
             return json_error(
                 StatusCode::CONFLICT,
@@ -2039,9 +2120,11 @@ async fn submit_console_message(
     // still there when the client comes back.
     let work = run_console_message_job(turn_runtime, state, message, turns, source, target);
     let label = format!("gateway:session_message:{session_id}");
-    if let Some(slot) = rf_slot {
+    if let Some(rf) = rf {
+        let accepted = rf.accepted();
+        let (job_id, slot) = (rf.job_id, rf.slot);
         // The slot is released exactly when the job's work ends or is dropped.
-        let job = jobs::submit_run_with_cleanup(
+        jobs::submit_run_with_cleanup(
             jobs::KIND_SESSION_MESSAGE,
             label,
             async move {
@@ -2049,9 +2132,9 @@ async fn submit_console_message(
                 work.await
             },
             Some(cleanup_receiver),
-            Some(std::sync::Arc::from(run_id.as_str())),
+            Some((std::sync::Arc::from(run_id.as_str()), job_id)),
         );
-        return rf_message::turn_accepted(&run_id, &job.job_id());
+        return accepted;
     }
     let job = jobs::submit_with_cleanup(jobs::KIND_SESSION_MESSAGE, label, work, Some(cleanup_receiver));
     // The job owns the turn now; hand the uploaded files over with it.
