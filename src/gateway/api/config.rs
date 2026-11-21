@@ -28,11 +28,14 @@ pub async fn post_config_reload(State(state): State<AppState>, headers: HeaderMa
         crate::tools::ConfigReloadTool::with_security(Arc::clone(&state.config), security)
     };
     match tool.execute(serde_json::json!({})).await {
-        Ok(result) if result.success => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "success": true, "message": result.output })),
-        )
-            .into_response(),
+        Ok(result) if result.success => {
+            retry_turn_runtime_standby(&state).await;
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "success": true, "message": result.output })),
+            )
+                .into_response()
+        }
         Ok(result) if !owner_authenticated => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
@@ -49,6 +52,20 @@ pub async fn post_config_reload(State(state): State<AppState>, headers: HeaderMa
                 "the configuration files could not be loaded and activated; the running configuration is unchanged",
             )
         }
+    }
+}
+
+/// After a successful reload, give a turn runtime standing by for a provider
+/// credential its retry (see `GatewayTurnRuntimeOwner::retry_standby`). The
+/// reload itself already succeeded, so a failed retry is logged and leaves the
+/// turn routes answering `503 provider_not_ready`.
+async fn retry_turn_runtime_standby(state: &AppState) {
+    let Some(owner) = state.turn_runtime.clone() else {
+        return;
+    };
+    match crate::runtime::blocking::spawn_blocking(move || owner.retry_standby()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) | Err(_) => warn!("gateway turn runtime could not be rebuilt after the reload"),
     }
 }
 

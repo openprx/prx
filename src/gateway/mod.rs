@@ -39,8 +39,10 @@ pub(crate) mod turn_source;
 /// would collide with one of them inside the `:`-composed caller identity.
 pub use compat::FIXED_EXTERNAL_ISSUERS;
 
+mod turn_readiness;
 mod ui;
 mod webhook_dedup;
+use turn_readiness::{GatewayTurnState, TurnNotReady, TurnNotReadyReason, TurnRuntimeStandby};
 
 use crate::agent::document_ingest::DocumentIngestRuntime;
 use crate::agent::turn_engine::run_turn;
@@ -970,6 +972,10 @@ fn gateway_channel_webhook_operation(channel: &str, action: &str) -> String {
 pub struct AppState {
     /// Sole configuration generation owner used by every gateway path.
     pub config: crate::config::SharedConfig,
+    /// Test fixtures' provider, served by `pin_turn_runtime` when a test
+    /// state has no turn runtime; every production turn takes its provider
+    /// from [`turn_runtime`](Self::turn_runtime).
+    #[cfg(test)]
     pub provider: Arc<dyn Provider>,
     pub model: String,
     pub temperature: f64,
@@ -1089,7 +1095,7 @@ impl crate::config::ConfigGenerationAuditSink for ConfigGenerationMessageAuditSi
 
 pub struct GatewayTurnRuntimeOwner {
     cleanup: Arc<turn_source::CleanupTracker>,
-    current: Arc<ArcSwap<TurnRuntimeGeneration>>,
+    current: Arc<ArcSwap<GatewayTurnState>>,
     config: crate::config::SharedConfig,
     memory: Arc<dyn Memory>,
     signal: Option<Arc<SignalChannel>>,
@@ -1104,7 +1110,7 @@ pub struct GatewayTurnRuntimeOwner {
 
 impl GatewayTurnRuntimeOwner {
     fn new(
-        current: TurnRuntimeGeneration,
+        current: impl Into<GatewayTurnState>,
         config: crate::config::SharedConfig,
         memory: Arc<dyn Memory>,
         signal: Option<Arc<SignalChannel>>,
@@ -1118,8 +1124,9 @@ impl GatewayTurnRuntimeOwner {
         // every targeted resolve until a later reconcile succeeds.
         let agents = agent_lifecycle::AgentLifecycle::default();
         agents.reconcile(memory.as_ref(), &config.pin().effective, true);
+        let current = current.into();
         Self {
-            cleanup: Arc::clone(&current.publication_slot.cleanup),
+            cleanup: Arc::clone(&current.publication_slot().cleanup),
             current: Arc::new(ArcSwap::from_pointee(current)),
             config,
             memory,
@@ -1134,8 +1141,14 @@ impl GatewayTurnRuntimeOwner {
         }
     }
 
-    fn pin(&self) -> Arc<TurnRuntimeGeneration> {
+    fn pin_state(&self) -> Arc<GatewayTurnState> {
         self.current.load_full()
+    }
+
+    /// Test fixtures' ready generation.
+    #[cfg(test)]
+    fn pin(&self) -> Arc<TurnRuntimeGeneration> {
+        self.current.load().ready().expect("test: the gateway turn runtime is ready")
     }
 
     const fn agent_lifecycle(&self) -> &agent_lifecycle::AgentLifecycle {
@@ -1147,16 +1160,38 @@ impl GatewayTurnRuntimeOwner {
     /// The lifecycle experiment HTTP adapter uses this to refuse when the
     /// process has no profile. It does not mint an invocation.
     pub(crate) fn has_controlled_profile(&self) -> bool {
-        self.current.load().publication_slot.controlled.is_some()
+        self.current.load().publication_slot().controlled.is_some()
     }
 
-    fn build(&self, generation: Arc<crate::config::ConfigGeneration>) -> anyhow::Result<TurnRuntimeGeneration> {
-        if let Some(profile) = &self.current.load().publication_slot.controlled {
+    /// The runtime of `generation`. A ready runtime rejects a generation
+    /// whose default provider has no usable credential (the previous
+    /// generation stays active); a runtime standing by takes it and keeps
+    /// standing by, so the agent and configuration routes keep applying.
+    fn build(&self, generation: Arc<crate::config::ConfigGeneration>) -> anyhow::Result<GatewayTurnState> {
+        let previous = self.current.load_full();
+        if let Some(profile) = &previous.publication_slot().controlled {
             profile.revoke();
             anyhow::bail!("controlled Gateway generation cannot be rebuilt");
         }
-        let mut runtime = build_gateway_turn_runtime(
+        let chat = build_gateway_turn_provider(
+            &generation.effective,
+            &providers::provider_runtime_options_from_config(&generation.effective),
+        );
+        let chat = match (chat, previous.as_ref()) {
+            (Ok(chat), _) => Ok(chat),
+            (Err(error), GatewayTurnState::NotReady(_)) => {
+                let reason = TurnNotReadyReason::of_provider_error(&error).ok_or(error)?;
+                tracing::warn!(
+                    reason = reason.code(),
+                    "Gateway turn runtime stays not ready after a configuration change"
+                );
+                Err(reason)
+            }
+            (Err(error), GatewayTurnState::Ready(_)) => return Err(error),
+        };
+        let mut runtime = build_gateway_turn_state(
             generation,
+            chat,
             Arc::clone(&self.config),
             Arc::clone(&self.memory),
             self.signal.clone(),
@@ -1167,15 +1202,42 @@ impl GatewayTurnRuntimeOwner {
             #[cfg(feature = "wasm-plugins")]
             self.plugin_runtime.clone(),
         )?;
-        Arc::get_mut(&mut runtime.publication_slot)
+        let slot = runtime
+            .publication_slot_mut()
+            .ok_or_else(|| anyhow::anyhow!("new gateway turn runtime was unexpectedly shared"))?;
+        Arc::get_mut(slot)
             .ok_or_else(|| anyhow::anyhow!("new gateway decision slot was unexpectedly shared"))?
             .cleanup = Arc::clone(&self.cleanup);
         Ok(runtime)
     }
 
+    /// Retry a runtime standing by against the active generation. Storing a
+    /// provider credential changes no configuration field, so the reload
+    /// that follows publishes no generation and prepares no participant;
+    /// the reload route calls this so that reload still makes the runtime
+    /// ready. A runtime that is ready, or that another reload replaced in
+    /// the meantime, is left as it is.
+    pub(crate) fn retry_standby(&self) -> anyhow::Result<()> {
+        let previous = self.current.load_full();
+        if previous.ready().is_ok() {
+            return Ok(());
+        }
+        let next = self.build(self.config.pin())?;
+        if next.ready().is_err() {
+            return Ok(());
+        }
+        let next = Arc::new(next);
+        let swapped = self.current.compare_and_swap(&previous, Arc::clone(&next));
+        if Arc::ptr_eq(&swapped, &previous) {
+            retire_replaced_mcp_servers(previous.mcp_tool(), next.mcp_tool());
+            tracing::info!("Gateway turn runtime is ready");
+        }
+        Ok(())
+    }
+
     fn synchronize_to_active(&self) -> anyhow::Result<()> {
         let active = self.config.pin();
-        if self.current.load().config_generation.id == active.id {
+        if self.current.load().config_generation().id == active.id {
             return Ok(());
         }
         self.current.store(Arc::new(self.build(active)?));
@@ -1191,7 +1253,7 @@ impl GatewayTurnRuntimeOwner {
 /// definition stops the process that ran the old one (D-098 F-1).
 #[allow(clippy::too_many_arguments)]
 fn start_gateway_turn_runtime(
-    startup: TurnRuntimeGeneration,
+    startup: impl Into<GatewayTurnState>,
     shared: &crate::config::SharedConfig,
     memory: Arc<dyn Memory>,
     signal: Option<Arc<SignalChannel>>,
@@ -1220,9 +1282,9 @@ fn start_gateway_turn_runtime(
 }
 
 struct PreparedGatewayTurnRuntime {
-    current: Arc<ArcSwap<TurnRuntimeGeneration>>,
-    previous: Arc<TurnRuntimeGeneration>,
-    generation: TurnRuntimeGeneration,
+    current: Arc<ArcSwap<GatewayTurnState>>,
+    previous: Arc<GatewayTurnState>,
+    generation: GatewayTurnState,
     agents: agent_lifecycle::AgentReconcile,
 }
 
@@ -1230,17 +1292,8 @@ impl crate::config::PreparedConfigGeneration for PreparedGatewayTurnRuntime {
     fn commit(&mut self) -> anyhow::Result<()> {
         // First, so a failed retire rejects the reload before it is published.
         self.agents.commit()?;
-        self.current.store(Arc::new(TurnRuntimeGeneration {
-            provider_binding: self.generation.provider_binding.clone(),
-            publication_slot: Arc::clone(&self.generation.publication_slot),
-            config_generation: Arc::clone(&self.generation.config_generation),
-            provider: Arc::clone(&self.generation.provider),
-            model: self.generation.model.clone(),
-            temperature: self.generation.temperature,
-            tools_registry: Arc::clone(&self.generation.tools_registry),
-            mcp_tool: self.generation.mcp_tool.clone(),
-        }));
-        retire_replaced_mcp_servers(self.previous.mcp_tool.as_ref(), self.generation.mcp_tool.as_ref());
+        self.current.store(Arc::new(self.generation.clone()));
+        retire_replaced_mcp_servers(self.previous.mcp_tool(), self.generation.mcp_tool());
         Ok(())
     }
 
@@ -1316,7 +1369,7 @@ impl crate::config::ConfigGenerationParticipant for GatewayTurnRuntimeOwner {
         let agents = agent_lifecycle::AgentReconcile::prepare(
             &self.agents,
             &self.memory,
-            &previous.config_generation.effective,
+            &previous.config_generation().effective,
             &generation.effective,
         );
         let runtime = self.build(generation)?;
@@ -1330,9 +1383,12 @@ impl crate::config::ConfigGenerationParticipant for GatewayTurnRuntimeOwner {
 }
 
 impl AppState {
-    fn pin_turn_runtime(&self) -> Arc<TurnRuntimeGeneration> {
+    /// The current turn runtime, ready or standing by. Routes that read the
+    /// tool surface or the configuration take this; routes that start or
+    /// continue a turn take [`admit_turn_runtime`](Self::admit_turn_runtime).
+    fn pin_turn_state(&self) -> Arc<GatewayTurnState> {
         if let Some(runtime) = &self.turn_runtime {
-            return runtime.pin();
+            return runtime.pin_state();
         }
         #[cfg(not(test))]
         {
@@ -1340,6 +1396,28 @@ impl AppState {
             std::process::abort();
         }
         #[cfg(test)]
+        {
+            Arc::new(GatewayTurnState::Ready(self.test_turn_runtime()))
+        }
+    }
+
+    /// The admission check of every turn entry point: the ready generation
+    /// the turn runs on, or the typed refusal it answers with.
+    fn admit_turn_runtime(&self) -> Result<Arc<TurnRuntimeGeneration>, TurnNotReady> {
+        self.pin_turn_state().ready()
+    }
+
+    /// Test fixtures' ready generation.
+    #[cfg(test)]
+    fn pin_turn_runtime(&self) -> Arc<TurnRuntimeGeneration> {
+        match &self.turn_runtime {
+            Some(runtime) => runtime.pin(),
+            None => self.test_turn_runtime(),
+        }
+    }
+
+    #[cfg(test)]
+    fn test_turn_runtime(&self) -> Arc<TurnRuntimeGeneration> {
         {
             let mut generation = TurnRuntimeGeneration {
                 provider_binding: None,
@@ -1515,6 +1593,9 @@ fn register_gateway_turn_tools(
     Ok((channels_registry, spawn_tools_handle))
 }
 
+/// A ready runtime of `generation`, or the error its default provider failed
+/// with (test fixtures; production builds through [`build_gateway_turn_state`]).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn build_gateway_turn_runtime(
     generation: Arc<crate::config::ConfigGeneration>,
@@ -1528,11 +1609,42 @@ fn build_gateway_turn_runtime(
     #[cfg(feature = "wasm-plugins")] plugin_runtime: Option<Arc<crate::plugins::PluginRuntime>>,
 ) -> anyhow::Result<TurnRuntimeGeneration> {
     let config = generation.effective.as_ref();
-    // The default is resolved before anything is built: a generation whose
-    // default model cannot chat is rejected here, so the participant refuses
-    // it and the previous generation stays active.
+    let chat = build_gateway_turn_provider(config, &providers::provider_runtime_options_from_config(config))?;
+    let state = build_gateway_turn_state(
+        generation,
+        Ok(chat),
+        shared_config,
+        memory,
+        signal,
+        whatsapp,
+        linq,
+        nextcloud_talk,
+        hooks,
+        #[cfg(feature = "wasm-plugins")]
+        plugin_runtime,
+    )?;
+    Arc::try_unwrap(state.ready()?).map_err(|_| anyhow::anyhow!("new gateway turn runtime was unexpectedly shared"))
+}
+
+/// The runtime of `generation` around its already resolved default chat
+/// connection, or a standby with the same tool surface when `chat` names
+/// why there is none. The caller resolves the default before anything is
+/// built, so a generation whose default model cannot chat is rejected first.
+#[allow(clippy::too_many_arguments)]
+fn build_gateway_turn_state(
+    generation: Arc<crate::config::ConfigGeneration>,
+    chat: Result<GatewayTurnChat, TurnNotReadyReason>,
+    shared_config: crate::config::SharedConfig,
+    memory: Arc<dyn Memory>,
+    signal: Option<Arc<SignalChannel>>,
+    whatsapp: Option<Arc<WhatsAppChannel>>,
+    linq: Option<Arc<LinqChannel>>,
+    nextcloud_talk: Option<Arc<NextcloudTalkChannel>>,
+    hooks: Arc<HookManager>,
+    #[cfg(feature = "wasm-plugins")] plugin_runtime: Option<Arc<crate::plugins::PluginRuntime>>,
+) -> anyhow::Result<GatewayTurnState> {
+    let config = generation.effective.as_ref();
     let provider_runtime_options = providers::provider_runtime_options_from_config(config);
-    let (provider, model, provider_binding) = build_gateway_turn_provider(config, &provider_runtime_options)?;
     let security = crate::runtime::bootstrap::build_security_policy(config);
     let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::from(runtime::create_runtime(&config.runtime)?);
     let (composio_key, composio_entity_id) = if config.composio.configured() {
@@ -1578,7 +1690,7 @@ fn build_gateway_turn_runtime(
         &shared_config,
         &security,
         &hooks,
-        &model,
+        chat.as_ref().map_or("", |(_, model, _)| model.as_str()),
         &memory,
         &provider_runtime_options,
         signal.as_ref(),
@@ -1589,29 +1701,57 @@ fn build_gateway_turn_runtime(
     let tools_registry = Arc::new(tools_list);
     let _ = spawn_tools_handle.set(&tools_registry);
 
-    let temperature = config.default_temperature;
-    Ok(TurnRuntimeGeneration {
-        provider_binding,
-        publication_slot: Arc::new(turn_source::publication_slot::GatewayPublicationSlot::new(
-            Arc::clone(&security),
+    let publication_slot = Arc::new(turn_source::publication_slot::GatewayPublicationSlot::new(
+        Arc::clone(&security),
+        {
+            #[cfg(feature = "wasm-plugins")]
             {
-                #[cfg(feature = "wasm-plugins")]
-                {
-                    plugin_runtime.as_ref().map_or(0, |runtime| runtime.generation_id())
-                }
-                #[cfg(not(feature = "wasm-plugins"))]
-                {
-                    0
-                }
-            },
-        )),
-        config_generation: generation,
-        provider,
-        model,
-        temperature,
-        tools_registry,
-        mcp_tool,
-    })
+                plugin_runtime.as_ref().map_or(0, |runtime| runtime.generation_id())
+            }
+            #[cfg(not(feature = "wasm-plugins"))]
+            {
+                0
+            }
+        },
+    ));
+    Ok(turn_state_of(chat, publication_slot, generation, tools_registry, mcp_tool))
+}
+
+/// The default chat connection of a ready generation: provider, model and
+/// the binding that proves they are the resolved selection.
+type GatewayTurnChat = (
+    Arc<dyn Provider>,
+    String,
+    Option<Arc<turn_source::GatewayProviderBinding>>,
+);
+
+/// Assemble a ready generation, or a standby with the same surface.
+fn turn_state_of(
+    chat: Result<GatewayTurnChat, TurnNotReadyReason>,
+    publication_slot: Arc<turn_source::publication_slot::GatewayPublicationSlot>,
+    config_generation: Arc<crate::config::ConfigGeneration>,
+    tools_registry: Arc<Vec<Box<dyn Tool>>>,
+    mcp_tool: Option<Arc<McpTool>>,
+) -> GatewayTurnState {
+    match chat {
+        Ok((provider, model, provider_binding)) => GatewayTurnState::from(TurnRuntimeGeneration {
+            provider_binding,
+            temperature: config_generation.effective.default_temperature,
+            publication_slot,
+            config_generation,
+            provider,
+            model,
+            tools_registry,
+            mcp_tool,
+        }),
+        Err(reason) => GatewayTurnState::NotReady(TurnRuntimeStandby {
+            reason,
+            publication_slot,
+            config_generation,
+            tools_registry,
+            mcp_tool,
+        }),
+    }
 }
 
 /// Build the pinned generation's default chat connection. The selected
@@ -1632,11 +1772,7 @@ pub(crate) fn build_gateway_provider_selection(
 fn build_gateway_turn_provider(
     config: &Config,
     options: &providers::ProviderRuntimeOptions,
-) -> anyhow::Result<(
-    Arc<dyn Provider>,
-    String,
-    Option<Arc<turn_source::GatewayProviderBinding>>,
-)> {
+) -> anyhow::Result<GatewayTurnChat> {
     let (provider, resolved) = build_gateway_provider_selection(config, options)?;
     let model = resolved.model().to_owned();
     let binding = Arc::new(turn_source::GatewayProviderBinding::new(
@@ -1722,7 +1858,24 @@ async fn run_gateway_inner(
         None
     };
     let provider_runtime_options = providers::provider_runtime_options_from_config(&config);
-    let (provider, model, provider_binding) = build_gateway_turn_provider(&config, &provider_runtime_options)?;
+    // A default provider without a usable credential leaves the turn runtime
+    // standing by instead of failing the start: every management route
+    // serves, and a reload after the credential is stored makes it ready.
+    let chat = match build_gateway_turn_provider(&config, &provider_runtime_options) {
+        Ok(chat) => Ok(chat),
+        Err(error) => {
+            let reason = TurnNotReadyReason::of_provider_error(&error).ok_or(error)?;
+            tracing::warn!(
+                reason = reason.code(),
+                "Gateway turn runtime is not ready; management routes serve and turns are refused"
+            );
+            Err(reason)
+        }
+    };
+    let model = chat.as_ref().map_or_else(
+        |_| config.default_model.clone().unwrap_or_default(),
+        |(_, model, _)| model.clone(),
+    );
     let temperature = config.default_temperature;
     let shared_config_for_reload = shared_config.unwrap_or_else(|| crate::config::new_shared(config.clone()));
     if controlled.is_some() {
@@ -2033,9 +2186,9 @@ async fn run_gateway_inner(
     // else keeps them, so the first configuration change releases them and
     // their stdio MCP children (D-098 F-1).
     let turn_runtime_owner = start_gateway_turn_runtime(
-        TurnRuntimeGeneration {
-            provider_binding,
-            publication_slot: Arc::new(
+        turn_state_of(
+            chat,
+            Arc::new(
                 turn_source::publication_slot::GatewayPublicationSlot::new(Arc::clone(&security), {
                     #[cfg(feature = "wasm-plugins")]
                     {
@@ -2050,13 +2203,10 @@ async fn run_gateway_inner(
                 })
                 .with_controlled(controlled.clone()),
             ),
-            config_generation: shared_config_for_reload.pin(),
-            provider: Arc::clone(&provider),
-            model: model.clone(),
-            temperature,
+            shared_config_for_reload.pin(),
             tools_registry,
             mcp_tool,
-        },
+        ),
         &shared_config_for_reload,
         Arc::clone(&mem),
         signal_channel.clone(),
@@ -2075,7 +2225,6 @@ async fn run_gateway_inner(
 
     let state = AppState {
         config: Arc::clone(&shared_config_for_reload),
-        provider,
         model,
         temperature,
         mem,
@@ -2509,7 +2658,9 @@ async fn run_gateway_chat_with_multimodal(
     fabric_ctx: &GatewayFabricContext,
     autosave_key: Option<&str>,
 ) -> anyhow::Result<GatewayTurnResult> {
-    let turn_runtime = state.pin_turn_runtime();
+    // The webhook routes admitted this turn; a typed refusal here only
+    // covers a job that outlived its admission check.
+    let turn_runtime = state.admit_turn_runtime()?;
     turn_runtime
         .provider_binding
         .as_ref()
@@ -3191,6 +3342,10 @@ async fn handle_webhook(
         });
         return (StatusCode::TOO_MANY_REQUESTS, Json(err));
     }
+    // Admission, before any idempotency claim is taken.
+    if let Err(refusal) = state.admit_turn_runtime() {
+        return turn_not_ready_plain(refusal);
+    }
 
     // ── Parse body ──
     let webhook_body: WebhookBody = match serde_json::from_slice(&body) {
@@ -3573,6 +3728,15 @@ fn channel_webhook_job_label(channel_key: &str, first: Option<&crate::channels::
 /// outbound API exactly as before. The delivery is claimed before submission, so
 /// a retry that races the accepted run is answered as a duplicate instead of
 /// starting a second copy of it.
+/// The `503` a non-`/api` turn route answers while the turn runtime is not
+/// ready, in those routes' own `{"error"}` shape.
+fn turn_not_ready_plain(refusal: TurnNotReady) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({ "error": refusal.to_string() })),
+    )
+}
+
 fn accept_channel_webhook_delivery(
     state: &AppState,
     channel: Arc<dyn Channel>,
@@ -3581,6 +3745,11 @@ fn accept_channel_webhook_delivery(
     messages: Vec<crate::channels::traits::ChannelMessage>,
     memory_key: fn(&crate::channels::traits::ChannelMessage) -> String,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // Admission, before the delivery is claimed: a refused delivery is
+    // redelivered by the platform once the runtime is ready.
+    if let Err(refusal) = state.admit_turn_runtime() {
+        return turn_not_ready_plain(refusal);
+    }
     let dedup_ttl = Duration::from_secs(state.config.load_full().gateway.channel_webhook_dedup_ttl_secs.max(1));
     let claim = match webhook_dedup::claim(webhook_dedup::delivery_key(channel_key, body), dedup_ttl) {
         webhook_dedup::DeliveryOutcome::Fresh(claim) => claim,

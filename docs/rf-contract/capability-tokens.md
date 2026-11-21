@@ -27,6 +27,16 @@ These codes can answer any `/api` route, in the coded shape:
   Both give the limiter window (60 s) as an upper bound: retry after at most
   this long. Exception: `GET /api/skills/discover` reports an upstream limit
   in its own shape `{"code":"rate_limited","error":"<text>"}`.
+- `503 provider_not_ready` `{"error":{"code","message","reason"}}`: the
+  default provider has no usable credential, so the daemon runs without a
+  turn runtime. `reason` is `missing_provider_credential` (the only value so
+  far). Only the routes that start or continue a turn answer it (the session
+  message route, including targeted turns, the approval inbox and the
+  approval actions); every other route, including capabilities, the catalog,
+  the agent routes, the credential routes and `POST /api/config/reload`,
+  answers normally. The catalog's `credentials_ready` shows when the
+  credential is usable. Storing a credential rebuilds nothing by itself: after
+  `POST /api/config/reload` (or a daemon restart) the turn routes serve.
 
 ## Routes: capabilities and catalog
 

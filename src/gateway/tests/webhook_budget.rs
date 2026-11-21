@@ -214,7 +214,7 @@ async fn a_webhook_turn_stays_on_one_runtime_generation_across_reload() {
             panic!("the webhook did not reach its provider within 15 seconds");
         }
     }
-    let previous = owner.current.load_full();
+    let previous = owner.pin();
     let replacement_provider_impl = Arc::new(MockProvider::default());
     let replacement_provider: Arc<dyn Provider> = replacement_provider_impl.clone();
     let config = previous.config_generation.effective.as_ref();
@@ -248,8 +248,8 @@ async fn a_webhook_turn_stays_on_one_runtime_generation_across_reload() {
     let mut prepared = PreparedGatewayTurnRuntime {
         agents: super::idle_agents(),
         current: Arc::clone(&owner.current),
-        previous: Arc::clone(&previous),
-        generation: TurnRuntimeGeneration {
+        previous: owner.pin_state(),
+        generation: crate::gateway::GatewayTurnState::from(TurnRuntimeGeneration {
             provider_binding: Some(Arc::new(turn_source::GatewayProviderBinding::new(
                 Arc::clone(&replacement_provider),
                 resolved,
@@ -261,7 +261,7 @@ async fn a_webhook_turn_stays_on_one_runtime_generation_across_reload() {
             temperature: 0.9,
             tools_registry: Arc::new(Vec::new()),
             mcp_tool: None,
-        },
+        }),
     };
     crate::config::PreparedConfigGeneration::commit(&mut prepared).expect("test: commit replacement runtime");
     assert_eq!(owner.pin().config_generation.id, next_generation.id);

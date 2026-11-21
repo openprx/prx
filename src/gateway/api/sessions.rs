@@ -1259,8 +1259,12 @@ pub async fn get_session_messages(
 
     let limit = normalize_limit(query.limit);
     let offset = normalize_offset(query.offset);
-    let runtime = state.pin_turn_runtime();
-    if let Err(error) = recover_console_history(&state, &runtime, &api_principal, &session_id).await {
+    // Recovery settles turns a ready runtime ran; a runtime standing by for a
+    // provider credential has run none since it started, and the stored
+    // history is still served.
+    if let Ok(runtime) = state.admit_turn_runtime()
+        && let Err(error) = recover_console_history(&state, &runtime, &api_principal, &session_id).await
+    {
         return history_recovery_failed(&error);
     }
     let principal = operator_history_principal(
@@ -1351,7 +1355,10 @@ pub(super) async fn get_session_approvals(
     Query(query): Query<ApprovalInboxQuery>,
     axum::Extension(principal): axum::Extension<super::ApiPrincipal>,
 ) -> Response {
-    let runtime = state.pin_turn_runtime();
+    let runtime = match state.admit_turn_runtime() {
+        Ok(runtime) => runtime,
+        Err(refusal) => return super::provider_not_ready(refusal),
+    };
     if let Some(response) = approvals_unavailable(&runtime.config_generation.effective, state.mem.as_ref()) {
         return response;
     }
@@ -1487,7 +1494,10 @@ pub async fn post_session_message(
     let Some(api_principal) = request.extensions().get::<super::ApiPrincipal>().cloned() else {
         return json_error(StatusCode::UNAUTHORIZED, "Authenticated API principal missing");
     };
-    let turn_runtime = state.pin_turn_runtime();
+    let turn_runtime = match state.admit_turn_runtime() {
+        Ok(runtime) => runtime,
+        Err(refusal) => return super::provider_not_ready(refusal),
+    };
     let headers = request.headers().clone();
     let owner_authenticated = super::owner_authenticated(&state, &headers);
     let async_mode = jobs::wants_async(request.uri().query(), &headers);
@@ -4058,7 +4068,10 @@ async fn call_approval_action(
         Ok(value) => value,
         Err(_) => return json_error(StatusCode::BAD_REQUEST, "Invalid call id"),
     };
-    let runtime = state.pin_turn_runtime();
+    let runtime = match state.admit_turn_runtime() {
+        Ok(runtime) => runtime,
+        Err(refusal) => return super::provider_not_ready(refusal),
+    };
     if let Some(response) = approvals_unavailable(&runtime.config_generation.effective, state.mem.as_ref()) {
         return response;
     }

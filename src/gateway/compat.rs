@@ -392,20 +392,22 @@ pub async fn mcp_tools_call(
     // a hot reload replaces — the same pin webhook turns take. The boot-time
     // `AppState::tools_registry` is never reassigned, so reading it would keep
     // serving a tool a reload removed or reconfigured and miss one it added.
-    let turn_runtime = state.pin_turn_runtime();
+    // A tool call needs no chat connection, so a runtime standing by for a
+    // provider credential serves it from the same published registry.
+    let turn_runtime = state.pin_turn_state();
     // Admission check only: the tool is resolved again inside the job, which is
     // where it actually runs, against this same pinned registry.
     if !turn_runtime
-        .tools_registry
+        .tools_registry()
         .iter()
         .any(|tool| tool.supports_name(&request.name))
     {
         return Err(json_error(StatusCode::NOT_FOUND, "exposed tool is not available"));
     }
     let execution_context = bind_mcp_execution_context(
-        Arc::clone(&turn_runtime.tools_registry),
-        turn_runtime.mcp_tool.as_ref(),
-        turn_runtime.config_generation.id.0.to_string(),
+        Arc::clone(turn_runtime.tools_registry()),
+        turn_runtime.mcp_tool(),
+        turn_runtime.config_generation().id.0.to_string(),
         &config,
         &request.name,
         &identity,
@@ -427,7 +429,7 @@ pub async fn mcp_tools_call(
         jobs::KIND_MCP_TOOL_CALL,
         format!("gateway:mcp_tool_call:{tool_name}"),
         run_mcp_tool_call_job(
-            Arc::clone(&turn_runtime.tools_registry),
+            Arc::clone(turn_runtime.tools_registry()),
             config,
             request.name,
             request.arguments,

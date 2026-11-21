@@ -56,15 +56,33 @@ impl GatewayPublicationSlot {
         runtime: &crate::gateway::TurnRuntimeGeneration,
         state: &crate::gateway::AppState,
     ) -> anyhow::Result<&Arc<TurnRuntimeService>> {
+        self.publish_parts(
+            &runtime.config_generation,
+            &runtime.tools_registry,
+            runtime.mcp_tool.as_ref(),
+            state,
+        )
+        .await
+    }
+
+    /// [`publish`](Self::publish) from the parts a generation without a chat
+    /// connection also holds.
+    pub(in crate::gateway) async fn publish_parts(
+        &self,
+        generation: &Arc<crate::config::ConfigGeneration>,
+        registry: &Arc<Vec<Box<dyn crate::tools::Tool>>>,
+        mcp_tool: Option<&Arc<crate::tools::McpTool>>,
+        state: &crate::gateway::AppState,
+    ) -> anyhow::Result<&Arc<TurnRuntimeService>> {
         if let Some(profile) = &self.controlled {
-            profile.verify(&runtime.config_generation.effective)?;
+            profile.verify(&generation.effective)?;
         }
         self.service
             .get_or_try_init(|| async {
                 let service = crate::runtime::turn_publication::TurnPublication {
-                    generation: Arc::clone(&runtime.config_generation),
-                    registry: Arc::clone(&runtime.tools_registry),
-                    mcp_tool: runtime.mcp_tool.clone(),
+                    generation: Arc::clone(generation),
+                    registry: Arc::clone(registry),
+                    mcp_tool: mcp_tool.cloned(),
                     security: Arc::clone(&self.security),
                     observer: Arc::clone(&state.observer),
                     hooks: Arc::clone(&state.hooks),

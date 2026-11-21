@@ -284,9 +284,9 @@ pub(super) async fn get_catalog(State(state): State<AppState>) -> Response {
 }
 
 async fn assemble_catalog(state: &AppState) -> Result<CatalogBody, CatalogError> {
-    let runtime = state.pin_turn_runtime();
+    let runtime = state.pin_turn_state();
     let tools = published_tools(state, &runtime).await?;
-    let config = std::sync::Arc::clone(&runtime.config_generation.effective);
+    let config = std::sync::Arc::clone(&runtime.config_generation().effective);
     let autonomy = config.autonomy.level;
     let models = crate::runtime::blocking::spawn_blocking(move || catalog_models(&config))
         .await
@@ -311,7 +311,7 @@ async fn assemble_catalog(state: &AppState) -> Result<CatalogBody, CatalogError>
 /// The names of the catalog's `tools`, sorted; `None` when the surface
 /// could not be published.
 pub(super) async fn catalog_tool_names(state: &AppState) -> Option<Vec<String>> {
-    let runtime = state.pin_turn_runtime();
+    let runtime = state.pin_turn_state();
     let tools = published_tools(state, &runtime).await.ok()?;
     Some(tools.into_iter().map(|tool| tool.name).collect())
 }
@@ -320,17 +320,15 @@ pub(super) async fn catalog_tool_names(state: &AppState) -> Option<Vec<String>> 
 /// sorted by name.
 async fn published_tools(
     state: &AppState,
-    runtime: &std::sync::Arc<crate::gateway::TurnRuntimeGeneration>,
+    runtime: &crate::gateway::GatewayTurnState,
 ) -> Result<Vec<CatalogTool>, CatalogError> {
     let cancellation = tokio_util::sync::CancellationToken::new();
     let cleanup =
-        crate::runtime::turn_cleanup::CleanupScope::new(Some(&runtime.publication_slot.cleanup), cancellation)
+        crate::runtime::turn_cleanup::CleanupScope::new(Some(&runtime.publication_slot().cleanup), cancellation)
             .map_err(|_| CatalogError::Draining)?;
     let service = cleanup
         .run(Box::pin(async {
-            Ok::<_, anyhow::Error>(std::sync::Arc::clone(
-                runtime.publication_slot.publish(runtime, state).await?,
-            ))
+            Ok::<_, anyhow::Error>(std::sync::Arc::clone(runtime.publish(state).await?))
         }))
         .await
         .map_err(|_| CatalogError::Surface)?;

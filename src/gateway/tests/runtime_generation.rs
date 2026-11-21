@@ -481,12 +481,12 @@ async fn a_generation_that_drops_an_mcp_server_stops_its_child() {
         tools_registry: Arc::new(vec![]),
         mcp_tool: Some(tool),
     };
-    let previous = Arc::new(generation(Arc::clone(&old_tool)));
+    let previous = Arc::new(crate::gateway::GatewayTurnState::from(generation(Arc::clone(&old_tool))));
     let mut prepared = PreparedGatewayTurnRuntime {
         agents: idle_agents(),
         current: Arc::new(ArcSwap::from(Arc::clone(&previous))),
         previous,
-        generation: generation(tool_for(&[])),
+        generation: generation(tool_for(&[])).into(),
     };
     crate::config::PreparedConfigGeneration::commit(&mut prepared).expect("test: commit");
 
@@ -583,7 +583,7 @@ fn gateway_core_authz_reads_hot_shared_config_after_reload() {
 fn turn_runtime_swap_keeps_in_flight_generation_pinned_and_is_reversible() {
     let manager = crate::config::new_shared(Config::default());
     let generation_zero = manager.pin();
-    let current = Arc::new(ArcSwap::from_pointee(TurnRuntimeGeneration {
+    let current = Arc::new(ArcSwap::from_pointee(crate::gateway::GatewayTurnState::from(TurnRuntimeGeneration {
         provider_binding: None,
         publication_slot: Arc::new(turn_source::publication_slot::GatewayPublicationSlot::default()),
         config_generation: Arc::clone(&generation_zero),
@@ -592,8 +592,8 @@ fn turn_runtime_swap_keeps_in_flight_generation_pinned_and_is_reversible() {
         temperature: 0.7,
         tools_registry: Arc::new(Vec::new()),
         mcp_tool: None,
-    }));
-    let in_flight = current.load_full();
+    })));
+    let in_flight = current.load().ready().unwrap();
     let generation_one = Arc::new(crate::config::ConfigGeneration {
         id: crate::config::ConfigGenerationId(1),
         source_revision: generation_zero.source_revision.clone(),
@@ -606,7 +606,7 @@ fn turn_runtime_swap_keeps_in_flight_generation_pinned_and_is_reversible() {
         agents: idle_agents(),
         current: Arc::clone(&current),
         previous: current.load_full(),
-        generation: TurnRuntimeGeneration {
+        generation: crate::gateway::GatewayTurnState::from(TurnRuntimeGeneration {
             provider_binding: None,
             publication_slot: Arc::new(turn_source::publication_slot::GatewayPublicationSlot::default()),
             config_generation: generation_one,
@@ -615,18 +615,18 @@ fn turn_runtime_swap_keeps_in_flight_generation_pinned_and_is_reversible() {
             temperature: 0.2,
             tools_registry: Arc::new(Vec::new()),
             mcp_tool: None,
-        },
+        }),
     };
 
     crate::config::PreparedConfigGeneration::commit(&mut prepared).unwrap();
-    assert_eq!(current.load().config_generation.id.0, 1);
-    assert_eq!(current.load().model, "model-one");
+    assert_eq!(current.load().config_generation().id.0, 1);
+    assert_eq!(current.load().ready().unwrap().model, "model-one");
     assert_eq!(in_flight.config_generation.id.0, 0);
     assert_eq!(in_flight.model, "model-zero");
 
     crate::config::PreparedConfigGeneration::rollback(&mut prepared);
-    assert_eq!(current.load().config_generation.id.0, 0);
-    assert_eq!(current.load().model, "model-zero");
+    assert_eq!(current.load().config_generation().id.0, 0);
+    assert_eq!(current.load().ready().unwrap().model, "model-zero");
 }
 
 #[tokio::test]

@@ -29,15 +29,13 @@ pub async fn get_mcp_servers(State(state): State<AppState>) -> Json<McpServersRe
     let mcp = &config.mcp;
 
     // Collect runtime-discovered tools if available.
-    let runtime = state.pin_turn_runtime();
+    let runtime = state.pin_turn_state();
     let discovered = runtime
-        .mcp_tool
-        .as_ref()
+        .mcp_tool()
         .map(|t| t.list_discovered_tools())
         .unwrap_or_default();
     let runtime_info = runtime
-        .mcp_tool
-        .as_ref()
+        .mcp_tool()
         .map(|tool| {
             tool.server_runtime_info()
                 .into_iter()
@@ -90,8 +88,7 @@ pub async fn get_mcp_servers(State(state): State<AppState>) -> Json<McpServersRe
     servers.sort_by(|a, b| a.name.cmp(&b.name));
 
     let config_error = runtime
-        .mcp_tool
-        .as_ref()
+        .mcp_tool()
         .and_then(|tool| tool.config_error())
         .map(|error| crate::security::redaction::redact_url_components(&error).into_owned());
     Json(McpServersResponse { servers, config_error })

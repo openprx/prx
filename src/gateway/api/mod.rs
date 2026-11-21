@@ -511,6 +511,17 @@ fn rate_limited_response() -> Response {
     response
 }
 
+/// The coded `503 provider_not_ready` an `/api` turn route answers while the
+/// turn runtime is not ready.
+pub(super) fn provider_not_ready(refusal: super::TurnNotReady) -> Response {
+    capabilities::coded_error_with(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "provider_not_ready",
+        "The default provider is not ready; store its credential and reload the configuration.",
+        Some(("reason", refusal.0.code())),
+    )
+}
+
 pub(super) fn configured_channel_names(config: &Config) -> Vec<String> {
     let mut channels = Vec::new();
     if config.channels_config.cli {
