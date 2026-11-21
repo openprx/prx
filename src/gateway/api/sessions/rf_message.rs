@@ -203,8 +203,8 @@ pub(super) async fn post_keyed_session(
 
 /// Admit a request on the caller-keyed session `session_id` only for its
 /// owner: another owner, or no such row, is `404 session_unknown`. A row of
-/// another channel is no caller-keyed session: refused for an rf-shaped
-/// request, left to the Console path otherwise.
+/// another channel is no caller-keyed session: refused for an rf message,
+/// left to the history listing otherwise.
 pub(super) async fn require_session_owner(
     state: &AppState,
     session_id: &str,
@@ -425,7 +425,13 @@ pub(super) fn turn_accepted(run_id: &str, job_id: &str) -> Response {
 }
 
 /// `POST /api/sessions/{id}/message` with an rf body.
-pub(super) async fn post_rf_message(state: AppState, session_id: String, parts: Parts, body: Bytes) -> Response {
+pub(super) async fn post_rf_message(
+    state: AppState,
+    session_id: String,
+    parts: Parts,
+    body: Bytes,
+    admitted: Result<std::sync::Arc<crate::gateway::TurnRuntimeGeneration>, crate::gateway::TurnNotReady>,
+) -> Response {
     let Some(principal) = parts.extensions.get::<ApiPrincipal>().cloned() else {
         return coded_error(
             StatusCode::UNAUTHORIZED,
@@ -441,7 +447,7 @@ pub(super) async fn post_rf_message(state: AppState, session_id: String, parts: 
         Ok(message) => message,
         Err(rule) => return field_invalid(rule),
     };
-    let turn_runtime = match state.admit_turn_runtime() {
+    let turn_runtime = match admitted {
         Ok(runtime) => runtime,
         Err(refusal) => return super::super::provider_not_ready(refusal),
     };

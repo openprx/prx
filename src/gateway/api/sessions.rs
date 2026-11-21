@@ -1508,18 +1508,21 @@ pub async fn post_session_message(
     Path(session_id): Path<String>,
     request: Request,
 ) -> impl IntoResponse {
+    let principal = request.extensions().get::<super::ApiPrincipal>().cloned();
+    // The runtime is pinned before the body is read, as before.
+    let admitted = state.admit_turn_runtime();
     // A body with `client_message_id` is an rf message (AC-1b1); any other
     // request takes the Console path below, unchanged.
     let (request, unreadable) = match rf_message::classify(&state, request).await {
         rf_message::MessageShape::Rf(parts, body) => {
-            return rf_message::post_rf_message(state, session_id, parts, body).await;
+            return rf_message::post_rf_message(state, session_id, parts, body, admitted).await;
         }
         rf_message::MessageShape::Console { request, unreadable } => (request, unreadable),
     };
-    let Some(api_principal) = request.extensions().get::<super::ApiPrincipal>().cloned() else {
+    let Some(api_principal) = principal else {
         return json_error(StatusCode::UNAUTHORIZED, "Authenticated API principal missing");
     };
-    let turn_runtime = match state.admit_turn_runtime() {
+    let turn_runtime = match admitted {
         Ok(runtime) => runtime,
         Err(refusal) => return super::provider_not_ready(refusal),
     };
@@ -1891,13 +1894,6 @@ async fn submit_console_message(
         )
             .into_response();
     };
-    if rf_slot.is_none()
-        && rf_message::is_caller_session_key(&session_id)
-        && let Err(response) =
-            rf_message::require_session_owner(&state, &session_id, &api_principal.owner_id, false).await
-    {
-        return *response;
-    }
     // Q10: the only place a Console turn's isolation is decided. A paired
     // bearer is the install owner and gets the terminal's tool rules at the
     // turn's own level; any other caller (pairing off) stays owner-isolated.
