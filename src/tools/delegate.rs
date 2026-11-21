@@ -1479,7 +1479,11 @@ impl DelegateLoopResources {
                     memory: crate::agent::turn_request::ToolLoopMemory::new(
                         &child_memory,
                         &security.workspace_dir,
-                        Some(DocumentIngestRuntime::from_scope(child_memory.clone(), &scope_ctx).into_nested_turn()),
+                        Some(
+                            DocumentIngestRuntime::from_scope(child_memory.clone(), &scope_ctx)
+                                .with_child_partition(envelope.agent_partition.as_ref())
+                                .into_nested_turn(),
+                        ),
                     )
                     .with_event_fabric(child_event_fabric),
                 },

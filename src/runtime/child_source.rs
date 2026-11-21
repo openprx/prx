@@ -17,6 +17,55 @@ use crate::memory::{MemoryFabric, MemoryVisibility, MessageEvent, MessageEventSc
 use anyhow::Context;
 use std::sync::Arc;
 
+/// The partition a child run writes under: the root turn's named agent
+/// (MA-01b5). Main and unpartitioned roots give `None`, so their children
+/// keep writing exactly as before.
+pub(crate) fn inherited_partition(
+    partition: Option<&crate::memory::AgentPartition>,
+) -> Option<crate::memory::AgentPartition> {
+    partition
+        .filter(|partition| matches!(partition.key, crate::memory::PartitionKey::Named { .. }))
+        .cloned()
+}
+
+/// A child whose root agent partition cannot be determined: the caller's
+/// envelope and its sealed parent source disagree. The spawn is refused; a
+/// child of a named agent never writes unstamped rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChildPartitionUnresolved;
+
+impl ChildPartitionUnresolved {
+    pub(crate) const fn code(self) -> &'static str {
+        "child_partition_unresolved"
+    }
+}
+
+impl std::fmt::Display for ChildPartitionUnresolved {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}: the agent partition of this child's root turn cannot be determined",
+            self.code()
+        )
+    }
+}
+
+impl std::error::Error for ChildPartitionUnresolved {}
+
+/// The root partition of a child issued by `caller`. The envelope's partition
+/// must agree with the partition sealed in the caller's parent publication.
+fn caller_root_partition(
+    caller: &crate::tools::ToolExecutionContext,
+) -> Result<Option<crate::memory::AgentPartition>, ChildPartitionUnresolved> {
+    let carried = inherited_partition(caller.envelope.agent_partition.as_ref());
+    match &caller.ordinary_child_publication {
+        Some(publication) if inherited_partition(publication.memory_scope().agent_partition.as_ref()) != carried => {
+            Err(ChildPartitionUnresolved)
+        }
+        _ => Ok(carried),
+    }
+}
+
 pub(crate) struct ChildInputReceipt {
     previous_segment_input: Option<String>,
     segment_issued: bool,
@@ -218,6 +267,8 @@ impl ChildInputReceipt {
         envelope.authority_guard = self.authority_guard.clone();
         envelope.config_generation_id = Some(proof.config_generation_id());
         envelope.config_source_revision = Some(proof.config_source_revision().to_owned());
+        // MA-01b5: every row the child writes carries its root agent's partition.
+        envelope.agent_partition = inherited_partition(proof.memory_scope().agent_partition.as_ref());
         crate::tools::ToolExecutionContext::new(envelope, proof.policy_chat_type())
             .with_dispatch_origin(crate::tools::DispatchOrigin::ModelTurn)
             .with_incoming_child(proof)
@@ -601,6 +652,7 @@ impl ChildProviderBinding {
             scope.lease_epoch = envelope.lease_epoch;
             scope.authority_guard = envelope.authority_guard.clone();
             scope.persona_id = envelope.persona_id.clone();
+            scope.agent_partition = caller_root_partition(caller.context())?;
         }
         scope.config_generation_id = Some(self.generation.id.0);
         scope.config_source_revision = Some(self.generation.source_revision.fingerprint_sha256.clone());
@@ -732,6 +784,7 @@ impl ChildProviderBinding {
         envelope.authority_guard = bound.authority_guard;
         envelope.config_generation_id = Some(proof.config_generation_id());
         envelope.config_source_revision = Some(proof.config_source_revision().to_owned());
+        envelope.agent_partition = inherited_partition(proof.memory_scope().agent_partition.as_ref());
         let execution = crate::tools::ToolExecutionContext::new(envelope, proof.policy_chat_type())
             .with_dispatch_origin(crate::tools::DispatchOrigin::ModelTurn)
             .with_incoming_child(proof.as_ref())?;

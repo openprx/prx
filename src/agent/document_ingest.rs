@@ -142,6 +142,14 @@ impl DocumentIngestRuntime {
         }
     }
 
+    /// Stamp a child loop's ingested documents with its root agent's
+    /// partition (MA-01b5); `None` and Main keep today's unstamped rows.
+    #[must_use]
+    pub(crate) fn with_child_partition(mut self, partition: Option<&crate::memory::AgentPartition>) -> Self {
+        self.agent_partition = crate::runtime::child_source::inherited_partition(partition);
+        self
+    }
+
     /// Re-key this runtime as a nested turn of the one that built its scope.
     ///
     /// A `delegate` or `sessions_spawn` sub-loop inherits the parent's

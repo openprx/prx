@@ -822,7 +822,7 @@ impl SessionsSpawnTool {
 
             {
                 let mut runs = self.active_runs.write().await;
-                runs.push(new_process_mode_run(ProcessModeRunSeed {
+                let mut run = new_process_mode_run(ProcessModeRunSeed {
                     id: run_id.clone(),
                     task: task.to_string(),
                     lineage: &run_lineage,
@@ -838,7 +838,9 @@ impl SessionsSpawnTool {
                     delegation: None,
                     progress: Arc::clone(&process_progress),
                     batch_id: batch_id.map(str::to_string),
-                }));
+                });
+                run.agent_partition = spawn_scope_for_event.agent_partition.clone();
+                runs.push(run);
             }
 
             let model = resolved_model;
@@ -1568,6 +1570,7 @@ impl SessionsSpawnTool {
         {
             let mut runs = self.active_runs.write().await;
             runs.push(SubAgentRun {
+                agent_partition: spawn_scope_for_event.agent_partition.clone(),
                 id: run_id.clone(),
                 task: task.to_string(),
                 owner_id: run_lineage.owner_id.clone(),

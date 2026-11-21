@@ -697,10 +697,12 @@ impl SessionsSpawnTool {
     ) -> Vec<BatchMember> {
         let recorded = {
             let rosters = self.batch_rosters.read().await;
-            rosters
-                .iter()
-                .find(|roster| roster.batch_id == batch_id)
-                .map(|roster| (owner_scope.admits(roster.owner_id.as_deref()), roster.members.clone()))
+            rosters.iter().find(|roster| roster.batch_id == batch_id).map(|roster| {
+                (
+                    owner_scope.admits(roster.owner_id.as_deref(), None),
+                    roster.members.clone(),
+                )
+            })
         };
         if let Some((admitted, members)) = recorded {
             // Another owner's batch is answered as an unknown one.
@@ -708,7 +710,10 @@ impl SessionsSpawnTool {
         }
         let runs = self.active_runs.read().await;
         runs.iter()
-            .filter(|run| run.batch_id.as_deref() == Some(batch_id) && owner_scope.admits(run.owner_id.as_deref()))
+            .filter(|run| {
+                run.batch_id.as_deref() == Some(batch_id)
+                    && owner_scope.admits(run.owner_id.as_deref(), run.agent_partition.as_ref())
+            })
             .map(|run| BatchMember {
                 run_id: run.id.clone(),
                 task: run.task.clone(),

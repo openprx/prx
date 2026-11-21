@@ -86,6 +86,8 @@ impl SubagentsTool {
         if let Some(parent_run_id) = run.parent_run_id.as_deref() {
             scope = scope.with_parent_run_id(parent_run_id);
         }
+        // MA-01b5: a control event on a stamped run lands in the run's partition.
+        scope.agent_partition = run.agent_partition.clone();
         let payload = json!({
             "task": run.task,
             "status": status_label(&run.status),
@@ -112,7 +114,7 @@ impl SubagentsTool {
         let runs = self.active_runs.read().await;
         let filtered: Vec<&SubAgentRun> = runs
             .iter()
-            .filter(|r| owner_scope.admits(r.owner_id.as_deref()))
+            .filter(|r| owner_scope.admits(r.owner_id.as_deref(), r.agent_partition.as_ref()))
             .filter(|r| match status_filter {
                 "running" => matches!(r.status, SubAgentStatus::Running),
                 "completed" => matches!(r.status, SubAgentStatus::Completed(_)),
@@ -171,7 +173,7 @@ impl SubagentsTool {
         let mut runs = self.active_runs.write().await;
         let Some(run) = runs
             .iter_mut()
-            .find(|r| r.id == run_id && owner_scope.admits(r.owner_id.as_deref()))
+            .find(|r| r.id == run_id && owner_scope.admits(r.owner_id.as_deref(), r.agent_partition.as_ref()))
         else {
             return Ok(ToolResult {
                 success: false,
@@ -337,7 +339,7 @@ impl SubagentsTool {
             let runs = self.active_runs.read().await;
             let Some(run) = runs
                 .iter()
-                .find(|r| r.id == run_id && owner_scope.admits(r.owner_id.as_deref()))
+                .find(|r| r.id == run_id && owner_scope.admits(r.owner_id.as_deref(), r.agent_partition.as_ref()))
             else {
                 return Ok(ToolResult {
                     success: false,
@@ -583,6 +585,7 @@ mod tests {
 
     fn make_run(id: &str, status: SubAgentStatus) -> SubAgentRun {
         SubAgentRun {
+            agent_partition: None,
             progress: crate::agent::idle::child_beat(),
             batch_id: None,
             id: id.to_string(),
@@ -941,6 +944,7 @@ mod tests {
     async fn steer_running_sends_message() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(crate::tools::sessions_spawn::STEER_CHANNEL_CAPACITY);
         let run = SubAgentRun {
+            agent_partition: None,
             progress: crate::agent::idle::child_beat(),
             batch_id: None,
             id: "run-2".into(),
@@ -980,6 +984,7 @@ mod tests {
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(crate::tools::sessions_spawn::STEER_CHANNEL_CAPACITY);
         let run = SubAgentRun {
+            agent_partition: None,
             progress: crate::agent::idle::child_beat(),
             batch_id: None,
             id: "run-steer-ledger".into(),

@@ -282,6 +282,10 @@ pub struct SubAgentRun {
     /// retired out of `active_runs` before the join reads it — see
     /// [`SessionsSpawnTool::batch_members`].
     pub batch_id: Option<String>,
+    /// The named-agent partition the run's rows are stamped with (MA-01b5):
+    /// its root turn's agent. `None` for Main and unpartitioned roots. Run
+    /// surfaces admit a stamped run only to that agent.
+    pub(crate) agent_partition: Option<crate::memory::AgentPartition>,
 }
 
 impl SubAgentRun {

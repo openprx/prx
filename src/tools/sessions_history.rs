@@ -102,7 +102,7 @@ impl Tool for SessionsHistoryTool {
         let runs = self.active_runs.read().await;
         let Some(run) = runs
             .iter()
-            .find(|r| r.id == run_id && owner_scope.admits(r.owner_id.as_deref()))
+            .find(|r| r.id == run_id && owner_scope.admits(r.owner_id.as_deref(), r.agent_partition.as_ref()))
         else {
             drop(runs);
             if let Some(history) = sessions_read_model::recover_run_history(
@@ -232,6 +232,7 @@ mod tests {
 
     fn make_run(id: &str, status: SubAgentStatus, entries: Vec<HistoryEntry>) -> SubAgentRun {
         SubAgentRun {
+            agent_partition: None,
             progress: crate::agent::idle::child_beat(),
             batch_id: None,
             id: id.to_string(),

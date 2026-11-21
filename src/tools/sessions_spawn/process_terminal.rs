@@ -109,6 +109,8 @@ pub(super) struct RecoveredProcessRun {
     pub(super) source: MessageEvent,
     pub(super) batch_id: Option<String>,
     pub(super) outcome: RecoveredProcessOutcome,
+    /// The root partition sealed in the run's launch record (MA-01b5).
+    pub(super) agent_partition: Option<crate::memory::AgentPartition>,
 }
 
 pub(super) enum RecoveredProcessOutcome {
@@ -237,6 +239,7 @@ impl RecoveredProcessRun {
             );
         }
         let run = SubAgentRun {
+            agent_partition: self.agent_partition,
             id: run_id,
             task: if source.role == "user" {
                 source.content

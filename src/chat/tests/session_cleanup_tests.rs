@@ -75,6 +75,7 @@ async fn exit_shutdown_helper_calls_shutdown_all_and_records_interrupted_summary
     }));
     let outcome = std::panic::AssertUnwindSafe(async {
         let run = crate::tools::sessions_spawn::SubAgentRun {
+            agent_partition: None,
             progress: crate::agent::idle::child_beat(),
             batch_id: None,
             id: "quit-live-agent".to_string(),

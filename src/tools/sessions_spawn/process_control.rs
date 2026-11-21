@@ -31,6 +31,7 @@ pub(super) struct ProcessModeRunSeed<'a> {
 /// `sessions_send` rejects the run as a "legacy run without steer support".
 pub(super) fn new_process_mode_run(seed: ProcessModeRunSeed<'_>) -> SubAgentRun {
     SubAgentRun {
+        agent_partition: None,
         id: seed.id,
         task: seed.task,
         owner_id: seed.lineage.owner_id.clone(),

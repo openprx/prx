@@ -728,11 +728,12 @@ impl MemoryFabric {
         &self,
         draft: &MemoryDraft,
         target_workspace_id: Option<&str>,
+        agent_partition: Option<&crate::memory::AgentPartition>,
     ) -> anyhow::Result<MemoryEvent> {
         self.memory
             .append_memory_event(MemoryEventInput {
-                // CARRY 01b3-2 (W8/W9): record_draft_merge_requested has no partition input in part 0
-                agent_partition: None,
+                // MA-01b5: a child worker's merge request carries its root partition.
+                agent_partition: agent_partition.cloned(),
                 event_id: None,
                 workspace_id: target_workspace_id.unwrap_or_else(|| self.workspace_id()).to_string(),
                 owner_id: draft.owner_id.clone(),
@@ -1251,7 +1252,7 @@ mod tests {
             .await
             .unwrap();
         fabric
-            .record_draft_merge_requested(&draft, Some("workspace-a"))
+            .record_draft_merge_requested(&draft, Some("workspace-a"), None)
             .await
             .unwrap();
 

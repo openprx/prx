@@ -302,7 +302,8 @@ fn child_memory_principal(
         sender: scope.sender.clone(),
         require_owner_match,
         legacy_session_key: None,
-        agent_partition: None,
+        // MA-01b5: a child reads inside the partition its rows are stamped with.
+        agent_partition: scope.agent_partition.clone(),
     })
 }
 

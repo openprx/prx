@@ -401,6 +401,7 @@ mod tests {
 
     fn make_run(id: &str) -> SubAgentRun {
         SubAgentRun {
+            agent_partition: None,
             progress: crate::agent::idle::child_beat(),
             batch_id: None,
             id: id.to_string(),

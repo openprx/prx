@@ -235,7 +235,7 @@ pub(super) async fn read(
     else {
         return Ok(None);
     };
-    if !owners.admits(plan.owner_id.as_deref()) {
+    if !owners.admits(plan.owner_id.as_deref(), None) {
         return Ok(None);
     }
     let parsed: Signed = serde_json::from_str(plan.raw_payload_json.as_deref().context("batch payload missing")?)?;

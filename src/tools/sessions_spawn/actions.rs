@@ -36,6 +36,8 @@ impl SessionsSpawnTool {
         if let Some(parent_run_id) = run.parent_run_id.as_deref() {
             scope = scope.with_parent_run_id(parent_run_id);
         }
+        // MA-01b5: a control event on a stamped run lands in the run's partition.
+        scope.agent_partition = run.agent_partition.clone();
         let payload = json!({
             "task": run.task,
             "status": status_label(&run.status),
@@ -61,7 +63,7 @@ impl SessionsSpawnTool {
         let registry = self.active_runs.read().await;
         let runs = registry
             .iter()
-            .filter(|run| owner_scope.admits(run.owner_id.as_deref()))
+            .filter(|run| owner_scope.admits(run.owner_id.as_deref(), run.agent_partition.as_ref()))
             .collect::<Vec<_>>();
         if runs.is_empty() {
             return Ok(ToolResult {
@@ -121,7 +123,7 @@ impl SessionsSpawnTool {
             let mut runs = self.active_runs.write().await;
             match runs
                 .iter_mut()
-                .find(|r| r.id == run_id && owner_scope.admits(r.owner_id.as_deref()))
+                .find(|r| r.id == run_id && owner_scope.admits(r.owner_id.as_deref(), r.agent_partition.as_ref()))
             {
                 Some(run) => {
                     match &run.status {
@@ -322,7 +324,7 @@ impl SessionsSpawnTool {
         let runs = self.active_runs.read().await;
         let Some(run) = runs
             .iter()
-            .find(|r| r.id == run_id && owner_scope.admits(r.owner_id.as_deref()))
+            .find(|r| r.id == run_id && owner_scope.admits(r.owner_id.as_deref(), r.agent_partition.as_ref()))
         else {
             return Ok(self.no_runtime_run_result(run_id, args).await);
         };
@@ -425,7 +427,7 @@ impl SessionsSpawnTool {
             let runs = self.active_runs.read().await;
             let Some(run) = runs
                 .iter()
-                .find(|r| r.id == run_id && owner_scope.admits(r.owner_id.as_deref()))
+                .find(|r| r.id == run_id && owner_scope.admits(r.owner_id.as_deref(), r.agent_partition.as_ref()))
             else {
                 return Ok(ToolResult {
                     success: false,

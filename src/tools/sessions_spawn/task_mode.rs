@@ -428,6 +428,7 @@ pub(super) async fn run_sub_agent_task(
                                     &workspace_dir_owned,
                                     Some(
                                         DocumentIngestRuntime::from_scope(memory_owned.clone(), &scope_ctx)
+                                            .with_child_partition(envelope.agent_partition.as_ref())
                                             .into_nested_turn(),
                                     ),
                                 )

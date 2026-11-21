@@ -487,6 +487,7 @@ async fn mcp_sessions_reads_admit_nothing_when_the_caller_carries_no_owner_id() 
             .await
             .expect("persist historical fixture row");
         rows.push(crate::tools::sessions_spawn::SubAgentRun {
+            agent_partition: None,
             id: run_id.to_owned(),
             task: task.to_owned(),
             owner_id: row_owner,

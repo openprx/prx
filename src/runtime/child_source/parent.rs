@@ -47,6 +47,11 @@ struct RecallScope {
     raw_sender: Option<String>,
     owner_id: Option<String>,
     require_owner_match: bool,
+    /// The root turn's named-agent partition (MA-01b5), sealed with the rest
+    /// of the parent source so a process worker never re-derives it. Absent
+    /// for Main and unpartitioned roots, whose payloads stay unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_partition: Option<crate::memory::AgentPartition>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -180,6 +185,7 @@ impl ParentSource {
                 raw_sender: self.memory_scope.raw_sender.clone(),
                 owner_id: self.memory_scope.owner_id.clone(),
                 require_owner_match: self.memory_scope.require_owner_match,
+                agent_partition: super::inherited_partition(self.memory_scope.agent_partition.as_ref()),
             },
         };
         Ok(serde_json::to_string(&fields)?)
@@ -266,8 +272,7 @@ impl ParentSource {
             policy_chat_type: fields.policy_chat_type,
             surface: TurnSurfaceKind::Interactive,
             memory_scope: MemoryWriteContext {
-                // CARRY 01c2 (target_switch_and_delegate_keep_partition): RecallScope has no partition.
-                agent_partition: None,
+                agent_partition: super::inherited_partition(fields.memory_scope.agent_partition.as_ref()),
                 session_key: None,
                 workspace_id: fields.memory_scope.workspace_id,
                 channel: fields.memory_scope.channel,
@@ -358,8 +363,7 @@ impl ParentSource {
             policy_chat_type: fields.policy_chat_type,
             surface,
             memory_scope: MemoryWriteContext {
-                // CARRY 01c2 (target_switch_and_delegate_keep_partition): RecallScope has no partition.
-                agent_partition: None,
+                agent_partition: super::inherited_partition(fields.memory_scope.agent_partition.as_ref()),
                 session_key: None,
                 workspace_id: fields.memory_scope.workspace_id,
                 channel: fields.memory_scope.channel,

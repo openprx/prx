@@ -31,10 +31,19 @@ pub(super) struct CompletionLineage {
     parent_scope_id: String,
     input_event_id: Option<String>,
     recording_enabled: bool,
+    /// The root partition from the sealed parent source (MA-01b5). Absent for
+    /// Main and unpartitioned roots, whose launch records stay unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_partition: Option<crate::memory::AgentPartition>,
 }
 
 impl CompletionLineage {
-    fn from_worker(worker: &WorkerManifest, parent_scope_id: String, parent_session: String) -> anyhow::Result<Self> {
+    fn from_worker(
+        worker: &WorkerManifest,
+        parent_scope_id: String,
+        parent_session: String,
+        agent_partition: Option<crate::memory::AgentPartition>,
+    ) -> anyhow::Result<Self> {
         let source = worker.ordinary_source.as_ref().context("ordinary source missing")?;
         Ok(Self {
             run_id: worker.run_id.clone(),
@@ -54,6 +63,7 @@ impl CompletionLineage {
             parent_scope_id,
             input_event_id: source.input.as_ref().map(|input| input.event_id.clone()),
             recording_enabled: worker.memory_event_recording.enabled,
+            agent_partition,
         })
     }
 }
@@ -173,6 +183,7 @@ pub(super) async fn authenticate_launch(
         worker,
         scope.gate_inputs().0.parent_authority_id.to_string(),
         provenance.session_key().to_owned(),
+        provenance.memory_scope().agent_partition.clone(),
     )?;
     Ok((key, lineage))
 }
@@ -465,9 +476,11 @@ pub(super) async fn retained_launch(
     let Some(launch) = launch::read(fabric, workspace, owner, run).await? else {
         return Ok(None);
     };
+    let mut scope = super::retained::terminal_scope(launch.input.as_ref().unwrap_or(&launch.event));
+    scope.agent_partition = launch.agent_partition().cloned();
     Ok(Some(super::retained::RetainedLaunch {
         worker_absent: launch.process_absent()?,
-        scope: super::retained::terminal_scope(launch.input.as_ref().unwrap_or(&launch.event)),
+        scope,
     }))
 }
 
@@ -498,10 +511,12 @@ pub(super) async fn recover_restart_event(
         None => RecoveredProcessOutcome::OrdinaryUnconfirmed(launch.partial_usage(fabric).await?),
     };
     let batch_id = launch.batch_id().map(str::to_owned);
+    let agent_partition = launch.agent_partition().cloned();
     Ok(Some(RecoveredProcessRun {
         source: launch.input.unwrap_or(launch.event),
         batch_id,
         outcome,
+        agent_partition,
     }))
 }
 

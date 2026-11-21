@@ -67,7 +67,11 @@ pub(super) async fn record_hybrid_worker_draft_if_needed(
                         let shared_workspace_id = shared_worker_workspace_id(manifest);
                         let shared_fabric = MemoryFabric::new(Arc::new(shared_memory), shared_workspace_id);
                         if let Err(error) = shared_fabric
-                            .record_draft_merge_requested(&draft, Some(shared_fabric.workspace_id()))
+                            .record_draft_merge_requested(
+                                &draft,
+                                Some(shared_fabric.workspace_id()),
+                                worker_event_scope.agent_partition.as_ref(),
+                            )
                             .await
                         {
                             tracing::warn!(

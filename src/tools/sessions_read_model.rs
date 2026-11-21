@@ -169,6 +169,10 @@ pub(crate) enum RunOwnerScope {
     /// Only runs registered under exactly this owner. `None` means the caller
     /// has no resolvable owner, so nothing is admitted.
     Owner(Option<String>),
+    /// A named agent (MA-01b5): only the runs stamped with exactly its
+    /// partition, under the partition's owner. Main and every other owner
+    /// scope never admit a stamped run.
+    Agent(crate::memory::AgentPartition),
 }
 
 /// The owner a trusted scope acts for: the authenticated `owner_id` the
@@ -261,20 +265,25 @@ impl RunOwnerScope {
     pub(crate) fn from_args(args: &Value) -> Self {
         if let Some(context) = crate::tools::execution::current_child_call_context() {
             let context = context.context();
-            if named_partition(context.envelope.agent_partition.as_ref()) {
-                return Self::Owner(None);
+            if let Some(partition) =
+                crate::runtime::child_source::inherited_partition(context.envelope.agent_partition.as_ref())
+            {
+                return Self::Agent(partition);
             }
             if !context.envelope.owner_isolated && context.is_local_operator() {
                 return Self::Unrestricted;
             }
             return Self::Owner(effective_run_owner_from_context(context));
         }
-        // MA-01h: registry runs carry no agent partition and a named agent
-        // starts none (its spawn tools are excluded), so a named agent, or a
-        // call whose partition cannot be read, sees no run at all.
+        // MA-01b5: a named agent sees the runs stamped with its partition; a
+        // call whose partition cannot be read sees no run at all.
         match crate::tools::execution::trusted_scope_read_partition(args) {
-            Ok(partition) if !named_partition(partition.as_ref()) => {}
-            Ok(_) | Err(_) => return Self::Owner(None),
+            Ok(partition) => {
+                if let Some(partition) = crate::runtime::child_source::inherited_partition(partition.as_ref()) {
+                    return Self::Agent(partition);
+                }
+            }
+            Err(_) => return Self::Owner(None),
         }
         if crate::tools::execution::scope_requires_owner_match(args) {
             return Self::Owner(
@@ -300,12 +309,35 @@ impl RunOwnerScope {
     /// A confined caller never sees an unowned run: the registry cannot prove
     /// such a run is the caller's, so it fails closed. Runs recorded before
     /// OWNER-VIS without an owner are therefore visible to the operator only.
-    pub(crate) fn admits(&self, run_owner_id: Option<&str>) -> bool {
+    ///
+    /// `run_partition` is the run's stamped named-agent partition: a stamped
+    /// run is admitted only to that agent (and to the unrestricted operator).
+    pub(crate) fn admits(
+        &self,
+        run_owner_id: Option<&str>,
+        run_partition: Option<&crate::memory::AgentPartition>,
+    ) -> bool {
+        match self {
+            Self::Unrestricted => true,
+            Self::Owner(_) => run_partition.is_none() && self.admits_owner(run_owner_id),
+            Self::Agent(caller) => run_partition == Some(caller) && self.admits_owner(run_owner_id),
+        }
+    }
+
+    /// The owner half of [`Self::admits`], for rows already read inside the
+    /// caller's partition.
+    fn admits_owner(&self, run_owner_id: Option<&str>) -> bool {
         match self {
             Self::Unrestricted => true,
             Self::Owner(Some(caller)) => run_owner_id.is_some_and(|owner| owner == caller),
             Self::Owner(None) => false,
+            Self::Agent(caller) => run_owner_id == Some(caller.owner_id.as_str()),
         }
+    }
+
+    /// Whether this caller is a named agent (MA-01b5).
+    pub(crate) const fn is_agent(&self) -> bool {
+        matches!(self, Self::Agent(_))
     }
 
     /// Owner-qualify already-fetched projection rows.
@@ -313,6 +345,8 @@ impl RunOwnerScope {
     /// The read model is handed whole rows by the `Memory` trait, not a query
     /// it can extend, so the confinement is applied to the rows' own `owner_id`
     /// column here — the one seam `sessions_list` and `sessions_history` share.
+    /// The rows were read inside the caller's agent partition, so only the
+    /// owner is checked here.
     /// The rule is [`Self::admits`] unchanged: a caller with no owner id admits
     /// nothing, and a row with no owner is unattributable and admits to nobody
     /// isolated.
@@ -322,16 +356,12 @@ impl RunOwnerScope {
     fn retain_admitted<T>(&self, rows: Vec<T>, owner_of: impl Fn(&T) -> Option<&str>) -> Vec<T> {
         match self {
             Self::Unrestricted => rows,
-            Self::Owner(_) => rows.into_iter().filter(|row| self.admits(owner_of(row))).collect(),
+            Self::Owner(_) | Self::Agent(_) => rows
+                .into_iter()
+                .filter(|row| self.admits_owner(owner_of(row)))
+                .collect(),
         }
     }
-}
-
-fn named_partition(partition: Option<&crate::memory::AgentPartition>) -> bool {
-    matches!(
-        partition.map(|partition| &partition.key),
-        Some(crate::memory::PartitionKey::Named { .. })
-    )
 }
 
 fn task_runs_from_events(events: Vec<MemoryEvent>, limit: usize) -> Vec<RecoveredTaskRun> {

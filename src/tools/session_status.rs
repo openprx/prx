@@ -110,7 +110,7 @@ impl Tool for SessionStatusTool {
         let all_runs = self.active_runs.read().await;
         let runs = all_runs
             .iter()
-            .filter(|run| owner_scope.admits(run.owner_id.as_deref()))
+            .filter(|run| owner_scope.admits(run.owner_id.as_deref(), run.agent_partition.as_ref()))
             .collect::<Vec<_>>();
         let active_ids = runs.iter().map(|run| run.id.clone()).collect::<HashSet<_>>();
         let running_count = runs
@@ -295,6 +295,7 @@ mod tests {
 
     fn owned_running_run(id: &str, owner_id: Option<&str>) -> SubAgentRun {
         SubAgentRun {
+            agent_partition: None,
             progress: crate::agent::idle::child_beat(),
             batch_id: None,
             id: id.into(),
@@ -429,6 +430,7 @@ mod tests {
     async fn counts_runs_by_status() {
         let runs = vec![
             SubAgentRun {
+                agent_partition: None,
                 progress: crate::agent::idle::child_beat(),
                 batch_id: None,
                 id: "r1".into(),
@@ -453,6 +455,7 @@ mod tests {
                 token_usage_records: Vec::new(),
             },
             SubAgentRun {
+                agent_partition: None,
                 progress: crate::agent::idle::child_beat(),
                 batch_id: None,
                 id: "r2".into(),
@@ -477,6 +480,7 @@ mod tests {
                 token_usage_records: Vec::new(),
             },
             SubAgentRun {
+                agent_partition: None,
                 progress: crate::agent::idle::child_beat(),
                 batch_id: None,
                 id: "r3".into(),

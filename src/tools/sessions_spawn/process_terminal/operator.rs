@@ -534,6 +534,8 @@ pub(super) async fn recover_restart_event(
         source: launch.input.unwrap_or(launch.event),
         batch_id,
         outcome,
+        // Operator workers are terminal-only roots: never partitioned.
+        agent_partition: None,
     }))
 }
 

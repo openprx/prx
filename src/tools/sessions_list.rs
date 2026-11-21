@@ -94,7 +94,7 @@ impl Tool for SessionsListTool {
         let runs = self.active_runs.read().await;
         let filtered: Vec<&SubAgentRun> = runs
             .iter()
-            .filter(|r| owner_scope.admits(r.owner_id.as_deref()))
+            .filter(|r| owner_scope.admits(r.owner_id.as_deref(), r.agent_partition.as_ref()))
             .filter(|r| match status_filter {
                 "running" => matches!(r.status, SubAgentStatus::Running),
                 "completed" => matches!(r.status, SubAgentStatus::Completed(_)),
@@ -323,6 +323,7 @@ mod tests {
 
     fn make_run(id: &str, status: SubAgentStatus, task: &str) -> SubAgentRun {
         SubAgentRun {
+            agent_partition: None,
             progress: crate::agent::idle::child_beat(),
             batch_id: None,
             id: id.to_string(),

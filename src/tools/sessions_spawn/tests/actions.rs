@@ -119,6 +119,7 @@ async fn kill_action_requires_resource_grant() {
     {
         let mut runs = tool.active_runs.write().await;
         runs.push(SubAgentRun {
+            agent_partition: None,
             progress: crate::agent::idle::child_beat(),
             batch_id: None,
             id: "run-1".to_string(),
@@ -644,6 +645,7 @@ async fn steer_backpressures_when_full_without_dropping_or_holding_the_registry_
     {
         let mut runs = tool.active_runs.write().await;
         runs.push(SubAgentRun {
+            agent_partition: None,
             progress: crate::agent::idle::child_beat(),
             batch_id: None,
             id: "run-backpressure".to_string(),
@@ -730,6 +732,7 @@ async fn steer_action_persists_task_event() {
     {
         let mut runs = tool.active_runs.write().await;
         runs.push(SubAgentRun {
+            agent_partition: None,
             progress: crate::agent::idle::child_beat(),
             batch_id: None,
             id: "run-steer".to_string(),
@@ -848,6 +851,7 @@ async fn history_action_returns_tail_usage_and_truncation_controls() {
     {
         let mut runs = tool.active_runs.write().await;
         runs.push(SubAgentRun {
+            agent_partition: None,
             progress: crate::agent::idle::child_beat(),
             batch_id: None,
             id: "run-history-tail".to_string(),

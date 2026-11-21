@@ -8,6 +8,30 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 
+/// A `sessions_spawn` action a named agent cannot use (MA-01b5): its rows
+/// could not carry the agent's partition. A batch journal row has no session
+/// to stamp, and a live `prx chat` session belongs to the operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SpawnActionUnpartitioned;
+
+impl SpawnActionUnpartitioned {
+    pub(crate) const fn code(self) -> &'static str {
+        "spawn_action_unpartitioned"
+    }
+}
+
+impl std::fmt::Display for SpawnActionUnpartitioned {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}: spawn_batch, join, chat_sessions and chat_assign are unavailable to a named agent",
+            self.code()
+        )
+    }
+}
+
+impl std::error::Error for SpawnActionUnpartitioned {}
+
 impl SessionsSpawnTool {
     pub(super) fn execution_schema(&self) -> &std::sync::Arc<serde_json::Value> {
         self.execution_schema.get_or_init(|| {
@@ -205,6 +229,13 @@ impl Tool for SessionsSpawnTool {
         // caller's owner started; the local-process operator sees them all. A
         // run outside the scope answers exactly like a missing one.
         let owner_scope = sessions_read_model::RunOwnerScope::from_args(&args);
+        if owner_scope.is_agent() && matches!(action, "spawn_batch" | "join" | "chat_sessions" | "chat_assign") {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(SpawnActionUnpartitioned.to_string()),
+            });
+        }
 
         match action {
             "list" => return self.execute_list(&owner_scope).await,

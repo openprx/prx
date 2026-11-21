@@ -22,6 +22,7 @@ async fn recovered_run(temp: &tempfile::TempDir) -> RecoveredProcessRun {
         .await
         .unwrap();
     RecoveredProcessRun {
+        agent_partition: None,
         source,
         batch_id: None,
         outcome: RecoveredProcessOutcome::OrdinaryUnconfirmed(RecoveredWorkerUsage {

@@ -79,6 +79,7 @@ pub(in crate::tools::sessions_spawn) async fn persist(
     scope.persona_id = lineage.persona_id.clone();
     scope.attempt_id = lineage.attempt_id.clone();
     scope.lease_epoch = lineage.lease_epoch;
+    scope.agent_partition = lineage.agent_partition.clone();
     let lookup = format!("worker:{}:ordinary-launch", lineage.run_id);
     let fields = LaunchFields {
         version: 1,
@@ -146,6 +147,10 @@ pub(super) struct VerifiedLaunch {
 impl VerifiedLaunch {
     pub(super) fn batch_id(&self) -> Option<&str> {
         self.fields.batch_id.as_deref()
+    }
+    /// The root partition the run's rows carry, from the sealed launch.
+    pub(super) fn agent_partition(&self) -> Option<&crate::memory::AgentPartition> {
+        self.fields.lineage.agent_partition.as_ref()
     }
     pub(super) fn process_absent(&self) -> anyhow::Result<bool> {
         worker_absent(&self.fields, &self.key)

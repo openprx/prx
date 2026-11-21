@@ -211,6 +211,8 @@ impl OrdinaryProcessSnapshots {
         initial_scope.lease_epoch = source.lease_epoch;
         initial_scope.config_generation_id = Some(self.generation.id.0);
         initial_scope.config_source_revision = Some(self.generation.source_revision.fingerprint_sha256.clone());
+        // MA-01b5: the root partition comes from the sealed parent source only.
+        initial_scope.agent_partition = self.parent.memory_scope().agent_partition.clone();
         if let Some(receipt) = &input {
             initial_scope.goal_id = receipt.event().goal_id.clone();
             initial_scope.correlation_id = receipt

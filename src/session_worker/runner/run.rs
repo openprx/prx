@@ -1046,6 +1046,11 @@ async fn run_owned_manifest(
                                         workspace_dir_ref,
                                         loop_scope.map(|ctx| {
                                             DocumentIngestRuntime::from_scope(Arc::clone(&memory), ctx)
+                                                .with_child_partition(
+                                                    child_execution
+                                                        .as_ref()
+                                                        .and_then(|context| context.envelope.agent_partition.as_ref()),
+                                                )
                                                 .into_nested_turn()
                                         }),
                                     )

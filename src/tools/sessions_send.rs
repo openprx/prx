@@ -213,7 +213,7 @@ impl Tool for SessionsSendTool {
             let runs = self.active_runs.read().await;
             let Some(run) = runs
                 .iter()
-                .find(|r| r.id == run_id && owner_scope.admits(r.owner_id.as_deref()))
+                .find(|r| r.id == run_id && owner_scope.admits(r.owner_id.as_deref(), r.agent_partition.as_ref()))
             else {
                 return Ok(ToolResult {
                     success: false,
@@ -293,6 +293,7 @@ mod tests {
     fn make_running_run(id: &str) -> (SubAgentRun, tokio::sync::mpsc::Receiver<String>) {
         let (tx, rx) = tokio::sync::mpsc::channel(crate::tools::sessions_spawn::STEER_CHANNEL_CAPACITY);
         let run = SubAgentRun {
+            agent_partition: None,
             progress: crate::agent::idle::child_beat(),
             batch_id: None,
             id: id.to_string(),
@@ -527,6 +528,7 @@ mod tests {
     #[tokio::test]
     async fn completed_session_returns_failure() {
         let run = SubAgentRun {
+            agent_partition: None,
             progress: crate::agent::idle::child_beat(),
             batch_id: None,
             id: "done-run".to_string(),

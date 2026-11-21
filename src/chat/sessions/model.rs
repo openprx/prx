@@ -423,6 +423,7 @@ mod tests {
     #[test]
     fn project_run_infers_origin_from_parent() {
         let mut run = SubAgentRun {
+            agent_partition: None,
             progress: crate::agent::idle::child_beat(),
             batch_id: None,
             id: "child".into(),

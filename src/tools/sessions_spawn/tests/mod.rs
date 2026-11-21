@@ -1074,6 +1074,7 @@ fn make_tool_with_channels_and_security(
 /// the deterministic approval-suspension restore logic.
 fn restore_test_run(id: &str, status: SubAgentStatus) -> SubAgentRun {
     SubAgentRun {
+        agent_partition: None,
         progress: crate::agent::idle::child_beat(),
         batch_id: None,
         id: id.to_string(),
