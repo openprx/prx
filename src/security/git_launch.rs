@@ -76,6 +76,10 @@
 //!     same per submodule named in the configuration or in `.gitmodules` of
 //!     the working tree, the index or `HEAD`).
 //!
+//! At an effective Full autonomy level (owner D1) a caller passes
+//! [`GitScope::PlainRepository`]: the same cleared environment, but no
+//! inspection, override, refusal or hooks path, as in the Full shell.
+//!
 //! Callers pass [`DIFF_SAFETY_ARGS`] to every command printing a patch,
 //! [`PUSH_SAFETY_ARGS`] to `push` and [`FETCH_SAFETY_ARGS`] to `fetch`,
 //! `pull` and `ls-remote`: `remote.<name>.receivepack`/`uploadpack` are read
@@ -118,6 +122,13 @@ pub enum GitScope<'a> {
     /// An existing repository (or a directory inside one): git starts in
     /// that directory, and its configuration is read first.
     Repository(&'a Path),
+    /// An existing repository used at an effective Full autonomy level:
+    /// git runs plainly there, as in the Full shell (owner D1). Its
+    /// configuration is not inspected, nothing is overridden and no hooks
+    /// path is set, so the repository's hooks and programs run; the cleared
+    /// environment ([`git_environment`]) is kept, so no secret of PRX's
+    /// environment reaches git.
+    PlainRepository(&'a Path),
     /// A command that creates a repository (`git clone <url> <dest>`): no
     /// repository configuration exists yet; the working directory is left
     /// to the caller.
@@ -1078,7 +1089,12 @@ async fn git_command_with_parent(
     scope: GitScope<'_>,
     parent: Vec<(OsString, OsString)>,
 ) -> anyhow::Result<tokio::process::Command> {
-    let hooks = hooks_path()?;
+    // Only an effective Full launch skips the hardening (and its refusals).
+    let hooks = if matches!(scope, GitScope::PlainRepository(_)) {
+        None
+    } else {
+        Some(hooks_path()?)
+    };
     let mut environment = git_environment(parent);
     let mut overrides = if let GitScope::Repository(dir) = scope {
         let (entries, paths, submodules) = inspect_repository(dir, &environment).await?;
@@ -1090,19 +1106,22 @@ async fn git_command_with_parent(
         overrides.extend(repository.overrides);
         overrides
     } else {
-        // `clone`: no repository configuration exists yet.
+        // `clone`: no repository configuration exists yet. A plain launch
+        // reads none.
         Vec::new()
     };
-    overrides.extend(
-        ALWAYS_OVERRIDES
-            .iter()
-            .map(|(key, value)| ((*key).to_string(), (*value).to_string())),
-    );
-    overrides.push(("core.hooksPath".to_string(), hooks.to_string_lossy().into_owned()));
+    if let Some(hooks) = hooks {
+        overrides.extend(
+            ALWAYS_OVERRIDES
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string())),
+        );
+        overrides.push(("core.hooksPath".to_string(), hooks.to_string_lossy().into_owned()));
+    }
 
     let mut command = tokio::process::Command::new("git");
     command.env_clear().envs(environment).stdin(Stdio::null());
-    if let GitScope::Repository(dir) = scope {
+    if let GitScope::Repository(dir) | GitScope::PlainRepository(dir) = scope {
         command.current_dir(dir);
     }
     command.arg("--no-pager");

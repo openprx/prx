@@ -93,6 +93,7 @@ impl GitOperationsTool {
     /// D-100): a cleared environment, and every program the repository's own
     /// configuration names (fsmonitor, hooks, filters, credential helpers,
     /// ...) neutralised, while the operator's global configuration applies.
+    /// An effective Full call runs git plainly in the cleared environment.
     async fn run_git_command(&self, args: &[&str]) -> anyhow::Result<String> {
         let output = self.run_git_output(args).await?;
         if !output.status.success() {
@@ -107,7 +108,14 @@ impl GitOperationsTool {
     async fn run_git_output(&self, args: &[&str]) -> anyhow::Result<std::process::Output> {
         // `git` forks its own helpers (git-remote-https, credential helpers),
         // so cancelling this future must tear down the whole process group.
-        let mut command = git_launch::git_command(GitScope::Repository(&self.workspace_dir)).await?;
+        // The call's carried level: only an effective Full call runs git
+        // plainly (owner D1); a missing level keeps the hardened launch.
+        let scope = if super::effective_autonomy::current() == Some(AutonomyLevel::Full) {
+            GitScope::PlainRepository(&self.workspace_dir)
+        } else {
+            GitScope::Repository(&self.workspace_dir)
+        };
+        let mut command = git_launch::git_command(scope).await?;
         command.args(args);
         Ok(crate::runtime::shell_process::run_managed_output(command).await?)
     }
