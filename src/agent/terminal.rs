@@ -254,6 +254,23 @@ fn terminal_semantic_scope(scope: &MessageEventScope) -> serde_json::Value {
     })
 }
 
+/// The scope as every terminal row persists it (sender and recipient through
+/// the provider-label redaction, as the memory fabric stores them), for
+/// field-exact comparison with a stored row. Scope fields are row
+/// identifiers and are never secret-redacted: a secret-shaped `session_key`
+/// such as `console-<uuid>` must stay comparable with its row.
+fn bound_scope(scope: &MessageEventScope) -> anyhow::Result<serde_json::Value> {
+    let mut bound = terminal_semantic_scope(scope);
+    let object = bound
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("terminal scope is not an object"))?;
+    for (field, value) in [("sender", &scope.sender), ("recipient", &scope.recipient)] {
+        let stored = value.clone().map(crate::memory::fabric::redact_provider_label);
+        object.insert(field.to_owned(), serde_json::to_value(stored)?);
+    }
+    Ok(bound)
+}
+
 /// Finalize one semantic turn.
 ///
 /// The `turn.finalized` marker is deliberately written last. A retry after a

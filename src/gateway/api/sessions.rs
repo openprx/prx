@@ -479,18 +479,82 @@ async fn recover_console_history(
                     .runtime_holder()
                     .recovery_scope()
                     .rejoin_terminal(terminal_id, owner)
-                    .await?;
+                    .await
+                    .map_err(|error| {
+                        if error
+                            .downcast_ref::<crate::runtime::turn_terminal::restart_verify::TerminalNotReplayable>()
+                            .is_some()
+                        {
+                            error.context(ConsoleTerminalRefused {
+                                run_id: terminal_id.to_owned(),
+                            })
+                        } else {
+                            error
+                        }
+                    })?;
             }
         }
         Ok::<(), anyhow::Error>(())
     };
-    tokio::time::timeout(std::time::Duration::from_secs(30), recovery)
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), recovery)
         .await
-        .map_err(|_| anyhow::anyhow!("Console history recovery timed out; retry required"))??;
-    if let Some(ticket) = cleanup {
-        ticket.finish(true);
+        .map_err(|_| anyhow::anyhow!("Console history recovery timed out; retry required"))
+        .and_then(|result| result);
+    match outcome {
+        Ok(()) => {
+            if let Some(ticket) = cleanup {
+                ticket.finish(true);
+            }
+            Ok(())
+        }
+        Err(error) => {
+            if let Some(refused) = error.downcast_ref::<ConsoleTerminalRefused>() {
+                // Restart verification refuses before any write, so no write of
+                // this recovery is unconfirmed: the ticket ends confirmed and
+                // the refusal stays with its session. Store faults, timeouts
+                // and projection-write failures keep the unfinished ticket,
+                // which closes the owner until recovery (turn_cleanup).
+                let reason = error
+                    .downcast_ref::<crate::runtime::turn_terminal::restart_verify::TerminalNotReplayable>()
+                    .map_or("unspecified", |refusal| refusal.0);
+                tracing::error!(
+                    run_id = %refused.run_id,
+                    reason,
+                    "Console terminal is not replayable; the refusal is isolated to its session"
+                );
+                if let Some(ticket) = cleanup {
+                    ticket.finish(true);
+                }
+            }
+            Err(error)
+        }
     }
-    Ok(())
+}
+
+/// A Console terminal that restart verification refused
+/// (`TerminalNotReplayable`) during history recovery: an error of that
+/// session only, already logged with its run id; admission stays open.
+#[derive(Debug)]
+struct ConsoleTerminalRefused {
+    run_id: String,
+}
+
+impl std::fmt::Display for ConsoleTerminalRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Console terminal {} is not replayable", self.run_id)
+    }
+}
+
+/// The response of a failed history recovery. A session-isolated refusal was
+/// logged where it was classified; every other failure is logged here.
+fn history_recovery_failed(error: &anyhow::Error) -> Response {
+    if error.downcast_ref::<ConsoleTerminalRefused>().is_none() {
+        tracing::error!(error = %error, "Console history recovery failed");
+    }
+    json_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Console history recovery is incomplete",
+    )
 }
 
 async fn append_console_turn(
@@ -1197,11 +1261,7 @@ pub async fn get_session_messages(
     let offset = normalize_offset(query.offset);
     let runtime = state.pin_turn_runtime();
     if let Err(error) = recover_console_history(&state, &runtime, &api_principal, &session_id).await {
-        tracing::error!(error = %error, "Console history recovery failed");
-        return json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Console history recovery is incomplete",
-        );
+        return history_recovery_failed(&error);
     }
     let principal = operator_history_principal(
         &api_principal,
@@ -1803,11 +1863,7 @@ async fn submit_console_message(
     .with_config_generation(&turn_runtime.config_generation);
 
     if let Err(error) = recover_console_history(&state, &turn_runtime, &api_principal, &session_id).await {
-        tracing::error!(error = %error, "Console history recovery failed");
-        return json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Console history recovery is incomplete",
-        );
+        return history_recovery_failed(&error);
     }
     let mut principal = operator_history_principal(&api_principal, &runtime_envelope);
     let partition = match history_partition(

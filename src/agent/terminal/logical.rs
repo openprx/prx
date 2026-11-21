@@ -1,8 +1,8 @@
 //! Source-bound logical task completion; model segments settle independently.
 use super::{
     Arc, Context, MemoryFabric, MessageEvent, MessageEventScope, TurnTerminalDraft, TurnTerminalPayload,
-    TurnTerminalReceipt, TurnTerminalStatus, ensure_runtime_authority, redact_persisted_json, redact_persisted_text,
-    terminal_semantic_scope,
+    TurnTerminalReceipt, TurnTerminalStatus, bound_scope, ensure_runtime_authority, redact_persisted_json,
+    redact_persisted_text, terminal_semantic_scope,
 };
 #[cfg(test)]
 use crate::memory::Memory;
@@ -169,7 +169,7 @@ impl LogicalTaskTerminalRef {
 
 fn verify_event_scope(event: &MessageEvent, scope: &MessageEventScope) -> anyhow::Result<()> {
     let actual = serde_json::to_value(event)?;
-    let expected = terminal_semantic_scope(scope);
+    let expected = bound_scope(scope)?;
     for (key, value) in expected.as_object().context("logical scope is not an object")? {
         anyhow::ensure!(
             actual.get(key).unwrap_or(&serde_json::Value::Null) == value,

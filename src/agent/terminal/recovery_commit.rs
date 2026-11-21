@@ -2,8 +2,9 @@
 
 use super::oversized_reply::{ReplyReference, compact_reply};
 use super::{
-    TurnTerminalCommit, TurnTerminalPayload, TurnTerminalReceipt, TurnTerminalStatus, ensure_runtime_authority,
-    redact_persisted_json, skill_awaiting_approval, skill_observations, skill_task_key, terminal_semantic_scope,
+    TurnTerminalCommit, TurnTerminalPayload, TurnTerminalReceipt, TurnTerminalStatus, bound_scope,
+    ensure_runtime_authority, redact_persisted_json, skill_awaiting_approval, skill_observations, skill_task_key,
+    terminal_semantic_scope,
 };
 use crate::config::schema::CostConfig;
 use crate::cost::types::CostSettlement;
@@ -556,13 +557,14 @@ fn claim_semantic(
         "telemetry": commit.telemetry,
         "delivery_intent": commit.delivery_intent,
     }));
-    // The bound scope is set after redaction: restart verification compares
-    // it field by field with the persisted terminal row, which stores these
-    // identifiers unredacted.
-    semantic
-        .as_object_mut()
-        .context("terminal claim is not an object")?
-        .insert("scope".to_owned(), bound_scope(&commit.scope)?);
+    // Identifiers that restart verification compares for equality (the
+    // terminal id and workspace with the settled chain, the scope field by
+    // field with the persisted terminal row) are set after redaction:
+    // redaction never touches a compared identifier.
+    let object = semantic.as_object_mut().context("terminal claim is not an object")?;
+    object.insert("terminal_id".to_owned(), commit.terminal_id.clone().into());
+    object.insert("workspace_id".to_owned(), fabric_workspace.into());
+    object.insert("scope".to_owned(), bound_scope(&commit.scope)?);
     if !prepared_parameters.is_empty() {
         semantic
             .as_object_mut()
@@ -598,20 +600,6 @@ fn claim_semantic(
         );
     }
     Ok((semantic, reference))
-}
-
-/// The claim's bound scope: the identity [`event_input`] persists on every
-/// terminal row (sender and recipient through the provider-label redaction).
-/// Scope fields are row identifiers, never secret-redacted: a secret-shaped
-/// `session_key` such as `console-<uuid>` must stay comparable with its row.
-fn bound_scope(scope: &MessageEventScope) -> anyhow::Result<serde_json::Value> {
-    let mut bound = terminal_semantic_scope(scope);
-    let object = bound.as_object_mut().context("terminal scope is not an object")?;
-    for (field, value) in [("sender", &scope.sender), ("recipient", &scope.recipient)] {
-        let stored = value.clone().map(crate::memory::fabric::redact_provider_label);
-        object.insert(field.to_owned(), serde_json::to_value(stored)?);
-    }
-    Ok(bound)
 }
 
 #[cfg(test)]
