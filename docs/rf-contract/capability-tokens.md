@@ -182,9 +182,10 @@ error is in the coded shape. They share the shared API rate limit.
 
 **Session keys.** `session_key` matches `[A-Za-z0-9_-]{8,128}` and does not
 start with `console-`. The session id is the key itself. A caller-keyed session
-belongs to the owner that created it: a message, a messages listing
-(`GET /api/sessions/{session_id}/messages`) or a Console message on it by
-another owner is `404 session_unknown`, exactly like a key that does not exist.
+belongs to the owner that created it: an rf message or a messages listing
+(`GET /api/sessions/{session_id}/messages`) on it by another owner is
+`404 session_unknown`, exactly like a key that does not exist. A Console
+message (no `client_message_id`) keeps its previous behaviour on any session.
 
 | Route | Request | 2xx |
 |---|---|---|
