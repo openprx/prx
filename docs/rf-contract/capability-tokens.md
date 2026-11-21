@@ -362,6 +362,50 @@ the purge of the agent incarnation.
   PRX found this input already stored and did not run it again): the input
   could not be confirmed; treat the outcome as unknown.
 
+## Message delete (`message_delete_v1`)
+
+Owner-authenticated (paired bearer), coded errors, caller-keyed sessions of
+the caller only (another owner's or a missing session: `404 session_unknown`).
+
+| Route | Answer |
+|---|---|
+| `POST /api/sessions/{session_id}/messages/{client_message_id}/delete`, body `{"agent"?: "<name>"\|"main"}` (an empty body is `{}`) | `200 {"message_id","status":"deleted","agents":[{"agent":"main"\|"<name>","runs":["<run_id>",…]},…]}`. `agent` omitted deletes the message for every agent it reached in this session (each agent has its own key); `agent` given, only for that agent. Per agent PRX deletes every attempt's input, the replies and the tool and working rows of those runs; a `deliver:"context"` message answers `runs:[]`. A repeat answers the same `200`. No record of the id (for that agent) in this session: `404 message_unknown`. A bad `agent` or body: `400 field_invalid` |
+| `POST /api/sessions/{session_id}/runs/{run_id}/reply/delete` | Deletes the assistant side of one run (the reply and its tool and working rows); the user's input stays. `200 {"run_id","status":"deleted"}`, the same on a repeat. A run still running: `409 run_active` (cancel it first). No such run of this owner in this session: `404 run_unknown` |
+| `POST /api/sessions/{session_id}/messages/delete`, body `{"ids":[1 to 100 client_message_id],"agent"?}` | `200 {"results":[…]}` in request order, one item per id: the single delete's `200` body, or `{"message_id","error":{"code":"message_unknown","message"}}`. Not all-or-nothing. Empty or more than 100 ids: `400 field_invalid` |
+
+**Tombstone.** Delete removes the content from the stored rows; it does not
+hide it. A deleted row keeps its id, its agent, its timestamp and a deleted
+mark; no length, tool name, title or other derivative of the content remains.
+Copies PRX derived from the deleted rows go in the same transaction:
+embedding-cache entries of their text, retrieval traces of the run,
+compaction summaries and handoff notes built from them, and memories, drafts
+and links PRX recorded with a deleted row as their source. Deleted rows never
+enter a later model context of the agent, recall, a handoff lookup or the
+session tools. `GET /api/sessions/{session_id}/messages` returns a deleted
+row as exactly `{"message_id","agent","deleted":true,"timestamp"}`.
+`GET /api/jobs/{job_id}` of a deleted run reports `result` `{"deleted":true}`.
+Each deleted run (or `context` message) gets one content-free `turn.deleted`
+record for the sync stream (SYNC-1).
+
+**Running turns.** Deleting a message whose turn is still running cancels
+nothing: its input is a tombstone in the history at once, and its reply and
+working rows are tombstoned when the turn ends (PRX applies the delete as
+soon as the run's job has ended). A reply delete of a running run is
+`409 run_active`.
+
+**Not undone.** What tools already did is not undone: files written,
+commands run and messages sent elsewhere stay.
+
+**Memories and documents are not forgotten.** Memories and documents an
+agent stored with its tools during a deleted run stay: PRX does not record
+which run wrote them, so there is no `forget_writes` option yet. Erasing a
+message does not make the agent forget what it already stored.
+
+**Replay.** A resend of a deleted message's key (`POST …/message` with that
+`client_message_id` for that agent) is `409 message_deleted`. The deleted mark
+lives in the message's idempotency record and is kept as long as the record
+(at least 7 days, the same purge). A reply delete leaves the key replayable.
+
 ## Partition and history labels (`targeted_agents_v1`)
 
 **Invariant.** Every read made by a gateway turn on behalf of an agent (Main
@@ -403,7 +447,7 @@ pairing off the listing is unchanged.
 | `message_target_v1` | The message route accepts a target together with caller context | advertised (AC-1b1) |
 | `message_context_delivery_v1` | Caller context is delivered to the turn within published bounds, with `deliver` | advertised (AC-1b1) |
 | `message_idempotency_v1` | The message route deduplicates by an idempotency key, with the replay response, the restart rule and 7-day key retention; cancel by run id; job cancel answers a coded `404 job_unknown` (see Message idempotency) | advertised (AC-1b2a) |
-| `message_delete_v1` | A message can be deleted | not yet |
+| `message_delete_v1` | A message, one run's reply, or a batch of messages can be deleted as tombstones; a deleted key replays `409 message_deleted` (see Message delete) | advertised (AC-1b2b) |
 | `sync_snapshot_v1` | `GET /api/sync/snapshot` returns the owner's sessions and turns; an expired cursor gets `410 snapshot_expired` | not yet |
 | `sync_ws_v1` | `GET /api/sync/ws` carries the durable journal kinds with hello, welcome, ack and cursor resume, the root and parent link fields, `turn.failed{prx_restart,retryable:true}` journaled at start, the config-changed startup check and every C§4 close | not yet |
 | `stream_frames_v1` | Turns stream `stream` frames with `delta` and `tool_status`, a per-run index and `stream_gap` | not yet |
