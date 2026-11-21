@@ -165,19 +165,15 @@ pub(super) fn delete_message(conn: &Connection, request: &RfMessageDelete) -> an
             erase(&tx, &target, Side::Message, attempt)?;
         }
         record_deleted(&tx, &target, Side::Message, attempt, &request.client_message_id)?;
-        let index = match agents.iter().position(|agent| agent.agent_key == attempt.agent_key) {
-            Some(index) => index,
-            None => {
-                agents.push(RfDeletedAgent {
-                    agent_key: attempt.agent_key.clone(),
-                    runs: Vec::new(),
-                    jobs: Vec::new(),
-                    deferred: Vec::new(),
-                });
-                agents.len().saturating_sub(1)
-            }
-        };
-        if let Some(agent) = agents.get_mut(index) {
+        if !agents.iter().any(|agent| agent.agent_key == attempt.agent_key) {
+            agents.push(RfDeletedAgent {
+                agent_key: attempt.agent_key.clone(),
+                runs: Vec::new(),
+                jobs: Vec::new(),
+                deferred: Vec::new(),
+            });
+        }
+        if let Some(agent) = agents.iter_mut().find(|agent| agent.agent_key == attempt.agent_key) {
             agent.runs.extend(attempt.run_id.iter().cloned());
             agent.jobs.extend(attempt.job_id.iter().cloned());
             if live {
@@ -597,7 +593,10 @@ pub(super) fn scrub(pool: &super::SqliteConnectionPool) -> anyhow::Result<bool> 
     if super::memory_impl::truncate_wal(pool, SCRUB_BUDGET).is_err() {
         return Ok(false);
     }
-    pool.write().execute("DELETE FROM rf_wal_scrub_pending", [])?;
+    {
+        let conn = pool.write();
+        conn.execute("DELETE FROM rf_wal_scrub_pending", [])?;
+    }
     // The deleted content is gone; a failure here leaves only the mark
     // table's page in the WAL.
     if let Err(error) = super::memory_impl::truncate_wal(pool, SCRUB_BUDGET) {
