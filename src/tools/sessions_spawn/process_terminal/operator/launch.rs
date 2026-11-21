@@ -172,6 +172,33 @@ fn worker_absent(fields: &LaunchFields, key: &crate::security::runtime_key::Deci
     process_identity::absent(fields.worker_pid)
 }
 
+/// Read-only absence probe over a stored launch payload for `prx doctor`:
+/// the seal must verify under the existing transport secret before the
+/// recorded worker PID is probed. Grants nothing.
+pub(super) fn stored_worker_absent(workspace: &str, run: &str, payload: &str) -> anyhow::Result<bool> {
+    let record: LaunchRecord = serde_json::from_str(payload)?;
+    let fields = record.fields;
+    let transport = crate::session_worker::transport_key::TransportSecret::existing()?.hmac_key();
+    let key = crate::security::runtime_key::DecisionKey::from_worker_channel(
+        &transport,
+        workspace,
+        run,
+        &fields.config_source,
+    )?;
+    anyhow::ensure!(
+        key.verify_hmac(
+            KeyDomain::StateFingerprint,
+            &[b"operator-worker-recovery-launch-v1", &serde_json::to_vec(&fields)?],
+            &record.seal
+        ) && fields.version == 1
+            && fields.worker_pid > 0
+            && fields.workspace == workspace
+            && fields.lineage.run_id == run,
+        "operator launch differs from signed provenance"
+    );
+    worker_absent(&fields, &key)
+}
+
 pub(super) async fn read(
     fabric: &MemoryFabric,
     workspace: &std::path::Path,

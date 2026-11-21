@@ -3,6 +3,7 @@
 mod decision_engine;
 mod ingress;
 mod prompt_cache;
+mod workers;
 use crate::config::Config;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -187,6 +188,7 @@ pub fn diagnose(config: &Config) -> DoctorReport {
     check_decision_plane(config, &mut items);
     check_workspace(config, &mut items);
     ingress::check_recovery_authority(config, &mut items);
+    workers::check_retained_worker_folders(config, &mut items);
     check_legacy_fitness_telemetry(config, &mut items);
     check_workspace_mcp_servers(config, &mut items);
     check_workspace_hooks(config, &mut items);

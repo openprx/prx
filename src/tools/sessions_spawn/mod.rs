@@ -94,6 +94,9 @@ use self::process_control::{ProcessModeRunSeed, new_process_mode_run};
 #[cfg(test)]
 use self::process_mode::classify_worker_output;
 use self::process_mode::run_sub_agent_process;
+pub(crate) use self::process_terminal::retained::{
+    scan_retained_folders, snapshot_carries_credential_field, stored_launch_owner_gone,
+};
 pub(crate) use self::scope::{SPAWN_EXECUTION_CONTEXT, SpawnExecutionContext, ambient_channel_excluded_tools};
 use self::scope::{
     SpawnLineage, SpawnScope, current_spawn_execution_context, parse_spawn_scope, spawn_lineage, spawn_session_key,

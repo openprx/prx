@@ -503,6 +503,11 @@ pub(super) async fn retained_launch(
     }))
 }
 
+/// Read-only owner probe for `prx doctor` over a stored launch payload.
+pub(super) fn stored_launch_worker_absent(workspace: &str, run: &str, payload: &str) -> anyhow::Result<bool> {
+    launch::stored_worker_absent(workspace, run, payload)
+}
+
 pub(super) async fn recover_restart_event(
     fabric: &MemoryFabric,
     workspace: &std::path::Path,

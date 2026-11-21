@@ -14,12 +14,17 @@ use std::path::{Path, PathBuf};
 
 /// Snapshot directory prefix written by `PreparedManifest::prepare`.
 const SNAPSHOT_PREFIX: &str = ".prx-worker-";
+/// Snapshot file inside a snapshot directory.
+const SNAPSHOT_FILE: &str = "manifest.json";
 /// Run directories looked at per scan.
 const MAX_SCANNED_RUN_DIRECTORIES: usize = 4096;
 /// Entries looked at inside one run directory.
 const MAX_ENTRIES_PER_RUN_DIRECTORY: usize = 64;
 /// Folders settled per process start; the rest wait for the next start.
 const MAX_SWEPT_FOLDERS: usize = 64;
+/// Largest snapshot a key-name check reads (the snapshot writer's own bound).
+const MAX_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024;
+
 /// One retained snapshot folder.
 pub(crate) struct RetainedFolder {
     pub(crate) run_id: String,
@@ -76,6 +81,45 @@ pub(crate) fn scan_retained_folders(worker_root: &Path) -> std::io::Result<Retai
         }
     }
     Ok(scan)
+}
+
+/// Whether a retained snapshot still names a credential field. Only top-level
+/// key names are decoded; every value is skipped without being kept.
+pub(crate) fn snapshot_carries_credential_field(folder: &Path) -> anyhow::Result<bool> {
+    use std::io::Read as _;
+    let path = folder.join(SNAPSHOT_FILE);
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let mut bytes = Vec::new();
+    file.take(MAX_SNAPSHOT_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        u64::try_from(bytes.len())? <= MAX_SNAPSHOT_BYTES,
+        "worker snapshot exceeds its byte bound"
+    );
+    let names: CredentialFieldNames = serde_json::from_slice(&bytes)?;
+    Ok(names.api_key.0)
+}
+
+/// The credential field names a snapshot may still hold. Other fields are
+/// skipped; a present field is recorded as present without keeping its value.
+#[derive(serde::Deserialize)]
+struct CredentialFieldNames {
+    #[serde(default)]
+    api_key: FieldPresent,
+}
+
+/// `true` once the field name occurred, whatever its value (even `null`).
+#[derive(Default)]
+struct FieldPresent(bool);
+
+impl<'de> serde::Deserialize<'de> for FieldPresent {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        serde::de::IgnoredAny::deserialize(deserializer).map(|_| Self(true))
+    }
 }
 
 /// What a signed launch says about a retained folder's worker.
@@ -243,4 +287,19 @@ fn remove_snapshot_folder(folder: &RetainedFolder) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Read-only owner check for `prx doctor`: verify a stored launch payload's
+/// seal and probe its worker process. `true` means the owner is gone.
+pub(crate) fn stored_launch_owner_gone(
+    workspace: &str,
+    run: &str,
+    event_type: &str,
+    payload: &str,
+) -> anyhow::Result<bool> {
+    match event_type {
+        "worker.ordinary.recovery.registered" => super::ordinary::stored_launch_worker_absent(workspace, run, payload),
+        "worker.operator.recovery.registered" => super::operator::stored_launch_worker_absent(workspace, run, payload),
+        _ => anyhow::bail!("unsupported worker launch record"),
+    }
 }
