@@ -102,7 +102,7 @@ pub(super) fn both_gateway_launch_paths_register_their_tools_from_one_body() {
     assert!(controlled.ends_with("letresult=super::run_gateway_inner(host,port,config,None,shutdown,Some(producer)).await;letcleanup=profile.close_reader().await;cleanup?;result}"),
         "controlled Gateway must forward its verified producer to the same owner and retain cleanup");
 
-    for entry in ["build_gateway_turn_runtime", "run_gateway_inner"] {
+    for entry in ["build_gateway_turn_state", "run_gateway_inner"] {
         let body = function_body(&production, entry);
         assert!(
             body.contains("register_gateway_turn_tools("),
