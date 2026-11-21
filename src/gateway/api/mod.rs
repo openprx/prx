@@ -488,17 +488,27 @@ async fn api_rate_limit_middleware(State(state): State<AppState>, request: Reque
     };
 
     if !state.rate_limiter.allow_api(&rate_key) {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(serde_json::json!({
-                "error": "Too many API requests. Please retry later.",
-                "retry_after": super::RATE_LIMIT_WINDOW_SECS,
-            })),
-        )
-            .into_response();
+        return rate_limited_response();
     }
 
     next.run(request).await
+}
+
+/// The coded `429 rate_limited` of the shared API limit. The sliding window
+/// does not compute the exact wait, so both the `Retry-After` header (seconds)
+/// and `retry_after_ms` carry the window length: an upper bound.
+fn rate_limited_response() -> Response {
+    let retry_after_ms = super::RATE_LIMIT_WINDOW_SECS.saturating_mul(1000);
+    let mut response = capabilities::coded_error_value(
+        StatusCode::TOO_MANY_REQUESTS,
+        "rate_limited",
+        "Too many API requests. Please retry later.",
+        Some(("retry_after_ms", serde_json::Value::from(retry_after_ms))),
+    );
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, header::HeaderValue::from(super::RATE_LIMIT_WINDOW_SECS));
+    response
 }
 
 pub(super) fn configured_channel_names(config: &Config) -> Vec<String> {

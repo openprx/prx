@@ -18,10 +18,20 @@ tokens it does not know.
 4. PRX never adds a static path segment under `/api/agents/` that starts with
    `a_`, and never mints a session key that starts with `rf-`.
 
+## General errors
+
+These codes can answer any `/api` route, in the coded shape:
+
+- `429 rate_limited` `{"error":{"code","message","retry_after_ms"}}`: the
+  shared API rate limit. The response also carries `Retry-After` in seconds.
+  Both give the limiter window (60 s) as an upper bound: retry after at most
+  this long. Exception: `GET /api/skills/discover` reports an upstream limit
+  in its own shape `{"code":"rate_limited","error":"<text>"}`.
+
 ## Routes: capabilities and catalog
 
 Both routes use the same bearer check as the other `/api` routes and the
-shared API rate limit (its `429` body is unchanged). Both are reads: they
+shared API rate limit (`429 rate_limited`, see General errors). Both are reads: they
 change no configuration, write no store and are not gated by autonomy. No body
 carries a credential, a key id or a URL with userinfo.
 

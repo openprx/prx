@@ -147,9 +147,25 @@ pub(super) fn coded_error_with(
     message: &str,
     extra: Option<(&'static str, &str)>,
 ) -> Response {
+    coded_error_value(
+        status,
+        code,
+        message,
+        extra.map(|(key, value)| (key, serde_json::Value::String(value.to_owned()))),
+    )
+}
+
+/// The coded error body with one extra field of any JSON type (for example
+/// the numeric `retry_after_ms` of a `429`).
+pub(super) fn coded_error_value(
+    status: StatusCode,
+    code: &str,
+    message: &str,
+    extra: Option<(&'static str, serde_json::Value)>,
+) -> Response {
     let mut error = serde_json::json!({ "code": code, "message": message });
     if let (Some((key, value)), Some(object)) = (extra, error.as_object_mut()) {
-        object.insert(key.to_owned(), serde_json::Value::String(value.to_owned()));
+        object.insert(key.to_owned(), value);
     }
     (status, Json(serde_json::json!({ "error": error }))).into_response()
 }

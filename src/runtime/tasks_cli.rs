@@ -273,18 +273,27 @@ pub fn session_is_unregistered(error: &anyhow::Error) -> bool {
 }
 
 /// The `code` and `error` fields the API sends with a refusal, when it sends
-/// them. One reader, so a test double and the live client cannot disagree about
-/// what a refusal body means.
+/// them; for the coded shape `{"error":{"code","message"}}` its `code` and
+/// `message`. One reader, so a test double and the live client cannot disagree
+/// about what a refusal body means.
 fn refusal_fields(body: &str) -> (Option<String>, Option<String>) {
     let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+    let coded = parsed
+        .as_ref()
+        .and_then(|value| value.get("error"))
+        .filter(|error| error.is_object());
+    let source = coded.or(parsed.as_ref());
     let field = |name: &str| {
-        parsed
-            .as_ref()
+        source
             .and_then(|value| value.get(name))
             .and_then(serde_json::Value::as_str)
             .map(ToString::to_string)
     };
-    (field("code"), field("error"))
+    if coded.is_some() {
+        (field("code"), field("message"))
+    } else {
+        (field("code"), field("error"))
+    }
 }
 
 /// Rebuild the error a refusal body would have produced, for tests that need a
