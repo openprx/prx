@@ -78,8 +78,12 @@ impl Tool for DocumentGetChunkTool {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow::anyhow!("Missing non-empty 'chunk_id' parameter"))?;
+        // MA-01h: the chunk is read only inside the caller's agent partition; an
+        // unreadable partition is refused. A chunk of another partition reads
+        // exactly as a missing one.
+        crate::tools::execution::trusted_scope_read_partition(&args)?;
         let principal = parse_scope_principal(&args, self.workspace_id());
-        let Some(chunk) = memory_view.get_document_chunk(chunk_id).await? else {
+        let Some(chunk) = memory_view.get_document_chunk_scoped(chunk_id, &principal).await? else {
             let dropped = vec![dropped_chunk_item(chunk_id, "not_found")];
             let trace_id = append_document_tool_retrieval_trace(
                 memory_view.as_ref(),

@@ -1,6 +1,6 @@
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
-use crate::memory::Memory;
 use crate::memory::principal::MemoryWriteContext;
+use crate::memory::{Memory, MemoryReadMode};
 use async_trait::async_trait;
 use serde_json::json;
 use std::fmt::Write;
@@ -134,6 +134,8 @@ impl Tool for MemoryRecallTool {
         // production registry also passes the real flag so local ACL-enabled
         // recalls take the same scoped branch.
         let isolated = crate::tools::execution::scope_requires_owner_match(&args);
+        // MA-01h: a partitioned caller recalls only rows of its own partition.
+        let partition = crate::tools::execution::trusted_scope_read_partition(&args)?;
         let recall_result = if self.acl_enabled || isolated {
             let mut scope_ctx = parse_scope_ctx(&args).unwrap_or(MemoryWriteContext {
                 agent_partition: None,
@@ -148,8 +150,16 @@ impl Tool for MemoryRecallTool {
                 require_owner_match: false,
             });
             scope_ctx.require_owner_match = isolated;
+            scope_ctx.agent_partition = partition;
             memory
                 .recall_with_context(query, limit, session_id, Some(&scope_ctx))
+                .await
+        } else if let Some(partition) = partition {
+            // The unscoped recall of an ACL-off turn, kept inside the partition.
+            let mut scope_ctx = parse_scope_ctx(&args).unwrap_or_default();
+            scope_ctx.agent_partition = Some(partition);
+            memory
+                .recall_with_context_mode(query, limit, session_id, Some(&scope_ctx), MemoryReadMode::Observe)
                 .await
         } else {
             memory.recall(query, limit, session_id).await

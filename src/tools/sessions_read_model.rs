@@ -143,7 +143,11 @@ pub(crate) fn principal_from_args(args: &Value, workspace_id: &str) -> MemoryPri
         // comes from the service-authored scope, never from caller arguments.
         require_owner_match: crate::tools::execution::scope_requires_owner_match(args),
         legacy_session_key: None,
-        agent_partition: None,
+        // MA-01h: recovered runs are read inside the caller's partition. An
+        // unreadable partition admits nothing through `RunOwnerScope`.
+        agent_partition: crate::tools::execution::trusted_scope_read_partition(args)
+            .ok()
+            .flatten(),
     }
 }
 
@@ -257,10 +261,20 @@ impl RunOwnerScope {
     pub(crate) fn from_args(args: &Value) -> Self {
         if let Some(context) = crate::tools::execution::current_child_call_context() {
             let context = context.context();
+            if named_partition(context.envelope.agent_partition.as_ref()) {
+                return Self::Owner(None);
+            }
             if !context.envelope.owner_isolated && context.is_local_operator() {
                 return Self::Unrestricted;
             }
             return Self::Owner(effective_run_owner_from_context(context));
+        }
+        // MA-01h: registry runs carry no agent partition and a named agent
+        // starts none (its spawn tools are excluded), so a named agent, or a
+        // call whose partition cannot be read, sees no run at all.
+        match crate::tools::execution::trusted_scope_read_partition(args) {
+            Ok(partition) if !named_partition(partition.as_ref()) => {}
+            Ok(_) | Err(_) => return Self::Owner(None),
         }
         if crate::tools::execution::scope_requires_owner_match(args) {
             return Self::Owner(
@@ -311,6 +325,13 @@ impl RunOwnerScope {
             Self::Owner(_) => rows.into_iter().filter(|row| self.admits(owner_of(row))).collect(),
         }
     }
+}
+
+fn named_partition(partition: Option<&crate::memory::AgentPartition>) -> bool {
+    matches!(
+        partition.map(|partition| &partition.key),
+        Some(crate::memory::PartitionKey::Named { .. })
+    )
 }
 
 fn task_runs_from_events(events: Vec<MemoryEvent>, limit: usize) -> Vec<RecoveredTaskRun> {

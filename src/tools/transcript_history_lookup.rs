@@ -58,6 +58,8 @@ impl TranscriptHistoryLookupTool {
                 .get("owner_id")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string),
+            // MA-01h: the session's rows of the caller's own agent partition only.
+            agent_partition: crate::tools::execution::trusted_scope_read_partition(args)?,
             ..MemoryPrincipal::default()
         })
     }

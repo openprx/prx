@@ -177,6 +177,8 @@ impl Tool for MemorySearchTool {
         let isolated = crate::tools::execution::scope_requires_owner_match(&args);
         let mut scope_ctx = parse_scope_ctx(&args).unwrap_or_default();
         scope_ctx.require_owner_match = isolated;
+        // MA-01h: the search stays in the caller's agent partition in both modes.
+        scope_ctx.agent_partition = crate::tools::execution::trusted_scope_read_partition(&args)?;
         let mode = if self.acl_enabled || isolated {
             MemoryReadMode::Enforce
         } else {

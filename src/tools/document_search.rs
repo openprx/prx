@@ -214,6 +214,8 @@ impl Tool for DocumentSearchTool {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow::anyhow!("Missing non-empty 'query' parameter"))?;
+        // MA-01h: an unreadable partition is refused, never searched unpartitioned.
+        crate::tools::execution::trusted_scope_read_partition(&args)?;
         let principal = parse_scope_principal(&args, self.workspace_id());
         let results = memory_view
             .search_document_chunks(&principal, query, parse_limit(&args))

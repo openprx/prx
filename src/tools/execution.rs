@@ -3911,6 +3911,38 @@ pub(crate) fn trusted_scope_agent_partition(args: &serde_json::Value) -> Option<
     }
 }
 
+/// The agent partition a read made for this call must stay in (MA-01h).
+///
+/// `Ok(None)` only when the call carries no trusted scope or its trusted scope
+/// names no partition (a turn that runs under none, such as the terminal). A
+/// trusted scope whose partition is present but unreadable is refused, never
+/// read as unpartitioned.
+///
+/// # Errors
+///
+/// [`crate::memory::AgentPartitionUnreadable`] for an unreadable partition.
+pub(crate) fn trusted_scope_read_partition(
+    args: &serde_json::Value,
+) -> Result<Option<crate::memory::AgentPartition>, crate::memory::AgentPartitionUnreadable> {
+    let trusted = args
+        .get("_zc_scope_trusted")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !trusted {
+        return Ok(None);
+    }
+    let Some(raw) = args.get("_zc_scope").and_then(|scope| scope.get("agent_partition")) else {
+        return Ok(None);
+    };
+    serde_json::from_value(raw.clone()).map(Some).map_err(|error| {
+        tracing::warn!(
+            error_category = ?error.classify(),
+            "refusing a read whose trusted agent_partition is malformed"
+        );
+        crate::memory::AgentPartitionUnreadable
+    })
+}
+
 /// Who is creating scheduled work with this call, and at what level: the
 /// call's level from the execution service's carrier (`None` off the service
 /// path) and the agent from the trusted scope's partition. A trusted scope

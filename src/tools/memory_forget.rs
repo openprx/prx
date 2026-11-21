@@ -154,10 +154,13 @@ impl Tool for MemoryForgetTool {
         // keeps the historical `Option`: a caller without a trusted scope still
         // reaches the unscoped delete it always did.
         let isolated = crate::tools::execution::scope_requires_owner_match(&args);
+        // MA-01h: a partitioned caller can delete only a row of its own partition.
+        let partition = crate::tools::execution::trusted_scope_read_partition(&args)?;
         let mut scope_ctx = parse_scope_ctx(&args);
-        if isolated {
+        if isolated || partition.is_some() {
             let mut context = scope_ctx.unwrap_or_default();
             context.require_owner_match = isolated;
+            context.agent_partition = partition;
             scope_ctx = Some(context);
         }
         match memory.forget_with_context(key, scope_ctx.as_ref()).await {
