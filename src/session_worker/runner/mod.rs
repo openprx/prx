@@ -15,7 +15,6 @@ mod validate;
 pub(crate) use self::capability::AuthenticatedWorkerTransport;
 use self::capability::capability_expiry_from_env;
 use self::paths::parse_tools_override;
-use self::provider::worker_credentials;
 use self::run::run_authenticated_manifest;
 pub(crate) use self::run::worker_child_skill_reader;
 use self::steering::spawn_stdin_control_reader;

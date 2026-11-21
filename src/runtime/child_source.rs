@@ -506,6 +506,11 @@ impl ChildProviderBinding {
     pub(crate) fn provider_name(&self) -> &str {
         self.resolved.provider_label()
     }
+    /// The secret this binding's own resolution released, for the worker's
+    /// provider-scoped fallbacks. Never serialized.
+    pub(crate) fn credential_api_key(&self) -> Option<&str> {
+        self.resolved.credential().api_key()
+    }
 
     /// Bind ordinary input metadata to this factory instance and local snapshot.
     /// This does not mint a parent grant or a delegated source proof.

@@ -2,31 +2,6 @@ use super::SessionsSpawnTool;
 use crate::config::DelegateAgentConfig;
 use crate::providers;
 
-/// Select a credential for a child provider.
-///
-/// Each credential in scope goes only to the provider identity it was issued
-/// for: a named agent's key to that agent's own provider, the gateway fallback
-/// to the gateway provider. A child on any other provider gets none and
-/// resolves its own auth profile, or runs keyless.
-pub(super) fn resolve_child_provider_api_key(
-    selected_agent: Option<&DelegateAgentConfig>,
-    fallback_api_key: Option<&str>,
-    child_provider_name: &str,
-    gateway_provider_name: &str,
-) -> Option<String> {
-    providers::credential_for_provider_identity(
-        child_provider_name,
-        &[
-            (
-                selected_agent.map(|agent| agent.provider.as_str()),
-                selected_agent.and_then(|agent| agent.api_key.as_deref()),
-            ),
-            (Some(gateway_provider_name), fallback_api_key),
-        ],
-    )
-    .map(str::to_string)
-}
-
 impl SessionsSpawnTool {
     /// Whether an ordinary child request names the already-admitted parent
     /// connection. A named agent with its own credential and a routed parent

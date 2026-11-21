@@ -416,7 +416,6 @@ async fn run_owned_manifest(
             None
         };
 
-    let credentials = worker_credentials(&manifest, &config);
     let memory: Arc<dyn Memory> = if normalized_worker_memory_strategy(&manifest)? == "shared_fabric" {
         let parent_workspace = manifest
             .memory_workspace_id
@@ -525,6 +524,14 @@ async fn run_owned_manifest(
     } else {
         return Err(crate::session_worker::protocol::WorkerManifestUnsupported.into());
     };
+    // The worker's own sealed binding resolved its credential from config and
+    // the sealed reference; the manifest carries no credential value.
+    let worker_binding = operator_authority
+        .as_ref()
+        .map(|authority| authority.binding())
+        .or_else(|| ordinary_authority.as_ref().map(|authority| authority.binding()))
+        .context("worker provider binding missing")?;
+    let credentials = worker_credentials(&manifest, worker_binding.credential_api_key(), &config);
 
     let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::from(runtime::create_runtime(&config.runtime)?);
     let shared_config = crate::config::new_shared(config.clone());

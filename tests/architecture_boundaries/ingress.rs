@@ -53,13 +53,13 @@ pub(super) fn ordinary_worker_credential_comparison_rejects_unscoped_neighbors_a
     ));
     let path = "src/session_worker/runner/ordinary_source.rs";
     let source = read_source(&repository_root().join(path));
-    let comparison = "resolved.credential().api_key() == credentials.sealed_key";
+    let comparison = "resolved.credential().reference() == &selection.credential";
     assert_eq!(source.matches(comparison).count(), 1);
     for replacement in [
         "resolved.credential().api_key() == manifest.api_key.as_deref()",
         "resolved.credential().api_key() == config.api_key.as_deref()",
         "resolved.credential().api_key() == credentials.provider.api_key",
-        "resolved.credential().api_key() == credentials.sealed_key && resolved.credential().api_key() == credentials.sealed_key",
+        "resolved.credential().reference() == &selection.credential && resolved.credential().reference() == &selection.credential",
     ] {
         assert!(scanner_fails_with(
             session_worker_credentials_are_decided_in_one_scoped_place,

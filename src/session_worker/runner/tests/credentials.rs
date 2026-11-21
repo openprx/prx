@@ -28,10 +28,9 @@ fn root_config(temp: &Path) -> Config {
     config
 }
 
-fn non_default_manifest(temp: &Path, api_key: Option<&str>) -> WorkerManifest {
+fn non_default_manifest(temp: &Path) -> WorkerManifest {
     let mut manifest = base_manifest(temp, "capability");
     manifest.provider_name = "custom:https://model-chosen.example/v1".to_string();
-    manifest.api_key = api_key.map(str::to_string);
     manifest
 }
 
@@ -43,16 +42,15 @@ fn a_non_default_worker_spawn_fallback_is_never_the_root_key() {
     let temp = tempfile::tempdir().expect("test: temp dir");
     let config = root_config(temp.path());
 
-    let keyless = non_default_manifest(temp.path(), None);
+    let manifest = non_default_manifest(temp.path());
     assert_eq!(
-        worker_credentials(&keyless, &config).spawn_fallback,
+        worker_credentials(&manifest, None, &config).spawn_fallback,
         None,
         "the root key must not become the fallback for the worker's own provider"
     );
 
-    let keyed = non_default_manifest(temp.path(), Some(WORKER_AGENT_SENTINEL));
     assert_eq!(
-        worker_credentials(&keyed, &config).spawn_fallback,
+        worker_credentials(&manifest, Some(WORKER_AGENT_SENTINEL), &config).spawn_fallback,
         Some(WORKER_AGENT_SENTINEL)
     );
 }
@@ -63,10 +61,10 @@ fn a_non_default_worker_spawn_fallback_is_never_the_root_key() {
 fn a_worker_root_slot_is_never_an_agent_key() {
     let temp = tempfile::tempdir().expect("test: temp dir");
     let config = root_config(temp.path());
-    let manifest = non_default_manifest(temp.path(), Some(WORKER_AGENT_SENTINEL));
+    let manifest = non_default_manifest(temp.path());
 
     assert_eq!(
-        worker_credentials(&manifest, &config).root_api_key,
+        worker_credentials(&manifest, Some(WORKER_AGENT_SENTINEL), &config).root_api_key,
         Some(WORKER_ROOT_SENTINEL),
         "an agent key must not stand in for the root key"
     );

@@ -285,7 +285,6 @@ impl OperatorProcessLaunch {
             source.resolved.credential().reference(),
             crate::providers::credentials::CredentialRef::LegacyInline(crate::providers::credentials::LegacySlot::Root)
         );
-        worker.api_key = source.resolved.credential().api_key().map(str::to_owned);
         worker.direct_uses_root_connection = source.route.is_none() && root;
         worker.route_uses_root_connection = source.route.is_some() && root;
         worker.route_source_provider = source.route.as_ref().map(|_| source.proof.provider_name().to_owned());

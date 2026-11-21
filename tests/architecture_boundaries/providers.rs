@@ -194,13 +194,7 @@ pub(super) fn session_worker_credentials_are_decided_in_one_scoped_place() {
             let restored = compact_rust_tokens(&function_body(&production, "restore"));
             assert_eq!(
                 restored
-                    .matches("letcredentials=super::worker_credentials(manifest,&generation.effective);")
-                    .count(),
-                1
-            );
-            assert_eq!(
-                restored
-                    .matches("resolved.credential().api_key()==credentials.sealed_key")
+                    .matches("resolved.credential().reference()==&selection.credential")
                     .count(),
                 1
             );
@@ -283,11 +277,7 @@ pub(super) fn session_worker_credentials_are_decided_in_one_scoped_place() {
                         .rev()
                         .collect();
                     assert!(
-                        matches!(receiver.as_str(), "credentials.provider" | "config.composio")
-                            || (relative == "src/session_worker/runner/ordinary_source.rs"
-                                && function == "restore"
-                                && field == ".api_key"
-                                && normalized == "&&resolved.credential().api_key()==credentials.sealed_key"),
+                        matches!(receiver.as_str(), "credentials.provider" | "config.composio"),
                         "{relative} (fn {function}) reads `{receiver}{field}`; outside `worker_credentials` only \
                          the scoped `credentials.provider` may be read"
                     );

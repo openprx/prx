@@ -129,7 +129,6 @@ pub struct WorkerManifest {
     pub task: String,
     pub provider_name: String,
     pub model: String,
-    pub api_key: Option<String>,
     /// Selected model route, when the parent resolved a `hint:` model.
     /// The worker verifies its destination against the sealed config.
     #[serde(default)]
@@ -401,7 +400,6 @@ mod tests {
             task: "analyze".into(),
             provider_name: "openrouter".into(),
             model: "anthropic/claude-sonnet-4.6".into(),
-            api_key: None,
             route_hint: None,
             route_source_provider: None,
             route_credential: None,
@@ -588,7 +586,6 @@ mod tests {
             task: "t".into(),
             provider_name: "mock".into(),
             model: "mock".into(),
-            api_key: None,
             route_hint: None,
             route_source_provider: None,
             route_credential: None,

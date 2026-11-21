@@ -865,7 +865,7 @@ fn mutation_proof_credential_comparison_guard() {
     assert_reviewed_source_mutation(
         ordinary_worker_credential_comparison_rejects_unscoped_neighbors_and_duplicates,
         "src/session_worker/runner/ordinary_source.rs",
-        "resolved.credential().api_key() == credentials.sealed_key",
+        "resolved.credential().reference() == &selection.credential",
         "resolved.credential().api_key() == manifest.api_key.as_deref()",
     );
 }

@@ -357,7 +357,6 @@ async fn restore_operator_process(
         task: task.to_owned(),
         provider_name: source.resolved().provider_label().to_owned(),
         model: source.resolved().model().to_owned(),
-        api_key: None,
         route_hint: source.route().map(|route| route.hint.clone()),
         route_source_provider: None,
         route_credential: None,

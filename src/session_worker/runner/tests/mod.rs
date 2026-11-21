@@ -22,7 +22,6 @@ pub(crate) fn base_manifest(workspace: &Path, capability: &str) -> WorkerManifes
         task: "noop".to_string(),
         provider_name: "provider".to_string(),
         model: "model".to_string(),
-        api_key: None,
         route_hint: None,
         route_source_provider: None,
         route_credential: None,

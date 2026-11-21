@@ -7,8 +7,8 @@ use super::{
     current_spawn_execution_context, deliver_or_withhold_notice, exited_without_result_reason, format_announce_message,
     new_process_mode_run, normalize_process_memory_strategy, parse_memory_scope, parse_spawn_scope, process_terminal,
     record_spawn_request_event, record_spawn_result_event, refresh_tools_for_explicit_allowlist,
-    register_killable_process_run, resolve_child_provider_api_key, resolve_tools_for_agent, run_sub_agent_process,
-    run_sub_agent_task, running_run_count, spawn_event_scope, spawn_lineage, spawn_session_key, spawn_started_text,
+    register_killable_process_run, resolve_tools_for_agent, run_sub_agent_process, run_sub_agent_task,
+    running_run_count, spawn_event_scope, spawn_lineage, spawn_session_key, spawn_started_text,
     sub_agent_reported_failure, task_failure_reason, task_terminal, termination_cause, watch_process_mode_monitor,
     watch_task_mode_monitor,
 };
@@ -665,21 +665,6 @@ impl SessionsSpawnTool {
             .as_ref()
             .and_then(|(_, cfg)| cfg.temperature)
             .unwrap_or(child_model_config.default_temperature);
-        // A gateway key is only meaningful for the gateway provider, and a named
-        // agent's key only for that agent's own provider. Passing either to a
-        // different provider hands one vendor's secret to another (and, for a
-        // model-chosen provider, to a host the model picked).
-        let resolved_api_key = selected_hint.as_ref().map_or_else(
-            || {
-                resolve_child_provider_api_key(
-                    selected_agent.as_ref().map(|(_, cfg)| cfg),
-                    self.fallback_api_key.as_deref(),
-                    &resolved_provider_name,
-                    &self.fallback_api_key_owner,
-                )
-            },
-            |resolved| resolved.credential().api_key().map(str::to_string),
-        );
         let reuses_parent_provider =
             self.reuses_parent_provider_identity(selected_agent.as_ref().map(|(_, cfg)| cfg), &resolved_provider_name);
         // A spelling alias of the already-configured gateway is the same
@@ -858,7 +843,6 @@ impl SessionsSpawnTool {
 
             let model = resolved_model;
             let provider_name = resolved_provider_name;
-            let api_key = resolved_api_key;
             let route_hint = selected_route_hint;
             let workspace_root = child_model_config.workspace_dir.clone();
             let worker_workspace_root = spawn_config
@@ -1029,7 +1013,6 @@ impl SessionsSpawnTool {
                                 &task_owned,
                                 &provider_name,
                                 &model,
-                                api_key.as_deref(),
                                 route_hint.as_deref(),
                                 route_source_provider.as_deref(),
                                 route_credential.as_ref(),

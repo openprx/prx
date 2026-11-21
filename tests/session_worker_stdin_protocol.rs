@@ -226,7 +226,7 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
         Some(CredentialRef::LegacyInline(LegacySlot::ModelRoute("fast".to_string()))),
         "{WIRE_UNCHANGED}"
     );
-    manifest.api_key = Some(WIRE_ROOT_KEY.to_string());
+    manifest.route_credential = Some(CredentialRef::LegacyInline(LegacySlot::Root));
     let expiry = far_future_expiry();
     let bad_run = run_forged_worker(&mut manifest, &home, &transport_secret, expiry);
     assert!(
@@ -697,7 +697,6 @@ fn manifest_for(config_dir: &Path, workspace_dir: &Path) -> WorkerManifest {
         task: "noop".to_string(),
         provider_name: "mock".to_string(),
         model: "mock".to_string(),
-        api_key: None,
         route_hint: None,
         route_source_provider: None,
         route_credential: None,

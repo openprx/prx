@@ -77,12 +77,15 @@ pub(super) fn restore(
         resolved.credential().reference(),
         crate::providers::credentials::CredentialRef::LegacyInline(crate::providers::credentials::LegacySlot::Root)
     );
-    let credentials = super::worker_credentials(manifest, &generation.effective);
+    // The credential is compared by its non-secret identity only: provider
+    // (above and below) plus the sealed reference (source kind and name). The
+    // worker presents the material its own resolution released; no copy of it
+    // travels in the manifest.
     anyhow::ensure!(
         crate::providers::ProviderId::of(resolved.provider_label())
             == crate::providers::ProviderId::of(&manifest.provider_name)
             && resolved.model() == manifest.model
-            && resolved.credential().api_key() == credentials.sealed_key
+            && resolved.credential().reference() == &selection.credential
             && route.map(|route| route.hint.as_str()) == manifest.route_hint.as_deref()
             && manifest.direct_uses_root_connection == (route.is_none() && root)
             && manifest.route_uses_root_connection == (route.is_some() && root)

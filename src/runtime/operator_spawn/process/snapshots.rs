@@ -97,7 +97,7 @@ impl OperatorProcessSnapshots {
             crate::providers::ProviderId::of(resolved.provider_label())
                 == crate::providers::ProviderId::of(&manifest.provider_name)
                 && resolved.model() == manifest.model
-                && resolved.credential().api_key() == manifest.api_key.as_deref()
+                && resolved.credential().reference() == &selection.credential
                 && route.as_ref().map(|route| route.hint.as_str()) == manifest.route_hint.as_deref()
                 && manifest.direct_uses_root_connection == (route.is_none() && root)
                 && manifest.route_uses_root_connection == (route.is_some() && root)

@@ -235,7 +235,6 @@ impl OrdinaryProcessLaunch {
             resolved.credential().reference(),
             crate::providers::credentials::CredentialRef::LegacyInline(crate::providers::credentials::LegacySlot::Root)
         );
-        worker.api_key = resolved.credential().api_key().map(str::to_owned);
         worker.direct_uses_root_connection = route.is_none() && root;
         worker.route_uses_root_connection = route.is_some() && root;
         worker.route_source_provider = route.map(|_| selection.provider.clone());

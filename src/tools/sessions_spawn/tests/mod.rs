@@ -14,7 +14,6 @@ mod actions;
 mod announce;
 mod chat_assign;
 mod credential_containment;
-mod credential_resolution;
 mod join;
 mod join_verdicts;
 mod kill_and_events;
@@ -706,7 +705,6 @@ fn admission_clone(tool: &SessionsSpawnTool) -> SessionsSpawnTool {
         parent_hooks: tool.parent_hooks.clone(),
         workspace_dir: tool.workspace_dir.clone(),
         agents: Arc::clone(&tool.agents),
-        fallback_api_key: tool.fallback_api_key.clone(),
         configured_providers: tool.configured_providers.clone(),
         model_catalog: Arc::clone(&tool.model_catalog),
         hint_config: tool.hint_config.clone(),

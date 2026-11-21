@@ -8,14 +8,13 @@ use std::sync::Arc;
 /// issued for.
 ///
 /// A worker runs on `manifest.provider_name`, which the parent may have taken
-/// from a model's per-call `provider` argument, and it carries at most the
-/// credential the parent released for that provider (`manifest.api_key`). The
+/// from a model's per-call `provider` argument. The credential for that
+/// provider is the material the worker's own sealed binding resolved
+/// (`resolved_key`); the manifest carries only its non-secret reference. The
 /// root key, base URL and rotation keys belong to the configured default
 /// provider. Each consumer below receives only the credential for the provider
 /// it will present it to.
 pub(super) struct WorkerCredentials<'a> {
-    /// Sealed credential material, retained only for manifest/config comparison.
-    pub(super) sealed_key: Option<&'a str>,
     /// Fallback for the worker's `sessions_spawn`, which pairs it with
     /// `manifest.provider_name`.
     pub(super) spawn_fallback: Option<&'a str>,
@@ -24,7 +23,11 @@ pub(super) struct WorkerCredentials<'a> {
     pub(super) root_api_key: Option<&'a str>,
 }
 
-pub(super) fn worker_credentials<'a>(manifest: &'a WorkerManifest, config: &'a Config) -> WorkerCredentials<'a> {
+pub(super) fn worker_credentials<'a>(
+    manifest: &WorkerManifest,
+    resolved_key: Option<&'a str>,
+    config: &'a Config,
+) -> WorkerCredentials<'a> {
     let configured_provider = crate::providers::selection::default_provider(config);
     let uses_root = if manifest.route_hint.is_some() {
         manifest.route_uses_root_connection
@@ -40,13 +43,12 @@ pub(super) fn worker_credentials<'a>(manifest: &'a WorkerManifest, config: &'a C
         )
     } else {
         crate::providers::ProviderConnection {
-            api_key: manifest.api_key.as_deref().map(str::trim).filter(|key| !key.is_empty()),
+            api_key: resolved_key.map(str::trim).filter(|key| !key.is_empty()),
             api_url: None,
             released: false,
         }
     };
     WorkerCredentials {
-        sealed_key: manifest.api_key.as_deref(),
         spawn_fallback: if manifest.route_hint.is_some() {
             config.api_key.as_deref()
         } else {

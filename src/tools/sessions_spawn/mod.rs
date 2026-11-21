@@ -89,7 +89,6 @@ use self::process_control::{ProcessModeRunSeed, new_process_mode_run};
 #[cfg(test)]
 use self::process_mode::classify_worker_output;
 use self::process_mode::run_sub_agent_process;
-use self::provider::resolve_child_provider_api_key;
 pub(crate) use self::scope::{SPAWN_EXECUTION_CONTEXT, SpawnExecutionContext, ambient_channel_excluded_tools};
 use self::scope::{
     SpawnLineage, SpawnScope, current_spawn_execution_context, parse_spawn_scope, spawn_lineage, spawn_session_key,
@@ -416,9 +415,6 @@ pub struct SessionsSpawnTool {
     workspace_dir: PathBuf,
     /// Configured named agents for identity/model/tool scoping in spawn.
     agents: Arc<HashMap<String, DelegateAgentConfig>>,
-    /// Credential issued for `provider_name` (the gateway provider): released
-    /// to a child only when the child runs on that same provider identity.
-    fallback_api_key: Option<String>,
     /// The providers the operator configured: the only ones a per-call
     /// `provider` argument may name.
     configured_providers: providers::ConfiguredProviders,
