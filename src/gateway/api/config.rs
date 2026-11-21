@@ -29,10 +29,14 @@ pub async fn post_config_reload(State(state): State<AppState>, headers: HeaderMa
     };
     match tool.execute(serde_json::json!({})).await {
         Ok(result) if result.success => {
-            retry_turn_runtime_standby(&state).await;
+            let message = if retry_turn_runtime_standby(&state).await {
+                report_turn_runtime_rebuilt(result.output)
+            } else {
+                result.output
+            };
             (
                 StatusCode::OK,
-                Json(serde_json::json!({ "success": true, "message": result.output })),
+                Json(serde_json::json!({ "success": true, "message": message })),
             )
                 .into_response()
         }
@@ -59,14 +63,37 @@ pub async fn post_config_reload(State(state): State<AppState>, headers: HeaderMa
 /// credential its retry (see `GatewayTurnRuntimeOwner::retry_standby`). The
 /// reload itself already succeeded, so a failed retry is logged and leaves the
 /// turn routes answering `503 provider_not_ready`.
-async fn retry_turn_runtime_standby(state: &AppState) {
+/// `true` when the retry made the turn runtime ready.
+async fn retry_turn_runtime_standby(state: &AppState) -> bool {
     let Some(owner) = state.turn_runtime.clone() else {
-        return;
+        return false;
     };
     match crate::runtime::blocking::spawn_blocking(move || owner.retry_standby()).await {
-        Ok(Ok(())) => {}
-        Ok(Err(_)) | Err(_) => warn!("gateway turn runtime could not be rebuilt after the reload"),
+        Ok(Ok(rebuilt)) => rebuilt,
+        Ok(Err(_)) | Err(_) => {
+            warn!("gateway turn runtime could not be rebuilt after the reload");
+            false
+        }
     }
+}
+
+/// The reload report with the turn runtime the retry rebuilt: its name in
+/// `rebuilt`, and `status` `applied` where the reload alone changed nothing.
+/// A report that does not parse is returned as it was.
+fn report_turn_runtime_rebuilt(output: String) -> String {
+    let Ok(mut report) = serde_json::from_str::<Value>(&output) else {
+        return output;
+    };
+    let Some(object) = report.as_object_mut() else {
+        return output;
+    };
+    if let Some(rebuilt) = object.get_mut("rebuilt").and_then(Value::as_array_mut) {
+        rebuilt.push(Value::from("gateway_turn_runtime"));
+    }
+    if object.get("status").and_then(Value::as_str) == Some("unchanged") {
+        object.insert("status".to_owned(), Value::from("applied"));
+    }
+    serde_json::to_string_pretty(&report).unwrap_or(output)
 }
 
 /// Any method other than `POST` on `/api/config/reload`.

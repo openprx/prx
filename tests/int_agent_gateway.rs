@@ -239,23 +239,6 @@ impl Provider for PositiveFeedbackProvider {
     }
 }
 
-/// Gateway mock provider for axum tests (minimal).
-#[derive(Default)]
-struct GatewayMockProvider;
-
-#[async_trait]
-impl Provider for GatewayMockProvider {
-    async fn chat_with_system(
-        &self,
-        _system_prompt: Option<&str>,
-        _message: &str,
-        _model: &str,
-        _temperature: f64,
-    ) -> Result<String> {
-        Ok("ok".into())
-    }
-}
-
 /// Simple tool that echoes its input argument.
 struct EchoTool;
 
@@ -410,7 +393,6 @@ fn scratch_config() -> Config {
 fn build_test_app_state(overrides: TestAppStateOverrides) -> AppState {
     AppState {
         config: new_shared(scratch_config()),
-        provider: overrides.provider.unwrap_or_else(|| Arc::new(GatewayMockProvider)),
         model: "test-model".into(),
         temperature: 0.0,
         mem: Arc::new(MockMemory),
@@ -445,7 +427,6 @@ fn build_test_app_state(overrides: TestAppStateOverrides) -> AppState {
 
 #[derive(Default)]
 struct TestAppStateOverrides {
-    provider: Option<Arc<dyn Provider>>,
     pairing: Option<Arc<PairingGuard>>,
     rate_limiter: Option<Arc<GatewayRateLimiter>>,
     webhook_token_hash: Option<Arc<str>>,

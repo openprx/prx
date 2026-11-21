@@ -210,7 +210,7 @@ impl Memory for MockMemory {
 }
 
 #[derive(Default)]
-struct MockProvider {
+pub(super) struct MockProvider {
     calls: AtomicUsize,
 }
 

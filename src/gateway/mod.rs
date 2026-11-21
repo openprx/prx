@@ -1219,23 +1219,25 @@ impl GatewayTurnRuntimeOwner {
     /// that follows publishes no generation and prepares no participant;
     /// the reload route calls this so that reload still makes the runtime
     /// ready. A runtime that is ready, or that another reload replaced in
-    /// the meantime, is left as it is.
-    pub(crate) fn retry_standby(&self) -> anyhow::Result<()> {
+    /// the meantime, is left as it is. `Ok(true)` when this call made the
+    /// runtime ready.
+    pub(crate) fn retry_standby(&self) -> anyhow::Result<bool> {
         let previous = self.current.load_full();
         if previous.ready().is_ok() {
-            return Ok(());
+            return Ok(false);
         }
         let next = self.build(self.config.pin())?;
         if next.ready().is_err() {
-            return Ok(());
+            return Ok(false);
         }
         let next = Arc::new(next);
         let swapped = self.current.compare_and_swap(&previous, Arc::clone(&next));
-        if Arc::ptr_eq(&swapped, &previous) {
-            retire_replaced_mcp_servers(previous.mcp_tool(), next.mcp_tool());
-            tracing::info!("Gateway turn runtime is ready");
+        if !Arc::ptr_eq(&swapped, &previous) {
+            return Ok(false);
         }
-        Ok(())
+        retire_replaced_mcp_servers(previous.mcp_tool(), next.mcp_tool());
+        tracing::info!("Gateway turn runtime is ready: the default provider credential resolved");
+        Ok(true)
     }
 
     fn synchronize_to_active(&self) -> anyhow::Result<()> {
@@ -1296,6 +1298,9 @@ impl crate::config::PreparedConfigGeneration for PreparedGatewayTurnRuntime {
         // First, so a failed retire rejects the reload before it is published.
         self.agents.commit()?;
         self.current.store(Arc::new(self.generation.clone()));
+        if self.previous.ready().is_err() && self.generation.ready().is_ok() {
+            tracing::info!("Gateway turn runtime is ready: the default provider credential resolved");
+        }
         retire_replaced_mcp_servers(self.previous.mcp_tool(), self.generation.mcp_tool());
         Ok(())
     }
@@ -1413,10 +1418,9 @@ impl AppState {
     /// Test fixtures' ready generation.
     #[cfg(test)]
     fn pin_turn_runtime(&self) -> Arc<TurnRuntimeGeneration> {
-        match &self.turn_runtime {
-            Some(runtime) => runtime.pin(),
-            None => self.test_turn_runtime(),
-        }
+        self.turn_runtime
+            .as_ref()
+            .map_or_else(|| self.test_turn_runtime(), |runtime| runtime.pin())
     }
 
     #[cfg(test)]
@@ -1885,6 +1889,13 @@ async fn run_gateway_inner(
         |_| config.default_model.clone().unwrap_or_default(),
         |(_, model, _)| model.clone(),
     );
+    // Test builds keep the fixture field filled; no turn reads it, since
+    // this state always holds its turn runtime.
+    #[cfg(test)]
+    let fixture_provider: Arc<dyn Provider> = match &chat {
+        Ok((provider, _, _)) => Arc::clone(provider),
+        Err(_) => Arc::new(tests::MockProvider::default()),
+    };
     let temperature = config.default_temperature;
     let shared_config_for_reload = shared_config.unwrap_or_else(|| crate::config::new_shared(config.clone()));
     if controlled.is_some() {
@@ -2234,6 +2245,8 @@ async fn run_gateway_inner(
 
     let state = AppState {
         config: Arc::clone(&shared_config_for_reload),
+        #[cfg(test)]
+        provider: fixture_provider,
         model,
         temperature,
         mem,
