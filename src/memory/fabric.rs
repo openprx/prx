@@ -377,14 +377,7 @@ impl MemoryFabric {
         if !self.should_record_role("user") {
             return Err(crate::memory::RfAdmissionRefused::Unrecorded.into());
         }
-        let mut input = self.event_input(
-            scope,
-            "user",
-            "message.created",
-            content.into(),
-            idempotency_key,
-            None,
-        );
+        let mut input = self.event_input(scope, "user", "message.created", content.into(), idempotency_key, None);
         if let Some(ingress) = &self.ingress {
             return Box::pin(ingress.append_admitting(input, admission)).await;
         }

@@ -682,7 +682,9 @@ pub(super) async fn post_rf_message(
     };
     let admission = RfAdmission {
         key,
-        attempt: previous.as_ref().map_or(1, |previous| previous.attempt.saturating_add(1)),
+        attempt: previous
+            .as_ref()
+            .map_or(1, |previous| previous.attempt.saturating_add(1)),
         request_hash,
         run: Some(RfRun {
             run_id: run_id.clone(),

@@ -42,12 +42,12 @@ pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
 pub use postgres::PostgresMemory;
 pub use principal::MemoryWriteContext;
+pub use rf_messages::{
+    RfAdmission, RfAdmissionRefused, RfAttempt, RfAttemptLookup, RfMessageKey, RfRun, RfRunTerminal,
+};
 pub use router_history::{
     RouterHistoryCommitReceipt, RouterHistoryDomain, RouterHistoryRead, RouterHistoryReadEvidence, RouterHistoryRow,
     RouterHistoryWriteEvidence,
-};
-pub use rf_messages::{
-    RfAdmission, RfAdmissionRefused, RfAttempt, RfAttemptLookup, RfMessageKey, RfRun, RfRunTerminal,
 };
 pub use sqlite::SqliteMemory;
 pub use traits::CALLER_KEYED_SESSION_CHANNEL;

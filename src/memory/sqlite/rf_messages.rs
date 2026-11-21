@@ -170,7 +170,11 @@ fn attempt_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttemptRow> {
 }
 
 /// Read one attempt and its run's terminal in one statement.
-pub(super) fn read(conn: &Connection, workspace_id: &str, lookup: &RfAttemptLookup) -> anyhow::Result<Option<RfAttempt>> {
+pub(super) fn read(
+    conn: &Connection,
+    workspace_id: &str,
+    lookup: &RfAttemptLookup,
+) -> anyhow::Result<Option<RfAttempt>> {
     let row = match lookup {
         RfAttemptLookup::Latest(key) => conn
             .query_row(
@@ -223,7 +227,12 @@ pub(super) fn read(conn: &Connection, workspace_id: &str, lookup: &RfAttemptLook
 }
 
 /// [`interrupt`] in its own IMMEDIATE transaction.
-pub(super) fn interrupt_run(conn: &Connection, workspace_id: &str, owner_id: &str, run_id: &str) -> anyhow::Result<bool> {
+pub(super) fn interrupt_run(
+    conn: &Connection,
+    workspace_id: &str,
+    owner_id: &str,
+    run_id: &str,
+) -> anyhow::Result<bool> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let marked = interrupt(&tx, workspace_id, owner_id, run_id)?;
     tx.commit()?;

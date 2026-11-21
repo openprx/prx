@@ -28,8 +28,7 @@ use axum::{
 /// The longest wait for the liveness claim on the admitting process's lock.
 const LIVENESS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
 
-const UNRECORDED: &str =
-    "message idempotency needs user-message event recording (memory.events.record_user_messages)";
+const UNRECORDED: &str = "message idempotency needs user-message event recording (memory.events.record_user_messages)";
 
 fn storage_unavailable(message: &str) -> Response {
     coded_error(StatusCode::INTERNAL_SERVER_ERROR, "storage_unavailable", message)
@@ -171,11 +170,7 @@ async fn turn_status(
 /// Whether the process that admitted the attempt has ended: its ingress
 /// lifetime lock can be claimed. A held lock, a missing lock or an attempt
 /// admitted without a lifetime proves nothing, so the answer is `false`.
-async fn admitting_process_gone(
-    state: &AppState,
-    workspace: &str,
-    attempt: &RfAttempt,
-) -> Result<bool, Box<Response>> {
+async fn admitting_process_gone(state: &AppState, workspace: &str, attempt: &RfAttempt) -> Result<bool, Box<Response>> {
     let Some(lifetime) = attempt.lifetime.as_deref() else {
         return Ok(false);
     };
@@ -219,7 +214,12 @@ pub(super) async fn lost_admission(state: &AppState, key: &RfMessageKey, request
 }
 
 /// The answer of a refused context admission.
-pub(super) async fn refused_context(state: &AppState, key: &RfMessageKey, request_hash: &str, error: &anyhow::Error) -> Response {
+pub(super) async fn refused_context(
+    state: &AppState,
+    key: &RfMessageKey,
+    request_hash: &str,
+    error: &anyhow::Error,
+) -> Response {
     if RfAdmissionRefused::of(error) == Some(RfAdmissionRefused::Unrecorded) {
         return storage_unavailable(UNRECORDED);
     }
@@ -282,7 +282,13 @@ async fn cancel_run(state: &AppState, workspace: &str, attempt: RfAttempt) -> Re
 }
 
 fn workspace_of(state: &AppState) -> String {
-    state.config.pin().effective.workspace_dir.to_string_lossy().into_owned()
+    state
+        .config
+        .pin()
+        .effective
+        .workspace_dir
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// `POST /api/sessions/{session_id}/runs/{run_id}/cancel`: answers
@@ -327,7 +333,11 @@ pub(in crate::gateway::api) async fn post_run_cancel(
 /// unchanged. An rf run answers `200 {"job_id","run_id","status"}` while its
 /// job is known; an evicted job, one from before a restart or another
 /// owner's is `404 job_unknown`.
-pub(in crate::gateway::api) async fn rf_job_cancel(state: &AppState, raw_id: &str, request: &Parts) -> Option<Response> {
+pub(in crate::gateway::api) async fn rf_job_cancel(
+    state: &AppState,
+    raw_id: &str,
+    request: &Parts,
+) -> Option<Response> {
     let job = uuid::Uuid::parse_str(raw_id.trim()).ok()?;
     let known = match jobs::snapshot(job) {
         Some(snapshot) if snapshot.run_id.is_none() => return None,
@@ -367,8 +377,9 @@ pub(in crate::gateway::api) async fn rf_job_cancel(state: &AppState, raw_id: &st
         return Some(job_unknown());
     };
     Some(match cancel_run(state, &workspace, attempt).await {
-        Ok(status) => Json(serde_json::json!({ "job_id": job.to_string(), "run_id": run_id, "status": status }))
-            .into_response(),
+        Ok(status) => {
+            Json(serde_json::json!({ "job_id": job.to_string(), "run_id": run_id, "status": status })).into_response()
+        }
         Err(response) => *response,
     })
 }
