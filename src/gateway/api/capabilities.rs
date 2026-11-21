@@ -316,8 +316,14 @@ pub(super) async fn catalog_tool_names(state: &AppState) -> Option<Vec<String>> 
     Some(tools.into_iter().map(|tool| tool.name).collect())
 }
 
-/// Main's published tool surface without the tools no target can reach,
-/// sorted by name.
+/// Turn controls the runtime adds or withholds by itself, never as a member
+/// of an agent's list: `capability_search` is offered only while something
+/// is left to discover (an explicit list publishes every member directly),
+/// and a Console turn never exposes `stay_silent`.
+const TURN_CONTROL_TOOLS: [&str; 2] = ["capability_search", "stay_silent"];
+
+/// Main's published tool surface without the tools no target can reach or
+/// list, sorted by name.
 async fn published_tools(
     state: &AppState,
     runtime: &crate::gateway::GatewayTurnState,
@@ -332,12 +338,13 @@ async fn published_tools(
         }))
         .await
         .map_err(|_| CatalogError::Surface)?;
-    let excluded = super::sessions::TARGET_EXCLUDED_TOOLS;
+    let hidden =
+        |name: &str| super::sessions::TARGET_EXCLUDED_TOOLS.contains(&name) || TURN_CONTROL_TOOLS.contains(&name);
     let mut tools = service
         .publication_scope()
         .catalog_view()
         .iter_entries()
-        .filter(|entry| !excluded.contains(&entry.public_name.as_str()) && !excluded.contains(&entry.root.as_str()))
+        .filter(|entry| !hidden(&entry.public_name) && !hidden(&entry.root))
         .map(|entry| CatalogTool {
             name: entry.public_name.clone(),
             read_only: entry.effect == SideEffectClass::ReadOnly,
