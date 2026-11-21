@@ -94,6 +94,8 @@ impl RunOutcome {
 pub(super) struct RfTurn {
     /// The (session, agent) slot, held until the job's work ends.
     pub(super) slot: TurnSlot,
+    /// Held until the job's terminal phase (AC-1b2b).
+    pub(super) in_flight: super::rf_message::RunInFlight,
     pub(super) run_id: String,
     pub(super) job_id: uuid::Uuid,
     /// The attempt row the input's transaction writes.
@@ -140,6 +142,14 @@ pub(super) async fn lookup(state: &AppState, key: &RfMessageKey, request_hash: &
         Ok(None) => return Lookup::First,
         Err(response) => return Lookup::Answer(*response),
     };
+    // A deleted message's key stays spent for as long as its record lives.
+    if attempt.deleted {
+        return Lookup::Answer(coded_error(
+            StatusCode::CONFLICT,
+            "message_deleted",
+            "this client_message_id belongs to a deleted message",
+        ));
+    }
     if attempt.request_hash != request_hash {
         return Lookup::Answer(coded_error(
             StatusCode::CONFLICT,

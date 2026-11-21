@@ -211,6 +211,13 @@ impl JobHandle {
         })
     }
 
+    /// Wait until the job reaches its terminal phase, after its terminal
+    /// cleanups, without taking its result.
+    pub(super) async fn finished(mut self) {
+        // A send error means the record was dropped, after the job finished.
+        let _ = self.phase.wait_for(|phase| phase.is_terminal()).await;
+    }
+
     /// Block until the job reaches a terminal phase and return its result.
     ///
     /// Dropping this future does **not** stop the job: that is the whole point
@@ -258,10 +265,28 @@ struct JobRecord {
     output: Option<JobOutput>,
     error: Option<String>,
     run_id: Option<Arc<str>>,
+    /// Its message was deleted (AC-1b2b): no result body is kept.
+    erased: bool,
     phase_tx: watch::Sender<JobPhase>,
 }
 
+/// The body a deleted message's job reports instead of its result.
+fn erased_body() -> serde_json::Value {
+    serde_json::json!({ "deleted": true })
+}
+
 impl JobRecord {
+    /// Drop the result body and error text of a deleted message's job.
+    fn erase(&mut self) {
+        self.erased = true;
+        if let Some(output) = self.output.as_mut() {
+            output.body = erased_body();
+        }
+        if self.error.is_some() {
+            self.error = Some("the message of this job was deleted".to_owned());
+        }
+    }
+
     fn snapshot(&self) -> JobSnapshot {
         let elapsed = self
             .finished_at
@@ -344,6 +369,9 @@ impl JobStore {
             }
             Terminal::Cancelled => JobPhase::Cancelled,
         };
+        if record.erased {
+            record.erase();
+        }
         // Waiters observe the terminal phase only after the result is stored.
         let _ = record.phase_tx.send(record.phase);
     }
@@ -437,6 +465,7 @@ where
         output: None,
         error: None,
         run_id,
+        erased: false,
         phase_tx,
     });
 
@@ -481,6 +510,14 @@ where
         work_id,
         kind,
         phase: phase_rx,
+    }
+}
+
+/// Erase the result of a deleted message's job, now and when it finishes
+/// (AC-1b2b). An unknown or evicted job holds nothing.
+pub(super) fn erase(id: Uuid) {
+    if let Some(record) = JOBS.records.lock().get_mut(&id) {
+        record.erase();
     }
 }
 
@@ -661,6 +698,7 @@ mod tests {
                     output: None,
                     error: None,
                     run_id: None,
+                    erased: false,
                     phase_tx,
                 },
             );

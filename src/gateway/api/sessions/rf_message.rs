@@ -30,8 +30,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 /// Caller session keys: `[A-Za-z0-9_-]{8,128}`, not a reserved prefix.
@@ -75,7 +75,7 @@ pub(super) fn is_caller_session_key(key: &str) -> bool {
             .any(|prefix| key.starts_with(prefix))
 }
 
-fn is_message_id(id: &str) -> bool {
+pub(super) fn is_message_id(id: &str) -> bool {
     (1..=MESSAGE_ID_MAX_LEN).contains(&id.len())
         && id
             .bytes()
@@ -543,6 +543,39 @@ pub(super) fn live_run(workspace: &str, session_id: &str, agent: &str, run_id: &
     }
 }
 
+/// rf runs whose job has not ended in this process, keyed
+/// `workspace\0run_id`: from the slot claim until the job's terminal phase,
+/// after its terminal cleanups (AC-1b2b). A delete leaves the stored event
+/// rows of such a run to the settle that runs when its job ends.
+static IN_FLIGHT: LazyLock<parking_lot::Mutex<HashSet<String>>> = LazyLock::new(Default::default);
+
+/// One run in [`IN_FLIGHT`]; removed on drop.
+pub(super) struct RunInFlight(String);
+
+impl RunInFlight {
+    fn enter(workspace: &str, run_id: &str) -> Self {
+        let key = format!("{workspace}\0{run_id}");
+        IN_FLIGHT.lock().insert(key.clone());
+        Self(key)
+    }
+}
+
+impl Drop for RunInFlight {
+    fn drop(&mut self) {
+        IN_FLIGHT.lock().remove(&self.0);
+    }
+}
+
+/// The runs of `workspace` whose job has not ended in this process.
+pub(super) fn runs_in_flight(workspace: &str) -> Vec<String> {
+    let prefix = format!("{workspace}\0");
+    IN_FLIGHT
+        .lock()
+        .iter()
+        .filter_map(|key| key.strip_prefix(prefix.as_str()).map(str::to_owned))
+        .collect()
+}
+
 /// Every validated body field, in a fixed order, for the request hash.
 #[derive(Serialize)]
 struct CanonicalRequest<'a> {
@@ -648,6 +681,9 @@ pub(super) async fn post_rf_message(
         .workspace_dir
         .to_string_lossy()
         .into_owned();
+    // Deleted runs whose job ended (after a restart, too) are tombstoned
+    // before this turn reads its history.
+    super::rf_delete::settle_deleted(&state, &workspace, &principal.owner_id, &session_id).await;
     let key = RfMessageKey {
         workspace_id: workspace.clone(),
         owner_id: principal.owner_id.clone(),
@@ -680,6 +716,7 @@ pub(super) async fn post_rf_message(
     let Some(slot) = TurnSlot::claim(&workspace, &session_id, &agent_key, &run_id) else {
         return rf_replay::session_busy();
     };
+    let in_flight = RunInFlight::enter(&workspace, &run_id);
     let admission = RfAdmission {
         key,
         attempt: previous
@@ -704,6 +741,7 @@ pub(super) async fn post_rf_message(
             owner_authenticated,
             rf: Some(rf_replay::RfTurn {
                 slot,
+                in_flight,
                 run_id,
                 job_id,
                 admission,
@@ -811,9 +849,11 @@ pub(super) async fn rf_history(
             Err(response) => return *response,
         }
     }
+    // Deleted runs whose job ended since are tombstoned before the read.
+    super::rf_delete::settle_deleted(state, &envelope.workspace_id, &principal.owner_id, &session.session_key).await;
     let turns = match state
         .mem
-        .list_console_conversation_turns(&reader, &session.session_key, limit, offset)
+        .list_rf_history_turns(&reader, &session.session_key, limit, offset)
         .await
     {
         Ok(turns) => turns,
@@ -825,7 +865,7 @@ pub(super) async fn rf_history(
             return storage_unavailable("the session history could not be read");
         }
     };
-    let ids = turns.iter().map(|turn| turn.id).collect::<Vec<_>>();
+    let ids = turns.iter().map(|row| row.turn.id).collect::<Vec<_>>();
     let keys = match state.mem.conversation_turn_agent_keys(&ids).await {
         Ok(keys) => keys,
         Err(error) => {
@@ -837,21 +877,44 @@ pub(super) async fn rf_history(
         }
     };
     let mut rows = Vec::with_capacity(turns.len());
-    for turn in turns {
+    for crate::memory::RfHistoryTurn { turn, deleted } in turns {
         // A row whose agent cannot be named is never served unlabelled.
         let Some(label) = keys.get(&turn.id).and_then(|key| agent_label(key)) else {
             tracing::warn!("Caller-keyed session history row carries no readable agent key");
             return storage_unavailable("the session history could not be read");
         };
-        rows.push(super::SessionMessage {
-            role: turn.role,
-            content: turn.content,
-            timestamp: turn.timestamp,
-            message_id: turn.message_id,
-            agent: Some(label),
+        rows.push(if deleted {
+            HistoryRow::Deleted {
+                message_id: turn.message_id,
+                agent: label,
+                deleted: true,
+                timestamp: turn.timestamp,
+            }
+        } else {
+            HistoryRow::Live(super::SessionMessage {
+                role: turn.role,
+                content: turn.content,
+                timestamp: turn.timestamp,
+                message_id: turn.message_id,
+                agent: Some(label),
+            })
         });
     }
     Json(rows).into_response()
+}
+
+/// One row of a caller-keyed history: a message, or the tombstone of a
+/// deleted one, exactly `{"message_id","agent","deleted":true,"timestamp"}`.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum HistoryRow {
+    Live(super::SessionMessage),
+    Deleted {
+        message_id: Option<String>,
+        agent: String,
+        deleted: bool,
+        timestamp: String,
+    },
 }
 
 /// The wire label of a stored agent key: `main` for Main, the name for a

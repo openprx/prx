@@ -299,6 +299,18 @@ pub fn router(state: AppState) -> Router<AppState> {
             "/sessions/{id}/runs/{run_id}/cancel",
             post(sessions::post_run_cancel).fallback(capabilities::method_not_allowed),
         )
+        .route(
+            "/sessions/{id}/runs/{run_id}/reply/delete",
+            post(sessions::post_reply_delete).fallback(capabilities::method_not_allowed),
+        )
+        .route(
+            "/sessions/{id}/messages/delete",
+            post(sessions::post_batch_delete).fallback(capabilities::method_not_allowed),
+        )
+        .route(
+            "/sessions/{id}/messages/{client_message_id}/delete",
+            post(sessions::post_message_delete).fallback(capabilities::method_not_allowed),
+        )
         .route_layer(middleware::from_fn_with_state(state.clone(), capabilities::guard));
 
     // The two mailbox endpoints, and only those two. They are authenticated

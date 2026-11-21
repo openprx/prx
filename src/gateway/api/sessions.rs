@@ -27,6 +27,8 @@ const MAX_UPLOAD_FILES: usize = 10;
 const MAX_UPLOAD_FILE_SIZE_BYTES: usize = 20 * 1024 * 1024;
 const UPLOADS_DIR_NAME: &str = "uploads";
 
+mod rf_delete;
+pub(super) use rf_delete::{post_batch_delete, post_message_delete, post_reply_delete};
 mod rf_message;
 pub(super) use rf_message::{create_route_auth, message_route_auth};
 mod rf_replay;
@@ -2149,14 +2151,17 @@ async fn submit_console_message(
     // turn mid-flight, after its side effects had already begun. It therefore
     // runs as a detached job: visible in `prx tasks list`, killable by id, and
     // still there when the client comes back.
+    let settle_state = rf.as_ref().map(|_| state.clone());
     let work = run_console_message_job(turn_runtime, state, message, turns, source, target);
     let label = format!("gateway:session_message:{session_id}");
     if let Some(rf) = rf {
         let accepted = rf.accepted();
         let (slot_key, job_id) = (rf.slot.key().to_owned(), rf.job_id);
         let slot = rf.slot;
+        let in_flight = rf.in_flight;
+        let key = rf.admission.key;
         // The slot is released exactly when the job's work ends or is dropped.
-        jobs::submit_run_with_cleanup(
+        let job = jobs::submit_run_with_cleanup(
             jobs::KIND_SESSION_MESSAGE,
             label,
             async move {
@@ -2166,6 +2171,15 @@ async fn submit_console_message(
             Some(cleanup_receiver),
             Some((std::sync::Arc::from(run_id.as_str()), job_id)),
         );
+        // AC-1b2b: the run stays in flight until the job's terminal phase;
+        // a delete that arrived meanwhile is then applied to its rows.
+        if let Some(settle_state) = settle_state {
+            tokio::spawn(async move {
+                job.finished().await;
+                drop(in_flight);
+                rf_delete::settle_deleted(&settle_state, &key.workspace_id, &key.owner_id, &key.session_key).await;
+            });
+        }
         if rf_message::attach_job(&slot_key, job_id)
             && let Some(work_id) = jobs::work_id_of(job_id)
         {
