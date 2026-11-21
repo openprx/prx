@@ -293,7 +293,12 @@ pub(super) fn prepare_target(
     let (provider, resolved) = target_provider(config, plan)
         .map_err(|error| TargetUnavailable(crate::security::redaction::redact_secrets(&format!("{error:#}"))))?;
     let model = resolved.model().to_owned();
-    let binding = Arc::new(GatewayProviderBinding::new(Arc::clone(&provider), resolved));
+    let binding = Arc::new(GatewayProviderBinding::targeted(
+        Arc::clone(&provider),
+        resolved,
+        plan.agent.provider.clone(),
+        plan.agent.model.clone(),
+    ));
     let mut own_level = (**config).clone();
     own_level.autonomy.level = plan.autonomy;
     let security = crate::runtime::bootstrap::build_security_policy(&own_level);

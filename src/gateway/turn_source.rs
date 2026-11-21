@@ -277,6 +277,9 @@ impl GatewaySourceReceipt {
 pub(super) struct GatewayProviderBinding {
     provider: std::sync::Arc<dyn crate::providers::Provider>,
     resolved: crate::providers::catalog::ResolvedModel,
+    /// The provider and model spellings a named agent selected; `None` for
+    /// Main, whose selection is the configured default.
+    selection: Option<(String, String)>,
 }
 
 impl GatewayProviderBinding {
@@ -284,7 +287,26 @@ impl GatewayProviderBinding {
         provider: std::sync::Arc<dyn crate::providers::Provider>,
         resolved: crate::providers::catalog::ResolvedModel,
     ) -> Self {
-        Self { provider, resolved }
+        Self {
+            provider,
+            resolved,
+            selection: None,
+        }
+    }
+
+    /// A named agent's binding: `resolved` was checked from the agent's own
+    /// provider, model and credential reference, which its turns carry.
+    pub(super) fn targeted(
+        provider: std::sync::Arc<dyn crate::providers::Provider>,
+        resolved: crate::providers::catalog::ResolvedModel,
+        provider_name: String,
+        model_name: String,
+    ) -> Self {
+        Self {
+            provider,
+            resolved,
+            selection: Some((provider_name, model_name)),
+        }
     }
 
     pub(super) fn provider_name(&self) -> &str {
@@ -448,8 +470,14 @@ impl GatewaySourceReceipt {
             "gateway source and provider generations differ"
         );
         let config = &runtime.config_generation.effective;
-        let provider_name = crate::providers::selection::default_provider(config).to_owned();
-        let model_name = crate::providers::selection::default_model(config).to_owned();
+        // A named agent's turn carries the agent's own selection, which its
+        // binding was resolved from; Main's is the configured default.
+        let (provider_name, model_name) = binding.selection.clone().unwrap_or_else(|| {
+            (
+                crate::providers::selection::default_provider(config).to_owned(),
+                crate::providers::selection::default_model(config).to_owned(),
+            )
+        });
         let catalog = crate::providers::selection::catalog_for(config);
         let route = crate::providers::selection::route_target(&catalog, &provider_name, &model_name)?.cloned();
         let proof = GatewayTurnProof {
@@ -518,6 +546,12 @@ impl crate::runtime::turn_source::TurnSourceProof for GatewayTurnProof {
     }
     fn model_name(&self) -> &str {
         &self.model_name
+    }
+    fn selected_credential(&self) -> Option<&crate::providers::credentials::CredentialRef> {
+        self.provider_binding
+            .selection
+            .as_ref()
+            .map(|_| self.provider_binding.resolved.credential().reference())
     }
     fn config_source_revision(&self) -> &str {
         &self.generation.source_revision.fingerprint_sha256

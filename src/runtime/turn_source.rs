@@ -154,6 +154,12 @@ pub(crate) trait TurnSourceProof: sealed::Sealed + Send + Sync {
     fn routing_input(&self) -> &str;
     fn provider_name(&self) -> &str;
     fn model_name(&self) -> &str;
+    /// The credential reference a source selected with its own provider
+    /// (a named agent's), when it is not the one the configuration derives
+    /// for `provider_name`. `None`: the decision derives it from the config.
+    fn selected_credential(&self) -> Option<&crate::providers::credentials::CredentialRef> {
+        None
+    }
     fn config_source_revision(&self) -> &str;
     fn source_event_id(&self) -> Option<&str>;
     fn memory_scope(&self) -> &MemoryWriteContext;

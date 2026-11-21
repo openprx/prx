@@ -302,6 +302,8 @@ impl<'a> PublicationScope<'a> {
     ) -> crate::providers::credentials::CredentialRef {
         if self.child_scope().is_some() || self.operator_task.is_some() || self.operator_process.is_some() {
             proof.model_binding().credential_reference().clone()
+        } else if let Some(selected) = proof.selected_credential() {
+            selected.clone()
         } else {
             crate::providers::selection::credential_for(&self.generation.effective, proof.provider_name())
         }
