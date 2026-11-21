@@ -149,7 +149,7 @@ impl VerifiedLaunch {
         self.fields.batch_id.as_deref()
     }
     /// The root partition the run's rows carry, from the sealed launch.
-    pub(super) fn agent_partition(&self) -> Option<&crate::memory::AgentPartition> {
+    pub(super) const fn agent_partition(&self) -> Option<&crate::memory::AgentPartition> {
         self.fields.lineage.agent_partition.as_ref()
     }
     pub(super) fn process_absent(&self) -> anyhow::Result<bool> {
