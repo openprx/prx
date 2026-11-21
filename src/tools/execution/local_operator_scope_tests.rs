@@ -448,7 +448,11 @@ async fn the_scheduled_tool_context_is_visible_only_inside_its_run() {
     assert!(scheduled_job_tool_scope().is_none());
     let config = crate::config::Config::default();
     let scope = JobOrigin::Unattributed
-        .scheduled_tool_scope(RuntimeEnvelope::cron("ws", "job-1", "attempt-1"), &config)
+        .scheduled_tool_scope(
+            RuntimeEnvelope::cron("ws", "job-1", "attempt-1"),
+            &config,
+            config.autonomy.level,
+        )
         .expect("test: an unattributed job gets a scope");
     let seen = with_scheduled_job_tool_scope(Some(scope.clone()), async { scheduled_job_tool_scope() }).await;
     assert_eq!(seen.map(|seen| seen.context), Some(scope.context));
@@ -485,12 +489,12 @@ fn a_scheduled_scope_carries_the_configured_policy_for_its_creator() {
     let envelope = || RuntimeEnvelope::cron("ws", "job-1", "attempt-1");
     assert!(
         JobOrigin::LocalOperator
-            .scheduled_tool_scope(envelope(), &config)
+            .scheduled_tool_scope(envelope(), &config, config.autonomy.level)
             .is_none()
     );
 
     let scope = webhook
-        .scheduled_tool_scope(envelope(), &config)
+        .scheduled_tool_scope(envelope(), &config, config.autonomy.level)
         .expect("test: a webhook job gets a scope");
     let policy = SecurityEffectPolicy::new(Arc::clone(&scope.policy));
     let descriptor = |name: &str| ToolDescriptor {
@@ -523,7 +527,7 @@ fn a_scheduled_scope_carries_the_configured_policy_for_its_creator() {
     config.security.audit.log_path = "cron-g-audit.log".to_string();
     config.security.audit.max_size_mb = 7;
     let supervised = webhook
-        .scheduled_tool_scope(envelope(), &config)
+        .scheduled_tool_scope(envelope(), &config, config.autonomy.level)
         .expect("test: a webhook job gets a scope");
     assert_eq!(
         SecurityEffectPolicy::new(Arc::clone(&supervised.policy))

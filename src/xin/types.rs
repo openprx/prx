@@ -206,6 +206,11 @@ pub struct XinTaskPatch {
     pub max_failures: Option<u32>,
     #[serde(skip)]
     pub approval_grant_json: Option<String>,
+    /// The rewriting call's level and agent, set only by the runtime. A
+    /// payload change records it, and `None` records neither, so a task
+    /// rewritten off the tool path runs capped at `supervised`.
+    #[serde(skip)]
+    pub creator: Option<crate::security::agent_level::CreatorStamp>,
     /// Which surface rewrote the payload (D-107 amendment), set only by the
     /// runtime. A payload change records it, and `None` records
     /// `agent_tool`: an agent tool that rewrites an operator task's command

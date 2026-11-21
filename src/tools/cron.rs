@@ -1129,6 +1129,8 @@ impl Tool for CronTool {
                 if patch.delivery.is_some() {
                     patch.delivery_principal = Some(cron::delivery_principal_from_trusted_scope(&args));
                 }
+                // A command or prompt rewrite re-records this call's level and agent.
+                patch.creator = Some(crate::tools::execution::creator_stamp_from_trusted_args(&args));
                 let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
                 if let Some(command) = &patch.command {
                     patch.approval_grant_json = ApprovalGrant::persisted_runner_grant(

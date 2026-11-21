@@ -311,6 +311,9 @@ pub struct CronJobLineage {
     /// Which surface created the job (D-107 amendment); the default is
     /// [`JobCreator::AgentTool`].
     pub created_via: JobCreator,
+    /// The creating call's level and agent (`creator_level`, `creator_agent`).
+    /// The default records neither, so the job runs capped at `supervised`.
+    pub creator: crate::security::agent_level::CreatorStamp,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -370,4 +373,9 @@ pub struct CronJobPatch {
     /// that rewrites an operator job's command makes it an agent job.
     #[serde(skip)]
     pub created_via: Option<JobCreator>,
+    /// The rewriting call's level and agent, set only by the runtime. A
+    /// command or prompt change records it, and `None` records neither, so a
+    /// job rewritten off the tool path runs capped at `supervised`.
+    #[serde(skip)]
+    pub creator: Option<crate::security::agent_level::CreatorStamp>,
 }

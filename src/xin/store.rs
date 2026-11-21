@@ -5,6 +5,7 @@
 
 use crate::config::Config;
 use crate::cron::JobCreator;
+use crate::security::agent_level::CreatorStamp;
 use crate::tools::execution::JobOrigin;
 use crate::xin::types::{
     ExecutionMode, GoalStatus, NewXinGoal, NewXinStep, NewXinTask, StepStatus, TaskKind, TaskPriority, TaskStatus,
@@ -52,6 +53,18 @@ pub fn add_task_with_origin_and_creator(
     origin: &JobOrigin,
     created_via: JobCreator,
 ) -> Result<XinTask> {
+    add_task_with_creator_stamp(config, new, origin, created_via, &CreatorStamp::default())
+}
+
+/// [`add_task_with_origin_and_creator`] recording the creating call's level
+/// and agent (`creator_level`, `creator_agent`).
+pub fn add_task_with_creator_stamp(
+    config: &Config,
+    new: &NewXinTask,
+    origin: &JobOrigin,
+    created_via: JobCreator,
+    creator: &CreatorStamp,
+) -> Result<XinTask> {
     let origin = origin.to_stored()?;
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
@@ -68,13 +81,14 @@ pub fn add_task_with_origin_and_creator(
                 name, description, kind, status, priority, execution_mode,
                 payload, recurring, interval_secs, created_at, updated_at,
                 last_run_at, next_run_at, last_status, last_output,
-                run_count, fail_count, max_failures, enabled, approval_grant_json, origin, created_via
+                run_count, fail_count, max_failures, enabled, approval_grant_json, origin, created_via,
+                creator_level, creator_agent
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5,
                 ?6, ?7, ?8, 'pending', ?9, ?10,
                 ?11, ?12, ?13, ?14, ?15,
                 NULL, ?16, NULL, NULL,
-                0, 0, ?17, 1, ?18, ?19, ?20
+                0, 0, ?17, 1, ?18, ?19, ?20, ?21, ?22
              )",
             params![
                 id,
@@ -97,6 +111,8 @@ pub fn add_task_with_origin_and_creator(
                 new.approval_grant_json,
                 origin,
                 created_via.as_str(),
+                creator.level_column(),
+                creator.agent.as_deref(),
             ],
         )
         .context("Failed to insert xin task")?;
@@ -205,6 +221,27 @@ pub fn task_created_via(config: &Config, task_id: &str) -> Result<JobCreator> {
     })
 }
 
+/// The stored creator of a task, or of the goal a step belongs to; an
+/// unreadable stamp reads as empty.
+pub fn task_creator(config: &Config, task_or_step_id: &str) -> Result<CreatorStamp> {
+    with_connection(config, |conn| stored_creator(conn, task_or_step_id))
+}
+
+fn stored_creator(conn: &Connection, task_or_step_id: &str) -> Result<CreatorStamp> {
+    let (level, agent) = conn
+        .query_row(
+            "SELECT creator_level, creator_agent FROM xin_tasks WHERE id = ?1
+             UNION ALL
+             SELECT g.creator_level, g.creator_agent FROM xin_steps s JOIN xin_goals g ON g.id = s.goal_id
+              WHERE s.id = ?1
+             LIMIT 1",
+            params![task_or_step_id],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .with_context(|| format!("xin task or step '{task_or_step_id}' not found"))?;
+    Ok(CreatorStamp::from_stored(level.as_deref(), agent))
+}
+
 /// Record that the operator vouches for a task as their own (`prx xin
 /// mark-operator`): its shell command may then run git, hardened.
 pub fn mark_task_operator(config: &Config, task_id: &str) -> Result<()> {
@@ -247,6 +284,11 @@ pub fn update_task(config: &Config, task_id: &str, patch: &XinTaskPatch) -> Resu
     if let Some(max_failures) = patch.max_failures {
         task.max_failures = max_failures;
     }
+    // A payload rewrite re-records the rewriter (V7).
+    let rewritten_creator = patch
+        .payload
+        .as_ref()
+        .map(|_| patch.creator.clone().unwrap_or_default());
     // Optimistic concurrency: capture the DB-read updated_at BEFORE overwriting.
     let previous_updated_at = task.updated_at;
     task.updated_at = now;
@@ -257,7 +299,9 @@ pub fn update_task(config: &Config, task_id: &str, patch: &XinTaskPatch) -> Resu
              SET name = ?1, description = ?2, priority = ?3, payload = ?4,
                  interval_secs = ?5, enabled = ?6, max_failures = ?7, updated_at = ?8,
                  approval_grant_json = ?9,
-                 created_via = COALESCE(?12, created_via)
+                 created_via = COALESCE(?12, created_via),
+                 creator_level = CASE WHEN ?13 THEN ?14 ELSE creator_level END,
+                 creator_agent = CASE WHEN ?13 THEN ?15 ELSE creator_agent END
              WHERE id = ?10 AND updated_at = ?11",
                 params![
                     task.name,
@@ -275,6 +319,9 @@ pub fn update_task(config: &Config, task_id: &str, patch: &XinTaskPatch) -> Resu
                         .payload
                         .as_ref()
                         .map(|_| patch.created_via.unwrap_or_default().as_str()),
+                    rewritten_creator.is_some(),
+                    rewritten_creator.as_ref().and_then(CreatorStamp::level_column),
+                    rewritten_creator.as_ref().and_then(|creator| creator.agent.as_deref()),
                 ],
             )
             .context("Failed to update xin task")?;
@@ -1202,11 +1249,21 @@ pub fn add_goal(config: &Config, new: &NewXinGoal) -> Result<XinGoal> {
 /// Insert a goal created by `origin` (CRON-ORIGIN); every step of it runs
 /// under that origin.
 pub fn add_goal_with_origin(config: &Config, new: &NewXinGoal, origin: &JobOrigin) -> Result<XinGoal> {
+    add_goal_with_creator_stamp(config, new, origin, &CreatorStamp::default())
+}
+
+/// [`add_goal_with_origin`] recording the creating call's level and agent.
+pub fn add_goal_with_creator_stamp(
+    config: &Config,
+    new: &NewXinGoal,
+    origin: &JobOrigin,
+    creator: &CreatorStamp,
+) -> Result<XinGoal> {
     let goal_id = Uuid::new_v4().to_string();
     let now = Utc::now();
 
     with_immediate_connection(config, |conn| {
-        insert_goal_rows(conn, config, &goal_id, new, origin, now)
+        insert_goal_rows(conn, config, &goal_id, new, origin, creator, now)
     })?;
 
     get_goal(config, &goal_id)
@@ -1220,6 +1277,7 @@ fn insert_goal_rows(
     goal_id: &str,
     new: &NewXinGoal,
     origin: &JobOrigin,
+    creator: &CreatorStamp,
     now: DateTime<Utc>,
 ) -> Result<()> {
     let steps_total = u32::try_from(new.initial_steps.len()).unwrap_or(u32::MAX);
@@ -1229,12 +1287,12 @@ fn insert_goal_rows(
                 id, owner_id, topic_id, parent_task_id, source_message_event_id,
                 name, description, kind, status, priority, target_completion_at,
                 steps_completed, steps_total, created_at, updated_at, completed_at,
-                final_output, enabled, origin
+                final_output, enabled, origin, creator_level, creator_agent
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5,
                 ?6, ?7, ?8, 'pending', ?9, ?10,
                 0, ?11, ?12, ?13, NULL,
-                NULL, 1, ?14
+                NULL, 1, ?14, ?15, ?16
              )",
         params![
             goal_id,
@@ -1251,6 +1309,8 @@ fn insert_goal_rows(
             now.to_rfc3339(),
             now.to_rfc3339(),
             origin,
+            creator.level_column(),
+            creator.agent.as_deref(),
         ],
     )
     .context("Failed to insert xin goal")?;
@@ -1317,6 +1377,17 @@ fn insert_step_row(conn: &Connection, goal_id: &str, step: &NewXinStep, now: Dat
 
 /// Append a step to an existing goal and bump its `steps_total`.
 pub fn add_step(config: &Config, goal_id: &str, step: &NewXinStep) -> Result<XinStep> {
+    add_step_with_creator_stamp(config, goal_id, step, &CreatorStamp::default())
+}
+
+/// [`add_step`] re-recording the adding call's level and agent on the goal:
+/// a new step rewrites what the goal runs (V7).
+pub fn add_step_with_creator_stamp(
+    config: &Config,
+    goal_id: &str,
+    step: &NewXinStep,
+    creator: &CreatorStamp,
+) -> Result<XinStep> {
     let now = Utc::now();
     let step_id = with_immediate_connection(config, |conn| {
         let id = insert_step_row(conn, goal_id, step, now)?;
@@ -1327,9 +1398,14 @@ pub fn add_step(config: &Config, goal_id: &str, step: &NewXinStep) -> Result<Xin
                      status = CASE WHEN status = 'completed' THEN 'running' ELSE status END,
                      completed_at = CASE WHEN status = 'completed' THEN NULL ELSE completed_at END,
                      final_output = CASE WHEN status = 'completed' THEN NULL ELSE final_output END,
-                     updated_at = ?1
+                     updated_at = ?1, creator_level = ?3, creator_agent = ?4
                  WHERE id = ?2",
-                params![now.to_rfc3339(), goal_id],
+                params![
+                    now.to_rfc3339(),
+                    goal_id,
+                    creator.level_column(),
+                    creator.agent.as_deref()
+                ],
             )
             .context("Failed to bump goal steps_total")?;
         if changed == 0 {
@@ -2074,8 +2150,9 @@ pub(crate) fn adopt_legacy_task(config: &Config, task_id: &str) -> Result<Option
             target_completion_at: None,
             initial_steps: vec![migrated_step, verification_step],
         };
-        // The adopted goal runs under the legacy task's own origin.
-        insert_goal_rows(conn, config, &goal_id, &goal, &task.origin, now)?;
+        // The adopted goal runs under the legacy task's own origin and creator.
+        let creator = stored_creator(conn, &task.id)?;
+        insert_goal_rows(conn, config, &goal_id, &goal, &task.origin, &creator, now)?;
         conn.execute(
             "INSERT INTO xin_task_adoptions (legacy_task_id, goal_id, adopted_at)
              VALUES (?1, ?2, ?3)",
@@ -2875,6 +2952,12 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
     // `agent_tool` (its git is refused) until the operator marks it.
     add_column_if_missing(&conn, "xin_tasks", "created_via", "TEXT")?;
     add_column_if_missing(&conn, "xin_goals", "origin", "TEXT")?;
+    // The creating call's level and agent. Nullable with no backfill: a row
+    // without them runs capped at `supervised`.
+    add_column_if_missing(&conn, "xin_tasks", "creator_level", "TEXT")?;
+    add_column_if_missing(&conn, "xin_tasks", "creator_agent", "TEXT")?;
+    add_column_if_missing(&conn, "xin_goals", "creator_level", "TEXT")?;
+    add_column_if_missing(&conn, "xin_goals", "creator_agent", "TEXT")?;
     // Forward-compat for any xin_steps table created before lease_ttl_secs existed.
     add_column_if_missing(&conn, "xin_steps", "lease_ttl_secs", "INTEGER NOT NULL DEFAULT 0")?;
     add_column_if_missing(&conn, "xin_steps", "lease_epoch", "INTEGER NOT NULL DEFAULT 0")?;

@@ -900,6 +900,17 @@ async fn run_agent(
     if !security.can_act() {
         return (false, "blocked by security policy: autonomy is read-only".into());
     }
+    let level = match task_run_level(config, task) {
+        Ok(level) => level,
+        Err(output) => return (false, output),
+    };
+    if let Some(refusal) = crate::security::agent_level::scheduled_agent_refusal(
+        level,
+        task.origin.is_local_operator(),
+        config.autonomy.level,
+    ) {
+        return (false, format!("blocked by security policy: {refusal}"));
+    }
 
     let prompt = task.payload.clone();
     // The model is resolved once, by the agent entry
@@ -912,7 +923,9 @@ async fn run_agent(
     // CRON-ORIGIN: the run's tool calls act as whoever created the task (or
     // goal). Only a task the local operator created keeps the local-operator CLI
     // context.
-    let scheduled_tool_scope = task.origin.scheduled_tool_scope(runtime_envelope.clone(), config);
+    let scheduled_tool_scope = task
+        .origin
+        .scheduled_tool_scope(runtime_envelope.clone(), config, level);
     match crate::agent::scheduled_source::ScheduledAgentOrigin::from_xin(task)
         .scope(crate::agent::run_with_runtime_envelope(
             match (
@@ -999,7 +1012,32 @@ async fn run_shell_with_cancellation(
         Ok(process) => process,
         Err(error) => return (false, format!("runtime error: {error}")),
     };
-    run_shell_with_adapter(config, task, cancellation, &process).await
+    let level = match task_run_level(config, task) {
+        Ok(level) => level,
+        Err(output) => return (false, output),
+    };
+    crate::tools::effective_autonomy::scope(level, run_shell_with_adapter(config, task, cancellation, &process)).await
+}
+
+/// The level a run of `task` (or of a goal step) runs at
+/// (`security::agent_level`), or the refusal recorded on the run. An
+/// unreadable creator reads as empty, so the run is capped at `supervised`.
+fn task_run_level(config: &Config, task: &XinTask) -> Result<crate::security::AutonomyLevel, String> {
+    let operator = task.kind == crate::xin::types::TaskKind::System
+        || task.origin.is_local_operator()
+        || store::task_created_via(config, &task.id)
+            .is_ok_and(|creator| creator == crate::cron::JobCreator::OperatorCli);
+    let creator = store::task_creator(config, &task.id).unwrap_or_else(|error| {
+        tracing::warn!(target: "xin", task_id = %task.id, "xin task creator unreadable; the run is capped at supervised: {error}");
+        crate::security::agent_level::CreatorStamp::default()
+    });
+    crate::security::agent_level::scheduled_level(
+        operator,
+        &creator,
+        config,
+        crate::tools::effective_autonomy::current(),
+    )
+    .map_err(|error| format!("blocked by security policy: {error}"))
 }
 
 /// How a Xin shell task's git is treated (D-107 and its amendment): a

@@ -22,8 +22,8 @@ pub use store::{
     abandon_job_claim, add_agent_job, add_agent_job_with_lineage, add_shell_job, add_shell_job_with_approval_grant,
     add_shell_job_with_lineage_and_approval_grant, add_shell_job_with_lineage_approval_and_delete,
     claim_job_if_current, claim_job_if_current_for_manual_run, claim_terminal_job_for_manual_rerun, due_jobs,
-    finish_claimed_run, get_job, job_claim_is_current, job_created_via, list_job_events, list_jobs, list_runs,
-    mark_job_operator, record_claim_lost, record_delivery_withheld, record_terminal_manual_run, remove_job,
+    finish_claimed_run, get_job, job_claim_is_current, job_created_via, job_creator, list_job_events, list_jobs,
+    list_runs, mark_job_operator, record_claim_lost, record_delivery_withheld, record_terminal_manual_run, remove_job,
     renew_job_claim, unmarked_shell_jobs, update_job,
 };
 pub use types::{
@@ -356,6 +356,7 @@ pub fn lineage_from_trusted_scope(config: &Config, args: &serde_json::Value) -> 
         owner_id,
         origin,
         created_via: JobCreator::AgentTool,
+        creator: crate::tools::execution::creator_stamp_from_trusted_args(args),
         delivery_principal: DeliveryPrincipal::new(
             sender.map(str::to_string),
             channel.map(str::to_string),

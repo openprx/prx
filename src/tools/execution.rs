@@ -993,17 +993,18 @@ impl JobOrigin {
         }
     }
 
-    /// [`Self::scheduled_tool_context`] paired with the configured policy for
-    /// it (see [`ScheduledToolScope::new`]); `None` for an operator job, which
-    /// keeps the operator's CLI context and policy.
+    /// [`Self::scheduled_tool_context`] paired with the configured policy at
+    /// the run's `level` (see [`ScheduledToolScope::new`]); `None` for an
+    /// operator job, which keeps the operator's CLI context and policy.
     #[must_use]
     pub fn scheduled_tool_scope(
         &self,
         run_envelope: RuntimeEnvelope,
         config: &crate::config::Config,
+        level: crate::security::AutonomyLevel,
     ) -> Option<ScheduledToolScope> {
         self.scheduled_tool_context(run_envelope)
-            .map(|context| ScheduledToolScope::new(context, config))
+            .map(|context| ScheduledToolScope::new(context, config, level))
     }
 
     /// The tool execution context a scheduled run of this job must use, or
@@ -1073,10 +1074,11 @@ pub struct ScheduledToolScope {
 }
 
 impl ScheduledToolScope {
-    /// Pair `context` with the configured policy, so the creator's
+    /// Pair `context` with the configured policy at the run's `level`
+    /// (`security::agent_level::scheduled_level`), so the creator's
     /// `[autonomy.scopes]` rules — keyed on the channel, sender and chat type
-    /// the context carries — and the configured autonomy level apply to the
-    /// run exactly as they applied to the creator's own turn.
+    /// the context carries — apply to the run exactly as they applied to the
+    /// creator's own turn.
     ///
     /// One difference is deliberate: a scheduled run is unattended, so nobody
     /// can answer an approval prompt. Under `supervised` a call that would
@@ -1088,12 +1090,18 @@ impl ScheduledToolScope {
     /// constructor, so the configured audit block is wired exactly as on every
     /// other surface (BUG-D1-01).
     #[must_use]
-    pub fn new(context: ToolExecutionContext, config: &crate::config::Config) -> Self {
+    pub fn new(
+        context: ToolExecutionContext,
+        config: &crate::config::Config,
+        level: crate::security::policy::AutonomyLevel,
+    ) -> Self {
         let mut policy = crate::runtime::bootstrap::build_security_policy(config);
-        if policy.autonomy == crate::security::policy::AutonomyLevel::Supervised {
-            // Freshly built and not yet shared, so this mutates in place.
-            Arc::make_mut(&mut policy).autonomy = crate::security::policy::AutonomyLevel::ReadOnly;
-        }
+        // Freshly built and not yet shared, so this mutates in place.
+        Arc::make_mut(&mut policy).autonomy = if level == crate::security::policy::AutonomyLevel::Supervised {
+            crate::security::policy::AutonomyLevel::ReadOnly
+        } else {
+            level
+        };
         Self { context, policy }
     }
 }
@@ -3900,6 +3908,31 @@ pub(crate) fn trusted_scope_agent_partition(args: &serde_json::Value) -> Option<
             tracing::warn!(error = %error, "ignoring malformed trusted agent_partition in _zc_scope");
             None
         }
+    }
+}
+
+/// Who is creating scheduled work with this call, and at what level: the
+/// call's level from the execution service's carrier (`None` off the service
+/// path) and the agent from the trusted scope's partition. A trusted scope
+/// without a partition is Main's; an untrusted one names nobody.
+#[must_use]
+pub(crate) fn creator_stamp_from_trusted_args(args: &serde_json::Value) -> crate::security::agent_level::CreatorStamp {
+    use crate::memory::PartitionKey;
+    use crate::security::agent_level::{CREATOR_MAIN, CreatorStamp, creator_agent_named};
+    let trusted = args
+        .get("_zc_scope_trusted")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        && args.get("_zc_scope").is_some_and(serde_json::Value::is_object);
+    let agent = trusted.then(
+        || match trusted_scope_agent_partition(args).map(|partition| partition.key) {
+            Some(PartitionKey::Named { name, incarnation }) => creator_agent_named(name.as_str(), &incarnation),
+            Some(PartitionKey::Main) | None => CREATOR_MAIN.to_owned(),
+        },
+    );
+    CreatorStamp {
+        level: super::effective_autonomy::current(),
+        agent,
     }
 }
 

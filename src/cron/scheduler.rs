@@ -176,7 +176,10 @@ async fn execute_job_with_retry_internal(
     for attempt in 0..=retries {
         let (success, output, retry_allowed) = match job.job_type {
             JobType::Shell => {
-                let (success, output) = run_job_command(config, job).await;
+                let (success, output) = match job_run_level(config, job) {
+                    Ok(level) => crate::tools::effective_autonomy::scope(level, run_job_command(config, job)).await,
+                    Err(output) => (false, output),
+                };
                 (success, output, true)
             }
             JobType::Agent => {
@@ -638,6 +641,17 @@ async fn run_agent_job_with_origin(
     if !security.can_act() {
         return (false, "blocked by security policy: autonomy is read-only".to_string());
     }
+    let level = match job_run_level(config, job) {
+        Ok(level) => level,
+        Err(output) => return (false, output),
+    };
+    if let Some(refusal) = crate::security::agent_level::scheduled_agent_refusal(
+        level,
+        job.origin.is_local_operator(),
+        config.autonomy.level,
+    ) {
+        return (false, format!("blocked by security policy: {refusal}"));
+    }
     let prompt = job.prompt.clone().unwrap_or_default();
     // The job's model is resolved once, by the agent entry
     // (`agent_provider_selection`): a model that cannot chat fails the job
@@ -683,7 +697,7 @@ async fn run_agent_job_with_origin(
     }
     // Calls retain the job creator's configured policy in both immediate
     // and scheduler-claimed runs; absence of a claim grants no new authority.
-    let scheduled_tool_scope = job.origin.scheduled_tool_scope(runtime_envelope.clone(), config);
+    let scheduled_tool_scope = job.origin.scheduled_tool_scope(runtime_envelope.clone(), config, level);
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
             // Background cron job: no cooperative shutdown signal of its own;
@@ -1057,6 +1071,24 @@ async fn deliver_if_configured(
     }
 
     Ok(DeliveryOutcome::Sent)
+}
+
+/// The level a run of `job` runs at (`security::agent_level`), or the
+/// refusal recorded on the run row. An unreadable creator reads as empty, so
+/// the run is capped at `supervised`.
+fn job_run_level(config: &Config, job: &CronJob) -> Result<crate::security::AutonomyLevel, String> {
+    let (created_via, creator) = crate::cron::job_creator(config, &job.id).unwrap_or_else(|error| {
+        tracing::warn!(job_id = %job.id, "cron job creator unreadable; the run is capped at supervised: {error}");
+        Default::default()
+    });
+    let operator = created_via == crate::cron::JobCreator::OperatorCli || job.origin.is_local_operator();
+    crate::security::agent_level::scheduled_level(
+        operator,
+        &creator,
+        config,
+        crate::tools::effective_autonomy::current(),
+    )
+    .map_err(|error| format!("blocked by security policy: {error}"))
 }
 
 async fn run_job_command(config: &Config, job: &CronJob) -> (bool, String) {

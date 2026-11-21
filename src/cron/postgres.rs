@@ -21,6 +21,7 @@ use crate::cron::types::{
 };
 use crate::cron::{next_run_for_schedule, schedule_cron_expression, validate_schedule};
 use crate::memory::postgres::PostgresConnectionPool;
+use crate::security::agent_level::CreatorStamp;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use parking_lot::Mutex;
@@ -56,6 +57,10 @@ const ORIGIN_MIGRATION_SQL: &str = "ALTER TABLE cron_jobs ADD COLUMN IF NOT EXIS
 /// Which surface created a job (D-107 amendment), mirroring the SQLite
 /// `ALTER TABLE`. Nullable with no backfill: NULL reads as `agent_tool`.
 const CREATED_VIA_MIGRATION_SQL: &str = "ALTER TABLE cron_jobs ADD COLUMN IF NOT EXISTS created_via TEXT;";
+/// The creating call's level and agent, mirroring the SQLite `ALTER TABLE`.
+/// Nullable with no backfill: a row without them runs capped at `supervised`.
+const CREATOR_LEVEL_MIGRATION_SQL: &str = "ALTER TABLE cron_jobs ADD COLUMN IF NOT EXISTS creator_level TEXT;
+     ALTER TABLE cron_jobs ADD COLUMN IF NOT EXISTS creator_agent TEXT;";
 const CLAIM_LEASE_MIGRATION_SQL: &str = "ALTER TABLE cron_jobs ADD COLUMN IF NOT EXISTS claim_owner TEXT;
      ALTER TABLE cron_jobs ADD COLUMN IF NOT EXISTS attempt_id TEXT;
      ALTER TABLE cron_jobs ADD COLUMN IF NOT EXISTS claimed_at TEXT;
@@ -204,6 +209,7 @@ impl PostgresCronStore {
         let delivery_json = serde_json::to_string(&DeliveryConfig::default())?;
         let origin = lineage.origin.to_stored()?;
         let created_via = lineage.created_via.as_str();
+        let creator_level = lineage.creator.level_column();
 
         self.with_client(|client| {
             let mut tx = client.transaction().context("failed to open cron insert transaction")?;
@@ -212,9 +218,10 @@ impl PostgresCronStore {
                     id, owner_id, topic_id, parent_task_id, source_message_event_id,
                     expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, approval_grant_json,
-                    creator_sender, creator_channel, creator_chat_type, origin, created_via
+                    creator_sender, creator_channel, creator_chat_type, origin, created_via,
+                    creator_level, creator_agent
                  ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'shell', NULL, $9, 'isolated', NULL,
-                           TRUE, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)",
+                           TRUE, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)",
                 &[
                     &id,
                     &lineage.owner_id,
@@ -235,6 +242,8 @@ impl PostgresCronStore {
                     &lineage.delivery_principal.chat_type,
                     &origin,
                     &created_via,
+                    &creator_level,
+                    &lineage.creator.agent,
                 ],
             )
             .context("Failed to insert cron shell job")?;
@@ -286,6 +295,7 @@ impl PostgresCronStore {
         let delivery_json = serde_json::to_string(&delivery)?;
         let session_target_str = session_target.as_str();
         let origin = lineage.origin.to_stored()?;
+        let creator_level = lineage.creator.level_column();
 
         self.with_client(|client| {
             let mut tx = client.transaction().context("failed to open cron insert transaction")?;
@@ -294,9 +304,9 @@ impl PostgresCronStore {
                     id, owner_id, topic_id, parent_task_id, source_message_event_id,
                     expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, approval_grant_json,
-                    creator_sender, creator_channel, creator_chat_type, origin
+                    creator_sender, creator_channel, creator_chat_type, origin, creator_level, creator_agent
                  ) VALUES ($1, $2, $3, $4, $5, $6, '', $7, 'agent', $8, $9, $10, $11,
-                           TRUE, $12, $13, $14, $15, NULL, $16, $17, $18, $19)",
+                           TRUE, $12, $13, $14, $15, NULL, $16, $17, $18, $19, $20, $21)",
                 &[
                     &id,
                     &lineage.owner_id,
@@ -317,6 +327,8 @@ impl PostgresCronStore {
                     &lineage.delivery_principal.channel,
                     &lineage.delivery_principal.chat_type,
                     &origin,
+                    &creator_level,
+                    &lineage.creator.agent,
                 ],
             )
             .context("Failed to insert cron agent job")?;
@@ -374,6 +386,27 @@ impl PostgresCronStore {
                 .context("Failed to query cron job creator")?;
             match row {
                 Some(row) => Ok(JobCreator::from_stored(row.try_get::<_, Option<String>>(0)?.as_deref())),
+                None => anyhow::bail!("Cron job '{job_id}' not found"),
+            }
+        })
+    }
+
+    pub fn job_creator(&self, job_id: &str) -> Result<(JobCreator, CreatorStamp)> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "SELECT created_via, creator_level, creator_agent FROM cron_jobs WHERE id = $1",
+                    &[&job_id],
+                )
+                .context("Failed to query cron job creator")?;
+            match row {
+                Some(row) => Ok((
+                    JobCreator::from_stored(row.try_get::<_, Option<String>>(0)?.as_deref()),
+                    CreatorStamp::from_stored(
+                        row.try_get::<_, Option<String>>(1)?.as_deref(),
+                        row.try_get::<_, Option<String>>(2)?,
+                    ),
+                )),
                 None => anyhow::bail!("Cron job '{job_id}' not found"),
             }
         })
@@ -842,6 +875,9 @@ impl PostgresCronStore {
             .command
             .as_ref()
             .map(|_| patch.created_via.unwrap_or_default().as_str());
+        // A rewrite of what the job runs re-records the rewriter (V7).
+        let rewritten_creator =
+            (patch.command.is_some() || patch.prompt.is_some()).then(|| patch.creator.unwrap_or_default());
         if let Some(command) = patch.command {
             job.command = command;
             job.approval_grant_json = approval_grant_json;
@@ -950,6 +986,13 @@ impl PostgresCronStore {
                     &[&created_via, &job.id],
                 )
                 .context("Failed to record the cron job creator")?;
+            }
+            if let Some(creator) = &rewritten_creator {
+                tx.execute(
+                    "UPDATE cron_jobs SET creator_level = $1, creator_agent = $2 WHERE id = $3",
+                    &[&creator.level_column(), &creator.agent, &job.id],
+                )
+                .context("Failed to record the cron job creator level")?;
             }
             let event_type = match (was_enabled, job.enabled) {
                 (true, false) => "cron.job.disabled",
@@ -1787,6 +1830,9 @@ fn init_schema(client: &mut Client) -> Result<()> {
     client
         .batch_execute(CREATED_VIA_MIGRATION_SQL)
         .context("Failed to migrate cron postgres job creator")?;
+    client
+        .batch_execute(CREATOR_LEVEL_MIGRATION_SQL)
+        .context("Failed to migrate cron postgres creator level")?;
     Ok(())
 }
 

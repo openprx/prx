@@ -1032,7 +1032,14 @@ impl Tool for XinTool {
                     approval_grant_json,
                 };
 
-                match store::add_task_with_origin(&cfg, &new, &origin) {
+                let creator = crate::tools::execution::creator_stamp_from_trusted_args(&args);
+                match store::add_task_with_creator_stamp(
+                    &cfg,
+                    &new,
+                    &origin,
+                    crate::cron::JobCreator::AgentTool,
+                    &creator,
+                ) {
                     Ok(task) => Ok(ToolResult {
                         success: true,
                         output: format!("Created xin task: {} ({})", task.id, task.name),
@@ -1091,6 +1098,8 @@ impl Tool for XinTool {
                     payload,
                     interval_secs: args.get("interval_secs").and_then(serde_json::Value::as_u64),
                     approval_grant_json,
+                    // A payload rewrite re-records this call's level and agent.
+                    creator: Some(crate::tools::execution::creator_stamp_from_trusted_args(&args)),
                     ..XinTaskPatch::default()
                 };
                 if patch.name.is_none()
@@ -1299,7 +1308,8 @@ impl Tool for XinTool {
                     target_completion_at,
                     initial_steps,
                 };
-                match store::add_goal_with_origin(&cfg, &new, &origin) {
+                let creator = crate::tools::execution::creator_stamp_from_trusted_args(&args);
+                match store::add_goal_with_creator_stamp(&cfg, &new, &origin, &creator) {
                     Ok(goal) => Ok(ToolResult {
                         success: true,
                         output: serde_json::to_string_pretty(&goal)?,
@@ -1358,7 +1368,8 @@ impl Tool for XinTool {
                         .saturating_add(1),
                 };
                 let step = self.build_step(&args, sequence, &args)?;
-                match store::add_step(&cfg, goal_id, &step) {
+                let creator = crate::tools::execution::creator_stamp_from_trusted_args(&args);
+                match store::add_step_with_creator_stamp(&cfg, goal_id, &step, &creator) {
                     Ok(step) => Ok(ToolResult {
                         success: true,
                         output: serde_json::to_string_pretty(&step)?,

@@ -23,6 +23,7 @@ use crate::cron::{
     DeliveryPrincipal, JobCreator, JobOrigin, JobType, Schedule, SessionTarget, next_run_for_schedule,
     schedule_cron_expression, validate_schedule,
 };
+use crate::security::agent_level::CreatorStamp;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -116,6 +117,7 @@ pub fn add_shell_job_with_lineage_approval_and_delete(
     let delivery_principal = lineage.delivery_principal;
     let origin = lineage.origin.to_stored()?;
     let created_via = lineage.created_via.as_str();
+    let creator = lineage.creator;
 
     with_connection(config, |conn| {
         conn.execute(
@@ -123,9 +125,10 @@ pub fn add_shell_job_with_lineage_approval_and_delete(
                 id, owner_id, topic_id, parent_task_id, source_message_event_id,
                 expression, command, schedule, job_type, prompt, name, session_target, model,
                 enabled, delivery, delete_after_run, created_at, next_run, approval_grant_json,
-                creator_sender, creator_channel, creator_chat_type, origin, created_via
+                creator_sender, creator_channel, creator_chat_type, origin, created_via,
+                creator_level, creator_agent
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'shell', NULL, ?9, 'isolated', NULL, 1, ?10, ?11, ?12, ?13, ?14,
-                       ?15, ?16, ?17, ?18, ?19)",
+                       ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
             params![
                 id,
                 owner_id.as_deref(),
@@ -146,6 +149,8 @@ pub fn add_shell_job_with_lineage_approval_and_delete(
                 delivery_principal.chat_type.as_deref(),
                 origin.as_str(),
                 created_via,
+                creator.level_column(),
+                creator.agent.as_deref(),
             ],
         )
         .context("Failed to insert cron shell job")?;
@@ -241,6 +246,7 @@ pub fn add_agent_job_with_lineage(
     let source_message_event_id = lineage.source_message_event_id;
     let delivery_principal = lineage.delivery_principal;
     let origin = lineage.origin.to_stored()?;
+    let creator = lineage.creator;
 
     with_connection(config, |conn| {
         conn.execute(
@@ -248,9 +254,9 @@ pub fn add_agent_job_with_lineage(
                 id, owner_id, topic_id, parent_task_id, source_message_event_id,
                 expression, command, schedule, job_type, prompt, name, session_target, model,
                 enabled, delivery, delete_after_run, created_at, next_run, approval_grant_json,
-                creator_sender, creator_channel, creator_chat_type, origin
+                creator_sender, creator_channel, creator_chat_type, origin, creator_level, creator_agent
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', ?7, 'agent', ?8, ?9, ?10, ?11, 1, ?12, ?13, ?14, ?15, NULL,
-                       ?16, ?17, ?18, ?19)",
+                       ?16, ?17, ?18, ?19, ?20, ?21)",
             params![
                 id,
                 owner_id.as_deref(),
@@ -271,6 +277,8 @@ pub fn add_agent_job_with_lineage(
                 delivery_principal.channel.as_deref(),
                 delivery_principal.chat_type.as_deref(),
                 origin.as_str(),
+                creator.level_column(),
+                creator.agent.as_deref(),
             ],
         )
         .context("Failed to insert cron agent job")?;
@@ -366,6 +374,33 @@ pub fn job_created_via(config: &Config, job_id: &str) -> Result<JobCreator> {
             )
             .with_context(|| format!("Cron job '{job_id}' not found"))?;
         Ok(JobCreator::from_stored(value.as_deref()))
+    })
+}
+
+/// Which surface created the job and the stored creator stamp; NULL
+/// `created_via` is `agent_tool`, and an unreadable stamp reads as empty.
+pub fn job_creator(config: &Config, job_id: &str) -> Result<(JobCreator, CreatorStamp)> {
+    if let Some(store) = pg_store(config)? {
+        return store.job_creator(job_id);
+    }
+    with_connection(config, |conn| {
+        let (created_via, level, agent) = conn
+            .query_row(
+                "SELECT created_via, creator_level, creator_agent FROM cron_jobs WHERE id = ?1",
+                params![job_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .with_context(|| format!("Cron job '{job_id}' not found"))?;
+        Ok((
+            JobCreator::from_stored(created_via.as_deref()),
+            CreatorStamp::from_stored(level.as_deref(), agent),
+        ))
     })
 }
 
@@ -954,6 +989,9 @@ pub fn update_job_at(config: &Config, job_id: &str, patch: CronJobPatch, now: Da
         .command
         .as_ref()
         .map(|_| patch.created_via.unwrap_or_default().as_str());
+    // A rewrite of what the job runs re-records the rewriter (V7).
+    let rewritten_creator =
+        (patch.command.is_some() || patch.prompt.is_some()).then(|| patch.creator.unwrap_or_default());
     if let Some(command) = patch.command {
         job.command = command;
         job.approval_grant_json = approval_grant_json;
@@ -1008,7 +1046,9 @@ pub fn update_job_at(config: &Config, job_id: &str, patch: CronJobPatch, now: Da
                  terminal_state = ?16, approval_grant_json = ?17,
                  claim_owner = ?18, attempt_id = ?19, claimed_at = ?20, claim_expires_at = ?21,
                  creator_sender = ?31, creator_channel = ?32, creator_chat_type = ?33,
-                 created_via = COALESCE(?34, created_via)
+                 created_via = COALESCE(?34, created_via),
+                 creator_level = CASE WHEN ?35 THEN ?36 ELSE creator_level END,
+                 creator_agent = CASE WHEN ?35 THEN ?37 ELSE creator_agent END
              WHERE id = ?22 AND next_run = ?23
                AND (schedule = ?24 OR (schedule IS NULL AND expression = ?25))
                AND last_status IS ?26
@@ -1048,6 +1088,9 @@ pub fn update_job_at(config: &Config, job_id: &str, patch: CronJobPatch, now: Da
                     job.delivery_principal.channel.as_deref(),
                     job.delivery_principal.chat_type.as_deref(),
                     command_created_via,
+                    rewritten_creator.is_some(),
+                    rewritten_creator.as_ref().and_then(CreatorStamp::level_column),
+                    rewritten_creator.as_ref().and_then(|creator| creator.agent.as_deref()),
                 ],
             )
             .context("Failed to update cron job")?;
@@ -2243,6 +2286,10 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&mut Connection) -> Result
     // backfill: a row stored before the column existed reads as
     // `agent_tool` (its git is refused) until the operator marks it.
     add_column_if_missing(&conn, "cron_jobs", "created_via", "TEXT")?;
+    // The creating call's level and agent. Nullable with no backfill: a row
+    // without them runs capped at `supervised`.
+    add_column_if_missing(&conn, "cron_jobs", "creator_level", "TEXT")?;
+    add_column_if_missing(&conn, "cron_jobs", "creator_agent", "TEXT")?;
     add_column_if_missing(&conn, "cron_runs", "attempt_id", "TEXT")?;
     add_column_if_missing(&conn, "cron_runs", "worker_id", "TEXT")?;
     add_column_if_missing(&conn, "cron_job_events", "source_message_event_id", "TEXT")?;
