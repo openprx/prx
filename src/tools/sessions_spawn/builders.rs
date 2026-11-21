@@ -325,10 +325,16 @@ impl SessionsSpawnTool {
         anyhow::ensure!(self.restart_recovery.is_none(), "worker recovery is already attached");
         let fabric = self.memory_fabric().context("worker recovery requires shared memory")?;
         let workspace = std::path::PathBuf::from(fabric.workspace_id());
+        let worker_root = super::resolve_worker_workspace_root(
+            self.hint_config
+                .as_ref()
+                .and_then(|config| config.sessions_spawn.worker_workspace_root.as_deref()),
+            &workspace,
+        );
         let runs = Arc::clone(&self.active_runs);
         let handle = tokio::runtime::Handle::try_current()?;
         self.restart_recovery = Some(AbortOnDrop(handle.spawn(async move {
-            process_terminal::run_restart_recovery(fabric, workspace, runs).await;
+            process_terminal::run_restart_recovery(fabric, workspace, worker_root, runs).await;
         })));
         Ok(self)
     }

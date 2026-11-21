@@ -454,6 +454,23 @@ async fn recover_journal(
     .map(Some)
 }
 
+/// Signed launch facts for a retained snapshot folder of `run`, or `None`
+/// when no launch was recorded.
+pub(super) async fn retained_launch(
+    fabric: &MemoryFabric,
+    workspace: &std::path::Path,
+    owner: &str,
+    run: &str,
+) -> anyhow::Result<Option<super::retained::RetainedLaunch>> {
+    let Some(launch) = launch::read(fabric, workspace, owner, run).await? else {
+        return Ok(None);
+    };
+    Ok(Some(super::retained::RetainedLaunch {
+        worker_absent: launch.process_absent()?,
+        scope: super::retained::terminal_scope(launch.input.as_ref().unwrap_or(&launch.event)),
+    }))
+}
+
 pub(super) async fn recover_restart_event(
     fabric: &MemoryFabric,
     workspace: &std::path::Path,

@@ -148,13 +148,7 @@ impl VerifiedLaunch {
         self.fields.batch_id.as_deref()
     }
     pub(super) fn process_absent(&self) -> anyhow::Result<bool> {
-        let Some(expected) = self.fields.process_context_mac else {
-            return Ok(false);
-        };
-        if process_identity::context_mac(&self.key)? != Some(expected) {
-            return Ok(false);
-        }
-        process_identity::absent(self.fields.worker_pid)
+        worker_absent(&self.fields, &self.key)
     }
 
     pub(super) async fn partial_usage(&self, fabric: &MemoryFabric) -> anyhow::Result<RecoveredWorkerUsage> {
@@ -185,6 +179,16 @@ impl VerifiedLaunch {
         }
         Ok(completion)
     }
+}
+
+fn worker_absent(fields: &LaunchFields, key: &crate::security::runtime_key::DecisionKey) -> anyhow::Result<bool> {
+    let Some(expected) = fields.process_context_mac else {
+        return Ok(false);
+    };
+    if process_identity::context_mac(key)? != Some(expected) {
+        return Ok(false);
+    }
+    process_identity::absent(fields.worker_pid)
 }
 
 pub(super) async fn read(

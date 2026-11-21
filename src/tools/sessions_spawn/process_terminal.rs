@@ -2,6 +2,7 @@
 pub(super) mod operator;
 pub(super) mod ordinary;
 mod process_identity;
+pub(super) mod retained;
 use crate::agent::terminal::TurnTerminalStatus;
 use crate::memory::{MemoryFabric, MessageEvent, MessageEventSource, MessageEventSubject};
 use crate::session_worker::protocol::WorkerResult;
@@ -48,8 +49,11 @@ fn admit_unconfirmed_warning(
 pub(super) async fn run_restart_recovery(
     fabric: MemoryFabric,
     workspace: std::path::PathBuf,
+    worker_root: std::path::PathBuf,
     runs: std::sync::Arc<tokio::sync::RwLock<Vec<super::SubAgentRun>>>,
 ) {
+    // Once per process start: settle snapshot folders whose owner is gone.
+    retained::sweep_retained_worker_folders(&fabric, &workspace, &worker_root, &runs).await;
     // An unconfirmed reconciliation is reported once per launch per process,
     // not again on every sweep; the set is bounded and never cleared.
     let mut warned = std::collections::HashSet::new();
