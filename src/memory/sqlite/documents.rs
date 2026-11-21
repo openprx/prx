@@ -28,6 +28,13 @@ impl SqliteMemory {
                 .then(|| principal.owner_id.clone())
                 .flatten();
         }
+        // MA-01h: a partitioned (gateway) turn reads the documents of its
+        // partition's owner, the owner `document_ingest` wrote them under
+        // (`owner_id_for_document_principal`). The channel/sender pair would
+        // name a different owner and hide the agent's own private documents.
+        if let Some(partition) = principal.agent_partition.as_ref() {
+            return Some(partition.owner_id.clone());
+        }
         let channel = principal.channel.as_deref()?.trim();
         let sender = principal.sender.as_deref()?.trim();
         if channel.is_empty() || sender.is_empty() {

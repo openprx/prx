@@ -364,15 +364,17 @@ the purge of the agent incarnation.
 
 ## Partition and history labels (`targeted_agents_v1`)
 
-**Invariant.** Every read made on behalf of an agent sees only rows of its own
-partition, and every row written for it carries that partition. The partition
+**Invariant.** Every read made by a gateway turn on behalf of an agent (Main
+or a named agent) sees only rows of its own partition, and every row written for it carries that partition. The partition
 key is (workspace, install owner, agent, incarnation); Main is one partition
 and each named agent incarnation is another. This holds for a turn's history,
 the recalled memory and documents injected into its prompt, the memory,
 document and session tools, and the context a compaction reads. Memory and
 documents have no session term: an agent's own memory is shared across its
 chats, and no other agent (Main included) reads it. Main, through the gateway,
-reads Main's rows only, also in a session it shares with named agents.
+reads Main's rows only, also in a session it shares with named agents. A
+terminal `prx chat` turn is the local operator's view: it runs under no
+partition and is outside this invariant.
 
 **History labels.** `GET /api/sessions/{session_id}/messages` on a
 caller-keyed session returns
