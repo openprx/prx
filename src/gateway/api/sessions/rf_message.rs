@@ -380,8 +380,10 @@ struct RfMessage {
     sender: RfSender,
     #[serde(default)]
     mentions: Vec<String>,
-    #[serde(default, deserialize_with = "present_string")]
-    reply_to: Option<String>,
+    /// The rf wire field `reply_to`; the Rust name follows the channel
+    /// layer's `reply_target` (tests/reply_target_field_regression.rs).
+    #[serde(default, deserialize_with = "present_string", rename = "reply_to")]
+    reply_target: Option<String>,
 }
 
 /// An optional string that, when present, must not be `null`.
@@ -398,8 +400,8 @@ struct CallerContext<'a> {
     chat: &'a RfChat,
     sender: &'a RfSender,
     mentions: &'a [String],
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reply_to: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "reply_to")]
+    reply_target: Option<&'a str>,
     client_message_id: &'a str,
     deliver: Deliver,
 }
@@ -409,7 +411,7 @@ fn parse_message(body: &[u8]) -> Result<RfMessage, &'static str> {
     if !is_message_id(&message.client_message_id) {
         return Err("client_message_id must be 1 to 128 characters of [A-Za-z0-9_.:-]");
     }
-    if message.reply_to.as_deref().is_some_and(|id| !is_message_id(id)) {
+    if message.reply_target.as_deref().is_some_and(|id| !is_message_id(id)) {
         return Err("reply_to must be 1 to 128 characters of [A-Za-z0-9_.:-]");
     }
     if message.message.trim().is_empty() {
@@ -451,7 +453,7 @@ fn render(message: &RfMessage) -> Result<String, serde_json::Error> {
         chat: &message.chat,
         sender: &message.sender,
         mentions: &message.mentions,
-        reply_to: message.reply_to.as_deref(),
+        reply_target: message.reply_target.as_deref(),
         client_message_id: &message.client_message_id,
         deliver: message.deliver,
     })?;
