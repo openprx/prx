@@ -887,7 +887,14 @@ impl SessionsSpawnTool {
             let process_announce_security = Arc::clone(launch_security);
             let process_announce_origin = AnnounceOrigin::from_scope(spawn_scope.as_ref());
             let process_announce_history = history_arc.clone();
-            let process_parent_run_id = parent_run_id.clone();
+            // The worker's parent is the run its bound input names: the
+            // publication's spawn run, or the operator source run. A gateway
+            // Console turn seeds no spawn context, so `parent_run_id` alone is
+            // None there and the manifest would differ from its issued input.
+            let process_parent_run_id = spawn_scope_for_event
+                .parent_run_id
+                .clone()
+                .or_else(|| parent_run_id.clone());
             let process_session_scope_key = session_scope_key.clone();
             let process_spawn_depth = spawn_depth;
             let process_channel_exclusions = inherited_channel_exclusions.clone();
@@ -1168,13 +1175,23 @@ impl SessionsSpawnTool {
                                     )
                                 }
                                 Err(error) => {
+                                    // Nothing was spawned for a refused launch, so its
+                                    // failure is final rather than left to recovery.
+                                    let launch_refused =
+                                        error.downcast_ref::<super::process_mode::WorkerLaunchRefused>().is_some();
+                                    tracing::warn!(
+                                        run_id = %rid,
+                                        launch_refused,
+                                        error = %crate::agent::diagnostics::error_class(&error),
+                                        "sub-agent process ended with an error"
+                                    );
                                     let detail = super::failure::llm_visible_error(&format!("{error:#}"));
                                     let msg = format!("Sub-agent process error: {detail}");
                                     (
                                         SubAgentStatus::Failed(detail),
                                         msg,
                                         Vec::new(),
-                                        if is_ordinary_process || is_operator_process {
+                                        if (is_ordinary_process || is_operator_process) && !launch_refused {
                                             ProcessFinalization::Unconfirmed
                                         } else { ProcessFinalization::Natural },
                                     )

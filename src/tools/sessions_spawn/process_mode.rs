@@ -16,6 +16,28 @@ use anyhow::Context as _;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+/// A process worker that could not be launched: nothing was spawned and no
+/// launch was recorded. The run ends with this typed, visible failure instead
+/// of waiting for a recovery that has nothing to find.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct WorkerLaunchRefused;
+
+impl WorkerLaunchRefused {
+    pub(super) const fn code(self) -> &'static str {
+        "worker_launch_refused"
+    }
+}
+
+impl std::fmt::Display for WorkerLaunchRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: the process worker could not be launched", self.code())
+    }
+}
+
+fn refused(error: impl Into<anyhow::Error>) -> anyhow::Error {
+    error.into().context(WorkerLaunchRefused)
+}
+
 pub(super) async fn run_sub_agent_process(
     run_id: &str,
     task: &str,
@@ -58,7 +80,9 @@ pub(super) async fn run_sub_agent_process(
     #[cfg(test)] test_worker_executable: Option<&TestWorkerExecutable>,
 ) -> anyhow::Result<ProcessWorkerOutcome> {
     if source_fabric.is_some_and(|fabric| fabric.memory().requires_scoped_execution()) {
-        return Err(crate::memory::erasure::Unsupported("process worker cannot preserve scoped memory erasure").into());
+        return Err(refused(crate::memory::erasure::Unsupported(
+            "process worker cannot preserve scoped memory erasure",
+        )));
     }
     let process_generation = source_launch.as_ref().map(|launch| Arc::clone(launch.generation()));
     let ordinary_generation = source_launch
@@ -69,22 +93,28 @@ pub(super) async fn run_sub_agent_process(
         .as_ref()
         .filter(|launch| !launch.is_ordinary())
         .map(|launch| Arc::clone(launch.generation()));
-    anyhow::ensure!(
-        operator_generation.is_none() || batch_id.is_none(),
-        "operator process cannot claim model batch provenance"
-    );
+    if operator_generation.is_some() && batch_id.is_some() {
+        return Err(refused(anyhow::anyhow!(
+            "operator process cannot claim model batch provenance"
+        )));
+    }
     // The strict transport secret `T` for this launch: it seals the capability,
     // the manifest snapshot, every child source record and the launch record.
     // Any error refuses the launch; there is no fallback key.
-    let launch_transport_key = crate::session_worker::transport_key::TransportSecret::for_launch()?.hmac_key();
+    let launch_transport_key = crate::session_worker::transport_key::TransportSecret::for_launch()
+        .map_err(refused)?
+        .hmac_key();
     let source_transport_key = source_launch.as_ref().map(|_| launch_transport_key.clone());
     if let Some(launch) = &source_launch {
-        let fabric = source_fabric.context("process source fabric missing")?;
+        let fabric = source_fabric
+            .context("process source fabric missing")
+            .map_err(refused)?;
         let issued = launch.source_fabric();
-        anyhow::ensure!(
-            fabric.workspace_id() == issued.workspace_id() && Arc::ptr_eq(&fabric.memory(), &issued.memory()),
-            "process source storage differs from captured launch"
-        );
+        if fabric.workspace_id() != issued.workspace_id() || !Arc::ptr_eq(&fabric.memory(), &issued.memory()) {
+            return Err(refused(anyhow::anyhow!(
+                "process source storage differs from captured launch"
+            )));
+        }
     }
     let logical_workspace_root = process_generation.as_ref().map_or(workspace_root, |generation| {
         generation.effective.workspace_dir.as_path()
@@ -136,10 +166,16 @@ pub(super) async fn run_sub_agent_process(
     }
     #[cfg(any(not(test), not(unix)))]
     std::fs::create_dir_all(&worker_workspace)
-        .with_context(|| format!("create worker workspace `{}`", worker_workspace.display()))?;
+        .with_context(|| format!("create worker workspace `{}`", worker_workspace.display()))
+        .map_err(refused)?;
+    // Every failure from here until the spawn removes the unused workspace.
+    let refused_here = |error: anyhow::Error| {
+        cleanup_process_worker_workspace(run_id, &worker_workspace, keep_workspace);
+        refused(error)
+    };
     let shared_memory_db_path = shared_worker_memory_db_path(logical_workspace_root);
     let worker_memory_db_path = private_worker_memory_db_path(&worker_workspace);
-    let normalized_memory_strategy = normalize_process_memory_strategy(memory_strategy)?;
+    let normalized_memory_strategy = normalize_process_memory_strategy(memory_strategy).map_err(refused_here)?;
     let (memory_db_path, memory_workspace_id) = match normalized_memory_strategy {
         PROCESS_MEMORY_STRATEGY_SHARED => (
             shared_memory_db_path.clone(),
@@ -149,20 +185,26 @@ pub(super) async fn run_sub_agent_process(
             worker_memory_db_path.clone(),
             worker_workspace.to_string_lossy().to_string(),
         ),
-        other => anyhow::bail!("invalid normalized process memory strategy '{other}'"),
+        other => {
+            return Err(refused_here(anyhow::anyhow!(
+                "invalid normalized process memory strategy '{other}'"
+            )));
+        }
     };
 
     let identity_dir = if let Some(identity_dir) = agent_identity_dir {
         let source_identity = workspace_root.join(identity_dir);
         if source_identity.is_dir() {
             let copied_identity_dir = worker_workspace.join("identity");
-            copy_dir_recursive(&source_identity, &copied_identity_dir).with_context(|| {
-                format!(
-                    "copy worker identity `{}` to `{}`",
-                    source_identity.display(),
-                    copied_identity_dir.display()
-                )
-            })?;
+            copy_dir_recursive(&source_identity, &copied_identity_dir)
+                .with_context(|| {
+                    format!(
+                        "copy worker identity `{}` to `{}`",
+                        source_identity.display(),
+                        copied_identity_dir.display()
+                    )
+                })
+                .map_err(refused_here)?;
             Some("identity".to_string())
         } else {
             tracing::warn!(path = %source_identity.display(), "configured agent identity directory is missing or is not a directory");
@@ -212,7 +254,8 @@ pub(super) async fn run_sub_agent_process(
         source_launch,
         &launch_transport_key,
         mailbox,
-    )?;
+    )
+    .map_err(refused_here)?;
 
     if let Some(reason) = process_control.termination_reason() {
         cleanup_process_worker_workspace(run_id, &worker_workspace, keep_workspace);
@@ -220,7 +263,9 @@ pub(super) async fn run_sub_agent_process(
     }
 
     #[cfg(not(test))]
-    let executable = std::env::current_exe().context("resolve the current executable for the session worker child")?;
+    let executable = std::env::current_exe()
+        .context("resolve the current executable for the session worker child")
+        .map_err(refused_here)?;
     #[cfg(test)]
     let executable = if let Some(artifact) = test_worker_executable {
         artifact
@@ -230,7 +275,7 @@ pub(super) async fn run_sub_agent_process(
     } else {
         std::env::current_exe().context("resolve the current executable path for the session worker child")?
     };
-    let cli_args = build_session_worker_cli_args(&manifest)?;
+    let cli_args = build_session_worker_cli_args(&manifest).map_err(refused_here)?;
     let mut command = tokio::process::Command::new(executable);
     #[cfg(test)]
     if let Some(artifact) = test_worker_executable {
@@ -263,7 +308,8 @@ pub(super) async fn run_sub_agent_process(
             "prepare worker manifest snapshot in `{}`",
             manifest.workspace_dir.display()
         )
-    })?;
+    })
+    .map_err(refused_here)?;
     #[cfg(unix)]
     let payload = prepared_manifest.line().to_owned();
     #[cfg(not(unix))]
@@ -275,13 +321,16 @@ pub(super) async fn run_sub_agent_process(
         control.claim()?;
         control.check_serialized_precondition(&payload)?;
     }
-    let mut child = command.spawn().with_context(|| {
-        format!(
-            "spawn session worker child `{}` (cwd {})",
-            command.as_std().get_program().to_string_lossy(),
-            std::env::current_dir().map_or_else(|_| "<unavailable>".to_owned(), |dir| dir.display().to_string())
-        )
-    })?;
+    let mut child = command
+        .spawn()
+        .with_context(|| {
+            format!(
+                "spawn session worker child `{}` (cwd {})",
+                command.as_std().get_program().to_string_lossy(),
+                std::env::current_dir().map_or_else(|_| "<unavailable>".to_owned(), |dir| dir.display().to_string())
+            )
+        })
+        .map_err(refused_here)?;
     if let Some(binding) = mailbox_binding.as_mut() {
         binding.spawned();
     }
