@@ -384,6 +384,7 @@ enter a later model context of the agent, recall, a handoff lookup or the
 session tools. `GET /api/sessions/{session_id}/messages` returns a deleted
 row as exactly `{"message_id","agent","deleted":true,"timestamp"}`.
 `GET /api/jobs/{job_id}` of a deleted run reports `result` `{"deleted":true}`.
+The deleted bytes leave PRX's store files (`brain.db` and its WAL) before the delete answers, or, if another reader keeps the WAL busy for 4 s or a run is still in flight, at the first of: that run's end, the next history read, message or delete on the session, the next PRX start or a clean stop.
 Each deleted run (or `context` message) gets one content-free `turn.deleted`
 record for the sync stream (SYNC-1).
 
