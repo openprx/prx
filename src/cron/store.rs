@@ -383,6 +383,11 @@ pub fn job_creator(config: &Config, job_id: &str) -> Result<(JobCreator, Creator
     if let Some(store) = pg_store(config)? {
         return store.job_creator(job_id);
     }
+    // No job store means no stored creator: the run is capped, and looking it
+    // up creates nothing.
+    if !config.workspace_dir.join("cron").join("jobs.db").exists() {
+        return Ok((JobCreator::AgentTool, CreatorStamp::default()));
+    }
     with_connection(config, |conn| {
         let (created_via, level, agent) = conn
             .query_row(

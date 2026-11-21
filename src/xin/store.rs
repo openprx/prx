@@ -225,6 +225,11 @@ pub fn task_created_via(config: &Config, task_id: &str) -> Result<JobCreator> {
 /// surface created it (NULL is `agent_tool`) and the creating call's level
 /// and agent (an unreadable stamp reads as empty).
 pub fn task_creator(config: &Config, task_or_step_id: &str) -> Result<(JobCreator, CreatorStamp)> {
+    // No task store means no stored creator: the run is capped, and looking
+    // it up creates nothing.
+    if !config.workspace_dir.join("xin").join("tasks.db").exists() {
+        return Ok((JobCreator::AgentTool, CreatorStamp::default()));
+    }
     with_connection(config, |conn| stored_creator(conn, task_or_step_id))
 }
 
