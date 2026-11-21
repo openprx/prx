@@ -1040,13 +1040,19 @@ fn task_run_level(config: &Config, task: &XinTask) -> Result<crate::security::Au
     .map_err(|error| format!("blocked by security policy: {error}"))
 }
 
-/// How a Xin shell task's git is treated (D-107 and its amendment): a
-/// system task (built-in or the operator's `HEARTBEAT.md`) and a task the
-/// operator created with `prx xin` (or marked with `prx xin mark-operator`)
-/// run git hardened, warned once; every other task, and every goal step
-/// (steps can be added to a goal through tools), refuses it. A failed
-/// lookup refuses.
+/// How a Xin shell task's git is treated. At an effective Full level (the
+/// carried level of the calling tool, else Main's configured level, which
+/// Xin runs at) git runs plainly, as in the Full shell, for every task and
+/// goal step (owner D1). Below Full (D-107 and its amendment): a system task
+/// (built-in or the operator's `HEARTBEAT.md`) and a task the operator
+/// created with `prx xin` (or marked with `prx xin mark-operator`) run git
+/// hardened, warned once; every other task, and every goal step (steps can
+/// be added to a goal through tools), refuses it. A failed lookup refuses.
 fn shell_git_policy(config: &Config, task: &XinTask) -> crate::runtime::shell_process::ShellGitPolicy {
+    let level = crate::tools::effective_autonomy::current().unwrap_or(config.autonomy.level);
+    if level == crate::security::AutonomyLevel::Full {
+        return crate::tools::shell::shell_git_policy(level);
+    }
     let operator = task.kind == crate::xin::types::TaskKind::System
         || store::task_created_via(config, &task.id)
             .is_ok_and(|creator| creator == crate::cron::JobCreator::OperatorCli);
@@ -1169,13 +1175,14 @@ mod tests {
         assert_eq!(tasks.len(), 3); // No duplicates
     }
 
-    /// D-107: only a system task (built-in or the operator's `HEARTBEAT.md`)
-    /// is operator-configured; any other Xin shell task may come from a
-    /// tool, so its git is refused.
+    /// D-107, below Full: only a system task (built-in or the operator's
+    /// `HEARTBEAT.md`) is operator-configured; any other Xin shell task may
+    /// come from a tool, so its git is refused.
     #[test]
     fn only_system_xin_tasks_run_git_hardened() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp);
+        let mut config = test_config(&tmp);
+        config.autonomy.level = crate::security::AutonomyLevel::Supervised;
         let task = |name: &str, kind: TaskKind| {
             store::add_task(
                 &config,
