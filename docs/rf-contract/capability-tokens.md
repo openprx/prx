@@ -172,20 +172,24 @@ without a level reads back Main's level, the one it runs at.
 
 ## Routes: sessions and messages (`session_key_v1`, `message_target_v1`, `message_context_delivery_v1`)
 
-A request is **rf-shaped** when its JSON body carries `session_key`
-(`POST /api/sessions`) or `client_message_id`
-(`POST /api/sessions/{session_id}/message`). Any other request on these routes
-is a Console request and keeps its previous behaviour and body. rf-shaped
+A `POST /api/sessions` is **rf-shaped** when its JSON body carries
+`session_key`. A `POST /api/sessions/{session_id}/message` is rf-shaped when
+the session id is a caller session key (below) or the JSON body carries any rf
+field (`client_message_id`, `deliver`, `chat`, `sender`, `mentions`,
+`reply_to`); it is then validated as the whole rf message body, so a body
+without `client_message_id`, a plain `{"message"}` or a multipart body sent to
+a caller-keyed session is `400 field_invalid`. Only a request to a PRX session
+(`console-…`, or a PRX key with `:`) whose body has none of the rf fields is a
+Console request, and it keeps its previous behaviour and body. rf-shaped
 requests need a paired bearer: with pairing off they are `401 auth_failed`.
 They take no query parameter, except `mode=async` on the message route. Every
 error is in the coded shape. They share the shared API rate limit.
 
 **Session keys.** `session_key` matches `[A-Za-z0-9_-]{8,128}` and does not
 start with `console-`. The session id is the key itself. A caller-keyed session
-belongs to the owner that created it: an rf message or a messages listing
+belongs to the owner that created it: a message or a messages listing
 (`GET /api/sessions/{session_id}/messages`) on it by another owner is
-`404 session_unknown`, exactly like a key that does not exist. A Console
-message (no `client_message_id`) keeps its previous behaviour on any session.
+`404 session_unknown`, exactly like a key that does not exist.
 
 | Route | Request | 2xx |
 |---|---|---|
@@ -254,11 +258,13 @@ and a resent `context` is stored again. Deduplication and replay are
 - `401 auth_failed`: a missing or invalid bearer, a credential in the query
   string, or pairing off.
 - `404 session_unknown`: no caller-keyed session with this id of this owner.
-- `404 agent_unknown`: no such configured agent.
+- `404 agent_unknown`: no such configured agent, whether targeted agents are
+  on or off (existence is checked first).
 - `409 session_owner_conflict`: another owner holds the `session_key`.
-- `409 agent_targeting_disabled`: a named `agent` while targeted agents are off
-  (`agent` omitted or `"main"` still runs Main).
-- `409 agent_disabled`: the agent is disabled or retired.
+- `409 agent_targeting_disabled`: a configured named `agent` while targeted
+  agents are off, whatever its own state (`agent` omitted or `"main"` still
+  runs Main).
+- `409 agent_disabled`: the agent is disabled or retired (targeted agents on).
 - `409 session_busy`: a `turn` of this agent in this session is still live.
 - `400 agent_tools_invalid`, `409 agent_backend_unsupported`,
   `409 agent_scope_refused`: the agent's configuration, the memory backend or
