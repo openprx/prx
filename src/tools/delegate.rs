@@ -454,7 +454,10 @@ impl Tool for DelegateTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        let agent_names: Vec<&str> = self.agents.keys().map(|s: &String| s.as_str()).collect();
+        // Sorted: the contract is fingerprinted, and a worker process rebuilds
+        // this tool from the same agents in its own hash order.
+        let mut agent_names: Vec<&str> = self.agents.keys().map(|s: &String| s.as_str()).collect();
+        agent_names.sort_unstable();
         json!({
             "type": "object",
             "additionalProperties": false,

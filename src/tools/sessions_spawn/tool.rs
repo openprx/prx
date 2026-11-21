@@ -36,12 +36,15 @@ impl SessionsSpawnTool {
     pub(super) fn execution_schema(&self) -> &std::sync::Arc<serde_json::Value> {
         self.execution_schema.get_or_init(|| {
             std::sync::Arc::new({
-                let available_agents = self
+                // Sorted: the contract is fingerprinted, and a worker process
+                // rebuilds this tool from the same agents in its own hash order.
+                let mut available_agents = self
                     .agents
                     .iter()
                     .filter(|(_, cfg)| cfg.spawn_enabled.unwrap_or(true))
                     .map(|(name, _)| name.as_str())
                     .collect::<Vec<_>>();
+                available_agents.sort_unstable();
                 crate::tools::schema::with_default_action_requirements(
                     json!({
                         "type": "object",
