@@ -527,7 +527,7 @@ impl Memory for SqliteMemory {
             let inserted = tx.execute(
                 "INSERT INTO sessions
                 (session_key, channel, sender, owner_id, created_at, updated_at, message_count, last_message_preview)
-                VALUES (?1, 'console', ?2, ?2, ?3, ?3, 0, '')
+                VALUES (?1, 'rf', ?2, ?2, ?3, ?3, 0, '')
                 ON CONFLICT(session_key) DO NOTHING",
                 params![session_key, owner_id, now],
             )?;
@@ -539,7 +539,8 @@ impl Memory for SqliteMemory {
                     params![session_key],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )?;
-                if channel == "console" && owner.as_deref() == Some(owner_id.as_str()) {
+                if channel == crate::memory::CALLER_KEYED_SESSION_CHANNEL && owner.as_deref() == Some(owner_id.as_str())
+                {
                     crate::memory::SessionClaim::Existing
                 } else {
                     crate::memory::SessionClaim::OtherOwner

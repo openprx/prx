@@ -46,6 +46,7 @@ pub use router_history::{
     RouterHistoryWriteEvidence,
 };
 pub use sqlite::SqliteMemory;
+pub use traits::CALLER_KEYED_SESSION_CHANNEL;
 pub use traits::LifecycleState;
 pub use traits::Memory;
 pub use traits::{

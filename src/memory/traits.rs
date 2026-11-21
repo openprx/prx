@@ -258,14 +258,18 @@ pub struct ConversationSessionSummary {
     pub last_message_preview: String,
 }
 
-/// How claiming a caller-keyed Console session ended.
+/// The `sessions.channel` of a session created under a caller-chosen key
+/// (`POST /api/sessions {"session_key"}`): the durable mark of its origin.
+pub const CALLER_KEYED_SESSION_CHANNEL: &str = "rf";
+
+/// How claiming a caller-keyed session ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionClaim {
-    /// No row held the key; it is now a Console session of the claimant.
+    /// No row held the key; it is now a caller-keyed session of the claimant.
     Created,
-    /// The key already names a Console session of the same owner.
+    /// The key already names a caller-keyed session of the same owner.
     Existing,
-    /// The key names a session of another owner (or a non-Console session).
+    /// The key names a session of another owner, or one of another origin.
     OtherOwner,
 }
 
@@ -1905,9 +1909,9 @@ pub trait Memory: Send + Sync {
         ))
     }
 
-    /// Get-or-create an empty Console session under a caller-chosen key, in
-    /// one transaction: a new row is owned by `owner_id`; an existing row is
-    /// compared, never changed.
+    /// Get-or-create an empty caller-keyed session (channel
+    /// [`CALLER_KEYED_SESSION_CHANNEL`]) in one transaction: a new row is owned
+    /// by `owner_id`; an existing row is compared, never changed.
     async fn claim_conversation_session(&self, session_key: &str, owner_id: &str) -> anyhow::Result<SessionClaim> {
         let _ = (session_key, owner_id);
         Err(crate::memory::fabric::fail_fast(

@@ -135,7 +135,10 @@ pub(in crate::gateway::api) async fn message_route_auth(
     request: Request,
     next: Next,
 ) -> Response {
-    let keyed = message_path_session(request.uri().path()).is_some_and(is_caller_session_key);
+    let keyed = match message_path_session(request.uri().path()) {
+        Some(session_id) => keyed_session(&state, session_id).await == Some(true),
+        None => false,
+    };
     route_auth(&state, request, next, &RF_MESSAGE_FIELDS, keyed).await
 }
 
@@ -214,10 +217,30 @@ pub(super) async fn post_keyed_session(
     }
 }
 
-/// Admit a request on the caller-keyed session `session_id` only for its
-/// owner: another owner, or no such row, is `404 session_unknown`. A row of
-/// another channel is no caller-keyed session: refused for an rf message,
-/// left to the history listing otherwise.
+/// Whether `session_id` names a session created by `session_key`: its row
+/// carries the channel [`crate::memory::CALLER_KEYED_SESSION_CHANNEL`], which
+/// only that route writes. `None` when the row could not be read. Ids outside
+/// the caller-key grammar are never looked up.
+async fn keyed_session(state: &AppState, session_id: &str) -> Option<bool> {
+    if !is_caller_session_key(session_id) {
+        return Some(false);
+    }
+    match state.mem.conversation_session_owner(session_id).await {
+        Ok(row) => Some(row.is_some_and(|row| row.channel == crate::memory::CALLER_KEYED_SESSION_CHANNEL)),
+        Err(error) => {
+            tracing::warn!(
+                error_kind = super::console_error_kind(&error),
+                "Session origin lookup failed"
+            );
+            None
+        }
+    }
+}
+
+/// Admit a request on a caller-keyed session only for its owner: another
+/// owner is `404 session_unknown`. For an rf message (`rf_shaped`) a missing
+/// row or a session of another origin is `404 session_unknown` too; for the
+/// history listing those are left to the Console path, unchanged.
 pub(super) async fn require_session_owner(
     state: &AppState,
     session_id: &str,
@@ -225,15 +248,15 @@ pub(super) async fn require_session_owner(
     rf_shaped: bool,
 ) -> Result<(), Box<Response>> {
     match state.mem.conversation_session_owner(session_id).await {
-        Ok(Some(row)) if row.channel != "console" => {
-            if rf_shaped {
-                Err(Box::new(session_unknown()))
-            } else {
+        Ok(Some(row)) if row.channel == crate::memory::CALLER_KEYED_SESSION_CHANNEL => {
+            if row.owner_id.as_deref() == Some(owner_id) {
                 Ok(())
+            } else {
+                Err(Box::new(session_unknown()))
             }
         }
-        Ok(Some(row)) if row.owner_id.as_deref() == Some(owner_id) => Ok(()),
-        Ok(_) => Err(Box::new(session_unknown())),
+        Ok(_) if rf_shaped => Err(Box::new(session_unknown())),
+        Ok(_) => Ok(()),
         Err(error) => {
             tracing::warn!(
                 error_kind = super::console_error_kind(&error),
@@ -254,13 +277,14 @@ pub(super) enum MessageShape {
     Console { request: Request, unreadable: bool },
 }
 
-/// Classify a message request. A request to a caller-keyed session is
-/// always rf-shaped (a body that is not the rf message, multipart included,
-/// is `400 field_invalid`); otherwise a non-multipart body is buffered under
-/// the same limit the JSON extractor applies and is rf-shaped when it carries
-/// an rf field.
+/// Classify a message request. A request to a session created by
+/// `session_key` is always rf-shaped (a body that is not the rf message,
+/// multipart included, is `400 field_invalid`; an unreadable origin counts as
+/// such a session, so the rf path reports it); otherwise a non-multipart body
+/// is buffered under the same limit the JSON extractor applies and is
+/// rf-shaped when it carries an rf field.
 pub(super) async fn classify(state: &AppState, session_id: &str, request: Request) -> MessageShape {
-    let keyed = is_caller_session_key(session_id);
+    let keyed = keyed_session(state, session_id).await != Some(false);
     if is_multipart(request.headers()) {
         if keyed {
             let (parts, _) = request.into_parts();
@@ -474,9 +498,6 @@ pub(super) async fn post_rf_message(
         Ok(runtime) => runtime,
         Err(refusal) => return super::super::provider_not_ready(refusal),
     };
-    if !is_caller_session_key(&session_id) {
-        return session_unknown();
-    }
     if let Err(response) = require_session_owner(&state, &session_id, &principal.owner_id, true).await {
         return *response;
     }
