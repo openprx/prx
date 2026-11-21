@@ -799,8 +799,10 @@ allow_executable_proposals = false
 [tool_tiering.model_allowlists]
 "gemma4-e2b" = ["shell", "file_read", "file_write"]
 
-# Secure autonomous defaults. `full` skips confirmation prompts but remains
-# workspace-scoped and bounded unless the operator explicitly widens it.
+# `full` has no permission limits: no confirmation prompts, and the native file
+# tools and shell skip `workspace_only` and `forbidden_paths`. Below `full`,
+# those two keys confine every file tool path and shell path argument (see
+# "Path policy by autonomy level" below).
 [autonomy]
 level = "full"
 workspace_only = true
@@ -862,6 +864,28 @@ component. The explicit `wasm:` namespace is required so plugins cannot shadow
 built-in provider or memory backend names. These selections are supported by
 TUI, line-mode and one-shot chat, the internal agent engine, gateway turns, standalone IM channels, delegated
 agents, and process-isolated session workers.
+
+### Path policy by autonomy level
+
+- `full`: no path limits. The native file tools and the shell skip
+  `workspace_only` and `forbidden_paths`; the native file tools still refuse
+  parent traversal (`..`).
+- `supervised` and `readonly`: a path is allowed exactly when it resolves
+  inside the workspace (with `workspace_only = true`) and outside every
+  `forbidden_paths` entry, however it is written: relative, absolute, or `~/`.
+  An absolute path inside the workspace is allowed; a path outside it, a
+  forbidden path, and a symlink inside the workspace that resolves outside it
+  are refused. Parent traversal (`..`), URL-encoded traversal and NUL bytes are
+  refused at every level below `full`. `readonly` still refuses mutations.
+- Below `full`, `file_read`, `file_write`, `file_edit` and `shell` check their
+  paths before any approval prompt or reservation. A refused call ends with a
+  `denied` status, no prompt and no reservation, and the result names the
+  reason: `Path not allowed: <path> is outside the workspace`,
+  `Path not allowed: <path> is a forbidden path`, or `Path not allowed: <path>
+  resolves outside the workspace through a symlink` (for shell arguments:
+  `path argument is outside the workspace: <arg>` or
+  `forbidden path argument: <arg>`). The tool checks the same path again when it
+  runs, because the file can change in between.
 
 An unrestricted profile is always explicit: set `workspace_only = false`,
 clear `forbidden_paths`, and set `max_cost_per_day_cents = 4294967295`
