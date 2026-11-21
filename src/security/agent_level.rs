@@ -91,22 +91,28 @@ pub enum ScheduledRefusal {
     /// The run's level is read-only.
     #[error("autonomy is read-only")]
     ReadOnly,
-    /// An operator job keeps the operator's context and Main's policy, so a
-    /// call below Main's level cannot start it at that lower level.
+    /// The job's origin keeps the local operator's context, whose policy is
+    /// Main's, so a run whose level is below Main's cannot start there.
     #[error(
-        "caller_below_operator: this operator job runs with Main's policy, above the calling turn's level, so nothing ran"
+        "below_operator_context: this job runs in the local operator's context with Main's policy, above its own \
+         level, so nothing ran"
     )]
-    CallerBelowOperator,
+    BelowOperatorContext,
 }
 
-/// The refusal for a scheduled agent run at `level`, if any. `operator`
-/// says the run keeps the operator's context and Main's (`main`) policy.
+/// The refusal for a scheduled agent run at `level`, if any.
+/// `operator_context` says the run keeps the local operator's context and
+/// Main's (`main`) policy (a `LocalOperator` origin).
 #[must_use]
-pub fn scheduled_agent_refusal(level: AutonomyLevel, operator: bool, main: AutonomyLevel) -> Option<ScheduledRefusal> {
+pub fn scheduled_agent_refusal(
+    level: AutonomyLevel,
+    operator_context: bool,
+    main: AutonomyLevel,
+) -> Option<ScheduledRefusal> {
     if level == AutonomyLevel::ReadOnly {
         Some(ScheduledRefusal::ReadOnly)
-    } else if operator && level < main {
-        Some(ScheduledRefusal::CallerBelowOperator)
+    } else if operator_context && level < main {
+        Some(ScheduledRefusal::BelowOperatorContext)
     } else {
         None
     }

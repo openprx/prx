@@ -272,7 +272,7 @@ fn handle_goal_command(command: XinGoalCommands, config: &Config) -> Result<()> 
                         .map_err(anyhow::Error::new)
                 })
                 .transpose()?;
-            let goal = store::add_goal_with_origin(
+            let goal = store::add_goal_with_creator_stamp(
                 config,
                 &NewXinGoal {
                     owner_id: None,
@@ -287,6 +287,9 @@ fn handle_goal_command(command: XinGoalCommands, config: &Config) -> Result<()> 
                     initial_steps: Vec::new(),
                 },
                 &JobOrigin::LocalOperator,
+                // The operator's own command (V9).
+                crate::cron::JobCreator::OperatorCli,
+                &crate::security::agent_level::CreatorStamp::default(),
             )?;
             println!("Created xin goal {} ({})", goal.id, goal.name);
         }

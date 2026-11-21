@@ -1309,7 +1309,13 @@ impl Tool for XinTool {
                     initial_steps,
                 };
                 let creator = crate::tools::execution::creator_stamp_from_trusted_args(&args);
-                match store::add_goal_with_creator_stamp(&cfg, &new, &origin, &creator) {
+                match store::add_goal_with_creator_stamp(
+                    &cfg,
+                    &new,
+                    &origin,
+                    crate::cron::JobCreator::AgentTool,
+                    &creator,
+                ) {
                     Ok(goal) => Ok(ToolResult {
                         success: true,
                         output: serde_json::to_string_pretty(&goal)?,
@@ -1369,7 +1375,13 @@ impl Tool for XinTool {
                 };
                 let step = self.build_step(&args, sequence, &args)?;
                 let creator = crate::tools::execution::creator_stamp_from_trusted_args(&args);
-                match store::add_step_with_creator_stamp(&cfg, goal_id, &step, &creator) {
+                match store::add_step_with_creator_stamp(
+                    &cfg,
+                    goal_id,
+                    &step,
+                    crate::cron::JobCreator::AgentTool,
+                    &creator,
+                ) {
                     Ok(step) => Ok(ToolResult {
                         success: true,
                         output: serde_json::to_string_pretty(&step)?,

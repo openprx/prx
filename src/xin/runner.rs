@@ -1023,14 +1023,14 @@ async fn run_shell_with_cancellation(
 /// (`security::agent_level`), or the refusal recorded on the run. An
 /// unreadable creator reads as empty, so the run is capped at `supervised`.
 fn task_run_level(config: &Config, task: &XinTask) -> Result<crate::security::AutonomyLevel, String> {
-    let operator = task.kind == crate::xin::types::TaskKind::System
-        || task.origin.is_local_operator()
-        || store::task_created_via(config, &task.id)
-            .is_ok_and(|creator| creator == crate::cron::JobCreator::OperatorCli);
-    let creator = store::task_creator(config, &task.id).unwrap_or_else(|error| {
+    // Operator work is decided by the operator-class `created_via` (and the
+    // built-in system tasks), never by the origin's channel or sender.
+    let (created_via, creator) = store::task_creator(config, &task.id).unwrap_or_else(|error| {
         tracing::warn!(target: "xin", task_id = %task.id, "xin task creator unreadable; the run is capped at supervised: {error}");
-        crate::security::agent_level::CreatorStamp::default()
+        Default::default()
     });
+    let operator =
+        task.kind == crate::xin::types::TaskKind::System || created_via == crate::cron::JobCreator::OperatorCli;
     crate::security::agent_level::scheduled_level(
         operator,
         &creator,

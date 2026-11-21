@@ -1081,7 +1081,9 @@ fn job_run_level(config: &Config, job: &CronJob) -> Result<crate::security::Auto
         tracing::warn!(job_id = %job.id, "cron job creator unreadable; the run is capped at supervised: {error}");
         Default::default()
     });
-    let operator = created_via == crate::cron::JobCreator::OperatorCli || job.origin.is_local_operator();
+    // Operator work is decided by the operator-class `created_via` only, never
+    // by the origin's channel or sender.
+    let operator = created_via == crate::cron::JobCreator::OperatorCli;
     crate::security::agent_level::scheduled_level(
         operator,
         &creator,
