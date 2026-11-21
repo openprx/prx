@@ -89,6 +89,58 @@ pub struct RfAttempt {
     /// that process recorded ingress.
     pub lifetime: Option<String>,
     pub terminal: Option<RfRunTerminal>,
+    /// The message was deleted (AC-1b2b): a replay of the key is refused.
+    pub deleted: bool,
+    /// The assistant side of the attempt's run was deleted.
+    pub reply_deleted: bool,
+}
+
+/// Delete one rf message (AC-1b2b, `message_delete_v1`): every attempt of
+/// `client_message_id` in the session, for one agent or for every agent.
+#[derive(Debug, Clone)]
+pub struct RfMessageDelete {
+    pub workspace_id: String,
+    pub owner_id: String,
+    pub session_key: String,
+    pub client_message_id: String,
+    /// `main` or an agent name; `None` is every agent the message reached.
+    pub agent_key: Option<String>,
+    /// Runs whose job has not ended in this process: their stored rows are
+    /// tombstoned when the job ends (see [`RfDeletedAgent::deferred`]).
+    pub live_runs: Vec<String>,
+}
+
+/// What one delete did for one agent key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RfDeletedAgent {
+    /// `main` or the agent name: the wire label.
+    pub agent_key: String,
+    /// The runs of the deleted attempts, in attempt order (`[]` for a
+    /// `context` message).
+    pub runs: Vec<String>,
+    /// The jobs of those runs, whose in-memory results are erased.
+    pub jobs: Vec<String>,
+    /// Runs still live here: their message rows wait for the job's end.
+    pub deferred: Vec<String>,
+}
+
+/// The outcome of a reply delete by run id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RfReplyDelete {
+    /// The assistant side is deleted (now or by an earlier delete); the
+    /// run's job, whose in-memory result is erased.
+    Deleted { job_id: String },
+    /// No attempt of this owner's session has this run.
+    Unknown,
+    /// The run has no terminal yet.
+    Active,
+}
+
+/// One row of a caller-keyed session's history, a tombstone included.
+#[derive(Debug, Clone)]
+pub struct RfHistoryTurn {
+    pub turn: super::ConversationTurn,
+    pub deleted: bool,
 }
 
 /// Which attempt to read.
@@ -112,8 +164,9 @@ pub enum RfAdmissionRefused {
     /// Another admission of the same key and attempt committed first.
     #[error("another admission of this rf message key committed first")]
     Taken,
-    /// The run the restart rule would end got a terminal first.
-    #[error("the previous rf attempt has a terminal; no new attempt starts")]
+    /// The run the restart rule would end got a terminal first, or the
+    /// message was deleted (AC-1b2b).
+    #[error("the previous rf attempt has a terminal or was deleted; no new attempt starts")]
     Stale,
     /// User-message event recording is off, so no input event can hold it.
     #[error("rf message admission needs user-message event recording")]

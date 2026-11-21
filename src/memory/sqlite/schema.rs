@@ -1127,6 +1127,7 @@ impl SqliteMemory {
         super::child_sessions::init_schema(conn)?;
         super::mailbox_schema::init_schema(conn)?;
         super::rf_messages::init_schema(conn)?;
+        super::rf_delete::init_schema(conn)?;
         let unattributed: u64 = super::agent_migration::migrate_legacy_console(conn)?;
         if unattributed > 0 {
             tracing::warn!(unattributed, "legacy console rows left without an agent scope");
@@ -1515,6 +1516,11 @@ impl SqliteMemory {
                 26,
                 "rf_message_attempts",
                 "rf_message_attempts(workspace_id,owner_id,session_key,agent_key,incarnation,client_message_id,attempt,request_hash,run_id,job_id,message_event_id,lifetime,interrupted,ma_scope_id,created_at) STRICT PK(workspace_id,owner_id,session_key,agent_key,incarnation,client_message_id,attempt) + partial UNIQUE(workspace_id,run_id) + partial UNIQUE(workspace_id,job_id)",
+            ),
+            (
+                27,
+                "rf_message_delete",
+                "rf_message_attempts + deleted_at,reply_deleted_at,erase_pending CHECK(0,1) + conversation_turns + deleted_at",
             ),
         ]
     }

@@ -20,6 +20,7 @@ mod recovery_keys;
 mod recovery_outbox;
 mod recovery_terminal;
 pub(crate) mod remote_tree;
+mod rf_delete;
 mod rf_messages;
 
 #[cfg(unix)]

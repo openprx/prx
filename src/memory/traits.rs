@@ -2216,6 +2216,54 @@ pub trait Memory: Send + Sync {
         Err(crate::memory::fabric::fail_fast(self.name(), "interrupt_rf_run"))
     }
 
+    /// Delete one rf message (AC-1b2b): mark every matching attempt deleted
+    /// and tombstone its rows in one transaction; an empty list when no
+    /// attempt matches.
+    async fn rf_delete_message(
+        &self,
+        request: super::rf_messages::RfMessageDelete,
+    ) -> anyhow::Result<Vec<super::rf_messages::RfDeletedAgent>> {
+        let _ = request;
+        Err(crate::memory::fabric::fail_fast(self.name(), "rf_delete_message"))
+    }
+
+    /// Delete the assistant side of one ended rf run in one transaction.
+    async fn rf_delete_reply(
+        &self,
+        workspace_id: &str,
+        owner_id: &str,
+        session_key: &str,
+        run_id: &str,
+    ) -> anyhow::Result<super::rf_messages::RfReplyDelete> {
+        let _ = (workspace_id, owner_id, session_key, run_id);
+        Err(crate::memory::fabric::fail_fast(self.name(), "rf_delete_reply"))
+    }
+
+    /// Tombstone the rows of the session's deleted runs whose jobs have
+    /// ended (every pending run not in `live_runs`).
+    async fn rf_settle_deleted(
+        &self,
+        workspace_id: &str,
+        owner_id: &str,
+        session_key: &str,
+        live_runs: Vec<String>,
+    ) -> anyhow::Result<()> {
+        let _ = (workspace_id, owner_id, session_key, live_runs);
+        Err(crate::memory::fabric::fail_fast(self.name(), "rf_settle_deleted"))
+    }
+
+    /// [`Self::list_console_conversation_turns`] with deleted tombstones.
+    async fn list_rf_history_turns(
+        &self,
+        principal: &MemoryPrincipal,
+        session_key: &str,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<Vec<super::rf_messages::RfHistoryTurn>> {
+        let _ = (principal, session_key, limit, offset);
+        Err(crate::memory::fabric::fail_fast(self.name(), "list_rf_history_turns"))
+    }
+
     async fn list_ingress_recovery_candidates(
         &self,
         scope: &super::ingress_recovery::IngressRecoveryScope,

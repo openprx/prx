@@ -823,6 +823,67 @@ impl Memory for SqliteMemory {
         .await?
     }
 
+    async fn rf_delete_message(
+        &self,
+        request: crate::memory::RfMessageDelete,
+    ) -> anyhow::Result<Vec<crate::memory::RfDeletedAgent>> {
+        let pool = self.pool.clone();
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<crate::memory::RfDeletedAgent>> {
+            let conn = pool.write();
+            super::rf_delete::delete_message(&conn, &request)
+        })
+        .await?
+    }
+
+    async fn rf_delete_reply(
+        &self,
+        workspace_id: &str,
+        owner_id: &str,
+        session_key: &str,
+        run_id: &str,
+    ) -> anyhow::Result<crate::memory::RfReplyDelete> {
+        let pool = self.pool.clone();
+        let (workspace_id, owner_id, session_key, run_id) = (
+            workspace_id.to_owned(),
+            owner_id.to_owned(),
+            session_key.to_owned(),
+            run_id.to_owned(),
+        );
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<crate::memory::RfReplyDelete> {
+            let conn = pool.write();
+            super::rf_delete::delete_reply(&conn, &workspace_id, &owner_id, &session_key, &run_id)
+        })
+        .await?
+    }
+
+    async fn rf_settle_deleted(
+        &self,
+        workspace_id: &str,
+        owner_id: &str,
+        session_key: &str,
+        live_runs: Vec<String>,
+    ) -> anyhow::Result<()> {
+        let pool = self.pool.clone();
+        let (workspace_id, owner_id, session_key) =
+            (workspace_id.to_owned(), owner_id.to_owned(), session_key.to_owned());
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = pool.write();
+            super::rf_delete::settle(&conn, &workspace_id, &owner_id, &session_key, &live_runs)
+        })
+        .await?
+    }
+
+    async fn list_rf_history_turns(
+        &self,
+        principal: &MemoryPrincipal,
+        session_key: &str,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<Vec<crate::memory::RfHistoryTurn>> {
+        self.list_rf_history_turns_impl(principal, session_key, limit, offset)
+            .await
+    }
+
     async fn list_ingress_recovery_candidates(
         &self,
         scope: &crate::memory::ingress_recovery::IngressRecoveryScope,

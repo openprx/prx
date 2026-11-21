@@ -2,7 +2,9 @@
 //! an rf message key, written in the transaction of the attempt's input
 //! event. No expiry runs here: rows are kept at least 7 days by having no
 //! deletion path but the incarnation purge (MA-01), which reaches them
-//! through `ma_scope_id`. Growth is one small row per rf message attempt.
+//! through `ma_scope_id`. A message delete (AC-1b2b, `rf_delete.rs`) keeps
+//! the rows and sets their deleted mark, so the mark lives exactly as long as
+//! the idempotency record. Growth is one small row per rf message attempt.
 
 use crate::memory::MessageEvent;
 use crate::memory::rf_messages::{RfAdmission, RfAdmissionRefused, RfAttempt, RfAttemptLookup, RfRun, run_terminal};
@@ -40,7 +42,12 @@ pub(super) fn init_schema(conn: &Connection) -> anyhow::Result<()> {
 
 /// Whether the run has a terminal row: its `turn.finalized` or its
 /// `turn.admission.failed` event.
-fn has_terminal(conn: &Connection, workspace_id: &str, owner_id: &str, run_id: &str) -> rusqlite::Result<bool> {
+pub(super) fn has_terminal(
+    conn: &Connection,
+    workspace_id: &str,
+    owner_id: &str,
+    run_id: &str,
+) -> rusqlite::Result<bool> {
     conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM message_events
              WHERE workspace_id = ?1 AND owner_id = ?2 AND idempotency_key IN (?3, ?4))",
@@ -88,6 +95,25 @@ pub(super) fn admit(
     {
         return Err(RfAdmissionRefused::Stale.into());
     }
+    // A message deleted while this attempt was being admitted keeps its key
+    // spent (AC-1b2b): the caller's lookup then answers `message_deleted`.
+    let deleted: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM rf_message_attempts
+             WHERE workspace_id = ?1 AND owner_id = ?2 AND session_key = ?3 AND agent_key = ?4
+               AND incarnation = ?5 AND client_message_id = ?6 AND deleted_at IS NOT NULL)",
+        params![
+            key.workspace_id,
+            key.owner_id,
+            key.session_key,
+            key.agent_key,
+            key.incarnation,
+            key.client_message_id
+        ],
+        |row| row.get(0),
+    )?;
+    if deleted {
+        return Err(RfAdmissionRefused::Stale.into());
+    }
     let scope: Option<String> = tx.query_row(
         "SELECT ma_scope_id FROM message_events WHERE event_id = ?1",
         params![event.event_id],
@@ -128,6 +154,7 @@ macro_rules! attempt_select {
         concat!(
             "SELECT a.owner_id, a.session_key, a.agent_key, a.attempt, a.request_hash, a.run_id, a.job_id,
                     a.message_event_id, a.lifetime, a.interrupted,
+                    a.deleted_at IS NOT NULL, a.reply_deleted_at IS NOT NULL,
                     (SELECT e.raw_payload_json FROM message_events e WHERE e.workspace_id = a.workspace_id
                         AND e.owner_id = a.owner_id AND e.idempotency_key = 'turn:' || a.run_id || ':final'),
                     (SELECT e.raw_payload_json FROM message_events e WHERE e.workspace_id = a.workspace_id
@@ -160,11 +187,13 @@ fn attempt_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttemptRow> {
             message_event_id: row.get(7)?,
             lifetime: row.get(8)?,
             terminal: None,
+            deleted: row.get(10)?,
+            reply_deleted: row.get(11)?,
         },
         row.get(5)?,
         row.get(6)?,
-        row.get(10)?,
-        row.get(11)?,
+        row.get(12)?,
+        row.get(13)?,
         row.get(9)?,
     ))
 }

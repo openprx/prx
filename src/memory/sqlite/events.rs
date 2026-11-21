@@ -80,9 +80,22 @@ pub(crate) const fn conversation_turns_ordering(recorded_order: bool) -> &'stati
     }
 }
 
-pub(crate) fn conversation_turns_select_sql(session_fragment: &str, partition_sql: &str, ordering: &str) -> String {
+/// The seventh column says whether the row is a deleted tombstone
+/// (AC-1b2b). Only a caller-keyed history listing (`tombstones`) reads
+/// tombstones; every other reader, model context included, skips them.
+pub(crate) fn conversation_turns_select_sql(
+    session_fragment: &str,
+    partition_sql: &str,
+    ordering: &str,
+    tombstones: bool,
+) -> String {
+    let deleted_sql = if tombstones {
+        ""
+    } else {
+        "\n                   AND deleted_at IS NULL"
+    };
     format!(
-        "SELECT id, session_key, role, content, timestamp, message_id
+        "SELECT id, session_key, role, content, timestamp, message_id, deleted_at IS NOT NULL
                  FROM conversation_turns
                  WHERE {session_fragment}
                    AND (
@@ -90,7 +103,7 @@ pub(crate) fn conversation_turns_select_sql(session_fragment: &str, partition_sq
                        OR
                        owner_id = ?4
                        OR (?5 = 1 AND (owner_id IS NULL OR owner_id = 'legacy:' || session_key))
-                   ){partition_sql}
+                   ){partition_sql}{deleted_sql}
                  ORDER BY {ordering}
                  LIMIT ?2 OFFSET ?3"
     )
@@ -144,10 +157,21 @@ pub(crate) struct MessageEventsSinceStatement {
 
 /// Production conversation-turns statement, including the partition conjunct.
 /// Returns `(sql, partition_values, legacy_session_keys)`.
+#[cfg(test)]
 pub(crate) fn conversation_turns_statement(
     principal: &MemoryPrincipal,
     session_key: &str,
     recorded_order: bool,
+) -> (String, Vec<String>, Vec<String>) {
+    conversation_turns_statement_with(principal, session_key, recorded_order, false)
+}
+
+/// [`conversation_turns_statement`], optionally reading deleted tombstones.
+fn conversation_turns_statement_with(
+    principal: &MemoryPrincipal,
+    session_key: &str,
+    recorded_order: bool,
+    tombstones: bool,
 ) -> (String, Vec<String>, Vec<String>) {
     let legacy_session_keys: Vec<String> = principal
         .legacy_session_key
@@ -168,6 +192,7 @@ pub(crate) fn conversation_turns_statement(
             &session_fragment.sql,
             &partition_sql,
             conversation_turns_ordering(recorded_order),
+            tombstones,
         ),
         partition_values,
         legacy_session_keys,
@@ -190,6 +215,36 @@ impl SqliteMemory {
         offset: usize,
         recorded_order: bool,
     ) -> anyhow::Result<Vec<ConversationTurn>> {
+        Ok(self
+            .conversation_turns_page(principal, session_key, limit, offset, recorded_order, false)
+            .await?
+            .into_iter()
+            .map(|row| row.turn)
+            .collect())
+    }
+
+    /// A Console history page in event-time order with deleted tombstones
+    /// (AC-1b2b): the caller-keyed history listing.
+    pub(super) async fn list_rf_history_turns_impl(
+        &self,
+        principal: &MemoryPrincipal,
+        session_key: &str,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<Vec<crate::memory::RfHistoryTurn>> {
+        self.conversation_turns_page(principal, session_key, limit, offset, true, true)
+            .await
+    }
+
+    async fn conversation_turns_page(
+        &self,
+        principal: &MemoryPrincipal,
+        session_key: &str,
+        limit: usize,
+        offset: usize,
+        recorded_order: bool,
+        tombstones: bool,
+    ) -> anyhow::Result<Vec<crate::memory::RfHistoryTurn>> {
         let pool = self.pool.clone();
         let owner_id = principal
             .owner_id
@@ -205,9 +260,9 @@ impl SqliteMemory {
         // at trailing placeholders starting at `?6`. With no legacy key the
         // predicate degrades to the byte-identical `session_key = ?1`.
         let (sql, partition_values, legacy_session_keys) =
-            conversation_turns_statement(principal, &session_key, recorded_order);
+            conversation_turns_statement_with(principal, &session_key, recorded_order, tombstones);
 
-        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<ConversationTurn>> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<crate::memory::RfHistoryTurn>> {
             let reader = pool.read()?;
             let conn = reader.connection()?;
             let mut stmt = conn.prepare(&sql)?;
@@ -220,13 +275,16 @@ impl SqliteMemory {
                 bind.push(value);
             }
             let rows = stmt.query_map(bind.as_slice(), |row| {
-                Ok(ConversationTurn {
-                    id: row.get(0)?,
-                    session_key: row.get(1)?,
-                    role: row.get(2)?,
-                    content: row.get(3)?,
-                    timestamp: row.get(4)?,
-                    message_id: row.get(5)?,
+                Ok(crate::memory::RfHistoryTurn {
+                    turn: ConversationTurn {
+                        id: row.get(0)?,
+                        session_key: row.get(1)?,
+                        role: row.get(2)?,
+                        content: row.get(3)?,
+                        timestamp: row.get(4)?,
+                        message_id: row.get(5)?,
+                    },
+                    deleted: row.get(6)?,
                 })
             })?;
 
@@ -544,15 +602,17 @@ impl SqliteMemory {
             )?;
             anyhow::ensure!(serde_json::to_value(&durable)? == serde_json::to_value(&event)?,
                 "console projection differs from its durable event");
-            let existing: Vec<(String, Option<String>, String, String)> = {
-                let mut stmt = tx.prepare("SELECT session_key, owner_id, role, content FROM conversation_turns
-                    WHERE message_event_id = ?1 OR message_id = ?1 LIMIT 2")?;
-                stmt.query_map(params![event.event_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?
+            let existing: Vec<(String, Option<String>, String, String, bool)> = {
+                let mut stmt = tx.prepare("SELECT session_key, owner_id, role, content, deleted_at IS NOT NULL
+                    FROM conversation_turns WHERE message_event_id = ?1 OR message_id = ?1 LIMIT 2")?;
+                stmt.query_map(params![event.event_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))?
                     .collect::<rusqlite::Result<Vec<_>>>()?
             };
             if let Some(row) = existing.first() {
+                // A deleted message (AC-1b2b) keeps its tombstone: nothing to project.
+                let tombstone = row.4 && row.1 == event.owner_id;
                 anyhow::ensure!(existing.len() == 1 && Some(&row.0) == event.session_key.as_ref()
-                    && row.1 == event.owner_id && row.2 == event.role && row.3 == event.content,
+                    && (tombstone || (row.1 == event.owner_id && row.2 == event.role && row.3 == event.content)),
                     "console message projection conflicts with its durable event");
                 if let (Some(owner), Some(deadline)) = (&repair_owner, deadline) {
                     ingress_recovery::validate_owner(&tx, owner, &event.workspace_id, deadline)?;
@@ -670,6 +730,9 @@ impl SqliteMemory {
                         content, content_hash, raw_payload_json, visibility, created_at, updated_at
                 FROM message_events WHERE workspace_id = ?1 AND session_key = ?2
                 AND source = 'console' AND event_type = 'turn.finalized' AND id > ?3
+                AND NOT EXISTS(SELECT 1 FROM rf_message_attempts a WHERE a.workspace_id = message_events.workspace_id
+                    AND a.run_id = message_events.run_id
+                    AND (a.deleted_at IS NOT NULL OR a.reply_deleted_at IS NOT NULL))
                 ORDER BY id ASC LIMIT ?4")?;
             Ok(stmt.query_map(params![workspace_id, session_key, after_id, limit], Self::message_event_from_row)?
                 .collect::<rusqlite::Result<Vec<_>>>()?)
@@ -900,9 +963,9 @@ impl SqliteMemory {
                              LIMIT ?2
                          ) recent_sessions
                          ON recent_sessions.session_key = ct.session_key
-                         WHERE ?3 = 'system:*'
+                         WHERE ct.deleted_at IS NULL AND (?3 = 'system:*'
                             OR ct.owner_id = ?3
-                            OR (?4 = 1 AND (ct.owner_id IS NULL OR ct.owner_id = 'legacy:' || ct.session_key))
+                            OR (?4 = 1 AND (ct.owner_id IS NULL OR ct.owner_id = 'legacy:' || ct.session_key)))
                      )
                      WHERE row_num <= ?1
                      ORDER BY session_key ASC, id ASC",
