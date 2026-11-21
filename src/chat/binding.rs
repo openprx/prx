@@ -751,15 +751,14 @@ impl ChatTurnBinding {
             "summary": summary,
         });
         let expected_content = format!("turn.admission.failed {summary}");
-        let event = fabric
-            .record_runtime_event_idempotent(
-                self.envelope.message_scope(),
-                "turn.admission.failed",
-                summary,
-                Some(serde_json::to_string(&payload)?),
-                format!("turn:{run_id}:admission-failed"),
-            )
-            .await?;
+        let event = crate::runtime::ingress_recovery::commit_admission_failure(
+            fabric,
+            self.envelope.message_scope(),
+            &summary,
+            serde_json::to_string(&payload)?,
+            format!("turn:{run_id}:admission-failed"),
+        )
+        .await?;
         anyhow::ensure!(
             event.content == expected_content
                 && event.idempotency_key.as_deref() == Some(format!("turn:{run_id}:admission-failed").as_str())

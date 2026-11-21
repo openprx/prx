@@ -656,6 +656,13 @@ impl Memory for LucidMemory {
     ) -> anyhow::Result<crate::memory::recovery_authority::RecoveryTerminalOutcome> {
         self.local.commit_recovery_terminal(commit, deadline).await
     }
+    async fn commit_owned_admission_failure(
+        &self,
+        event: MessageEventInput,
+        ingress: crate::memory::ingress_recovery::IngressRecoveryCommit,
+    ) -> anyhow::Result<MessageEvent> {
+        self.local.commit_owned_admission_failure(event, ingress).await
+    }
     async fn append_message_event_until(
         &self,
         input: MessageEventInput,

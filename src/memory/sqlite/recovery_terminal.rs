@@ -212,6 +212,37 @@ fn commit_blocking(
     }
 }
 
+impl SqliteMemory {
+    /// The owner's pre-decision terminal record (`turn.admission.failed`) and
+    /// the settlement of its own ingress row, in one transaction (I3).
+    pub(crate) async fn commit_owned_admission_failure_impl(
+        &self,
+        event: MessageEventInput,
+        ingress: crate::memory::ingress_recovery::IngressRecoveryCommit,
+    ) -> anyhow::Result<MessageEvent> {
+        event.validate()?;
+        ingress_recovery::validate_input_bounds(&ingress.evidence)?;
+        let deadline = ingress.deadline;
+        remaining(deadline)?;
+        let pool = self.pool.clone();
+        crate::runtime::blocking::spawn_blocking(move || {
+            let write = pool.write_until(deadline)?;
+            let _sync = recovery_authority::FullSync::new(&write)?;
+            let tx = rusqlite::Transaction::new_unchecked(&write, TransactionBehavior::Immediate)?;
+            let evidence = ingress.evidence.clone();
+            let mutation = AtomicIngressMutation::Owner(ingress);
+            ingress_recovery::before_append(&tx, &mutation, &evidence)?;
+            let (settled, inserted) = Self::append_event_row(&tx, evidence, true)?;
+            ingress_recovery::after_append(&tx, &mutation, &settled, inserted)?;
+            let (stored, _) = insert_terminal_event(&tx, event)?;
+            remaining(deadline)?;
+            tx.commit()?;
+            Ok(stored)
+        })
+        .await?
+    }
+}
+
 fn insert_terminal_event(
     tx: &rusqlite::Transaction<'_>,
     input: MessageEventInput,

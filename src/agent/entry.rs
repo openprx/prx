@@ -475,15 +475,14 @@ impl AgentTurnProof {
             "status": if cancelled { "cancelled" } else { "failed" }, "summary": summary,
         });
         let expected_content = format!("turn.admission.failed {summary}");
-        let event = fabric
-            .record_runtime_event_idempotent(
-                scope.clone(),
-                "turn.admission.failed",
-                summary,
-                Some(serde_json::to_string(&payload)?),
-                format!("turn:{}:admission-failed", self.run_id),
-            )
-            .await?;
+        let event = crate::runtime::ingress_recovery::commit_admission_failure(
+            fabric,
+            scope.clone(),
+            &summary,
+            serde_json::to_string(&payload)?,
+            format!("turn:{}:admission-failed", self.run_id),
+        )
+        .await?;
         anyhow::ensure!(
             event.content == expected_content
                 && event.idempotency_key.as_deref() == Some(format!("turn:{}:admission-failed", self.run_id).as_str())

@@ -2160,6 +2160,20 @@ pub trait Memory: Send + Sync {
         ))
     }
 
+    /// The owner's pre-decision terminal record and the settlement of its own
+    /// ingress row (the commit's evidence), in one transaction (I3).
+    async fn commit_owned_admission_failure(
+        &self,
+        event: MessageEventInput,
+        ingress: super::ingress_recovery::IngressRecoveryCommit,
+    ) -> anyhow::Result<MessageEvent> {
+        let _ = (event, ingress);
+        Err(crate::memory::fabric::fail_fast(
+            self.name(),
+            "commit_owned_admission_failure",
+        ))
+    }
+
     /// Bounded evidence repair; this does not grant provider or tool authority.
     async fn append_message_event_until(
         &self,

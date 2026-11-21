@@ -380,6 +380,41 @@ pub(crate) async fn owner_settlement(
     }
 }
 
+/// Record a run's pre-decision terminal (`turn.admission.failed`). When this
+/// process recorded the run's input and still owns its row, the row is
+/// reconciled in the same transaction (I3); otherwise the record is written
+/// alone and the row, if any, is left to recovery.
+pub(crate) async fn commit_admission_failure(
+    fabric: &crate::memory::MemoryFabric,
+    scope: crate::memory::MessageEventScope,
+    summary: &str,
+    payload: String,
+    idempotency_key: String,
+) -> anyhow::Result<crate::memory::MessageEvent> {
+    let chain = match (scope.owner_id.as_deref(), scope.run_id.as_deref()) {
+        (Some(owner_id), Some(run_id)) => Some(RecoveryChain {
+            workspace_id: fabric.workspace_id().to_owned(),
+            owner_id: owner_id.to_owned(),
+            source: scope.source.as_str().to_owned(),
+            run_id: run_id.to_owned(),
+        }),
+        _ => None,
+    };
+    if let Some(chain) = chain {
+        let memory = fabric.memory();
+        let deadline = Instant::now() + std::time::Duration::from_secs(15);
+        if let Some(ingress) = owner_settlement(&memory, &chain, deadline).await {
+            let input = fabric.runtime_event_input(scope, "turn.admission.failed", summary, payload, idempotency_key);
+            let event = memory.commit_owned_admission_failure(input, ingress).await?;
+            owner_settled(&chain);
+            return Ok(event);
+        }
+    }
+    fabric
+        .record_runtime_event_idempotent(scope, "turn.admission.failed", summary, Some(payload), idempotency_key)
+        .await
+}
+
 /// The run's terminal committed: its input is no longer offered for settlement.
 pub(crate) fn owner_settled(chain: &RecoveryChain) {
     owned_inputs().lock().retain(|entry| entry.chain != *chain);

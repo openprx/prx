@@ -787,27 +787,17 @@ impl MemoryFabric {
         }
     }
 
-    async fn record_message_event(
+    /// The input of one event as this fabric records it.
+    fn event_input(
         &self,
         scope: MessageEventScope,
         role: &str,
         event_type: &str,
-        content: impl Into<String>,
+        content: String,
         idempotency_key: Option<String>,
         raw_payload_json: Option<String>,
-    ) -> anyhow::Result<MessageEvent> {
-        let content = content.into();
-        if !self.should_record_role(role) {
-            return Ok(self.synthetic_message_event(
-                scope,
-                role,
-                event_type,
-                content,
-                idempotency_key,
-                raw_payload_json,
-            ));
-        }
-        let input = MessageEventInput {
+    ) -> MessageEventInput {
+        MessageEventInput {
             agent_partition: scope.agent_partition,
             event_id: None,
             idempotency_key,
@@ -838,7 +828,51 @@ impl MemoryFabric {
             content,
             raw_payload_json,
             visibility: scope.visibility,
-        };
+        }
+    }
+
+    /// The input of a runtime event exactly as
+    /// [`Self::record_runtime_event_idempotent`] records it, for a caller that
+    /// commits it together with other rows.
+    pub(crate) fn runtime_event_input(
+        &self,
+        scope: MessageEventScope,
+        event_type: &str,
+        content: &str,
+        raw_payload_json: String,
+        idempotency_key: String,
+    ) -> MessageEventInput {
+        self.event_input(
+            scope,
+            "event",
+            event_type,
+            format!("{event_type} {content}"),
+            Some(idempotency_key),
+            Some(raw_payload_json),
+        )
+    }
+
+    async fn record_message_event(
+        &self,
+        scope: MessageEventScope,
+        role: &str,
+        event_type: &str,
+        content: impl Into<String>,
+        idempotency_key: Option<String>,
+        raw_payload_json: Option<String>,
+    ) -> anyhow::Result<MessageEvent> {
+        let content = content.into();
+        if !self.should_record_role(role) {
+            return Ok(self.synthetic_message_event(
+                scope,
+                role,
+                event_type,
+                content,
+                idempotency_key,
+                raw_payload_json,
+            ));
+        }
+        let input = self.event_input(scope, role, event_type, content, idempotency_key, raw_payload_json);
         if role == "user" && event_type == "message.created" {
             if let Some(ingress) = &self.ingress {
                 return Box::pin(ingress.append(input)).await;

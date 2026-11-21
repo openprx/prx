@@ -680,16 +680,14 @@ impl EmbeddedAgentSource {
             "status": if cancelled { "cancelled" } else { "failed" }, "summary": summary,
         });
         let key = format!("turn:{}:admission-failed", self.run_id());
-        let event = self
-            .fabric
-            .record_runtime_event_idempotent(
-                scope.clone(),
-                "turn.admission.failed",
-                summary,
-                Some(serde_json::to_string(&payload)?),
-                key.clone(),
-            )
-            .await?;
+        let event = crate::runtime::ingress_recovery::commit_admission_failure(
+            &self.fabric,
+            scope.clone(),
+            summary,
+            serde_json::to_string(&payload)?,
+            key.clone(),
+        )
+        .await?;
         anyhow::ensure!(
             event.id > 0
                 && !event.event_id.is_empty()

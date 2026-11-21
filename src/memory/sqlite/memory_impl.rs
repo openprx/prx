@@ -770,6 +770,14 @@ impl Memory for SqliteMemory {
         self.commit_recovery_terminal_impl(commit, deadline).await
     }
 
+    async fn commit_owned_admission_failure(
+        &self,
+        event: MessageEventInput,
+        ingress: crate::memory::ingress_recovery::IngressRecoveryCommit,
+    ) -> anyhow::Result<MessageEvent> {
+        self.commit_owned_admission_failure_impl(event, ingress).await
+    }
+
     async fn append_message_event_until(
         &self,
         input: MessageEventInput,

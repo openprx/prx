@@ -950,6 +950,56 @@ impl Memory for EncryptedScope {
         Ok(self.reveal(event))
     }
 
+    async fn commit_owned_admission_failure(
+        &self,
+        mut event: crate::memory::MessageEventInput,
+        mut ingress: crate::memory::ingress_recovery::IngressRecoveryCommit,
+    ) -> anyhow::Result<crate::memory::MessageEvent> {
+        // A replay keeps the stored ciphertext so each receipt compares equal.
+        // The ingress evidence keeps its parseable binding payload; the record
+        // seals its payload like every other event.
+        let stored_event = match event.idempotency_key.as_deref() {
+            Some(key) => {
+                self.inner
+                    .find_message_event_by_idempotency_key(&event.workspace_id, key)
+                    .await?
+            }
+            None => None,
+        };
+        match stored_event {
+            Some(stored) if self.reveal(stored.clone()).content == event.content => {
+                let plain_payload = self.reveal(stored.clone()).raw_payload_json;
+                event.content = stored.content;
+                if plain_payload == event.raw_payload_json {
+                    event.raw_payload_json = stored.raw_payload_json;
+                }
+            }
+            _ => {
+                self.seal_event_content(&mut event)?;
+                if let Some(payload) = event.raw_payload_json.take() {
+                    let key = event.idempotency_key.as_deref().unwrap_or("event");
+                    event.raw_payload_json = Some(self.seal(&format!("{key}:payload"), &payload)?);
+                }
+            }
+        }
+        let stored_evidence = match ingress.evidence.idempotency_key.as_deref() {
+            Some(key) => {
+                self.inner
+                    .find_message_event_by_idempotency_key(&ingress.evidence.workspace_id, key)
+                    .await?
+            }
+            None => None,
+        };
+        match stored_evidence {
+            Some(stored) if self.reveal(stored.clone()).content == ingress.evidence.content => {
+                ingress.evidence.content = stored.content;
+            }
+            _ => self.seal_event_content(&mut ingress.evidence)?,
+        }
+        let stored = self.inner.commit_owned_admission_failure(event, ingress).await?;
+        Ok(self.reveal(stored))
+    }
+
     async fn commit_recovery_terminal(
         &self,
         mut commit: crate::memory::recovery_authority::RecoveryTerminalCommit,

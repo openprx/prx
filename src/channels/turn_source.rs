@@ -310,15 +310,14 @@ impl ChannelSourceReceipt {
         let payload = serde_json::json!({ "run_id": run, "source_event_id": id,
             "status": if cancelled { "cancelled" } else { "failed" }, "summary": summary });
         let scope = self.envelope.message_scope();
-        let result = fabric
-            .record_runtime_event_idempotent(
-                scope.clone(),
-                "turn.admission.failed",
-                summary,
-                Some(serde_json::to_string(&payload)?),
-                format!("turn:{run}:admission-failed"),
-            )
-            .await?;
+        let result = crate::runtime::ingress_recovery::commit_admission_failure(
+            fabric,
+            scope.clone(),
+            summary,
+            serde_json::to_string(&payload)?,
+            format!("turn:{run}:admission-failed"),
+        )
+        .await?;
         anyhow::ensure!(
             result.id > 0
                 && !result.event_id.is_empty()

@@ -1121,7 +1121,9 @@ mod authority;
 mod settlement;
 pub(crate) mod status;
 pub(crate) use authority::{SettledTerminalFacts, SkillObservation};
-pub(crate) use settlement::{QuarantineCause, RecoveryRowOutcome, owner_settled, owner_settlement};
+pub(crate) use settlement::{
+    QuarantineCause, RecoveryRowOutcome, commit_admission_failure, owner_settled, owner_settlement,
+};
 use settlement::{RowFailure, RowStep as _, Settler};
 
 #[cfg(test)]
