@@ -481,7 +481,9 @@ async fn a_generation_that_drops_an_mcp_server_stops_its_child() {
         tools_registry: Arc::new(vec![]),
         mcp_tool: Some(tool),
     };
-    let previous = Arc::new(crate::gateway::GatewayTurnState::from(generation(Arc::clone(&old_tool))));
+    let previous = Arc::new(crate::gateway::GatewayTurnState::from(generation(Arc::clone(
+        &old_tool,
+    ))));
     let mut prepared = PreparedGatewayTurnRuntime {
         agents: idle_agents(),
         current: Arc::new(ArcSwap::from(Arc::clone(&previous))),
@@ -583,16 +585,18 @@ fn gateway_core_authz_reads_hot_shared_config_after_reload() {
 fn turn_runtime_swap_keeps_in_flight_generation_pinned_and_is_reversible() {
     let manager = crate::config::new_shared(Config::default());
     let generation_zero = manager.pin();
-    let current = Arc::new(ArcSwap::from_pointee(crate::gateway::GatewayTurnState::from(TurnRuntimeGeneration {
-        provider_binding: None,
-        publication_slot: Arc::new(turn_source::publication_slot::GatewayPublicationSlot::default()),
-        config_generation: Arc::clone(&generation_zero),
-        provider: Arc::new(MockProvider::default()),
-        model: "model-zero".to_string(),
-        temperature: 0.7,
-        tools_registry: Arc::new(Vec::new()),
-        mcp_tool: None,
-    })));
+    let current = Arc::new(ArcSwap::from_pointee(crate::gateway::GatewayTurnState::from(
+        TurnRuntimeGeneration {
+            provider_binding: None,
+            publication_slot: Arc::new(turn_source::publication_slot::GatewayPublicationSlot::default()),
+            config_generation: Arc::clone(&generation_zero),
+            provider: Arc::new(MockProvider::default()),
+            model: "model-zero".to_string(),
+            temperature: 0.7,
+            tools_registry: Arc::new(Vec::new()),
+            mcp_tool: None,
+        },
+    )));
     let in_flight = current.load().ready().unwrap();
     let generation_one = Arc::new(crate::config::ConfigGeneration {
         id: crate::config::ConfigGenerationId(1),

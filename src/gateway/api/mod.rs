@@ -505,9 +505,10 @@ fn rate_limited_response() -> Response {
         "Too many API requests. Please retry later.",
         Some(("retry_after_ms", serde_json::Value::from(retry_after_ms))),
     );
-    response
-        .headers_mut()
-        .insert(header::RETRY_AFTER, header::HeaderValue::from(super::RATE_LIMIT_WINDOW_SECS));
+    response.headers_mut().insert(
+        header::RETRY_AFTER,
+        header::HeaderValue::from(super::RATE_LIMIT_WINDOW_SECS),
+    );
     response
 }
 

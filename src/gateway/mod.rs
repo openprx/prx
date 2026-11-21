@@ -1148,7 +1148,10 @@ impl GatewayTurnRuntimeOwner {
     /// Test fixtures' ready generation.
     #[cfg(test)]
     fn pin(&self) -> Arc<TurnRuntimeGeneration> {
-        self.current.load().ready().expect("test: the gateway turn runtime is ready")
+        self.current
+            .load()
+            .ready()
+            .expect("test: the gateway turn runtime is ready")
     }
 
     const fn agent_lifecycle(&self) -> &agent_lifecycle::AgentLifecycle {
@@ -1714,7 +1717,13 @@ fn build_gateway_turn_state(
             }
         },
     ));
-    Ok(turn_state_of(chat, publication_slot, generation, tools_registry, mcp_tool))
+    Ok(turn_state_of(
+        chat,
+        publication_slot,
+        generation,
+        tools_registry,
+        mcp_tool,
+    ))
 }
 
 /// The default chat connection of a ready generation: provider, model and
