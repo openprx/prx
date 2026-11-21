@@ -129,6 +129,33 @@ impl Tool for SessionsHistoryTool {
 
         let entries = run.history.read().await;
 
+        // A process-mode run keeps no in-process transcript: once it has ended,
+        // its durable rows (read inside the caller's partition) are its history.
+        if entries.is_empty() && matches!(run.status, SubAgentStatus::Completed(_) | SubAgentStatus::Failed(_)) {
+            drop(entries);
+            drop(runs);
+            if let Some(history) = sessions_read_model::recover_run_history(
+                memory_view.as_ref(),
+                self.workspace_id(),
+                &args,
+                run_id,
+                limit,
+            )
+            .await?
+            {
+                return Ok(ToolResult {
+                    success: true,
+                    output: format_recovered_history(run_id, &history, limit),
+                    error: None,
+                });
+            }
+            return Ok(ToolResult {
+                success: true,
+                output: format!("No history entries for run `{run_id}` (ended; no durable history was found)."),
+                error: None,
+            });
+        }
+
         if entries.is_empty() {
             let status = match &run.status {
                 SubAgentStatus::Running => "still running, no history captured yet",

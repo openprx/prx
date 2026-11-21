@@ -38,6 +38,33 @@ fn refused(error: impl Into<anyhow::Error>) -> anyhow::Error {
     error.into().context(WorkerLaunchRefused)
 }
 
+/// A reaped worker that printed a result without completion evidence: its own
+/// unsigned failure (it never reached a sealed completion). The process is gone,
+/// so the outcome is final: a failed run carrying the worker's own words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct WorkerUnverifiedFailure;
+
+impl WorkerUnverifiedFailure {
+    pub(super) const fn code(self) -> &'static str {
+        "worker_unverified_failure"
+    }
+
+    fn outcome(self, result: crate::session_worker::protocol::WorkerResult) -> ProcessWorkerOutcome {
+        let detail = result
+            .error
+            .filter(|error| !error.trim().is_empty())
+            .unwrap_or_else(|| "the worker reported no error".to_owned());
+        ProcessWorkerOutcome::Finished(crate::session_worker::protocol::WorkerResult {
+            ordinary_completion: None,
+            operator_completion: None,
+            success: false,
+            output: String::new(),
+            error: Some(format!("{}: {detail}", self.code())),
+            tokens_used: None,
+        })
+    }
+}
+
 pub(super) async fn run_sub_agent_process(
     run_id: &str,
     task: &str,
@@ -716,6 +743,13 @@ pub(super) async fn run_sub_agent_process(
                 // This branch is reached only after OwnedProcessPhase::Exited and
                 // mark_reaped above; terminated/unconfirmed owners return earlier.
                 Ok(ProcessWorkerOutcome::VerifiedStartupFailure(envelope.result))
+            }
+            ProcessWorkerOutcome::Finished(result)
+                if (ordinary_generation.is_some() && result.ordinary_completion.is_none())
+                    || (operator_generation.is_some() && result.operator_completion.is_none()) =>
+            {
+                tracing::warn!(run_id, "process worker ended without completion evidence");
+                Ok(WorkerUnverifiedFailure.outcome(result))
             }
             ProcessWorkerOutcome::Finished(result) => {
                 if let Some(generation) = &ordinary_generation {
