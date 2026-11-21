@@ -425,13 +425,16 @@ pub(super) struct ApiPrincipal {
 /// Domain separator of the API owner digest (D-040 OQ-A10).
 const API_OWNER_DIGEST_DOMAIN: &str = "prx-api-owner-v1";
 
+/// The owner of a request that sent no token (pairing off).
+const LOCAL_OWNER_ID: &str = "api:local";
+
 impl ApiPrincipal {
     /// The principal of a request that presented `token`.
     pub(super) fn of_token(token: &str) -> Self {
         use sha2::{Digest, Sha256};
         if token.is_empty() {
             return Self {
-                owner_id: "api:local".to_string(),
+                owner_id: LOCAL_OWNER_ID.to_string(),
             };
         }
         let mut hasher = Sha256::new();
@@ -442,6 +445,12 @@ impl ApiPrincipal {
         Self {
             owner_id: format!("api:{}", digest.get(..32).unwrap_or(digest.as_str())),
         }
+    }
+
+    /// The tokenless principal of a request with pairing off. It is never
+    /// owner-authenticated, so its Console turns stay owner-isolated.
+    pub(super) fn is_local(&self) -> bool {
+        self.owner_id == LOCAL_OWNER_ID
     }
 }
 

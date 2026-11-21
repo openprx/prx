@@ -408,7 +408,7 @@ impl GatewaySourceReceipt {
     ) -> anyhow::Result<GatewayTurnProof> {
         anyhow::ensure!(
             envelope.source == crate::runtime::envelope::RuntimeSource::Console
-                && envelope.owner_isolated
+                && (envelope.owner_isolated || !principal.is_local())
                 && envelope.owner_id.as_deref() == Some(principal.owner_id.as_str())
                 && envelope.workspace_id == runtime.config_generation.effective.workspace_dir.to_string_lossy()
                 && envelope.run_id.as_deref().is_some_and(|id| !id.is_empty())

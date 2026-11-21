@@ -1813,7 +1813,8 @@ struct ConsoleSubmission {
     async_mode: bool,
     uploads: UploadGuard,
     /// [`super::owner_authenticated`]; when false, Main's level gates the
-    /// message and the saved reply as before A4.
+    /// message and the saved reply as before A4, and the turn is
+    /// owner-isolated.
     owner_authenticated: bool,
 }
 
@@ -1856,6 +1857,12 @@ async fn submit_console_message(
         )
             .into_response();
     };
+    // Q10: the only place a Console turn's isolation is decided. A paired
+    // bearer is the install owner and gets the terminal's tool rules at the
+    // turn's own level; any other caller (pairing off) stays owner-isolated.
+    // A controlled H2 launch binds only isolated Gateway sources, so it keeps
+    // isolation.
+    let owner_isolated = !owner_authenticated || turn_runtime.publication_slot.controlled.is_some();
     let runtime_envelope = console_runtime_envelope_for_workspace(
         turn_runtime
             .config_generation
@@ -1867,8 +1874,12 @@ async fn submit_console_message(
         &session.channel,
         &session.sender,
     )
-    .with_owner_id(api_principal.owner_id.clone())
-    .with_owner_isolation()
+    .with_owner_id(api_principal.owner_id.clone());
+    let runtime_envelope = if owner_isolated {
+        runtime_envelope.with_owner_isolation()
+    } else {
+        runtime_envelope
+    }
     .with_run_id(uuid::Uuid::new_v4().to_string())
     .with_config_generation(&turn_runtime.config_generation);
 
