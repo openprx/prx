@@ -18,7 +18,7 @@ tokens it does not know.
 4. PRX never adds a static path segment under `/api/agents/` that starts with
    `a_`, and never mints a session key that starts with `rf-`.
 
-## Routes
+## Routes: capabilities and catalog
 
 Both routes use the same bearer check as the other `/api` routes and the
 shared API rate limit (its `429` body is unchanged). Both are reads: they
@@ -42,8 +42,10 @@ sorted ascending, with no duplicates.
 `GET /api/agents/catalog` returns `200` with exactly these top-level fields:
 
 - `prx_version`: the PRX package version.
-- `revision`: the lowercase hex SHA-256 of the canonical JSON of the body
-  without `revision`. It changes whenever any other field changes, including a
+- `revision`: the **catalog revision**, the lowercase hex SHA-256 of the
+  canonical JSON of the body without `revision`. It is not the config
+  revision of the agent routes below, and sent as `If-Match` it never matches
+  (`409 revision_conflict`). It changes whenever any other field changes, including a
   credential becoming usable; a change that shows in no field (for example a
   per-model parameter setting) leaves it unchanged.
 - `capabilities`: the same effective list as `GET /api/capabilities`.
@@ -64,6 +66,90 @@ sorted ascending, with no duplicates.
 - `caller_reserved_session_key_prefixes`: prefixes reserved for callers, which
   PRX never mints (`rf-`).
 
+## Routes: agents (`agent_crud_v1`, `agent_main_readback_v1`)
+
+`agent_crud_v1` covers `GET /api/agents`, `GET`/`PUT`/`DELETE
+/api/agents/{name}`, `GET`/`PUT /api/gateway/targeted-agents` and
+`POST /api/config/reload`; `agent_main_readback_v1` covers
+`GET /api/agents/main`. These routes are authorised by the owner bearer
+alone: no autonomy level, Main's included, is consulted. They share the
+shared API rate limit. No body carries a credential: an agent's `api_key` and
+`credential_ref` are kept across a `PUT` and never returned, and provider
+text is redacted as in the catalog.
+
+**Revision.** `revision` on these routes is the **config revision**: the
+lowercase hex SHA-256 over the PRX configuration files. Any configuration
+change (another agent, a provider, the console, a hand edit) changes it. Read
+it from `GET /api/agents` (present when the list is empty), from a readback or
+from the last write. `PUT` and `DELETE` require `If-Match: <config revision>`;
+a missing `If-Match` or `*` is `400 field_invalid`, any other value is
+`409 revision_conflict` with `current_revision`.
+
+**Readback** (`GET /api/agents/{name}`, the answer of `PUT`):
+`{"name","config":{"provider","model","prompt"?,"autonomy","tools","enabled"},"revision","incarnation","status"}`.
+`autonomy` is `readonly`, `supervised` or `full`; `tools` is `["*"]` (Main's
+tools), `[]` (none) or tool names; `config.enabled` is exactly what was put;
+`incarnation` is a UUID that never changes across `PUT`s; `status` is
+`active` (enabled), `disabled` (`config.enabled` false) or `retired` (deleted,
+purge pending). `prompt` is absent when PRX composes the prompt, and is
+returned byte for byte as put otherwise (`""` included). A hand-written agent
+without a level reads back Main's level, the one it runs at.
+
+**Main** (`GET /api/agents/main`):
+`{"name":"main","config":{"provider","model","autonomy","tools":["*"]},"revision","incarnation"}`
+(no `enabled`, `prompt` or `status`).
+
+| Route | Request | 2xx |
+|---|---|---|
+| `GET /api/agents` | | `200 {"revision","agents":[readback…]}`: every configured named agent, retired ones included, sorted by name; Main and names outside the grammar are not listed |
+| `GET /api/agents/{name}` | | `200` readback; `main` gives Main's |
+| `PUT /api/agents/{name}` | `If-Match`; body `{"provider","model","autonomy","tools","enabled","prompt"?}`, a full replacement; `?confirm_high_risk=true` only after a `428` | `201` readback when created, `200` when replaced. The incarnation is created at the first `PUT`, whatever the switch or `enabled` say |
+| `DELETE /api/agents/{name}` | `If-Match` | `200 {"name","status":"retired","revision"}`. The agent stays configured, disabled, and takes no turn; a repeated `DELETE` gives the same body with the current revision. The purge is `agent_memory_purge_v1` |
+| `GET /api/gateway/targeted-agents` | | `200 {"revision","configured","effective","restart_required"}` |
+| `PUT /api/gateway/targeted-agents` | `If-Match`; `{"enabled":bool}` | `200`, same shape; the switch takes effect at the next daemon restart, so `restart_required` is `true` until then |
+| `POST /api/config/reload` | | `200 {"success":true,"message":"<report>"}` |
+
+**Field bounds** (enforced on `PUT`, `400` otherwise):
+
+- name: `^[a-z][a-z0-9_-]{0,63}$` (1 to 64 bytes), not `main` or `catalog`,
+  and nothing credential-shaped (`agent_invalid`);
+- `provider`: a provider PRX can construct; `model`: non-empty
+  (`field_invalid`);
+- `prompt`: a string of at most 32,768 bytes (the config schema has no bound
+  of its own); `null` is refused (`field_invalid`);
+- `autonomy`: exactly `readonly`, `supervised` or `full` (`read_only` is
+  refused, `field_invalid`);
+- `tools`: `["*"]`, `[]`, or distinct names from the catalog's `tools`, so at
+  most that many; a duplicate, `*` beside a name or an unknown name is
+  `agent_tools_invalid`;
+- any other field is `field_invalid`; `limits` is not supported yet
+  (`agent_limits_v1`).
+
+**Errors** (coded shape):
+
+- `400 agent_invalid`: a name outside the grammar or reserved; `PUT` or
+  `DELETE` on `main` or `catalog`. Checked first, before `If-Match` and the
+  body; nothing is planned.
+- `400 agent_tools_invalid`, `400 field_invalid`: as above; also a query
+  parameter other than `confirm_high_risk=true|false` on `PUT`/`DELETE`.
+- `401 auth_failed`: a missing or invalid bearer, or a credential in the
+  query string.
+- `404 agent_unknown`: no such agent (also `DELETE` of a name that never
+  existed).
+- `405 method_not_allowed`, with `Allow`.
+- `409 revision_conflict` `{"error":{"code","message","current_revision"}}`;
+  `409 agent_disabled`: a `PUT` on a retired name (use a new name);
+  `409 agent_backend_unsupported`: the memory backend keeps no incarnation
+  registry.
+- `422 not_applied`: the change was refused at activation and nothing stays
+  written.
+- `428 confirmation_required` `{"error":{"code","message","revision"}}`: a
+  high-risk change (for example a provider change on an agent that holds an
+  inline key); resend with `?confirm_high_risk=true` and `If-Match` equal to
+  `revision`. Nothing rf sends in normal use triggers it.
+- `500 storage_unavailable`: the configuration, the registry or a reload
+  failed.
+
 ## Tokens
 
 | Token | Meaning | Status |
@@ -71,8 +157,9 @@ sorted ascending, with no duplicates.
 | `capabilities_v1` | `GET /api/capabilities` returns the version and the sorted token list | advertised since 85ab41f7a |
 | `agent_catalog_v1` | `GET /api/agents/catalog` returns the fields listed above | advertised since 85ab41f7a |
 | `targeted_agents_v1` | A message turn can target a named agent, with a per-agent partitioned history that reads back with an agent label and filter | not yet |
-| `agent_crud_v1` | `GET`, `PUT` and `DELETE /api/agents/{name}` with If-Match, a revision, an incarnation and `enabled`; `DELETE` retires the agent (the purge is `agent_memory_purge_v1`) | not yet |
-| `agent_main_readback_v1` | `GET /api/agents/main` reads back Main's configuration | not yet |
+| `agent_crud_v1` | The agent routes above: `GET /api/agents`, `GET`, `PUT` and `DELETE /api/agents/{name}` with If-Match, the config revision, an incarnation and `status`; `GET`/`PUT /api/gateway/targeted-agents`; the owner-bearer-only `POST /api/config/reload`. `DELETE` retires the agent (the purge is `agent_memory_purge_v1`) | advertised since 39509eb97 |
+| `agent_main_readback_v1` | `GET /api/agents/main` reads back Main's configuration | advertised since 39509eb97 |
+| `agent_limits_v1` | `limits {max_concurrent_turns, max_cost_per_day_cents}` on an agent `PUT` (unset by default; card AC-LIM) | not yet |
 | `owner_id_stable_v1` | The owner id stays the same for one install across bearer-token rotation | not yet |
 | `session_key_v1` | `POST /api/sessions` accepts a caller-chosen `session_key` | not yet |
 | `message_target_v1` | The message route accepts a target together with caller context | not yet |
