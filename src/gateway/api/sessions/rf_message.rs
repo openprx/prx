@@ -808,7 +808,7 @@ pub(super) async fn rf_history(
             Ok(Some(partition)) => reader.agent_partition = Some(partition),
             // The agent has no incarnation for this owner, so it has no row.
             Ok(None) => return Json(Vec::<super::SessionMessage>::new()).into_response(),
-            Err(response) => return response,
+            Err(response) => return *response,
         }
     }
     let turns = match state
@@ -873,13 +873,13 @@ fn history_filter(
     workspace_id: &str,
     owner_id: &str,
     agent: &str,
-) -> Result<Option<crate::memory::AgentPartition>, Response> {
+) -> Result<Option<crate::memory::AgentPartition>, Box<Response>> {
     let unknown = || {
-        coded_error(
+        Box::new(coded_error(
             StatusCode::NOT_FOUND,
             "agent_unknown",
             "no configured agent has this name",
-        )
+        ))
     };
     let partition = |key| crate::memory::AgentPartition {
         workspace_id: workspace_id.to_owned(),
@@ -895,11 +895,11 @@ fn history_filter(
         return Err(unknown());
     }
     let Some(registry) = state.mem.agent_registry() else {
-        return Err(coded_error(
+        return Err(Box::new(coded_error(
             StatusCode::CONFLICT,
             TargetError::BackendUnsupported.code(),
             "the memory backend keeps no agent incarnation registry",
-        ));
+        )));
     };
     let key = crate::gateway::agent_lifecycle::agent_key(name.as_str());
     let live = registry
@@ -909,7 +909,7 @@ fn history_filter(
                 error_kind = super::console_error_kind(&error),
                 "Agent registry read failed"
             );
-            storage_unavailable("the agent registry could not be read")
+            Box::new(storage_unavailable("the agent registry could not be read"))
         })?;
     let Some(live) = live else {
         return Ok(None);
@@ -920,7 +920,7 @@ fn history_filter(
             agent = name.as_str(),
             "Agent incarnation is not a valid UUID"
         );
-        storage_unavailable("the agent registry could not be read")
+        Box::new(storage_unavailable("the agent registry could not be read"))
     })?;
     Ok(Some(partition(crate::memory::PartitionKey::Named {
         name,
