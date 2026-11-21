@@ -79,13 +79,22 @@ fn is_message_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-'))
 }
 
-/// Whether `body` is a JSON object that carries `key` (any value).
-fn carries_key(body: &[u8], key: &str) -> bool {
+/// The fields only an rf message body has: any one makes a message
+/// request rf-shaped.
+const RF_MESSAGE_FIELDS: [&str; 6] = ["client_message_id", "deliver", "chat", "sender", "mentions", "reply_to"];
+
+/// Whether `body` is a JSON object that carries any of `keys` (any value).
+fn carries_any(body: &[u8], keys: &[&str]) -> bool {
     serde_json::from_slice::<serde_json::Value>(body)
         .ok()
         .as_ref()
         .and_then(serde_json::Value::as_object)
-        .is_some_and(|object| object.contains_key(key))
+        .is_some_and(|object| keys.iter().any(|key| object.contains_key(*key)))
+}
+
+/// The session id of a `…/sessions/{id}/message` path.
+fn message_path_session(path: &str) -> Option<&str> {
+    path.strip_suffix("/message")?.rsplit('/').next()
 }
 
 fn is_multipart(headers: &HeaderMap) -> bool {
@@ -117,7 +126,7 @@ pub(in crate::gateway::api) async fn create_route_auth(
     request: Request,
     next: Next,
 ) -> Response {
-    route_auth(&state, request, next, "session_key").await
+    route_auth(&state, request, next, &["session_key"], false).await
 }
 
 /// The bearer check of `POST /api/sessions/{id}/message`.
@@ -126,22 +135,26 @@ pub(in crate::gateway::api) async fn message_route_auth(
     request: Request,
     next: Next,
 ) -> Response {
-    route_auth(&state, request, next, "client_message_id").await
+    let keyed = message_path_session(request.uri().path()).is_some_and(is_caller_session_key);
+    route_auth(&state, request, next, &RF_MESSAGE_FIELDS, keyed).await
 }
 
-/// The shared bearer check. A refused `POST` whose JSON body (within the
-/// gateway body cap) carries `rf_key` is `401 auth_failed`; every other
+/// The shared bearer check. A refused `POST` that is rf-shaped (`keyed`: a
+/// message to a caller-keyed session; or a JSON body within the gateway body
+/// cap that carries one of `rf_keys`) is `401 auth_failed`; every other
 /// refusal keeps the shared body.
-async fn route_auth(state: &AppState, mut request: Request, next: Next, rf_key: &str) -> Response {
+async fn route_auth(state: &AppState, mut request: Request, next: Next, rf_keys: &[&str], keyed: bool) -> Response {
     if let Some(principal) = super::super::authenticated_principal(state, request.headers()) {
         request.extensions_mut().insert(principal);
         return next.run(request).await;
     }
-    if request.method() == Method::POST
-        && !is_multipart(request.headers())
-        && let Ok(body) = axum::body::to_bytes(request.into_body(), crate::gateway::MAX_BODY_SIZE).await
-        && carries_key(&body, rf_key)
-    {
+    let rf_shaped = request.method() == Method::POST
+        && (keyed
+            || (!is_multipart(request.headers())
+                && axum::body::to_bytes(request.into_body(), crate::gateway::MAX_BODY_SIZE)
+                    .await
+                    .is_ok_and(|body| carries_any(&body, rf_keys))));
+    if rf_shaped {
         return coded_error(
             StatusCode::UNAUTHORIZED,
             "auth_failed",
@@ -233,17 +246,26 @@ pub(super) async fn require_session_owner(
 
 /// How `POST /api/sessions/{id}/message` was asked.
 pub(super) enum MessageShape {
-    /// The body carries `client_message_id`.
+    /// The session is caller-keyed, or the body carries an rf field
+    /// ([`RF_MESSAGE_FIELDS`]); the body is validated as the rf message.
     Rf(Parts, Bytes),
     /// Any other request, rebuilt with the same body. `unreadable`: the body
     /// could not be buffered (the Console JSON parser refuses it).
     Console { request: Request, unreadable: bool },
 }
 
-/// Buffer a non-multipart body under the same limit the JSON extractor
-/// applies, and classify it.
-pub(super) async fn classify(state: &AppState, request: Request) -> MessageShape {
+/// Classify a message request. A request to a caller-keyed session is
+/// always rf-shaped (a body that is not the rf message, multipart included,
+/// is `400 field_invalid`); otherwise a non-multipart body is buffered under
+/// the same limit the JSON extractor applies and is rf-shaped when it carries
+/// an rf field.
+pub(super) async fn classify(state: &AppState, session_id: &str, request: Request) -> MessageShape {
+    let keyed = is_caller_session_key(session_id);
     if is_multipart(request.headers()) {
+        if keyed {
+            let (parts, _) = request.into_parts();
+            return MessageShape::Rf(parts, Bytes::new());
+        }
         return MessageShape::Console {
             request,
             unreadable: false,
@@ -253,11 +275,12 @@ pub(super) async fn classify(state: &AppState, request: Request) -> MessageShape
     let mut probe = Request::new(body);
     *probe.extensions_mut() = parts.extensions.clone();
     match Bytes::from_request(probe, state).await {
-        Ok(bytes) if carries_key(&bytes, "client_message_id") => MessageShape::Rf(parts, bytes),
+        Ok(bytes) if keyed || carries_any(&bytes, &RF_MESSAGE_FIELDS) => MessageShape::Rf(parts, bytes),
         Ok(bytes) => MessageShape::Console {
             request: Request::from_parts(parts, Body::from(bytes)),
             unreadable: false,
         },
+        Err(_) if keyed => MessageShape::Rf(parts, Bytes::new()),
         Err(_) => MessageShape::Console {
             request: Request::from_parts(parts, Body::empty()),
             unreadable: true,
@@ -461,7 +484,17 @@ pub(super) async fn post_rf_message(
     let agent_key = match TurnTarget::from_field(agent.clone()) {
         Ok(TurnTarget::Main) => "main".to_owned(),
         Ok(TurnTarget::Named(name)) => {
-            if !turn_runtime.config_generation.effective.gateway.targeted_agents {
+            // Existence first, whatever the switch says; then the switch, then
+            // the agent's own state (in selection below).
+            let config = &turn_runtime.config_generation.effective;
+            if !config.agents.contains_key(name.as_str()) {
+                return coded_error(
+                    StatusCode::NOT_FOUND,
+                    "agent_unknown",
+                    "no configured agent has this name",
+                );
+            }
+            if !config.gateway.targeted_agents {
                 return coded_error(
                     StatusCode::CONFLICT,
                     "agent_targeting_disabled",

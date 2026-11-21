@@ -1511,9 +1511,10 @@ pub async fn post_session_message(
     let principal = request.extensions().get::<super::ApiPrincipal>().cloned();
     // The runtime is pinned before the body is read, as before.
     let admitted = state.admit_turn_runtime();
-    // A body with `client_message_id` is an rf message (AC-1b1); any other
-    // request takes the Console path below, unchanged.
-    let (request, unreadable) = match rf_message::classify(&state, request).await {
+    // A message to a caller-keyed session, or a body with an rf field, is an
+    // rf message (AC-1b1); any other request takes the Console path below,
+    // unchanged.
+    let (request, unreadable) = match rf_message::classify(&state, &session_id, request).await {
         rf_message::MessageShape::Rf(parts, body) => {
             return rf_message::post_rf_message(state, session_id, parts, body, admitted).await;
         }
