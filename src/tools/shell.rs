@@ -9,7 +9,13 @@ use serde_json::json;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
-const fn shell_git_policy(level: crate::security::AutonomyLevel) -> crate::runtime::shell_process::ShellGitPolicy {
+/// The git policy of a shell command at an effective autonomy `level`:
+/// plain git at Full, refused below. Skill scripts, cron jobs and Xin tasks
+/// at an effective Full level reuse it, so Full git behaves the same on
+/// every shell path.
+pub(crate) const fn shell_git_policy(
+    level: crate::security::AutonomyLevel,
+) -> crate::runtime::shell_process::ShellGitPolicy {
     use crate::runtime::shell_process::ShellGitPolicy::{PlainGit, RefuseGit};
     use crate::security::AutonomyLevel::Full;
     match level {

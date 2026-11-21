@@ -62,10 +62,12 @@ const OUTPUT_DRAIN_KILL_GRACE: Duration = Duration::from_secs(1);
 pub enum ShellGitPolicy {
     /// Effective Full autonomy: ordinary git, without injected settings.
     PlainGit,
-    /// Restricted shell tools, workspace skill scripts, and model-created
-    /// cron/Xin jobs refuse command strings that run git.
+    /// Below an effective Full level: restricted shell tools, workspace
+    /// skill scripts, and model-created cron/Xin jobs refuse command strings
+    /// that run git.
     RefuseGit,
-    /// An operator-configured job: git runs, with the environment hardening
+    /// An operator-configured job below an effective Full level: git runs,
+    /// with the environment hardening
     /// of [`crate::security::git_launch::operator_git_environment`].
     HardenGit,
 }
@@ -122,7 +124,8 @@ pub enum ShellProcessError {
     #[error("command execution cancelled")]
     Cancelled,
     /// A restricted command string runs git (GIT-ENV, D-106).
-    /// Effective Full shell invocations select PlainGit instead.
+    /// Effective Full shell, skill, cron and Xin invocations select PlainGit
+    /// instead.
     #[error(
         "refusing to run git through the shell: use the git_operations tool, which disables the programs a \
          repository's configuration names"

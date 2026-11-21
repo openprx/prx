@@ -468,8 +468,9 @@ pub(super) fn process_command_types_are_never_aliased() {
 }
 
 /// GIT-ENV (D-106, D-107 and its amendment): git in a shell command string
-/// is ordinary only in an effective Full shell. Restricted shells, workspace
-/// skill scripts, cron jobs and Xin tasks an agent tool created refuse it; git is hardened
+/// is ordinary only at an effective Full level. Below it, restricted shells,
+/// workspace skill scripts, cron jobs and Xin tasks an agent tool created
+/// refuse it; git is hardened
 /// through the environment on the operator's (`prx cron`/`prx xin` jobs,
 /// system Xin tasks, node allowlists).
 #[test]
@@ -492,8 +493,12 @@ fn shell_sites_refuse_or_harden_git() {
         );
     }
     assert!(
-        body("src/tools/skills.rs", "execute_resolved").contains("ShellGitPolicy::RefuseGit"),
-        "workspace skill execution must still refuse git"
+        body("src/tools/skills.rs", "execute_resolved")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            .contains("git:super::shell::shell_git_policy(super::effective_autonomy::current().unwrap_or(crate::security::AutonomyLevel::Supervised),)"),
+        "workspace skill execution must still refuse git below an effective Full level"
     );
     let policy = body("src/tools/shell.rs", "shell_git_policy");
     let policy = policy

@@ -1473,7 +1473,11 @@ impl SkillExecuteTool {
             workspace_dir: root,
             timeout,
             cancellation,
-            git: crate::runtime::shell_process::ShellGitPolicy::RefuseGit,
+            // The call's carried level, fail-closed like the shell tool: git
+            // runs plainly only at an effective Full level (owner D1).
+            git: super::shell::shell_git_policy(
+                super::effective_autonomy::current().unwrap_or(crate::security::AutonomyLevel::Supervised),
+            ),
         };
         // A deadline marks a managed run, which is also joined: the process
         // group ends with its leader.
