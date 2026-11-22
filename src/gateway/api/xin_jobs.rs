@@ -159,13 +159,17 @@ async fn control(
     body: Bytes,
 ) -> Response {
     if !body.is_empty()
-        && serde_json::from_slice::<Value>(&body).is_ok_and(|v| v.as_object().is_some_and(|o| o.is_empty())) == false
+        && !serde_json::from_slice::<Value>(&body).is_ok_and(|v| v.as_object().is_some_and(|o| o.is_empty()))
     {
         return coded_error(StatusCode::BAD_REQUEST, "field_invalid", "request body must be empty");
     }
     if let Err(response) = super::authorize_resource_mutation(
         &state,
-        match operation {Control::Pause=>"gateway_api:xin:pause",Control::Resume=>"gateway_api:xin:resume",Control::Remove=>"gateway_api:xin:remove"},
+        match operation {
+            Control::Pause => "gateway_api:xin:pause",
+            Control::Resume => "gateway_api:xin:resume",
+            Control::Remove => "gateway_api:xin:remove",
+        },
         crate::security::policy::ResourceRiskLevel::Medium,
     ) {
         return response.into_response();

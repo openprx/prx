@@ -75,7 +75,7 @@ fn cross_dialect_fallback_is_refused_by_every_production_entry_builder() {
         &options,
     ));
 
-    let cli_choice = crate::agent::entry::resolve_agent_model_choice(&config, None, None)
+    let cli_choice = crate::agent::entry::resolve_agent_model_choice(&config, None, None, None)
         .expect("test: CLI selection resolves before its fallback chain is built");
     let cli = refusal(crate::agent::entry::agent_provider_selection(&cli_choice).build_provider(&config, &options));
     let channels = refusal(crate::channels::build_channel_startup_provider(&config, &options));
@@ -155,8 +155,8 @@ async fn chat_and_cli_keep_fallback_admission_after_primary_429() {
     let options = provider_runtime_options_from_config(&config);
     let (_, chat) = crate::chat::chat_provider_chain(&config, &primary_name, &primary_name, PROBE_MODEL, &options)
         .expect("test: chat chain builds");
-    let cli_choice =
-        crate::agent::entry::resolve_agent_model_choice(&config, None, None).expect("test: CLI selection resolves");
+    let cli_choice = crate::agent::entry::resolve_agent_model_choice(&config, None, None, None)
+        .expect("test: CLI selection resolves");
     let cli = crate::agent::entry::agent_provider_selection(&cli_choice)
         .build_provider(&config, &options)
         .expect("test: CLI chain builds");
@@ -225,8 +225,8 @@ async fn broken_route_is_retained_as_the_same_refusal_on_every_surface() {
 
     let (_, chat) = crate::chat::chat_provider_chain(&config, &primary, &primary, PROBE_MODEL, &options)
         .expect("chat starts with the refused route retained");
-    let choice =
-        crate::agent::entry::resolve_agent_model_choice(&config, None, None).expect("CLI default selection resolves");
+    let choice = crate::agent::entry::resolve_agent_model_choice(&config, None, None, None)
+        .expect("CLI default selection resolves");
     let cli = crate::agent::entry::agent_provider_selection(&choice)
         .build_provider(&config, &options)
         .expect("CLI starts with the refused route retained");
@@ -257,7 +257,7 @@ async fn broken_route_is_retained_as_the_same_refusal_on_every_surface() {
         assert_eq!(refusal, expected, "{surface} changed the retained route refusal");
     }
 
-    let cli_override = match crate::agent::entry::resolve_agent_model_choice(&config, None, Some("hint:broken")) {
+    let cli_override = match crate::agent::entry::resolve_agent_model_choice(&config, None, Some("hint:broken"), None) {
         Ok(_) => panic!("the CLI --model override accepted a refused route"),
         Err(error) => error,
     };

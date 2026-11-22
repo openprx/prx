@@ -34,7 +34,7 @@ async fn a_custom_override_does_not_receive_the_root_key() {
     let selected = probe.custom_provider();
     let options = crate::providers::provider_runtime_options_from_config(&config);
 
-    let choice = resolve_agent_model_choice(&config, Some(&selected), Some(PROBE_MODEL))
+    let choice = resolve_agent_model_choice(&config, Some(&selected), Some(PROBE_MODEL), None)
         .expect("test: a keyless custom endpoint is selectable");
     let provider = agent_provider_selection(&choice)
         .build_provider(&config, &options)
@@ -56,7 +56,7 @@ fn a_catalog_override_without_its_own_credential_is_refused() {
     let config = isolated_config(&temp);
     let options = crate::providers::provider_runtime_options_from_config(&config);
 
-    let outcome = resolve_agent_model_choice(&config, Some("mistral"), Some("mistral-large-latest"))
+    let outcome = resolve_agent_model_choice(&config, Some("mistral"), Some("mistral-large-latest"), None)
         .and_then(|choice| agent_provider_selection(&choice).build_provider(&config, &options));
 
     let typed = match outcome {
@@ -83,8 +83,8 @@ fn the_configured_default_keeps_its_connection() {
     config.api_url = Some("https://api.openai.example/v1".to_string());
 
     for spelling in [None, Some("openai"), Some("OPENAI")] {
-        let choice =
-            resolve_agent_model_choice(&config, spelling, None).expect("test: the default provider is selectable");
+        let choice = resolve_agent_model_choice(&config, spelling, None, None)
+            .expect("test: the default provider is selectable");
         assert_eq!(
             choice.resolved.credential().api_key(),
             Some(ROOT_SENTINEL),
@@ -104,7 +104,8 @@ fn the_configured_default_keeps_its_connection() {
 fn a_changed_key_under_the_same_credential_reference_fails_the_attestation() {
     let temp = tempfile::tempdir().expect("test: temp config dir");
     let mut config = isolated_config(&temp);
-    let choice = resolve_agent_model_choice(&config, None, None).expect("test: the default provider is selectable");
+    let choice =
+        resolve_agent_model_choice(&config, None, None, None).expect("test: the default provider is selectable");
     assert!(choice.factory_credential_source_matches(&config));
     config.api_key = Some("C0-AGENT-ROTATED-ROOT".to_string());
     assert!(
@@ -120,7 +121,7 @@ fn an_incompatible_model_is_refused_before_construction() {
     let temp = tempfile::tempdir().expect("test: temp config dir");
     let config = isolated_config(&temp);
 
-    let error = match resolve_agent_model_choice(&config, Some("mistral"), Some("openai/gpt-4o")) {
+    let error = match resolve_agent_model_choice(&config, Some("mistral"), Some("openai/gpt-4o"), None) {
         Ok(_) => panic!("an incompatible model must be refused"),
         Err(error) => error.to_string(),
     };
@@ -138,7 +139,7 @@ async fn a_custom_override_does_not_receive_the_rotation_keys() {
     let selected = probe.custom_provider();
     let options = crate::providers::provider_runtime_options_from_config(&config);
 
-    let choice = resolve_agent_model_choice(&config, Some(&selected), Some(PROBE_MODEL))
+    let choice = resolve_agent_model_choice(&config, Some(&selected), Some(PROBE_MODEL), None)
         .expect("test: a keyless custom endpoint is selectable");
     let provider = agent_provider_selection(&choice)
         .build_provider(&config, &options)
@@ -160,7 +161,7 @@ fn an_override_does_not_inherit_the_root_base_url() {
     let mut config = isolated_config(&temp);
     config.api_url = Some("http://127.0.0.1:9/v1".to_string());
 
-    let choice = resolve_agent_model_choice(&config, Some("litellm"), Some("probe-model"))
+    let choice = resolve_agent_model_choice(&config, Some("litellm"), Some("probe-model"), None)
         .expect("test: litellm accepts a bare model id");
     assert_eq!(choice.resolved.credential().api_url(), None);
     assert_eq!(choice.resolved.credential().api_key(), None);
@@ -192,7 +193,7 @@ async fn a_decision_only_model_is_refused_before_construction() {
     let selected = probe.custom_provider();
     declare_decision_only(&mut config, &selected);
 
-    let Err(error) = resolve_agent_model_choice(&config, Some(&selected), Some("jev-decision-test")) else {
+    let Err(error) = resolve_agent_model_choice(&config, Some(&selected), Some("jev-decision-test"), None) else {
         panic!("a decision-only model was selected for the agent loop");
     };
     assert!(format!("{error:#}").contains("cannot be used for chat"), "{error:#}");
@@ -217,7 +218,7 @@ async fn a_route_to_a_decision_only_model_is_refused() {
         credential_ref: None,
     }];
 
-    let choice = resolve_agent_model_choice(&config, None, None).expect("test: the default model resolves");
+    let choice = resolve_agent_model_choice(&config, None, None, None).expect("test: the default model resolves");
     let options = crate::providers::provider_runtime_options_from_config(&config);
     let provider = agent_provider_selection(&choice)
         .build_provider(&config, &options)
@@ -244,8 +245,8 @@ fn a_hint_model_is_resolved_through_its_route() {
         api_key: None,
         credential_ref: None,
     }];
-    resolve_agent_model_choice(&config, None, Some("hint:fast")).expect("test: a configured hint");
-    let Err(error) = resolve_agent_model_choice(&config, None, Some("hint:nope")) else {
+    resolve_agent_model_choice(&config, None, Some("hint:fast"), None).expect("test: a configured hint");
+    let Err(error) = resolve_agent_model_choice(&config, None, Some("hint:nope"), None) else {
         panic!("an unknown hint was accepted");
     };
     assert!(format!("{error:#}").contains("hint:nope"), "{error:#}");
@@ -269,7 +270,7 @@ async fn direct_turn_keeps_root_credential_beside_a_keyed_route() {
         api_key: Some("PRX-ROUTE-KEY".to_string()),
         credential_ref: None,
     });
-    let choice = resolve_agent_model_choice(&config, None, None).expect("direct model selected");
+    let choice = resolve_agent_model_choice(&config, None, None, None).expect("direct model selected");
     let options = crate::providers::provider_runtime_options_from_config(&config);
     let provider = agent_provider_selection(&choice)
         .build_provider(&config, &options)
@@ -309,7 +310,7 @@ async fn second_same_provider_hint_uses_its_own_wire_key() {
             credential_ref: None,
         });
     }
-    let choice = resolve_agent_model_choice(&config, None, Some("hint:second")).expect("second hint selected");
+    let choice = resolve_agent_model_choice(&config, None, Some("hint:second"), None).expect("second hint selected");
     let options = crate::providers::provider_runtime_options_from_config(&config);
     let provider = agent_provider_selection(&choice)
         .build_provider(&config, &options)
@@ -355,7 +356,7 @@ async fn keyed_hint_after_unkeyed_route_uses_its_own_key() {
             credential_ref: None,
         },
     ];
-    let choice = resolve_agent_model_choice(&config, None, Some("hint:keyed")).expect("keyed hint selected");
+    let choice = resolve_agent_model_choice(&config, None, Some("hint:keyed"), None).expect("keyed hint selected");
     let options = crate::providers::provider_runtime_options_from_config(&config);
     let provider = agent_provider_selection(&choice)
         .build_provider(&config, &options)
@@ -395,7 +396,7 @@ async fn keyed_primary_hint_retries_without_root_rotation_key() {
         api_key: Some("PRX-ROUTE-KEY".to_string()),
         credential_ref: None,
     });
-    let choice = resolve_agent_model_choice(&config, None, Some("hint:fast")).expect("keyed hint selected");
+    let choice = resolve_agent_model_choice(&config, None, Some("hint:fast"), None).expect("keyed hint selected");
     let options = crate::providers::provider_runtime_options_from_config(&config);
     let provider = agent_provider_selection(&choice)
         .build_provider(&config, &options)
@@ -422,7 +423,7 @@ fn keyed_primary_hint_does_not_inherit_root_endpoint() {
         api_key: Some("PRX-ROUTE-KEY".to_string()),
         credential_ref: None,
     });
-    let choice = resolve_agent_model_choice(&config, None, Some("hint:fast")).expect("keyed hint selected");
+    let choice = resolve_agent_model_choice(&config, None, Some("hint:fast"), None).expect("keyed hint selected");
     let selection = agent_provider_selection(&choice);
     assert_eq!(selection.resolved.credential().api_url(), None);
     selection
@@ -450,7 +451,7 @@ fn raw_provider_whitespace_cannot_hide_a_keyed_factory_route() {
         api_key: Some("PRX-ROUTE-KEY".to_string()),
         credential_ref: None,
     });
-    let choice = resolve_agent_model_choice(&config, None, None).expect("PMM trims the selected provider label");
+    let choice = resolve_agent_model_choice(&config, None, None, None).expect("PMM trims the selected provider label");
     let generation = crate::config::new_shared(config).pin();
     let envelope = crate::runtime::envelope::RuntimeEnvelope::agent(temp.path().to_string_lossy(), "prx_run")
         .with_config_generation(&generation);
@@ -478,7 +479,7 @@ async fn root_url_without_root_key_uses_the_provider_profile() {
             true,
         )
         .expect("isolated profile");
-    let choice = resolve_agent_model_choice(&config, None, None).expect("PMM root URL selection");
+    let choice = resolve_agent_model_choice(&config, None, None, None).expect("PMM root URL selection");
     let options = crate::providers::provider_runtime_options_from_config(&config);
     let (built, counts) = crate::providers::credential_resolution_observation::observe(|| {
         agent_provider_selection(&choice).build_provider(&config, &options)
@@ -507,7 +508,7 @@ fn openai_codex_ignores_root_key_url_and_rotation_material() {
     config.api_key = Some("PRX-IGNORED-CODEX-ROOT".to_string());
     config.api_url = Some("https://ignored.example.invalid/v1".to_string());
     config.reliability.api_keys = vec!["PRX-IGNORED-CODEX-ROTATION".to_string()];
-    let choice = resolve_agent_model_choice(&config, None, None).expect("Codex Root selection resolves");
+    let choice = resolve_agent_model_choice(&config, None, None, None).expect("Codex Root selection resolves");
     let options = crate::providers::provider_runtime_options_from_config(&config);
     let (provider, counts) = crate::providers::credential_resolution_observation::observe(|| {
         agent_provider_selection(&choice).build_provider(&config, &options)
@@ -522,12 +523,13 @@ fn openai_codex_ignores_root_key_url_and_rotation_material() {
 fn an_unlisted_kimi_code_model_is_still_refused() {
     let temp = tempfile::tempdir().expect("test: temp config dir");
     let config = isolated_config(&temp);
-    let Err(error) = resolve_agent_model_choice(&config, Some("kimi-code"), Some("definitely-not-a-model")) else {
+    let Err(error) = resolve_agent_model_choice(&config, Some("kimi-code"), Some("definitely-not-a-model"), None)
+    else {
         panic!("an unlisted kimi-code model was accepted");
     };
     assert!(format!("{error:#}").contains("kimi-code"), "{error:#}");
-    resolve_agent_model_choice(&config, Some("kimi-code"), Some("k3")).expect("test: a listed model");
-    resolve_agent_model_choice(&config, Some("kimi-code"), Some("k3.1-pro")).expect("test: catalog active id");
+    resolve_agent_model_choice(&config, Some("kimi-code"), Some("k3"), None).expect("test: a listed model");
+    resolve_agent_model_choice(&config, Some("kimi-code"), Some("k3.1-pro"), None).expect("test: catalog active id");
 }
 
 /// Real wire plus actual factory lookup observation: no header-only inference.
@@ -601,7 +603,7 @@ async fn resolved_url_only_roots_restore_provider_profile_lookup_on_owned_wire()
                     true,
                 )
                 .expect("owned conflicting profile");
-            let choice = resolve_agent_model_choice(&config, None, None).expect("actual resolved connection");
+            let choice = resolve_agent_model_choice(&config, None, None, None).expect("actual resolved connection");
             let options = crate::providers::provider_runtime_options_from_config(&config);
             let selection = agent_provider_selection(&choice);
             let mut changed = config.clone();

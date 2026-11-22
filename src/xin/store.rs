@@ -1029,7 +1029,7 @@ pub fn commit_task_execution(
             task_id,
             started_at,
             finished_at,
-            crate::cron::agent_jobs::run_status(success,output),
+            crate::cron::agent_jobs::run_status(success, output),
             Some(&bounded),
             duration_ms,
         )?;

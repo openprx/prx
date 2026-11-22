@@ -791,7 +791,7 @@ pub(crate) fn test_cli_agent_turn_proof_with_run(
         run_id,
         routing_input,
         None,
-        &resolve_agent_model_choice(&generation.effective, Some(provider_name), Some(model_name))
+        &resolve_agent_model_choice(&generation.effective, Some(provider_name), Some(model_name), None)
             .expect("test selected model"),
     )
     .expect("test CLI Agent proof")
@@ -839,7 +839,7 @@ pub(crate) async fn test_recorded_cli_agent_turn_proof_with_selection(
         run_id,
         input,
         Some(&event),
-        &resolve_agent_model_choice(&generation.effective, Some(selection.0), Some(selection.1))
+        &resolve_agent_model_choice(&generation.effective, Some(selection.0), Some(selection.1), None)
             .expect("test selected model"),
     )
     .expect("recorded CLI Agent proof")
@@ -880,7 +880,7 @@ pub(crate) async fn test_recovery_cli_agent_turn_proof_with_selection(
         run_id,
         input,
         Some(&event),
-        &resolve_agent_model_choice(&generation.effective, Some(selection.0), Some(selection.1))
+        &resolve_agent_model_choice(&generation.effective, Some(selection.0), Some(selection.1), None)
             .expect("test: selected recovery model"),
     )
     .expect("test: recovery CLI proof");
@@ -961,7 +961,7 @@ mod agent_turn_origin_tests {
             "prx_run",
             "raw request",
             Some(&event),
-            &resolve_agent_model_choice(&generation.effective, Some("ollama"), Some("prx-local-model"))
+            &resolve_agent_model_choice(&generation.effective, Some("ollama"), Some("prx-local-model"), None)
                 .expect("test selected model"),
         )
         .expect("local CLI origin");
@@ -1029,7 +1029,7 @@ mod agent_turn_origin_tests {
             .record_inbound_user_message(envelope.message_scope(), "raw", None, None)
             .await
             .expect("persist inbound receipt");
-        let choice = resolve_agent_model_choice(&generation.effective, Some("ollama"), Some("prx-local-model"))
+        let choice = resolve_agent_model_choice(&generation.effective, Some("ollama"), Some("prx-local-model"), None)
             .expect("test selected model");
         let issue = |identity| {
             issue_cli_agent_turn_proof_for_session(None, &envelope, &generation, identity, "raw", Some(&event), &choice)
@@ -1062,7 +1062,7 @@ mod agent_turn_origin_tests {
         let generation = crate::config::new_shared(config).pin();
         let envelope =
             RuntimeEnvelope::agent(workspace.path().to_string_lossy(), "prx_run").with_config_generation(&generation);
-        let choice = resolve_agent_model_choice(&generation.effective, Some("ollama"), Some("prx-local-model"))
+        let choice = resolve_agent_model_choice(&generation.effective, Some("ollama"), Some("prx-local-model"), None)
             .expect("test selected model");
         let fabric = MemoryFabric::new(
             Arc::new(crate::memory::NoneMemory::new()),
@@ -1132,7 +1132,7 @@ mod agent_turn_origin_tests {
         let generation = crate::config::new_shared(config).pin();
         let envelope =
             RuntimeEnvelope::agent(workspace.path().to_string_lossy(), "prx_run").with_config_generation(&generation);
-        let choice = resolve_agent_model_choice(&generation.effective, Some("ollama"), Some("prx-local-model"))
+        let choice = resolve_agent_model_choice(&generation.effective, Some("ollama"), Some("prx-local-model"), None)
             .expect("test selected model");
         let fabric = MemoryFabric::new(
             Arc::new(crate::memory::NoneMemory::new()),
@@ -1157,7 +1157,7 @@ mod agent_turn_origin_tests {
         let mut config = Config::default();
         config.workspace_dir = workspace.path().to_path_buf();
         let generation = crate::config::new_shared(config).pin();
-        let choice = resolve_agent_model_choice(&generation.effective, Some("ollama"), Some("prx-local-model"))
+        let choice = resolve_agent_model_choice(&generation.effective, Some("ollama"), Some("prx-local-model"), None)
             .expect("test selected model");
         let workspace_id = workspace.path().to_string_lossy();
         let envelope_a = RuntimeEnvelope::agent(workspace_id.as_ref(), "prx_run_a").with_config_generation(&generation);
@@ -1233,7 +1233,7 @@ mod agent_turn_origin_tests {
         let interactive = RuntimeEnvelope::agent(workspace.path().to_string_lossy(), "prx_run")
             .with_recipient("cli:local-user")
             .with_config_generation(&generation);
-        let choice = resolve_agent_model_choice(&generation.effective, Some("ollama"), Some("prx-local-model"))
+        let choice = resolve_agent_model_choice(&generation.effective, Some("ollama"), Some("prx-local-model"), None)
             .expect("test selected model");
         let fabric = MemoryFabric::new(
             Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("actual source memory")),
@@ -1259,7 +1259,7 @@ mod agent_turn_origin_tests {
                     "prx_run",
                     "raw",
                     Some(&inbound),
-                    &resolve_agent_model_choice(&generation.effective, Some("ollama"), Some("prx-local-model"))
+                    &resolve_agent_model_choice(&generation.effective, Some("ollama"), Some("prx-local-model"), None)
                         .expect("test selected model"),
                 )
                 .is_err()
@@ -1313,7 +1313,7 @@ mod agent_turn_origin_tests {
         config.workspace_dir = workspace.path().to_path_buf();
         config.default_provider = Some("ollama".to_string());
         config.default_model = Some("prx-local-model ".to_string());
-        let direct = resolve_agent_model_choice(&config, None, None).expect("PMM trims direct model");
+        let direct = resolve_agent_model_choice(&config, None, None, None).expect("PMM trims direct model");
         let direct_generation = crate::config::new_shared(config.clone()).pin();
         let direct_envelope = RuntimeEnvelope::agent(workspace.path().to_string_lossy(), "prx_run")
             .with_config_generation(&direct_generation);
@@ -1339,7 +1339,7 @@ mod agent_turn_origin_tests {
             api_key: None,
             credential_ref: None,
         });
-        let hint = resolve_agent_model_choice(&config, None, Some("hint:fast")).expect("PMM trims route model");
+        let hint = resolve_agent_model_choice(&config, None, Some("hint:fast"), None).expect("PMM trims route model");
         let hint_generation = crate::config::new_shared(config).pin();
         let hint_envelope = RuntimeEnvelope::agent(workspace.path().to_string_lossy(), "prx_run")
             .with_config_generation(&hint_generation);
@@ -1360,7 +1360,7 @@ mod agent_turn_origin_tests {
         config.default_provider = Some("qwen-code".to_string());
         config.default_model = Some("qwen3-coder-plus".to_string());
         config.api_key = Some("qwen-oauth".to_string());
-        let choice = resolve_agent_model_choice(&config, None, None).expect("PMM root placeholder selection");
+        let choice = resolve_agent_model_choice(&config, None, None, None).expect("PMM root placeholder selection");
         let generation = crate::config::new_shared(config).pin();
         let envelope =
             RuntimeEnvelope::agent(workspace.path().to_string_lossy(), "prx_run").with_config_generation(&generation);
@@ -1530,9 +1530,35 @@ pub(crate) fn resolve_agent_model_choice(
     config: &Config,
     provider_override: Option<&str>,
     model_override: Option<&str>,
+    creator_agent: Option<&str>,
 ) -> Result<AgentModelChoice> {
-    let provider_name = provider_override.unwrap_or_else(|| providers::selection::default_provider(config));
-    let model_name = model_override.unwrap_or_else(|| providers::selection::default_model(config));
+    use crate::providers::credentials::{CredentialRef, LegacySlot};
+    let named = creator_agent
+        .map(|name| config.agents.get(name).ok_or_else(|| anyhow::anyhow!("creator_gone")))
+        .transpose()?;
+    let provider_name = named.map_or_else(
+        || provider_override.unwrap_or_else(|| providers::selection::default_provider(config)),
+        |agent| agent.provider.as_str(),
+    );
+    let model_name = named.map_or_else(
+        || model_override.unwrap_or_else(|| providers::selection::default_model(config)),
+        |agent| agent.model.as_str(),
+    );
+    let credential = named.map_or_else(
+        || providers::selection::credential_for(config, provider_name),
+        |agent| {
+            agent.credential_ref.as_ref().map_or_else(
+                || {
+                    if agent.api_key.as_deref().is_some_and(|key| !key.trim().is_empty()) {
+                        CredentialRef::LegacyInline(LegacySlot::Agent(creator_agent.unwrap_or_default().to_owned()))
+                    } else {
+                        providers::selection::credential_for(config, provider_name)
+                    }
+                },
+                |id| CredentialRef::Profile { id: id.clone() },
+            )
+        },
+    );
     let catalog = providers::selection::catalog_for(config);
     let route = providers::selection::route_target(&catalog, provider_name, model_name)?.cloned();
     let resolved = providers::selection::check_with(
@@ -1540,7 +1566,7 @@ pub(crate) fn resolve_agent_model_choice(
         &catalog,
         provider_name,
         model_name,
-        providers::selection::credential_for(config, provider_name),
+        credential,
         &providers::catalog::Requirement::chat(),
         providers::catalog::UnknownPolicy::Invocation,
     )
@@ -1548,36 +1574,6 @@ pub(crate) fn resolve_agent_model_choice(
     Ok(AgentModelChoice {
         provider_name: provider_name.to_string(),
         model_name: model_name.to_string(),
-        model_binding: AgentModelBinding::from_resolved(&resolved, route),
-        resolved,
-        catalog,
-    })
-}
-
-fn resolve_named_model_choice(config: &Config, name: &str) -> Result<AgentModelChoice> {
-    use crate::providers::credentials::{CredentialRef, LegacySlot};
-    let agent = config.agents.get(name).ok_or_else(|| anyhow::anyhow!("creator_gone"))?;
-    let credential = if let Some(id) = &agent.credential_ref {
-        CredentialRef::Profile { id: id.clone() }
-    } else if agent.api_key.as_deref().is_some_and(|key| !key.trim().is_empty()) {
-        CredentialRef::LegacyInline(LegacySlot::Agent(name.to_owned()))
-    } else {
-        providers::selection::credential_for(config, &agent.provider)
-    };
-    let catalog = providers::selection::catalog_for(config);
-    let route = providers::selection::route_target(&catalog, &agent.provider, &agent.model)?.cloned();
-    let resolved = providers::selection::check_with(
-        config,
-        &catalog,
-        &agent.provider,
-        &agent.model,
-        credential,
-        &providers::catalog::Requirement::chat(),
-        providers::catalog::UnknownPolicy::Invocation,
-    )?;
-    Ok(AgentModelChoice {
-        provider_name: agent.provider.clone(),
-        model_name: agent.model.clone(),
         model_binding: AgentModelBinding::from_resolved(&resolved, route),
         resolved,
         catalog,
@@ -1713,11 +1709,12 @@ pub(crate) async fn run_with_runtime_envelope(
         .and_then(|job| config.agents.get(job.name.as_str()))
         .and_then(|agent| agent.temperature)
         .unwrap_or(temperature);
-    let choice = if let Some(job) = &named_job {
-        resolve_named_model_choice(config, job.name.as_str())?
-    } else {
-        resolve_agent_model_choice(config, provider_override.as_deref(), model_override.as_deref())?
-    };
+    let choice = resolve_agent_model_choice(
+        config,
+        provider_override.as_deref(),
+        model_override.as_deref(),
+        named_job.as_ref().map(|job| job.name.as_str()),
+    )?;
     // ── Wire up subsystems via RuntimeBootstrap (D1 step 2) ──────
     // The internal agent engine is always a full single-shot run with no
     // memory-only early-exit (unlike chat's `--list-sessions`), so it always

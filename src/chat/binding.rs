@@ -257,6 +257,7 @@ impl ChatProviderBinding {
             &generation.effective,
             Some(provider_name),
             Some(model_name),
+            None,
         )?;
         anyhow::ensure!(
             choice.factory_credential_source_matches(&generation.effective),

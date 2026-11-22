@@ -1435,6 +1435,38 @@ pub async fn get_session_messages(
     if session.channel == crate::memory::CALLER_KEYED_SESSION_CHANNEL {
         return rf_message::rf_history(&state, &session, &api_principal, query.agent.as_deref(), limit, offset).await;
     }
+    if matches!(session.channel.as_str(), "cron" | "xin") {
+        let memory = std::sync::Arc::clone(&state.mem);
+        let owner = api_principal.owner_id.clone();
+        let key = session.session_key.clone();
+        let named = crate::runtime::blocking::spawn_blocking(move || {
+            memory.sync_store().map_or(Ok(false), |sync| {
+                sync.session_metadata(&owner, &key).map(|metadata| metadata.is_some())
+            })
+        })
+        .await;
+        match named {
+            Ok(Ok(true)) => {
+                return rf_message::rf_history(
+                    &state,
+                    &session,
+                    &api_principal,
+                    query.agent.as_deref().or(Some(session.sender.as_str())),
+                    limit,
+                    offset,
+                )
+                .await;
+            }
+            Ok(Ok(false)) => {}
+            _ => {
+                return super::capabilities::coded_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "storage_unavailable",
+                    "scheduled session metadata unavailable",
+                );
+            }
+        }
+    }
     let principal = operator_history_principal(
         &api_principal,
         &console_runtime_envelope(&state, &session_id, &session.channel, &session.sender),

@@ -466,8 +466,12 @@ impl ChannelSourceReceipt {
 
     /// Resolve the immutable model identity before constructing its transport.
     pub(super) fn bind_model(&self, provider: &str, model: &str) -> anyhow::Result<ChannelTurnProof> {
-        let choice =
-            crate::agent::entry::resolve_agent_model_choice(&self.generation.effective, Some(provider), Some(model))?;
+        let choice = crate::agent::entry::resolve_agent_model_choice(
+            &self.generation.effective,
+            Some(provider),
+            Some(model),
+            None,
+        )?;
         Ok(ChannelTurnProof {
             envelope: self.envelope.clone(),
             owner: self.envelope.resolved_owner_id(),

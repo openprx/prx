@@ -1143,7 +1143,7 @@ pub fn reschedule_after_run(config: &Config, job: &CronJob, success: bool, outpu
     }
     let now = Utc::now();
     let next_run = next_run_for_schedule(&job.schedule, now)?;
-    let status = super::agent_jobs::run_status(success,output);
+    let status = super::agent_jobs::run_status(success, output);
     let bounded_output = stored_cron_output(output);
 
     with_connection(config, |conn| {
@@ -1292,7 +1292,7 @@ fn finish_claimed_run_with_schedule(
         );
     }
 
-    let status = super::agent_jobs::run_status(success,output);
+    let status = super::agent_jobs::run_status(success, output);
     let terminal_state = if success {
         CronJobTerminalState::Succeeded
     } else {
@@ -1412,7 +1412,7 @@ fn finish_sqlite_recurring_claimed_run(
     disable_after: bool,
     advance_schedule: bool,
 ) -> Result<bool> {
-    let status = super::agent_jobs::run_status(success,output);
+    let status = super::agent_jobs::run_status(success, output);
     let bounded_output = stored_cron_output(output);
     let next_run = if advance_schedule {
         next_run_for_schedule(&job.schedule, finished_at)?
@@ -1555,7 +1555,7 @@ pub fn record_terminal_manual_run(
             config.cron.max_run_history,
         );
     }
-    let status = super::agent_jobs::run_status(success,output);
+    let status = super::agent_jobs::run_status(success, output);
     let bounded_output = stored_cron_output(output);
     let keep = i64::from(config.cron.max_run_history.max(1));
     let schedule_json = serde_json::to_string(&job.schedule)?;

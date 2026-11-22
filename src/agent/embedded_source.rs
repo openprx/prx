@@ -49,8 +49,12 @@ impl EmbeddedAgentBinding {
         memory: Arc<dyn Memory>,
         inputs: Vec<EmbeddedProviderInput>,
     ) -> anyhow::Result<Arc<Self>> {
-        let selected =
-            super::entry::resolve_agent_model_choice(&generation.effective, Some(selection.0), Some(selection.1))?;
+        let selected = super::entry::resolve_agent_model_choice(
+            &generation.effective,
+            Some(selection.0),
+            Some(selection.1),
+            None,
+        )?;
         let (provider_name, model_name) = selected.resolved_selection();
         anyhow::ensure!(
             provider_name == selection.0,
@@ -64,6 +68,7 @@ impl EmbeddedAgentBinding {
             &generation.effective,
             Some(provider_name),
             Some(model_name),
+            None,
         ) {
             Ok(concrete)
                 if selected.same_provider_connection(&concrete)
@@ -81,6 +86,7 @@ impl EmbeddedAgentBinding {
                 &generation.effective,
                 Some(&input.provider_name),
                 Some(&input.model_name),
+                None,
             )?;
             anyhow::ensure!(
                 route_choice.resolved_selection().0 == input.provider_name
@@ -153,7 +159,7 @@ impl EmbeddedAgentBinding {
             target.to_owned()
         };
         let selected =
-            super::entry::resolve_agent_model_choice(config, Some(self.choice.provider_name()), Some(&target))?;
+            super::entry::resolve_agent_model_choice(config, Some(self.choice.provider_name()), Some(&target), None)?;
         self.bind_selected_model(selected).map(Some)
     }
 
@@ -174,7 +180,7 @@ impl EmbeddedAgentBinding {
         // spelling would change its credential slot. Execution uses the
         // resolved destination accepted by the ingress model binding.
         let (provider, model) = selected.resolved_selection();
-        let choice = match super::entry::resolve_agent_model_choice(config, Some(provider), Some(model)) {
+        let choice = match super::entry::resolve_agent_model_choice(config, Some(provider), Some(model), None) {
             Ok(concrete)
                 if concrete.same_provider_connection(&selected)
                     && concrete.factory_credential_source_matches(config) =>
@@ -603,6 +609,7 @@ impl EmbeddedAgentSource {
                         config,
                         Some(self.binding.choice.provider_name()),
                         Some(&format!("hint:{}", route.hint)),
+                        None,
                     )?
                 } else {
                     let model = if provider == "ollama" && model == "*" {
@@ -610,7 +617,7 @@ impl EmbeddedAgentSource {
                     } else {
                         model
                     };
-                    super::entry::resolve_agent_model_choice(config, Some(provider), Some(model))?
+                    super::entry::resolve_agent_model_choice(config, Some(provider), Some(model), None)?
                 };
                 Some(self.binding.bind_selected_model(choice)?)
             } else {

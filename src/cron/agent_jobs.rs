@@ -160,6 +160,12 @@ pub(crate) fn purge(work: &crate::memory::agent_erasure::EraseWork) -> Result<BT
 }
 
 /// Admission refusals are skipped attempts, rather than provider failures.
-pub(crate) fn run_status(success:bool,output:&str)->&'static str {
-    if success {"ok"} else if matches!(output,"agent_busy"|"agent_budget_exhausted") {"skipped"} else {"error"}
+pub(crate) fn run_status(success: bool, output: &str) -> &'static str {
+    if success {
+        "ok"
+    } else if matches!(output, "agent_busy" | "agent_budget_exhausted") {
+        "skipped"
+    } else {
+        "error"
+    }
 }

@@ -181,7 +181,7 @@ pub(super) fn event_header(conn: &Connection, id: &str, kind: &str) -> anyhow::R
     let root = if root.is_some() {
         root
     } else {
-        conn.query_row("WITH RECURSIVE family(run) AS (SELECT ?1 UNION SELECT e.parent_run_id FROM message_events e JOIN family f ON e.run_id=f.run WHERE e.workspace_id=?2 AND e.owner_id=?3 AND e.parent_run_id IS NOT NULL) SELECT e.session_key,s.agent_key,s.incarnation,e.run_id,s.session_key FROM message_events e JOIN agent_scopes s ON s.scope_id=e.ma_scope_id WHERE e.workspace_id=?2 AND e.owner_id=?3 AND e.source IN ('cron','xin') AND e.parent_run_id IS NULL AND e.run_id IN(SELECT run FROM family) LIMIT 1", params![root_run, workspace, owner], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).optional()?
+        conn.query_row("WITH RECURSIVE family(run) AS (SELECT ?1 UNION SELECT e.parent_run_id FROM message_events e JOIN family f ON e.run_id=f.run WHERE e.workspace_id=?2 AND e.owner_id=?3 AND e.parent_run_id IS NOT NULL) SELECT e.session_key,s.agent_key,s.incarnation,e.run_id,s.session_key FROM message_events e JOIN agent_scopes s ON s.scope_id=e.ma_scope_id WHERE e.workspace_id=?2 AND e.owner_id=?3 AND s.agent_key GLOB 'n:*' AND e.source IN ('cron','xin') AND e.parent_run_id IS NULL AND e.run_id IN(SELECT run FROM family) LIMIT 1", params![root_run, workspace, owner], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).optional()?
     };
     let Some((root_session, agent, incarnation, root_id, _)) = root else {
         return Ok(None);
@@ -251,7 +251,7 @@ pub(super) fn event_written(conn: &Connection, event: &crate::memory::MessageEve
         if event.role == "user" {
             project_scheduled(conn, &event.event_id)?;
         } else {
-            conn.execute("INSERT INTO sessions(session_key,channel,sender,owner_id,created_at,updated_at) VALUES(?1,?2,?2,?3,?4,?4) ON CONFLICT(session_key) DO UPDATE SET updated_at=excluded.updated_at WHERE sessions.owner_id=excluded.owner_id",params![h.session,event.source.as_str(),h.owner,event.created_at])?;
+            conn.execute("INSERT INTO sessions(session_key,channel,sender,owner_id,created_at,updated_at) VALUES(?1,?2,?5,?3,?4,?4) ON CONFLICT(session_key) DO UPDATE SET updated_at=excluded.updated_at WHERE sessions.owner_id=excluded.owner_id",params![h.session,event.source.as_str(),h.owner,event.created_at,h.agent])?;
         }
         h.kind = if event.event_type == "scheduled.skipped" {
             "turn.failed"
@@ -334,7 +334,7 @@ pub(super) fn event_written(conn: &Connection, event: &crate::memory::MessageEve
 
 /// Transcript projection shares the source/journal transaction and its erase stamp.
 fn project_scheduled(conn: &Connection, event: &str) -> anyhow::Result<()> {
-    conn.execute("INSERT INTO sessions(session_key,channel,sender,owner_id,created_at,updated_at) SELECT session_key,channel,COALESCE(sender,source),owner_id,created_at,created_at FROM message_events WHERE event_id=?1 ON CONFLICT(session_key) DO UPDATE SET updated_at=excluded.updated_at WHERE sessions.owner_id=excluded.owner_id AND sessions.channel=excluded.channel",[event])?;
+    conn.execute("INSERT INTO sessions(session_key,channel,sender,owner_id,created_at,updated_at) SELECT session_key,channel,(SELECT substr(agent_key,3) FROM agent_scopes WHERE scope_id=ma_scope_id),owner_id,created_at,created_at FROM message_events WHERE event_id=?1 ON CONFLICT(session_key) DO UPDATE SET updated_at=excluded.updated_at WHERE sessions.owner_id=excluded.owner_id AND sessions.channel=excluded.channel",[event])?;
     conn.execute("INSERT INTO conversation_turns(session_key,owner_id,role,content,timestamp,message_id,message_event_id,agent_id,persona_id,visibility,ma_scope_id) SELECT session_key,owner_id,role,content,created_at,event_id,event_id,agent_id,persona_id,visibility,ma_scope_id FROM message_events WHERE event_id=?1 AND NOT EXISTS(SELECT 1 FROM conversation_turns WHERE message_event_id=?1)",[event])?;
     conn.execute("UPDATE sessions SET message_count=(SELECT COUNT(*) FROM conversation_turns t WHERE t.session_key=sessions.session_key AND t.owner_id=sessions.owner_id),last_message_preview=(SELECT substr(content,1,120) FROM message_events WHERE event_id=?1) WHERE session_key=(SELECT session_key FROM message_events WHERE event_id=?1) AND owner_id=(SELECT owner_id FROM message_events WHERE event_id=?1)",[event])?;
     Ok(())
