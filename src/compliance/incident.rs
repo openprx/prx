@@ -126,8 +126,11 @@ impl IncidentStore {
         let parent = path.parent().context("incident store path must have a parent")?;
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create incident store directory {}", parent.display()))?;
-        let conn =
+        let mut conn =
             Connection::open(path).with_context(|| format!("failed to open incident store {}", path.display()))?;
+        // A side store: wait briefly for a concurrent writer, never block the
+        // caller indefinitely; past the bound the write fails with its error.
+        crate::runtime::sqlite_pool::install_bounded_busy_handler(&mut conn)?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA foreign_keys=ON;
@@ -441,8 +444,9 @@ pub fn write_incident_export(path: &Path, export: &IncidentExport) -> Result<()>
 }
 
 pub fn verify_incident_store(path: &Path) -> Result<String> {
-    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    let mut conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("failed to open incident evidence store {}", path.display()))?;
+    crate::runtime::sqlite_pool::install_bounded_busy_handler(&mut conn)?;
     let version: i64 = conn.query_row(
         "SELECT version FROM compliance_schema WHERE component='article_73_incidents'",
         [],

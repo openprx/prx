@@ -155,6 +155,13 @@ CREATE TABLE engine_outcomes(sequence INTEGER PRIMARY KEY,
 /// The telemetry file under the workspace.
 pub const TELEMETRY_FILE: &str = "decision-engine.sqlite";
 
+/// How long a telemetry connection waits for a concurrent writer before the
+/// statement fails with `SQLITE_BUSY`. The engine may not import the runtime,
+/// so this is rusqlite's `busy_timeout` set to the same bound as the runtime's
+/// bounded busy handler (`runtime::sqlite_pool::BOUNDED_BUSY_WAIT`, 5 s): the
+/// telemetry store is a side store that must never block a turn indefinitely.
+const TELEMETRY_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(5_000);
+
 /// Dedicated observation store; only the worker owns the writing connection.
 pub struct SqliteTelemetryWriter {
     connection: rusqlite::Connection,
@@ -166,6 +173,7 @@ impl SqliteTelemetryWriter {
             super::access_spy::record(workspace, false);
         }
         let mut connection = rusqlite::Connection::open(path)?;
+        connection.busy_timeout(TELEMETRY_BUSY_TIMEOUT)?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version != SCHEMA_VERSION {
             // The engine may not import the runtime, so it begins IMMEDIATE through
@@ -187,6 +195,7 @@ impl SqliteTelemetryWriter {
             return Ok(None);
         }
         let connection = rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_timeout(TELEMETRY_BUSY_TIMEOUT)?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version != SCHEMA_VERSION {
             return Ok(None);
