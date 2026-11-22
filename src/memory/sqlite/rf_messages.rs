@@ -69,9 +69,12 @@ fn interrupt(conn: &Connection, workspace_id: &str, owner_id: &str, run_id: &str
     }
     let changed = conn.execute(
         "UPDATE rf_message_attempts SET interrupted = 1
-         WHERE workspace_id = ?1 AND owner_id = ?2 AND run_id = ?3",
+         WHERE workspace_id = ?1 AND owner_id = ?2 AND run_id = ?3 AND interrupted=0",
         params![workspace_id, owner_id, run_id],
     )?;
+    if changed == 1 {
+        super::sync_journal::interrupted(conn, workspace_id, owner_id, run_id)?;
+    }
     Ok(changed == 1)
 }
 
@@ -145,6 +148,7 @@ pub(super) fn admit(
     if written == 0 {
         return Err(RfAdmissionRefused::Taken.into());
     }
+    super::sync_journal::admission(tx, admission, event)?;
     Ok(())
 }
 

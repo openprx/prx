@@ -240,6 +240,18 @@ pub(super) fn finish(memory: &SqliteMemory, work: &EraseWork) -> anyhow::Result<
         "UPDATE agent_purge_operations SET receipt=?2 WHERE purge_id=?1",
         params![work.erase_id, serde_json::to_string(&receipt)?],
     )?;
+    for incarnation in &incarnations {
+        let mut header = super::sync_journal::Header::new(
+            &work.owner,
+            "history.erased",
+            "",
+            &work.agent,
+            incarnation,
+            format!("purge:{}", work.erase_id),
+        );
+        header.event_id = format!("purge:{}:{incarnation}", work.erase_id);
+        super::sync_journal::append(&tx, &header)?;
+    }
     tx.commit()?;
     Ok(receipt)
 }

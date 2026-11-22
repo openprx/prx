@@ -87,6 +87,10 @@ impl Memory for SqliteMemory {
         Some(self)
     }
 
+    fn sync_store(&self) -> Option<std::sync::Arc<dyn crate::memory::sync::SyncStore>> {
+        Some(std::sync::Arc::new(self.clone()))
+    }
+
     fn agent_registry(&self) -> Option<&dyn crate::memory::agent_registry::AgentRegistry> {
         Some(self)
     }
@@ -559,6 +563,7 @@ impl Memory for SqliteMemory {
                 params![session_key, owner_id, now],
             )?;
             let claim = if inserted == 1 {
+                super::sync_journal::session_created(&tx, &session_key, &owner_id)?;
                 crate::memory::SessionClaim::Created
             } else {
                 let (channel, owner): (String, Option<String>) = tx.query_row(

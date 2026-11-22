@@ -25,6 +25,9 @@ pub(crate) mod remote_tree;
 mod rf_delete;
 mod rf_forget;
 mod rf_messages;
+mod sync_journal;
+mod sync_projection;
+mod sync_snapshot;
 mod write_log;
 
 #[cfg(unix)]
@@ -223,6 +226,7 @@ pub struct SqliteMemory {
     /// capsule key id. The set never grows, whatever ids stored capsules name.
     recovery_key_gates: Arc<[parking_lot::Mutex<()>; recovery_authority::RECOVERY_KEY_GATES]>,
     ingress_owners: Arc<super::ingress_recovery::IngressOwnerCache>,
+    sync_runtime: Arc<sync_journal::Runtime>,
     mailbox_runtime: Arc<mailbox::runtime::Runtime>,
     db_path: PathBuf,
     acl_enabled: bool,
@@ -445,7 +449,10 @@ impl SqliteMemory {
             ),
         }
 
+        let sync_runtime = Arc::new(sync_journal::Runtime::default());
+        sync_journal::install_notify(&mut pool.write(), &sync_runtime)?;
         Ok(Self {
+            sync_runtime,
             pool,
             ingress_owners: Default::default(),
             mailbox_runtime: mailbox::runtime::for_database(&db_path)?,

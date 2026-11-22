@@ -555,6 +555,9 @@ impl SqliteMemory {
                 ],
             )?;
         }
+        if inserted > 0 {
+            super::sync_journal::event_written(tx, &event)?;
+        }
         Ok((event, inserted > 0))
     }
 

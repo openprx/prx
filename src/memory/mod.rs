@@ -28,6 +28,7 @@ pub(crate) mod router_history;
 pub mod session_predicate;
 pub mod snapshot;
 pub mod sqlite;
+pub mod sync;
 pub mod topic;
 pub mod traits;
 pub mod vector;

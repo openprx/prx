@@ -560,6 +560,19 @@ pub(super) fn finish_history(memory: &SqliteMemory, work: &EraseWork) -> anyhow:
             params![uuid::Uuid::new_v4().to_string(), next, work.scope_id],
         )?;
     }
+    if !work.purge {
+        super::sync_journal::append(
+            &tx,
+            &super::sync_journal::Header::new(
+                &work.owner,
+                "history.erased",
+                &work.session,
+                &work.agent,
+                &work.incarnation,
+                format!("erase:{}", work.erase_id),
+            ),
+        )?;
+    }
     tx.commit().context(ErasureStep::CommitReceipt)?;
     Ok(receipt)
 }

@@ -628,6 +628,35 @@ fn record_deleted(
             attempt.scope,
         ],
     )?;
+    let event_id: String = tx.query_row(
+        "SELECT event_id FROM message_events WHERE workspace_id=?1 AND owner_id=?2 AND idempotency_key=?3",
+        params![
+            target.workspace_id,
+            target.owner_id,
+            format!("rf-delete:{}:{subject}", side.label())
+        ],
+        |r| r.get(0),
+    )?;
+    // The delete source is content-free and names its root attempt explicitly.
+    let incarnation: Option<String> = tx
+        .query_row(
+            "SELECT incarnation FROM agent_scopes WHERE scope_id=?1",
+            [&attempt.scope],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(incarnation) = incarnation {
+        let mut header = super::sync_journal::Header::new(
+            target.owner_id,
+            "turn.deleted",
+            target.session_key,
+            &attempt.agent_key,
+            &incarnation,
+            format!("event:{event_id}"),
+        );
+        header.run_id = attempt.run_id.clone();
+        super::sync_journal::append(tx, &header)?;
+    }
     Ok(())
 }
 

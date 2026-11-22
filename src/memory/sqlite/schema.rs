@@ -1127,6 +1127,7 @@ impl SqliteMemory {
         super::child_sessions::init_schema(conn)?;
         super::mailbox_schema::init_schema(conn)?;
         super::rf_messages::init_schema(conn)?;
+        super::sync_journal::init_schema(conn)?;
         super::rf_delete::init_schema(conn)?;
         super::write_log::init_schema(conn)?;
         super::rf_forget::init_schema(conn)?;

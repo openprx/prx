@@ -1449,6 +1449,11 @@ const fn enforced_read_mode(context: Option<&MemoryWriteContext>, requested: Mem
 /// Core memory trait — implement for any persistence backend
 #[async_trait]
 pub trait Memory: Send + Sync {
+    /// Available only with the transactional rf journal backend.
+    fn sync_store(&self) -> Option<std::sync::Arc<dyn crate::memory::sync::SyncStore>> {
+        None
+    }
+
     /// Unavailable without a transactional namespace for child sessions.
     fn child_session_store(&self) -> Option<&dyn crate::memory::child_sessions::ChildSessionStore> {
         None
