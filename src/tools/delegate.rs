@@ -1215,7 +1215,12 @@ impl DelegateLoopResources {
             );
         }
         let answer_only = child_source.is_some() && !agent_config.agentic;
-        if !answer_only && agent_config.allowed_tools.is_empty() {
+        // At Full the agent's `allowed_tools` is ignored: the child inherits
+        // every tool its level allows.
+        let full = child_source
+            .as_ref()
+            .is_some_and(|source| source.authority.publication.level() == crate::security::AutonomyLevel::Full);
+        if !answer_only && !full && agent_config.allowed_tools.is_empty() {
             return Ok(DelegateAgenticExecution {
                 child_terminal_committed: false,
                 result: ToolResult {
@@ -1235,8 +1240,8 @@ impl DelegateLoopResources {
             .map(|name| name.trim())
             .filter(|name| !name.is_empty())
             .collect::<std::collections::HashSet<_>>();
-        let inherit_all = answer_only || requested.contains("*");
-        if !answer_only && inherit_all && requested.len() != 1 {
+        let inherit_all = answer_only || full || requested.contains("*");
+        if !answer_only && !full && inherit_all && requested.len() != 1 {
             return Ok(DelegateAgenticExecution {
                 child_terminal_committed: false,
                 result: ToolResult {
@@ -2828,35 +2833,6 @@ pub(crate) mod tests {
         let result = dispatch_configured_delegate(tool, json!({"agent":"any", "prompt":"test"})).await;
         assert!(!result.success);
         assert!(result.error.unwrap().contains("none configured"));
-    }
-
-    #[tokio::test]
-    async fn agentic_mode_rejects_empty_allowed_tools() {
-        let mut agents = HashMap::new();
-        agents.insert("agentic".to_string(), agentic_config(Vec::new()));
-
-        let tool = DelegateTool::new(agents, test_security());
-        let result = dispatch_configured_delegate(tool, json!({"agent":"agentic", "prompt":"test"})).await;
-        assert!(!result.success);
-        assert!(result.error.as_deref().unwrap_or("").contains("allowed_tools is empty"));
-    }
-
-    #[tokio::test]
-    async fn agentic_mode_rejects_unmatched_allowed_tools() {
-        let mut agents = HashMap::new();
-        agents.insert("agentic".to_string(), agentic_config(vec!["missing_tool".to_string()]));
-
-        let tool =
-            DelegateTool::new(agents, test_security()).with_parent_tools(Arc::new(vec![Arc::new(EchoTool::default())]));
-        let result = dispatch_configured_delegate(tool, json!({"agent":"agentic", "prompt":"test"})).await;
-        assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("unknown or ineligible tools: missing_tool")
-        );
     }
 
     struct CapturedDelegate {

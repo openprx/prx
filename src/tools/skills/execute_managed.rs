@@ -104,7 +104,12 @@ impl SkillExecuteTool {
         let caller = |key: &str| trusted_scope_field(args, &[key]).unwrap_or_else(|| "unknown".to_string());
         let grant = PolicyGrant {
             security: Arc::clone(&self.security),
-            excluded: self.config.tool_tiering.always_exclude.clone(),
+            excluded: self
+                .config
+                .tool_tiering
+                .at_level(crate::tools::effective_autonomy::call_policy(&self.security).autonomy)
+                .always_exclude
+                .clone(),
             sender: caller("sender"),
             channel: caller("channel"),
             chat_type: caller("chat_type"),

@@ -360,7 +360,7 @@ async fn an_undeclared_or_ungranted_tool_is_refused() {
     let mut excluded = m.config();
     excluded.tool_tiering.always_exclude = vec!["shell".to_string()];
     let hidden = m
-        .tool_with(m.policy(AutonomyLevel::Full), excluded)
+        .tool_with(m.policy(AutonomyLevel::Supervised), excluded)
         .execute(m.call(&task, "run", &args))
         .await;
     assert!(hidden.is_err());

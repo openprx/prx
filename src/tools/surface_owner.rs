@@ -27,8 +27,13 @@ pub(crate) struct SurfaceParts<'a> {
 }
 
 pub(crate) fn build(parts: SurfaceParts<'_>) -> TurnSurface {
-    let mut config = parts.tiering.clone();
-    config.always_exclude.extend(parts.inherited_exclusions.iter().cloned());
+    // At Full the configured and inherited exclusions are ignored: every
+    // tool the level allows is published (the model allowlist stays).
+    let full = parts.security.autonomy == crate::security::AutonomyLevel::Full;
+    let mut config = parts.tiering.at_level(parts.security.autonomy).into_owned();
+    if !full {
+        config.always_exclude.extend(parts.inherited_exclusions.iter().cloned());
+    }
     let view = parts
         .catalog
         .view(&CatalogScope::default())
@@ -50,7 +55,7 @@ pub(crate) fn build(parts: SurfaceParts<'_>) -> TurnSurface {
         candidates,
         &config,
         parts.pinned_model,
-        parts.channel,
+        parts.channel && !full,
         |descriptor| {
             parts
                 .catalog

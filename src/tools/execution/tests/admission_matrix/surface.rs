@@ -172,7 +172,10 @@ async fn production_channel_surface_omits_channel_excluded_tool() {
     .expect("catalog");
     let mut tiering = crate::config::ToolTieringConfig::default();
     tiering.channel_exclude.push("project_tool".into());
-    let security = crate::security::SecurityPolicy::default();
+    let security = crate::security::SecurityPolicy {
+        autonomy: crate::security::AutonomyLevel::Supervised,
+        ..crate::security::SecurityPolicy::default()
+    };
     let service = crate::tools::ToolExecutionService::from_boxed(
         tools,
         Arc::new(crate::tools::SecurityEffectPolicy::new(Arc::new(security.clone()))),

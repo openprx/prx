@@ -159,6 +159,25 @@ fn worker_sealed_level(
     Ok(level)
 }
 
+/// The names a worker's surface hides: the configured and inherited
+/// exclusions below Full, none at Full.
+fn worker_excluded_names(
+    config: &Config,
+    manifest: &WorkerManifest,
+    level: crate::security::AutonomyLevel,
+) -> std::collections::BTreeSet<String> {
+    if level == crate::security::AutonomyLevel::Full {
+        return std::collections::BTreeSet::new();
+    }
+    config
+        .tool_tiering
+        .always_exclude
+        .iter()
+        .chain(&manifest.channel_excluded_tools)
+        .cloned()
+        .collect()
+}
+
 fn worker_source_workspace(manifest: &WorkerManifest) -> Result<&str> {
     match (&manifest.ordinary_source, &manifest.operator_source) {
         (Some(source), None) => Ok(source.parent_constraints.workspace.as_str()),
@@ -719,9 +738,7 @@ async fn run_owned_manifest(
     let tools_registry = select_tools_for_manifest(full_tools, &manifest).await?;
     let _ = spawn_tools_handle.set(&tools_registry);
     let child_service = if let Some(authority) = &ordinary_authority {
-        let mut excluded_names: std::collections::BTreeSet<String> =
-            config.tool_tiering.always_exclude.iter().cloned().collect();
-        excluded_names.extend(manifest.channel_excluded_tools.iter().cloned());
+        let excluded_names = worker_excluded_names(&config, &manifest, level);
         Some(
             crate::runtime::turn_publication::OrdinaryProcessPublication {
                 authority: Arc::clone(authority),
@@ -749,9 +766,7 @@ async fn run_owned_manifest(
             .await?,
         )
     } else if let Some(authority) = &operator_authority {
-        let mut excluded_names: std::collections::BTreeSet<String> =
-            config.tool_tiering.always_exclude.iter().cloned().collect();
-        excluded_names.extend(manifest.channel_excluded_tools.iter().cloned());
+        let excluded_names = worker_excluded_names(&config, &manifest, level);
         Some(
             crate::runtime::turn_publication::OperatorProcessPublication {
                 authority: Arc::clone(authority),

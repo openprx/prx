@@ -208,10 +208,17 @@ pub(super) fn resolve_target(config: &Config, target: &TurnTarget) -> Result<Opt
     if !agent.enabled {
         return Err(TargetError::Disabled);
     }
-    let tools = allowlist_for(agent)?;
+    let autonomy = crate::security::agent_level::agent_level(agent.autonomy, config.autonomy.level);
+    // At Full the agent's `allowed_tools` is ignored: an agentic target
+    // inherits every tool its level allows (the target-wide exclusions stay).
+    let tools = if autonomy == AutonomyLevel::Full && agent.agentic {
+        ToolAllowlist::Inherit
+    } else {
+        allowlist_for(agent)?
+    };
     Ok(Some(TargetPlan {
         name: name.clone(),
-        autonomy: crate::security::agent_level::agent_level(agent.autonomy, config.autonomy.level),
+        autonomy,
         agent: agent.clone(),
         tools,
     }))

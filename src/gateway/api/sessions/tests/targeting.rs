@@ -14,10 +14,9 @@ use crate::memory::{
 use crate::security::AutonomyLevel;
 use crate::tools::document_ingest::DocumentIngestTool;
 use crate::tools::memory_store::MemoryStoreTool;
-use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::super::target::{AgentField, TargetError, ToolAllowlist, TurnTarget, resolve_target};
+use super::super::target::{AgentField, TargetError, TurnTarget, resolve_target};
 use crate::security::agent_level::agent_level as effective_autonomy;
 
 fn agent(agentic: bool, allowed_tools: &[&str]) -> DelegateAgentConfig {
@@ -386,60 +385,6 @@ async fn agent_name_is_exact_at_all_ingresses() {
     assert_untouched(&fixture).await;
 }
 
-#[tokio::test]
-async fn target_allowlist_semantics() {
-    let resolve = |cfg: DelegateAgentConfig| {
-        resolve_target(&config_with(vec![("worker", cfg)], true), &named("worker"))
-            .map(|plan| plan.map(|plan| plan.tools))
-    };
-    // Non-agentic: no general execution tools, whatever the list holds.
-    assert_eq!(resolve(agent(false, &["file_read"])), Ok(Some(ToolAllowlist::None)));
-    // Wildcard inherits only the admitted host surface.
-    assert_eq!(resolve(agent(true, &["*"])), Ok(Some(ToolAllowlist::Inherit)));
-    assert_eq!(resolve(agent(true, &[" * "])), Ok(Some(ToolAllowlist::Inherit)));
-    // Mixed wildcard and empty lists are refused.
-    for list in [&["*", "file_read"][..], &[][..], &[" ", ""][..]] {
-        assert_eq!(resolve(agent(true, list)), Err(TargetError::ToolsInvalid), "{list:?}");
-    }
-    // Explicit names intersect the host surface; cron and xin never reach a target.
-    let explicit = resolve(agent(true, &["file_read", "cron"]))
-        .expect("test: resolves")
-        .expect("test: plan");
-    assert_eq!(
-        explicit,
-        ToolAllowlist::Only(BTreeSet::from(["file_read".to_owned(), "cron".to_owned()]))
-    );
-    let surface = explicit.surface();
-    assert_eq!(surface.allowed_tools, Some(BTreeSet::from(["file_read".to_owned()])));
-    let excluded = BTreeSet::from(["cron", "xin"].map(str::to_owned));
-    assert_eq!(surface.excluded_names, excluded);
-    let inherit = ToolAllowlist::Inherit.surface();
-    assert_eq!(inherit.allowed_tools, None);
-    assert_eq!(
-        inherit.excluded_names, excluded,
-        "the wildcard does not widen past the exclusion"
-    );
-    assert_eq!(ToolAllowlist::None.surface().allowed_tools, Some(BTreeSet::new()));
-
-    // Over HTTP an invalid agentic list is a typed 400 with no effects.
-    let fixture = fixture(|config| {
-        config.gateway.targeted_agents = true;
-        config
-            .agents
-            .insert("worker".to_owned(), agent(true, &["*", "file_read"]));
-    })
-    .await;
-    let (status, value) = post(
-        &fixture,
-        SESSION,
-        serde_json::json!({"message": "hi", "agent": "worker"}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(error_code(&value), Some("agent_tools_invalid"));
-    assert_untouched(&fixture).await;
-}
-
 // ── Enforcement through the real targeted console turn ──────────────────────
 //
 // These tests run `run_console_runtime_turn` with a target built by the real
@@ -551,7 +496,6 @@ impl crate::tools::Tool for CountingTool {
     }
 }
 
-const NOT_EXPOSED: &str = "was not exposed for this turn and was not executed";
 const APPROVAL_DENIED: &str = "approval is not available for this agent";
 const APPROVAL_EVENT_TYPES: [&str; 8] = [
     "approval.call.pending",
@@ -866,51 +810,6 @@ async fn drive(
             driven.expect("test: scripted turn and cleanup")
         })
         .await
-}
-
-#[tokio::test]
-async fn targeted_turn_cannot_dispatch_excluded_or_unlisted_tool() {
-    // `cron` is excluded even under a wildcard; `file_grep` is registered but
-    // not on the agent's explicit allowlist; `file_read` is listed. The model
-    // calls all three in one reply.
-    let probe = serde_json::json!({"path": "probe.txt"});
-    let calls = vec![
-        ("cron", probe.clone()),
-        ("file_grep", probe.clone()),
-        ("file_read", probe),
-    ];
-    let input = "file_read probe.txt: show the probe file";
-    for allowlist in [&["file_read", "cron"][..], &["*"][..]] {
-        let driven = drive(
-            AutonomyLevel::Full,
-            Some(agent(true, allowlist)),
-            &["cron", "file_grep", "file_read"],
-            calls.clone(),
-            input,
-            false,
-        )
-        .await;
-        assert_eq!(driven.ran("cron"), 0, "cron never runs ({allowlist:?})");
-        assert_eq!(driven.ran("file_grep"), 0, "unlisted never runs ({allowlist:?})");
-        assert_eq!(
-            driven.denied_attempts, 2,
-            "both refused calls end denied ({allowlist:?})"
-        );
-        assert_eq!(
-            driven.follow_up.matches(NOT_EXPOSED).count(),
-            2,
-            "{allowlist:?}: {}",
-            driven.follow_up
-        );
-        assert_eq!(
-            driven.ran("file_read"),
-            1,
-            "the listed tool still works ({allowlist:?})"
-        );
-        assert_eq!(driven.successful_attempts, 1, "{allowlist:?}");
-        assert!(driven.follow_up.contains("probe-output"), "{allowlist:?}");
-        assert!(!driven.awaiting_approval);
-    }
 }
 
 #[tokio::test]

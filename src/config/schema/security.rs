@@ -277,6 +277,24 @@ impl ToolTieringConfig {
         }
         effective
     }
+
+    /// The tiering policy at a turn's level. At Full PRX publishes every tool
+    /// the level allows: `always_exclude` and `channel_exclude` are ignored
+    /// and only `always_include` and the model allowlists stay. Below Full
+    /// the configured policy applies unchanged.
+    #[must_use]
+    pub fn at_level(&self, level: crate::security::AutonomyLevel) -> std::borrow::Cow<'_, Self> {
+        if level == crate::security::AutonomyLevel::Full {
+            std::borrow::Cow::Owned(Self {
+                always_include: self.always_include.clone(),
+                always_exclude: Vec::new(),
+                channel_exclude: Vec::new(),
+                model_allowlists: self.model_allowlists.clone(),
+            })
+        } else {
+            std::borrow::Cow::Borrowed(self)
+        }
+    }
 }
 
 /// Audit logging configuration

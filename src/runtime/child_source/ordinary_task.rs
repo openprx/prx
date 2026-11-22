@@ -122,7 +122,12 @@ impl OrdinaryTaskAuthority {
         &self.binding
     }
 
+    /// The named agent's allowance; `None` (no limit) at Full or when the
+    /// agent sets none.
     pub(crate) fn allowed_tools(&self) -> Option<std::collections::BTreeSet<String>> {
+        if self.publication.level() == crate::security::AutonomyLevel::Full {
+            return None;
+        }
         let agent = self
             .scope
             .agent_id

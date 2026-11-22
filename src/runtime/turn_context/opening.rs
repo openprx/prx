@@ -30,7 +30,20 @@ pub(super) struct EffectiveAgentExclusions {
         Option<Arc<dyn crate::tools::capability::turn_state::model_admission::ModelAdmissionView>>,
 }
 
+/// The level a turn runs at: a child turn's sealed scope level (a named
+/// agent's own level may differ from the hosting service's), else the
+/// service's policy level.
+pub(super) fn turn_level(
+    security: &crate::security::SecurityPolicy,
+    proof: &dyn TurnSourceProof,
+) -> crate::security::AutonomyLevel {
+    proof
+        .child_scope()
+        .map_or(security.autonomy, |scope| scope.gate_inputs().0.authority.level)
+}
+
 pub(super) fn effective_agent_exclusions(
+    level: crate::security::AutonomyLevel,
     config: &crate::config::Config,
     registry: &[Box<dyn Tool>],
     catalog: &CatalogView<'_>,
@@ -40,6 +53,7 @@ pub(super) fn effective_agent_exclusions(
 ) -> EffectiveAgentExclusions {
     let names: BTreeSet<Arc<str>> = config
         .tool_tiering
+        .at_level(level)
         .always_exclude
         .iter()
         .map(|name| Arc::from(name.as_str()))
@@ -112,6 +126,7 @@ impl TurnRuntimeService {
         let catalog = self.catalog_view();
         let model_ref: Arc<str> = Arc::from(format!("{}:{}", model.provider_label(), model.model()));
         let effective_exclusions = effective_agent_exclusions(
+            turn_level(&self.security, proof),
             &self.generation.effective,
             &self.registry,
             &catalog,
@@ -132,10 +147,7 @@ impl TurnRuntimeService {
             surface: proof.surface(),
             // A child turn runs at its sealed scope level (a named agent's
             // own level may differ from the hosting service's).
-            side_effect_mode: match proof
-                .child_scope()
-                .map_or(self.security.autonomy, |scope| scope.gate_inputs().0.authority.level)
-            {
+            side_effect_mode: match turn_level(&self.security, proof) {
                 crate::security::AutonomyLevel::ReadOnly => {
                     crate::tools::capability::turn_state::SideEffectMode::ReadOnly
                 }

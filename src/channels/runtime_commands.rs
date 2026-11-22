@@ -133,8 +133,12 @@ pub(super) fn message_runtime_snapshot(
         // IM channel turns run under the channel tiering policy: the
         // operations/development surface is folded into `always_exclude` here,
         // once, so capability routing and the prompt compilers below cannot
-        // disagree about what this turn may reach.
-        tool_tiering: config.tool_tiering.for_channel_surface(),
+        // disagree about what this turn may reach. At Full nothing is
+        // folded or excluded: every tool the level allows is published.
+        tool_tiering: config
+            .tool_tiering
+            .at_level(config.autonomy.level)
+            .for_channel_surface(),
     }
 }
 

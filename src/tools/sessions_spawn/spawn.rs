@@ -105,7 +105,13 @@ impl SessionsSpawnTool {
     /// a task child runs on this tool's registry, every child keeps the
     /// inherited surface exclusions, and a named agent's allowance bounds its
     /// tools. A recursive scope is derived only for a child that can serve it.
-    fn child_serves_delegator(&self, args: &serde_json::Value, config: &crate::config::Config) -> anyhow::Result<bool> {
+    /// A Full child (`full`) has neither inherited exclusions nor an allowance.
+    fn child_serves_delegator(
+        &self,
+        args: &serde_json::Value,
+        config: &crate::config::Config,
+        full: bool,
+    ) -> anyhow::Result<bool> {
         let name = self.name();
         let mode = args
             .get("mode")
@@ -120,6 +126,9 @@ impl SessionsSpawnTool {
                 .is_some_and(|registry| registry.iter().any(|tool| tool.name() == name))
         {
             return Ok(false);
+        }
+        if full {
+            return Ok(true);
         }
         if current_spawn_execution_context()
             .is_some_and(|context| context.channel_excluded_tools.iter().any(|tool| tool == name))
@@ -165,14 +174,14 @@ impl SessionsSpawnTool {
             Some(caller) => match caller.context().ordinary_child_publication.as_ref() {
                 Some(publication) => {
                     let config = &publication.generation().effective;
-                    let served = self.child_serves_delegator(args, config)?;
-                    let (selected, delegation) = publication.select_for_spawn(caller.context(), recursive, served)?;
-                    child_delegation = Some(delegation);
                     // A named agent runs at its own configured level, sealed
                     // into its scope; an ordinary child keeps the caller's.
-                    let level = crate::tools::capability::child::ChildLevel::from_named(
-                        crate::security::agent_level::named_child_level(config, requested_agent_name(args)),
-                    );
+                    let named = crate::security::agent_level::named_child_level(config, requested_agent_name(args));
+                    let full = named.unwrap_or_else(|| publication.level()) == crate::security::AutonomyLevel::Full;
+                    let served = self.child_serves_delegator(args, config, full)?;
+                    let (selected, delegation) = publication.select_for_spawn(caller.context(), recursive, served)?;
+                    child_delegation = Some(delegation);
+                    let level = crate::tools::capability::child::ChildLevel::from_named(named);
                     Some(caller.with_ordinary_publication(selected.with_child_level(level)?)?)
                 }
                 None => Some(caller),
@@ -308,9 +317,12 @@ impl SessionsSpawnTool {
                 .map(|source| source.proof().run_id().to_owned())
         });
         // Whatever the parent turn's surface hides stays hidden for everything
-        // this spawn produces, however deeply it nests.
+        // this spawn produces, however deeply it nests. A Full child has no
+        // such exclusions: every tool its level allows is published.
+        let child_full = child_level == crate::security::AutonomyLevel::Full;
         let inherited_channel_exclusions = parent_exec_ctx
             .as_ref()
+            .filter(|_| !child_full)
             .map(|ctx| ctx.channel_excluded_tools.clone())
             .unwrap_or_default();
 
@@ -357,7 +369,12 @@ impl SessionsSpawnTool {
         let selected_agent = match agent_name.as_deref() {
             Some(name) => match agents.get(name) {
                 Some(cfg) => {
-                    if !cfg.spawn_enabled.unwrap_or(true) {
+                    // At Full `spawn_enabled` does not limit the caller.
+                    let caller_full = crate::security::agent_level::call_level(
+                        crate::tools::effective_autonomy::current(),
+                        launch_security.autonomy,
+                    ) == crate::security::AutonomyLevel::Full;
+                    if !caller_full && !cfg.spawn_enabled.unwrap_or(true) {
                         return Ok(SpawnOutcome::rejected(format!(
                             "Agent '{name}' is not allowed for sessions_spawn (spawn_enabled=false)."
                         )));
@@ -734,8 +751,10 @@ impl SessionsSpawnTool {
             run_lineage.parent_task_id = Some(source.proof().run_id().to_owned());
             run_lineage.source_message_event_id = source.proof().source_event_id().map(str::to_owned);
         }
+        // At Full a named agent's `allowed_tools` is ignored.
         let allowed_tools = selected_agent
             .as_ref()
+            .filter(|_| !child_full)
             .map(|(_, cfg)| {
                 cfg.allowed_tools
                     .iter()
@@ -1496,7 +1515,7 @@ impl SessionsSpawnTool {
                     registry,
                     &agent,
                     memory_scope,
-                    if cfg.allowed_tools.is_empty() {
+                    if child_full || cfg.allowed_tools.is_empty() {
                         None
                     } else {
                         Some(&cfg.allowed_tools)

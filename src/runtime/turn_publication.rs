@@ -160,7 +160,7 @@ impl TurnPublication {
             &hooks.diagnostics(),
             self.plugin_generation,
         );
-        let mut surface_policy = surface_policy(surface, &config.tool_tiering);
+        let mut surface_policy = surface_policy(surface, &config.tool_tiering.at_level(security.autonomy));
         if let Some(targeted) = targeted {
             // An explicit list is exact and has no discovery tool unless it
             // names one, so every listed tool is published directly; the

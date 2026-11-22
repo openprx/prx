@@ -43,6 +43,7 @@ impl TurnSurfacePort for TurnSurfaceBinding<'_> {
         let catalog = service.catalog_view();
         let model_ref = format!("{}:{}", model.provider_label(), model.model());
         let exclusions = super::opening::effective_agent_exclusions(
+            super::opening::turn_level(&service.security, proof),
             &service.generation.effective,
             &service.registry,
             &catalog,

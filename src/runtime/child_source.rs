@@ -598,8 +598,12 @@ impl ChildProviderBinding {
                 .agents
                 .get(agent)
                 .context("ordinary child agent differs from its pinned configuration")?;
+            // At Full `spawn_enabled` does not limit the caller.
+            let caller_full = crate::tools::effective_autonomy::current() == Some(crate::security::AutonomyLevel::Full);
             anyhow::ensure!(
-                scope.source != MessageEventSource::SessionsSpawn || configured.spawn_enabled.unwrap_or(true),
+                caller_full
+                    || scope.source != MessageEventSource::SessionsSpawn
+                    || configured.spawn_enabled.unwrap_or(true),
                 "ordinary child agent disallows spawning"
             );
         }

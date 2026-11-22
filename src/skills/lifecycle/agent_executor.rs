@@ -259,6 +259,26 @@ impl AgentCaseExecutor {
             .filter(|name| !allowed.contains(**name))
             .map(|name| (*name).to_string())
             .collect();
+        // A Full run ignores `always_exclude`; the model allowlists still
+        // apply at every level, so the trial's allowlist is also stated for
+        // every model the run may be served by.
+        let allowlist: Vec<String> = allowed.iter().map(|name| (*name).to_owned()).collect();
+        let models: std::collections::BTreeSet<String> = config
+            .default_model
+            .iter()
+            .cloned()
+            .chain(config.model_routes.iter().map(|route| route.model.clone()))
+            .chain(
+                config
+                    .reliability
+                    .model_fallbacks
+                    .iter()
+                    .flat_map(|(model, fallbacks)| std::iter::once(model).chain(fallbacks).cloned()),
+            )
+            .collect();
+        for model in models {
+            config.tool_tiering.model_allowlists.insert(model, allowlist.clone());
+        }
         config.tool_tiering.always_include = offered;
         Ok(config)
     }

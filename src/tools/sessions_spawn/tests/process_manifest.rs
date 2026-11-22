@@ -79,42 +79,6 @@ async fn spawn_rejects_unknown_agent() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn spawn_rejects_spawn_disabled_agent() {
-    let (ch, _) = RecordingChannel::new();
-    let mut agents = HashMap::new();
-    let mut cfg = make_agent_config(None);
-    cfg.spawn_enabled = Some(false);
-    agents.insert("alpha".to_string(), cfg);
-    let tool = SessionsSpawnTool::new(
-        Arc::new(ch),
-        "ollama",
-        "prx-local-model",
-        0.7,
-        test_security(),
-        std::path::PathBuf::from("/tmp"),
-        crate::config::MultimodalConfig::default(),
-        agents,
-        None,
-        crate::providers::ProviderRuntimeOptions::default(),
-        crate::config::SessionsSpawnConfig::default(),
-    )
-    .with_test_parent_provider(Arc::new(EchoProvider { response: "ok".into() }));
-    let workspace = tempfile::tempdir().expect("test: parent workspace");
-    let config = preconstruction_parent_config(&tool, workspace.path());
-    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace.path()).expect("test: parent memory"));
-    let result = dispatch_preconstruction_parent(
-        tool,
-        config,
-        memory,
-        with_spawn_grant(json!({"task": "hello", "agent": "alpha"})),
-    )
-    .await
-    .unwrap();
-    assert!(!result.success);
-    assert!(result.error.unwrap_or_default().contains("spawn_enabled=false"));
-}
-
-#[tokio::test]
 async fn spawn_agent_uses_identity_prompt() {
     let ws = tempfile::TempDir::new().unwrap();
     let identity_dir = ws.path().join("identities/alpha");

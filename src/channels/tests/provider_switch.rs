@@ -350,7 +350,11 @@ fn channel_message_admission_pins_the_current_manager_generation() {
 /// `config.tool_tiering.clone()` and this test goes red.
 #[test]
 fn channel_message_runtime_hides_the_operations_tools_by_default() {
-    let manager = crate::config::new_shared(Config::default());
+    let manager = crate::config::new_shared({
+        let mut config = Config::default();
+        config.autonomy.level = crate::security::AutonomyLevel::Supervised;
+        config
+    });
     let generation = manager.pin();
     let mut ctx = ctx_with_histories(HashMap::new());
     ctx.config = Arc::clone(&manager);
