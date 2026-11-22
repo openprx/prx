@@ -164,11 +164,11 @@ async fn rehomed_security_items_preserve_refusal() -> anyhow::Result<()> {
     let trusted = &one.context.runtime().trusted;
     let policy = trusted.policy_version.clone();
     assert_eq!(
-        validate_agent_retrieval_provenance(two.proof, trusted, &trusted.resolved_model, &policy, &[], None),
+        validate_agent_retrieval_provenance(two.proof, trusted, &trusted.resolved_model, &policy, &[]),
         Err(TurnOriginMismatch)
     );
     assert_eq!(
-        validate_agent_retrieval_provenance(one.proof, trusted, "prx-other-model", &policy, &[], None),
+        validate_agent_retrieval_provenance(one.proof, trusted, "prx-other-model", &policy, &[]),
         Err(TurnOriginMismatch)
     );
 

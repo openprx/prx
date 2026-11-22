@@ -1209,27 +1209,17 @@ mod agent_turn_origin_tests {
         trusted.policy_version = Arc::from("policy-v1");
         trusted.exclusions.clear();
         let verify = crate::runtime::turn_context::validate_agent_retrieval_provenance;
-        assert!(verify(&proof_a, &trusted, "prx:model", "policy-v1", &[], None).is_ok());
-        assert!(verify(&proof_b, &trusted, "prx:model", "policy-v1", &[], None).is_err());
+        assert!(verify(&proof_a, &trusted, "prx:model", "policy-v1", &[]).is_ok());
+        assert!(verify(&proof_b, &trusted, "prx:model", "policy-v1", &[]).is_err());
         trusted.owner_id = Some(Arc::from("prx_foreign_owner"));
-        assert!(verify(&proof_a, &trusted, "prx:model", "policy-v1", &[], None).is_err());
+        assert!(verify(&proof_a, &trusted, "prx:model", "policy-v1", &[]).is_err());
         trusted.owner_id = Some(Arc::from(proof_a.owner_id()));
         trusted.source_event_id = Some(Arc::from("foreign-event"));
-        assert!(verify(&proof_a, &trusted, "prx:model", "policy-v1", &[], None).is_err());
+        assert!(verify(&proof_a, &trusted, "prx:model", "policy-v1", &[]).is_err());
         trusted.source_event_id = proof_a.source_event_id().map(Arc::from);
-        assert!(verify(&proof_a, &trusted, "foreign:model", "policy-v1", &[], None).is_err());
-        assert!(verify(&proof_a, &trusted, "prx:model", "foreign-policy", &[], None).is_err());
-        assert!(
-            verify(
-                &proof_a,
-                &trusted,
-                "prx:model",
-                "policy-v1",
-                &[Arc::from("blocked")],
-                None
-            )
-            .is_err()
-        );
+        assert!(verify(&proof_a, &trusted, "foreign:model", "policy-v1", &[]).is_err());
+        assert!(verify(&proof_a, &trusted, "prx:model", "foreign-policy", &[]).is_err());
+        assert!(verify(&proof_a, &trusted, "prx:model", "policy-v1", &[Arc::from("blocked")]).is_err());
     }
 
     #[tokio::test]
