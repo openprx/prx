@@ -781,6 +781,28 @@ impl ToolExecutionContext {
             && self.chat_id == LOCAL_OPERATOR_CHAT_ID
             && self.chat_type == LOCAL_OPERATOR_CHAT_TYPE
     }
+
+    /// Whether the root principal of this call is the local operator: the
+    /// terminal UI turn itself, any child of a terminal turn at any depth
+    /// (children keep the root's `terminal` channel), a scheduled run the
+    /// local operator created (the local CLI tuple), or a scheduled run with
+    /// no recorded creator. Remote principals (IM channels, the console, the
+    /// gateway and rf), their children and their jobs answer `false`, as does
+    /// any owner-isolated scope. Runtime-authored; never caller input.
+    #[must_use]
+    pub fn is_local_root(&self) -> bool {
+        if self.envelope.owner_isolated {
+            return false;
+        }
+        self.is_local_operator()
+            || self.channel() == LOCAL_OPERATOR_CHANNEL
+            || (self.envelope.source == crate::runtime::envelope::RuntimeSource::Chat
+                && self.channel() == LOCAL_CLI_CHANNEL
+                && self.sender() == LOCAL_CLI_SENDER
+                && self.chat_id == LOCAL_CLI_CHAT_ID
+                && self.chat_type == LOCAL_OPERATOR_CHAT_TYPE)
+            || (self.dispatch_origin == DispatchOrigin::Job && self.chat_type == JOB_ORIGIN_UNKNOWN)
+    }
 }
 
 /// The exact scope tuple the local terminal UI stamps on every turn it drives.
@@ -2979,14 +3001,17 @@ impl ToolExecutionService {
                 .verify_admitted_call(&context.envelope, admission, &descriptor, &command)
                 .map_err(|_| anyhow::anyhow!("experiment action has no admitted descriptor"))?;
             // The initial pending call still needs to be recorded first. Full
-            // autonomy requests no approval (R51); the admitted-descriptor
-            // verification above still applies.
-            if self.policy.autonomy_level() != crate::security::AutonomyLevel::Full
-                && crate::security::approval_operation::requires_explicit_grant(&command.name, &command.arguments)
+            // autonomy requests no approval and no review (R51); the
+            // admitted-descriptor verification above still applies.
+            let full = context.child_scope.as_ref().map_or_else(
+                || self.policy.autonomy_level(),
+                |scope| scope.gate_inputs().0.authority.level,
+            ) == crate::security::AutonomyLevel::Full;
+            if !full && crate::security::approval_operation::requires_explicit_grant(&command.name, &command.arguments)
             {
                 return Ok(None);
             }
-            Ok(Some(EntryInvocation::from_verified(origin, &verified).await?))
+            Ok(Some(EntryInvocation::from_verified(origin, &verified, full).await?))
         }
         .await
         {
@@ -4166,6 +4191,14 @@ fn normalize_arguments(
     root.insert(
         "_prx_scope_trusted".to_string(),
         serde_json::Value::Bool(context.is_local_operator()),
+    );
+    // Local-root marker: the call's root principal is the local operator
+    // (see `ToolExecutionContext::is_local_root`). At Full it admits the
+    // destructive `gateway` actions for the operator's children and jobs.
+    // Authored here and only here, after caller values were stripped.
+    root.insert(
+        "_prx_local_root".to_string(),
+        serde_json::Value::Bool(context.is_local_root()),
     );
     root.insert(
         RUNTIME_APPROVAL_GRANTED_ARG.to_string(),

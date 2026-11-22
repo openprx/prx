@@ -95,6 +95,15 @@ impl EntryInvocation {
         call: EntryCall,
         local_review: Option<LocalOwnerReview>,
     ) -> Result<Arc<Self>> {
+        let review_required = Self::needs_local_review(&origin, &call);
+        Self::admit_checked(origin, call, local_review, review_required)
+    }
+    fn admit_checked(
+        origin: Arc<VerifiedEntryOrigin>,
+        call: EntryCall,
+        local_review: Option<LocalOwnerReview>,
+        review_required: bool,
+    ) -> Result<Arc<Self>> {
         origin.ensure_live()?;
         let source = origin.record();
         ensure!(
@@ -108,7 +117,7 @@ impl EntryInvocation {
                 && call.tool == "skills_manage",
             "controlled call source changed"
         );
-        if Self::needs_local_review(&origin, &call) {
+        if review_required {
             local_review
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("local lifecycle owner review required"))?
@@ -121,13 +130,18 @@ impl EntryInvocation {
             local_review,
         }))
     }
-    /// Admits an actual verified backend call; a Gateway lifecycle mutation
-    /// waits for the original local owner's review of this exact call.
+    /// Admits an actual verified backend call; below Full a Gateway lifecycle
+    /// mutation waits for the original local owner's review of this exact
+    /// call. At Full (`full`) no review step applies, for every origin.
     pub(crate) async fn from_verified(
         origin: Arc<VerifiedEntryOrigin>,
         verified: &crate::tools::capability::execution_binding::VerifiedExecutionCall,
+        full: bool,
     ) -> Result<Arc<Self>> {
         let call = Self::verified_call(verified)?;
+        if full {
+            return Self::admit_checked(origin, call, None, false);
+        }
         Self::admit_reviewed(origin, call).await
     }
     fn verified_call(

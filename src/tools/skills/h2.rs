@@ -1,6 +1,6 @@
 //! Pure experiment intents reach the service only through the exact call port.
 mod schema;
-use super::{ApprovalGrant, ResourceRiskLevel, SideEffectGate, SkillsManageTool, Tool, ToolResult, json};
+use super::{ResourceRiskLevel, SideEffectGate, SkillsManageTool, Tool, ToolResult, json};
 use crate::runtime::h2_entry::{self, EntryAction};
 use crate::skills::lifecycle::experiment;
 use serde::de::DeserializeOwned;
@@ -119,7 +119,10 @@ impl SkillsManageTool {
             crate::acl::approval_grant::RiskLevel::High => ResourceRiskLevel::High,
         };
         let grant = Self::approval_grant(args);
-        let required = crate::security::approval_operation::requires_explicit_grant(self.name(), args);
+        // At Full a lifecycle action needs no grant and no review (R44-R46).
+        let policy = crate::tools::effective_autonomy::call_policy(&self.security);
+        let required = policy.autonomy != crate::security::AutonomyLevel::Full
+            && crate::security::approval_operation::requires_explicit_grant(self.name(), args);
         let refusal = || ToolResult {
             success: false,
             output: String::new(),
@@ -135,20 +138,13 @@ impl SkillsManageTool {
         {
             return Err(refusal());
         }
-        SideEffectGate::new(&crate::tools::effective_autonomy::call_policy(&self.security))
+        SideEffectGate::new(&policy)
             .authorize_resource_operation(self.name(), &operation, risk, grant.as_ref())
             .map_err(|error| ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(error),
             })?;
-        if required
-            && crate::tools::effective_autonomy::call_policy(&self.security).autonomy
-                == crate::security::AutonomyLevel::Full
-            && !grant.as_ref().is_some_and(ApprovalGrant::consume_single_use)
-        {
-            return Err(refusal());
-        }
         Ok(())
     }
 }

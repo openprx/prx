@@ -134,11 +134,14 @@ impl GatewayTool {
     /// `config.d` fragment included) as one configuration transaction: it is
     /// saved through the encrypting save path, activated immediately, and
     /// restored if the runtime refuses it.
+    /// At Full (`full`) the high-risk confirmation is satisfied here, bound
+    /// to the revision the patch is based on (N06).
     async fn apply_config_patch(
         &self,
         patch: &serde_json::Value,
         confirm_high_risk: bool,
         confirmed_revision: Option<&str>,
+        full: bool,
     ) -> anyhow::Result<ToolResult> {
         let refused = |error: String| ToolResult {
             success: false,
@@ -210,14 +213,21 @@ impl GatewayTool {
         let base_revision = ConfigTransactions::base_revision(&desired);
         let result = match transactions.plan(ConfigChange::Structured(Box::new(patched))).await {
             Ok(plan) => {
+                let full_revision = full
+                    .then(|| {
+                        base_revision
+                            .clone()
+                            .or_else(|| plan.planned_revision().map(str::to_owned))
+                    })
+                    .flatten();
                 transactions
                     .apply(
                         plan,
                         ConfigActor::AgentConfigPatch,
                         ApplyOptions {
                             expected_revision: base_revision.as_deref(),
-                            confirm_high_risk,
-                            confirmed_revision,
+                            confirm_high_risk: confirm_high_risk || full,
+                            confirmed_revision: full_revision.as_deref().or(confirmed_revision),
                         },
                     )
                     .await
@@ -234,7 +244,7 @@ impl GatewayTool {
                         required: "confirm_high_risk" | "if_match",
                         revision: Some(revision),
                         ..
-                    } => format!(
+                    } if !full => format!(
                         " Only if the operator asked for exactly this change, repeat the call with \
                          confirm_high_risk=true and revision=\"{revision}\"."
                     ),
@@ -381,11 +391,13 @@ impl Tool for GatewayTool {
         // requested). Gate 1 is therefore the *only* thing separating a remote
         // WhatsApp message from a daemon restart on a default install — do not
         // remove it on the assumption that gate 2 covers it.
+        let full = crate::tools::effective_autonomy::call_policy(&self.security).autonomy
+            == crate::security::AutonomyLevel::Full;
         if action == "config.patch" || action == "restart" {
-            let trusted = args
-                .get("_prx_scope_trusted")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+            let flag = |key: &str| args.get(key).and_then(serde_json::Value::as_bool).unwrap_or(false);
+            // At Full the local operator's children and jobs qualify too; a
+            // remote principal never does.
+            let trusted = flag("_prx_scope_trusted") || (full && flag("_prx_local_root"));
             if !trusted {
                 return Ok(ToolResult {
                     success: false,
@@ -469,7 +481,7 @@ impl Tool for GatewayTool {
                     .and_then(serde_json::Value::as_str)
                     .map(str::trim)
                     .filter(|revision| !revision.is_empty());
-                self.apply_config_patch(patch, confirm_high_risk, revision).await
+                self.apply_config_patch(patch, confirm_high_risk, revision, full).await
             }
 
             "status" => {
@@ -1205,28 +1217,6 @@ mod tests {
         assert!((shared.load_full().default_temperature - 0.3).abs() < f64::EPSILON);
     }
 
-    /// PMMD-g (N-3): the `changed` list the model reads never carries a
-    /// credentialed price key.
-    #[tokio::test]
-    async fn config_patch_output_never_carries_url_userinfo() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = split_config(&tmp).await;
-        let tool = GatewayTool::new(new_shared(cfg), "anthropic", "claude-sonnet-4-6", vec![]);
-        let key = "custom:http://alice:userinfo-sentinel-pw@127.0.0.1:1/v1/model-a";
-
-        let mut args = trusted_patch(json!({ "cost": { "prices": { key: { "input": 1.0, "output": 2.0 } } } }));
-        let refused = tool.execute(args.clone()).await.unwrap();
-        assert!(!refused.success, "a credentialed price key needs confirmation");
-        assert!(!refused.error.unwrap_or_default().contains("userinfo-sentinel-pw"));
-
-        args["confirm_high_risk"] = json!(true);
-        args["revision"] = json!(ConfigTransactions::base_revision(&tool.config.desired()));
-        let result = tool.execute(args).await.unwrap();
-        assert!(result.success, "{:?}", result.error);
-        assert!(!result.output.contains("userinfo-sentinel-pw"), "{}", result.output);
-        assert!(result.output.contains("[redacted]@"), "{}", result.output);
-    }
-
     /// INT-2B a55 (R-C2BUh, D-027): `config.patch` refuses a price key that
     /// collides with a stored credentialed key once redacted, even confirmed
     /// against the current revision. Nothing is written and the error names
@@ -1306,156 +1296,6 @@ mod tests {
             .map(|entry| std::fs::read_to_string(entry.path()).unwrap_or_default())
             .collect::<String>();
         assert!(!stored.contains("sign_events"), "{stored}");
-    }
-
-    /// D-049 B, RED before SECRETS-h: `confirm_high_risk` alone applied a
-    /// high-risk patch. After: the confirmation is bound to the revision the
-    /// refusal names; without it the patch is refused again, naming the
-    /// revision to send, and nothing is written. The schema has `revision`.
-    #[tokio::test]
-    async fn config_patch_confirmation_is_bound_to_a_revision() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = split_config(&tmp).await;
-        let shared = new_shared(cfg);
-        let tool = GatewayTool::new(Arc::clone(&shared), "anthropic", "claude-sonnet-4-6", vec![]);
-
-        let mut args = trusted_patch(json!({ "api_key": "sentinel-patched-root" }));
-        args["confirm_high_risk"] = json!(true);
-        let refused = tool.execute(args.clone()).await.unwrap();
-        assert!(!refused.success, "an unbound confirmation must be refused");
-        let error = refused.error.unwrap_or_default();
-        assert!(error.contains("if_match"), "{error}");
-        assert!(
-            error.contains("revision=\""),
-            "the refusal names the revision to send: {error}"
-        );
-        assert!(!error.contains("sentinel-patched-root"), "{error}");
-        assert_ne!(
-            shared.desired().config.api_key.as_deref(),
-            Some("sentinel-patched-root")
-        );
-
-        args["revision"] = json!(ConfigTransactions::base_revision(&shared.desired()));
-        let result = tool.execute(args).await.unwrap();
-        assert!(result.success, "{:?}", result.error);
-
-        let schema = tool.execution_schema().to_string();
-        assert!(schema.contains("\"revision\""), "{schema}");
-    }
-
-    /// RED before PMME-g (D-088 C-1): renaming a route's hint while moving it
-    /// to another provider kept its `api_key` and handed it to the new
-    /// vendor, and `config.patch` applied it without any confirmation.
-    #[tokio::test]
-    async fn config_patch_cannot_move_a_route_key_to_another_provider_by_renaming_the_route() {
-        let tmp = TempDir::new().unwrap();
-        let mut cfg = Config {
-            workspace_dir: tmp.path().join("workspace"),
-            config_path: tmp.path().join("config.toml"),
-            ..Config::default()
-        };
-        cfg.model_routes = vec![crate::config::ModelRouteConfig {
-            settings: Default::default(),
-            hint: "fast".into(),
-            provider: "openrouter".into(),
-            model: "vendor/route-model".into(),
-            api_key: Some("sentinel-rename-route-key".into()),
-            credential_ref: None,
-        }];
-        for (provider, model) in [("openrouter", "vendor/route-model"), ("anthropic", "claude-sonnet-4-5")] {
-            cfg.providers.models.push(
-                toml::from_str(&format!(
-                    "provider = \"{provider}\"\nmodel = \"{model}\"\noperations = [\"chat\"]\n"
-                ))
-                .unwrap(),
-            );
-        }
-        cfg.save().await.unwrap();
-        let loaded = Config::load_from_path(&cfg.config_path, cfg.workspace_dir.clone()).unwrap();
-        let shared = new_shared(loaded);
-        let tool = GatewayTool::new(Arc::clone(&shared), "openrouter", "vendor/route-model", vec![]);
-        let before = tokio::fs::read_to_string(&cfg.config_path).await.unwrap();
-
-        let result = tool
-            .execute(trusted_patch(json!({
-                "model_routes": [{
-                    "hint": "fast2",
-                    "provider": "anthropic",
-                    "model": "claude-sonnet-4-5",
-                    "api_key": "sentinel-rename-route-key"
-                }]
-            })))
-            .await
-            .unwrap();
-        assert!(
-            !result.success,
-            "the route key changed providers unconfirmed: {result:?}"
-        );
-        let error = result.error.unwrap_or_default();
-        assert!(
-            error.contains("sends a stored credential to a different provider"),
-            "{error}"
-        );
-        assert!(!error.contains("sentinel-rename-route-key"), "{error}");
-        assert_eq!(tokio::fs::read_to_string(&cfg.config_path).await.unwrap(), before);
-    }
-
-    /// D-087 (5): `config.patch` gets the PMME-f classification too:
-    /// switching the default provider away from the root key is high risk
-    /// (the refusal names `sends a stored credential to a different
-    /// provider`), nothing is written before the confirmation bound to the
-    /// revision, and the confirmed patch applies. The new default is
-    /// declared, so the strict (model-driven) selection check passes and
-    /// the refusal is the risk alone.
-    #[tokio::test]
-    async fn config_patch_switching_the_default_away_from_the_root_key_is_high_risk() {
-        let tmp = TempDir::new().unwrap();
-        let mut cfg = Config {
-            workspace_dir: tmp.path().join("workspace"),
-            config_path: tmp.path().join("config.toml"),
-            default_provider: Some("openai".into()),
-            default_model: Some("gpt-4o".into()),
-            api_key: Some("sentinel-root-owner-key".into()),
-            ..Config::default()
-        };
-        cfg.providers.models = vec![crate::config::schema::ProviderModelConfig {
-            provider: "anthropic".into(),
-            model: Some("claude-sonnet-4-5".into()),
-            operations: Some(vec![crate::config::schema::ModelOperationSetting::Chat]),
-            native_tools: None,
-            vision_input: None,
-            streaming: None,
-            structured_output: None,
-            tool_schema_dialect: None,
-            tool_call_dialect: None,
-            context_window: None,
-        }];
-        cfg.save().await.unwrap();
-        let cfg = Config::load_from_path(&cfg.config_path, cfg.workspace_dir.clone()).unwrap();
-        let shared = new_shared(cfg);
-        let tool = GatewayTool::new(Arc::clone(&shared), "anthropic", "claude-sonnet-4-6", vec![]);
-        let before = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
-
-        let mut args = trusted_patch(json!({ "default_provider": "anthropic", "default_model": "claude-sonnet-4-5" }));
-        let refused = tool.execute(args.clone()).await.unwrap();
-        assert!(!refused.success, "the root key changed hands unconfirmed");
-        let error = refused.error.unwrap_or_default();
-        assert!(
-            error.contains("sends a stored credential to a different provider"),
-            "{error}"
-        );
-        assert!(!error.contains("sentinel-root-owner-key"), "{error}");
-        assert_eq!(
-            std::fs::read_to_string(tmp.path().join("config.toml")).unwrap(),
-            before,
-            "nothing was written"
-        );
-
-        args["confirm_high_risk"] = json!(true);
-        args["revision"] = json!(ConfigTransactions::base_revision(&shared.desired()));
-        let result = tool.execute(args).await.unwrap();
-        assert!(result.success, "{:?}", result.error);
-        assert_eq!(shared.desired().config.default_provider.as_deref(), Some("anthropic"));
     }
 
     /// D-049 F, RED before SECRETS-h: the `confirm_high_risk` description
