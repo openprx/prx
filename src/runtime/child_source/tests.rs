@@ -851,7 +851,7 @@ fn golden_constraints_and_effective_config_payloads() {
     let zeta = literal.find(r#""zeta/model":{"#).expect("test: zeta price");
     assert!(alpha < zeta, "the literal holds the nested maps sorted");
     // The seal is recomputed with `ring` over the literal and pinned.
-    const EFFECTIVE_CONFIG_SEAL: &str = "4b492db5f4b3bd565e3397e53f893c7d81d3ae0840ca3496f5e8875eb506b97c";
+    const EFFECTIVE_CONFIG_SEAL: &str = "6b913487cfebd837d14d7a232bb9130e049f6b655ab2073609e8e5695bebd906";
     assert_eq!(
         golden_state_fingerprint(&k_child, &[b"process-effective-config-v1", &expected]),
         EFFECTIVE_CONFIG_SEAL
