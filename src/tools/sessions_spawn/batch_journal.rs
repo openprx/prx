@@ -190,7 +190,8 @@ impl PreparedBatch {
             .record_runtime_event_idempotent(
                 {
                     let mut scope = MessageEventScope::new("sessions_spawn", MemoryVisibility::Workspace)
-                        .with_owner_id(&self.fields.owner).with_run_id(&self.fields.batch);
+                        .with_owner_id(&self.fields.owner)
+                        .with_run_id(&self.fields.batch);
                     scope.session_key = Some(self.fields.ordinary_source.parent_session.clone());
                     scope.parent_run_id = Some(self.fields.ordinary_source.parent_run.clone());
                     scope.parent_session_key = Some(self.fields.ordinary_source.parent_session.clone());
@@ -253,7 +254,9 @@ pub(super) async fn read(
         &parsed.fields.ordinary_source.config_revision,
     )?;
     let plan_fields = verify(&plan, fabric.workspace_id(), batch, "plan", &key)?;
-    if !owners.admits(plan.owner_id.as_deref(), plan_fields.ordinary_source.partition.as_ref()) { return Ok(None); }
+    if !owners.admits(plan.owner_id.as_deref(), plan_fields.ordinary_source.partition.as_ref()) {
+        return Ok(None);
+    }
 
     anyhow::ensure!(
         plan_fields.dispatched.is_none(),
@@ -281,6 +284,7 @@ pub(super) async fn read(
     Ok(Some(BatchRoster {
         batch_id: batch.to_owned(),
         owner_id: Some(plan_fields.owner),
+        agent_partition: plan_fields.ordinary_source.partition,
         members: plan_fields
             .members
             .into_iter()

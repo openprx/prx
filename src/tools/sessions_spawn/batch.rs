@@ -24,6 +24,7 @@ pub(super) struct BatchMember {
 /// The membership of one fan-out.
 #[derive(Debug, Clone)]
 pub(super) struct BatchRoster {
+    pub(super) agent_partition: Option<crate::memory::AgentPartition>,
     pub(super) batch_id: String,
     /// The owner the batch was launched for (OWNER-VIS): `join` answers a
     /// batch only to a caller whose run scope admits this owner.
@@ -576,6 +577,9 @@ impl SessionsSpawnTool {
             rosters.push(BatchRoster {
                 batch_id: batch_id.clone(),
                 owner_id: batch_owner,
+                agent_partition: batch_caller
+                    .as_ref()
+                    .and_then(|caller| caller.context().envelope.agent_partition.clone()),
                 members: roster,
             });
         }
@@ -699,7 +703,7 @@ impl SessionsSpawnTool {
             let rosters = self.batch_rosters.read().await;
             rosters.iter().find(|roster| roster.batch_id == batch_id).map(|roster| {
                 (
-                    owner_scope.admits(roster.owner_id.as_deref(), None),
+                    owner_scope.admits(roster.owner_id.as_deref(), roster.agent_partition.as_ref()),
                     roster.members.clone(),
                 )
             })

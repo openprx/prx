@@ -8,9 +8,8 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 
-/// A `sessions_spawn` action a named agent cannot use (MA-01b5): its rows
-/// could not carry the agent's partition. A batch journal row has no session
-/// to stamp, and a live `prx chat` session belongs to the operator.
+/// Named agents cannot control the operator's live chat sessions.
+/// Batch journals and children retain the parent agent's partition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SpawnActionUnpartitioned;
 
