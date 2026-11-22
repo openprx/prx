@@ -165,6 +165,18 @@ fn scope_bounds(scope: &IngressRecoveryScope) -> anyhow::Result<()> {
 }
 
 /// Lazy migration: ordinary/off message writers never call this function.
+/// Begin the transaction [`schema`] runs in: `BEGIN IMMEDIATE`, because
+/// `schema` reads and then may write (the first use creates the tables; every
+/// use may add the scope column and the erasure triggers). A deferred
+/// transaction would take a read snapshot first and upgrade at the first
+/// write; on a WAL database, when another connection to the same file (the
+/// daemon opens several stores on `brain.db` at start) committed in between,
+/// that upgrade fails at once with `SQLITE_BUSY` without consulting the busy
+/// handler. Taking the write lock up front lets the busy handler wait instead.
+fn begin_schema_transaction(connection: &Connection) -> rusqlite::Result<Transaction<'_>> {
+    Transaction::new_unchecked(connection, rusqlite::TransactionBehavior::Immediate)
+}
+
 pub(super) fn schema(connection: &Connection) -> anyhow::Result<String> {
     let exists: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'ingress_recovery_schema')",
@@ -612,7 +624,7 @@ pub(super) async fn list(
     crate::runtime::blocking::spawn_blocking(move || {
         let mut connection = pool.write_until(deadline)?;
         let connection = ConnectionDeadline::new(&mut connection, deadline)?;
-        let transaction = connection.unchecked_transaction()?;
+        let transaction = begin_schema_transaction(&connection)?;
         let namespace = schema(&transaction)?;
         validate_owner(&transaction,&current,&scope.workspace_id,deadline)?;
         let other_state=match phase {crate::memory::ingress_recovery::IngressRecoveryScan::PendingOnly=>"pending",crate::memory::ingress_recovery::IngressRecoveryScan::IncludeUnconfirmed=>"unconfirmed"};
@@ -791,7 +803,7 @@ pub(super) use local::{acquire, validate_lease, validate_owner};
 mod local {
     use super::{
         Arc, AtomicIngressMutation, Connection, ConnectionDeadline, Context, IngressLifetime, Instant, MAX_ID_BYTES,
-        PathBuf, SqliteConnectionPool, SqliteMemory, deadline, remaining, schema,
+        PathBuf, SqliteConnectionPool, SqliteMemory, begin_schema_transaction, deadline, remaining, schema,
     };
     use crate::memory::ingress_recovery::IngressLockMissing;
     use fs2::FileExt;
@@ -1048,7 +1060,7 @@ mod local {
             let namespace = {
                 let mut connection = pool.write_until(deadline)?;
                 let connection = ConnectionDeadline::new(&mut connection, deadline)?;
-                let transaction = connection.unchecked_transaction()?;
+                let transaction = begin_schema_transaction(&connection)?;
                 let namespace = schema(&transaction)?;
                 remaining(deadline)?;
                 transaction.commit()?;
