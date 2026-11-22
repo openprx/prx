@@ -728,9 +728,7 @@ async fn service_refuses_a_dynamic_alias_that_shadows_a_listed_name() {
 /// registers still reaches its own implementation through the handler when
 /// an operator exposes it.
 ///
-/// `session_status` and `sessions_send` are off the list while the gateway
-/// does not register them; see
-/// `mcp_handler_refuses_session_tools_the_gateway_does_not_register_before_any_write`.
+/// The gateway also registers `session_status` and `sessions_send`.
 #[tokio::test]
 async fn mcp_handler_still_runs_every_isolation_aware_tool() {
     let workspace = TempDir::new().expect("test: temp workspace");
@@ -1449,53 +1447,6 @@ async fn mcp_handler_document_ingest_stays_in_the_callers_namespace() {
     assert_eq!(status, StatusCode::OK, "{refused}");
     assert_eq!(refused.pointer("/is_error"), Some(&Value::Bool(true)), "{refused}");
     assert!(!handler_text(&refused).contains("host-only secret"), "{refused}");
-}
-
-/// MCP-A follow-up (R-MCPA F-7): `session_status` and `sessions_send` are
-/// owner-aware in-process, but the gateway does not register them. While
-/// they were on the isolation-aware list an exposed entry was advertised,
-/// passed the isolation gate, wrote an identity binding for the caller and
-/// only then answered 404. Off the list, the call is refused with 403
-/// before any write.
-///
-/// MUTATION GUARD: put either name back on `OWNER_ISOLATION_AWARE_TOOLS`
-/// and this goes red (404, and a binding row).
-#[tokio::test]
-async fn mcp_handler_refuses_session_tools_the_gateway_does_not_register_before_any_write() {
-    let workspace = TempDir::new().expect("test: temp workspace");
-    let mut config = production_mcp_handler_config(workspace.path());
-    for name in ["session_status", "sessions_send"] {
-        config.mcp_server.exposed_tools.push(name.to_string());
-    }
-    let memory = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("test: sqlite memory"));
-    let (state, _owner) = production_mcp_app_state(&config, &memory);
-    let mallory_owner = handler_owner_id(&config, "mallory");
-
-    let mut answers = Vec::new();
-    for (name, arguments) in [
-        ("session_status", serde_json::json!({})),
-        (
-            "sessions_send",
-            serde_json::json!({"run_id": "missing", "message": "hello"}),
-        ),
-    ] {
-        answers.push((
-            name,
-            call_mcp_handler(&state, bearer_headers("mallory"), name, arguments).await,
-        ));
-    }
-    assert_eq!(
-        identity_binding_count(workspace.path(), &mallory_owner).as_deref(),
-        Some("0"),
-        "a refused call must not write an identity binding: {answers:?}"
-    );
-    for (name, (status, body)) in answers {
-        assert_eq!(status, StatusCode::FORBIDDEN, "{name}: {body}");
-        assert!(
-            body_str(&body, "/error").contains(OWNER_ISOLATION_REFUSAL),
-            "{name}: {body}"
-        );
-    }
 }
 
 /// Collects formatted `tracing` output for the warning-volume test below.

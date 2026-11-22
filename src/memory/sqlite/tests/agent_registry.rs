@@ -11,7 +11,7 @@ const SCOPE: &str = "00000000-0000-4000-8000-0000000000a1";
 const ERASE: &str = "00000000-0000-4000-8000-0000000000b1";
 const KEY: &str = "idempotency-key-0001";
 
-const STORES: [&str; 33] = [
+const STORES: [&str; 40] = [
     "conversation_turns",
     "message_events",
     "memories",
@@ -34,9 +34,6 @@ const STORES: [&str; 33] = [
     "chat_sessions",
     "chat_assignments",
     "chat_results",
-    "decisions",
-    "outcomes",
-    "child_outcomes",
     "engine_outcomes",
     "access_audit_log",
     "approval_grants",
@@ -45,6 +42,16 @@ const STORES: [&str; 33] = [
     "ingress_recovery",
     "recovery_attestations",
     "ramflux_blobs",
+    "prx_mailbox_messages",
+    "prx_mailbox_receipts",
+    "prx_mailbox_outbox",
+    "prx_mailbox_parents",
+    "prx_mailbox_seq",
+    "child_sessions",
+    "engine_analyses",
+    "memory_write_log",
+    "rf_message_attempts",
+    "prx_remote_trees",
 ];
 
 fn open(dir: &TempDir) -> (SqliteMemory, Connection) {
@@ -152,7 +159,11 @@ fn registry_rejects_unknown_enum() {
         )
         .unwrap();
     }
-    assert_eq!(count(&conn, "SELECT count(*) FROM agent_erase_manifest"), 33);
+    assert_eq!(
+        count(&conn, "SELECT count(*) FROM agent_erase_manifest"),
+        40,
+        "every current manifest store must remain accepted"
+    );
 
     let long = "x".repeat(4097);
     let long_o = "x".repeat(513);
@@ -260,7 +271,7 @@ fn registry_rejects_unknown_enum() {
     cases.push(("key control byte", key("idempotency-key-\u{7f}x", REV, O)));
     cases.push(("key hash", key("idempotency-key-0002", "abc", O)));
     cases.push(("key owner mismatch", key("idempotency-key-0003", REV, "other")));
-    cases.push(("manifest store", manifest("bogus", "{}".into(), None)));
+    cases.push(("manifest store", manifest("decisions", "{}".into(), None)));
     cases.push(("manifest record too long", manifest("memories", "x".repeat(1025), None)));
     cases.push(("manifest fts zero", manifest("memories", "{\"a\":1}".into(), Some(0))));
     let purge = |key: &str, id: &str, state: &str, after: Option<&str>| {

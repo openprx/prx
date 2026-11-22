@@ -1186,6 +1186,29 @@
         }
       }
     },
+    "AgentLimits": {
+      "description": "Optional admission limits for rf-started turns of a named agent.",
+      "type": "object",
+      "properties": {
+        "max_concurrent_turns": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_cost_per_day_cents": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
     "AuditConfig": {
       "description": "Audit logging configuration",
       "type": "object",
@@ -2182,6 +2205,13 @@
             "null"
           ],
           "default": null
+        },
+        "limits": {
+          "$ref": "#/$defs/AgentLimits",
+          "default": {
+            "max_concurrent_turns": null,
+            "max_cost_per_day_cents": null
+          }
         },
         "max_depth": {
           "description": "Max recursion depth for nested delegation",
