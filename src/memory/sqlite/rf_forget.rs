@@ -6,7 +6,8 @@
 //! with `run_id = R`. Only rows of the answering agent's partition count;
 //! unstamped rows belong to Main. Every target of the family (one memory or
 //! document, deduplicated) is deleted with its derived copies: embedding-cache
-//! entries, trash copies, links, drafts and `memory_events` rows. A target
+//! entries, trash copies, links, drafts, `memory_events` rows and the topic a
+//! memory's text created once nothing else references it. A target
 //! already gone is not counted. The family's log rows stay (content-free) and
 //! get `forgotten_at`; the attempt row records the request and the counts, so
 //! a replay answers the first execution's counts and a late write of the run
@@ -305,14 +306,14 @@ fn evict_embeddings(tx: &Connection, scope: Option<&str>, text: &str) -> anyhow:
 /// Delete one memory by its stable id with its derived copies; `false` when
 /// it is already gone.
 fn delete_memory(tx: &Connection, memory_id: &str) -> anyhow::Result<bool> {
-    let row: Option<(String, String, Option<String>)> = tx
+    let row: Option<(String, String, Option<String>, Option<String>)> = tx
         .query_row(
-            "SELECT key, content, ma_scope_id FROM memories WHERE id = ?1",
+            "SELECT key, content, ma_scope_id, topic_id FROM memories WHERE id = ?1",
             params![memory_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
-    let Some((key, content, scope)) = row else {
+    let Some((key, content, scope, topic_id)) = row else {
         return Ok(false);
     };
     evict_embeddings(tx, scope.as_deref(), &content)?;
@@ -328,7 +329,38 @@ fn delete_memory(tx: &Connection, memory_id: &str) -> anyhow::Result<bool> {
         "DELETE FROM memory_events WHERE subject_table = 'memories' AND subject_id IN (?1, ?2)",
         params![memory_id, key],
     )?;
-    Ok(tx.execute("DELETE FROM memories WHERE id = ?1", params![memory_id])? > 0)
+    let deleted = tx.execute("DELETE FROM memories WHERE id = ?1", params![memory_id])? > 0;
+    if let Some(topic_id) = topic_id {
+        delete_orphan_topic(tx, &topic_id)?;
+    }
+    Ok(deleted)
+}
+
+/// A memory write derives a topic from the memory's text (its title is a
+/// prefix of the content). Once nothing references the topic any more, it
+/// goes with the memory, with its participants and aliases.
+fn delete_orphan_topic(tx: &Connection, topic_id: &str) -> anyhow::Result<()> {
+    let referenced: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM memories WHERE topic_id = ?1)
+             OR EXISTS(SELECT 1 FROM documents WHERE topic_id = ?1)
+             OR EXISTS(SELECT 1 FROM document_chunks WHERE topic_id = ?1)
+             OR EXISTS(SELECT 1 FROM topic_aliases WHERE to_topic_id = ?1)",
+        params![topic_id],
+        |row| row.get(0),
+    )?;
+    if referenced {
+        return Ok(());
+    }
+    for statement in [
+        "DELETE FROM topic_participants WHERE topic_id = ?1",
+        "DELETE FROM topic_aliases WHERE from_topic_id = ?1",
+    ] {
+        tx.execute(statement, params![topic_id])?;
+    }
+    if tx.execute("DELETE FROM topics WHERE id = ?1", params![topic_id])? > 0 {
+        tx.execute("INSERT INTO topics_fts(topics_fts) VALUES('rebuild')", [])?;
+    }
+    Ok(())
 }
 
 /// Delete one document with its chunks and derived copies; `false` when it
