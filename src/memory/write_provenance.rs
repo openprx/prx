@@ -11,6 +11,19 @@ use super::Memory;
 use std::future::Future;
 use std::sync::Arc;
 
+/// A write refused because its run family was forgotten by a message delete
+/// (`message_forget_writes_v1`); the write's transaction rolled back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "run_forgotten: the message of this run was deleted with its writes; the run can no longer write memory or documents"
+)]
+pub struct RunForgotten;
+
+impl RunForgotten {
+    /// The closed error code.
+    pub const CODE: &'static str = "run_forgotten";
+}
+
 /// The run (and, inside a tool call, the call) a write belongs to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteProvenance {

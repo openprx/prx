@@ -108,6 +108,79 @@ pub struct RfMessageDelete {
     /// Runs whose job has not ended in this process: their stored rows are
     /// tombstoned when the job ends (see [`RfDeletedAgent::deferred`]).
     pub live_runs: Vec<String>,
+    /// Also forget the memories and documents the deleted runs (and their
+    /// descendants) wrote (`message_forget_writes_v1`).
+    pub forget_writes: bool,
+}
+
+/// How many targets one forget deleted, by table and by whether the run
+/// family created them (`created`) or only updated them (`touched`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RfForgetCounts {
+    pub memories_created: i64,
+    pub memories_touched: i64,
+    pub documents_created: i64,
+    pub documents_touched: i64,
+}
+
+impl RfForgetCounts {
+    /// The per-table sums of two counts.
+    #[must_use]
+    pub const fn plus(self, other: Self) -> Self {
+        Self {
+            memories_created: self.memories_created.saturating_add(other.memories_created),
+            memories_touched: self.memories_touched.saturating_add(other.memories_touched),
+            documents_created: self.documents_created.saturating_add(other.documents_created),
+            documents_touched: self.documents_touched.saturating_add(other.documents_touched),
+        }
+    }
+}
+
+/// The forget part of one agent's (or one reply's) delete answer, present
+/// only when the request asked to forget writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RfForget {
+    /// The counts deleted (or recorded at the first execution); `None` while
+    /// a run of the delete is still live and its forget waits for settle.
+    pub counts: Option<RfForgetCounts>,
+    /// `false` when a deleted run started before this store recorded write
+    /// provenance, so its writes cannot all be attributed.
+    pub writes_traceable: bool,
+}
+
+impl RfForget {
+    /// The answer of an agent with several attempts: summed counts, pending
+    /// when any attempt is pending, traceable only when every attempt is.
+    #[must_use]
+    pub fn merge(self, other: Self) -> Self {
+        Self {
+            counts: self.counts.zip(other.counts).map(|(left, right)| left.plus(right)),
+            writes_traceable: self.writes_traceable && other.writes_traceable,
+        }
+    }
+}
+
+/// A forget the store refused; nothing of the delete was written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RfForgetRefused {
+    /// The run family has more write-log rows than one delete forgets.
+    #[error("forget_family_too_large: the deleted run family wrote more than one delete can forget")]
+    FamilyTooLarge,
+}
+
+impl RfForgetRefused {
+    /// The closed wire code.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::FamilyTooLarge => "forget_family_too_large",
+        }
+    }
+
+    /// The refusal anywhere in the error chain.
+    pub fn of(error: &anyhow::Error) -> Option<Self> {
+        error.chain().find_map(|cause| cause.downcast_ref::<Self>().copied())
+    }
 }
 
 /// What one delete did for one agent key.
@@ -122,14 +195,17 @@ pub struct RfDeletedAgent {
     pub jobs: Vec<String>,
     /// Runs still live here: their message rows wait for the job's end.
     pub deferred: Vec<String>,
+    /// The forget answer; `None` when the request did not ask to forget.
+    pub forget: Option<RfForget>,
 }
 
 /// The outcome of a reply delete by run id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RfReplyDelete {
     /// The assistant side is deleted (now or by an earlier delete); the
-    /// run's job, whose in-memory result is erased.
-    Deleted { job_id: String },
+    /// run's job, whose in-memory result is erased, and the forget answer
+    /// when the request asked to forget.
+    Deleted { job_id: String, forget: Option<RfForget> },
     /// No attempt of this owner's session has this run.
     Unknown,
     /// The run has no terminal yet.

@@ -138,6 +138,12 @@ impl SqliteMailbox {
             )
             .map_err(storage_error)?;
         }
+        // The content-free write log names targets and runs of this scope.
+        tx.execute(
+            "DELETE FROM memory_write_log WHERE agent_partition=?1",
+            [scope.scope_id.to_string()],
+        )
+        .map_err(storage_error)?;
         let remaining = verify_coverage(&tx, scope)?;
         tx.commit().map_err(storage_error)?;
         if remaining != 0 {

@@ -44,8 +44,8 @@ pub use none::NoneMemory;
 pub use postgres::PostgresMemory;
 pub use principal::MemoryWriteContext;
 pub use rf_messages::{
-    RfAdmission, RfAdmissionRefused, RfAttempt, RfAttemptLookup, RfDeletedAgent, RfHistoryTurn, RfMessageDelete,
-    RfMessageKey, RfReplyDelete, RfRun, RfRunTerminal,
+    RfAdmission, RfAdmissionRefused, RfAttempt, RfAttemptLookup, RfDeletedAgent, RfForget, RfForgetCounts,
+    RfForgetRefused, RfHistoryTurn, RfMessageDelete, RfMessageKey, RfReplyDelete, RfRun, RfRunTerminal,
 };
 pub use router_history::{
     RouterHistoryCommitReceipt, RouterHistoryDomain, RouterHistoryRead, RouterHistoryReadEvidence, RouterHistoryRow,

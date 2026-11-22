@@ -9,13 +9,17 @@
 //! tombstoned at once, the job's in-memory result is erased now and when it
 //! finishes, and [`settle_deleted`] rewrites the event rows after the job's
 //! terminal phase. Nothing is cancelled and what tools did is not undone.
+//!
+//! With `"forget_writes": true` (`message_forget_writes_v1`) the same
+//! transaction also deletes the memories and documents the deleted runs and
+//! their descendants wrote, and each answer reports what was forgotten.
 
 use super::super::ApiPrincipal;
 use super::super::capabilities::{coded_error, rf_session_refusal};
 use super::rf_message::{is_message_id, require_session_owner, runs_in_flight};
 use super::target::{AgentField, TurnTarget};
 use crate::gateway::{AppState, jobs};
-use crate::memory::{RfDeletedAgent, RfMessageDelete, RfReplyDelete};
+use crate::memory::{RfDeletedAgent, RfForget, RfForgetCounts, RfForgetRefused, RfMessageDelete, RfReplyDelete};
 use axum::{
     Json,
     body::{Bytes, to_bytes},
@@ -32,6 +36,7 @@ const BODY_MAX_BYTES: usize = 64 * 1024;
 
 const AGENT_RULE: &str = "agent must be \"main\" or an agent name";
 const BODY_RULE: &str = "the body must be {\"agent\"?} with agent a string";
+const REPLY_BODY_RULE: &str = "forget_writes must be a boolean";
 const BATCH_RULE: &str = "the body must be {\"ids\":[1 to 100 client_message_id strings],\"agent\"?}";
 
 fn field_invalid(message: &str) -> Response {
@@ -49,6 +54,8 @@ const MESSAGE_UNKNOWN: &str = "this session has no record of this message for th
 struct DeleteBody {
     #[serde(default, deserialize_with = "super::present_value")]
     agent: Option<serde_json::Value>,
+    #[serde(default)]
+    forget_writes: bool,
 }
 
 #[derive(Deserialize)]
@@ -57,13 +64,98 @@ struct BatchBody {
     ids: Vec<String>,
     #[serde(default, deserialize_with = "super::present_value")]
     agent: Option<serde_json::Value>,
+    #[serde(default)]
+    forget_writes: bool,
 }
 
 #[derive(Serialize)]
 struct DeletedAgent {
     agent: String,
     runs: Vec<String>,
+    /// Present only when the request asked to forget writes.
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    forget: Option<WireForget>,
 }
+
+#[derive(Serialize)]
+struct WireCounts {
+    created: i64,
+    touched: i64,
+}
+
+#[derive(Serialize)]
+struct WireForgotten {
+    memories: WireCounts,
+    documents: WireCounts,
+}
+
+/// `forgotten` is `null` while a live run's forget waits for its end;
+/// `forget_pending` appears only then.
+#[derive(Serialize)]
+struct WireForget {
+    forgotten: Option<WireForgotten>,
+    writes_traceable: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    forget_pending: bool,
+}
+
+impl From<RfForget> for WireForget {
+    fn from(forget: RfForget) -> Self {
+        Self {
+            forgotten: forget.counts.map(|counts: RfForgetCounts| WireForgotten {
+                memories: WireCounts {
+                    created: counts.memories_created,
+                    touched: counts.memories_touched,
+                },
+                documents: WireCounts {
+                    created: counts.documents_created,
+                    touched: counts.documents_touched,
+                },
+            }),
+            writes_traceable: forget.writes_traceable,
+            forget_pending: forget.counts.is_none(),
+        }
+    }
+}
+
+/// A failed delete: the route's coded error.
+#[derive(Debug, Clone, Copy)]
+enum DeleteFailure {
+    Storage,
+    FamilyTooLarge,
+}
+
+impl DeleteFailure {
+    fn of(error: &anyhow::Error) -> Self {
+        match RfForgetRefused::of(error) {
+            Some(RfForgetRefused::FamilyTooLarge) => Self::FamilyTooLarge,
+            None => Self::Storage,
+        }
+    }
+
+    const fn code(self) -> &'static str {
+        match self {
+            Self::Storage => "storage_unavailable",
+            Self::FamilyTooLarge => RfForgetRefused::FamilyTooLarge.code(),
+        }
+    }
+
+    const fn message(self) -> &'static str {
+        match self {
+            Self::Storage => "the message could not be deleted",
+            Self::FamilyTooLarge => FAMILY_TOO_LARGE,
+        }
+    }
+
+    fn response(self) -> Response {
+        match self {
+            Self::Storage => storage_unavailable(self.message()),
+            Self::FamilyTooLarge => coded_error(StatusCode::UNPROCESSABLE_ENTITY, self.code(), self.message()),
+        }
+    }
+}
+
+const FAMILY_TOO_LARGE: &str = "the deleted run family wrote more than one delete can forget; nothing was deleted";
 
 #[derive(Serialize)]
 struct Deleted<'a> {
@@ -148,7 +240,8 @@ async fn delete_one(
     scope: &Scope,
     client_message_id: &str,
     agent: Option<&str>,
-) -> Result<Option<Vec<DeletedAgent>>, Box<Response>> {
+    forget_writes: bool,
+) -> Result<Option<Vec<DeletedAgent>>, DeleteFailure> {
     if !is_message_id(client_message_id) {
         return Ok(None);
     }
@@ -159,13 +252,14 @@ async fn delete_one(
         client_message_id: client_message_id.to_owned(),
         agent_key: agent.map(str::to_owned),
         live_runs: runs_in_flight(&scope.workspace_id),
+        forget_writes,
     };
     let agents = state.mem.rf_delete_message(request).await.map_err(|error| {
         tracing::warn!(
             error_kind = super::console_error_kind(&error),
             "rf message delete failed"
         );
-        Box::new(storage_unavailable("the message could not be deleted"))
+        DeleteFailure::of(&error)
     })?;
     if agents.is_empty() {
         return Ok(None);
@@ -188,6 +282,7 @@ fn wire_agent(agent: RfDeletedAgent) -> DeletedAgent {
     DeletedAgent {
         agent: agent.agent_key,
         runs: agent.runs,
+        forget: agent.forget.map(WireForget::from),
     }
 }
 
@@ -228,11 +323,11 @@ pub(in crate::gateway::api) async fn post_message_delete(
         Ok(admitted) => admitted,
         Err(response) => return *response,
     };
-    let agent = if body.iter().all(u8::is_ascii_whitespace) {
-        None
+    let (agent, forget_writes) = if body.iter().all(u8::is_ascii_whitespace) {
+        (None, false)
     } else {
         match serde_json::from_slice::<DeleteBody>(&body) {
-            Ok(body) => body.agent,
+            Ok(body) => (body.agent, body.forget_writes),
             Err(_) => return field_invalid(BODY_RULE),
         }
     };
@@ -240,7 +335,7 @@ pub(in crate::gateway::api) async fn post_message_delete(
         Ok(agent) => agent,
         Err(response) => return *response,
     };
-    match delete_one(&state, &scope, &client_message_id, agent.as_deref()).await {
+    match delete_one(&state, &scope, &client_message_id, agent.as_deref(), forget_writes).await {
         Ok(Some(agents)) => Json(Deleted {
             message_id: &client_message_id,
             status: "deleted",
@@ -248,7 +343,7 @@ pub(in crate::gateway::api) async fn post_message_delete(
         })
         .into_response(),
         Ok(None) => coded_error(StatusCode::NOT_FOUND, "message_unknown", MESSAGE_UNKNOWN),
-        Err(response) => *response,
+        Err(failure) => failure.response(),
     }
 }
 
@@ -276,27 +371,29 @@ pub(in crate::gateway::api) async fn post_batch_delete(
     };
     let mut results = Vec::with_capacity(batch.ids.len());
     for id in &batch.ids {
-        results.push(match delete_one(&state, &scope, id, agent.as_deref()).await {
-            Ok(Some(agents)) => BatchItem::Deleted(Deleted {
-                message_id: id,
-                status: "deleted",
-                agents,
-            }),
-            Ok(None) => BatchItem::Refused {
-                message_id: id,
-                error: ItemError {
-                    code: "message_unknown",
-                    message: MESSAGE_UNKNOWN,
+        results.push(
+            match delete_one(&state, &scope, id, agent.as_deref(), batch.forget_writes).await {
+                Ok(Some(agents)) => BatchItem::Deleted(Deleted {
+                    message_id: id,
+                    status: "deleted",
+                    agents,
+                }),
+                Ok(None) => BatchItem::Refused {
+                    message_id: id,
+                    error: ItemError {
+                        code: "message_unknown",
+                        message: MESSAGE_UNKNOWN,
+                    },
+                },
+                Err(failure) => BatchItem::Refused {
+                    message_id: id,
+                    error: ItemError {
+                        code: failure.code(),
+                        message: failure.message(),
+                    },
                 },
             },
-            Err(_) => BatchItem::Refused {
-                message_id: id,
-                error: ItemError {
-                    code: "storage_unavailable",
-                    message: "the message could not be deleted",
-                },
-            },
-        });
+        );
     }
     Json(serde_json::json!({ "results": results })).into_response()
 }
@@ -310,8 +407,12 @@ pub(in crate::gateway::api) async fn post_reply_delete(
     Path((session_id, run_id)): Path<(String, String)>,
     request: Request,
 ) -> Response {
-    let (scope, _) = match admit(&state, session_id, request).await {
+    let (scope, body) = match admit(&state, session_id, request).await {
         Ok(admitted) => admitted,
+        Err(response) => return *response,
+    };
+    let forget_writes = match reply_forget_writes(&body) {
+        Ok(forget_writes) => forget_writes,
         Err(response) => return *response,
     };
     if runs_in_flight(&scope.workspace_id).contains(&run_id) {
@@ -319,12 +420,23 @@ pub(in crate::gateway::api) async fn post_reply_delete(
     }
     match state
         .mem
-        .rf_delete_reply(&scope.workspace_id, &scope.owner_id, &scope.session_key, &run_id)
+        .rf_delete_reply(
+            &scope.workspace_id,
+            &scope.owner_id,
+            &scope.session_key,
+            &run_id,
+            forget_writes,
+        )
         .await
     {
-        Ok(RfReplyDelete::Deleted { job_id }) => {
+        Ok(RfReplyDelete::Deleted { job_id, forget }) => {
             erase_jobs(std::iter::once(&job_id));
-            Json(serde_json::json!({ "run_id": run_id, "status": "deleted" })).into_response()
+            Json(DeletedReply {
+                run_id: &run_id,
+                status: "deleted",
+                forget: forget.map(WireForget::from),
+            })
+            .into_response()
         }
         Ok(RfReplyDelete::Active) => run_active(),
         Ok(RfReplyDelete::Unknown) => coded_error(
@@ -334,8 +446,38 @@ pub(in crate::gateway::api) async fn post_reply_delete(
         ),
         Err(error) => {
             tracing::warn!(error_kind = super::console_error_kind(&error), "rf reply delete failed");
-            storage_unavailable("the reply could not be deleted")
+            match DeleteFailure::of(&error) {
+                DeleteFailure::Storage => storage_unavailable("the reply could not be deleted"),
+                failure @ DeleteFailure::FamilyTooLarge => failure.response(),
+            }
         }
+    }
+}
+
+/// The reply delete's answer; the forget fields sit beside `run_id` (the
+/// reply of one run is one agent's entry).
+#[derive(Serialize)]
+struct DeletedReply<'a> {
+    run_id: &'a str,
+    status: &'static str,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    forget: Option<WireForget>,
+}
+
+/// `forget_writes` of a reply delete body. The route took no body before, so
+/// anything but an object naming `forget_writes` is ignored as it was; a
+/// non-boolean `forget_writes` is `400 field_invalid`.
+fn reply_forget_writes(body: &[u8]) -> Result<bool, Box<Response>> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(false);
+    }
+    let Ok(serde_json::Value::Object(fields)) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return Ok(false);
+    };
+    match fields.get("forget_writes") {
+        None => Ok(false),
+        Some(serde_json::Value::Bool(forget_writes)) => Ok(*forget_writes),
+        Some(_) => Err(Box::new(field_invalid(REPLY_BODY_RULE))),
     }
 }
 

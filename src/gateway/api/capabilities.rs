@@ -36,13 +36,14 @@ use std::borrow::Cow;
 
 /// The tokens effective in this running daemon, sorted ascending. A token is
 /// listed only when its whole earliest usable form is on main.
-const CAPABILITY_TOKENS: [&str; 10] = [
+const CAPABILITY_TOKENS: [&str; 11] = [
     "agent_catalog_v1",
     "agent_crud_v1",
     "agent_main_readback_v1",
     "capabilities_v1",
     "message_context_delivery_v1",
     "message_delete_v1",
+    "message_forget_writes_v1",
     "message_idempotency_v1",
     "message_target_v1",
     "owner_id_stable_v1",

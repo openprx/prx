@@ -1129,6 +1129,7 @@ impl SqliteMemory {
         super::rf_messages::init_schema(conn)?;
         super::rf_delete::init_schema(conn)?;
         super::write_log::init_schema(conn)?;
+        super::rf_forget::init_schema(conn)?;
         let unattributed: u64 = super::agent_migration::migrate_legacy_console(conn)?;
         if unattributed > 0 {
             tracing::warn!(unattributed, "legacy console rows left without an agent scope");
@@ -1527,6 +1528,11 @@ impl SqliteMemory {
                 28,
                 "memory_write_log",
                 "memory_write_log(id,root_run_id,run_id,parent_run_id,operation_id,target_kind CHECK(memory,document),target_id,op CHECK(insert,update),agent_partition,created_at) STRICT + indexes root_run_id, run_id, (target_kind,target_id); applied_at of this version is the instant write provenance starts",
+            ),
+            (
+                29,
+                "forget_writes",
+                "rf_message_attempts + forget_requested CHECK(0,1),forgot_memories_created,forgot_memories_touched,forgot_documents_created,forgot_documents_touched + partial index rf_message_attempts_forgotten_run(run_id) WHERE forget_requested=1; memory_write_log + forgotten_at",
             ),
         ]
     }

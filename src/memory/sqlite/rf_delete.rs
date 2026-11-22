@@ -22,8 +22,10 @@
 //! job has ended.
 
 use super::SqliteMemory;
-use crate::memory::rf_messages::{RfDeletedAgent, RfMessageDelete, RfReplyDelete};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use super::rf_forget::{self, ForgetState, Partition};
+use crate::memory::rf_messages::{RfDeletedAgent, RfForget, RfForgetCounts, RfMessageDelete, RfReplyDelete};
+use crate::runtime::sqlite_pool::begin_immediate;
+use rusqlite::{Connection, OptionalExtension, params};
 
 /// Idempotent DDL, run after the attempt table exists.
 pub(super) fn init_schema(conn: &Connection) -> anyhow::Result<()> {
@@ -82,6 +84,32 @@ struct Attempt {
     job_id: Option<String>,
     input_event_id: String,
     scope: Option<String>,
+    forget: ForgetState,
+}
+
+impl Attempt {
+    /// The columns [`Attempt::from_row`] reads, in its order.
+    const COLUMNS: &'static str = "agent_key, run_id, job_id, message_event_id, ma_scope_id, forget_requested,
+         forgot_memories_created, forgot_memories_touched, forgot_documents_created, forgot_documents_touched";
+
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            agent_key: row.get(0)?,
+            run_id: row.get(1)?,
+            job_id: row.get(2)?,
+            input_event_id: row.get(3)?,
+            scope: row.get(4)?,
+            forget: rf_forget::state_at(row, 5)?,
+        })
+    }
+
+    /// The partition the attempt's forget acts in.
+    fn partition(&self) -> Partition<'_> {
+        Partition {
+            scope: self.scope.as_deref(),
+            main: self.agent_key == "main",
+        }
+    }
 }
 
 /// The identity every statement of one delete shares.
@@ -102,14 +130,15 @@ pub(super) fn delete_message(conn: &Connection, request: &RfMessageDelete) -> an
         session_key: &request.session_key,
         now: &now,
     };
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let tx = begin_immediate(conn)?;
     let attempts = {
-        let mut statement = tx.prepare(
-            "SELECT agent_key, run_id, job_id, message_event_id, ma_scope_id FROM rf_message_attempts
+        let mut statement = tx.prepare(&format!(
+            "SELECT {} FROM rf_message_attempts
              WHERE workspace_id = ?1 AND owner_id = ?2 AND session_key = ?3 AND client_message_id = ?4
                AND (?5 IS NULL OR agent_key = ?5)
              ORDER BY rowid",
-        )?;
+            Attempt::COLUMNS
+        ))?;
         statement
             .query_map(
                 params![
@@ -119,15 +148,7 @@ pub(super) fn delete_message(conn: &Connection, request: &RfMessageDelete) -> an
                     request.client_message_id,
                     request.agent_key
                 ],
-                |row| {
-                    Ok(Attempt {
-                        agent_key: row.get(0)?,
-                        run_id: row.get(1)?,
-                        job_id: row.get(2)?,
-                        input_event_id: row.get(3)?,
-                        scope: row.get(4)?,
-                    })
-                },
+                Attempt::from_row,
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
@@ -153,6 +174,13 @@ pub(super) fn delete_message(conn: &Connection, request: &RfMessageDelete) -> an
             .run_id
             .as_ref()
             .is_some_and(|run| request.live_runs.contains(run));
+        // Before the erase, so a memory the erase would remove by its source
+        // event is counted as forgotten.
+        let forget = if request.forget_writes {
+            Some(forget_attempt(&tx, &target, attempt, live)?)
+        } else {
+            None
+        };
         if live {
             let mut ids = run_event_ids(&tx, &target, attempt.run_id.as_deref())?;
             ids.push(attempt.input_event_id.clone());
@@ -171,6 +199,7 @@ pub(super) fn delete_message(conn: &Connection, request: &RfMessageDelete) -> an
                 runs: Vec::new(),
                 jobs: Vec::new(),
                 deferred: Vec::new(),
+                forget: None,
             });
         }
         if let Some(agent) = agents.iter_mut().find(|agent| agent.agent_key == attempt.agent_key) {
@@ -178,6 +207,9 @@ pub(super) fn delete_message(conn: &Connection, request: &RfMessageDelete) -> an
             agent.jobs.extend(attempt.job_id.iter().cloned());
             if live {
                 agent.deferred.extend(attempt.run_id.iter().cloned());
+            }
+            if let Some(forget) = forget {
+                agent.forget = Some(agent.forget.map_or(forget, |earlier| earlier.merge(forget)));
             }
         }
     }
@@ -194,6 +226,7 @@ pub(super) fn delete_reply(
     owner_id: &str,
     session_key: &str,
     run_id: &str,
+    forget_writes: bool,
 ) -> anyhow::Result<RfReplyDelete> {
     let now = chrono::Utc::now().to_rfc3339();
     let target = Target {
@@ -202,11 +235,13 @@ pub(super) fn delete_reply(
         session_key,
         now: &now,
     };
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let tx = begin_immediate(conn)?;
     let row = tx
         .query_row(
             "SELECT agent_key, client_message_id, job_id, message_event_id, ma_scope_id, interrupted,
-                    deleted_at IS NOT NULL OR reply_deleted_at IS NOT NULL
+                    deleted_at IS NOT NULL OR reply_deleted_at IS NOT NULL, forget_requested,
+                    forgot_memories_created, forgot_memories_touched, forgot_documents_created,
+                    forgot_documents_touched
              FROM rf_message_attempts
              WHERE workspace_id = ?1 AND owner_id = ?2 AND session_key = ?3 AND run_id = ?4",
             params![workspace_id, owner_id, session_key, run_id],
@@ -218,6 +253,7 @@ pub(super) fn delete_reply(
                         job_id: row.get(2)?,
                         input_event_id: row.get(3)?,
                         scope: row.get(4)?,
+                        forget: rf_forget::state_at(row, 7)?,
                     },
                     row.get::<_, String>(1)?,
                     row.get::<_, bool>(5)?,
@@ -231,11 +267,29 @@ pub(super) fn delete_reply(
     };
     let job_id = attempt.job_id.clone().unwrap_or_default();
     if deleted {
-        return Ok(RfReplyDelete::Deleted { job_id });
+        if !forget_writes {
+            return Ok(RfReplyDelete::Deleted { job_id, forget: None });
+        }
+        // A replay answers the recorded counts; a first forget on an
+        // already deleted run runs now (its log rows are still there).
+        let forget = forget_attempt(&tx, &target, &attempt, false)?;
+        if attempt.forget.recorded.is_none() {
+            mark_scrub(&tx, &now)?;
+        }
+        tx.commit()?;
+        return Ok(RfReplyDelete::Deleted {
+            job_id,
+            forget: Some(forget),
+        });
     }
     if !interrupted && !super::rf_messages::has_terminal(&tx, workspace_id, owner_id, run_id)? {
         return Ok(RfReplyDelete::Active);
     }
+    let forget = if forget_writes {
+        Some(forget_attempt(&tx, &target, &attempt, false)?)
+    } else {
+        None
+    };
     tx.execute(
         "UPDATE rf_message_attempts SET reply_deleted_at = ?3 WHERE workspace_id = ?1 AND run_id = ?2",
         params![workspace_id, run_id, now],
@@ -245,7 +299,7 @@ pub(super) fn delete_reply(
     refresh_preview(&tx, session_key)?;
     mark_scrub(&tx, &now)?;
     tx.commit()?;
-    Ok(RfReplyDelete::Deleted { job_id })
+    Ok(RfReplyDelete::Deleted { job_id, forget })
 }
 
 /// Rewrite the event rows of every deleted run of the session whose job is
@@ -273,22 +327,15 @@ pub(super) fn settle(
     if !any {
         return Ok(());
     }
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let tx = begin_immediate(conn)?;
     let pending = {
-        let mut statement = tx.prepare(
-            "SELECT agent_key, run_id, job_id, message_event_id, ma_scope_id FROM rf_message_attempts
+        let mut statement = tx.prepare(&format!(
+            "SELECT {} FROM rf_message_attempts
              WHERE workspace_id = ?1 AND owner_id = ?2 AND session_key = ?3 AND erase_pending = 1",
-        )?;
+            Attempt::COLUMNS
+        ))?;
         statement
-            .query_map(params![workspace_id, owner_id, session_key], |row| {
-                Ok(Attempt {
-                    agent_key: row.get(0)?,
-                    run_id: row.get(1)?,
-                    job_id: row.get(2)?,
-                    input_event_id: row.get(3)?,
-                    scope: row.get(4)?,
-                })
-            })?
+            .query_map(params![workspace_id, owner_id, session_key], Attempt::from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
     let mut settled = false;
@@ -296,6 +343,10 @@ pub(super) fn settle(
         .iter()
         .filter(|attempt| attempt.run_id.as_ref().is_none_or(|run| !live_runs.contains(run)))
     {
+        // A forget asked while the run was live runs now, before the erase.
+        if attempt.forget.requested && attempt.forget.recorded.is_none() {
+            forget_now(&tx, &target, attempt)?;
+        }
         erase(&tx, &target, Side::Message, attempt)?;
         tx.execute(
             "UPDATE rf_message_attempts SET erase_pending = 0 WHERE workspace_id = ?1 AND message_event_id = ?2",
@@ -309,6 +360,40 @@ pub(super) fn settle(
         tx.commit()?;
     }
     Ok(())
+}
+
+/// The forget answer of one attempt: the recorded counts on a replay, a
+/// pending forget (settled with the run) for a live run, else the forget
+/// executed now and recorded.
+fn forget_attempt(tx: &Connection, target: &Target<'_>, attempt: &Attempt, live: bool) -> anyhow::Result<RfForget> {
+    let writes_traceable = rf_forget::writes_traceable(
+        tx,
+        target.workspace_id,
+        &attempt.input_event_id,
+        attempt.run_id.as_deref(),
+    )?;
+    let counts = if let Some(recorded) = attempt.forget.recorded {
+        Some(recorded)
+    } else if live {
+        rf_forget::request(tx, target.workspace_id, &attempt.input_event_id)?;
+        None
+    } else {
+        Some(forget_now(tx, target, attempt)?)
+    };
+    Ok(RfForget {
+        counts,
+        writes_traceable,
+    })
+}
+
+/// Forget the writes of the attempt's run family now and record the counts.
+fn forget_now(tx: &Connection, target: &Target<'_>, attempt: &Attempt) -> anyhow::Result<RfForgetCounts> {
+    let counts = match attempt.run_id.as_deref() {
+        Some(run_id) => rf_forget::forget_family(tx, run_id, attempt.partition(), target.now)?,
+        None => RfForgetCounts::default(),
+    };
+    rf_forget::record(tx, target.workspace_id, &attempt.input_event_id, counts)?;
+    Ok(counts)
 }
 
 /// The event ids of a run's rows.
@@ -401,8 +486,14 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
             target.now
         ],
     )?;
+    let direct = serde_json::to_string(&rows.iter().map(|row| row.event_id.as_str()).collect::<Vec<_>>())?;
+    let contents = rows
+        .iter()
+        .filter(|row| row.conversational && !row.content.is_empty())
+        .map(|row| row.content.as_str())
+        .collect::<Vec<_>>();
+    rf_forget::erase_context_pages(tx, target.session_key, attempt.partition(), &direct, &contents)?;
     let mut ids = rows.into_iter().map(|row| row.event_id).collect::<Vec<_>>();
-    let direct = serde_json::to_string(&ids)?;
     let mut forgotten = tx.execute(
         "DELETE FROM memories WHERE source_event_id IN (SELECT value FROM json_each(?1))",
         params![direct],

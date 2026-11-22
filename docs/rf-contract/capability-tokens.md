@@ -420,10 +420,40 @@ soon as the run's job has ended). A reply delete of a running run is
 **Not undone.** What tools already did is not undone: files written,
 commands run and messages sent elsewhere stay.
 
-**Memories and documents are not forgotten.** Memories and documents an
-agent stored with its tools during a deleted run stay: PRX does not record
-which run wrote them, so there is no `forget_writes` option yet. Erasing a
-message does not make the agent forget what it already stored.
+**Memories and documents (`message_forget_writes_v1`).** Without
+`forget_writes`, memories and documents an agent stored with its tools during
+a deleted run stay. All three routes take an optional boolean
+`"forget_writes"` in the body (the reply route reads only that field of a
+JSON object body); a non-boolean value is `400 field_invalid`. With
+`"forget_writes": true` PRX also deletes, in the delete's transaction, every
+memory and document that the deleted run, or any run it spawned, inserted or
+updated, in the answering agent's partition only, with their embedding-cache
+entries, trash copies, links, drafts, chunks and events. Each agent entry
+(for the reply route: the answer object itself) gains
+`"forgotten":{"memories":{"created":n,"touched":m},"documents":{"created":n,"touched":m}}`
+and `"writes_traceable":bool`. `created` counts deleted targets the run family
+inserted; `touched` counts deleted targets it only updated (someone else's
+row). A target already gone is not counted. `writes_traceable` is `false`
+when the run started before this store recorded write provenance: rows
+written before provenance existed are not forgotten. A run still in flight
+answers `"forgotten":null,"forget_pending":true`; its forget runs when the
+run ends, and repeating the same delete then returns the counts.
+`forget_pending` is absent otherwise. A repeat returns the counts recorded at
+the first execution. A plain delete followed by a repeat with
+`forget_writes:true` forgets then; a forget followed by a plain repeat
+answers the plain shape. Once forgotten, a run (and its children) can no
+longer write memory or documents: a later write fails with the tool error
+`run_forgotten`. More than 20,000 recorded writes in one run family:
+`422 forget_family_too_large`, nothing deleted (a batch item carries that
+code). Only memories and documents are forgotten: other tool side effects
+(files, commands, messages, cron and xin jobs) are not undone. Without
+`forget_writes` the answer is unchanged.
+
+**Context pages.** From the commit that advertises `message_forget_writes_v1`,
+every delete (with or without `forget_writes`) also deletes the agent's
+OS-paging context-page documents of the session that hold a deleted row (a
+page written during the deleted turn, or a page whose text holds the deleted
+text). They are not counted in `forgotten`.
 
 **Replay.** A resend of a deleted message's key (`POST …/message` with that
 `client_message_id` for that agent) is `409 message_deleted`. The deleted mark
@@ -481,6 +511,7 @@ pairing off the listing is unchanged.
 | `message_context_delivery_v1` | Caller context is delivered to the turn within published bounds, with `deliver` | advertised (AC-1b1) |
 | `message_idempotency_v1` | The message route deduplicates by an idempotency key, with the replay response, the restart rule and 7-day key retention; cancel by run id; job cancel of an rf run's job answers a coded `404 job_unknown` once PRX no longer knows the job, while a job id PRX never issued keeps the legacy uncoded `404` (see Cancel under Message idempotency) | advertised (AC-1b2a) |
 | `message_delete_v1` | A message, one run's reply, or a batch of messages can be deleted as tombstones; a deleted key replays `409 message_deleted` (see Message delete) | advertised (AC-1b2b) |
+| `message_forget_writes_v1` | The three delete routes take `"forget_writes": true` and also forget the memories and documents the deleted runs wrote, with counts (see Message delete) | advertised (W2) |
 | `sync_snapshot_v1` | `GET /api/sync/snapshot` returns the owner's sessions and turns; an expired cursor gets `410 snapshot_expired` | not yet |
 | `sync_ws_v1` | `GET /api/sync/ws` carries the durable journal kinds with hello, welcome, ack and cursor resume, the root and parent link fields, `turn.failed{prx_restart,retryable:true}` journaled at start, the config-changed startup check and every C§4 close | not yet |
 | `stream_frames_v1` | Turns stream `stream` frames with `delta` and `tool_status`, a per-run index and `stream_gap` | not yet |

@@ -84,6 +84,11 @@ struct LoggedWrite<'a> {
 /// Append the log row of `write` on `conn`, inside the caller's open
 /// write transaction.
 fn record(conn: &Connection, provenance: &WriteProvenance, write: LoggedWrite<'_>) -> anyhow::Result<()> {
+    // A forgotten run family never writes again; the refusal rolls the
+    // caller's transaction back with the write.
+    if super::rf_forget::is_forgotten(conn, provenance)? {
+        return Err(crate::memory::write_provenance::RunForgotten.into());
+    }
     conn.execute(
         "INSERT INTO memory_write_log (
             root_run_id, run_id, parent_run_id, operation_id,

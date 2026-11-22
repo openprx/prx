@@ -2236,15 +2236,17 @@ pub trait Memory: Send + Sync {
         Err(crate::memory::fabric::fail_fast(self.name(), "rf_delete_message"))
     }
 
-    /// Delete the assistant side of one ended rf run in one transaction.
+    /// Delete the assistant side of one ended rf run in one transaction;
+    /// with `forget_writes`, also forget what its run family wrote.
     async fn rf_delete_reply(
         &self,
         workspace_id: &str,
         owner_id: &str,
         session_key: &str,
         run_id: &str,
+        forget_writes: bool,
     ) -> anyhow::Result<super::rf_messages::RfReplyDelete> {
-        let _ = (workspace_id, owner_id, session_key, run_id);
+        let _ = (workspace_id, owner_id, session_key, run_id, forget_writes);
         Err(crate::memory::fabric::fail_fast(self.name(), "rf_delete_reply"))
     }
 

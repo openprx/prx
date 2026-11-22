@@ -871,6 +871,7 @@ impl Memory for SqliteMemory {
         owner_id: &str,
         session_key: &str,
         run_id: &str,
+        forget_writes: bool,
     ) -> anyhow::Result<crate::memory::RfReplyDelete> {
         let pool = self.pool.clone();
         let (workspace_id, owner_id, session_key, run_id) = (
@@ -880,8 +881,14 @@ impl Memory for SqliteMemory {
             run_id.to_owned(),
         );
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<crate::memory::RfReplyDelete> {
-            let outcome =
-                super::rf_delete::delete_reply(&pool.write(), &workspace_id, &owner_id, &session_key, &run_id)?;
+            let outcome = super::rf_delete::delete_reply(
+                &pool.write(),
+                &workspace_id,
+                &owner_id,
+                &session_key,
+                &run_id,
+                forget_writes,
+            )?;
             if matches!(outcome, crate::memory::RfReplyDelete::Deleted { .. }) {
                 scrub_after_delete(&pool);
             }
