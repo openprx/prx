@@ -458,6 +458,7 @@ async fn run_owned_manifest(
         ordinary_snapshots.as_ref(),
         operator_snapshots.as_ref(),
     )?;
+    config.autonomy.level = level;
     // FIX-P1-31: honour the configured `security.audit` block on the gate audit path.
     let security = Arc::new(SecurityPolicy {
         autonomy: level,

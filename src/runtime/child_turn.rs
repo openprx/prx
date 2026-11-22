@@ -203,11 +203,20 @@ impl ChildSegmentTurn {
     pub(crate) fn prompt_with_skills(&self, base: &str) -> anyhow::Result<String> {
         let skills = self.prompt_skills()?;
         let metadata = crate::skills::skills_to_prompt(&skills, std::path::Path::new(self.proof.workspace_id()));
-        if metadata.is_empty() {
-            Ok(base.to_owned())
-        } else {
-            Ok(format!("{base}\n\n{metadata}"))
+        let mut prompt = base.to_owned();
+        let level = self.execution.child_scope.as_ref().map_or_else(
+            || self.service.security().autonomy,
+            |scope| scope.gate_inputs().0.authority.level,
+        );
+        if level == crate::security::AutonomyLevel::Full {
+            prompt.push_str("\n\n");
+            prompt.push_str(crate::agent::prompt::FULL_AUTONOMY_SAFETY);
         }
+        if !metadata.is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(&metadata);
+        }
+        Ok(prompt)
     }
 
     pub(crate) fn compaction(&self) -> &crate::config::AgentCompactionConfig {
