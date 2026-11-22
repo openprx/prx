@@ -525,8 +525,8 @@ pairing off the listing is unchanged.
 | `message_forget_writes_v1` | The three delete routes take `"forget_writes": true` and also forget the memories and documents the deleted runs wrote, with counts (see Message delete) | advertised (W2) |
 | `sync_snapshot_v1` | `GET /api/sync/snapshot` returns a consistent paged inventory; expired page tokens get `410 snapshot_expired` | advertised (SQLite) |
 | `sync_ws_v1` | `GET /api/sync/ws` carries the durable journal kinds with hello, welcome, ack and cursor resume, the root and parent link fields, `turn.failed{prx_restart,retryable:true}` journaled at start, the config-changed startup check and every C§4 close | advertised (SQLite) |
-| `stream_frames_v1` | Turns stream `stream` frames with `delta` and `tool_status`, a per-run index and `stream_gap` | not yet |
-| `run_approvals_v1` | Pending tool approvals can be approved and continued, including child-run approvals keyed by the root session, with `cancelled` and `cause` | not yet |
+| `stream_frames_v1` | Turns stream `stream` frames with `delta`, `tool_status` and `typing`, a per-run index and `stream_gap` | advertised (SQLite, B2) |
+| `run_approvals_v1` | Pending tool approvals can be approved and continued, including child-run approvals keyed by the root session, with `cancelled` and `cause` | advertised (SQLite, B2) |
 | `history_erase_v1` | An agent's history can be erased through the erase route, which returns a receipt | advertised (RF-UNIT-A) |
 | `agent_memory_purge_v1` | A deleted named agent's memory is purged | advertised (RF-UNIT-A) |
 | `host_bootstrap_v1` | A host can install and start PRX non-interactively (`token issue --out`, `runtime.json`) | not yet |
@@ -606,7 +606,7 @@ returns `409 idempotency_conflict`.
 
 SQLite backends advertise
 `sync_snapshot_v1` and `sync_ws_v1`; other backends list them in `available`.
-B1 does not advertise `stream_frames_v1` or `run_approvals_v1`.
+B2 additionally advertises `stream_frames_v1` and `run_approvals_v1` on SQLite.
 
 Both sync routes require a paired Authorization bearer. Cookies and URL
 credentials grant no sync access. They sit outside the ordinary API minute
@@ -684,3 +684,65 @@ counts by `erase_id`; never sum the repeated map across incarnation events.
 Receipt inventory survives journal retention. Config and erase payloads carry
 only identity/revision/status/count metadata; journal and snapshot reference
 rows carry no message text, reasoning, tool arguments or credentials.
+
+
+### Live frames and run approvals (B2)
+
+Live frames use `{type:"stream",session,agent,incarnation,run_id,idx,kind,...}`.
+The immutable admission supplies identity; descendants also carry all four
+parent/root links. Each run has a monotonic index. Root turns emit sanitized
+`delta{text}`; task-mode spawn and delegate children emit only `tool_status`
+and `typing{state:"thinking"}`. Reasoning is never copied into this transport.
+Providers without streaming support emit status frames and the durable final.
+Deltas coalesce on a 50 ms pacing boundary or 4 KiB; every stream kind shares
+the run's 20 frames/second pacing. Structured tool-call candidates are held
+until they can be scrubbed without exposing partial arguments. The producer
+queue holds 64 inputs, the connection holds 256 frames. Overflow drops stream
+frames, marks `stream_gap{run_id}`, and never waits for or fails the turn.
+At most 256 distinct outstanding gap markers are retained; exhaustion closes
+the stream with 1011, without affecting a turn. A connection joining an active
+run that already produced data receives a gap. Live frames are never journaled
+or replayed; the final durable `turn.appended` remains authoritative.
+
+`tool_status` contains `{tool,phase}` without arguments or results. Phases are
+`started`, `succeeded`, `failed`, `denied`, `cancelled`, and `awaiting_approval`.
+Optional `cause` appears only on denied/failed/cancelled phases and uses typed
+approval or termination causes: `user_rejected`, `no_answer`,
+`no_approval_surface`, `no_terminal`, `prompt_unavailable`, `concurrent_pending`,
+`session_switched`, `no_resolver`, `channel_denied`, `ledger_refused`, or
+`cancelled`. Process workers have no approval relay in this unit. Their
+completion returns a bounded, content-free `denials:[{tool,cause}]` inventory
+under the existing completion signature. Only after authentication does the
+parent emit one frame per denial on the **parent run**:
+`{tool,phase:"denied",cause:"no_resolver",child_run_id}` plus its stable ids.
+The inventory holds at most 256 denials with tool names at most 64 bytes;
+overflow fails completion explicitly. It carries no model text or arguments.
+
+For an rf-keyed root session, `POST /api/sessions/{id}/approvals/{approval_id}`
+accepts exactly `{"decision":"approved"}` or `{"decision":"denied"}` under a
+paired bearer. Child approvals use the root session id. Success is
+`200 {approval_id,run_id,decision}`; the same decision is idempotent, another
+is `409 approval_decided`. Unknown ids return `404 approval_unknown`, mismatched
+owner/session or a run no longer live returns `409 approval_run_mismatch`, and
+expiry returns `410 approval_expired`. This path does not consult Main's level.
+
+The exact-call ledger owns the pending row and one-shot grant. Its pending
+source and `approval.pending{approval_id,run_id,tool,agent,summary,expires_at}`
+header commit together. The summary uses the existing secret redactor and is
+at most 512 UTF-8 bytes. A single decision is committed as
+`approval.decided{approval_id,run_id,decision,cause?}` in the source resolution
+transaction. Only denied decisions include `cause:"owner_denied"`. Only an
+approved decision consumes the exact grant and continues execution. Denial or
+expiry returns a denied tool result and the loop continues to its final turn.
+Cancellation and restart close outstanding approvals transactionally. Full
+never enters this approval path; ReadOnly and ordinary policy gates remain.
+
+Configure `[agent].approval_wait_secs` for Main and
+`[agents.<name>].approval_wait_secs` per named agent; default 600, valid range
+1–86400 seconds. Named-agent PUT accepts the same optional field (omission
+resets to 600 under full replacement); agent readback publishes the value.
+A pending approval pauses idle detection for its turn and waiting ancestors,
+while the existing session-busy rule rejects a competing turn. The job remains
+live throughout approval and continuation. Console approvals keep their
+existing body, four-minute expiry, and review behavior; terminal chat, channel
+and cron entry points do not opt into these rf semantics.

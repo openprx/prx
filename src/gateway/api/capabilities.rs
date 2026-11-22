@@ -36,7 +36,7 @@ use std::borrow::Cow;
 
 /// The tokens effective in this running daemon, sorted ascending. A token is
 /// listed only when its whole earliest usable form is on main.
-const CAPABILITY_TOKENS: [&str; 16] = [
+const CAPABILITY_TOKENS: [&str; 18] = [
     "agent_catalog_v1",
     "agent_crud_v1",
     "agent_limits_v1",
@@ -50,7 +50,9 @@ const CAPABILITY_TOKENS: [&str; 16] = [
     "message_idempotency_v1",
     "message_target_v1",
     "owner_id_stable_v1",
+    "run_approvals_v1",
     "session_key_v1",
+    "stream_frames_v1",
     "sync_snapshot_v1",
     "sync_ws_v1",
 ];
@@ -72,8 +74,13 @@ fn advertised_tokens(state: &AppState) -> (Vec<&'static str>, Vec<&'static str>)
         available.push(TARGETED_AGENTS_TOKEN);
     }
     if state.mem.sync_store().is_none() {
-        capabilities.retain(|token| !matches!(*token, "sync_snapshot_v1" | "sync_ws_v1"));
-        available.extend(["sync_snapshot_v1", "sync_ws_v1"]);
+        capabilities.retain(|token| {
+            !matches!(
+                *token,
+                "sync_snapshot_v1" | "sync_ws_v1" | "stream_frames_v1" | "run_approvals_v1"
+            )
+        });
+        available.extend(["sync_snapshot_v1", "sync_ws_v1", "stream_frames_v1", "run_approvals_v1"]);
         available.sort_unstable();
     }
     (capabilities, available)
@@ -167,7 +174,7 @@ impl IntoResponse for CatalogError {
 }
 
 /// The rf contract's coded error body.
-pub(super) fn coded_error(status: StatusCode, code: &str, message: &str) -> Response {
+pub(in crate::gateway) fn coded_error(status: StatusCode, code: &str, message: &str) -> Response {
     coded_error_with(status, code, message, None)
 }
 
