@@ -2352,6 +2352,20 @@ fn emit_step_event(
     )
 }
 
+/// Retain the retirement reason in the goal's existing lifecycle stream.
+pub(crate) fn record_retired_goal(conn: &Connection, config: &Config, goal_id: &str) -> Result<()> {
+    let lineage = load_goal_lineage(conn, goal_id)?.context("retired goal missing")?;
+    insert_task_event(
+        conn,
+        &workspace_id(config),
+        goal_id,
+        lineage,
+        "goal.paused",
+        Some("retired"),
+        Some(r#"{"reason":"retired"}"#),
+    )
+}
+
 /// Emit a lifecycle event for a goal.
 fn emit_goal_event(
     conn: &Connection,

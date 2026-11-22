@@ -3700,7 +3700,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             Ok(())
         }
 
-        AuthCommands::Status { .. } => {
+        AuthCommands::Status => {
             let data = auth_service.load_profiles()?;
             if data.profiles.is_empty() {
                 println!("No auth profiles configured.");

@@ -71,6 +71,14 @@ pub(crate) fn retire(config: &Config, owner: &str, name: &str) -> Result<()> {
         };
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         for table in tables {
+            let goals = if *table == "xin_goals" {
+                let mut query = tx.prepare("SELECT id FROM xin_goals WHERE owner_id=?1 AND substr(creator_agent,1,length(?2))=?2 AND enabled<>0")?;
+                query
+                    .query_map(params![owner, prefix], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            } else {
+                Vec::new()
+            };
             // Table identifiers are a closed source-owned inventory, never request input.
             let status = if *table == "xin_goals" {
                 ""
@@ -78,6 +86,9 @@ pub(crate) fn retire(config: &Config, owner: &str, name: &str) -> Result<()> {
                 ",last_status='retired'"
             };
             tx.execute(&format!("UPDATE {table} SET enabled=0,version=version+1{status} WHERE owner_id=?1 AND substr(creator_agent,1,length(?2))=?2 AND enabled<>0"),params![owner,prefix])?;
+            for id in goals {
+                crate::xin::store::record_retired_goal(&tx, config, &id)?;
+            }
         }
         tx.commit()?;
     }
