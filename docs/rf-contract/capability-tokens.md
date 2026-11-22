@@ -602,7 +602,6 @@ already purged agent returns it under any later key without doing work.
 Keys are retained at least seven days; the same key with another agent name
 returns `409 idempotency_conflict`.
 
-
 ### Sync snapshot and durable WebSocket (B1)
 
 SQLite backends advertise
