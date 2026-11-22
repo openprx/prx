@@ -628,8 +628,23 @@ snapshot id/cursor. Tokens expire ten minutes after the last page read:
 `410 snapshot_expired` requires a new snapshot. At most two valid cuts per
 owner are retained; a third returns `429 rate_limited`.
 
+After erasure, a fresh snapshot may omit erased turn rows. It still inventories
+an `erase_receipt` for each completed history erase, including receipts within
+the 14-day journal retention window and older receipts retained by the erasure
+store. Its payload includes `erase_id`, the history `scope`, `generation`,
+per-store `counts`, `session_key`, `agent`, and `incarnation`. Clients must apply
+these receipts to remove any locally retained copies during resnapshot.
+Agent purges contribute one `erase_receipt` per purged incarnation, keyed by
+`<erase_id>:<incarnation>`, with `scope:"agent"`, the same purge `erase_id`, and
+the unchanged operation-wide purge `counts`; clients deduplicate the operation
+by `erase_id`. Snapshot receipt inventory is read from the completed erasure
+stores in the fixed cut and does not depend on erased message rows surviving.
+
 WebSocket hello is `{"type":"hello","proto":1,"cursor":null}` or a saved
 `"<epoch>:<seq>"` cursor. Null starts at the retained journal's beginning.
+A client Close frame, including normal code 1000, is echoed by flushing the
+protocol's queued close reply before the server drops the socket. This also
+applies when the client closes before hello.
 Welcome is `{type:"welcome",epoch,head_seq}`; events replay in sequence before
 live delivery. The install epoch is 32 lowercase hex characters and survives
 restart. Headers retain owner scope and stable identity; the four descendant

@@ -8,6 +8,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::Response,
 };
+use futures::SinkExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{collections::VecDeque, sync::Arc, time::Duration};
@@ -65,6 +66,12 @@ async fn close(socket: &mut WebSocket, code: u16, reason: &'static str) {
     )
     .await;
 }
+async fn finish_peer_close(socket: &mut WebSocket) {
+    // Receiving Close queues the matching reply inside Tungstenite. Flush it
+    // before dropping the upgraded transport, including before hello.
+    let _ = tokio::time::timeout(Duration::from_secs(2), socket.flush()).await;
+}
+
 async fn send(socket: &mut WebSocket, value: &Value) -> anyhow::Result<usize> {
     let text = serde_json::to_string(value)?;
     anyhow::ensure!(text.len() <= MAX_FRAME, crate::memory::sync::SyncError::InvalidSource);
@@ -108,6 +115,10 @@ async fn run(
         hello=tokio::time::timeout(Duration::from_secs(10),socket.recv())=>hello,
     };
     let message = match hello {
+        Ok(Some(Ok(Message::Close(_)))) => {
+            finish_peer_close(socket).await;
+            return Ok(());
+        }
         Ok(Some(Ok(message))) => message,
         Ok(Some(Err(_))) => return Err((1009, "client frame too large")),
         _ => return Err((1008, "hello required")),
@@ -187,7 +198,10 @@ async fn run(
             ()=connection.cancelled()=>return Err((4001,"superseded")),
             ()=shutdown.cancelled()=>return Err((1001,"shutdown")),
             inbound=socket.recv()=>{
-                let message=match inbound {Some(Ok(Message::Close(_)))|None=>return Ok(()),Some(Ok(message))=>message,Some(Err(_))=>return Err((1009,"client frame too large"))};
+                let message=match inbound {
+                    Some(Ok(Message::Close(_)))=>{finish_peer_close(socket).await;return Ok(());},
+                    None=>return Ok(()),Some(Ok(message))=>message,Some(Err(_))=>return Err((1009,"client frame too large"))
+                };
                 match decode(message).map_err(|code|(code,"invalid client frame"))? {
                     Client::Hello{..}=>return Err((1008,"second hello")),
                     Client::Pong=>missed=0,
