@@ -3433,3 +3433,14 @@ Direct tool calls without runtime authority keep the Supervised behavior.
 Docker continues to use the shell environment allowlist at every level. Native Full
 ignores that allowlist for admission, but invalid entries are still rejected.
 `git_operations`, skill scripts and scheduled shell jobs retain their existing git policy.
+
+### Named-agent rf admission limits
+
+Each `[agents.<name>.limits]` may set `max_concurrent_turns` (1–1024) and
+`max_cost_per_day_cents` (1–1,000,000,000). Both are unset by default.
+The limits gate new rf-targeted turns across the agent's sessions; child runs
+consume no concurrency slot but their usage counts toward the root agent's
+UTC daily spend. A running turn is allowed to finish. The agent PUT route
+replaces these settings with the rest of its managed configuration.
+See [the rf contract](rf-contract/capability-tokens.md#agent-admission-limits-agent_limits_v1)
+for readback, refusal and retry semantics.

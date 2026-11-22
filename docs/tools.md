@@ -1942,3 +1942,11 @@ If a built-in HTML or search-result pattern cannot compile, web tools return an
 error instead of returning unprocessed page content. The memory safety filter
 rejects writes when a PII detector is unavailable and reports
 `pii pattern unavailable`.
+
+### Gateway session tools
+
+Gateway turns register `sessions_send` and `session_status` beside
+`sessions_spawn`, `sessions_list` and `sessions_history`, sharing the same
+run registry and owner/agent scope used in terminal chat. Named targeted
+agents at Full have the Full tool surface, including shell and file writes;
+Supervised and ReadOnly retain their existing restrictions.

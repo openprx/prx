@@ -133,7 +133,7 @@ a missing `If-Match` or `*` is `400 field_invalid`, any other value is
 `409 revision_conflict` with `current_revision`.
 
 **Readback** (`GET /api/agents/{name}`, the answer of `PUT`):
-`{"name","config":{"provider","model","prompt"?,"autonomy","tools","enabled"},"revision","incarnation","status"}`.
+`{"name","config":{"provider","model","prompt"?,"autonomy","tools","enabled","limits"},"revision","incarnation","status"}`.
 `autonomy` is `readonly`, `supervised` or `full`; `tools` is `["*"]` (Main's
 tools), `[]` (none) or tool names; `config.enabled` is exactly what was put;
 `incarnation` is a UUID that never changes across `PUT`s; `status` is
@@ -150,7 +150,7 @@ without a level reads back Main's level, the one it runs at.
 |---|---|---|
 | `GET /api/agents` | | `200 {"revision","agents":[readback…]}`: every configured named agent, retired ones included, sorted by name; Main and names outside the grammar are not listed |
 | `GET /api/agents/{name}` | | `200` readback; `main` gives Main's |
-| `PUT /api/agents/{name}` | `If-Match`; body `{"provider","model","autonomy","tools","enabled","prompt"?}`, a full replacement; `?confirm_high_risk=true` only after a `428` | `201` readback when created, `200` when replaced. The incarnation is created at the first `PUT`, whatever the switch or `enabled` say |
+| `PUT /api/agents/{name}` | `If-Match`; body `{"provider","model","autonomy","tools","enabled","prompt"?,"limits"?}`, a full replacement; `?confirm_high_risk=true` only after a `428` | `201` readback when created, `200` when replaced. The incarnation is created at the first `PUT`, whatever the switch or `enabled` say |
 | `DELETE /api/agents/{name}` | `If-Match` | `200 {"name","status":"retired","revision"}`. The agent stays configured, disabled, and takes no turn; a repeated `DELETE` gives the same body with the current revision. The purge is `agent_memory_purge_v1` |
 | `GET /api/gateway/targeted-agents` | | `200 {"revision","configured","effective","restart_required"}` |
 | `PUT /api/gateway/targeted-agents` | `If-Match`; `{"enabled":bool}` | `200`, same shape; the switch takes effect at the next daemon restart, so `restart_required` is `true` until then |
@@ -169,8 +169,11 @@ without a level reads back Main's level, the one it runs at.
 - `tools`: `["*"]`, `[]`, or distinct names from the catalog's `tools`, so at
   most that many; a duplicate, `*` beside a name or an unknown name is
   `agent_tools_invalid`;
-- any other field is `field_invalid`; `limits` is not supported yet
-  (`agent_limits_v1`).
+- `limits`: optional object or `null`. Its optional nullable fields are
+  `max_concurrent_turns` (integer 1 to 1024) and `max_cost_per_day_cents`
+  (integer 1 to 1,000,000,000). Absence or `null` clears both limits.
+  Readback includes `config.limits` with both fields, including nulls.
+- any other field is `field_invalid`.
 
 **Errors** (coded shape):
 
@@ -512,7 +515,7 @@ pairing off the listing is unchanged.
 | `targeted_agents_v1` | A message turn can target a named agent, with a per-agent partitioned history that reads back with an agent label and filter (see Partition and history labels) | in `capabilities` while `gateway.targeted_agents` is effective in the running daemon, in `available` otherwise (AC-1b3) |
 | `agent_crud_v1` | The agent routes above: `GET /api/agents`, `GET`, `PUT` and `DELETE /api/agents/{name}` with If-Match, the config revision, an incarnation and `status`; `GET`/`PUT /api/gateway/targeted-agents`; the owner-bearer-only `POST /api/config/reload`. `DELETE` retires the agent (the purge is `agent_memory_purge_v1`) | advertised since 39509eb97 |
 | `agent_main_readback_v1` | `GET /api/agents/main` reads back Main's configuration | advertised since 39509eb97 |
-| `agent_limits_v1` | `limits {max_concurrent_turns, max_cost_per_day_cents}` on an agent `PUT` (unset by default; card AC-LIM) | not yet |
+| `agent_limits_v1` | `limits {max_concurrent_turns, max_cost_per_day_cents}` on an agent `PUT` (unset by default; card AC-LIM) | advertised (RF-UNIT-A) |
 | `owner_id_stable_v1` | Every paired bearer acts for one install owner id that survives bearer rotation, re-pairing, restarts and additional paired devices; `GET /api/owner` returns it (see Route: owner) | advertised (HOST-1a) |
 | `session_key_v1` | `POST /api/sessions` accepts a caller-chosen `session_key` | advertised (AC-1b1) |
 | `message_target_v1` | The message route accepts a target together with caller context | advertised (AC-1b1) |
@@ -524,8 +527,8 @@ pairing off the listing is unchanged.
 | `sync_ws_v1` | `GET /api/sync/ws` carries the durable journal kinds with hello, welcome, ack and cursor resume, the root and parent link fields, `turn.failed{prx_restart,retryable:true}` journaled at start, the config-changed startup check and every C§4 close | not yet |
 | `stream_frames_v1` | Turns stream `stream` frames with `delta` and `tool_status`, a per-run index and `stream_gap` | not yet |
 | `run_approvals_v1` | Pending tool approvals can be approved and continued, including child-run approvals keyed by the root session, with `cancelled` and `cause` | not yet |
-| `history_erase_v1` | An agent's history can be erased through the erase route, which returns a receipt | not yet |
-| `agent_memory_purge_v1` | A deleted named agent's memory is purged | not yet |
+| `history_erase_v1` | An agent's history can be erased through the erase route, which returns a receipt | advertised (RF-UNIT-A) |
+| `agent_memory_purge_v1` | A deleted named agent's memory is purged | advertised (RF-UNIT-A) |
 | `host_bootstrap_v1` | A host can install and start PRX non-interactively (`token issue --out`, `runtime.json`) | not yet |
 | `release_manifest_v1` | Releases carry a signed manifest that rf can verify | not yet |
 
@@ -535,3 +538,66 @@ rebase onto main changes it, `git log -S agent_catalog_v1 -- src/gateway/api/cap
 finds the landed one). When a later card makes another token advertisable,
 that card adds it to `CAPABILITY_TOKENS` and updates its status here in the
 same change.
+
+## Agent admission limits (`agent_limits_v1`)
+
+Limits apply to new rf message turns of a named agent across its sessions.
+Children do not consume concurrency slots; their provider usage is charged
+against the root agent's daily spend. The ledger uses reported provider usage
+and the configured/catalog price; subscription usage costs zero. Spend is
+aggregated by UTC date and by the root agent's owner and name, across
+incarnations. A running turn continues when a limit is reached.
+
+At the concurrency limit a new turn receives `429 agent_busy` and
+`Retry-After: 1`. At the daily cost limit it receives
+`429 agent_budget_exhausted` with seconds until the next UTC midnight in
+`Retry-After`. These refusals consume no message idempotency key. Replays
+are answered before admission checks. A context-only input starts no turn
+and consumes no concurrency slot.
+
+## History erase (`history_erase_v1`)
+
+`DELETE /api/sessions/{id}/agents/{name}/history` also accepts `main`.
+It requires the paired owner bearer, a caller-keyed session of that owner,
+`Idempotency-Key` (16 to 128 printable ASCII bytes), and
+`If-Match: <incarnation UUID>`. Its optional body is
+`{"forget_writes":true}`; the default is false.
+
+Success is `200 {"status":"erased","scope":{"session","agent","incarnation"},
+"erase_id","generation","remaining":0,"incarnation"}`. Generations start at
+1 and advance only after verified erasure; replay returns the saved receipt.
+The old scope stays sealed. A new turn uses the replacement generation.
+Erasure removes scoped transcripts, events, memories/documents and derived
+copies, mailbox payloads and approvals. Main erasure preserves other sessions
+and shared configuration. Context pages are selected by scope, never by text.
+Payload-free message keys remain deleted so an old message retry cannot
+restore its content. With `forget_writes`, the run families' writes are also
+forgotten and the receipt adds `forgotten:{created,touched}`.
+
+`503 history_pending` requires retry with the same key; it never certifies
+zero residue. `409 incarnation_mismatch` includes `current_incarnation`.
+`409 idempotency_conflict` refuses a changed request under a retained key.
+`404 agent_unknown` is reconciliation only. Keys are retained at least seven
+days; terminal receipts and fences are permanent. SQLite payload removal,
+FTS rebuilds and a successful WAL truncation precede a successful receipt.
+
+## Agent purge (`agent_memory_purge_v1`)
+
+`POST /api/agents/{name}/purge` requires the paired owner bearer,
+`If-Match: <config revision>` and `Idempotency-Key` as above. It accepts no
+body fields or query parameters. A first purge of an active agent returns
+`409 agent_not_retired`; call `DELETE /api/agents/{name}` first.
+
+Purge removes the named partition's stores across all sessions and
+incarnations and removes its retired configuration through the management
+transaction. It preserves shared provider state. The receipt is
+`200 {"name","incarnations":[UUID strings],"counts":{store:u64},"completed_at"}`.
+`counts` includes every manifest store with sorted keys and zero counts;
+values are rows removed. `completed_at` is RFC 3339 UTC at second precision
+with a `Z` suffix. `503 purge_pending` means incomplete work: retry the same
+key. Progress survives a restart.
+
+Purge is never implicit in agent DELETE. The receipt is permanent and an
+already purged agent returns it under any later key without doing work.
+Keys are retained at least seven days; the same key with another agent name
+returns `409 idempotency_conflict`.
