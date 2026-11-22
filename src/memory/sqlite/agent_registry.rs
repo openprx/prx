@@ -8,7 +8,7 @@ use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The closed inventory of erase-manifest stores (design inventory enum).
-pub(super) const MANIFEST_STORES: [&str; 39] = [
+pub(super) const MANIFEST_STORES: [&str; 40] = [
     "conversation_turns",
     "message_events",
     "memories",
@@ -31,9 +31,6 @@ pub(super) const MANIFEST_STORES: [&str; 39] = [
     "chat_sessions",
     "chat_assignments",
     "chat_results",
-    "decisions",
-    "outcomes",
-    "child_outcomes",
     "engine_outcomes",
     "access_audit_log",
     "approval_grants",
@@ -48,6 +45,10 @@ pub(super) const MANIFEST_STORES: [&str; 39] = [
     "prx_mailbox_parents",
     "prx_mailbox_seq",
     "child_sessions",
+    "engine_analyses",
+    "memory_write_log",
+    "rf_message_attempts",
+    "prx_remote_trees",
 ];
 
 /// Byte length of a text column.
@@ -296,6 +297,9 @@ const SCHEMA_SCOPED_TABLES: [&str; 17] = [
 /// `table` is always a literal of a schema module, never request data. No
 /// version value, version check or CHECK constraint changes.
 pub(super) fn add_scope_column(conn: &rusqlite::Connection, table: &str) -> anyhow::Result<()> {
+    if !MANIFEST_STORES.contains(&table) {
+        return Err(crate::memory::agent_erasure::ErasureRefusal::UnknownStore(table.to_owned()).into());
+    }
     let present: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = 'ma_scope_id')",
         [table],
@@ -318,6 +322,20 @@ pub(super) fn add_schema_scope_columns(conn: &rusqlite::Connection) -> anyhow::R
 }
 
 impl AgentRegistry for SqliteMemory {
+    fn begin_history_erase(
+        &self,
+        request: &crate::memory::agent_erasure::HistoryErase,
+    ) -> anyhow::Result<crate::memory::agent_erasure::ErasePrepared> {
+        super::agent_erasure::begin_history(self, request)
+    }
+
+    fn finish_history_erase(
+        &self,
+        work: &crate::memory::agent_erasure::EraseWork,
+    ) -> anyhow::Result<serde_json::Value> {
+        super::agent_erasure::finish_history(self, work)
+    }
+
     fn resolve_incarnation(
         &self,
         workspace_id: &str,

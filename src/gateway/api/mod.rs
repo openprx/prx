@@ -11,6 +11,7 @@ use axum::{
     routing::{any, delete, get, patch, post, put},
 };
 
+mod agent_erasure;
 mod agents;
 mod capabilities;
 mod causal;
@@ -294,6 +295,10 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route(
             "/config/reload",
             post(config::post_config_reload).fallback(config::reload_method_not_allowed),
+        )
+        .route(
+            "/sessions/{id}/agents/{name}/history",
+            delete(agent_erasure::delete_history).fallback(capabilities::method_not_allowed),
         )
         .route(
             "/sessions/{id}/runs/{run_id}/cancel",

@@ -1130,6 +1130,8 @@ impl SqliteMemory {
         super::rf_delete::init_schema(conn)?;
         super::write_log::init_schema(conn)?;
         super::rf_forget::init_schema(conn)?;
+        super::agent_erasure::init_schema(conn)?;
+        super::agent_erasure::check_manifest(conn)?;
         let unattributed: u64 = super::agent_migration::migrate_legacy_console(conn)?;
         if unattributed > 0 {
             tracing::warn!(unattributed, "legacy console rows left without an agent scope");

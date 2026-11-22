@@ -306,7 +306,7 @@ fn evict_embeddings(tx: &Connection, scope: Option<&str>, text: &str) -> anyhow:
 
 /// Delete one memory by its stable id with its derived copies; `false` when
 /// it is already gone.
-fn delete_memory(tx: &Connection, memory_id: &str) -> anyhow::Result<bool> {
+pub(super) fn delete_memory(tx: &Connection, memory_id: &str) -> anyhow::Result<bool> {
     let row: Option<(String, String, Option<String>, Option<String>)> = tx
         .query_row(
             "SELECT key, content, ma_scope_id, topic_id FROM memories WHERE id = ?1",
@@ -339,7 +339,7 @@ fn delete_memory(tx: &Connection, memory_id: &str) -> anyhow::Result<bool> {
 
 /// Delete one document with its chunks and derived copies; `false` when it
 /// is already gone, or when it is a context page and `skip_pages` is set.
-fn delete_document(tx: &Connection, document_id: &str, skip_pages: bool) -> anyhow::Result<bool> {
+pub(super) fn delete_document(tx: &Connection, document_id: &str, skip_pages: bool) -> anyhow::Result<bool> {
     let row: Option<(Option<String>, String)> = tx
         .query_row(
             "SELECT ma_scope_id, source_kind FROM documents WHERE document_id = ?1",

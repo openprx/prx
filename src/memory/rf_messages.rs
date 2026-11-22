@@ -115,7 +115,7 @@ pub struct RfMessageDelete {
 
 /// How many targets one forget deleted, by table and by whether the run
 /// family created them (`created`) or only updated them (`touched`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RfForgetCounts {
     pub memories_created: i64,
     pub memories_touched: i64,

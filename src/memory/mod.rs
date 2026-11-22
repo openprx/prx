@@ -1,4 +1,5 @@
 pub(crate) mod active_view;
+pub mod agent_erasure;
 pub mod agent_registry;
 pub(crate) mod artifact_summary;
 pub mod backend;

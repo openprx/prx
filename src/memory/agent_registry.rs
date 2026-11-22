@@ -41,6 +41,17 @@ pub struct RetiredIncarnation {
 }
 
 pub trait AgentRegistry: Send + Sync {
+    fn begin_history_erase(
+        &self,
+        _request: &super::agent_erasure::HistoryErase,
+    ) -> anyhow::Result<super::agent_erasure::ErasePrepared> {
+        Err(super::agent_erasure::ErasureRefusal::Unsupported.into())
+    }
+
+    fn finish_history_erase(&self, _work: &super::agent_erasure::EraseWork) -> anyhow::Result<serde_json::Value> {
+        Err(super::agent_erasure::ErasureRefusal::Unsupported.into())
+    }
+
     /// The active incarnation of (workspace, owner, key), minted if absent.
     /// A retiring row and `admit` are checked inside the write transaction, so
     /// a refusal writes nothing. `admit` carries the caller's own barriers.
