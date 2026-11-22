@@ -31,8 +31,9 @@ These codes can answer any `/api` route, in the coded shape:
   default provider has no usable credential, so the daemon runs without a
   turn runtime. `reason` is `missing_provider_credential` (the only value so
   far). Only the routes that start or continue a turn answer it (the session
-  message route, including targeted turns, the approval inbox and the
-  approval actions); every other route, including capabilities, the catalog,
+  message route, including targeted turns and `deliver:"context"`, whose row
+  is stamped by the turn runtime; the approval inbox and the approval
+  actions); every other route, including capabilities, the catalog,
   the agent routes, the credential routes and `POST /api/config/reload`,
   answers normally. The catalog's `credentials_ready` shows when the
   credential is usable. Storing a credential rebuilds nothing by itself: after
@@ -216,7 +217,10 @@ start with `console-`. The session id is the key itself; the session lists with
 `channel` `rf` in `GET /api/sessions`. A caller-keyed session
 belongs to the owner that created it: a message or a messages listing
 (`GET /api/sessions/{session_id}/messages`) on it by another owner is
-`404 session_unknown`, exactly like a key that does not exist.
+`404 session_unknown`, exactly like an id in the `session_key` grammar that
+was never created. An id outside that grammar (a Console `console-…` id, for
+example) that does not exist keeps the Console's uncoded
+`404 {"error":"Session not found"}`.
 
 | Route | Request | 2xx |
 |---|---|---|
@@ -265,12 +269,20 @@ agent) runs at a time: another while it is live is `409 session_busy`; send it
 after the job ends. `context` records the input as a user row of the session
 for that target, with the same agent stamp a turn's input row gets, and starts
 no run; a later turn of that target reads it in its history. `context` is
-always accepted, in arrival order.
+accepted in arrival order whenever the route serves; it calls no provider, but
+the agent stamp comes from the turn runtime, so without a usable provider
+credential it is `503 provider_not_ready` like a turn.
 
 **Job status.** `GET /api/jobs/{job_id}` reports the turn until the journal
 exists: `status` is `running`, then `succeeded`, `failed` or `cancelled`, and
 the body of an rf-shaped turn carries its `run_id`. Jobs are kept in memory for
 one hour after they end and do not survive a restart.
+A job whose terminal record could not be written reads `failed`; its `error`
+names the failed step with a closed reason in parentheses
+(`recovery_key_unavailable`, `auxiliary_receipt_failed`,
+`child_cleanup_incomplete`, `terminal_commit_failed`, `usage_record_failed`,
+`terminal_persistence_failed`), and the daemon log line carries the same
+`reason` field.
 
 ## Message idempotency (`message_idempotency_v1`)
 
@@ -323,8 +335,16 @@ admission (a guaranteed lower bound). Nothing in PRX deletes it earlier except
 the purge of the agent incarnation.
 
 **Recording.** The record lives with the user-message events. With
-`memory.events.record_user_messages = false`, an rf message is refused with
-`500 storage_unavailable`, and nothing is written.
+`memory.events.record_user_messages = false`, an rf message (`turn` and
+`context` alike) is refused with `500 storage_unavailable`, and nothing is
+written. A `turn` also needs the daemon's recovery key, because its attempt
+row names the admitting process's ingress lifetime that the restart rule
+claims. PRX refuses that key at startup when the state directory or one of its
+ancestors is not owned by the daemon's user or root, or is group- or
+other-writable (a root-owned sticky directory such as `/tmp` is accepted as an
+ancestor); `prx doctor` names the directory. Then every new `turn` is refused
+with `500 storage_unavailable` and `"reason":"recovery_unavailable"` and
+nothing is written; `context` messages and replays still answer.
 
 **Cancel.**
 
@@ -358,9 +378,12 @@ the purge of the agent incarnation.
   `409 agent_scope_refused`: the agent's configuration, the memory backend or
   its scope registry cannot serve a targeted turn.
 - `503 provider_not_ready`: see General errors.
-- `500 storage_unavailable` (also `503` while the gateway drains, and `409` when
-  PRX found this input already stored and did not run it again): the input
-  could not be confirmed; treat the outcome as unknown.
+- `500 storage_unavailable` (also `503` while the gateway drains or its input
+  admission is closed, and `409` when PRX's ingress recovery found this input
+  already accepted and did not run it again; the key's own replay answers come
+  first, so this `409` is rare): the input could not be confirmed; treat the
+  outcome as unknown. A refused recovery key adds `"reason":"recovery_unavailable"`
+  (see Recording).
 
 ## Message delete (`message_delete_v1`)
 
@@ -456,7 +479,7 @@ pairing off the listing is unchanged.
 | `session_key_v1` | `POST /api/sessions` accepts a caller-chosen `session_key` | advertised (AC-1b1) |
 | `message_target_v1` | The message route accepts a target together with caller context | advertised (AC-1b1) |
 | `message_context_delivery_v1` | Caller context is delivered to the turn within published bounds, with `deliver` | advertised (AC-1b1) |
-| `message_idempotency_v1` | The message route deduplicates by an idempotency key, with the replay response, the restart rule and 7-day key retention; cancel by run id; job cancel answers a coded `404 job_unknown` (see Message idempotency) | advertised (AC-1b2a) |
+| `message_idempotency_v1` | The message route deduplicates by an idempotency key, with the replay response, the restart rule and 7-day key retention; cancel by run id; job cancel of an rf run's job answers a coded `404 job_unknown` once PRX no longer knows the job, while a job id PRX never issued keeps the legacy uncoded `404` (see Cancel under Message idempotency) | advertised (AC-1b2a) |
 | `message_delete_v1` | A message, one run's reply, or a batch of messages can be deleted as tombstones; a deleted key replays `409 message_deleted` (see Message delete) | advertised (AC-1b2b) |
 | `sync_snapshot_v1` | `GET /api/sync/snapshot` returns the owner's sessions and turns; an expired cursor gets `410 snapshot_expired` | not yet |
 | `sync_ws_v1` | `GET /api/sync/ws` carries the durable journal kinds with hello, welcome, ack and cursor resume, the root and parent link fields, `turn.failed{prx_restart,retryable:true}` journaled at start, the config-changed startup check and every C§4 close | not yet |
