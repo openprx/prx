@@ -135,6 +135,8 @@ pub enum ManagedChange {
     PutAgent { agent: String, spec: AgentSpec },
     /// Retire a named agent: it stays configured, disabled, until its purge.
     RetireAgent { agent: String },
+    /// Remove a retired agent configuration after its stores are verified erased.
+    PurgeAgent { agent: String },
     /// Set `gateway.targeted_agents` (takes effect at the next restart).
     SetTargetedAgents { enabled: bool },
 }
@@ -1724,6 +1726,11 @@ fn candidate(current: &Config, change: &ManagedChange) -> Result<Config, ManageE
                 .map_err(|message| ManageError::Invalid(message.to_owned()))?;
             entry.limits = spec.limits.clone();
             entry.enabled = spec.enabled;
+        }
+        ManagedChange::PurgeAgent { agent } => {
+            next.agents
+                .remove(agent)
+                .ok_or_else(|| ManageError::NotFound(format!("agent `{agent}`")))?;
         }
         ManagedChange::RetireAgent { agent } => {
             next.agents

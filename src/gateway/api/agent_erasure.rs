@@ -18,6 +18,14 @@ pub(super) fn failure(error: &anyhow::Error, purge: bool) -> Response {
         Some(ErasureRefusal::NotRetired) => (StatusCode::CONFLICT, "agent_not_retired"),
         Some(ErasureRefusal::Unknown) => (StatusCode::NOT_FOUND, "agent_unknown"),
         Some(ErasureRefusal::Unsupported) => (StatusCode::CONFLICT, "agent_backend_unsupported"),
+        Some(ErasureRefusal::RevisionConflict(current)) => {
+            return super::capabilities::coded_error_with(
+                StatusCode::CONFLICT,
+                "revision_conflict",
+                "the config revision changed",
+                Some(("current_revision", current)),
+            );
+        }
         Some(ErasureRefusal::IncarnationMismatch(current)) => {
             return super::capabilities::coded_error_with(
                 StatusCode::CONFLICT,
@@ -38,11 +46,14 @@ pub(super) fn failure(error: &anyhow::Error, purge: bool) -> Response {
             )
         }
     };
-    coded_error(
-        status,
-        code,
-        "agent erasure is incomplete; retry with the same idempotency key",
-    )
+    let message = match code {
+        "idempotency_conflict" => "this idempotency key belongs to another request",
+        "agent_not_retired" => "retire the named agent before requesting purge",
+        "agent_unknown" => "no such agent; reconcile the agent inventory",
+        "agent_backend_unsupported" => "the memory backend does not support agent erasure",
+        _ => "agent erasure is incomplete; retry with the same idempotency key",
+    };
+    coded_error(status, code, message)
 }
 
 pub(super) fn idempotency_key(headers: &HeaderMap) -> Result<String, Box<Response>> {
@@ -228,4 +239,111 @@ pub(super) async fn drain(work: &EraseWork) -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(10), work_to_drain)
         .await
         .map_err(|_| ErasureRefusal::Pending)?
+}
+
+pub(super) async fn post_purge(
+    State(state): State<AppState>,
+    Path(agent): Path<String>,
+    Extension(principal): Extension<ApiPrincipal>,
+    headers: HeaderMap,
+    uri: Uri,
+    body: Bytes,
+) -> Response {
+    if !super::owner_authenticated(&state, &headers) {
+        return coded_error(
+            StatusCode::UNAUTHORIZED,
+            "auth_failed",
+            "a paired owner bearer is required",
+        );
+    }
+    if uri.query().is_some()
+        || (!body.is_empty() && serde_json::from_slice::<serde_json::Value>(&body).ok() != Some(serde_json::json!({})))
+    {
+        return coded_error(
+            StatusCode::BAD_REQUEST,
+            "field_invalid",
+            "purge takes no query parameters or body fields",
+        );
+    }
+    match crate::config::agent_name::AgentName::parse(&agent) {
+        Ok(name) if !name.is_reserved() => {}
+        _ => return coded_error(StatusCode::BAD_REQUEST, "agent_invalid", "purge requires a named agent"),
+    }
+    let key = match idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(response) => return *response,
+    };
+    let expected = match super::config::if_match_revision(&headers) {
+        Ok(Some(revision)) => revision,
+        _ => {
+            return coded_error(
+                StatusCode::BAD_REQUEST,
+                "field_invalid",
+                "If-Match must name a configuration revision",
+            );
+        }
+    };
+    let desired = state.config.desired();
+    let Some(current) = crate::config::manage::ConfigTransactions::base_revision(&desired) else {
+        return coded_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage_unavailable",
+            "no config revision is available",
+        );
+    };
+    let request = crate::memory::agent_erasure::AgentPurge {
+        workspace: desired.config.workspace_dir.to_string_lossy().into_owned(),
+        owner: principal.owner_id,
+        agent: agent.clone(),
+        key,
+        expected_revision: expected,
+        current_revision: current,
+    };
+    let memory = std::sync::Arc::clone(&state.mem);
+    let prepared = crate::runtime::blocking::spawn_blocking(move || {
+        memory
+            .agent_registry()
+            .ok_or(ErasureRefusal::Unsupported)?
+            .begin_agent_purge(&request)
+    })
+    .await;
+    let work = match prepared {
+        Ok(Ok(ErasePrepared::Replay(receipt))) => return Json(receipt).into_response(),
+        Ok(Ok(ErasePrepared::Work(work))) => work,
+        Ok(Err(error)) => return failure(&error, true),
+        Err(error) => return failure(&error.into(), true),
+    };
+    if let Err(error) = drain(&work).await {
+        return failure(&error, true);
+    }
+    let memory = std::sync::Arc::clone(&state.mem);
+    let erased_work = work.clone();
+    match crate::runtime::blocking::spawn_blocking(move || {
+        memory
+            .agent_registry()
+            .ok_or(ErasureRefusal::Unsupported)?
+            .finish_history_erase(&erased_work)
+    })
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => return failure(&error, true),
+        Err(error) => return failure(&error.into(), true),
+    }
+    if let Err(response) = super::agents::purge_config(&state, &agent, &headers).await {
+        return *response;
+    }
+    let memory = std::sync::Arc::clone(&state.mem);
+    match crate::runtime::blocking::spawn_blocking(move || {
+        memory
+            .agent_registry()
+            .ok_or(ErasureRefusal::Unsupported)?
+            .finish_agent_purge(&work)
+    })
+    .await
+    {
+        Ok(Ok(receipt)) => Json(receipt).into_response(),
+        Ok(Err(error)) => failure(&error, true),
+        Err(error) => failure(&error.into(), true),
+    }
 }

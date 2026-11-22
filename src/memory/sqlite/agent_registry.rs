@@ -322,6 +322,17 @@ pub(super) fn add_schema_scope_columns(conn: &rusqlite::Connection) -> anyhow::R
 }
 
 impl AgentRegistry for SqliteMemory {
+    fn begin_agent_purge(
+        &self,
+        request: &crate::memory::agent_erasure::AgentPurge,
+    ) -> anyhow::Result<crate::memory::agent_erasure::ErasePrepared> {
+        super::agent_purge::begin(self, request)
+    }
+
+    fn finish_agent_purge(&self, work: &crate::memory::agent_erasure::EraseWork) -> anyhow::Result<serde_json::Value> {
+        super::agent_purge::finish(self, work)
+    }
+
     fn begin_history_erase(
         &self,
         request: &crate::memory::agent_erasure::HistoryErase,

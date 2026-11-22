@@ -287,6 +287,10 @@ pub fn router(state: AppState) -> Router<AppState> {
                 .fallback(agents::agent_method_not_allowed),
         )
         .route(
+            "/agents/{name}/purge",
+            post(agent_erasure::post_purge).fallback(|| async { capabilities::method_not_allowed_allowing("POST") }),
+        )
+        .route(
             "/gateway/targeted-agents",
             get(agents::get_targeted_agents)
                 .put(agents::put_targeted_agents)
@@ -298,7 +302,8 @@ pub fn router(state: AppState) -> Router<AppState> {
         )
         .route(
             "/sessions/{id}/agents/{name}/history",
-            delete(agent_erasure::delete_history).fallback(capabilities::method_not_allowed),
+            delete(agent_erasure::delete_history)
+                .fallback(|| async { capabilities::method_not_allowed_allowing("DELETE") }),
         )
         .route(
             "/sessions/{id}/runs/{run_id}/cancel",

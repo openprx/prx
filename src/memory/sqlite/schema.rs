@@ -1131,6 +1131,7 @@ impl SqliteMemory {
         super::write_log::init_schema(conn)?;
         super::rf_forget::init_schema(conn)?;
         super::agent_erasure::init_schema(conn)?;
+        super::agent_purge::init_schema(conn)?;
         super::agent_erasure::check_manifest(conn)?;
         let unattributed: u64 = super::agent_migration::migrate_legacy_console(conn)?;
         if unattributed > 0 {

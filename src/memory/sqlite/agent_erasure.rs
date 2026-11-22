@@ -2,6 +2,7 @@
 //! terminal receipts follow independent coverage checks and WAL truncation.
 use super::{SqliteMemory, agent_registry::MANIFEST_STORES};
 use crate::memory::agent_erasure::{ErasePrepared, EraseWork, ErasureRefusal, HistoryErase};
+use crate::runtime::sqlite_pool::begin_immediate;
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::BTreeMap;
@@ -67,7 +68,7 @@ fn request_hash(request: &HistoryErase) -> anyhow::Result<String> {
 
 pub(super) fn begin_history(memory: &SqliteMemory, request: &HistoryErase) -> anyhow::Result<ErasePrepared> {
     let conn = memory.pool.write();
-    let tx = crate::runtime::sqlite_pool::begin_immediate(&conn)?;
+    let tx = begin_immediate(&conn)?;
     let hash = request_hash(request)?;
     let saved: Option<(String, String, Option<String>)> = tx
         .query_row(
@@ -86,6 +87,15 @@ pub(super) fn begin_history(memory: &SqliteMemory, request: &HistoryErase) -> an
             Some(receipt) => ErasePrepared::Replay(serde_json::from_str(&receipt)?),
             None => ErasePrepared::Work(serde_json::from_str(&work)?),
         });
+    }
+    let purge_key: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agent_purge_keys
+        WHERE workspace_id=?1 AND owner_id=?2 AND idempotency_key=?3)",
+        params![request.workspace, request.owner, request.key],
+        |row| row.get(0),
+    )?;
+    if purge_key {
+        return Err(ErasureRefusal::IdempotencyConflict.into());
     }
     if !request.configured {
         return Err(ErasureRefusal::Unknown.into());
@@ -177,6 +187,7 @@ pub(super) fn begin_history(memory: &SqliteMemory, request: &HistoryErase) -> an
         incarnation: incarnation.clone(),
         generation,
         forget_writes: request.forget_writes,
+        purge: false,
         runs,
         jobs,
         scopes,
@@ -230,9 +241,22 @@ fn erase_rows(
     scopes: &str,
     counts: &mut BTreeMap<String, u64>,
     erase_id: Option<&str>,
+    keep_message_keys: bool,
 ) -> anyhow::Result<()> {
     check_manifest(conn)?;
     let tables = stamped_tables(conn)?;
+    let mut extra_totals = BTreeMap::new();
+    for table in ["prx_remote_tree_resources", "ramflux_erase_index"] {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name=?1)",
+            [table],
+            |row| row.get(0),
+        )?;
+        if exists {
+            let total: i64 = conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row.get(0))?;
+            extra_totals.insert(table, u64::try_from(total)?);
+        }
+    }
     // Defer links while every member of the scoped family is removed.
     conn.execute_batch("PRAGMA defer_foreign_keys=ON")?;
     for (table, columns) in &tables {
@@ -284,7 +308,7 @@ fn erase_rows(
     }
     // Parent tables may cascade; all counts above include those removals.
     for (table, columns) in &tables {
-        if table == "rf_message_attempts" {
+        if table == "rf_message_attempts" && keep_message_keys {
             conn.execute(
                 "UPDATE rf_message_attempts SET deleted_at=COALESCE(deleted_at,?2),request_hash='',erase_pending=0
                 WHERE ma_scope_id IN(SELECT value FROM json_each(?1))",
@@ -307,6 +331,15 @@ fn erase_rows(
                 .context("erase row count increased")?,
         );
     }
+    for (table, before) in extra_totals {
+        let after: i64 = conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row.get(0))?;
+        counts.insert(
+            table.to_owned(),
+            before
+                .checked_sub(u64::try_from(after)?)
+                .context("derived erase count increased")?,
+        );
+    }
     for fts in ["memories_fts", "document_chunks_fts", "topics_fts"] {
         let exists: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name=?1)",
@@ -320,10 +353,10 @@ fn erase_rows(
     Ok(())
 }
 
-fn verify(conn: &Connection, scopes: &str) -> anyhow::Result<()> {
+fn verify(conn: &Connection, scopes: &str, keep_message_keys: bool) -> anyhow::Result<()> {
     check_manifest(conn)?;
     for (table, columns) in stamped_tables(conn)? {
-        let payload = if table == "rf_message_attempts" {
+        let payload = if table == "rf_message_attempts" && keep_message_keys {
             " AND (deleted_at IS NULL OR request_hash<>'' OR erase_pending<>0)"
         } else {
             ""
@@ -357,7 +390,7 @@ pub(super) fn finish_history(memory: &SqliteMemory, work: &EraseWork) -> anyhow:
     };
     {
         let writer = memory.pool.write();
-        let tx = crate::runtime::sqlite_pool::begin_immediate(&writer)?;
+        let tx = begin_immediate(&writer)?;
         let runs = serde_json::to_string(&work.runs)?;
         let mut query=tx.prepare("WITH RECURSIVE family(run) AS (
             SELECT value FROM json_each(?1) UNION SELECT e.run_id FROM message_events e JOIN family f ON e.parent_run_id=f.run
@@ -392,7 +425,7 @@ pub(super) fn finish_history(memory: &SqliteMemory, work: &EraseWork) -> anyhow:
                 [scope],
                 |row| row.get(0),
             )?;
-            if owner != work.erase_id {
+            if owner != work.erase_id && !work.purge {
                 return Err(ErasureRefusal::Pending.into());
             }
         }
@@ -411,7 +444,7 @@ pub(super) fn finish_history(memory: &SqliteMemory, work: &EraseWork) -> anyhow:
     }
     {
         let conn = memory.pool.write();
-        let tx = crate::runtime::sqlite_pool::begin_immediate(&conn)?;
+        let tx = begin_immediate(&conn)?;
         let (saved, erased): (String, bool) = tx.query_row(
             "SELECT work,main_erased FROM agent_erase_work WHERE erase_id=?1",
             [&work.erase_id],
@@ -438,13 +471,13 @@ pub(super) fn finish_history(memory: &SqliteMemory, work: &EraseWork) -> anyhow:
                     forgotten.documents_touched += found.documents_touched;
                 }
             }
-            erase_rows(&tx, &scopes, &mut counts, Some(&work.erase_id))?;
+            erase_rows(&tx, &scopes, &mut counts, Some(&work.erase_id), !work.purge)?;
             // Session previews are shared by agents; derive them again from survivors.
-            tx.execute("UPDATE sessions SET last_message_preview=COALESCE((SELECT substr(content,1,200) FROM conversation_turns
-                WHERE session_key=?1 AND deleted_at IS NULL ORDER BY id DESC LIMIT 1),''),
-                message_count=(SELECT count(*) FROM conversation_turns WHERE session_key=?1 AND deleted_at IS NULL)
-                WHERE session_key=?1",[&work.session])?;
-            verify(&tx, &scopes)?;
+            tx.execute("UPDATE sessions SET last_message_preview=COALESCE((SELECT substr(c.content,1,200) FROM conversation_turns c
+                WHERE c.session_key=sessions.session_key AND c.deleted_at IS NULL ORDER BY c.id DESC LIMIT 1),''),
+                message_count=(SELECT count(*) FROM conversation_turns c WHERE c.session_key=sessions.session_key AND c.deleted_at IS NULL)
+                WHERE session_key IN(SELECT session_key FROM agent_scopes WHERE scope_id IN(SELECT value FROM json_each(?1)))",[&scopes])?;
+            verify(&tx, &scopes, !work.purge)?;
             tx.execute(
                 "UPDATE agent_erase_work SET main_erased=1,counts=?2,forgotten=?3 WHERE erase_id=?1",
                 params![
@@ -459,8 +492,8 @@ pub(super) fn finish_history(memory: &SqliteMemory, work: &EraseWork) -> anyhow:
     erase_side_stores(memory, &work, &scopes)?;
     super::memory_impl::truncate_wal(&memory.pool, Duration::from_secs(4)).map_err(|_| ErasureRefusal::Pending)?;
     let conn = memory.pool.write();
-    let tx = crate::runtime::sqlite_pool::begin_immediate(&conn)?;
-    verify(&tx, &scopes)?;
+    let tx = begin_immediate(&conn)?;
+    verify(&tx, &scopes, !work.purge)?;
     let existing: Option<String> = tx.query_row(
         "SELECT receipt FROM agent_erase_work WHERE erase_id=?1",
         [&work.erase_id],
@@ -496,14 +529,16 @@ pub(super) fn finish_history(memory: &SqliteMemory, work: &EraseWork) -> anyhow:
         "UPDATE agent_erase_work SET receipt=?2 WHERE erase_id=?1",
         params![work.erase_id, serde_json::to_string(&receipt)?],
     )?;
-    let next = work.generation.checked_add(1).context("erase generation exhausted")?;
-    tx.execute(
-        "INSERT INTO agent_scopes(scope_id,workspace_id,owner_id,session_key,agent_key,incarnation,generation)
+    if !work.purge {
+        let next = work.generation.checked_add(1).context("erase generation exhausted")?;
+        tx.execute(
+            "INSERT INTO agent_scopes(scope_id,workspace_id,owner_id,session_key,agent_key,incarnation,generation)
         SELECT ?1,workspace_id,owner_id,session_key,agent_key,incarnation,?2 FROM agent_scopes a WHERE scope_id=?3
         AND EXISTS(SELECT 1 FROM agent_incarnations i WHERE i.workspace_id=a.workspace_id AND i.owner_id=a.owner_id
         AND i.agent_key=a.agent_key AND i.incarnation=a.incarnation AND i.state='active')",
-        params![uuid::Uuid::new_v4().to_string(), next, work.scope_id],
-    )?;
+            params![uuid::Uuid::new_v4().to_string(), next, work.scope_id],
+        )?;
+    }
     tx.commit()?;
     Ok(receipt)
 }
@@ -511,17 +546,42 @@ pub(super) fn finish_history(memory: &SqliteMemory, work: &EraseWork) -> anyhow:
 fn erase_side_stores(memory: &SqliteMemory, work: &EraseWork, scopes: &str) -> anyhow::Result<()> {
     let workspace = std::path::Path::new(&work.workspace);
     for path in [
-        workspace.join(crate::decision_engine::observe::TELEMETRY_FILE),
+        workspace.join("decision-engine.sqlite"),
         workspace.join("state/chat-mailbox.db"),
     ] {
         if !path.try_exists()? {
             continue;
         }
-        let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        let conn = Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
         conn.busy_timeout(Duration::from_secs(4))?;
         conn.execute_batch("PRAGMA secure_delete=ON;PRAGMA foreign_keys=ON;
             CREATE TABLE IF NOT EXISTS agent_erase_side_progress(erase_id TEXT PRIMARY KEY,counts TEXT NOT NULL) STRICT;")?;
-        let tx = crate::runtime::sqlite_pool::begin_immediate(&conn)?;
+        let tx = begin_immediate(&conn)?;
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS agent_erase_side_fences(scope_id TEXT PRIMARY KEY) STRICT;")?;
+        tx.execute(
+            "INSERT OR IGNORE INTO agent_erase_side_fences SELECT value FROM json_each(?1)",
+            [scopes],
+        )?;
+        // Side writers have their own connections and queues. Durable triggers
+        // close stale writes there too, after cancellation and after restart.
+        check_manifest(&tx)?;
+        for (table, columns) in stamped_tables(&tx)? {
+            let sealed = columns
+                .iter()
+                .map(|column| format!("EXISTS(SELECT 1 FROM agent_erase_side_fences WHERE scope_id=NEW.\"{column}\")"))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            for operation in ["INSERT", "UPDATE"] {
+                tx.execute_batch(&format!(
+                    "CREATE TRIGGER IF NOT EXISTS agent_erase_fence_{table}_{operation}
+                    BEFORE {operation} ON \"{table}\" WHEN {sealed}
+                    BEGIN SELECT RAISE(ABORT,'history_pending'); END;"
+                ))?;
+            }
+        }
         let old: Option<String> = tx
             .query_row(
                 "SELECT counts FROM agent_erase_side_progress WHERE erase_id=?1",
@@ -533,8 +593,8 @@ fn erase_side_stores(memory: &SqliteMemory, work: &EraseWork, scopes: &str) -> a
             serde_json::from_str::<BTreeMap<String, u64>>(&old)?
         } else {
             let mut counts = BTreeMap::new();
-            erase_rows(&tx, scopes, &mut counts, None)?;
-            verify(&tx, scopes)?;
+            erase_rows(&tx, scopes, &mut counts, None, !work.purge)?;
+            verify(&tx, scopes, !work.purge)?;
             tx.execute(
                 "INSERT INTO agent_erase_side_progress VALUES(?1,?2)",
                 params![work.erase_id, serde_json::to_string(&counts)?],
@@ -549,7 +609,7 @@ fn erase_side_stores(memory: &SqliteMemory, work: &EraseWork, scopes: &str) -> a
         // Each side transaction retained its own counts. Apply them exactly
         // once, with the main progress update, even after a crash between DBs.
         let writer = memory.pool.write();
-        let tx = crate::runtime::sqlite_pool::begin_immediate(&writer)?;
+        let tx = begin_immediate(&writer)?;
         let path_key = path.to_string_lossy();
         let applied: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM agent_erase_side_applied WHERE erase_id=?1 AND store_path=?2)",

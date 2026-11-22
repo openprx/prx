@@ -144,6 +144,7 @@ const ALLOWED_BRAIN_DB_OPENS_OUTSIDE_SQLITE_REPOSITORY: &[&str] = &[
 /// backend (everything but the tests directory). Both lists are compared with
 /// the directory, so a new file must be placed in one of them on purpose.
 const SQLITE_BACKEND_FILES: &[&str] = &[
+    "agent_erasure.rs",
     "agent_migration.rs",
     "agent_registry.rs",
     "approval_grants.rs",
@@ -168,6 +169,7 @@ const SQLITE_BACKEND_FILES: &[&str] = &[
 /// Older child modules that were never part of the exemption for the
 /// repository root and stay scanned like any other file.
 const SQLITE_SEPARATE_MODULES: &[&str] = &[
+    "agent_purge.rs",
     // R3d transactional branch copy; runs on the backend's pool, opens nothing.
     "branch_copy.rs",
     "event_batch.rs",
@@ -348,6 +350,10 @@ fn runtime_and_message_events_preserve_typed_config_generation_columns() {
     // fails the build if one of them moves, and a column that moves to a file
     // missing from this list fails the check below, so neither can go blind.
     let sqlite_sources = [
+        (
+            "agent_erasure.rs",
+            include_str!("../../src/memory/sqlite/agent_erasure.rs"),
+        ),
         ("mod.rs", include_str!("../../src/memory/sqlite/mod.rs")),
         (
             "agent_migration.rs",

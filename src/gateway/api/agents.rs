@@ -735,3 +735,17 @@ async fn put_switch(
 pub(super) async fn switch_method_not_allowed() -> Response {
     method_not_allowed_allowing("GET,HEAD,PUT")
 }
+
+/// Purge is an explicit owner destructive action. Remove only the named
+/// configuration through the same CAS/activation engine as agent management.
+pub(super) async fn purge_config(state: &AppState, name: &str, headers: &HeaderMap) -> Result<(), Box<Response>> {
+    if !state.config.desired().config.agents.contains_key(name) {
+        return Ok(());
+    }
+    let write = Write::of(&WriteQuery::confirming(true), headers)?;
+    let change = ManagedChange::PurgeAgent { agent: name.to_owned() };
+    manage::commit_as_owner(state, &change, &write, true)
+        .await
+        .map_err(|error| Box::new(owner_refusal_of(error).into_response()))?;
+    Ok(())
+}

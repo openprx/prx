@@ -7,6 +7,8 @@ pub enum ErasureRefusal {
     IdempotencyConflict,
     #[error("incarnation_mismatch")]
     IncarnationMismatch(String),
+    #[error("revision_conflict")]
+    RevisionConflict(String),
     #[error("history_pending")]
     Pending,
     #[error("agent_not_retired")]
@@ -43,6 +45,7 @@ pub struct EraseWork {
     pub incarnation: String,
     pub generation: i64,
     pub forget_writes: bool,
+    pub purge: bool,
     pub scopes: Vec<String>,
     pub runs: Vec<String>,
     pub jobs: Vec<String>,
@@ -51,4 +54,14 @@ pub struct EraseWork {
 pub enum ErasePrepared {
     Replay(serde_json::Value),
     Work(Box<EraseWork>),
+}
+
+#[derive(Clone)]
+pub struct AgentPurge {
+    pub workspace: String,
+    pub owner: String,
+    pub agent: String,
+    pub key: String,
+    pub expected_revision: String,
+    pub current_revision: String,
 }

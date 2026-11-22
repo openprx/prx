@@ -206,6 +206,7 @@ const fn operation_name(change: &ManagedChange) -> &'static str {
             "gateway_api:routes:update"
         }
         ManagedChange::BindAgent { .. } | ManagedChange::PutAgent { .. } => "gateway_api:agents:update",
+        ManagedChange::PurgeAgent { .. } => "gateway_api:agents:purge",
         ManagedChange::RetireAgent { .. } => "gateway_api:agents:retire",
         ManagedChange::SetTargetedAgents { .. } => "gateway_api:gateway:targeted-agents",
     }
