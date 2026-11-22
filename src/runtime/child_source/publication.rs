@@ -389,9 +389,10 @@ impl OrdinaryChildPublication {
         &self,
         caller: &crate::tools::ToolExecutionContext,
         allowed_tools: Option<BTreeSet<String>>,
+        registry: Option<Arc<Vec<Box<dyn Tool>>>>,
     ) -> anyhow::Result<Arc<TurnRuntimeService>> {
         self.verify_caller(caller)?;
-        self.derive_child_service(allowed_tools, None, None, &[])
+        self.derive_child_service(allowed_tools, None, registry, &[])
     }
 
     pub(crate) fn task_service(
@@ -415,6 +416,10 @@ impl OrdinaryChildPublication {
     ) -> anyhow::Result<Arc<TurnRuntimeService>> {
         let runtime = self.loop_runtime()?.clone();
         let parent = &self.inner.service;
+        let security = Arc::new(crate::security::SecurityPolicy {
+            autonomy: self.level(),
+            ..parent.security.as_ref().clone()
+        });
         let (registry, execution) = task_registry.map_or_else(
             || (Arc::clone(&parent.registry), Arc::clone(&parent.execution)),
             |registry| {
@@ -424,7 +429,7 @@ impl OrdinaryChildPublication {
                 let execution = Arc::new(
                     ToolExecutionService::from_shared_boxed_registry(
                         Arc::clone(&registry),
-                        Arc::new(crate::tools::SecurityEffectPolicy::new(Arc::clone(&parent.security))),
+                        Arc::new(crate::tools::SecurityEffectPolicy::new(Arc::clone(&security))),
                         Arc::new(crate::tools::DenyApprovalStrategy),
                         Arc::new(crate::tools::AdapterOwnedPreparation),
                         Arc::new(crate::tools::TracingToolExecutionAudit),
@@ -454,12 +459,8 @@ impl OrdinaryChildPublication {
             );
         }
         parent.catalog.check_child_parity(&execution, self.scope())?;
-        let policy_version = pinned_policy_version(
-            &parent.generation.effective,
-            &parent.security,
-            &policy,
-            &parent.state_key,
-        )?;
+        let policy_version =
+            pinned_policy_version(&parent.generation.effective, &security, &policy, &parent.state_key)?;
         let factory = DecisionBackendFactory::from_config(
             &parent.generation.effective,
             FactoryDeps {
@@ -480,7 +481,7 @@ impl OrdinaryChildPublication {
                 )),
                 Some(self.allocate_child_budget()?.1.money()),
                 &parent.generation.effective,
-                &parent.security,
+                &security,
             )),
             // R9/R26: an enabled engine analyses the child's own turns on
             // the child's runtime context and accounting scope.
@@ -516,7 +517,7 @@ impl OrdinaryChildPublication {
             registry,
             execution,
             memory: Arc::clone(&parent.memory),
-            security: Arc::clone(&parent.security),
+            security: Arc::clone(&security),
         }))
     }
 

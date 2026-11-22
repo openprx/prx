@@ -288,7 +288,7 @@ pub(super) fn admit_child(
     };
     // Full autonomy has no permission limits (R51): manifest membership does
     // not limit a Full child. Scope MAC, pin and parity above and below stay.
-    let full = service.policy.autonomy_level() == crate::security::AutonomyLevel::Full;
+    let full = scope.gate_inputs().0.authority.level == crate::security::AutonomyLevel::Full;
     if !full && !scope.gate_inputs().0.allowed.contains(&reference) {
         return Err(stale());
     }

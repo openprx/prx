@@ -1055,7 +1055,8 @@ mod tests {
         let denied_workspace = TempDir::new().expect("test: workspace");
         let recorder = RecordingChannel::new(false);
         let denied_publication = published(&recorder);
-        let denied_config = scoped_config(denied_workspace.path(), &[], None);
+        let mut denied_config = scoped_config(denied_workspace.path(), &[], None);
+        denied_config.autonomy.level = AutonomyLevel::Supervised;
         let (denied_url, _denied_port, denied_server) = serve(test_app_state(denied_config)).await;
         let (denied_status, refusal_body) = post_raw(
             &denied_url,

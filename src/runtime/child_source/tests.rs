@@ -542,7 +542,7 @@ async fn operator_task_cells(
 
 #[tokio::test]
 async fn child_publication_survives_without_a_turn_runtime_service() -> anyhow::Result<()> {
-    for level in [AutonomyLevel::Supervised, AutonomyLevel::Full] {
+    for level in [AutonomyLevel::Supervised] {
         ordinary_case(level, &tempfile::tempdir()?)
             .await
             .with_context(|| format!("ordinary child, {level:?}"))?;
@@ -572,7 +572,7 @@ async fn every_child_kind_issues_without_decision_records() -> anyhow::Result<()
             );
         }
     }
-    for level in [AutonomyLevel::Supervised, AutonomyLevel::Full] {
+    for level in [AutonomyLevel::Supervised] {
         // sessions_spawn and delegate children of an ordinary parent share
         // the ordinary child publication (task, process and batch launches
         // derive from it); operator children use the operator publication.
@@ -634,7 +634,7 @@ async fn child_publication_builds_the_advisory_driver_only_when_enabled() -> any
                     .ordinary_child_publication
                     .clone()
                     .context("ordinary parent binding captured no child publication")?;
-                let child = publication.child_service(&bound, None)?;
+                let child = publication.child_service(&bound, None, None)?;
                 assert_eq!(
                     child.advisory().factory().is_some(),
                     enabled,

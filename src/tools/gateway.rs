@@ -1136,6 +1136,7 @@ mod tests {
             "action": "config.patch",
             "_prx_scope_trusted": true,
             "patch": patch,
+            crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG: serde_json::to_value(ApprovalGrant::for_resource_operation("gateway", "gateway:config.patch", "test", None)).unwrap(),
         })
     }
 

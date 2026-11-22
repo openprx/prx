@@ -265,7 +265,6 @@ const CATCH_UNWIND_FILES: &[&str] = &[
     "src/chat/tests/legacy_chat_compaction_audit_tests.rs",
     "src/chat/tests/session_cleanup_tests.rs",
     "src/decision_engine/prediction/builtin/mod.rs",
-    "src/gateway/api/runtime.rs",
     "src/gateway/tests/mod.rs",
     "src/gateway/tests/platform_jobs.rs",
     "src/gateway/tests/webhook_turns.rs",

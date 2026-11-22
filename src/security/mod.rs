@@ -12,6 +12,7 @@ pub mod agent_level;
 pub(crate) mod approval_ledger;
 pub(crate) mod approval_operation;
 pub mod audit;
+mod command_paths;
 pub mod decision_id;
 pub mod git_launch;
 pub mod inbound_gate;

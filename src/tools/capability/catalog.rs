@@ -601,7 +601,15 @@ impl CapabilityCatalog {
         if manifest.catalog_generation != self.generation {
             return Err(ParityError);
         }
-        self.check_published_parity(exec, &manifest.allowed)
+        // Full children inherit the complete level surface, including parent
+        // backends this child executor cannot serve. Every served reference
+        // still needs exact descriptor/binding parity; below Full the entire
+        // sealed subset must be executable as before.
+        if manifest.authority.level == crate::security::AutonomyLevel::Full {
+            self.check_published_parity(exec, &self.served_references(exec, &manifest.allowed))
+        } else {
+            self.check_published_parity(exec, &manifest.allowed)
+        }
     }
 
     /// Whether `exec` registers the backend that runs `entry`. A worker's

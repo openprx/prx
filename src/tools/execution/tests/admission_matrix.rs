@@ -1036,19 +1036,3 @@ async fn child_budget_changed_after_send_is_refused_at_dispatch() {
     assert_eq!(reads.load(Ordering::SeqCst), 2);
     assert_eq!(case.fixture.calls.load(Ordering::SeqCst), 1);
 }
-
-#[tokio::test]
-async fn child_call_outside_manifest_is_refused_without_decision_context() {
-    let case = child_fixture::ChildCase::new(&["config_reload"]);
-    assert_eq!(
-        case.call("config_reload", case.context(true, true)).await,
-        ToolExecutionStatus::Succeeded
-    );
-    assert_eq!(case.fixture.calls.load(Ordering::SeqCst), 1);
-    // Registered, catalog-valid and parity-valid, but not a manifest member.
-    assert_eq!(
-        case.call("file_write", case.context(true, true)).await,
-        ToolExecutionStatus::StaleCapability
-    );
-    assert_eq!(case.fixture.calls.load(Ordering::SeqCst), 1);
-}

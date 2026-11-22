@@ -183,10 +183,11 @@ fn runtime_autonomy(
 ) -> Arc<ChannelRuntimeContext> {
     let mut channels_by_name = HashMap::new();
     channels_by_name.insert(channel.name().to_string(), channel);
-    let config = crate::config::Config {
+    let mut config = crate::config::Config {
         workspace_dir: dir.to_path_buf(),
         ..crate::config::Config::default()
     };
+    config.autonomy.level = autonomy;
     let runtime = Arc::new(ChannelRuntimeContext {
         publication_slot: Arc::new(turn_source::publication_slot::ChannelPublicationSlot::default()),
         config: crate::config::new_shared(config.clone()),
@@ -603,7 +604,7 @@ async fn approval_decision_round(decision: &str, executions_expected: usize) {
         Arc::clone(&memory) as Arc<dyn Memory>,
         Arc::new(Mutex::new(HashMap::new())),
     );
-    let ctx = runtime(
+    let ctx = runtime_autonomy(
         dir.path(),
         Arc::clone(&channel) as Arc<dyn Channel>,
         Arc::new(ToolThenText),
@@ -615,6 +616,7 @@ async fn approval_decision_round(decision: &str, executions_expected: usize) {
             always_include: vec!["mock_price".to_string()],
             ..crate::config::ToolTieringConfig::default()
         },
+        crate::security::AutonomyLevel::Supervised,
     );
     spawn_turns(channel.clone(), ctx);
     let mut host = Host::connect(channel.socket_path()).await;

@@ -69,7 +69,11 @@ async fn child_scope_round(supervised: bool) {
         default_model: Some("parent-scope-model".into()),
         ..crate::config::Config::default()
     };
-    config.autonomy.level = crate::security::AutonomyLevel::Full;
+    config.autonomy.level = if supervised {
+        crate::security::AutonomyLevel::Supervised
+    } else {
+        crate::security::AutonomyLevel::Full
+    };
     config.reliability.provider_retries = 0;
     config.tool_tiering.always_include = vec!["sessions_spawn".into(), "memory_store".into()];
     for model in ["parent-scope-model", "child-scope-model"] {

@@ -133,13 +133,14 @@ impl PublicationRules<'_, '_> {
     /// own executor serves.
     pub(crate) fn child_membership_admits(&self, reference: &CapabilityRef) -> bool {
         self.facts.child_scope().is_none_or(|(manifest, _)| {
-            manifest.allowed.contains(reference)
-                || (self.full_autonomy()
-                    && self
-                        .facts
-                        .child_served
-                        .as_ref()
-                        .is_none_or(|served| served.contains(&reference.id)))
+            if self.full_autonomy() {
+                self.facts
+                    .child_served
+                    .as_ref()
+                    .is_none_or(|served| served.contains(&reference.id))
+            } else {
+                manifest.allowed.contains(reference)
+            }
         })
     }
 
@@ -169,7 +170,7 @@ impl PublicationRules<'_, '_> {
                 && estimated_cost.is_some_and(|cost| {
                     cost.micro_usd <= u64::from(manifest.authority.max_cost_cents).saturating_mul(10_000)
                 })
-                && (full || manifest.allowed.contains(reference))
+                && self.child_membership_admits(reference)
         });
         if trusted.workspace_id.is_empty()
             || trusted
@@ -284,11 +285,10 @@ impl PublicationRules<'_, '_> {
                     return None;
                 }
                 // A Full child has no manifest membership limit (R51), but its
-                // catalog is the parent's pinned one: outside the manifest it
-                // publishes only what its own executor serves, so its call
+                // catalog is the parent's pinned one: it publishes only what
+                // its own executor serves, so its call
                 // budget funds every tool it can actually see.
-                if let (Some(served), Some((manifest, _))) = (&self.facts.child_served, self.facts.child_scope())
-                    && !manifest.allowed.contains(&reference)
+                if let Some(served) = &self.facts.child_served
                     && !served.contains(&entry.id)
                 {
                     return None;

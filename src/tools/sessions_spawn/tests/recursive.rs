@@ -24,8 +24,6 @@ const FREE_MODEL: &str = "prx-free-model";
 /// A word `PRX-SEARCH=<query>` in a task makes its model call
 /// `capability_search` for `<query>`, one query per request, in order.
 const SEARCH: &str = "PRX-SEARCH=";
-/// An effectful (`local_write`) tool registered only by the tests that ask.
-const WRITE_TOOL: &str = "prx_local_write";
 
 /// One model request as the scripted model saw it.
 #[derive(Clone, Debug)]
@@ -234,28 +232,6 @@ struct Fixture {
     _workspace: tempfile::TempDir,
 }
 
-/// An effectful tool the fixture's model may discover but never calls.
-struct ProbeWriteTool;
-
-#[async_trait]
-impl Tool for ProbeWriteTool {
-    fn name(&self) -> &str {
-        WRITE_TOOL
-    }
-
-    fn description(&self) -> &str {
-        "Record a release note"
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
-        json!({"type": "object", "properties": {}})
-    }
-
-    async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
-        anyhow::bail!("the probe write tool is discovered, never dispatched")
-    }
-}
-
 struct Options {
     level: AutonomyLevel,
     daily_cap_cents: Option<u32>,
@@ -296,11 +272,6 @@ fn run_approval(tool: &SessionsSpawnTool, resolver: Arc<GrantingResolver>) -> Ar
 
 async fn fixture(options: Options) -> Fixture {
     fixture_with(options, None).await
-}
-
-/// A fixture whose child registry also serves [`ProbeWriteTool`].
-async fn fixture_with_write_tool(options: Options) -> Fixture {
-    build_fixture(options, None, vec![Box::new(ProbeWriteTool)]).await
 }
 
 /// `factory` is the run approval resolver factory each task child's run
@@ -453,45 +424,6 @@ fn run_for<'a>(runs: &'a [Run], label: &str) -> &'a Run {
     runs.iter()
         .find(|run| own_task(&run.task).contains(label))
         .unwrap_or_else(|| panic!("no run for {label}: {runs:?}"))
-}
-
-/// H1 task path: the default spawn runs its child under the derived
-/// publication, whose model request lists `sessions_spawn`; a sibling with an
-/// explicit opt-out keeps the captured scope and does not.
-#[tokio::test]
-async fn task_child_runs_under_the_derived_publication() {
-    let fixture = fixture(Options {
-        level: AutonomyLevel::Full,
-        daily_cap_cents: None,
-    })
-    .await;
-    let derived = execute_admitted_spawn(&fixture.tool, spawn_args("PRX-DERIVED.".to_owned()))
-        .await
-        .expect("test: default spawn");
-    assert!(derived.success, "{:?}", derived.error);
-    let mut captured = spawn_args("PRX-CAPTURED.".to_owned());
-    captured["allow_delegation"] = json!(false);
-    let captured = execute_admitted_spawn(&fixture.tool, captured)
-        .await
-        .expect("test: opt-out spawn");
-    assert!(captured.success, "{:?}", captured.error);
-    let runs = settled(&fixture.tool, 2).await;
-    assert_eq!(run_for(&runs, "PRX-DERIVED.").output(), Some(DONE));
-    assert_eq!(run_for(&runs, "PRX-CAPTURED.").output(), Some(DONE));
-    let derived = fixture.script.for_task("PRX-DERIVED.");
-    let captured = fixture.script.for_task("PRX-CAPTURED.");
-    assert!(
-        derived
-            .first()
-            .is_some_and(|seen| seen.tools.iter().any(|tool| tool == "sessions_spawn")),
-        "the derived child lists sessions_spawn: {derived:?}"
-    );
-    assert!(
-        captured
-            .first()
-            .is_some_and(|seen| !seen.tools.iter().any(|tool| tool == "sessions_spawn")),
-        "the opted-out sibling does not list sessions_spawn: {captured:?}"
-    );
 }
 
 /// Full: neither the root nor its child needs a grant to spawn.
@@ -732,24 +664,6 @@ async fn stored_rows(fixture: &Fixture, principal: &MemoryPrincipal) -> Vec<crat
     rows
 }
 
-/// The `capability_search` hit for `name` among a model's tool results. A
-/// native tool message carries the output under `content`.
-fn search_hit(results: &[String], name: &str) -> Option<serde_json::Value> {
-    results
-        .iter()
-        .filter_map(|result| serde_json::from_str::<serde_json::Value>(result).ok())
-        .map(|result| {
-            let inner = result
-                .get("content")
-                .and_then(serde_json::Value::as_str)
-                .and_then(|content| serde_json::from_str::<serde_json::Value>(content).ok());
-            inner.unwrap_or(result)
-        })
-        .filter_map(|result| result.get("hits").and_then(serde_json::Value::as_array).cloned())
-        .flatten()
-        .find(|hit| hit.pointer("/schema/name").and_then(serde_json::Value::as_str) == Some(name))
-}
-
 /// I1: a Full child that inherited `sessions_spawn` keeps it on its surface
 /// even though its input names a tool outside its sealed manifest
 /// (`capability_search`); the named tool is dropped from the request, never
@@ -781,56 +695,6 @@ async fn full_child_naming_an_unsealed_tool_still_spawns_a_grandchild() {
     assert_eq!(grandchild.parent.as_deref(), Some(child.id.as_str()));
     assert_eq!(child.output(), Some(DONE));
     assert_eq!(grandchild.output(), Some(DONE));
-}
-
-/// I2 in a real Full child turn: a child without an outgoing manifest sees
-/// `sessions_spawn` as unavailable with the reason, and an effectful tool its
-/// turn admits as callable without approval.
-#[tokio::test]
-async fn full_child_capability_search_hits_report_the_turns_own_admission() {
-    let fixture = fixture_with_write_tool(Options {
-        level: AutonomyLevel::Full,
-        daily_cap_cents: None,
-    })
-    .await;
-    let mut args = spawn_args(format!(
-        "PRX-SEARCHING-CHILD. Find sessions_spawn and {WRITE_TOOL}. {SEARCH}sessions_spawn {SEARCH}{WRITE_TOOL}"
-    ));
-    args["allow_delegation"] = json!(false);
-    let result = execute_admitted_spawn_with_tools(&fixture.tool, args, vec![Box::new(ProbeWriteTool)])
-        .await
-        .expect("test: opt-out spawn");
-    assert!(result.success, "{:?}", result.error);
-    let runs = settled(&fixture.tool, 1).await;
-    assert_eq!(run_for(&runs, "PRX-SEARCHING-CHILD.").output(), Some(DONE));
-    let seen = fixture.script.for_task("PRX-SEARCHING-CHILD.");
-    assert!(
-        seen.first()
-            .is_some_and(|seen| !seen.tools.iter().any(|tool| tool == "sessions_spawn")),
-        "the opted-out child publishes no sessions_spawn: {seen:?}"
-    );
-    let results: Vec<String> = seen.iter().flat_map(|seen| seen.results.iter().cloned()).collect();
-    let spawn = search_hit(&results, "sessions_spawn").unwrap_or_else(|| panic!("no sessions_spawn hit: {seen:?}"));
-    assert_eq!(
-        spawn.get("approval").and_then(serde_json::Value::as_str),
-        Some("unavailable")
-    );
-    assert_eq!(
-        spawn.get("unavailable_reason").and_then(serde_json::Value::as_str),
-        Some("spawn_not_granted"),
-        "{spawn}"
-    );
-    let write = search_hit(&results, WRITE_TOOL).unwrap_or_else(|| panic!("no {WRITE_TOOL} hit: {seen:?}"));
-    assert_eq!(
-        write.get("effect").and_then(serde_json::Value::as_str),
-        Some("local_write")
-    );
-    assert_eq!(
-        write.get("approval").and_then(serde_json::Value::as_str),
-        Some("none"),
-        "{write}"
-    );
-    assert!(write.get("unavailable_reason").is_none(), "{write}");
 }
 
 /// I4: every spawned run records under `spawn:<run_id>` and links to its

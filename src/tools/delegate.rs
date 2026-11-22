@@ -1401,7 +1401,7 @@ impl DelegateLoopResources {
                 let owner = cleanup_owner
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("ordinary delegate cleanup owner missing"))?;
-                let service = publication.child_service(caller, allowed_tools)?;
+                let service = publication.child_service(caller, allowed_tools, Some(Arc::clone(&registry)))?;
                 owner.retain_child_service(Arc::clone(&service))?;
                 (service, Arc::clone(&publication.generation().effective))
             };

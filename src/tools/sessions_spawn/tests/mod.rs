@@ -732,16 +732,6 @@ async fn execute_admitted_spawn(tool: &SessionsSpawnTool, arguments: serde_json:
     execute_admitted_spawn_with_plane(tool, arguments, false, None, Vec::new()).await
 }
 
-/// `execute_admitted_spawn` with `extra` registered beside the spawn tool in
-/// the admitted parent's catalog, so a child turn can discover them.
-async fn execute_admitted_spawn_with_tools(
-    tool: &SessionsSpawnTool,
-    arguments: serde_json::Value,
-    extra: Vec<Box<dyn Tool>>,
-) -> anyhow::Result<ToolResult> {
-    execute_admitted_spawn_with_plane(tool, arguments, false, None, extra).await
-}
-
 /// `execute_admitted_spawn` with the root dispatch under `approval`, as a
 /// root turn's runtime adapter runs it under the run's approval strategy.
 async fn execute_admitted_spawn_with_approval(
