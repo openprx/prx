@@ -227,6 +227,9 @@ pub struct WorkerManifest {
     pub session_scope_key: String,
     #[serde(default)]
     pub parent_run_id: Option<String>,
+    /// The top-level run the worker's run descends from (write provenance).
+    #[serde(default)]
+    pub root_run_id: Option<String>,
     /// Sealed remote provenance for a chained turn. Absent on local operator work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inherited_provenance: Option<crate::messaging::InheritedProvenance>,
@@ -452,6 +455,7 @@ mod tests {
             spawn_depth: 1,
             session_scope_key: "telegram:chat-1:openprx_user".into(),
             parent_run_id: Some("run-0".into()),
+            root_run_id: None,
             inherited_provenance: None,
             session_addr: None,
             compaction_config: Some(crate::config::AgentCompactionConfig::default()),
@@ -633,6 +637,7 @@ mod tests {
             spawn_depth: 0,
             session_scope_key: "s".into(),
             parent_run_id: None,
+            root_run_id: None,
             inherited_provenance: None,
             session_addr: None,
             compaction_config: None,

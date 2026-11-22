@@ -203,7 +203,10 @@ pub(super) async fn plan_os_paging(
         persona_id: runtime.persona_id.clone(),
     };
 
-    match runtime.memory.ingest_document(input).await {
+    match crate::memory::write_provenance::apply(&runtime.memory)
+        .ingest_document(input)
+        .await
+    {
         Ok(document) => {
             tracing::info!(
                 document_id = %crate::agent::diagnostics::text_class(&document.document_id),

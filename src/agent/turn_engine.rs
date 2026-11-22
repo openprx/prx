@@ -149,7 +149,11 @@ pub(crate) async fn run_turn(
         .as_ref()
         .and_then(|adapter| adapter.provider_trace.clone());
     let started = std::time::Instant::now();
-    let inner = Box::pin(run_turn_unguarded(history, request, services, delivery));
+    let provenance = turn_write_provenance(&services);
+    let inner = Box::pin(crate::memory::write_provenance::scope_turn(
+        provenance,
+        run_turn_unguarded(history, request, services, delivery),
+    ));
     let result = crate::agent::idle::run_guarded(
         crate::agent::idle::configured(),
         channel_name,
@@ -347,6 +351,24 @@ fn outbound_middleware_calls() -> usize {
 ///
 /// Split out only so [`run_turn`] can wrap it; every caller must go through
 /// the guarded entrypoint.
+/// The run this turn's writes belong to: the execution adapter's envelope
+/// (every ingress and child turn), else the envelope the turn's ingest
+/// runtime was built from (single-shot, cron and xin turns, whose adapter is
+/// synthetic).
+fn turn_write_provenance(services: &TurnServices<'_>) -> Option<crate::memory::write_provenance::WriteProvenance> {
+    services
+        .runtime_adapter
+        .as_ref()
+        .and_then(|adapter| adapter.tool_execution_context.envelope.write_provenance())
+        .or_else(|| {
+            services
+                .memory
+                .ingest
+                .as_ref()
+                .and_then(|ingest| ingest.write_provenance.clone())
+        })
+}
+
 async fn run_turn_unguarded(
     history: &mut Vec<ChatMessage>,
     request: TurnRequest<'_>,

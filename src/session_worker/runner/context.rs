@@ -198,6 +198,9 @@ fn worker_runtime_envelope_for_workspace(manifest: &WorkerManifest, workspace_id
     if let Some(parent_run_id) = manifest.parent_run_id.as_deref() {
         envelope = envelope.with_parent_run_id(parent_run_id);
     }
+    if let Some(root_run_id) = manifest.root_run_id.as_deref() {
+        envelope = envelope.with_root_run_id(root_run_id);
+    }
     if let Some(sender) = manifest.scope_sender.as_deref() {
         envelope = envelope.with_sender(sender);
     }

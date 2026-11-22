@@ -119,7 +119,7 @@ impl Tool for MemoryStoreTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let memory = crate::memory::active_view::current().unwrap_or_else(|| Arc::clone(&self.memory));
+        let memory = crate::memory::active_view::select(&self.memory);
         let key = args
             .get("key")
             .and_then(|v| v.as_str())

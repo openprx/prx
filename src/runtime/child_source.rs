@@ -256,6 +256,7 @@ impl ChildInputReceipt {
         };
         envelope.source_message_event_id = Some(event.event_id.clone());
         envelope.parent_run_id = event.parent_run_id.clone();
+        envelope.root_run_id = crate::memory::write_provenance::child_root(event.parent_run_id.as_deref());
         envelope.parent_session_key = event.parent_session_key.clone();
         envelope.agent_id = event.agent_id.clone();
         envelope.persona_id = event.persona_id.clone();
@@ -750,8 +751,17 @@ impl ChildProviderBinding {
             Some(caller),
         )?;
         let proof = Arc::new(self.ordinary_source_proof(provider, caller, &bound, input, receipt)?);
+        // The child descends from its caller's root run.
+        let root_run_id = caller
+            .context()
+            .envelope
+            .write_provenance()
+            .map(|caller_run| caller_run.root_run_id().to_owned());
         if let Some(receipt) = receipt {
-            let execution = receipt.execution_context(proof.as_ref())?;
+            let mut execution = receipt.execution_context(proof.as_ref())?;
+            if root_run_id.is_some() {
+                execution.envelope.root_run_id = root_run_id;
+            }
             return Ok((proof, execution));
         }
         let mut envelope = match bound.source {
@@ -773,6 +783,8 @@ impl ChildProviderBinding {
             _ => None,
         };
         envelope.source_message_event_id = proof.source_event_id().map(str::to_owned);
+        envelope.root_run_id =
+            root_run_id.or_else(|| crate::memory::write_provenance::child_root(bound.parent_run_id.as_deref()));
         envelope.parent_run_id = bound.parent_run_id;
         envelope.agent_id = bound.agent_id;
         envelope.persona_id = bound.persona_id;

@@ -33,6 +33,9 @@ pub struct RuntimeEnvelope {
     pub source_message_event_id: Option<String>,
     pub run_id: Option<String>,
     pub parent_run_id: Option<String>,
+    /// The top-level run this run descends from. `None` on a top-level run,
+    /// whose root is its own `run_id`; a child copies its parent's root.
+    pub root_run_id: Option<String>,
     /// The launching parent's session key for a child turn (sessions_spawn,
     /// session worker, delegate). `None` for every root origin. A child's
     /// terminal carries it so its lineage equals its launch (CR-CI-3).
@@ -109,6 +112,7 @@ impl RuntimeEnvelope {
             source_message_event_id: None,
             run_id: None,
             parent_run_id: None,
+            root_run_id: None,
             parent_session_key: None,
             attempt_id: None,
             lease_epoch: None,
@@ -403,6 +407,23 @@ impl RuntimeEnvelope {
     pub fn with_parent_run_id(mut self, parent_run_id: impl Into<String>) -> Self {
         self.parent_run_id = Some(parent_run_id.into());
         self
+    }
+
+    #[must_use]
+    pub fn with_root_run_id(mut self, root_run_id: impl Into<String>) -> Self {
+        self.root_run_id = Some(root_run_id.into());
+        self
+    }
+
+    /// The write provenance of this envelope's run; `None` without a run id.
+    #[must_use]
+    pub fn write_provenance(&self) -> Option<crate::memory::write_provenance::WriteProvenance> {
+        let run_id = self.run_id.clone()?;
+        Some(crate::memory::write_provenance::WriteProvenance::for_run(
+            run_id,
+            self.parent_run_id.clone(),
+            self.root_run_id.clone(),
+        ))
     }
 
     #[must_use]

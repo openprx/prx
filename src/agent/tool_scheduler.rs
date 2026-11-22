@@ -317,13 +317,18 @@ async fn execute_one_unrecorded(
     };
     let execution_context = adapter.tool_execution_context.clone();
     let cancellation = cancellation.cloned();
-    let outcome = if matches!(call.name.as_str(), "delegate" | "sessions_spawn") {
-        spawn_delegation_tool(service.clone(), command, execution_context, cancellation)
-            .join()
-            .await?
-    } else {
-        service.execute(command, execution_context, cancellation).await
-    };
+    // Every memory or document write of this call is attributed to the
+    // turn's run narrowed to this call's operation id.
+    let outcome = crate::memory::write_provenance::scope_operation(&tool_call_id, async {
+        if matches!(call.name.as_str(), "delegate" | "sessions_spawn") {
+            spawn_delegation_tool(service.clone(), command, execution_context, cancellation)
+                .join()
+                .await
+        } else {
+            Ok(service.execute(command, execution_context, cancellation).await)
+        }
+    })
+    .await?;
     let awaiting_approval = outcome.status == crate::tools::ToolExecutionStatus::AwaitingApproval;
     let success = outcome.succeeded();
     // Legacy failures can be backend refusals. Only process facts establish
@@ -374,6 +379,7 @@ fn spawn_delegation_tool(
     let progress = crate::agent::idle::current_beat();
     let approval = crate::agent::channel_approval::current_installed();
     let memory = crate::memory::active_view::current();
+    let provenance = crate::memory::write_provenance::installed();
     let spawn_context = crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
         .try_with(Clone::clone)
         .ok();
@@ -395,6 +401,8 @@ fn spawn_delegation_tool(
                     execute.await
                 }
             });
+            let execute: ToolExecutionFuture =
+                Box::pin(crate::memory::write_provenance::scope_turn(provenance, execute));
             let execute = async move {
                 match spawn_context {
                     Some(spawn_context) => {

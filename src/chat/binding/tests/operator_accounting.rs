@@ -398,6 +398,7 @@ async fn restore_operator_process(
             .clone()
             .ok_or_else(|| anyhow::anyhow!("missing child session"))?,
         parent_run_id: scope.parent_run_id.clone(),
+        root_run_id: None,
         inherited_provenance: None,
         session_addr: None,
         compaction_config: None,

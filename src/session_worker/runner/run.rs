@@ -65,13 +65,15 @@ pub(super) async fn run_authenticated_manifest(
     let workspace = manifest.workspace_dir.clone();
     let config_dir = manifest.config_dir.clone();
     let memory_db = manifest.memory_db_path.clone();
+    // The worker's own run descends from the root its sealed manifest names.
+    let inherited_root = crate::memory::write_provenance::InheritedRoot::new(
+        manifest.parent_run_id.as_deref(),
+        manifest.root_run_id.as_deref(),
+    );
     let prepared = cleanup
-        .run(owned_worker_future(
-            manifest,
-            steer_rx,
-            mailbox_rx,
-            explicit_config_dir,
-            transport,
+        .run(crate::memory::write_provenance::scope_inherited_root(
+            inherited_root,
+            owned_worker_future(manifest, steer_rx, mailbox_rx, explicit_config_dir, transport),
         ))
         .await
         .with_context(|| {

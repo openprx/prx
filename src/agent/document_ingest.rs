@@ -54,6 +54,10 @@ pub(crate) struct DocumentIngestRuntime {
     /// Set only for a child tool loop (`from_scope`). A child recalls only
     /// context pages its own logical task wrote; main turns are unrestricted.
     pub(super) child_turn: bool,
+    /// Run provenance of the turn this runtime serves, taken from its
+    /// envelope; `None` for a runtime built from a scope (a child loop, whose
+    /// execution adapter carries its run).
+    pub(super) write_provenance: Option<crate::memory::write_provenance::WriteProvenance>,
 }
 
 impl DocumentIngestRuntime {
@@ -94,6 +98,7 @@ impl DocumentIngestRuntime {
             config_source_revision: envelope.config_source_revision.clone(),
             visibility: envelope.visibility.clone(),
             child_turn: false,
+            write_provenance: envelope.write_provenance(),
         }
     }
 
@@ -139,6 +144,7 @@ impl DocumentIngestRuntime {
             config_source_revision: scope.config_source_revision.map(ToString::to_string),
             visibility: MemoryVisibility::Session,
             child_turn: true,
+            write_provenance: None,
         }
     }
 
@@ -281,7 +287,10 @@ pub(super) async fn persist_tool_output_document(
         agent_id: runtime.agent_id.clone(),
         persona_id: runtime.persona_id.clone(),
     };
-    match runtime.memory.ingest_document(input).await {
+    match crate::memory::write_provenance::apply(&runtime.memory)
+        .ingest_document(input)
+        .await
+    {
         Ok(document) => {
             tracing::info!(
                 document_id = %crate::agent::diagnostics::text_class(&document.document_id),
@@ -399,7 +408,10 @@ pub(super) async fn persist_untrusted_external_copy(
         agent_id: runtime.agent_id.clone(),
         persona_id: runtime.persona_id.clone(),
     };
-    match runtime.memory.ingest_document(input).await {
+    match crate::memory::write_provenance::apply(&runtime.memory)
+        .ingest_document(input)
+        .await
+    {
         Ok(document) => {
             tracing::info!(
                 document_id = %crate::agent::diagnostics::text_class(&document.document_id),

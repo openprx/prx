@@ -621,7 +621,8 @@ impl MemoryFabric {
             session_key: session_id.map(str::to_string),
             ..MemoryWriteContext::default()
         });
-        self.memory
+        let memory = crate::memory::write_provenance::apply(&self.memory);
+        memory
             .store_with_context_and_metadata(
                 key,
                 content,
@@ -640,8 +641,7 @@ impl MemoryFabric {
                 },
             )
             .await?;
-        let _event = self
-            .memory
+        let _event = memory
             .append_memory_event(MemoryEventInput {
                 agent_partition: agent_partition.clone(),
                 event_id: None,
