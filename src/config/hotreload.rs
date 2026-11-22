@@ -127,9 +127,9 @@ fn retry_due_settlement(
     runtime: Option<&tokio::runtime::Handle>,
     pending: &mut Option<PendingSettlement>,
 ) {
-    if !pending
+    if pending
         .as_ref()
-        .is_some_and(|waiting| std::time::Instant::now() >= waiting.next_retry)
+        .is_none_or(|waiting| std::time::Instant::now() < waiting.next_retry)
     {
         return;
     }
@@ -150,7 +150,7 @@ fn retry_due_settlement(
 /// Opens, reads and closes without a write (`Access` other than
 /// `Close(Write)`) and access-time updates cannot; reporting them made the
 /// watcher's own read of `config.toml` re-trigger it forever.
-fn may_change_content(kind: &notify::EventKind) -> bool {
+const fn may_change_content(kind: notify::EventKind) -> bool {
     use notify::event::{AccessKind, AccessMode, MetadataKind, ModifyKind};
     match kind {
         notify::EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
@@ -173,7 +173,7 @@ struct ContentChangeWatcher {
 impl notify::Watcher for ContentChangeWatcher {
     fn new<F: notify::EventHandler>(mut event_handler: F, config: notify::Config) -> notify::Result<Self> {
         let filtered = move |event: notify::Result<notify::Event>| {
-            if event.as_ref().is_ok_and(|event| !may_change_content(&event.kind)) {
+            if event.as_ref().is_ok_and(|event| !may_change_content(event.kind)) {
                 return;
             }
             event_handler.handle_event(event);
