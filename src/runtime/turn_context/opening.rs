@@ -150,6 +150,23 @@ impl TurnRuntimeService {
             exclusions: effective_exclusions.names,
             constraints: {
                 let mut constraints = Vec::new();
+                if turn_level(&self.security, proof) == crate::security::AutonomyLevel::Full
+                    && proof.surface() == crate::tools::capability::turn_state::TurnSurfaceKind::Server
+                    && proof.policy_channel() == "console"
+                    && proof.h2_entry_origin().is_none()
+                    && matches!(
+                        proof
+                            .memory_scope()
+                            .agent_partition
+                            .as_ref()
+                            .map(|partition| &partition.key),
+                        Some(crate::memory::PartitionKey::Named { .. })
+                    )
+                {
+                    constraints.push(crate::tools::capability::turn_state::ConstraintCode::new(
+                        "full_targeted_agent",
+                    ));
+                }
                 if proof.owner_isolated() {
                     constraints.push(crate::tools::capability::turn_state::ConstraintCode::new(
                         "owner_isolated",

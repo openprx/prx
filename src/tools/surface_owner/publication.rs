@@ -118,6 +118,7 @@ impl PublicationRules<'_, '_> {
     /// that filesystem is bound.
     pub(crate) fn owner_isolation_admits(&self, entry: &CapabilityEntry) -> bool {
         !self.trusted.owner_isolated()
+            || (self.full_autonomy() && self.has_constraint("full_targeted_agent"))
             || crate::tools::capability::policy::admits_owner_isolated_identity(&entry.public_name, &entry.root)
             || (self.has_constraint("owner_private_filesystem_v1")
                 && entry.public_name == entry.root

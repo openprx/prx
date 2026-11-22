@@ -194,6 +194,7 @@ fn bind_auxiliary_accounting(
                     context.runtime().trusted.budgets,
                     context.deadline(),
                 )
+                .with_root_agent(proof.memory_scope().agent_partition.as_ref())
                 .with_money(
                     context
                         .runtime()

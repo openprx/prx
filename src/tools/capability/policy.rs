@@ -47,10 +47,8 @@ pub(crate) fn plan_intercepts_tool(name: &str) -> bool {
 /// owner. A tool joins this list only once it is owner-aware or reads no private
 /// runtime state. Web search is stateless; its provider key and quota are shared.
 ///
-/// `session_status` and `sessions_send` are owner-aware for in-process turns
-/// but the gateway does not register them, so they stay off the list until it
-/// does: an exposed entry is then refused with 403 before any identity binding
-/// is written, instead of passing this gate and answering 404 afterwards.
+/// Gateway and terminal registrations share the same run registry for
+/// `session_status` and `sessions_send`; both enforce its owner scope.
 pub const OWNER_ISOLATION_AWARE_TOOLS: &[&str] = &[
     // Stateless public web reads; no access to another owner's local data.
     "web_search_tool",
@@ -63,6 +61,8 @@ pub const OWNER_ISOLATION_AWARE_TOOLS: &[&str] = &[
     "document_get_chunk",
     "sessions_list",
     "sessions_history",
+    "sessions_send",
+    "session_status",
     "memory_forget",
     // Confines its write to the caller's own keys (owner_predicate::
     // isolated_store_owner / store_conflict_guard on both adapters).

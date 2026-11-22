@@ -1585,6 +1585,20 @@ fn register_gateway_turn_tools(
                 .with_shared_memory(Arc::clone(memory), workspace_id.clone()),
         ));
         tools_list.push(Box::new(
+            tools::SessionsSendTool::with_security(Arc::clone(&active_runs), Arc::clone(security))
+                .with_shared_memory(Arc::clone(memory))
+                .with_event_recording(config.memory.event_recording_config()),
+        ));
+        tools_list.push(Box::new(
+            tools::SessionStatusTool::new(
+                Arc::clone(&active_runs),
+                providers::selection::default_provider(config),
+                providers::selection::default_model(config),
+                channels_registry.keys().cloned().collect(),
+            )
+            .with_shared_memory(Arc::clone(memory), workspace_id.clone()),
+        ));
+        tools_list.push(Box::new(
             tools::SessionsHistoryTool::new(active_runs).with_shared_memory(Arc::clone(memory), workspace_id),
         ));
 
