@@ -44,6 +44,9 @@ mod skills;
 mod skills_h2;
 mod skills_lifecycle;
 mod status;
+mod sync_snapshot;
+pub(super) mod sync_startup;
+mod sync_ws;
 #[cfg(test)]
 mod test_support;
 
@@ -348,6 +351,13 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/chat-sessions/{id}/result", post(chat_sessions::post_result))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
+    let sync_routes = Router::new()
+        .route(
+            "/sync/snapshot",
+            get(sync_snapshot::snapshot).fallback(capabilities::method_not_allowed),
+        )
+        .route("/sync/ws", get(sync_ws::ws).fallback(capabilities::method_not_allowed))
+        .route_layer(middleware::from_fn_with_state(state.clone(), capabilities::guard));
     Router::new()
         .route("/logs", get(logs::ws_handler))
         // Phase 1: alias for frontend compatibility
@@ -362,6 +372,7 @@ pub fn router(state: AppState) -> Router<AppState> {
             api_rate_limit_middleware,
         ))
         .merge(mailbox_routes)
+        .merge(sync_routes)
 }
 
 pub(super) fn extract_bearer_auth_token(headers: &HeaderMap) -> Option<String> {
