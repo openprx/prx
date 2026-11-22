@@ -12,6 +12,7 @@ const SESSION: &str = "no-such-session";
 
 fn agent(temperature: f64, enabled: bool) -> DelegateAgentConfig {
     DelegateAgentConfig {
+        approval_wait_secs: 600,
         limits: crate::config::AgentLimits::default(),
         provider: "ollama".to_owned(),
         model: "prx-local-model".to_owned(),

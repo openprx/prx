@@ -96,10 +96,18 @@ pub(super) fn child_payload(conn: &Connection, h: &Header) -> anyhow::Result<Val
     Ok(p)
 }
 
-pub(super) fn cancel_approvals(conn: &Connection, root: &Header, workspace: &str, run: &str) -> anyhow::Result<()> {
+pub(super) fn cancel_approvals(
+    conn: &Connection,
+    root: &Header,
+    workspace: &str,
+    run: &str,
+    descendants: bool,
+) -> anyhow::Result<()> {
     use crate::security::approval_ledger::keys::{ApprovalAuthority, RunCallAuthority};
-    let mut q=conn.prepare("SELECT CASE WHEN length(CAST(raw_payload_json AS BLOB))<=65536 THEN raw_payload_json ELSE NULL END FROM message_events WHERE workspace_id=?1 AND owner_id=?2 AND run_id=?3 AND event_type='approval.call.pending'")?;
-    for raw in q.query_map(params![workspace, root.owner, run], |r| r.get::<_, Option<String>>(0))? {
+    let mut q=conn.prepare("SELECT CASE WHEN length(CAST(raw_payload_json AS BLOB))<=65536 THEN raw_payload_json ELSE NULL END FROM message_events WHERE workspace_id=?1 AND owner_id=?2 AND (run_id=?3 OR (?4 AND json_extract(raw_payload_json,'$.record.rf.root_run_id')=?3)) AND event_type='approval.call.pending'")?;
+    for raw in q.query_map(params![workspace, root.owner, run, descendants], |r| {
+        r.get::<_, Option<String>>(0)
+    })? {
         let raw = raw?.ok_or_else(|| crate::memory::sync::SyncError::InvalidSource)?;
         let value: Value = serde_json::from_str(&raw)?;
         let authority: RunCallAuthority = serde_json::from_value(
@@ -109,6 +117,27 @@ pub(super) fn cancel_approvals(conn: &Connection, root: &Header, workspace: &str
                 .cloned()
                 .ok_or_else(|| crate::memory::sync::SyncError::InvalidSource)?,
         )?;
+        let id = authority.call_id();
+        if value.pointer("/record/rf").is_some_and(|v| !v.is_null()) {
+            let key = format!("rf-decision:{id}");
+            let payload = json!({"approval_id":id,"run_id":authority.run_id,"decision":"cancelled","cause":null});
+            let event = uuid::Uuid::new_v4().to_string();
+            let content = "call approval lifecycle";
+            let written = conn.execute("INSERT OR IGNORE INTO message_events (
+                event_id,idempotency_key,workspace_id,owner_id,source,channel,session_key,parent_session_key,run_id,parent_run_id,agent_id,persona_id,
+                sender,recipient,role,event_type,source_ref_json,subject_ref_json,goal_id,causation_event_id,correlation_id,attempt_id,lease_epoch,config_generation_id,config_source_revision,
+                content,content_hash,raw_payload_json,visibility,created_at,updated_at,ma_scope_id)
+                SELECT ?4,?5,workspace_id,owner_id,source,channel,session_key,parent_session_key,run_id,parent_run_id,agent_id,persona_id,
+                sender,recipient,role,'tool.approval.resolved',source_ref_json,subject_ref_json,goal_id,causation_event_id,correlation_id,attempt_id,lease_epoch,config_generation_id,config_source_revision,
+                ?6,?7,?8,visibility,?9,?9,ma_scope_id FROM message_events WHERE workspace_id=?1 AND owner_id=?2 AND idempotency_key=?3", params![workspace,root.owner,authority.pending_key(),event,key,content,super::SqliteMemory::content_hash(content),serde_json::to_string(&payload)?,chrono::Utc::now().to_rfc3339()])?;
+            if written > 0 {
+                if let Some(mut h) = event_header(conn, &event, "approval.decided")? {
+                    h.event_id = format!("approval-decided:{id}");
+                    append(conn, &h)?;
+                }
+            }
+            continue;
+        }
         let closed:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM message_events WHERE workspace_id=?1 AND owner_id=?2 AND idempotency_key IN(?3,?4))",params![workspace,root.owner,authority.issued_key(),authority.resolution_key()],|r|r.get(0))?;
         if closed {
             continue;

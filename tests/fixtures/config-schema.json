@@ -38,6 +38,7 @@
       "description": "Agent orchestration settings (`[agent]`).",
       "$ref": "#/$defs/AgentConfig",
       "default": {
+        "approval_wait_secs": 600,
         "compact_context": false,
         "compaction": {
           "keep_recent_messages": 12,
@@ -1138,6 +1139,14 @@
       "description": "Agent orchestration configuration (`[agent]` section).",
       "type": "object",
       "properties": {
+        "approval_wait_secs": {
+          "description": "rf approve-and-continue wait; Console approvals retain their own expiry.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 600,
+          "maximum": 86400,
+          "minimum": 1
+        },
         "compact_context": {
           "description": "When true: bootstrap_max_chars=6000. Use for 13B or smaller models.",
           "type": "boolean",
@@ -2174,6 +2183,14 @@
             "null"
           ],
           "default": null
+        },
+        "approval_wait_secs": {
+          "description": "rf approve-and-continue wait; Console approvals retain their own expiry.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 600,
+          "maximum": 86400,
+          "minimum": 1
         },
         "autonomy": {
           "description": "The agent's own autonomy level for targeted turns. Unset inherits the\nmain agent's level.",

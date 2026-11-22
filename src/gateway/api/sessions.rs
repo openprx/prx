@@ -750,6 +750,34 @@ async fn run_console_runtime_turn(
         // decision slot publishes its tool policy with.
         config_snapshot.autonomy.level = target.autonomy;
     }
+    let live_scope =
+        if let (Some(store), Some(source)) = (state.mem.sync_store(), turn_envelope.source_message_event_id.clone()) {
+            let owner = turn_envelope.resolved_owner_id();
+            crate::runtime::blocking::spawn_blocking(move || store.live_scope(&owner, &source)).await??
+        } else {
+            None
+        };
+    let live = live_scope.map(|scope| {
+        let wait_secs = target
+            .and_then(|target| config_snapshot.agents.get(target.name.as_str()))
+            .map_or(config_snapshot.agent.approval_wait_secs, |agent| {
+                agent.approval_wait_secs
+            });
+        std::sync::Arc::new(crate::gateway::run_approvals::RunApprovalResolver {
+            scope,
+            streams: std::sync::Arc::clone(&state.rf_streams),
+            approvals: std::sync::Arc::clone(&state.rf_approvals),
+            cancellation: decision.cancellation.clone(),
+            wait_secs,
+        }) as std::sync::Arc<dyn crate::agent::live_frames::LiveTurn>
+    });
+    let live_frames = live.as_ref().map(|live| {
+        live.frames(
+            &turn_envelope,
+            &crate::agent::sanitize::known_tool_names(turn_runtime.tools_registry.as_ref()),
+        )
+    });
+    let stream_provider = live.is_some() && turn_runtime.provider.supports_streaming();
     let provider_label = turn_runtime
         .provider_binding
         .as_ref()
@@ -760,7 +788,11 @@ async fn run_console_runtime_turn(
         .provider
         .capabilities_for(
             &turn_runtime.model,
-            crate::providers::traits::ProviderRequestMode::NonStreaming,
+            if stream_provider {
+                crate::providers::traits::ProviderRequestMode::Streaming
+            } else {
+                crate::providers::traits::ProviderRequestMode::NonStreaming
+            },
         )
         .native_tool_calling;
     let system_prompt = if let Some(target) = target {
@@ -835,33 +867,6 @@ async fn run_console_runtime_turn(
         .effective_compaction(&provider_label, &turn_runtime.model);
     effective_compaction.config = decision.context.main_compaction().clone();
     crate::providers::context_window::trace_effective_compaction_resolution(&effective_compaction);
-    let live_scope =
-        if let (Some(store), Some(source)) = (state.mem.sync_store(), turn_envelope.source_message_event_id.clone()) {
-            let owner = turn_envelope.resolved_owner_id();
-            crate::runtime::blocking::spawn_blocking(move || store.live_scope(&owner, &source)).await??
-        } else {
-            None
-        };
-    let live = live_scope.map(|scope| {
-        let wait_secs = target
-            .and_then(|target| config_snapshot.agents.get(target.name.as_str()))
-            .map_or(config_snapshot.agent.approval_wait_secs, |agent| {
-                agent.approval_wait_secs
-            });
-        std::sync::Arc::new(crate::gateway::run_approvals::RunApprovalResolver {
-            scope,
-            streams: std::sync::Arc::clone(&state.rf_streams),
-            approvals: std::sync::Arc::clone(&state.rf_approvals),
-            cancellation: decision.cancellation.clone(),
-            wait_secs,
-        }) as std::sync::Arc<dyn crate::agent::live_frames::LiveTurn>
-    });
-    let live_frames = live.as_ref().map(|live| {
-        live.frames(
-            &turn_envelope,
-            &crate::agent::sanitize::known_tool_names(turn_runtime.tools_registry.as_ref()),
-        )
-    });
     let provider_started_at = chrono::Utc::now();
     let loop_result = run_turn(
         &mut history,
@@ -904,7 +909,7 @@ async fn run_console_runtime_turn(
                     .as_ref()
                     .map(|(trace, _)| std::sync::Arc::clone(trace)),
                 events: None,
-                stream_provider: live.is_some(),
+                stream_provider,
                 tool_execution_service: None,
                 tool_execution_context: {
                     let mut context = crate::tools::ToolExecutionContext::new(turn_envelope.clone(), "private")

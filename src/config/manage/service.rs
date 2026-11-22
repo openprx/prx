@@ -144,6 +144,7 @@ pub enum ManagedChange {
 /// The caller-owned fields of a named agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSpec {
+    pub approval_wait_secs: u64,
     pub limits: crate::config::AgentLimits,
     pub provider: String,
     pub model: String,
@@ -1724,6 +1725,12 @@ fn candidate(current: &Config, change: &ManagedChange) -> Result<Config, ManageE
             spec.limits
                 .validate()
                 .map_err(|message| ManageError::Invalid(message.to_owned()))?;
+            if !(1..=86400).contains(&spec.approval_wait_secs) {
+                return Err(ManageError::Invalid(
+                    "approval_wait_secs must be within 1..=86400".into(),
+                ));
+            }
+            entry.approval_wait_secs = spec.approval_wait_secs;
             entry.limits = spec.limits.clone();
             entry.enabled = spec.enabled;
         }

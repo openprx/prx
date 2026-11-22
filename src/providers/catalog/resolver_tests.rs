@@ -580,6 +580,7 @@ fn agent_and_route_keys_are_bound_to_their_entries_provider() {
     config.agents.insert(
         "coder".to_string(),
         crate::config::DelegateAgentConfig {
+            approval_wait_secs: 600,
             limits: crate::config::AgentLimits::default(),
             provider: "claude-code".to_string(),
             model: "claude-sonnet-4".to_string(),

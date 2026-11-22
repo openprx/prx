@@ -197,6 +197,7 @@ fn configured_providers_are_every_provider_the_operator_named() {
     config.agents = std::collections::HashMap::from([(
         "coder".to_string(),
         crate::config::DelegateAgentConfig {
+            approval_wait_secs: 600,
             limits: crate::config::AgentLimits::default(),
             provider: "groq".to_string(),
             model: "m".to_string(),

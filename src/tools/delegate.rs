@@ -1905,6 +1905,7 @@ pub(crate) mod tests {
         agents.insert(
             "researcher".to_string(),
             DelegateAgentConfig {
+                approval_wait_secs: 600,
                 limits: crate::config::AgentLimits::default(),
                 provider: "ollama".to_string(),
                 model: "llama3".to_string(),
@@ -1925,6 +1926,7 @@ pub(crate) mod tests {
         agents.insert(
             "coder".to_string(),
             DelegateAgentConfig {
+                approval_wait_secs: 600,
                 limits: crate::config::AgentLimits::default(),
                 provider: "openrouter".to_string(),
                 model: "anthropic/claude-sonnet-4-20250514".to_string(),
@@ -2089,6 +2091,7 @@ pub(crate) mod tests {
 
     fn agentic_config(allowed_tools: Vec<String>) -> DelegateAgentConfig {
         DelegateAgentConfig {
+            approval_wait_secs: 600,
             limits: crate::config::AgentLimits::default(),
             provider: "openrouter".to_string(),
             identity_dir: None,
@@ -2214,6 +2217,7 @@ pub(crate) mod tests {
         agents.insert(
             "broken".to_string(),
             DelegateAgentConfig {
+                approval_wait_secs: 600,
                 limits: crate::config::AgentLimits::default(),
                 provider: "totally-invalid-provider".to_string(),
                 model: "model".to_string(),
@@ -2323,6 +2327,7 @@ pub(crate) mod tests {
         agents.insert(
             "tester".to_string(),
             DelegateAgentConfig {
+                approval_wait_secs: 600,
                 limits: crate::config::AgentLimits::default(),
                 provider: "mock".to_string(),
                 model: "test-model".to_string(),
@@ -3856,6 +3861,7 @@ pub(crate) mod tests {
         agents.insert(
             name.to_string(),
             DelegateAgentConfig {
+                approval_wait_secs: 600,
                 limits: crate::config::AgentLimits::default(),
                 provider: provider.to_string(),
                 model: model.to_string(),

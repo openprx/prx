@@ -216,6 +216,14 @@ pub(super) fn event_written(conn: &Connection, event: &crate::memory::MessageEve
             };
         if let Some(kind) = kind {
             h.kind = kind.into();
+            if kind == "approval.pending" {
+                let authority: crate::security::approval_ledger::keys::RunCallAuthority = serde_json::from_value(
+                    raw.pointer("/record/authority")
+                        .cloned()
+                        .ok_or(crate::memory::sync::SyncError::InvalidSource)?,
+                )?;
+                h.event_id = format!("approval-pending:{}", authority.call_id());
+            }
             if kind == "approval.decided" {
                 if let Some(id) = raw.get("approval_id").and_then(serde_json::Value::as_str) {
                     h.event_id = format!("approval-decided:{id}");
@@ -274,6 +282,9 @@ pub(super) fn event_written(conn: &Connection, event: &crate::memory::MessageEve
                 header.source_ref = format!("final:{}:{assistant}", event.event_id);
                 append(conn, &header)?;
             }
+        }
+        if let Some(run) = &event.run_id {
+            super::sync_lifecycle::cancel_approvals(conn, &h, &event.workspace_id, run, status == "cancelled")?;
         }
         if h.parent_run_id.is_some() {
             h.kind = "child_session.upsert".into();
@@ -341,7 +352,7 @@ pub(super) fn interrupted(conn: &Connection, workspace: &str, owner: &str, run: 
             h.source_ref = format!("interrupt:{run}");
             h.event_id = format!("interrupt:{run}");
             append(conn, &h)?;
-            super::sync_lifecycle::cancel_approvals(conn, &h, workspace, run)?;
+            super::sync_lifecycle::cancel_approvals(conn, &h, workspace, run, true)?;
         }
     }
     Ok(())

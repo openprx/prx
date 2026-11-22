@@ -1202,6 +1202,7 @@ mod tests {
         let agents = HashMap::from([(
             "schema-audit".to_string(),
             DelegateAgentConfig {
+                approval_wait_secs: 600,
                 limits: crate::config::AgentLimits::default(),
                 provider: "ollama".to_string(),
                 model: "test-model".to_string(),
@@ -1324,6 +1325,7 @@ mod tests {
         agents.insert(
             "researcher".to_string(),
             DelegateAgentConfig {
+                approval_wait_secs: 600,
                 limits: crate::config::AgentLimits::default(),
                 provider: "ollama".to_string(),
                 model: "llama3".to_string(),
@@ -1407,6 +1409,7 @@ mod tests {
         let agents = HashMap::from([(
             "a".to_string(),
             DelegateAgentConfig {
+                approval_wait_secs: 600,
                 limits: crate::config::AgentLimits::default(),
                 provider: "litellm".to_string(),
                 model: PROBE_MODEL.to_string(),

@@ -30,7 +30,7 @@ pub(crate) enum Decision {
     Cancelled,
 }
 impl Decision {
-    fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::Approved => "approved",
             Self::Denied => "denied",
@@ -67,7 +67,8 @@ impl Entry {
         {
             let mut rx = self.outcome.subscribe();
             loop {
-                if let Some(value) = *rx.borrow_and_update() {
+                let observed = *rx.borrow_and_update();
+                if let Some(value) = observed {
                     return Ok(value);
                 }
                 rx.changed().await.context("approval waiter closed")?;
@@ -98,9 +99,9 @@ impl Entry {
                 Ok(value)
             }
             Err(error) => {
-                self.claimed.store(false, Ordering::Release);
-                // Wake concurrent readers to retry instead of leaving a claimed write stuck.
-                self.outcome.send_replace(None);
+                self.outcome.send_replace(Some(Decision::Cancelled));
+                // Fail closed and wake every waiter if the source cannot be committed.
+                // The run can now reach its terminal, which closes the pending source transactionally.
                 Err(error)
             }
         }
@@ -209,50 +210,63 @@ impl RunApprovalResolver {
             )
             .await?;
         let id = pending.authority().call_id();
-        let (outcome, mut rx) = watch::channel(None);
-        let proposed = Arc::new(Entry {
-            ledger: ledger.clone(),
-            pending,
-            claimed: AtomicBool::new(false),
-            outcome,
-            cancel: self.cancellation.child_token(),
-        });
-        let (entry, fresh) = {
-            let mut entries = self.approvals.entries.lock();
-            match entries.entry(id) {
-                std::collections::hash_map::Entry::Occupied(old) => (Arc::clone(old.get()), false),
-                std::collections::hash_map::Entry::Vacant(slot) => {
-                    slot.insert(Arc::clone(&proposed));
-                    (proposed, true)
-                }
-            }
-        };
-        if fresh {
-            let waiter = Arc::clone(&entry);
-            tokio::spawn(async move {
-                let seconds = (waiter.pending.expires_at() - chrono::Utc::now())
-                    .to_std()
-                    .unwrap_or_default();
-                let selected = tokio::select! {
-                    biased;
-                    ()=waiter.cancel.cancelled()=>Some(Decision::Cancelled),
-                    ()=tokio::time::sleep(seconds)=>Some(Decision::Expired),
-                    _=rx.changed()=>None,
-                };
-                if let Some(decision) = selected {
-                    if waiter.finish(decision).await.is_err() {
-                        tracing::warn!("rf approval terminal write failed");
+        let saved = ledger
+            .memory
+            .find_message_event_by_idempotency_key(&ledger.workspace, &format!("rf-decision:{id}"))
+            .await?;
+        let decision = if let Some(saved) = saved {
+            let value: Value =
+                serde_json::from_str(saved.raw_payload_json.as_deref().context("approval decision missing")?)?;
+            serde_json::from_value::<Decision>(value.get("decision").cloned().context("approval decision missing")?)?
+        } else {
+            let (outcome, mut rx) = watch::channel(None);
+            let proposed = Arc::new(Entry {
+                ledger: ledger.clone(),
+                pending: pending.clone(),
+                claimed: AtomicBool::new(false),
+                outcome,
+                cancel: self.cancellation.child_token(),
+            });
+            let (entry, fresh) = {
+                let mut entries = self.approvals.entries.lock();
+                match entries.entry(id.clone()) {
+                    std::collections::hash_map::Entry::Occupied(old) => (Arc::clone(old.get()), false),
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(Arc::clone(&proposed));
+                        (proposed, true)
                     }
                 }
-            });
-        }
-        let _pause = crate::agent::idle::pause_for_approval();
-        let mut rx = entry.outcome.subscribe();
-        let decision = loop {
-            if let Some(value) = *rx.borrow_and_update() {
-                break value;
+            };
+            if fresh {
+                let waiter = Arc::clone(&entry);
+                tokio::spawn(async move {
+                    let seconds = (waiter.pending.expires_at() - chrono::Utc::now())
+                        .to_std()
+                        .unwrap_or_default();
+                    let selected = tokio::select! {
+                        biased;
+                        ()=waiter.cancel.cancelled()=>Some(Decision::Cancelled),
+                        ()=tokio::time::sleep(seconds)=>Some(Decision::Expired),
+                        _=rx.changed()=>None,
+                    };
+                    if let Some(decision) = selected {
+                        if waiter.finish(decision).await.is_err() {
+                            tracing::warn!("rf approval terminal write failed");
+                        }
+                    }
+                });
             }
-            rx.changed().await.context("approval wait closed")?;
+            let _pause = crate::agent::idle::pause_for_approval();
+            let mut rx = entry.outcome.subscribe();
+            let decided = loop {
+                let observed = *rx.borrow_and_update();
+                if let Some(value) = observed {
+                    break value;
+                }
+                rx.changed().await.context("approval wait closed")?;
+            };
+            self.approvals.entries.lock().remove(&id);
+            decided
         };
         if decision != Decision::Approved {
             return Ok(ToolApprovalDecision::Denied {
@@ -264,7 +278,7 @@ impl RunApprovalResolver {
             .claim_if_approved(
                 &request.context.envelope.resolved_owner_id(),
                 &request.context.envelope.session_key,
-                entry.pending.authority(),
+                pending.authority(),
             )
             .await?
             .context("approved call grant unavailable")?;
@@ -362,8 +376,16 @@ async fn recorded(
         Ok::<_, anyhow::Error>((pending, resolved))
     }
     .await;
-    let Ok((Some(pending), resolved)) = load else {
-        return error(StatusCode::NOT_FOUND, "approval_unknown", "approval unknown");
+    let (pending, resolved) = match load {
+        Ok((Some(pending), resolved)) => (pending, resolved),
+        Ok((None, _)) => return error(StatusCode::NOT_FOUND, "approval_unknown", "approval unknown"),
+        Err(_) => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "storage_unavailable",
+                "approval lookup failed",
+            );
+        }
     };
     let raw: Value = pending
         .raw_payload_json

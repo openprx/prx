@@ -426,6 +426,7 @@ impl Config {
                     (
                         name.clone(),
                         DelegateAgentConfig {
+                            approval_wait_secs: 600,
                             api_key: configured_key(
                                 &source,
                                 &agent.provider,

@@ -3438,6 +3438,7 @@ mod tests {
         config.agents.insert(
             "worker".into(),
             crate::config::DelegateAgentConfig {
+                approval_wait_secs: 600,
                 limits: crate::config::AgentLimits::default(),
                 provider: "openrouter".into(),
                 model: "model-test".into(),
@@ -3999,6 +4000,7 @@ mod tests {
         config.agents.insert(
             "zeta".into(),
             crate::config::DelegateAgentConfig {
+                approval_wait_secs: 600,
                 limits: crate::config::AgentLimits::default(),
                 provider: "totally-fake".into(),
                 model: "model-z".into(),
@@ -4019,6 +4021,7 @@ mod tests {
         config.agents.insert(
             "alpha".into(),
             crate::config::DelegateAgentConfig {
+                approval_wait_secs: 600,
                 limits: crate::config::AgentLimits::default(),
                 provider: "totally-fake".into(),
                 model: "model-a".into(),

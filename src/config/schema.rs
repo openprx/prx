@@ -536,7 +536,7 @@ pub use observability::*;
 mod autonomy;
 pub use autonomy::*;
 
-pub(super) const fn default_approval_wait_secs() -> u64 {
+pub(crate) const fn default_approval_wait_secs() -> u64 {
     600
 }
 fn deserialize_approval_wait_secs<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {

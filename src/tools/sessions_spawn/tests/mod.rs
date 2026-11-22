@@ -532,6 +532,7 @@ impl crate::providers::Provider for EchoSystemProvider {
 
 fn make_agent_config(identity_dir: Option<String>) -> DelegateAgentConfig {
     DelegateAgentConfig {
+        approval_wait_secs: 600,
         limits: crate::config::AgentLimits::default(),
         provider: "ollama".to_string(),
         model: "prx-local-model".to_string(),

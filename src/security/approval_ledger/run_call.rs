@@ -76,7 +76,7 @@ impl PendingCall {
     pub(crate) const fn subject(&self) -> &Subject {
         &self.subject
     }
-    pub(crate) fn expires_at(&self) -> DateTime<Utc> {
+    pub(crate) const fn expires_at(&self) -> DateTime<Utc> {
         self.expires_at
     }
     #[cfg(test)]
@@ -301,13 +301,23 @@ impl ApprovalLedgerPort<'_> {
             _ => None,
         };
         let value = serde_json::json!({"approval_id":pending.authority.call_id(),"run_id":pending.authority.run_id,"decision":decision,"cause":cause});
-        self.write(
-            &source,
-            &format!("rf-decision:{}", pending.authority.call_id()),
-            "tool.approval.resolved",
-            &value,
-        )
-        .await?;
+        let stored = self
+            .write(
+                &source,
+                &format!("rf-decision:{}", pending.authority.call_id()),
+                "tool.approval.resolved",
+                &value,
+            )
+            .await?;
+        anyhow::ensure!(
+            stored
+                .raw_payload_json
+                .as_deref()
+                .map(serde_json::from_str::<serde_json::Value>)
+                .transpose()?
+                == Some(value),
+            "approval already decided"
+        );
         Ok(())
     }
 

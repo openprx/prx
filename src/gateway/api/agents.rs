@@ -271,6 +271,7 @@ fn named_incarnation(
 
 #[derive(Serialize)]
 struct AgentConfigBody {
+    approval_wait_secs: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     limits: Option<crate::config::AgentLimits>,
     provider: String,
@@ -316,6 +317,7 @@ fn named_readback(
     Readback {
         name: name.as_str().to_owned(),
         config: AgentConfigBody {
+            approval_wait_secs: agent.approval_wait_secs,
             limits: Some(agent.limits.clone()),
             provider: redact_provider_text(&agent.provider),
             model: agent.model.clone(),
@@ -354,6 +356,7 @@ fn read_main(registry: &Registry<'_>, snapshot: &Snapshot) -> Outcome<Readback> 
     Ok(Readback {
         name: crate::config::agent_name::MAIN_AGENT_NAME.to_owned(),
         config: AgentConfigBody {
+            approval_wait_secs: config.agent.approval_wait_secs,
             limits: None,
             provider: redact_provider_text(crate::providers::selection::default_provider(config)),
             model: crate::providers::selection::default_model(config).to_owned(),
@@ -412,6 +415,8 @@ fn write_of(uri: &Uri, headers: &HeaderMap) -> Outcome<Write> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PutBody {
+    #[serde(default = "crate::config::schema::default_approval_wait_secs")]
+    approval_wait_secs: u64,
     #[serde(default)]
     limits: Option<crate::config::AgentLimits>,
     provider: String,
@@ -451,9 +456,13 @@ fn parse_spec(body: &[u8]) -> Outcome<AgentSpec> {
     {
         return Err(Refusal::field("prompt is longer than 32768 bytes; nothing was written"));
     }
+    if !(1..=86400).contains(&body.approval_wait_secs) {
+        return Err(Refusal::field("approval_wait_secs must be within 1..=86400"));
+    }
     let limits = body.limits.unwrap_or_default();
     limits.validate().map_err(Refusal::field)?;
     Ok(AgentSpec {
+        approval_wait_secs: body.approval_wait_secs,
         limits,
         provider: body.provider,
         model: body.model,

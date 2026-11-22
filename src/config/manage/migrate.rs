@@ -419,6 +419,7 @@ pub fn migrated(config: &Config, report: &MigrationReport) -> Config {
     for (name, agent) in &mut next.agents {
         if let Some(id) = reference_for(&format!("agents.{name}.api_key")) {
             *agent = DelegateAgentConfig {
+                approval_wait_secs: 600,
                 api_key: None,
                 credential_ref: Some(id),
                 ..agent.clone()

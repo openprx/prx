@@ -93,7 +93,7 @@ fn inventory(conn: &Connection, id: &str, owner: &str, head: i64, water: i64) ->
         }
     }
     let mut q = conn.prepare(&format!(
-        "SELECT {COLUMNS} FROM sync_journal WHERE owner_id=?1 AND kind='approval.pending' AND seq<=?2 ORDER BY seq"
+        "SELECT {COLUMNS} FROM sync_journal j WHERE owner_id=?1 AND kind='approval.pending' AND seq<=?2 AND NOT EXISTS(SELECT 1 FROM sync_journal d WHERE d.owner_id=j.owner_id AND d.kind='approval.decided' AND d.seq<=?2 AND d.event_id=replace(j.event_id,'approval-pending:','approval-decided:')) ORDER BY seq"
     ))?;
     for h in q.query_map(params![owner, head], Header::row)? {
         let h = h?;

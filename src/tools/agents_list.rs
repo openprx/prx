@@ -106,6 +106,7 @@ mod tests {
 
     fn make_agent(provider: &str, model: &str) -> DelegateAgentConfig {
         DelegateAgentConfig {
+            approval_wait_secs: 600,
             limits: crate::config::AgentLimits::default(),
             provider: provider.to_string(),
             model: model.to_string(),
@@ -159,6 +160,7 @@ mod tests {
         agents.insert(
             "super-agent".to_string(),
             DelegateAgentConfig {
+                approval_wait_secs: 600,
                 agentic: true,
                 ..make_agent("openai", "gpt-4o")
             },
