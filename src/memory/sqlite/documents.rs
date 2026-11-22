@@ -7,6 +7,7 @@ use crate::memory::traits::{
     DocumentSearchResult, MemoryLink, MemoryLinkInput, MemoryPrincipal, PartitionKey, RetrievalTrace,
     RetrievalTraceInput,
 };
+use crate::memory::write_provenance::WriteProvenance;
 use crate::runtime::sqlite_pool::begin_immediate;
 use chrono::{Local, Utc};
 use rusqlite::{OptionalExtension, params, params_from_iter, types::Value};
@@ -139,11 +140,18 @@ impl SqliteMemory {
             let embedding_model = embedding_model.clone();
             let cache_now = Local::now().to_rfc3339();
             let cache_max = i64::try_from(self.cache_max).unwrap_or(i64::MAX);
+            let provenance = self.write_provenance.clone();
             let outcome = crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<IngestOutcome> {
                 let conn = pool.write();
                 let tx = begin_immediate(&conn)?;
                 let now = Utc::now().to_rfc3339();
                 let document_id = input.document_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
+                let existed = match provenance.as_deref() {
+                    Some(_) => {
+                        super::write_log::target_exists(&tx, super::write_log::WriteTarget::Document, &document_id)?
+                    }
+                    None => false,
+                };
                 let content_sha256 = Self::content_sha256_hex(&input.content);
                 let visibility = input.visibility.as_str().to_string();
                 let chunk_count = prepared_chunks.len();
@@ -277,12 +285,16 @@ impl SqliteMemory {
                     }
                 }
 
+                if let Some(provenance) = provenance.as_deref() {
+                    super::write_log::record_document_upsert(&tx, provenance, &document_id, existed)?;
+                }
                 tx.execute(
                     "INSERT INTO memory_events (
                     event_id, workspace_id, owner_id, event_type, subject_table, subject_id,
-                    session_key, agent_id, persona_id, visibility, payload_json, created_at, ma_scope_id
+                    session_key, run_id, parent_run_id, agent_id, persona_id, visibility, payload_json,
+                    created_at, ma_scope_id
                  )
-                 VALUES (?1, ?2, ?3, 'document.ingested', 'documents', ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                 VALUES (?1, ?2, ?3, 'document.ingested', 'documents', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
                          (SELECT ma_scope_id FROM documents WHERE document_id = ?4))",
                     params![
                         Uuid::new_v4().to_string(),
@@ -290,6 +302,8 @@ impl SqliteMemory {
                         input.owner_id,
                         document_id,
                         input.session_key,
+                        provenance.as_deref().map(WriteProvenance::run_id),
+                        provenance.as_deref().and_then(WriteProvenance::parent_run_id),
                         input.agent_id,
                         input.persona_id,
                         input.visibility.as_str(),

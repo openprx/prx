@@ -226,6 +226,17 @@ impl Memory for EncryptedScope {
     fn erasure_store(&self) -> anyhow::Result<crate::memory::erasure::SharedErasureStore> {
         self.inner.erasure_store()
     }
+    fn with_write_provenance(
+        &self,
+        provenance: crate::memory::write_provenance::WriteProvenance,
+    ) -> anyhow::Result<Arc<dyn Memory>> {
+        Ok(Arc::new(Self::new(
+            self.inner.with_write_provenance(provenance)?,
+            Arc::clone(&self.crypto),
+            self.account_id.clone(),
+            self.scope.clone(),
+        )))
+    }
 
     fn recovery_repository(&self) -> Option<&dyn crate::memory::recovery_authority::RecoveryRepository> {
         self.inner.recovery_repository()

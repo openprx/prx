@@ -106,6 +106,14 @@ impl Memory for SqliteMemory {
     fn erasure_store(&self) -> anyhow::Result<crate::memory::erasure::SharedErasureStore> {
         Ok(self.pool.clone())
     }
+    fn with_write_provenance(
+        &self,
+        provenance: crate::memory::write_provenance::WriteProvenance,
+    ) -> anyhow::Result<std::sync::Arc<dyn Memory>> {
+        let mut view = self.clone();
+        view.write_provenance = Some(std::sync::Arc::new(provenance));
+        Ok(std::sync::Arc::new(view))
+    }
 
     fn name(&self) -> &str {
         "sqlite"
@@ -1176,7 +1184,15 @@ impl Memory for SqliteMemory {
         self.load_session_context_before_impl(query, before_id).await
     }
 
-    async fn append_memory_event(&self, input: MemoryEventInput) -> anyhow::Result<MemoryEvent> {
+    async fn append_memory_event(&self, mut input: MemoryEventInput) -> anyhow::Result<MemoryEvent> {
+        // The event describing a run's memory write carries that run.
+        if let Some(provenance) = self.write_provenance.as_deref()
+            && input.run_id.is_none()
+            && input.event_type == "memory.stored"
+        {
+            input.run_id = Some(provenance.run_id().to_owned());
+            input.parent_run_id = provenance.parent_run_id().map(str::to_owned);
+        }
         self.append_memory_event_impl(input).await
     }
 

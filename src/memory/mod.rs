@@ -30,6 +30,7 @@ pub mod sqlite;
 pub mod topic;
 pub mod traits;
 pub mod vector;
+pub mod write_provenance;
 
 pub use backend::{
     MemoryBackendKind, classify_memory_backend, default_memory_backend_key, memory_backend_profile,

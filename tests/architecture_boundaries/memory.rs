@@ -186,6 +186,8 @@ const SQLITE_SEPARATE_MODULES: &[&str] = &[
     "rf_messages.rs",
     "router_history.rs",
     "router_learning.rs",
+    // W1 content-free write log; SQL on transactions the backend passes in, opens nothing.
+    "write_log.rs",
 ];
 
 const ALLOWED_PERSISTED_EVENT_TABLES: &[&str] = &[

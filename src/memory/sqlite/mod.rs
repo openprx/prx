@@ -22,6 +22,7 @@ mod recovery_terminal;
 pub(crate) mod remote_tree;
 mod rf_delete;
 mod rf_messages;
+mod write_log;
 
 #[cfg(unix)]
 pub(crate) use ingress_recovery::{
@@ -229,6 +230,9 @@ pub struct SqliteMemory {
     /// Ceiling on the candidates one vector recall scores; see
     /// `[memory] vector_candidate_cap`.
     vector_candidate_cap: usize,
+    /// Run provenance of this view's writes; `None` on the plain backend,
+    /// whose writes record no write-log row.
+    write_provenance: Option<Arc<crate::memory::write_provenance::WriteProvenance>>,
 }
 
 #[cfg(test)]
@@ -460,6 +464,7 @@ impl SqliteMemory {
             keyword_weight,
             cache_max,
             vector_candidate_cap: VECTOR_CANDIDATE_CAP,
+            write_provenance: None,
         })
     }
 

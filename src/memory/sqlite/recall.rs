@@ -310,10 +310,15 @@ impl SqliteMemory {
             let cache_bytes = embedding_bytes.clone();
             let isolated_owner = isolated_owner.clone();
             let category = category.clone();
+            let provenance = self.write_provenance.clone();
 
             let outcome = crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<WriteOutcome> {
                 let conn = pool.write();
                 let tx = begin_immediate(&conn)?;
+                let existed = match provenance.as_deref() {
+                    Some(_) => super::write_log::target_exists(&tx, super::write_log::WriteTarget::Memory, &key)?,
+                    None => false,
+                };
                 let now = Local::now().to_rfc3339();
                 let cat = Self::category_to_str(&category);
                 let id = Uuid::new_v4().to_string();
@@ -551,6 +556,9 @@ impl SqliteMemory {
                         bound_scope.as_deref(),
                         cache_max,
                     )?;
+                }
+                if let Some(provenance) = provenance.as_deref() {
+                    super::write_log::record_memory_upsert(&tx, provenance, &key, existed)?;
                 }
                 tx.commit()?;
                 Ok(WriteOutcome::Done)

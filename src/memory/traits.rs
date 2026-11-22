@@ -1486,6 +1486,15 @@ pub trait Memory: Send + Sync {
         Err(crate::memory::erasure::Unsupported("transactional erasure").into())
     }
 
+    /// Return a view that appends one content-free write-log row, in the
+    /// write's own transaction, for every memory and document it writes.
+    fn with_write_provenance(
+        &self,
+        _provenance: crate::memory::write_provenance::WriteProvenance,
+    ) -> anyhow::Result<std::sync::Arc<dyn Memory>> {
+        Err(crate::memory::erasure::Unsupported("write provenance").into())
+    }
+
     /// Backend name
     fn name(&self) -> &str;
 
