@@ -490,8 +490,9 @@ partition and is outside this invariant.
 turn's agent, so a named agent's children are its own rows; Main's children
 are unchanged. `sessions_list`, `sessions_history`, `session_status`,
 `subagents` and `sessions_send` show a named agent only the runs it started.
-`spawn_batch`, `join`, `chat_sessions` and `chat_assign` answer a named agent
-with `spawn_action_unpartitioned`; a child whose root partition cannot be
+`spawn_batch` and `join` retain the parent's agent partition, including the
+batch journal and cached roster. `chat_sessions` and `chat_assign` answer a
+named agent with `spawn_action_unpartitioned`; a child whose root partition cannot be
 determined is refused with `child_partition_unresolved`.
 
 **History labels.** `GET /api/sessions/{session_id}/messages` on a
@@ -529,7 +530,7 @@ pairing off the listing is unchanged.
 | `run_approvals_v1` | Pending tool approvals can be approved and continued, including child-run approvals keyed by the root session, with `cancelled` and `cause` | advertised (SQLite, B2) |
 | `history_erase_v1` | An agent's history can be erased through the erase route, which returns a receipt | advertised (RF-UNIT-A) |
 | `agent_memory_purge_v1` | A deleted named agent's memory is purged | advertised (RF-UNIT-A) |
-| `host_bootstrap_v1` | A host can install and start PRX non-interactively (`token issue --out`, `runtime.json`) | not yet |
+| `host_bootstrap_v1` | A host can install and start PRX non-interactively (`token issue --out`, `runtime.json`) | advertised |
 | `release_manifest_v1` | Releases carry a signed manifest that rf can verify | not yet |
 
 An "advertised since" commit is the one that added the token to
@@ -751,3 +752,72 @@ while the existing session-busy rule rejects a competing turn. The job remains
 live throughout approval and continuation. Console approvals keep their
 existing body, four-minute expiry, and review behavior; terminal chat, channel
 and cron entry points do not opt into these rf semantics.
+
+### Agent-owned automation and host bootstrap (C)
+
+Named-agent turns may use `cron` and `xin`. Creation records the stable agent
+name and incarnation. Scheduled agent runs use that agent's composed prompt,
+provider/model, temperature, autonomy and partition; Full agents run Full jobs.
+Their sessions are `cron:<job_id>` and `xin:<task_id>`, with channels `cron` and
+`xin`. Session metadata and each run's durable events carry `job_id` and
+`job_version`; an edit advances the persisted revision. Named automation
+sessions and final turns appear in the sync journal and snapshot.
+
+Scheduled roots share the agent's concurrency counter with rf-targeted turns
+and count toward its UTC daily cost. A due job waits on slot release for up to
+600 seconds, then records a skipped run and
+`turn.failed{reason:"agent_busy",retryable:false}`. A spent daily budget records
+`agent_budget_exhausted` instead. Children retain the root agent's cost and
+partition, use depth 1, and consume no root concurrency slot. Capabilities
+include `limits_facts:{spawn_batch_max:null,live_children_per_agent_max:null}`:
+there is no PRX child-count cap; the agent's daily cost policy still applies.
+
+Owner-bearer inventory/control routes are:
+
+- `GET /api/cron/jobs?agent=<name>` and the existing cron item/control routes.
+- `GET /api/xin/tasks?agent=<name>` and `GET /api/xin/tasks/{id}`.
+- `GET /api/xin/goals?agent=<name>` and `GET /api/xin/goals/{id}`.
+- `POST /api/xin/tasks/{id}/pause` and `/resume`; `DELETE /api/xin/tasks/{id}`.
+- `POST /api/xin/goals/{id}/pause` and `/resume`; `DELETE /api/xin/goals/{id}`.
+
+Lists use `jobs`, `tasks` or `goals` envelopes; item responses are the row.
+Rows include `id`, `kind` (`cron`, `xin_task`, `xin_goal`), `creator_agent`
+(null for non-agent jobs), `schedule` (string or null), `next_run_at`
+(RFC 3339 UTC Z or null), `enabled`, and `version`. Xin goals have no recurring
+schedule or next-run timestamp. Unknown or foreign-owner Xin ids return
+`404 xin_task_unknown` / `xin_goal_unknown`; missing owner bearer returns
+`401 auth_failed`. Xin creation remains on its tool. Retiring an agent pauses
+its jobs with the retired reason. Purge removes jobs, runs, events, outboxes,
+steps/adoptions and retained ownership records; content-free side-store
+receipts keep purge counts stable across retries.
+
+Headless installation uses the same configuration and encrypted credential
+store as normal provider management:
+
+```sh
+# Supply the provider key on stdin through a private pipe.
+prx onboard --non-interactive --provider <id> --model <model>
+prx token issue --out <private-token-path>
+prx service install --user --yes
+prx service start
+prx status --json
+```
+
+`--model` is optional. The provider key is read only from stdin and stored
+through the encrypted provider-credential reference store, with its existing
+0600 `.secret_key`. Missing inputs fail nonzero with a typed message. Provider
+keys never belong in argv, environment variables, logs or plaintext files.
+
+Token issuance requires pairing enabled, persists only the bearer verifier,
+and writes the bearer atomically to the explicit `--out` path (0600). Its
+parent must exist. An existing path, including a symlink, is refused unless
+`--force`; stdout contains only the output path and stable install-owner id.
+Service installation is non-interactive and idempotent. `--user` refuses a
+system-wide OpenRC installation.
+
+The daemon's gateway binding atomically publishes `<state dir>/runtime.json`
+(0600) with `prx_version`, `api_base` (`http://127.0.0.1:<actual port>`), `pid`,
+`owner_id`, `started_at` (RFC 3339 UTC Z), and `capabilities_url`.
+`prx status --json` returns its `runtime_path`. Clean shutdown removes the
+matching descriptor; a crash can leave one. Consumers check pid/started_at
+and treat a mismatch as stale.

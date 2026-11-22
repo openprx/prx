@@ -36,7 +36,7 @@ use std::borrow::Cow;
 
 /// The tokens effective in this running daemon, sorted ascending. A token is
 /// listed only when its whole earliest usable form is on main.
-const CAPABILITY_TOKENS: [&str; 18] = [
+const CAPABILITY_TOKENS: [&str; 19] = [
     "agent_catalog_v1",
     "agent_crud_v1",
     "agent_limits_v1",
@@ -44,6 +44,7 @@ const CAPABILITY_TOKENS: [&str; 18] = [
     "agent_memory_purge_v1",
     "capabilities_v1",
     "history_erase_v1",
+    "host_bootstrap_v1",
     "message_context_delivery_v1",
     "message_delete_v1",
     "message_forget_writes_v1",
@@ -107,7 +108,14 @@ const PRX_COMMIT: &str = match option_env!("PRX_BUILD_COMMIT") {
 const CREDENTIAL_QUERY_KEYS: [&str; 6] = ["access_token", "api_key", "auth", "authorization", "bearer", "token"];
 
 #[derive(Serialize)]
+struct LimitsFacts {
+    spawn_batch_max: Option<u64>,
+    live_children_per_agent_max: Option<u64>,
+}
+
+#[derive(Serialize)]
 struct CapabilitiesBody {
+    limits_facts: LimitsFacts,
     prx_version: &'static str,
     commit: &'static str,
     api: u32,
@@ -257,7 +265,11 @@ pub(super) async fn guard(State(state): State<AppState>, mut request: Request, n
         && pairs
             .iter()
             .all(|(key, _)| matches!(key.as_str(), "page_token" | "limit"));
-    if !pairs.is_empty() && !confirm_only && !snapshot_query {
+    let job_query = request.method() == Method::GET
+        && request.uri().path().contains("/xin/")
+        && pairs.len() <= 1
+        && pairs.iter().all(|(key, _)| key == "agent");
+    if !pairs.is_empty() && !confirm_only && !snapshot_query && !job_query {
         return coded_error(
             StatusCode::BAD_REQUEST,
             "field_invalid",
@@ -364,6 +376,10 @@ pub(super) fn method_not_allowed_allowing(allow: &'static str) -> Response {
 pub(super) async fn get_capabilities(State(state): State<AppState>) -> Response {
     let (capabilities, available) = advertised_tokens(&state);
     Json(CapabilitiesBody {
+        limits_facts: LimitsFacts {
+            spawn_batch_max: None,
+            live_children_per_agent_max: None,
+        },
         prx_version: PRX_VERSION,
         commit: PRX_COMMIT,
         api: CAPABILITIES_API,
