@@ -39,9 +39,11 @@ pub(crate) mod turn_source;
 /// would collide with one of them inside the `:`-composed caller identity.
 pub use compat::FIXED_EXTERNAL_ISSUERS;
 
+mod turn_failure;
 mod turn_readiness;
 mod ui;
 mod webhook_dedup;
+use turn_failure::TurnFailureClass;
 use turn_readiness::{GatewayTurnState, TurnNotReady, TurnNotReadyReason, TurnRuntimeStandby};
 
 use crate::agent::document_ingest::DocumentIngestRuntime;
@@ -2702,10 +2704,15 @@ async fn run_gateway_chat_with_multimodal(
     message: &str,
     fabric_ctx: &GatewayFabricContext,
     autosave_key: Option<&str>,
+    stage: &mut TurnFailureClass,
 ) -> anyhow::Result<GatewayTurnResult> {
+    // `stage` names the step that runs next, so a returned error is reported
+    // by the step that failed and never by its text.
+    *stage = TurnFailureClass::TurnNotReady;
     // The webhook routes admitted this turn; a typed refusal here only
     // covers a job that outlived its admission check.
     let turn_runtime = state.admit_turn_runtime()?;
+    *stage = TurnFailureClass::ProviderBinding;
     turn_runtime
         .provider_binding
         .as_ref()
@@ -2768,6 +2775,7 @@ async fn run_gateway_chat_with_multimodal(
         Some(owner_id) => runtime_envelope.with_owner_id(owner_id),
         None => runtime_envelope,
     };
+    *stage = TurnFailureClass::ReplayLookup;
     if fabric.records_recovery_terminal() {
         if let Some(key) = fabric_ctx.idempotency_key.as_deref() {
             if let Some(unavailable) = crate::agent::terminal::oversized_reply::for_input(
@@ -2783,6 +2791,7 @@ async fn run_gateway_chat_with_multimodal(
             }
         }
     }
+    *stage = TurnFailureClass::ResourceDenied;
     authorize_gateway_config_resource_mutation(
         &config_snapshot,
         "gateway:webhook:message_event:user",
@@ -2799,6 +2808,7 @@ async fn run_gateway_chat_with_multimodal(
     })?;
     let cancellation = jobs::current_cancellation().map_or_else(CancellationToken::new, |token| token.child_token());
     let _turn_cancel_guard = cancellation.clone().drop_guard();
+    *stage = TurnFailureClass::InputRecord;
     let pending_input = turn_source::GatewayPendingInput {
         generation: Arc::clone(&config_generation),
         fabric: fabric.clone(),
@@ -2815,6 +2825,7 @@ async fn run_gateway_chat_with_multimodal(
         .await?;
     let runtime_envelope = source_receipt.envelope().clone();
     let base_scope = runtime_envelope.message_scope();
+    *stage = TurnFailureClass::SourceBinding;
     let gateway_proof = source_receipt.bind(&turn_runtime, fabric_ctx)?;
     if let Some(key) = autosave_key {
         let write_scope = runtime_envelope.memory_write_context(if fabric_ctx.channel == "webhook" {
@@ -2843,6 +2854,7 @@ async fn run_gateway_chat_with_multimodal(
     }
     // A spawned webhook job cannot inherit the caller's cleanup task-local.
     // Prediction and later work must retain the same concrete cleanup owner.
+    *stage = TurnFailureClass::DecisionAdmission;
     let child_cleanup = match crate::runtime::turn_cleanup::CleanupScope::new(
         Some(&turn_runtime.publication_slot.cleanup),
         cancellation.clone(),
@@ -2908,6 +2920,7 @@ async fn run_gateway_chat_with_multimodal(
     };
     // Bind before the handoff: a refusal here still has the admission guard
     // to record the failed input and answer the job monitor.
+    *stage = TurnFailureClass::TerminalBinding;
     let terminal_binding = service.terminal_binding(&context)?;
     let (cleanup_ticket, admission_acknowledgement) = admission_guard.into_terminal_parts()?;
     let terminal_guard = turn_source::publication_slot::GatewayTerminalGuard::new(
@@ -2919,6 +2932,7 @@ async fn run_gateway_chat_with_multimodal(
         runtime_envelope.clone(),
         admission_acknowledgement,
     )?;
+    *stage = TurnFailureClass::TurnPreparation;
     let turn_result: anyhow::Result<GatewayTurnResult> = child_cleanup
         .run(async {
             let mem_context = crate::agent::context_recall::scoped_recall(
@@ -3028,6 +3042,7 @@ async fn run_gateway_chat_with_multimodal(
             effective_compaction.config = context.main_compaction().clone();
             crate::providers::context_window::trace_effective_compaction_resolution(&effective_compaction);
 
+            *stage = TurnFailureClass::TurnLoop;
             let provider_started_at = chrono::Utc::now();
             let route_decision = crate::llm::route_decision::RouteDecision::single_candidate_for_context(
                 provider_label,
@@ -3161,6 +3176,7 @@ async fn run_gateway_chat_with_multimodal(
                 Err(error) => {
                     let cancelled =
                         cancellation.is_cancelled() || crate::agent::turn_contracts::is_tool_loop_cancelled(&error);
+                    *stage = TurnFailureClass::Internal;
                     let terminal_id = runtime_envelope
                         .run_id
                         .clone()
@@ -3191,16 +3207,24 @@ async fn run_gateway_chat_with_multimodal(
                     )
                     .await
                     {
+                        *stage = terminal_guard.failure_reason().into();
                         return Err(finalize_error);
                     }
+                    *stage = if cancelled {
+                        TurnFailureClass::Cancelled
+                    } else {
+                        TurnFailureClass::TurnLoop
+                    };
                     return Err(error);
                 }
             };
+            *stage = TurnFailureClass::Internal;
             anyhow::ensure!(
                 trace.execution_trace.as_ref() == Some(&context.terminal_execution_trace()),
                 "gateway returned execution trace differs from its owning decision"
             );
 
+            *stage = TurnFailureClass::ResourceDenied;
             authorize_gateway_config_resource_mutation(
                 &config_snapshot,
                 "gateway:webhook:message_event:assistant",
@@ -3221,7 +3245,7 @@ async fn run_gateway_chat_with_multimodal(
                 .run_id
                 .clone()
                 .unwrap_or_else(|| provider_outcome.decision_id.clone());
-            let receipt = turn_source::publication_slot::commit_terminal(
+            let committed = turn_source::publication_slot::commit_terminal(
                 Some(&terminal_guard),
                 &fabric,
                 crate::agent::terminal::TurnTerminalDraft {
@@ -3249,8 +3273,19 @@ async fn run_gateway_chat_with_multimodal(
                 },
                 &config_snapshot,
             )
-            .await?;
+            .await;
+            let receipt = match committed {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    *stage = terminal_guard.failure_reason().into();
+                    return Err(error);
+                }
+            };
+            *stage = TurnFailureClass::ReplayLookup;
             let replay_unavailable = crate::agent::terminal::oversized_reply::from_receipt(&receipt)?;
+            // The turn's own work is done; what fails from here is its
+            // owned cleanup settling.
+            *stage = TurnFailureClass::TurnCleanup;
             Ok(GatewayTurnResult {
                 response,
                 replay_unavailable,
@@ -3258,9 +3293,10 @@ async fn run_gateway_chat_with_multimodal(
         })
         .await;
     if let Err(error) = &turn_result {
-        terminal_guard
-            .finish_failure(error, cancellation.is_cancelled())
-            .await?;
+        if let Err(finish_error) = terminal_guard.finish_failure(error, cancellation.is_cancelled()).await {
+            *stage = terminal_guard.failure_reason().into();
+            return Err(finish_error);
+        }
     }
     turn_result
 }
@@ -3588,7 +3624,16 @@ async fn run_webhook_job_work(
     if let Some(claim) = idempotency_claim.as_mut() {
         claim.mark_dispatched();
     }
-    match run_gateway_chat_with_multimodal(&state, &provider_label, message, &fabric_ctx, autosave_key.as_deref()).await
+    let mut stage = TurnFailureClass::Internal;
+    match run_gateway_chat_with_multimodal(
+        &state,
+        &provider_label,
+        message,
+        &fabric_ctx,
+        autosave_key.as_deref(),
+        &mut stage,
+    )
+    .await
     {
         Ok(GatewayTurnResult {
             response,
@@ -3724,8 +3769,20 @@ async fn run_webhook_job_work(
                 });
                 return Ok(jobs::JobOutput::new(StatusCode::INTERNAL_SERVER_ERROR, err));
             }
-            tracing::error!("Webhook provider error: {}", sanitized);
-            let err = serde_json::json!({"error": "LLM request failed"});
+            // "LLM request failed" stands for a failed provider request only;
+            // every other failure answers the closed class of its step, never
+            // the error text.
+            let reason = TurnFailureClass::classify(stage, &e);
+            tracing::error!(
+                reason = %reason,
+                error = %crate::agent::diagnostics::error_class(&e),
+                "Webhook turn failed"
+            );
+            let err = if reason == TurnFailureClass::Provider {
+                serde_json::json!({"error": "LLM request failed"})
+            } else {
+                serde_json::json!({"error": "turn_failed", "reason": reason.code()})
+            };
             Ok(jobs::JobOutput::new(StatusCode::INTERNAL_SERVER_ERROR, err))
         }
     }
@@ -3889,12 +3946,14 @@ async fn run_channel_webhook_job_work(
         // The turn records the inbound message and may call tools, so from here
         // the delivery is not replayable by re-execution.
         claim.mark_dispatched();
+        let mut stage = TurnFailureClass::Internal;
         match run_gateway_chat_with_multimodal(
             &state,
             &provider_label,
             &msg.content,
             &fabric_ctx,
             autosave_key.as_deref(),
+            &mut stage,
         )
         .await
         {
@@ -3911,7 +3970,8 @@ async fn run_channel_webhook_job_work(
                 }
             }
             Err(e) => {
-                tracing::error!(error = %crate::security::redaction::redact_provider_text(&format!("{e:#}")), "LLM error for {channel_key} message");
+                let reason = TurnFailureClass::classify(stage, &e);
+                tracing::error!(reason = %reason, error = %crate::security::redaction::redact_provider_text(&format!("{e:#}")), "Turn failed for {channel_key} message");
                 if let Err((status, body)) = authorize_gateway_resource_mutation(
                     &state,
                     &gateway_channel_webhook_operation(channel_key, "send"),
