@@ -250,7 +250,7 @@ impl PublicationRules<'_, '_> {
     /// The bounded direct core the serving model sees while it decides
     /// whether to answer or call a tool: every Direct entry, plus a
     /// delegator when the turn sealed an outgoing child manifest on a
-    /// non-interactive surface. Entries restricted by the turn or blocked by
+    /// non-interactive surface or at Full. Entries restricted by the turn or blocked by
     /// [`Self::capability`] are not published.
     pub(crate) fn direct_surface(
         &self,
@@ -266,8 +266,9 @@ impl PublicationRules<'_, '_> {
                 let delegate = is_delegator(&entry.public_name);
                 let reference = entry_ref(entry);
                 let directly_exposed = matches!(entry.exposure, Exposure::Direct);
-                let minted_delegator =
-                    delegate && outgoing_child && self.trusted.surface != TurnSurfaceKind::Interactive;
+                let minted_delegator = delegate
+                    && outgoing_child
+                    && (self.trusted.surface != TurnSurfaceKind::Interactive || self.full_autonomy());
                 // A child's sealed manifest is the tool set its parent chose
                 // for it (the retired child hop's selection, R9). A child with
                 // its own discovery control reaches deferred members through
@@ -320,7 +321,7 @@ impl PublicationRules<'_, '_> {
     /// A delegator in the published surface may bind the turn's sealed
     /// outgoing child manifest: it is a live delegator entry with the same
     /// schema and generation, published directly or minted on a
-    /// non-interactive surface.
+    /// non-interactive surface or at Full.
     pub(crate) fn admits_published_delegator(&self, published: &BTreeSet<CapabilityRef>, outgoing_child: bool) -> bool {
         published.iter().any(|reference| {
             self.catalog.entry_any(&reference.id).is_some_and(|entry| {
@@ -328,7 +329,8 @@ impl PublicationRules<'_, '_> {
                     && entry.generation == reference.generation
                     && is_delegator(&entry.public_name)
                     && (matches!(entry.exposure, Exposure::Direct)
-                        || outgoing_child && self.trusted.surface != TurnSurfaceKind::Interactive)
+                        || outgoing_child
+                            && (self.trusted.surface != TurnSurfaceKind::Interactive || self.full_autonomy()))
             })
         })
     }

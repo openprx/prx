@@ -147,6 +147,11 @@ retaining revision binding. Remote principals remain refused; paired gateway
 and Console turns do not publish this tool. Below Full, the terminal tool
 registry is unchanged.
 
+When named agents exist at chat startup, Full chat also publishes `delegate`
+and includes it in capability discovery. Restart chat after adding an agent.
+Process children inherit reconstructible tools; `managed_session` and
+`chat_schedule` remain owned by the interactive parent.
+
 A uniquely named read-only operation can acquire its own evidence before generic
 context retrieval, even if the request also mentions a tool with side effects.
 This only orders recovery: discovery, freshness checks, explicit restrictions

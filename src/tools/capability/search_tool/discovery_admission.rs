@@ -186,9 +186,11 @@ pub(crate) fn discovery_entries(
         let core = port.execution_refs().contains(&reference);
         let eligible = !matches!(
             entry.public_name.as_str(),
-            "capability_search" | "stay_silent" | "transcript_history_lookup" | "delegate"
-        ) && (entry.supports_metadata_discovery()
-            || matches!(entry.exposure, Exposure::Direct) && (offered_direct.contains(&entry.id) || core))
+            "capability_search" | "stay_silent" | "transcript_history_lookup"
+        ) && (entry.public_name != "delegate"
+            || port.facts().policy.autonomy == crate::security::AutonomyLevel::Full)
+            && (entry.supports_metadata_discovery()
+                || matches!(entry.exposure, Exposure::Direct) && (offered_direct.contains(&entry.id) || core))
             && rules.owner_isolation_admits(entry)
             && entry.availability.level >= CapabilityAvailabilityLevel::Configured
             && !trusted.excludes_entry(view.model_admission_entry(entry))
