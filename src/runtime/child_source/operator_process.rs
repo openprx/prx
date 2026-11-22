@@ -134,9 +134,15 @@ impl OperatorProcessAuthority {
             &source.generation.effective.autonomy,
             &source.generation.effective.workspace_dir,
         );
-        source
-            .publication
-            .verify_policy(&security, &source.parent, &source.catalog)?;
+        source.publication.verify_policy(
+            &security,
+            crate::security::agent_level::named_child_level(
+                &source.generation.effective,
+                self.initial_scope.agent_id.as_deref(),
+            ),
+            &source.parent,
+            &source.catalog,
+        )?;
         anyhow::ensure!(
             !self.cancellation.is_cancelled(),
             "operator worker authority closed during verification"

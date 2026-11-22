@@ -286,8 +286,17 @@ impl TurnRuntimeService {
             key: Arc::clone(&self.state_key),
         };
         // Retaining the exact inherited authority must not bypass a tighter
-        // current policy or the remaining turn allowance.
-        if !authority_within_policy(&parent, trusted, &self.security, parent.authority.remaining_depth) {
+        // current policy or the remaining turn allowance. A child's level
+        // ceiling is its own sealed level (a named agent may run above the
+        // service that hosts it); a root's is its policy level.
+        let ceiling = inherited.map_or(self.security.autonomy, |manifest| manifest.authority.level);
+        if !authority_within_policy(
+            &parent,
+            trusted,
+            &self.security,
+            ceiling,
+            parent.authority.remaining_depth,
+        ) {
             return None;
         }
         Some(OutgoingDelegation { parent, requested })
@@ -300,9 +309,10 @@ fn authority_within_policy(
     parent: &CapabilityConstraints,
     trusted: &TrustedParts,
     policy: &SecurityPolicy,
+    ceiling: AutonomyLevel,
     max_depth: u8,
 ) -> bool {
-    let level_allowed = match policy.autonomy {
+    let level_allowed = match ceiling {
         AutonomyLevel::ReadOnly => parent.authority.level == AutonomyLevel::ReadOnly,
         AutonomyLevel::Supervised => parent.authority.level != AutonomyLevel::Full,
         AutonomyLevel::Full => true,

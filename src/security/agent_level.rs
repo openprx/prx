@@ -2,9 +2,9 @@
 //!
 //! Every reader of a turn's, a call's or a scheduled run's level asks these
 //! pure functions. A level that is unset or unreadable is never read as
-//! `Full`: a stored creator without a readable level is capped at
-//! `Supervised`, and nothing here raises a child above its parent (that
-//! `min` stays in the execution service and the child-scope derive).
+//! `Full`: a stored creator with an unreadable spelling is capped at
+//! `Supervised`. A child runs at its parent's level unless it is a named
+//! agent, which runs at its own configured level ([`named_child_level`]).
 use crate::config::Config;
 use crate::security::AutonomyLevel;
 
@@ -17,6 +17,16 @@ pub const CREATOR_MAIN: &str = "main";
 #[must_use]
 pub fn agent_level(own: Option<AutonomyLevel>, main: AutonomyLevel) -> AutonomyLevel {
     own.unwrap_or(main)
+}
+
+/// The level a named-agent child runs at: the agent's configured level, or
+/// Main's when it sets none. `None` when `agent` names no configured agent;
+/// such a child runs at its parent's level.
+#[must_use]
+pub fn named_child_level(config: &Config, agent: Option<&str>) -> Option<AutonomyLevel> {
+    agent
+        .and_then(|name| config.agents.get(name))
+        .map(|configured| agent_level(configured.autonomy, config.autonomy.level))
 }
 
 /// The level a tool-internal check reads: the call's level when the
@@ -122,8 +132,9 @@ pub fn scheduled_agent_refusal(
 ///
 /// - Work the local operator created keeps Main's live level.
 /// - Otherwise the stored creator level, lowered to the creator's current
-///   level. A stamp without a readable level or creator is capped at
-///   `Supervised`. A named creator that is gone fails the run.
+///   level. A row with no recorded creator runs at Main's level; a creator
+///   with an unreadable spelling is capped at `Supervised`. A named creator
+///   that is gone fails the run.
 /// - A run started from a tool call is lowered to that call's level.
 ///
 /// # Errors
@@ -143,7 +154,7 @@ pub fn scheduled_level(
                 Some(current) => stored.min(current?),
                 None => AutonomyLevel::Supervised.min(main),
             },
-            _ => AutonomyLevel::Supervised.min(main),
+            _ => main,
         }
     };
     Ok(caller.map_or(base, |caller| base.min(caller)))

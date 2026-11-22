@@ -130,7 +130,12 @@ impl TurnRuntimeService {
             source_event_id: proof.source_event_id().map(Arc::from),
             causation_event_id: None,
             surface: proof.surface(),
-            side_effect_mode: match self.security.autonomy {
+            // A child turn runs at its sealed scope level (a named agent's
+            // own level may differ from the hosting service's).
+            side_effect_mode: match proof
+                .child_scope()
+                .map_or(self.security.autonomy, |scope| scope.gate_inputs().0.authority.level)
+            {
                 crate::security::AutonomyLevel::ReadOnly => {
                     crate::tools::capability::turn_state::SideEffectMode::ReadOnly
                 }
@@ -215,8 +220,9 @@ impl TurnRuntimeService {
                 && catalog
                     .iter_entries()
                     .any(|entry| entry.public_name == "capability_search"),
-            child_served: (proof.child_scope().is_some()
-                && self.security.autonomy == crate::security::AutonomyLevel::Full)
+            child_served: proof
+                .child_scope()
+                .is_some_and(|scope| scope.gate_inputs().0.authority.level == crate::security::AutonomyLevel::Full)
                 .then(|| Arc::new(self.child_served_entries(&catalog))),
         };
         // The published surface is an execution rule over the pinned scope,

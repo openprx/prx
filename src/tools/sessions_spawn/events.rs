@@ -35,6 +35,14 @@ pub(super) fn spawn_event_scope(
     event_scope
 }
 
+/// The codes the `task.spawned` record states about the issued child.
+pub(super) struct SpawnRecordCodes<'a> {
+    /// Whether the child can spawn ([`crate::runtime::child_source::publication::ChildDelegation`]).
+    pub(super) child_delegation: Option<&'a str>,
+    /// The level the child runs at.
+    pub(super) child_level: crate::security::AutonomyLevel,
+}
+
 pub(super) async fn record_spawn_request_event(
     fabric: Option<&MemoryFabric>,
     scope: MessageEventScope,
@@ -42,7 +50,7 @@ pub(super) async fn record_spawn_request_event(
     mode: &str,
     selection: (&str, &str),
     lineage: &SpawnLineage,
-    child_delegation: Option<&str>,
+    codes: SpawnRecordCodes<'_>,
 ) -> anyhow::Result<Option<Arc<crate::runtime::child_source::ChildInputReceipt>>> {
     let Some(fabric) = fabric else {
         return Ok(None);
@@ -67,8 +75,14 @@ pub(super) async fn record_spawn_request_event(
     delegation::append_task(&mut metadata, task)?;
     // Only the task record states it. The child-input payload is read back
     // with `deny_unknown_fields` and owns the `delegation` key.
-    if let (Some(code), Some(object)) = (child_delegation, metadata.as_object_mut()) {
-        object.insert("child_delegation".to_owned(), serde_json::Value::from(code));
+    if let Some(object) = metadata.as_object_mut() {
+        if let Some(code) = codes.child_delegation {
+            object.insert("child_delegation".to_owned(), serde_json::Value::from(code));
+        }
+        object.insert(
+            "child_level".to_owned(),
+            serde_json::Value::from(crate::security::agent_level::stored_level(codes.child_level)),
+        );
     }
     if let Err(error) = fabric
         .record_task_event(task_event_scope, task_id, "task.spawned", Some(metadata.to_string()))

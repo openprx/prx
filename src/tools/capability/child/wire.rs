@@ -33,6 +33,9 @@ pub struct WorkerChildCapabilityManifest {
     pub owner: String,
     pub workspace: String,
     pub level: crate::security::AutonomyLevel,
+    /// The named agent's configured level, when the child is that agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_level: Option<crate::security::AutonomyLevel>,
     pub max_cost_cents: u32,
     pub remaining_depth: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]

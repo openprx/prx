@@ -111,7 +111,12 @@ impl OperatorProcessSnapshots {
             &generation.effective.autonomy,
             &generation.effective.workspace_dir,
         );
-        publication.verify_policy(&security, &parent, &catalog)?;
+        publication.verify_policy(
+            &security,
+            crate::security::agent_level::named_child_level(&generation.effective, manifest.agent_id.as_deref()),
+            &parent,
+            &catalog,
+        )?;
         Ok(Self {
             publication,
             key,

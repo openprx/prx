@@ -747,16 +747,23 @@ impl Tool for DelegateTool {
         let child_source = if let Some(caller) = caller.as_ref()
             && let Some(publication) = &caller.context().ordinary_child_publication
         {
+            // The named agent runs at its own configured level, sealed into
+            // the child scope.
+            let level = crate::tools::capability::child::ChildLevel::from_named(
+                crate::security::agent_level::named_child_level(&publication.generation().effective, Some(agent_name)),
+            );
+            let publication = publication.with_child_level(level)?;
+            let caller = caller.with_ordinary_publication(publication.clone())?;
             let (proof, execution) = child_binding.ordinary_execution_source(
                 &provider,
-                caller,
+                &caller,
                 &event_scope,
                 &full_prompt,
                 source_receipt.as_deref(),
             )?;
             Some(DelegateChildSource {
                 authority: DelegateChildAuthority {
-                    publication: publication.clone(),
+                    publication,
                     caller: caller.context().clone(),
                 },
                 proof,

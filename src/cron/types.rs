@@ -312,7 +312,7 @@ pub struct CronJobLineage {
     /// [`JobCreator::AgentTool`].
     pub created_via: JobCreator,
     /// The creating call's level and agent (`creator_level`, `creator_agent`).
-    /// The default records neither, so the job runs capped at `supervised`.
+    /// The default records neither, so the job runs at Main's level.
     pub creator: crate::security::agent_level::CreatorStamp,
 }
 
@@ -375,7 +375,7 @@ pub struct CronJobPatch {
     pub created_via: Option<JobCreator>,
     /// The rewriting call's level and agent, set only by the runtime. A
     /// command or prompt change records it, and `None` records neither, so a
-    /// job rewritten off the tool path runs capped at `supervised`.
+    /// job rewritten off the tool path runs at Main's level.
     #[serde(skip)]
     pub creator: Option<crate::security::agent_level::CreatorStamp>,
 }

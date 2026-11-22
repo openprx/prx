@@ -2279,7 +2279,7 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&mut Connection) -> Result
     // `agent_tool` (its git is refused) until the operator marks it.
     add_column_if_missing(&conn, "cron_jobs", "created_via", "TEXT")?;
     // The creating call's level and agent. Nullable with no backfill: a row
-    // without them runs capped at `supervised`.
+    // without them runs at Main's level.
     add_column_if_missing(&conn, "cron_jobs", "creator_level", "TEXT")?;
     add_column_if_missing(&conn, "cron_jobs", "creator_agent", "TEXT")?;
     add_column_if_missing(&conn, "cron_runs", "attempt_id", "TEXT")?;

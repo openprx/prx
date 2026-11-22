@@ -24,9 +24,15 @@ pub(super) async fn operator_process_publication(
             && build.catalog_sources.config_generation_id == snapshots.generation.id.0.to_string(),
         "operator worker service differs from source"
     );
-    snapshots
-        .publication
-        .verify_policy(&build.security, &snapshots.parent, &snapshots.catalog)?;
+    snapshots.publication.verify_policy(
+        &build.security,
+        crate::security::agent_level::named_child_level(
+            &snapshots.generation.effective,
+            authority.logical_scope().agent_id.as_deref(),
+        ),
+        &snapshots.parent,
+        &snapshots.catalog,
+    )?;
     // The frozen capability set is a membership limit; Full has no permission
     // limits (R51/OV-4), so a Full worker keeps the actual surface policy.
     // The pinned catalog is the parent's: an entry this worker's executor

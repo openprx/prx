@@ -128,6 +128,37 @@ fn worker_direct_names(
     )
 }
 
+/// The level a worker runs at: the level sealed into its child scope or
+/// operator publication. It is not read from Main's level on disk. A level
+/// above Main's is accepted only when it is the level the named agent's
+/// configuration derives.
+fn worker_sealed_level(
+    config: &Config,
+    manifest: &WorkerManifest,
+    ordinary: Option<&crate::runtime::child_source::ordinary_process::OrdinaryProcessSnapshots>,
+    operator: Option<&crate::runtime::operator_spawn::process::OperatorProcessSnapshots>,
+) -> Result<crate::security::AutonomyLevel> {
+    let named = crate::security::agent_level::named_child_level(config, manifest.agent_id.as_deref());
+    let level = if let Some(ordinary) = ordinary {
+        let scope = ordinary.scope.gate_inputs().0;
+        anyhow::ensure!(
+            scope.agent_level.is_none() || scope.agent_level == named,
+            "session-worker named-agent level differs from its configuration"
+        );
+        scope.authority.level
+    } else {
+        operator
+            .context("session-worker sealed level source missing")?
+            .publication
+            .level()
+    };
+    anyhow::ensure!(
+        level <= config.autonomy.level || named == Some(level),
+        "session-worker sealed level exceeds its configuration"
+    );
+    Ok(level)
+}
+
 fn worker_source_workspace(manifest: &WorkerManifest) -> Result<&str> {
     match (&manifest.ordinary_source, &manifest.operator_source) {
         (Some(source), None) => Ok(source.parent_constraints.workspace.as_str()),
@@ -402,11 +433,18 @@ async fn run_owned_manifest(
         })
         .transpose()?;
     config.workspace_dir = manifest.workspace_dir.clone();
+    let level = worker_sealed_level(
+        &config,
+        &manifest,
+        ordinary_snapshots.as_ref(),
+        operator_snapshots.as_ref(),
+    )?;
     // FIX-P1-31: honour the configured `security.audit` block on the gate audit path.
-    let security = Arc::new(
-        SecurityPolicy::from_config(&config.autonomy, &manifest.workspace_dir)
-            .with_audit_config(config.security.audit.clone()),
-    );
+    let security = Arc::new(SecurityPolicy {
+        autonomy: level,
+        ..SecurityPolicy::from_config(&config.autonomy, &manifest.workspace_dir)
+            .with_audit_config(config.security.audit.clone())
+    });
 
     let provider_runtime_options = crate::providers::provider_runtime_options_from_config(&config);
 

@@ -105,6 +105,10 @@ impl VerifiedOperatorProcessPublication {
     pub(crate) const fn allowed(&self) -> &BTreeSet<CapabilityRef> {
         &self.allowed
     }
+    /// The sealed level the process child runs at.
+    pub(crate) const fn level(&self) -> crate::security::AutonomyLevel {
+        self.level
+    }
 }
 
 pub(crate) struct OperatorProcessLaunch {
@@ -274,6 +278,11 @@ impl OperatorProcessLaunch {
             },
             self.scope.attempt_id.clone(),
             self.scope.lease_epoch,
+            crate::security::agent_level::named_child_level(
+                &source.generation.effective,
+                self.scope.agent_id.as_deref(),
+            )
+            .unwrap_or(source.security.autonomy),
         )?;
         source.publication.verify(
             &source.proof,
@@ -349,19 +358,18 @@ pub(crate) struct OperatorProcessSnapshots {
 }
 
 impl VerifiedOperatorProcessPublication {
+    /// `named` is the level derived from the worker's named agent's
+    /// configuration; only that level may exceed the restored policy.
     pub(crate) fn verify_policy(
         &self,
         security: &crate::security::SecurityPolicy,
+        named: Option<crate::security::AutonomyLevel>,
         parent: &crate::runtime::child_source::parent::ParentSource,
         catalog: &CapabilityCatalog,
     ) -> anyhow::Result<()> {
-        let rank = |level| match level {
-            crate::security::AutonomyLevel::ReadOnly => 0,
-            crate::security::AutonomyLevel::Supervised => 1,
-            crate::security::AutonomyLevel::Full => 2,
-        };
         anyhow::ensure!(
-            rank(self.level) <= rank(security.autonomy) && self.max_cost_cents <= security.max_cost_per_day_cents,
+            (self.level <= security.autonomy || named == Some(self.level))
+                && self.max_cost_cents <= security.max_cost_per_day_cents,
             "operator process authority exceeds restored security policy"
         );
         let view = catalog.view(&crate::tools::capability::catalog::CatalogScope::default());

@@ -90,7 +90,9 @@ pub(crate) fn runtime_dependency_spec(
     let trusted = port.trusted();
     // Full has no permission limits (R51): manifest membership does not
     // limit a Full child's runtime dependencies; parity and exclusion stay.
-    let full = port.facts().policy.autonomy == crate::security::AutonomyLevel::Full;
+    let full = proof.child_scope().map_or(port.facts().policy.autonomy, |scope| {
+        scope.gate_inputs().0.authority.level
+    }) == crate::security::AutonomyLevel::Full;
     if let Some(scope) = proof.child_scope().filter(|_| !full) {
         anyhow::ensure!(
             scope.gate_inputs().0.allowed.contains(&CapabilityRef {

@@ -1021,12 +1021,12 @@ async fn run_shell_with_cancellation(
 
 /// The level a run of `task` (or of a goal step) runs at
 /// (`security::agent_level`), or the refusal recorded on the run. An
-/// unreadable creator reads as empty, so the run is capped at `supervised`.
+/// unreadable creator reads as empty, so the run uses Main's level.
 fn task_run_level(config: &Config, task: &XinTask) -> Result<crate::security::AutonomyLevel, String> {
     // Operator work is decided by the operator-class `created_via` (and the
     // built-in system tasks), never by the origin's channel or sender.
     let (created_via, creator) = store::task_creator(config, &task.id).unwrap_or_else(|error| {
-        tracing::warn!(target: "xin", task_id = %task.id, "xin task creator unreadable; the run is capped at supervised: {error}");
+        tracing::warn!(target: "xin", task_id = %task.id, "xin task creator unreadable; the run uses Main's level: {error}");
         Default::default()
     });
     let operator =

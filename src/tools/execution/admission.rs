@@ -307,21 +307,21 @@ pub(super) fn admit_child(
     Ok(())
 }
 
-/// Combines the parent policy decision with the child manifest autonomy by
-/// Deny > Ask > Allow. A child can only tighten the parent decision, except
-/// under a Full service, which has no permission limits (R51).
+/// Combines the policy decision at the call's effective level with the child
+/// manifest autonomy by Deny > Ask > Allow. A child at Full has no permission
+/// limits (R51).
 pub(super) fn child_autonomy(
     context: &ToolExecutionContext,
     descriptor: &ToolDescriptor,
     decision: super::ToolExecutionDecision,
-    service_level: crate::security::policy::AutonomyLevel,
+    effective_level: crate::security::policy::AutonomyLevel,
 ) -> super::ToolExecutionDecision {
     use super::ToolExecutionDecision::{Allow, Ask, Deny};
     use crate::security::policy::AutonomyLevel;
     let Some(scope) = &context.child_scope else {
         return decision;
     };
-    if service_level == AutonomyLevel::Full {
+    if effective_level == AutonomyLevel::Full {
         return decision;
     }
     let name = if descriptor.adapter == super::ToolAdapterKind::Skill {

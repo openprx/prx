@@ -116,6 +116,7 @@ impl ChildCapabilityManifest {
                 remaining_depth: wire.remaining_depth,
                 delegation: wire.delegation.clone().map(Arc::new),
             },
+            agent_level: wire.agent_level,
             catalog_generation: CatalogGeneration(wire.catalog_generation),
             seal: wire.seal,
         };
@@ -139,6 +140,7 @@ impl ChildCapabilityManifest {
             owner: self.authority.owner.clone(),
             workspace: self.authority.workspace.clone(),
             level: self.authority.level,
+            agent_level: self.agent_level,
             max_cost_cents: self.authority.max_cost_cents,
             remaining_depth: self.authority.remaining_depth,
             delegation: self.authority.delegation.as_deref().cloned(),

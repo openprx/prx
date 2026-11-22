@@ -3740,7 +3740,7 @@ async fn run_webhook_job_work(
                 .observer
                 .record_event(&crate::observability::ObserverEvent::Error {
                     component: "gateway".to_string(),
-                    message: sanitized.clone(),
+                    message: sanitized,
                 });
             state
                 .observer

@@ -68,8 +68,29 @@ pub(crate) struct ChildCapabilityManifest {
     pub parent_authority_id: ParentAuthorityId,
     pub allowed: BTreeSet<CapabilityRef>,
     pub authority: AuthorityEnvelope,
+    /// The level derived from a named agent's configuration when the child
+    /// is that agent, bound into the seal. Only a child carrying it may run
+    /// above its parent, and then exactly at it.
+    pub agent_level: Option<AutonomyLevel>,
     pub catalog_generation: CatalogGeneration,
     pub seal: [u8; 32],
+}
+
+/// The level input of a child derivation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildLevel {
+    /// An ordinary child runs at its parent's effective level.
+    Parent,
+    /// A named-agent child runs at the level derived from that agent's
+    /// configuration (`security::agent_level::named_child_level`).
+    NamedAgent(AutonomyLevel),
+}
+
+impl ChildLevel {
+    /// `NamedAgent` for a configured named agent, else `Parent`.
+    pub(crate) fn from_named(level: Option<AutonomyLevel>) -> Self {
+        level.map_or(Self::Parent, Self::NamedAgent)
+    }
 }
 
 /// Immutable verified input to a child decision. Serialization is intentionally
@@ -211,9 +232,20 @@ pub(crate) enum ChildManifestError {
 }
 
 impl ChildCapabilityManifest {
+    /// An ordinary child at its parent's level.
     pub(crate) fn derive_strict_subset(
         parent: &CapabilityConstraints,
         requested: &[CapabilityRef],
+    ) -> Result<Self, ChildManifestError> {
+        Self::derive_at_level(parent, requested, ChildLevel::Parent)
+    }
+
+    /// A child at an explicit level input; the level and, for a named agent,
+    /// the configured level are bound into the seal.
+    pub(crate) fn derive_at_level(
+        parent: &CapabilityConstraints,
+        requested: &[CapabilityRef],
+        level: ChildLevel,
     ) -> Result<Self, ChildManifestError> {
         if parent.authority.remaining_depth == 0 {
             return Err(ChildManifestError::DepthExhausted);
@@ -230,6 +262,13 @@ impl ChildCapabilityManifest {
         }
         let mut authority = parent.authority.clone();
         authority.remaining_depth -= 1;
+        let agent_level = match level {
+            ChildLevel::Parent => None,
+            ChildLevel::NamedAgent(named) => {
+                authority.level = named;
+                Some(named)
+            }
+        };
         if let Some(delegation) = authority.delegation.as_ref().filter(|pins| pins.requested) {
             authority.delegation = Some(Arc::new(wire::WorkerDelegationAuthority {
                 requested: false,
@@ -241,6 +280,7 @@ impl ChildCapabilityManifest {
             parent_authority_id: parent.parent_authority_id,
             allowed,
             authority,
+            agent_level,
             catalog_generation: parent.catalog_generation,
             seal: [0; 32],
         };
@@ -268,7 +308,9 @@ impl ChildCapabilityManifest {
         }
         if self.authority.owner != parent.authority.owner
             || self.authority.workspace != parent.authority.workspace
-            || level_rank(self.authority.level) > level_rank(parent.authority.level)
+            || self.agent_level.is_some_and(|named| named != self.authority.level)
+            || (level_rank(self.authority.level) > level_rank(parent.authority.level)
+                && self.agent_level != Some(self.authority.level))
             || self.authority.max_cost_cents > parent.authority.max_cost_cents
             || self.authority.remaining_depth >= parent.authority.remaining_depth
             || parent.authority.delegation.as_ref().is_some_and(|pins| {
@@ -299,6 +341,10 @@ impl ChildCapabilityManifest {
             append(&mut encoded, reference.id.as_str().as_bytes());
             append(&mut encoded, &reference.fingerprint.0);
             append(&mut encoded, &reference.generation.0);
+        }
+        if let Some(named) = self.agent_level {
+            append(&mut encoded, b"named-agent-level-v1");
+            encoded.push(level_rank(named));
         }
         if let Some(delegation) = &self.authority.delegation {
             append(&mut encoded, b"recursive-delegation-v1");

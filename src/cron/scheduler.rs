@@ -1075,10 +1075,10 @@ async fn deliver_if_configured(
 
 /// The level a run of `job` runs at (`security::agent_level`), or the
 /// refusal recorded on the run row. An unreadable creator reads as empty, so
-/// the run is capped at `supervised`.
+/// the run uses Main's level.
 fn job_run_level(config: &Config, job: &CronJob) -> Result<crate::security::AutonomyLevel, String> {
     let (created_via, creator) = crate::cron::job_creator(config, &job.id).unwrap_or_else(|error| {
-        tracing::warn!(job_id = %job.id, "cron job creator unreadable; the run is capped at supervised: {error}");
+        tracing::warn!(job_id = %job.id, "cron job creator unreadable; the run uses Main's level: {error}");
         Default::default()
     });
     // Operator work is decided by the operator-class `created_via` only, never

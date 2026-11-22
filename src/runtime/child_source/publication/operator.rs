@@ -170,6 +170,21 @@ impl OperatorChildPublication {
             Arc::ptr_eq(&registry, &parent.registry),
             "operator task registry differs from source"
         );
+        // A named agent runs at its own configured level; an ordinary child
+        // at the operator's.
+        let level = crate::security::agent_level::named_child_level(
+            &parent.generation.effective,
+            task.logical_scope().agent_id.as_deref(),
+        )
+        .unwrap_or(parent.security.autonomy);
+        let security = if level == parent.security.autonomy {
+            Arc::clone(&parent.security)
+        } else {
+            Arc::new(SecurityPolicy {
+                autonomy: level,
+                ..parent.security.as_ref().clone()
+            })
+        };
         let runtime = parent
             .loop_runtime
             .clone()
@@ -180,7 +195,7 @@ impl OperatorChildPublication {
         let execution = Arc::new(
             ToolExecutionService::from_shared_boxed_registry(
                 Arc::clone(&registry),
-                Arc::new(crate::tools::SecurityEffectPolicy::new(Arc::clone(&parent.security))),
+                Arc::new(crate::tools::SecurityEffectPolicy::new(Arc::clone(&security))),
                 Arc::new(crate::tools::DenyApprovalStrategy),
                 Arc::new(crate::tools::AdapterOwnedPreparation),
                 Arc::new(crate::tools::TracingToolExecutionAudit),
@@ -191,7 +206,7 @@ impl OperatorChildPublication {
         // The frozen capability set is a membership limit. Full has no
         // permission limits (R51/OV-4): a Full task publishes under the
         // parent's surface policy; parity, budget and per-call policy stay.
-        if parent.security.autonomy != crate::security::AutonomyLevel::Full {
+        if level != crate::security::AutonomyLevel::Full {
             let view = parent.catalog.view(&CatalogScope::default());
             let mut names = BTreeSet::new();
             for entry in view.iter_entries() {
@@ -211,12 +226,8 @@ impl OperatorChildPublication {
             policy.allowed_tools = Some(names);
         }
         parent.catalog.check_parity(&execution)?;
-        let policy_version = pinned_policy_version(
-            &parent.generation.effective,
-            &parent.security,
-            &policy,
-            &parent.state_key,
-        )?;
+        let policy_version =
+            pinned_policy_version(&parent.generation.effective, &security, &policy, &parent.state_key)?;
         let factory = DecisionBackendFactory::from_config(
             &parent.generation.effective,
             FactoryDeps {
@@ -235,7 +246,7 @@ impl OperatorChildPublication {
                 }),
                 Some(task.allowance().money()),
                 &parent.generation.effective,
-                &parent.security,
+                &security,
             )),
             // R9/R26: an enabled engine analyses the child's own turns on
             // the child's runtime context and accounting scope.
@@ -271,7 +282,7 @@ impl OperatorChildPublication {
             registry,
             execution,
             memory: Arc::clone(&parent.memory),
-            security: Arc::clone(&parent.security),
+            security,
         });
         service.resolve_agent_model(task.as_ref())?;
         task.verify()?;
@@ -280,10 +291,13 @@ impl OperatorChildPublication {
 }
 
 impl OperatorChildPublication {
+    /// `level` is the level the process child runs at: a named agent's
+    /// configured level or the operator's, sealed into the publication.
     pub(crate) fn bind_process_publication(
         &self,
         id: uuid::Uuid,
         key: &DecisionKey,
+        level: crate::security::AutonomyLevel,
     ) -> anyhow::Result<crate::session_worker::protocol::WorkerOperatorPublication> {
         let parent = &self.service;
         self.verify(&self.source, &parent.generation, &parent.memory, &parent.security)?;
@@ -291,7 +305,7 @@ impl OperatorChildPublication {
             publication_id: id.to_string(),
             owner: self.source.owner_id().to_owned(),
             workspace: self.source.workspace_id().to_owned(),
-            level: parent.security.autonomy,
+            level,
             max_cost_cents: parent.security.max_cost_per_day_cents,
             allowed: self
                 .authority
@@ -325,9 +339,10 @@ impl OperatorChildPublication {
         selection: crate::session_worker::protocol::WorkerProviderSelection,
         attempt_id: Option<String>,
         lease_epoch: Option<i64>,
+        level: crate::security::AutonomyLevel,
     ) -> anyhow::Result<crate::session_worker::protocol::WorkerOperatorSource> {
         Ok(crate::session_worker::protocol::WorkerOperatorSource {
-            publication: self.bind_process_publication(id, key)?,
+            publication: self.bind_process_publication(id, key, level)?,
             input,
             provider_selection: selection,
             attempt_id,

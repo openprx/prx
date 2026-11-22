@@ -235,6 +235,32 @@ impl OrdinaryChildPublication {
         })
     }
 
+    /// The same selected capabilities at a child's own level: a named agent
+    /// runs at its configured level (sealed into the scope), an ordinary child
+    /// keeps this publication's level. The parent half stays shared.
+    pub(crate) fn with_child_level(
+        &self,
+        level: crate::tools::capability::child::ChildLevel,
+    ) -> Result<Self, crate::tools::capability::child::ChildManifestError> {
+        if level == crate::tools::capability::child::ChildLevel::Parent {
+            return Ok(self.clone());
+        }
+        let constraints = &self.inner.authority.constraints;
+        let requested: Vec<CapabilityRef> = self.scope.gate_inputs().0.allowed.iter().cloned().collect();
+        let manifest =
+            crate::tools::capability::child::ChildCapabilityManifest::derive_at_level(constraints, &requested, level)?;
+        let scope = crate::tools::capability::child::VerifiedChildScope::new(manifest, constraints)?;
+        Ok(Self {
+            inner: Arc::clone(&self.inner),
+            scope: Arc::new(scope),
+        })
+    }
+
+    /// The level a child issued from this publication runs at.
+    pub(crate) fn level(&self) -> crate::security::AutonomyLevel {
+        self.scope.gate_inputs().0.authority.level
+    }
+
     /// The publication a `sessions_spawn` child issues from. An explicit
     /// `true` must derive the recursive scope; an explicit `false` keeps this
     /// captured object itself, unchanged. An omitted flag derives the

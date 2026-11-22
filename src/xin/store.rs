@@ -2972,7 +2972,7 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
     add_column_if_missing(&conn, "xin_tasks", "created_via", "TEXT")?;
     add_column_if_missing(&conn, "xin_goals", "origin", "TEXT")?;
     // The creating call's level and agent. Nullable with no backfill: a row
-    // without them runs capped at `supervised`.
+    // without them runs at Main's level.
     add_column_if_missing(&conn, "xin_tasks", "creator_level", "TEXT")?;
     add_column_if_missing(&conn, "xin_tasks", "creator_agent", "TEXT")?;
     add_column_if_missing(&conn, "xin_goals", "creator_level", "TEXT")?;

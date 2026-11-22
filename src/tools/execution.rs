@@ -1206,6 +1206,16 @@ pub enum ToolExecutionDecision {
 pub trait EffectPolicy: Send + Sync {
     fn autonomy_level(&self) -> crate::security::AutonomyLevel;
     fn decide(&self, descriptor: &ToolDescriptor, context: &ToolExecutionContext) -> ToolExecutionDecision;
+    /// The decision at the call's effective level, which a child scope may
+    /// set apart from the service's own level.
+    fn decide_at(
+        &self,
+        descriptor: &ToolDescriptor,
+        context: &ToolExecutionContext,
+        _level: crate::security::AutonomyLevel,
+    ) -> ToolExecutionDecision {
+        self.decide(descriptor, context)
+    }
 }
 
 /// Adapter from the current authoritative [`SecurityPolicy`] decision point.
@@ -1232,6 +1242,33 @@ impl EffectPolicy for SecurityEffectPolicy {
         };
         decide_tool_execution(
             self.policy.as_ref(),
+            policy_name,
+            context.sender(),
+            context.channel(),
+            &context.chat_type,
+        )
+    }
+
+    fn decide_at(
+        &self,
+        descriptor: &ToolDescriptor,
+        context: &ToolExecutionContext,
+        level: crate::security::AutonomyLevel,
+    ) -> ToolExecutionDecision {
+        if level == self.policy.autonomy {
+            return self.decide(descriptor, context);
+        }
+        let policy_name = if descriptor.adapter == ToolAdapterKind::Skill {
+            &descriptor.backend_name
+        } else {
+            &descriptor.public_name
+        };
+        let at_level = SecurityPolicy {
+            autonomy: level,
+            ..self.policy.as_ref().clone()
+        };
+        decide_tool_execution(
+            &at_level,
             policy_name,
             context.sender(),
             context.channel(),
@@ -2972,19 +3009,19 @@ impl ToolExecutionService {
             }
         };
 
-        let service_level = self.policy.autonomy_level();
-        let full = service_level == crate::security::AutonomyLevel::Full;
-        // Full has no permission limits (R51): a Full child's backend runs at
-        // Full whatever its manifest level; below Full the manifest attenuates.
-        let effective_level = match context.child_scope.as_ref() {
-            Some(scope) if !full => service_level.min(scope.gate_inputs().0.authority.level),
-            _ => service_level,
-        };
+        // A child runs at its sealed scope level: its parent's level, or a
+        // named agent's own configured level (verified against the seal).
+        // Without a child scope the call runs at the service's level.
+        let effective_level = context.child_scope.as_ref().map_or_else(
+            || self.policy.autonomy_level(),
+            |scope| scope.gate_inputs().0.authority.level,
+        );
+        let full = effective_level == crate::security::AutonomyLevel::Full;
         let decision = admission::child_autonomy(
             &context,
             &descriptor,
-            self.policy.decide(&descriptor, &context),
-            service_level,
+            self.policy.decide_at(&descriptor, &context, effective_level),
+            effective_level,
         );
         // Ordinary calls honor the execution policy, including Full's Allow.
         // Only the verified controlled H2 ingress retains its durable exact

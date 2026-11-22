@@ -58,7 +58,7 @@ const ORIGIN_MIGRATION_SQL: &str = "ALTER TABLE cron_jobs ADD COLUMN IF NOT EXIS
 /// `ALTER TABLE`. Nullable with no backfill: NULL reads as `agent_tool`.
 const CREATED_VIA_MIGRATION_SQL: &str = "ALTER TABLE cron_jobs ADD COLUMN IF NOT EXISTS created_via TEXT;";
 /// The creating call's level and agent, mirroring the SQLite `ALTER TABLE`.
-/// Nullable with no backfill: a row without them runs capped at `supervised`.
+/// Nullable with no backfill: a row without them runs at Main's level.
 const CREATOR_LEVEL_MIGRATION_SQL: &str = "ALTER TABLE cron_jobs ADD COLUMN IF NOT EXISTS creator_level TEXT;
      ALTER TABLE cron_jobs ADD COLUMN IF NOT EXISTS creator_agent TEXT;";
 const CLAIM_LEASE_MIGRATION_SQL: &str = "ALTER TABLE cron_jobs ADD COLUMN IF NOT EXISTS claim_owner TEXT;
