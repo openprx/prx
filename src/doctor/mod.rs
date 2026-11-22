@@ -406,7 +406,7 @@ fn check_unfinished_config_changes(config: &Config, items: &mut Vec<DiagItem>) {
 /// remedy (D-088 C-7). Reads the file only; starts nothing.
 fn check_workspace_mcp_servers(config: &Config, items: &mut Vec<DiagItem>) {
     let category = "mcp";
-    let notes = crate::tools::mcp::workspace_server_notes(&config.mcp, &config.workspace_dir);
+    let notes = crate::tools::mcp::workspace_server_notes(&config.mcp, &config.workspace_dir, config.autonomy.level);
     if notes.is_empty() {
         items.push(DiagItem::healthy(
             category,
@@ -2861,6 +2861,7 @@ mod tests {
     fn doctor_reports_a_workspace_mcp_server_blocked_by_the_opt_in() {
         let temp = TempDir::new().unwrap();
         let mut config = Config::default();
+        config.autonomy.level = crate::security::AutonomyLevel::Supervised;
         config.workspace_dir = temp.path().to_path_buf();
         std::fs::write(
             temp.path().join("mcp.json"),

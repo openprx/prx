@@ -40,11 +40,19 @@ type McpClient = rmcp::service::RunningService<rmcp::RoleClient, ()>;
 ///   another host;
 /// - no idle connection pooling, as in rmcp's default (avoids delayed-ACK
 ///   stalls on a reused connection whose body was not drained).
-fn mcp_http_client() -> anyhow::Result<reqwest013::Client> {
-    reqwest013::Client::builder()
+///
+/// `full` is the registry's level: at Full the resolver refuses only
+/// unspecified and multicast addresses.
+fn mcp_http_client(full: bool) -> anyhow::Result<reqwest013::Client> {
+    let builder = reqwest013::Client::builder()
         .pool_max_idle_per_host(0)
-        .redirect(reqwest013::redirect::Policy::none())
-        .dns_resolver(GlobalOnlyResolver)
+        .redirect(reqwest013::redirect::Policy::none());
+    let builder = if full {
+        builder.dns_resolver(FullLevelResolver)
+    } else {
+        builder.dns_resolver(GlobalOnlyResolver)
+    };
+    builder
         .build()
         .map_err(|error| anyhow::anyhow!("failed to build the MCP HTTP client: {error}"))
 }
@@ -63,6 +71,30 @@ impl reqwest013::dns::Resolve for GlobalOnlyResolver {
         Box::pin(async move {
             let addresses = super::http_request::lookup_host(&host, 0).await?;
             refuse_non_global(&host, addresses)
+        })
+    }
+}
+
+/// The MCP HTTP resolver at Full: private, loopback and link-local
+/// addresses are allowed; unspecified and multicast addresses are refused.
+struct FullLevelResolver;
+
+impl reqwest013::dns::Resolve for FullLevelResolver {
+    fn resolve(&self, name: reqwest013::dns::Name) -> reqwest013::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let addresses = super::http_request::lookup_host(&host, 0).await?;
+            if addresses.is_empty() {
+                return Err(format!("MCP HTTP host {host} did not resolve").into());
+            }
+            if addresses
+                .iter()
+                .any(|address| super::http_request::is_unroutable_ip(address.ip()))
+            {
+                return Err(format!("MCP HTTP host {host} resolves to an unspecified or multicast address").into());
+            }
+            let addresses: reqwest013::dns::Addrs = Box::new(addresses.into_iter());
+            Ok(addresses)
         })
     }
 }
@@ -118,6 +150,9 @@ struct RuntimeState {
     last_refresh_attempt: Option<SystemTime>,
     catalog_snapshot: super::SharedToolCatalogSnapshot,
     capability_specs: Vec<McpCapabilitySpec>,
+    /// The registry's held level is Full: per-server allow/deny lists are
+    /// not applied to the published catalog.
+    full_level: bool,
 }
 
 struct StdioSession {
@@ -187,9 +222,17 @@ struct McpJsonServer {
 /// did not start as written, with its remedy, for `prx doctor` (D-088 C-7).
 /// Reads the file only; starts nothing.
 #[must_use]
-pub fn workspace_server_notes(base: &McpConfig, workspace_dir: &Path) -> Vec<String> {
+/// `level` is the configured autonomy level the registry would run at.
+pub fn workspace_server_notes(
+    base: &McpConfig,
+    workspace_dir: &Path,
+    level: crate::security::AutonomyLevel,
+) -> Vec<String> {
     McpTool::new(
-        Arc::new(SecurityPolicy::default()),
+        Arc::new(SecurityPolicy {
+            autonomy: level,
+            ..SecurityPolicy::default()
+        }),
         base.clone(),
         workspace_dir.to_path_buf(),
     )
@@ -280,6 +323,7 @@ impl McpTool {
             last_refresh_attempt: None,
             catalog_snapshot: super::SharedToolCatalogSnapshot::default(),
             capability_specs: Vec::new(),
+            full_level: security.autonomy == crate::security::AutonomyLevel::Full,
         };
 
         let tool = Self {
@@ -475,7 +519,8 @@ impl McpTool {
             state_hasher.update(config_bytes);
             let state_digest: [u8; 32] = state_hasher.finalize().into();
             for (tool, metadata) in tools {
-                if !Self::tool_allowed(server_config, tool) {
+                // At Full the per-server allow/deny lists are ignored.
+                if !state.full_level && !Self::tool_allowed(server_config, tool) {
                     continue;
                 }
                 snapshot.push(McpCapabilitySpec {
@@ -599,6 +644,25 @@ impl McpTool {
             bail!("SSRF blocked: MCP HTTP URL resolves to a private/local address (host: {host})");
         }
         Ok(())
+    }
+
+    /// [`Self::validate_http_url`] below Full. At Full (`full`) private,
+    /// loopback and link-local hosts are allowed; userinfo and unspecified or
+    /// multicast hosts are refused at every level.
+    fn validate_http_target(url: &str, full: bool) -> anyhow::Result<()> {
+        if !full {
+            return Self::validate_http_url(url);
+        }
+        let host = super::http_request::extract_host(url)?;
+        if super::http_request::is_unroutable_host(&host) {
+            bail!("MCP HTTP URL targets an unspecified or multicast address (host: {host})");
+        }
+        Ok(())
+    }
+
+    /// Whether this registry runs at Full (its held policy's level).
+    fn full(&self) -> bool {
+        self.security.autonomy == crate::security::AutonomyLevel::Full
     }
 
     /// Validate that a stdio server's command is safe to execute.
@@ -728,6 +792,10 @@ impl McpTool {
                     ));
                     continue;
                 }
+                // At Full the workspace allow/deny lists are not applied.
+                if self.full() {
+                    continue;
+                }
                 match Self::narrowed(base_server, &server.allow_tools, &server.deny_tools) {
                     Some(narrowed) => {
                         cfg.servers.insert(name, narrowed);
@@ -759,10 +827,13 @@ impl McpTool {
             };
 
             // ── A new server: only with the operator's opt-in ──
-            let allowed = match converted.transport {
-                McpTransport::Stdio => self.base_config.workspace_servers == WorkspaceMcpServers::Stdio,
-                McpTransport::Http => self.base_config.workspace_servers != WorkspaceMcpServers::Off,
-            };
+            // At Full a workspace server loads without the opt-in.
+            let full = self.full();
+            let allowed = full
+                || match converted.transport {
+                    McpTransport::Stdio => self.base_config.workspace_servers == WorkspaceMcpServers::Stdio,
+                    McpTransport::Http => self.base_config.workspace_servers != WorkspaceMcpServers::Off,
+                };
             if !allowed {
                 tracing::warn!(
                     server = %shown,
@@ -787,7 +858,7 @@ impl McpTool {
             }
 
             // ── Security gate: validate stdio commands ──
-            if converted.transport == McpTransport::Stdio {
+            if converted.transport == McpTransport::Stdio && !full {
                 if let Some(ref cmd) = converted.command {
                     if !self.is_command_allowed(&name, cmd) {
                         tracing::warn!(
@@ -810,7 +881,7 @@ impl McpTool {
             // ── Security gate: block HTTP URLs targeting private/local hosts ──
             if converted.transport == McpTransport::Http {
                 if let Some(ref url) = converted.url {
-                    if let Err(e) = Self::validate_http_url(url) {
+                    if let Err(e) = Self::validate_http_target(url, full) {
                         tracing::warn!(
                             server = %shown,
                             url = %crate::providers::redact_endpoint_userinfo(url),
@@ -1150,9 +1221,9 @@ impl McpTool {
     ///
     /// Both HTTP entry points (discovery and `call_http`) connect here, so
     /// the transport's HTTP client is chosen in one place.
-    async fn connect_http(url: &str, startup_timeout_ms: u64) -> anyhow::Result<McpClient> {
+    async fn connect_http(url: &str, startup_timeout_ms: u64, full: bool) -> anyhow::Result<McpClient> {
         let transport = StreamableHttpClientTransport::with_client(
-            mcp_http_client()?,
+            mcp_http_client(full)?,
             StreamableHttpClientTransportConfig::with_uri(url),
         );
         tokio::time::timeout(Duration::from_millis(startup_timeout_ms), ().serve(transport))
@@ -1164,6 +1235,7 @@ impl McpTool {
     async fn discover_server_tools_http(
         server_name: &str,
         server: &McpServerConfig,
+        full: bool,
     ) -> anyhow::Result<HashMap<String, DiscoveredToolMeta>> {
         let url = server
             .url
@@ -1172,10 +1244,10 @@ impl McpTool {
             .filter(|v| !v.is_empty())
             .ok_or_else(|| anyhow::anyhow!("MCP server '{server_name}' uses http but url is missing"))?;
 
-        // ── SSRF protection: block private/local addresses ──
-        Self::validate_http_url(url)?;
+        // ── SSRF protection: block private/local addresses below Full ──
+        Self::validate_http_target(url, full)?;
 
-        let client = Self::connect_http(url, server.startup_timeout_ms).await?;
+        let client = Self::connect_http(url, server.startup_timeout_ms, full).await?;
 
         let list = client.peer().list_all_tools().await?;
         let _ = client.cancel().await;
@@ -1198,10 +1270,11 @@ impl McpTool {
         server_name: &str,
         server: &McpServerConfig,
         launch_root: Option<&Path>,
+        full: bool,
     ) -> anyhow::Result<HashMap<String, DiscoveredToolMeta>> {
         match server.transport {
             McpTransport::Stdio => Self::discover_server_tools_stdio(server_name, server, launch_root).await,
-            McpTransport::Http => Self::discover_server_tools_http(server_name, server).await,
+            McpTransport::Http => Self::discover_server_tools_http(server_name, server, full).await,
         }
     }
 
@@ -1362,6 +1435,7 @@ impl McpTool {
         server: &McpServerConfig,
         tool_name: &str,
         arguments: Option<serde_json::Map<String, serde_json::Value>>,
+        full: bool,
     ) -> anyhow::Result<(bool, String)> {
         let url = server
             .url
@@ -1370,11 +1444,11 @@ impl McpTool {
             .filter(|v| !v.is_empty())
             .ok_or_else(|| anyhow::anyhow!("MCP server '{server_name}' uses http but url is missing"))?;
 
-        // ── SSRF protection: block private/local addresses ──
-        Self::validate_http_url(url)?;
+        // ── SSRF protection: block private/local addresses below Full ──
+        Self::validate_http_target(url, full)?;
 
         let request_timeout = Duration::from_millis(server.request_timeout_ms);
-        let client = Self::connect_http(url, server.startup_timeout_ms).await?;
+        let client = Self::connect_http(url, server.startup_timeout_ms, full).await?;
 
         let result = tokio::time::timeout(
             request_timeout,
@@ -1433,7 +1507,7 @@ impl McpTool {
         let mut discovery_errors = HashMap::new();
         let retired = self.retired.lock().clone();
         for (server_name, server) in new_config.servers.iter().filter(|(name, _)| !retired.contains(*name)) {
-            match Self::discover_server_tools(server_name, server, self.launch_root.as_deref()).await {
+            match Self::discover_server_tools(server_name, server, self.launch_root.as_deref(), self.full()).await {
                 Ok(tools) => {
                     discovered.insert(server_name.clone(), tools);
                 }
@@ -1520,7 +1594,7 @@ impl McpTool {
                 published.and_then(|entry| entry.binding_digest()),
             )?;
             let server = Self::resolve_server(&state.effective_config, &server_name)?;
-            if !Self::tool_allowed(server, &tool_name) {
+            if !self.full() && !Self::tool_allowed(server, &tool_name) {
                 bail!("Tool '{tool_name}' is blocked by allow/deny rules for MCP server '{server_name}'");
             }
             if let Some(discovered) = state.discovered_tools.get(&server_name)
@@ -1535,7 +1609,7 @@ impl McpTool {
 
         match server.transport {
             McpTransport::Stdio => self.call_stdio(&server_name, &server, &tool_name, arguments).await,
-            McpTransport::Http => Self::call_http(&server_name, &server, &tool_name, arguments).await,
+            McpTransport::Http => Self::call_http(&server_name, &server, &tool_name, arguments, self.full()).await,
         }
     }
 }
@@ -1902,7 +1976,7 @@ mod tests {
     async fn the_mcp_http_transport_speaks_tls_to_an_https_url() {
         let (port, first_bytes) = first_bytes_listener().await;
         let url = format!("https://127.0.0.1:{port}/mcp");
-        let connected = McpTool::connect_http(&url, 3_000).await;
+        let connected = McpTool::connect_http(&url, 3_000, false).await;
         assert!(connected.is_err(), "the probe never completes a handshake");
         let bytes = tokio::time::timeout(Duration::from_secs(3), first_bytes)
             .await
@@ -1966,7 +2040,7 @@ mod tests {
             let _ = axum::serve(origin, origin_app).await;
         });
 
-        let connected = McpTool::connect_http(&format!("http://127.0.0.1:{origin_port}/mcp"), 3_000).await;
+        let connected = McpTool::connect_http(&format!("http://127.0.0.1:{origin_port}/mcp"), 3_000, false).await;
         assert!(connected.is_err(), "a redirect is not a session");
         assert!(
             origin_hits.load(Ordering::SeqCst) >= 1,
@@ -3335,10 +3409,17 @@ for line in sys.stdin:
         )
         .expect("test: write mcp.json");
         let load = |config: McpConfig| {
-            McpTool::new(Arc::new(SecurityPolicy::default()), config, dir.path().to_path_buf())
-                .load_effective_config_from_json()
-                .expect("test: load config")
-                .expect("test: some config")
+            McpTool::new(
+                Arc::new(SecurityPolicy {
+                    autonomy: crate::security::AutonomyLevel::Supervised,
+                    ..SecurityPolicy::default()
+                }),
+                config,
+                dir.path().to_path_buf(),
+            )
+            .load_effective_config_from_json()
+            .expect("test: load config")
+            .expect("test: some config")
         };
 
         let off = load(McpConfig::default());
@@ -3407,7 +3488,10 @@ for line in sys.stdin:
             },
         );
         let tool = McpTool::new(
-            Arc::new(SecurityPolicy::default()),
+            Arc::new(SecurityPolicy {
+                autonomy: crate::security::AutonomyLevel::Supervised,
+                ..SecurityPolicy::default()
+            }),
             base.clone(),
             dir.path().to_path_buf(),
         );
@@ -3463,7 +3547,10 @@ for line in sys.stdin:
             );
         }
         let tool = McpTool::new(
-            Arc::new(SecurityPolicy::default()),
+            Arc::new(SecurityPolicy {
+                autonomy: crate::security::AutonomyLevel::Supervised,
+                ..SecurityPolicy::default()
+            }),
             base.clone(),
             dir.path().to_path_buf(),
         );
@@ -3479,7 +3566,7 @@ for line in sys.stdin:
             "the unlisted configured server stays; the explicit disable holds"
         );
 
-        let notes = workspace_server_notes(&base, dir.path());
+        let notes = workspace_server_notes(&base, dir.path(), crate::security::AutonomyLevel::Supervised);
         let joined = notes.join("\n");
         assert!(
             joined.contains("workspace server 'legacy-stdio' (stdio) is not started")
@@ -3643,7 +3730,10 @@ for line in sys.stdin:
         .expect("test: write mcp.json");
 
         let tool = McpTool::new(
-            Arc::new(SecurityPolicy::default()),
+            Arc::new(SecurityPolicy {
+                autonomy: crate::security::AutonomyLevel::Supervised,
+                ..SecurityPolicy::default()
+            }),
             opted_in(WorkspaceMcpServers::Stdio),
             dir.clone(),
         );
@@ -3860,7 +3950,10 @@ for line in sys.stdin:
         .expect("test: write mcp.json");
 
         let tool = McpTool::new(
-            Arc::new(SecurityPolicy::default()),
+            Arc::new(SecurityPolicy {
+                autonomy: crate::security::AutonomyLevel::Supervised,
+                ..SecurityPolicy::default()
+            }),
             opted_in(WorkspaceMcpServers::HttpOnly),
             dir.clone(),
         );
@@ -3915,7 +4008,14 @@ for line in sys.stdin:
             },
         );
 
-        let tool = McpTool::new(Arc::new(SecurityPolicy::default()), base, dir.clone());
+        let tool = McpTool::new(
+            Arc::new(SecurityPolicy {
+                autonomy: crate::security::AutonomyLevel::Supervised,
+                ..SecurityPolicy::default()
+            }),
+            base,
+            dir.clone(),
+        );
 
         let cfg = tool
             .load_effective_config_from_json()
@@ -3987,7 +4087,10 @@ for line in sys.stdin:
         // Commands containing path separators must be rejected for
         // non-pre-registered servers, preventing basename whitelist bypass.
         let tool = McpTool::new(
-            Arc::new(SecurityPolicy::default()),
+            Arc::new(SecurityPolicy {
+                autonomy: crate::security::AutonomyLevel::Supervised,
+                ..SecurityPolicy::default()
+            }),
             McpConfig::default(),
             std::env::temp_dir(),
         );

@@ -45,6 +45,18 @@ impl HttpRequestTool {
         }
 
         let host = extract_host(url)?;
+        // At Full private, loopback and link-local destinations and IPv6
+        // literals are reachable and `allowed_domains` is not enforced; an
+        // unspecified or multicast destination is refused at every level.
+        if call_is_full() {
+            if is_unroutable_host(&host) {
+                anyhow::bail!("Blocked unroutable host: {host}");
+            }
+            return Ok(url.to_string());
+        }
+        if host.parse::<std::net::Ipv6Addr>().is_ok() {
+            anyhow::bail!("IPv6 hosts are not supported in http_request");
+        }
         if is_private_or_local_host(&host) {
             anyhow::bail!("Blocked local/private host: {host}");
         }
@@ -114,7 +126,7 @@ impl HttpRequestTool {
         // addresses for this host: the client must not resolve the name a
         // second time (DNS rebinding). Redirects are never followed, so this
         // is the only hop.
-        let target = resolve_pinned_target(url).await?;
+        let target = resolve_pinned_target(url, call_is_full()).await?;
         let client = self.client_for(&target, &crate::config::runtime_proxy_config())?;
 
         let mut request = client.request(method, url);
@@ -330,42 +342,43 @@ impl Tool for HttpRequestTool {
 
 // Helper functions for HTTP domain validation
 
+/// The host of an `http(s)` URL, parsed by the `url` crate: the one host
+/// extraction `http_request`, `web_fetch` and MCP share. Userinfo in the URL
+/// is refused at every level. An IPv6 literal is returned without brackets.
 pub(crate) fn extract_host(url: &str) -> anyhow::Result<String> {
-    let rest = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))
-        .ok_or_else(|| anyhow::anyhow!("Only http:// and https:// URLs are allowed"))?;
-
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("Invalid URL"))?;
-
-    if authority.is_empty() {
-        anyhow::bail!("URL must include a host");
+    let parsed = reqwest::Url::parse(url).map_err(|error| anyhow::anyhow!("Invalid URL: {error}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        anyhow::bail!("Only http:// and https:// URLs are allowed");
     }
-
-    if authority.contains('@') {
+    if !parsed.username().is_empty() || parsed.password().is_some() {
         anyhow::bail!("URL userinfo is not allowed");
     }
-
-    if authority.starts_with('[') {
-        anyhow::bail!("IPv6 hosts are not supported in http_request");
-    }
-
-    let host = authority
-        .split(':')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .trim_end_matches('.')
-        .to_lowercase();
-
+    let host = parsed
+        .host_str()
+        .map(|host| unbracketed(host).trim_end_matches('.').to_ascii_lowercase())
+        .unwrap_or_default();
     if host.is_empty() {
         anyhow::bail!("URL must include a valid host");
     }
-
     Ok(host)
+}
+
+/// Whether the current tool call runs at Full (the execution service's
+/// per-call level).
+pub(crate) fn call_is_full() -> bool {
+    super::effective_autonomy::current() == Some(crate::security::AutonomyLevel::Full)
+}
+
+/// A destination refused at every level: an unspecified or multicast address.
+pub(crate) const fn is_unroutable_ip(ip: std::net::IpAddr) -> bool {
+    ip.is_unspecified() || ip.is_multicast()
+}
+
+/// Whether `host` is an unspecified or multicast address literal.
+pub(crate) fn is_unroutable_host(host: &str) -> bool {
+    unbracketed(host)
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(is_unroutable_ip)
 }
 
 pub(crate) fn is_private_or_local_host(host: &str) -> bool {
@@ -461,6 +474,25 @@ impl PinnedTarget {
         })
     }
 
+    /// The Full-level target of `host` when it resolved to `addrs`: private,
+    /// loopback and link-local addresses are allowed; an empty list or an
+    /// unspecified or multicast address is refused.
+    pub(crate) fn from_resolved_full(host: &str, addrs: Vec<std::net::SocketAddr>) -> Result<Self, PinError> {
+        if addrs.is_empty() {
+            return Err(PinError::Unresolved { host: host.to_string() });
+        }
+        if let Some(blocked) = addrs.iter().find(|addr| is_unroutable_ip(addr.ip())) {
+            return Err(PinError::NonGlobal {
+                host: host.to_string(),
+                address: blocked.ip(),
+            });
+        }
+        Ok(Self {
+            host: host.to_string(),
+            addrs,
+        })
+    }
+
     /// `builder` with this host pinned to the checked addresses.
     pub(crate) fn pin(&self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
         builder.resolve_to_addrs(&self.host, &self.addrs)
@@ -470,8 +502,10 @@ impl PinnedTarget {
 /// Resolve the host of `url` once and return it pinned to the checked
 /// addresses. The host is the one `reqwest` itself parses from the URL, so
 /// the name that is checked is the name that is connected to. One hop only:
-/// a caller that follows redirects calls this again for every hop.
-pub(crate) async fn resolve_pinned_target(url: &str) -> Result<PinnedTarget, PinError> {
+/// a caller that follows redirects calls this again for every hop. `full`
+/// is the call's level: at Full only unspecified and multicast addresses are
+/// refused.
+pub(crate) async fn resolve_pinned_target(url: &str, full: bool) -> Result<PinnedTarget, PinError> {
     let parsed = reqwest::Url::parse(url).map_err(|error| PinError::InvalidUrl(error.to_string()))?;
     let host = parsed
         .host_str()
@@ -483,7 +517,11 @@ pub(crate) async fn resolve_pinned_target(url: &str) -> Result<PinnedTarget, Pin
         host: host.to_string(),
         source,
     })?;
-    PinnedTarget::from_resolved(host, addrs)
+    if full {
+        PinnedTarget::from_resolved_full(host, addrs)
+    } else {
+        PinnedTarget::from_resolved(host, addrs)
+    }
 }
 
 /// Resolve `host:port` for a connection, through the system resolver. Every
@@ -1147,7 +1185,7 @@ mod tests {
     /// checks every address and pins them with the URL's port.
     #[tokio::test]
     async fn resolve_pinned_target_checks_every_resolved_address() {
-        let target = within(resolve_pinned_target("https://example.com/v1"))
+        let target = within(resolve_pinned_target("https://example.com/v1", false))
             .await
             .expect("test: public table name pins");
         assert_eq!(target.host, "example.com", "host comes from the parsed URL");
@@ -1163,7 +1201,7 @@ mod tests {
             "http://10.0.0.1/secret",
             "http://127.0.0.1:8080/",
         ] {
-            let error = within(resolve_pinned_target(url))
+            let error = within(resolve_pinned_target(url, false))
                 .await
                 .expect_err("test: a non-global target must not pin");
             assert!(
@@ -1172,14 +1210,14 @@ mod tests {
             );
         }
 
-        let error = within(resolve_pinned_target("https://unlisted.test/"))
+        let error = within(resolve_pinned_target("https://unlisted.test/", false))
             .await
             .expect_err("test: an unresolvable name must not pin");
         assert!(
             matches!(error, PinError::Lookup { .. }),
             "expected Lookup, got {error:?}"
         );
-        let error = within(resolve_pinned_target("not a url"))
+        let error = within(resolve_pinned_target("not a url", false))
             .await
             .expect_err("test: a malformed URL must not pin");
         assert!(

@@ -110,7 +110,19 @@ impl WebFetchTool {
         if !url.starts_with("http://") && !url.starts_with("https://") {
             anyhow::bail!("URL must start with http:// or https://");
         }
-        let host = extract_host(url)?;
+        let host = super::http_request::extract_host(url)?;
+        // At Full private, loopback and link-local destinations and IPv6
+        // literals are reachable and `allowed_domains` is not enforced; an
+        // unspecified or multicast destination is refused at every level.
+        if super::http_request::call_is_full() {
+            if super::http_request::is_unroutable_host(&host) {
+                anyhow::bail!("Blocked unroutable host: {host}");
+            }
+            return Ok(url.to_string());
+        }
+        if host.parse::<std::net::Ipv6Addr>().is_ok() {
+            anyhow::bail!("IPv6 hosts are not supported in web_fetch");
+        }
         if is_private_or_local_address(&host) {
             anyhow::bail!("Blocked local/private host: {host}");
         }
@@ -202,7 +214,8 @@ impl WebFetchTool {
                 .and_then(|v| v.to_str().ok())
                 .ok_or_else(|| anyhow::anyhow!("Redirect with no Location header"))?;
             current_url = self.redirect_target(&current_url, location)?;
-            target = super::http_request::resolve_pinned_target(&current_url).await?;
+            target =
+                super::http_request::resolve_pinned_target(&current_url, super::http_request::call_is_full()).await?;
             redirect_count += 1;
         }
     }
@@ -257,7 +270,7 @@ impl Tool for WebFetchTool {
 
         tracing::info!("Fetching URL: {}", url);
 
-        let target = super::http_request::resolve_pinned_target(&url).await?;
+        let target = super::http_request::resolve_pinned_target(&url, super::http_request::call_is_full()).await?;
         let response = self.fetch_following_redirects(&url, target).await?;
 
         let status = response.status();
@@ -377,44 +390,6 @@ fn normalize_domain(raw: &str) -> Option<String> {
     }
 
     Some(domain)
-}
-
-fn extract_host(url: &str) -> anyhow::Result<String> {
-    let rest = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))
-        .ok_or_else(|| anyhow::anyhow!("Only http:// and https:// URLs are allowed"))?;
-
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("Invalid URL"))?;
-
-    if authority.is_empty() {
-        anyhow::bail!("URL must include a host");
-    }
-
-    if authority.contains('@') {
-        anyhow::bail!("URL userinfo is not allowed");
-    }
-
-    if authority.starts_with('[') {
-        anyhow::bail!("IPv6 hosts are not supported in web_fetch");
-    }
-
-    let host = authority
-        .split(':')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .trim_end_matches('.')
-        .to_lowercase();
-
-    if host.is_empty() {
-        anyhow::bail!("URL must include a valid host");
-    }
-
-    Ok(host)
 }
 
 pub(crate) fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {

@@ -393,7 +393,15 @@ async fn prepare_remote_target(url: &reqwest::Url) -> Result<RemoteTarget, Artif
         .ok_or_else(|| ArtifactError::InvalidUrl("missing host".to_string()))?
         .trim_matches(['[', ']'])
         .to_ascii_lowercase();
-    if crate::tools::http_request::is_private_or_local_host(&host) {
+    // At Full (the call's or turn's level) private, loopback and link-local
+    // destinations are reachable; unspecified and multicast never are.
+    let full = crate::tools::http_request::call_is_full();
+    let blocked_host = if full {
+        crate::tools::http_request::is_unroutable_host(&host)
+    } else {
+        crate::tools::http_request::is_private_or_local_host(&host)
+    };
+    if blocked_host {
         return Err(ArtifactError::SsrfBlocked {
             url: url.to_string(),
             host,
@@ -409,9 +417,13 @@ async fn prepare_remote_target(url: &reqwest::Url) -> Result<RemoteTarget, Artif
             reason: format!("DNS resolution failed: {error}"),
         })?;
     if addrs.is_empty()
-        || addrs
-            .iter()
-            .any(|addr| crate::tools::http_request::is_private_or_local_host(&addr.ip().to_string()))
+        || addrs.iter().any(|addr| {
+            if full {
+                crate::tools::http_request::is_unroutable_ip(addr.ip())
+            } else {
+                crate::tools::http_request::is_private_or_local_host(&addr.ip().to_string())
+            }
+        })
     {
         return Err(ArtifactError::SsrfBlocked {
             url: url.to_string(),
