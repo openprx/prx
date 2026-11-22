@@ -2490,9 +2490,9 @@ async fn run_console_message_job_work(
         {
             Ok(receipt) => receipt,
             Err(error) => {
-                let reason = terminal_guard.failure_reason();
+                let reason: crate::runtime::turn_terminal::TerminalPersistReason = terminal_guard.failure_reason();
                 tracing::warn!(
-                    reason,
+                    reason = %reason,
                     error = %crate::agent::diagnostics::error_class(&error),
                     "Failed to commit shared console terminal event"
                 );

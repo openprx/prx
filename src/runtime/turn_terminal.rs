@@ -316,8 +316,41 @@ pub(crate) struct TurnTerminalGuard {
 struct TerminalState {
     pending: Option<crate::agent::terminal::TurnTerminalDraft>,
     finished: bool,
-    /// The reason code of the last failed flush.
-    failure: Option<&'static str>,
+    /// The reason of the last failed flush.
+    failure: Option<TerminalPersistReason>,
+}
+
+/// The closed reason a terminal could not be persisted, logged and reported
+/// in place of the error text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TerminalPersistReason {
+    /// The store refused its recovery key, whatever step met it.
+    RecoveryKeyUnavailable,
+    AuxiliaryReceiptFailed,
+    ChildCleanupIncomplete,
+    TerminalCommitFailed,
+    UsageRecordFailed,
+    /// A failure before any persistence step.
+    Unclassified,
+}
+
+impl TerminalPersistReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::RecoveryKeyUnavailable => "recovery_key_unavailable",
+            Self::AuxiliaryReceiptFailed => "auxiliary_receipt_failed",
+            Self::ChildCleanupIncomplete => "child_cleanup_incomplete",
+            Self::TerminalCommitFailed => "terminal_commit_failed",
+            Self::UsageRecordFailed => "usage_record_failed",
+            Self::Unclassified => "terminal_persistence_failed",
+        }
+    }
+}
+
+impl std::fmt::Display for TerminalPersistReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// The persistence step of a terminal, in the order the steps run.
@@ -330,7 +363,7 @@ enum TerminalPersistStep {
 }
 
 /// A terminal that could not be persisted: the step that failed and its
-/// error. The error text may quote stored input, so only [`Self::reason`]
+/// error. The error text may quote stored input, so only [`Self::persist_reason`]
 /// leaves the process in a job error or a log line.
 struct TerminalPersistFailure {
     step: TerminalPersistStep,
@@ -338,24 +371,21 @@ struct TerminalPersistFailure {
 }
 
 impl TerminalPersistFailure {
-    /// The reason of a failure that happened before any persistence step.
-    const UNCLASSIFIED: &'static str = "terminal_persistence_failed";
-
-    /// The closed reason code: the failed step, or the refused recovery key
+    /// The closed reason: the failed step, or the refused recovery key
     /// whatever step met it.
-    fn reason(&self) -> &'static str {
+    fn persist_reason(&self) -> TerminalPersistReason {
         if self
             .error
             .downcast_ref::<crate::memory::recovery_authority::RecoveryKeyUnavailable>()
             .is_some()
         {
-            return "recovery_key_unavailable";
+            return TerminalPersistReason::RecoveryKeyUnavailable;
         }
         match self.step {
-            TerminalPersistStep::AuxiliaryReceipt => "auxiliary_receipt_failed",
-            TerminalPersistStep::ChildCleanup => "child_cleanup_incomplete",
-            TerminalPersistStep::TerminalCommit => "terminal_commit_failed",
-            TerminalPersistStep::UsageRecord => "usage_record_failed",
+            TerminalPersistStep::AuxiliaryReceipt => TerminalPersistReason::AuxiliaryReceiptFailed,
+            TerminalPersistStep::ChildCleanup => TerminalPersistReason::ChildCleanupIncomplete,
+            TerminalPersistStep::TerminalCommit => TerminalPersistReason::TerminalCommitFailed,
+            TerminalPersistStep::UsageRecord => TerminalPersistReason::UsageRecordFailed,
         }
     }
 }
@@ -588,7 +618,7 @@ impl TurnTerminalGuard {
         {
             Ok(receipt) => receipt,
             Err(failure) => {
-                self.state.lock().failure = Some(failure.reason());
+                self.state.lock().failure = Some(failure.persist_reason());
                 return Err(failure.error);
             }
         };
@@ -598,13 +628,10 @@ impl TurnTerminalGuard {
         Ok(receipt)
     }
 
-    /// The closed reason code of the last failed persistence of this
-    /// terminal, for a payload-free job error or log line.
-    pub(crate) fn failure_reason(&self) -> &'static str {
-        self.state
-            .lock()
-            .failure
-            .unwrap_or(TerminalPersistFailure::UNCLASSIFIED)
+    /// The closed reason of the last failed persistence of this terminal,
+    /// for a payload-free job error or log line.
+    pub(crate) fn failure_reason(&self) -> TerminalPersistReason {
+        self.state.lock().failure.unwrap_or(TerminalPersistReason::Unclassified)
     }
 
     pub(crate) async fn finish_error(&self, error: &anyhow::Error) -> anyhow::Result<()> {
@@ -890,9 +917,9 @@ impl Drop for TurnTerminalGuard {
                         drop(stage);
                     }
                     let result = result.map(|_| ()).map_err(|failure| {
-                        let reason = failure.reason();
+                        let reason: TerminalPersistReason = failure.persist_reason();
                         tracing::error!(
-                            reason,
+                            reason = %reason,
                             error = %crate::agent::diagnostics::error_class(&failure.error),
                             "Runtime interrupted terminal cleanup remains incomplete"
                         );
