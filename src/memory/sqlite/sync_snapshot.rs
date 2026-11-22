@@ -22,7 +22,7 @@ pub(super) fn init_schema(conn: &Connection) -> anyhow::Result<()> {
 fn save(conn: &Connection, id: &str, ordinal: &mut i64, kind: &str, key: &str, h: &Header) -> anyhow::Result<()> {
     *ordinal = ordinal
         .checked_add(1)
-        .ok_or_else(|| anyhow::anyhow!("snapshot ordinal exhausted"))?;
+        .ok_or_else(|| crate::memory::sync::SyncError::InvalidSource)?;
     conn.execute(
         "INSERT INTO sync_snapshot_rows VALUES(?1,?2,?3,?4,?5)",
         params![id, *ordinal, kind, key, serde_json::to_string(h)?],
@@ -54,6 +54,11 @@ fn inventory(conn: &Connection, id: &str, owner: &str, head: i64, water: i64) ->
             ),
         )?;
     }
+    let mut q=conn.prepare(&format!("SELECT {COLUMNS} FROM sync_journal j WHERE owner_id=?1 AND kind='session.upsert' AND parent_run_id IS NOT NULL AND seq<=?2 AND seq=(SELECT MAX(k.seq) FROM sync_journal k WHERE k.owner_id=j.owner_id AND k.session=j.session AND k.kind=j.kind AND k.seq<=?2) ORDER BY session"))?;
+    for h in q.query_map(params![owner, head], Header::row)? {
+        let h = h?;
+        save(conn, id, &mut ordinal, "session", &h.session, &h)?;
+    }
     let mut q=conn.prepare("SELECT s.agent,s.incarnation,(SELECT c.id FROM sync_config_sources c WHERE c.owner_id=s.owner_id AND c.agent=s.agent ORDER BY rowid DESC LIMIT 1) FROM sync_agent_state s WHERE owner_id=?1 ORDER BY agent")?;
     for row in q.query_map([owner], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
@@ -75,23 +80,83 @@ fn inventory(conn: &Connection, id: &str, owner: &str, head: i64, water: i64) ->
             ),
         )?;
     }
-    for (kind, event_kind) in [
-        ("child_session", "child_session.upsert"),
-        ("erase_receipt", "history.erased"),
-    ] {
-        let mut q=conn.prepare(&format!("SELECT {COLUMNS} FROM sync_journal j WHERE owner_id=?1 AND kind=?2 AND seq<=?3 AND seq=(SELECT MAX(k.seq) FROM sync_journal k WHERE k.owner_id=j.owner_id AND k.kind=j.kind AND k.session=j.session AND k.agent=j.agent AND k.incarnation=j.incarnation AND k.seq<=?3) ORDER BY seq"))?;
-        for h in q.query_map(params![owner, event_kind, head], Header::row)? {
-            let h = h?;
-            save(conn, id, &mut ordinal, kind, &h.event_id, &h)?;
+    let mut q=conn.prepare("SELECT e.event_id FROM message_events e WHERE e.owner_id=?1 AND e.parent_run_id IS NOT NULL AND e.id<=?2 AND e.id=(SELECT x.id FROM message_events x WHERE x.owner_id=e.owner_id AND x.session_key=e.session_key AND x.parent_run_id IS NOT NULL AND x.id<=?2 ORDER BY (x.event_type IN('turn.finalized','turn.admission.failed')) DESC,x.id DESC LIMIT 1) ORDER BY e.session_key")?;
+    for source in q.query_map(params![owner, water], |r| r.get::<_, String>(0))? {
+        let source = source?;
+        if let Some(mut h) = super::sync_journal::event_header(conn, &source, "child_session.upsert")? {
+            let latest:Option<(String,String)>=conn.query_row("SELECT event_id,created_at FROM memory_events WHERE owner_id=?1 AND run_id=?2 AND event_type IN('task.completed','task.failed','task.cancelled') ORDER BY id DESC LIMIT 1",params![owner,h.run_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+            if let Some((event, time)) = latest {
+                h.source_ref = format!("memory:{event}");
+                h.timestamp = time;
+            }
+            save(conn, id, &mut ordinal, "child_session", &h.session, &h)?;
         }
     }
-    let mut q=conn.prepare("SELECT e.event_id,COALESCE(c.message_id,e.event_id) FROM message_events e JOIN conversation_turns c ON c.message_event_id=e.event_id WHERE e.owner_id=?1 AND e.id<=?2 AND c.role IN('user','assistant') ORDER BY e.id")?;
-    for row in q.query_map(params![owner, water], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    let mut q = conn.prepare(&format!(
+        "SELECT {COLUMNS} FROM sync_journal WHERE owner_id=?1 AND kind='approval.pending' AND seq<=?2 ORDER BY seq"
+    ))?;
+    for h in q.query_map(params![owner, head], Header::row)? {
+        let h = h?;
+        save(conn, id, &mut ordinal, "approval", &h.event_id, &h)?;
+    }
+    // Receipts outlive journal retention and must survive a fresh snapshot.
+    let mut q=conn.prepare("SELECT w.erase_id,json_extract(w.work,'$.session'),json_extract(w.work,'$.agent'),json_extract(w.work,'$.incarnation') FROM agent_erase_work w JOIN agent_erase_receipts r ON r.erase_id=w.erase_id WHERE r.owner_id=?1 AND w.receipt IS NOT NULL AND json_extract(w.work,'$.purge')=0 ORDER BY w.erase_id")?;
+    for row in q.query_map([owner], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+        ))
     })? {
-        let (event, message) = row?;
-        if let Some(h) = super::sync_journal::event_header(conn, &event, "turn.appended")? {
-            save(conn, id, &mut ordinal, "turn", &message, &h)?;
+        let (receipt, session, agent, inc) = row?;
+        let h = Header::new(
+            owner,
+            "history.erased",
+            &session,
+            &agent,
+            &inc,
+            format!("erase:{receipt}"),
+        );
+        save(conn, id, &mut ordinal, "erase_receipt", &receipt, &h)?;
+    }
+    let mut q=conn.prepare("SELECT p.purge_id,substr(p.agent_key,3),i.value FROM agent_purge_operations p,json_each(p.receipt,'$.incarnations') i WHERE p.owner_id=?1 AND p.receipt IS NOT NULL ORDER BY p.purge_id,i.value")?;
+    for row in q.query_map([owner], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+    })? {
+        let (receipt, agent, inc) = row?;
+        let h = Header::new(owner, "history.erased", "", &agent, &inc, format!("purge:{receipt}"));
+        save(conn, id, &mut ordinal, "erase_receipt", &format!("{receipt}:{inc}"), &h)?;
+    }
+    // Admission/terminal commits precede their transcript projections. The
+    // cut must inventory the primary events, or it could advance past an
+    // event that is absent from both snapshot and subsequent replay.
+    let mut q=conn.prepare("WITH candidates AS (
+        SELECT e.id,e.event_id,e.workspace_id,e.owner_id,e.run_id,e.role,e.event_type,e.idempotency_key,
+            CASE WHEN e.role='assistant' OR e.idempotency_key LIKE 'turn:%:assistant'
+            THEN (SELECT f.event_id FROM message_events f WHERE f.owner_id=e.owner_id AND f.workspace_id=e.workspace_id
+                AND f.run_id=e.run_id AND f.id<=?2 AND (
+                    (f.event_type='turn.finalized' AND json_extract(f.raw_payload_json,'$.assistant_event_id')=e.event_id)
+                    OR (e.idempotency_key='turn:'||e.run_id||':assistant' AND f.idempotency_key='turn:'||e.run_id||':final'))
+                ORDER BY f.id LIMIT 1) END AS final_marker
+        FROM message_events e WHERE e.owner_id=?1 AND e.id<=?2)
+        SELECT e.event_id,e.final_marker FROM candidates e WHERE
+            e.role='user'
+            OR (e.event_type='message.deleted' AND (
+                EXISTS(SELECT 1 FROM rf_message_attempts a WHERE a.owner_id=e.owner_id AND a.message_event_id=e.event_id)
+                OR EXISTS(SELECT 1 FROM conversation_turns c WHERE c.message_event_id=e.event_id AND c.role='user')
+                OR EXISTS(SELECT 1 FROM sync_journal j WHERE j.owner_id=e.owner_id AND j.kind='turn.appended' AND j.source_ref='event:'||e.event_id AND j.seq<=?3)))
+            OR e.final_marker IS NOT NULL
+        ORDER BY e.id")?;
+    for row in q.query_map(params![owner, water, head], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+    })? {
+        let (event, marker) = row?;
+        if let Some(mut h) = super::sync_journal::event_header(conn, &event, "turn.appended")? {
+            if let Some(marker) = marker {
+                h.source_ref = format!("final:{marker}:{event}");
+            }
+            save(conn, id, &mut ordinal, "turn", &event, &h)?;
         }
     }
     Ok(())
@@ -107,7 +172,7 @@ pub(super) fn page(
         return Err(SyncError::Invalid.into());
     }
     let conn = memory.pool.write();
-    let tx = crate::runtime::sqlite_pool::begin_immediate(&conn)?;
+    let tx: rusqlite::Transaction<'_> = crate::runtime::sqlite_pool::begin_immediate(&conn)?;
     let now = chrono::Utc::now().timestamp();
     tx.execute(
         "DELETE FROM sync_snapshot_rows WHERE snapshot_id IN(SELECT id FROM sync_snapshots WHERE expires<?1)",
