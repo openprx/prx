@@ -20,6 +20,7 @@ fn summary(id: &str, status: &str, title: &str, body: &str) -> PersistedSessionS
 
 fn usage_record() -> MeteredTokenUsageRecord {
     MeteredTokenUsageRecord {
+        root_agent: None,
         settlement_id: None,
         provider: "openai".to_string(),
         model: "gpt-4o-mini".to_string(),

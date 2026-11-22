@@ -874,6 +874,7 @@ async fn history_action_returns_tail_usage_and_truncation_controls() {
             spawn_depth: 0,
             delegation: None,
             token_usage_records: vec![crate::llm::route_decision::MeteredTokenUsageRecord {
+                root_agent: None,
                 settlement_id: None,
                 provider: "test-provider".to_string(),
                 model: "test-model".to_string(),

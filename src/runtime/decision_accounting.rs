@@ -56,6 +56,7 @@ pub(crate) struct AccountingScope {
     config: Arc<Config>,
     key: Arc<DecisionKey>,
     cleanup: Arc<CleanupTracker>,
+    root_agent: Option<crate::cost::types::RootAgent>,
     scope_id: [u8; 32],
     budgets: TurnBudgets,
     deadline: Instant,
@@ -87,6 +88,11 @@ impl AccountingScope {
                 settlement_failed: AtomicBool::new(false),
             }));
         }
+        self
+    }
+
+    pub(crate) fn with_root_agent(mut self, partition: Option<&crate::memory::AgentPartition>) -> Self {
+        self.root_agent = partition.map(crate::cost::types::RootAgent::from_partition);
         self
     }
 
@@ -153,6 +159,7 @@ impl AccountingScope {
             key,
             cleanup,
             scope_id,
+            root_agent: None,
             budgets,
             deadline,
             remaining: OnceLock::new(),
@@ -402,6 +409,7 @@ impl AccountingScope {
         let budgets = self.budgets;
         let call_limit = self.call_limit;
         let group = self.group.clone();
+        let root_agent = self.root_agent.clone();
         let stage = self.stage.get().cloned();
         // Copy only on a real configured physical attempt; the same full
         // guarded bytes are measured without removing image or request data.
@@ -571,6 +579,7 @@ impl AccountingScope {
                     restore_tokens = false;
                     Ok(OwnedReceipt {
                         _settlement_guard: settlement_guard,
+                        root_agent,
                         tracker,
                         receipt,
                         config,
@@ -690,6 +699,7 @@ impl Drop for UnclaimedReceipt {
 }
 
 pub(super) struct OwnedReceipt {
+    root_agent: Option<crate::cost::types::RootAgent>,
     _settlement_guard: tokio::sync::OwnedMutexGuard<()>,
     tracker: Arc<CostTracker>,
     receipt: ReservationReceipt,

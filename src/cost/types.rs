@@ -67,9 +67,30 @@ pub enum UsagePeriod {
 /// The `billing` value of a `$0` subscription settlement row.
 pub const SUBSCRIPTION_BILLING: &str = "subscription";
 
+/// Root agent identity, stable across sessions and incarnations within a workspace ledger.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RootAgent {
+    pub owner_id: String,
+    pub name: String,
+}
+
+impl RootAgent {
+    pub fn from_partition(partition: &crate::memory::AgentPartition) -> Self {
+        Self {
+            owner_id: partition.owner_id.clone(),
+            name: match &partition.key {
+                crate::memory::PartitionKey::Main => "main".to_owned(),
+                crate::memory::PartitionKey::Named { name, .. } => name.as_str().to_owned(),
+            },
+        }
+    }
+}
+
 /// A single cost record for persistent storage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CostRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_agent: Option<RootAgent>,
     /// Unique identifier
     pub id: String,
     /// Stable terminal settlement identifier. Legacy/manual records omit it.
@@ -103,6 +124,7 @@ impl CostRecord {
     /// Create a new cost record.
     pub fn new(session_id: impl Into<String>, usage: TokenUsage) -> Self {
         Self {
+            root_agent: None,
             id: uuid::Uuid::new_v4().to_string(),
             settlement_id: None,
             settlement_sha256: None,
@@ -119,6 +141,7 @@ impl CostRecord {
     pub fn from_settlement(session_id: impl Into<String>, settlement_id: impl Into<String>, usage: TokenUsage) -> Self {
         let settlement_id = settlement_id.into();
         Self {
+            root_agent: None,
             id: settlement_id.clone(),
             settlement_id: Some(settlement_id),
             settlement_sha256: None,

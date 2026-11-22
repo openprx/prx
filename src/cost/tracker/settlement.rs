@@ -140,6 +140,7 @@ impl CostTracker {
             timestamp: Utc::now(),
         };
         let mut cost_record = CostRecord::from_settlement(&self.session_id, settlement_id, usage);
+        cost_record.root_agent = record.root_agent.clone();
         cost_record.settlement_sha256 = Some(settlement_fingerprint(record, cost_usd)?);
         cost_record.settlement_provider = Some(record.provider.clone());
         cost_record.settlement_source = Some(record.source);
@@ -189,6 +190,7 @@ impl CostTracker {
             timestamp: Utc::now(),
         };
         let mut cost_record = CostRecord::from_settlement(&self.session_id, settlement_id, usage);
+        cost_record.root_agent = record.root_agent.clone();
         cost_record.settlement_sha256 = Some(settlement_fingerprint(record, 0.0)?);
         cost_record.settlement_provider = Some(record.provider.clone());
         cost_record.settlement_source = Some(record.source);
@@ -299,6 +301,7 @@ impl CostTracker {
             timestamp: Utc::now(),
         };
         let mut cost_record = CostRecord::from_settlement(&self.session_id, settlement_id, usage);
+        cost_record.root_agent = record.root_agent.clone();
         cost_record.settlement_sha256 = Some(settlement_fingerprint(record, cost_usd)?);
         cost_record.settlement_provider = Some(record.provider.clone());
         cost_record.settlement_source = Some(record.source);

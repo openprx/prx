@@ -209,6 +209,7 @@ async fn int_das_01_delegate_inherits_parent_security_policy() {
     agents.insert(
         "researcher".to_string(),
         DelegateAgentConfig {
+            limits: openprx::config::AgentLimits::default(),
             provider: "test".to_string(),
             model: "test-model".to_string(),
             system_prompt: None,
@@ -403,6 +404,7 @@ async fn int_das_02_delegate_respects_max_depth() {
     agents.insert(
         "deep-agent".to_string(),
         DelegateAgentConfig {
+            limits: openprx::config::AgentLimits::default(),
             provider: "test".to_string(),
             model: "test-model".to_string(),
             system_prompt: None,
@@ -673,6 +675,7 @@ async fn admitted_delegate_under_depth_reports_unsupported_provider() -> anyhow:
     agents.insert(
         "prx_depth_agent".to_string(),
         DelegateAgentConfig {
+            limits: openprx::config::AgentLimits::default(),
             provider: "test".to_string(),
             model: "test-model".to_string(),
             system_prompt: None,

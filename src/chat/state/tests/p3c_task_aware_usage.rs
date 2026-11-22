@@ -19,6 +19,7 @@ fn task_pair() -> (TurnTaskId, TurnTaskId) {
 
 fn record(total_tokens: u64) -> MainSessionTokenUsageRecord {
     MainSessionTokenUsageRecord {
+        root_agent: None,
         settlement_id: None,
         provider: "openai".to_string(),
         model: "gpt-4o-mini".to_string(),

@@ -162,6 +162,8 @@ pub struct TokenUsage {
 /// display cost. Shared by main chat sessions and sub-agent sessions.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MeteredTokenUsageRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_agent: Option<crate::cost::types::RootAgent>,
     /// Stable turn settlement identifier. Legacy records have no value; the
     /// shared terminal finalizer always supplies one so projections can dedup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -284,6 +286,7 @@ impl MeteredTokenUsageRecord {
         );
 
         Some(Self {
+            root_agent: None,
             settlement_id: None,
             provider: provider.to_string(),
             model: model.to_string(),

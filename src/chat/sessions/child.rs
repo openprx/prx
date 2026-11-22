@@ -612,6 +612,7 @@ mod tests {
                 record
                     .token_usage_records
                     .push(crate::llm::route_decision::MeteredTokenUsageRecord {
+                        root_agent: None,
                         settlement_id: Some("prx-settlement".into()),
                         provider: "prx_provider".into(),
                         model: "prx_model".into(),

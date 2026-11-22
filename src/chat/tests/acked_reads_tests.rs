@@ -840,6 +840,7 @@ async fn compact_right_after_a_rewind_is_compacted() {
 
 fn metered_usage() -> crate::llm::route_decision::MeteredTokenUsageRecord {
     crate::llm::route_decision::MeteredTokenUsageRecord {
+        root_agent: None,
         settlement_id: None,
         provider: "provider".to_owned(),
         model: "model".to_owned(),

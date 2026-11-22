@@ -571,6 +571,25 @@ impl CostTracker {
         self.session_costs.lock()
     }
 
+    /// Today's settled USD spend for this root agent, including its children.
+    /// The canonical cross-process ledger lock protects the bounded snapshot.
+    pub fn root_agent_spend_today(&self, agent: &super::types::RootAgent) -> Result<u128> {
+        let storage = self.lock_storage();
+        let _ledger_lock = acquire_cost_ledger_lock(&storage.path)?;
+        let text = read_state_ledger_bounded(storage.workspace()?, "costs.jsonl")?.unwrap_or_default();
+        let today = Utc::now().date_naive();
+        let mut total = 0u128;
+        for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            let row: CostRecord = serde_json::from_str(line)?;
+            if row.root_agent.as_ref() == Some(agent) && row.usage.timestamp.date_naive() == today {
+                total = total
+                    .checked_add(ceil_micro_usd(row.usage.cost_usd)?)
+                    .context("agent daily spend overflows")?;
+            }
+        }
+        Ok(total)
+    }
+
     /// Check if a request is within budget.
     pub fn check_budget(&self, estimated_cost_usd: f64) -> Result<BudgetCheck> {
         let config = self.config.clone();
@@ -1071,7 +1090,7 @@ fn settlement_fingerprint(
     record: &crate::llm::route_decision::MeteredTokenUsageRecord,
     cost_usd: f64,
 ) -> Result<String> {
-    let bytes = serde_json::to_vec(&(
+    let mut bytes = serde_json::to_vec(&(
         "prx-cost-settlement-v1",
         &record.provider,
         &record.model,
@@ -1083,6 +1102,9 @@ fn settlement_fingerprint(
         &record.source,
         cost_usd.to_bits(),
     ))?;
+    if let Some(root) = &record.root_agent {
+        bytes.extend(serde_json::to_vec(root)?);
+    }
     Ok(hex::encode(<sha2::Sha256 as sha2::Digest>::digest(bytes)))
 }
 
@@ -1102,6 +1124,7 @@ pub(crate) fn settlement_row_is_authentic(row: &CostRecord) -> bool {
     let usage = &row.usage;
     let matches = |provider: &str, model: &str, source: TokenUsageSource| {
         let record = MeteredTokenUsageRecord {
+            root_agent: row.root_agent.clone(),
             settlement_id: Some(settlement_id.to_string()),
             provider: provider.to_string(),
             model: model.to_string(),
@@ -2391,6 +2414,7 @@ mod tests {
         cost_usd: Option<f64>,
     ) -> crate::llm::route_decision::MeteredTokenUsageRecord {
         crate::llm::route_decision::MeteredTokenUsageRecord {
+            root_agent: None,
             settlement_id: Some(settlement_id.to_string()),
             provider: "provider-a".to_string(),
             model: "model-a".to_string(),

@@ -142,6 +142,7 @@ pub enum ManagedChange {
 /// The caller-owned fields of a named agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSpec {
+    pub limits: crate::config::AgentLimits,
     pub provider: String,
     pub model: String,
     /// `None` means PRX composes the prompt; `Some("")` is stored as is.
@@ -1718,6 +1719,10 @@ fn candidate(current: &Config, change: &ManagedChange) -> Result<Config, ManageE
             entry.autonomy = Some(spec.autonomy);
             entry.agentic = !spec.tools.is_empty();
             entry.allowed_tools.clone_from(&spec.tools);
+            spec.limits
+                .validate()
+                .map_err(|message| ManageError::Invalid(message.to_owned()))?;
+            entry.limits = spec.limits.clone();
             entry.enabled = spec.enabled;
         }
         ManagedChange::RetireAgent { agent } => {

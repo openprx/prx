@@ -531,10 +531,18 @@ async fn finalize_turn_impl(
             history.assistant_content = redact_persisted_text(&history.assistant_content);
         }
 
-        let usage_settlement = commit
+        let mut usage_settlement = commit
             .provider_outcome
             .as_ref()
             .and_then(|outcome| usage_settlement(&commit.terminal_id, outcome, cost_config));
+
+        if let Some(record) = usage_settlement.as_mut() {
+            record.root_agent = commit
+                .scope
+                .agent_partition
+                .as_ref()
+                .map(crate::cost::types::RootAgent::from_partition);
+        }
 
         if fabric.records_recovery_terminal() {
             // Keep the recovery transaction future out of the enclosing

@@ -23,8 +23,8 @@ pub(crate) use schema::set_runtime_proxy_config;
 
 pub use schema::{
     A2aConfig, A2aCredential, A2aPeer, A2aPeerAuth, AgentCompactionConfig, AgentCompactionMode, AgentConfig,
-    AuditConfig, AuthConfig, AutonomyConfig, BrowserComputerUseConfig, BrowserConfig, ChannelsConfig, ChatConfig,
-    ClassificationRule, ComposioConfig, Config, CostConfig, CronConfig, DEFAULT_CHANNEL_EXCLUDED_TOOLS,
+    AgentLimits, AuditConfig, AuthConfig, AutonomyConfig, BrowserComputerUseConfig, BrowserConfig, ChannelsConfig,
+    ChatConfig, ClassificationRule, ComposioConfig, Config, CostConfig, CronConfig, DEFAULT_CHANNEL_EXCLUDED_TOOLS,
     DelegateAgentConfig, DiscordConfig, DmPolicy, DockerRuntimeConfig, EMBEDDING_DEFAULT_UPGRADE_NOTICE,
     EmbeddingRouteConfig, FitnessConfig, GatewayConfig, GroupPolicy, GroupReplyMode, HYBRID_PROCESS_MEMORY_UNAVAILABLE,
     HeartbeatConfig, HttpRequestConfig, IMessageConfig, IdentityBindingConfig, IdentityConfig, LarkConfig, McpConfig,

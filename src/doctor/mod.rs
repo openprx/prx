@@ -3438,6 +3438,7 @@ mod tests {
         config.agents.insert(
             "worker".into(),
             crate::config::DelegateAgentConfig {
+                limits: crate::config::AgentLimits::default(),
                 provider: "openrouter".into(),
                 model: "model-test".into(),
                 system_prompt: None,
@@ -3998,6 +3999,7 @@ mod tests {
         config.agents.insert(
             "zeta".into(),
             crate::config::DelegateAgentConfig {
+                limits: crate::config::AgentLimits::default(),
                 provider: "totally-fake".into(),
                 model: "model-z".into(),
                 system_prompt: None,
@@ -4017,6 +4019,7 @@ mod tests {
         config.agents.insert(
             "alpha".into(),
             crate::config::DelegateAgentConfig {
+                limits: crate::config::AgentLimits::default(),
                 provider: "totally-fake".into(),
                 model: "model-a".into(),
                 system_prompt: None,

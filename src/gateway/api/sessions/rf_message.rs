@@ -521,7 +521,7 @@ fn slot_key(workspace: &str, session_id: &str, agent: &str) -> String {
 
 /// One live rf turn of a (session, agent), held from before its input is
 /// admitted until its job's work ends; released on drop.
-pub(super) struct TurnSlot(String);
+pub(super) struct TurnSlot(String, Option<super::target::AgentTurnPermit>);
 
 impl TurnSlot {
     fn claim(workspace: &str, session_id: &str, agent: &str, run_id: &str) -> Option<Self> {
@@ -535,7 +535,7 @@ impl TurnSlot {
                     cancel_requested: false,
                 });
                 // Built only when claimed: a dropped slot releases its key.
-                Some(Self(key))
+                Some(Self(key, None))
             }
         }
     }
@@ -761,9 +761,18 @@ pub(super) async fn post_rf_message(
     }
     let run_id = uuid::Uuid::new_v4().to_string();
     let job_id = uuid::Uuid::new_v4();
-    let Some(slot) = TurnSlot::claim(&workspace, &session_id, &agent_key, &run_id) else {
+    let permit = match super::target::admit_agent_turn(
+        &selected.runtime.config_generation.effective,
+        &principal.owner_id,
+        &agent_key,
+    ) {
+        Ok(permit) => permit,
+        Err(response) => return *response,
+    };
+    let Some(mut slot) = TurnSlot::claim(&workspace, &session_id, &agent_key, &run_id) else {
         return rf_replay::session_busy();
     };
+    slot.1 = permit;
     let in_flight = RunInFlight::enter(&workspace, &run_id);
     let admission = RfAdmission {
         key,

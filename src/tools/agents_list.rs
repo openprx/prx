@@ -106,6 +106,7 @@ mod tests {
 
     fn make_agent(provider: &str, model: &str) -> DelegateAgentConfig {
         DelegateAgentConfig {
+            limits: crate::config::AgentLimits::default(),
             provider: provider.to_string(),
             model: model.to_string(),
             system_prompt: None,

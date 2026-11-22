@@ -366,3 +366,78 @@ pub(super) fn resolve_incarnation(
         )))),
     }
 }
+
+/// Admission ownership counts only rf root turns; dropping a refused request or
+/// completed job releases it. Children inherit cost attribution, never a slot.
+#[derive(Debug)]
+pub(super) struct AgentTurnPermit((String, String, String));
+
+static AGENT_TURNS: std::sync::LazyLock<parking_lot::Mutex<std::collections::BTreeMap<(String, String, String), u32>>> =
+    std::sync::LazyLock::new(Default::default);
+
+impl Drop for AgentTurnPermit {
+    fn drop(&mut self) {
+        let mut turns = AGENT_TURNS.lock();
+        if let Some(count) = turns.get_mut(&self.0) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                turns.remove(&self.0);
+            }
+        }
+    }
+}
+
+/// Reserve a root turn before its durable idempotency admission or provider access.
+pub(super) fn admit_agent_turn(
+    config: &Config,
+    owner: &str,
+    name: &str,
+) -> Result<Option<AgentTurnPermit>, Box<Response>> {
+    let Some(agent) = config.agents.get(name) else {
+        return Ok(None);
+    };
+    let fail = |code, retry: u64| {
+        let mut response = crate::gateway::api::capabilities::coded_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            code,
+            "the agent's configured admission limit is reached",
+        );
+        if let Ok(value) = axum::http::HeaderValue::from_str(&retry.to_string()) {
+            response.headers_mut().insert(axum::http::header::RETRY_AFTER, value);
+        }
+        Box::new(response)
+    };
+    let key = (
+        config.workspace_dir.to_string_lossy().into_owned(),
+        owner.to_owned(),
+        name.to_owned(),
+    );
+    let mut turns = AGENT_TURNS.lock();
+    let count = turns.get(&key).copied().unwrap_or(0);
+    if agent.limits.max_concurrent_turns.is_some_and(|limit| count >= limit) {
+        return Err(fail("agent_busy", 1));
+    }
+    if let Some(cents) = agent.limits.max_cost_per_day_cents {
+        let root = crate::cost::types::RootAgent {
+            owner_id: owner.to_owned(),
+            name: name.to_owned(),
+        };
+        let spent = crate::cost::tracker::CostTracker::for_workspace(config.cost.clone(), &config.workspace_dir)
+            .and_then(|tracker| tracker.root_agent_spend_today(&root))
+            .map_err(|_| {
+                Box::new(crate::gateway::api::capabilities::coded_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "storage_unavailable",
+                    "the agent cost ledger could not be read",
+                ))
+            })?;
+        if spent >= u128::from(cents) * 10_000 {
+            let now = chrono::Utc::now().timestamp();
+            let retry = u64::try_from(86_400 - now.rem_euclid(86_400)).unwrap_or(86_400);
+            return Err(fail("agent_budget_exhausted", retry));
+        }
+    }
+    let next = count.checked_add(1).ok_or_else(|| fail("agent_busy", 1))?;
+    turns.insert(key.clone(), next);
+    Ok(Some(AgentTurnPermit(key)))
+}

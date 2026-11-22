@@ -21,6 +21,7 @@ use crate::security::agent_level::agent_level as effective_autonomy;
 
 fn agent(agentic: bool, allowed_tools: &[&str]) -> DelegateAgentConfig {
     DelegateAgentConfig {
+        limits: crate::config::AgentLimits::default(),
         provider: "ollama".to_owned(),
         model: "test-model".to_owned(),
         system_prompt: None,

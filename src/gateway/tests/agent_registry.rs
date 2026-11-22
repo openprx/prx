@@ -12,6 +12,7 @@ const SESSION: &str = "no-such-session";
 
 fn agent(temperature: f64, enabled: bool) -> DelegateAgentConfig {
     DelegateAgentConfig {
+        limits: crate::config::AgentLimits::default(),
         provider: "ollama".to_owned(),
         model: "prx-local-model".to_owned(),
         system_prompt: None,

@@ -143,6 +143,7 @@ pub(super) async fn recovery_subscription_commit_survives_restart() {
         let tracker =
             crate::cost::tracker::CostTracker::for_workspace(cell.cost.clone(), &cell.workspace).expect("test: ledger");
         let prior = crate::llm::route_decision::MeteredTokenUsageRecord {
+            root_agent: None,
             settlement_id: Some(id.to_owned()),
             provider: "kimi-code".to_owned(),
             model: "kimi-for-coding".to_owned(),

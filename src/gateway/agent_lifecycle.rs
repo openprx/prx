@@ -34,6 +34,7 @@ struct RevisionPreimage<'a> {
     spawn_enabled: Option<bool>,
     enabled: bool,
     autonomy: Option<crate::security::AutonomyLevel>,
+    limits: &'a crate::config::AgentLimits,
 }
 
 /// Lowercase SHA-256 over the serialized preimage.
@@ -52,6 +53,7 @@ pub(crate) fn config_revision(agent: &DelegateAgentConfig) -> anyhow::Result<Str
         spawn_enabled: agent.spawn_enabled,
         enabled: agent.enabled,
         autonomy: agent.autonomy,
+        limits: &agent.limits,
     })?;
     Ok(crate::memory::SqliteMemory::schema_migration_checksum(&preimage))
 }

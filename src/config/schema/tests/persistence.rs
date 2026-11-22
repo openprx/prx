@@ -362,6 +362,7 @@ async fn config_split_and_reload_roundtrip_matches_original() {
     config.agents.insert(
         "worker".into(),
         DelegateAgentConfig {
+            limits: crate::config::AgentLimits::default(),
             provider: "openrouter".into(),
             model: "test-model".into(),
             system_prompt: Some("delegate".into()),
@@ -450,6 +451,7 @@ async fn config_save_encrypts_nested_credentials() {
     config.agents.insert(
         "worker".into(),
         DelegateAgentConfig {
+            limits: crate::config::AgentLimits::default(),
             provider: "openrouter".into(),
             model: "model-test".into(),
             system_prompt: None,

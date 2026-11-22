@@ -42,6 +42,7 @@ fn reservation() -> EstimatedReservationRequest {
 
 fn subscription_usage() -> MeteredTokenUsageRecord {
     MeteredTokenUsageRecord {
+        root_agent: None,
         settlement_id: Some(ATTEMPT.to_owned()),
         provider: "kimi-code".to_owned(),
         model: "kimi-for-coding".to_owned(),

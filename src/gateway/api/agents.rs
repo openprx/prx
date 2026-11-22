@@ -46,7 +46,7 @@ use std::sync::Arc;
 const PROMPT_MAX_BYTES: usize = 32_768;
 
 const BODY_SHAPE: &str = "the body must be a JSON object with exactly provider, model, autonomy, tools, enabled and an \
-                          optional prompt; nothing was written";
+                          optional prompt and limits; nothing was written";
 
 /// A refused request: its status, closed code and message, and the one
 /// extra field its code carries.
@@ -271,6 +271,8 @@ fn named_incarnation(
 
 #[derive(Serialize)]
 struct AgentConfigBody {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limits: Option<crate::config::AgentLimits>,
     provider: String,
     model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -314,6 +316,7 @@ fn named_readback(
     Readback {
         name: name.as_str().to_owned(),
         config: AgentConfigBody {
+            limits: Some(agent.limits.clone()),
             provider: redact_provider_text(&agent.provider),
             model: agent.model.clone(),
             prompt: agent.system_prompt.clone(),
@@ -351,6 +354,7 @@ fn read_main(registry: &Registry<'_>, snapshot: &Snapshot) -> Outcome<Readback> 
     Ok(Readback {
         name: crate::config::agent_name::MAIN_AGENT_NAME.to_owned(),
         config: AgentConfigBody {
+            limits: None,
             provider: redact_provider_text(crate::providers::selection::default_provider(config)),
             model: crate::providers::selection::default_model(config).to_owned(),
             prompt: None,
@@ -408,6 +412,8 @@ fn write_of(uri: &Uri, headers: &HeaderMap) -> Outcome<Write> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PutBody {
+    #[serde(default)]
+    limits: Option<crate::config::AgentLimits>,
     provider: String,
     model: String,
     autonomy: String,
@@ -422,11 +428,6 @@ fn parse_spec(body: &[u8]) -> Outcome<AgentSpec> {
     let Some(object) = value.as_object() else {
         return Err(Refusal::field(BODY_SHAPE));
     };
-    if object.contains_key("limits") {
-        return Err(Refusal::field(
-            "limits are not supported yet (they arrive with the token agent_limits_v1); nothing was written",
-        ));
-    }
     if object.get("prompt").is_some_and(serde_json::Value::is_null) {
         return Err(Refusal::field(
             "prompt must be a string, or absent for PRX's own composition; nothing was written",
@@ -450,7 +451,10 @@ fn parse_spec(body: &[u8]) -> Outcome<AgentSpec> {
     {
         return Err(Refusal::field("prompt is longer than 32768 bytes; nothing was written"));
     }
+    let limits = body.limits.unwrap_or_default();
+    limits.validate().map_err(Refusal::field)?;
     Ok(AgentSpec {
+        limits,
         provider: body.provider,
         model: body.model,
         prompt: body.prompt,

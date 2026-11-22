@@ -51,6 +51,7 @@ impl OwnedReceipt {
             };
             let total = input + output;
             let record = MeteredTokenUsageRecord {
+                root_agent: self.root_agent.clone(),
                 settlement_id: Some(self.receipt.attempt_id().to_owned()),
                 provider: crate::providers::redact_endpoint_userinfo(&self.provider).into_owned(),
                 model: self.model.clone(),

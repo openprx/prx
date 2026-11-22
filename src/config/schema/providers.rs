@@ -2,9 +2,36 @@ use super::{Deserialize, JsonSchema, Serialize};
 
 // ── Delegate Agents ──────────────────────────────────────────────
 
+/// Optional admission limits for rf-started turns of a named agent.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentLimits {
+    pub max_concurrent_turns: Option<u32>,
+    pub max_cost_per_day_cents: Option<u64>,
+}
+
+impl AgentLimits {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self
+            .max_concurrent_turns
+            .is_some_and(|value| !(1..=1024).contains(&value))
+            || self
+                .max_cost_per_day_cents
+                .is_some_and(|value| !(1..=1_000_000_000).contains(&value))
+        {
+            return Err(
+                "limits must be null or within max_concurrent_turns 1..=1024 and max_cost_per_day_cents 1..=1000000000",
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Configuration for a delegate sub-agent used by the `delegate` tool.
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DelegateAgentConfig {
+    #[serde(default)]
+    pub limits: AgentLimits,
     /// Provider name (e.g. "ollama", "openrouter", "anthropic")
     pub provider: String,
     /// Model name
@@ -60,6 +87,10 @@ impl DelegateAgentConfig {
         Self {
             provider,
             model,
+            limits: AgentLimits {
+                max_concurrent_turns: None,
+                max_cost_per_day_cents: None,
+            },
             system_prompt: None,
             api_key: None,
             credential_ref: None,

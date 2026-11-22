@@ -15,6 +15,7 @@ fn usage_record(
     source: crate::llm::route_decision::TokenUsageSource,
 ) -> crate::llm::route_decision::MeteredTokenUsageRecord {
     crate::llm::route_decision::MeteredTokenUsageRecord {
+        root_agent: None,
         settlement_id: None,
         provider: "openai".to_string(),
         model: "gpt-4o-mini".to_string(),

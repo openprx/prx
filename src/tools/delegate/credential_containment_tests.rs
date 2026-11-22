@@ -7,6 +7,7 @@ const ROOT_SENTINEL: &str = "C0-DELEGATE-ROOT-SENTINEL";
 
 fn agent(provider: &str, api_key: Option<&str>) -> DelegateAgentConfig {
     DelegateAgentConfig {
+        limits: crate::config::AgentLimits::default(),
         provider: provider.to_string(),
         model: PROBE_MODEL.to_string(),
         system_prompt: None,

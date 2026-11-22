@@ -643,6 +643,7 @@ fn usage_is_read_from_the_run_ledger_and_the_environment_binds_the_models_that_s
     let settle = |id: &str, model: &str, tokens: u64, cost: f64| {
         tracker
             .settle_metered(&crate::llm::route_decision::MeteredTokenUsageRecord {
+                root_agent: None,
                 settlement_id: Some(id.to_string()),
                 provider: "p".to_string(),
                 model: model.to_string(),
@@ -876,6 +877,7 @@ fn rows_with_cache_tokens_verify_and_count_and_a_tampered_row_voids_the_ledger()
     ] {
         tracker
             .settle_metered(&crate::llm::route_decision::MeteredTokenUsageRecord {
+                root_agent: None,
                 settlement_id: Some(id.to_string()),
                 provider: "custom:http://127.0.0.1:9/v1".to_string(),
                 model: "cached-model".to_string(),

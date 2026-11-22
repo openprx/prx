@@ -35,6 +35,7 @@ fn request() -> EstimatedReservationRequest {
 }
 fn usage() -> MeteredTokenUsageRecord {
     MeteredTokenUsageRecord {
+        root_agent: None,
         settlement_id: Some("prx_settlement_attempt".to_owned()),
         provider: "prx_provider".to_owned(),
         model: "prx_model".to_owned(),

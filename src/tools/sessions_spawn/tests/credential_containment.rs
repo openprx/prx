@@ -9,6 +9,7 @@ const SPAWN_ROOT_SENTINEL: &str = "C0-SPAWN-ROOT-SENTINEL";
 
 fn containment_agent(provider: &str, api_key: Option<&str>) -> DelegateAgentConfig {
     DelegateAgentConfig {
+        limits: crate::config::AgentLimits::default(),
         provider: provider.to_string(),
         model: crate::providers::credential_probe::PROBE_MODEL.to_string(),
         system_prompt: None,

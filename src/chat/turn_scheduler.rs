@@ -591,6 +591,7 @@ mod tests {
         let id = scheduler.enqueue("metered", TurnPriority::Normal, 0);
         scheduler.start_task(id).unwrap();
         let record = crate::chat::session::MainSessionTokenUsageRecord {
+            root_agent: None,
             settlement_id: None,
             provider: "kimi-code".to_string(),
             model: "kimi-k2.7-code".to_string(),

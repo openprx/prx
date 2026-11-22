@@ -122,6 +122,7 @@ async fn genuine_depth_denial_retains_parent_cleanup_ack_evidence() -> anyhow::R
                 },
             );
             let depth_config = crate::config::DelegateAgentConfig {
+                limits: crate::config::AgentLimits::default(),
                 provider: "test".to_owned(),
                 model: "test-model".to_owned(),
                 system_prompt: None,

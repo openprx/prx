@@ -711,6 +711,7 @@ mod tests {
         cost: Option<f64>,
     ) -> MainSessionTokenUsageRecord {
         MainSessionTokenUsageRecord {
+            root_agent: None,
             settlement_id: None,
             provider: "kimi-code".to_owned(),
             model: "kimi-for-coding".to_owned(),
