@@ -1,7 +1,7 @@
 //! Scope-fenced erase orchestration. Payload removal and progress commit together;
 //! terminal receipts follow independent coverage checks and WAL truncation.
 use super::{SqliteMemory, agent_registry::MANIFEST_STORES};
-use crate::memory::agent_erasure::{ErasePrepared, EraseWork, ErasureRefusal, HistoryErase};
+use crate::memory::agent_erasure::{ErasePrepared, EraseWork, ErasureRefusal, ErasureStep, HistoryErase};
 use crate::runtime::sqlite_pool::begin_immediate;
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -230,6 +230,25 @@ fn predicate(columns: &[String]) -> String {
         .join(" OR ")
 }
 
+/// Include recovery rows by their stable source links as well as the stamp.
+/// This is the erase dependency closure, including unstamped source derivatives;
+/// it neither rebinds existing rows nor guesses ownership from their contents.
+fn erase_predicate(table: &str, columns: &[String]) -> String {
+    let scoped = predicate(columns);
+    let links: &[&str] = match table {
+        "ingress_recovery" => &["input_event_id", "evidence_event_id"],
+        "recovery_attestations" => &["input_event_id", "terminal_event_id"],
+        _ => &[],
+    };
+    let mut condition = format!("({scoped})");
+    for link in links {
+        condition.push_str(&format!(
+            " OR {link} IN(SELECT event_id FROM message_events WHERE ma_scope_id IN(SELECT value FROM json_each(?1)))"
+        ));
+    }
+    condition
+}
+
 fn inventory_counts() -> BTreeMap<String, u64> {
     MANIFEST_STORES.iter().map(|name| ((*name).to_owned(), 0)).collect()
 }
@@ -260,7 +279,7 @@ fn erase_rows(
     // Defer links while every member of the scoped family is removed.
     conn.execute_batch("PRAGMA defer_foreign_keys=ON")?;
     for (table, columns) in &tables {
-        let condition = predicate(columns);
+        let condition = erase_predicate(table, columns);
         let amount: i64 = conn.query_row(&format!("SELECT count(*) FROM \"{table}\""), [], |row| row.get(0))?;
         *counts.entry(table.clone()).or_default() = u64::try_from(amount)?;
         if let Some(erase_id) = erase_id {
@@ -316,7 +335,7 @@ fn erase_rows(
             )?;
         } else {
             conn.execute(
-                &format!("DELETE FROM \"{table}\" WHERE {}", predicate(columns)),
+                &format!("DELETE FROM \"{table}\" WHERE {}", erase_predicate(table, columns)),
                 [scopes],
             )?;
         }
@@ -364,7 +383,7 @@ fn verify(conn: &Connection, scopes: &str, keep_message_keys: bool) -> anyhow::R
         let remaining: i64 = conn.query_row(
             &format!(
                 "SELECT count(*) FROM \"{table}\" WHERE ({}){payload}",
-                predicate(&columns)
+                erase_predicate(&table, &columns)
             ),
             [scopes],
             |row| row.get(0),
@@ -433,13 +452,13 @@ pub(super) fn finish_history(memory: &SqliteMemory, work: &EraseWork) -> anyhow:
             "UPDATE agent_erase_work SET work=?2 WHERE erase_id=?1",
             params![work.erase_id, serde_json::to_string(&work)?],
         )?;
-        tx.commit()?;
+        tx.commit().context(ErasureStep::RefreshFamily)?;
     }
     let scopes = serde_json::to_string(&work.scopes)?;
     for scope in &work.scopes {
         let id = uuid::Uuid::parse_str(scope)?;
         if !memory.mailbox_runtime.drain_and_join(id, Duration::from_secs(4)) {
-            return Err(ErasureRefusal::Pending.into());
+            return Err(anyhow::Error::new(ErasureRefusal::Pending).context(ErasureStep::DrainLeases));
         }
     }
     {
@@ -471,13 +490,13 @@ pub(super) fn finish_history(memory: &SqliteMemory, work: &EraseWork) -> anyhow:
                     forgotten.documents_touched += found.documents_touched;
                 }
             }
-            erase_rows(&tx, &scopes, &mut counts, Some(&work.erase_id), !work.purge)?;
+            erase_rows(&tx, &scopes, &mut counts, Some(&work.erase_id), !work.purge).context(ErasureStep::EraseRows)?;
             // Session previews are shared by agents; derive them again from survivors.
             tx.execute("UPDATE sessions SET last_message_preview=COALESCE((SELECT substr(c.content,1,200) FROM conversation_turns c
                 WHERE c.session_key=sessions.session_key AND c.deleted_at IS NULL ORDER BY c.id DESC LIMIT 1),''),
                 message_count=(SELECT count(*) FROM conversation_turns c WHERE c.session_key=sessions.session_key AND c.deleted_at IS NULL)
                 WHERE session_key IN(SELECT session_key FROM agent_scopes WHERE scope_id IN(SELECT value FROM json_each(?1)))",[&scopes])?;
-            verify(&tx, &scopes, !work.purge)?;
+            verify(&tx, &scopes, !work.purge).context(ErasureStep::VerifyCoverage)?;
             tx.execute(
                 "UPDATE agent_erase_work SET main_erased=1,counts=?2,forgotten=?3 WHERE erase_id=?1",
                 params![
@@ -487,13 +506,15 @@ pub(super) fn finish_history(memory: &SqliteMemory, work: &EraseWork) -> anyhow:
                 ],
             )?;
         }
-        tx.commit()?;
+        tx.commit().context(ErasureStep::CommitRows)?;
     }
-    erase_side_stores(memory, &work, &scopes)?;
-    super::memory_impl::truncate_wal(&memory.pool, Duration::from_secs(4)).map_err(|_| ErasureRefusal::Pending)?;
+    erase_side_stores(memory, &work, &scopes).context(ErasureStep::EraseSideStores)?;
+    super::memory_impl::truncate_wal(&memory.pool, Duration::from_secs(4))
+        .map_err(|_| ErasureRefusal::Pending)
+        .context(ErasureStep::TruncateWal)?;
     let conn = memory.pool.write();
     let tx = begin_immediate(&conn)?;
-    verify(&tx, &scopes, !work.purge)?;
+    verify(&tx, &scopes, !work.purge).context(ErasureStep::VerifyCoverage)?;
     let existing: Option<String> = tx.query_row(
         "SELECT receipt FROM agent_erase_work WHERE erase_id=?1",
         [&work.erase_id],
@@ -539,7 +560,7 @@ pub(super) fn finish_history(memory: &SqliteMemory, work: &EraseWork) -> anyhow:
             params![uuid::Uuid::new_v4().to_string(), next, work.scope_id],
         )?;
     }
-    tx.commit()?;
+    tx.commit().context(ErasureStep::CommitReceipt)?;
     Ok(receipt)
 }
 

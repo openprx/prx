@@ -833,7 +833,7 @@ pub(in crate::memory::sqlite) fn publish_in(
         .into());
     }
     sign(&mut receipt, &key)?;
-    tx.execute("INSERT INTO recovery_attestations(workspace_id,owner_id,source,run_id,input_event_id,terminal_event_id,version,key_id,state,facts,mac) VALUES(?1,?2,?3,?4,?5,?6,1,?7,?8,?9,?10) ON CONFLICT(workspace_id,owner_id,source,run_id) DO UPDATE SET terminal_event_id=excluded.terminal_event_id,key_id=excluded.key_id,state=excluded.state,facts=excluded.facts,mac=excluded.mac", params![publication.chain.workspace_id,publication.chain.owner_id,publication.chain.source,publication.chain.run_id,facts.input.as_ref().map(|e| &e.id),facts.terminal.as_ref().map(|e| &e.id),receipt.key_id,receipt.state,receipt.facts,receipt.mac])?;
+    tx.execute("INSERT INTO recovery_attestations(workspace_id,owner_id,source,run_id,input_event_id,terminal_event_id,version,key_id,state,facts,mac,ma_scope_id) VALUES(?1,?2,?3,?4,?5,?6,1,?7,?8,?9,?10,(SELECT ma_scope_id FROM message_events WHERE event_id=COALESCE(?5,?6))) ON CONFLICT(workspace_id,owner_id,source,run_id) DO UPDATE SET terminal_event_id=excluded.terminal_event_id,key_id=excluded.key_id,state=excluded.state,facts=excluded.facts,mac=excluded.mac,ma_scope_id=excluded.ma_scope_id", params![publication.chain.workspace_id,publication.chain.owner_id,publication.chain.source,publication.chain.run_id,facts.input.as_ref().map(|e| &e.id),facts.terminal.as_ref().map(|e| &e.id),receipt.key_id,receipt.state,receipt.facts,receipt.mac])?;
     Ok(receipt)
 }
 

@@ -538,8 +538,8 @@ pub(in crate::memory::sqlite) fn after_append(
                 );
                 transaction.execute(
                     "INSERT INTO ingress_recovery(cursor, input_event_id, workspace_id, owner_id,
-                        source, input_key, lifetime, capsule_json, state)
-                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending')",
+                        source, input_key, lifetime, capsule_json, state, ma_scope_id)
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', (SELECT ma_scope_id FROM message_events WHERE event_id=?2))",
                     params![
                         event.id,
                         event.event_id,

@@ -65,3 +65,34 @@ pub struct AgentPurge {
     pub expected_revision: String,
     pub current_revision: String,
 }
+
+/// Payload-free progress codes retained in an erase error chain.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+pub enum ErasureStep {
+    #[error("finish_history")]
+    FinishHistory,
+    #[error("prepare_history")]
+    PrepareHistory,
+    #[error("prepare_purge")]
+    PreparePurge,
+    #[error("drain_jobs")]
+    DrainJobs,
+    #[error("refresh_family")]
+    RefreshFamily,
+    #[error("drain_leases")]
+    DrainLeases,
+    #[error("erase_rows")]
+    EraseRows,
+    #[error("verify_coverage")]
+    VerifyCoverage,
+    #[error("commit_rows")]
+    CommitRows,
+    #[error("erase_side_stores")]
+    EraseSideStores,
+    #[error("truncate_wal")]
+    TruncateWal,
+    #[error("commit_receipt")]
+    CommitReceipt,
+    #[error("finish_purge")]
+    FinishPurge,
+}

@@ -1,7 +1,8 @@
 //! Owner-authenticated history erasure. The store persists the fence before
 //! cancellation; no successful response precedes verified payload removal.
 use super::{ApiPrincipal, AppState, capabilities::coded_error};
-use crate::memory::agent_erasure::{ErasePrepared, EraseWork, ErasureRefusal, HistoryErase};
+use crate::memory::agent_erasure::{ErasePrepared, EraseWork, ErasureRefusal, ErasureStep, HistoryErase};
+use anyhow::Context;
 use axum::{
     Extension, Json,
     body::Bytes,
@@ -13,6 +14,13 @@ use serde::Deserialize;
 use std::time::Duration;
 
 pub(super) fn failure(error: &anyhow::Error, purge: bool) -> Response {
+    let step: Option<&ErasureStep> = error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<ErasureStep>())
+        .last();
+    if step.is_some() || error.downcast_ref::<ErasureRefusal>().is_none() {
+        tracing::warn!(step=?step,error_kind=%crate::agent::diagnostics::error_class(error),"agent erasure did not complete");
+    }
     let (status, code) = match error.downcast_ref::<ErasureRefusal>() {
         Some(ErasureRefusal::IdempotencyConflict) => (StatusCode::CONFLICT, "idempotency_conflict"),
         Some(ErasureRefusal::NotRetired) => (StatusCode::CONFLICT, "agent_not_retired"),
@@ -38,13 +46,10 @@ pub(super) fn failure(error: &anyhow::Error, purge: bool) -> Response {
             StatusCode::SERVICE_UNAVAILABLE,
             if purge { "purge_pending" } else { "history_pending" },
         ),
-        _ => {
-            tracing::warn!(error_kind=%crate::agent::diagnostics::error_class(error),"agent erasure did not complete");
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                if purge { "purge_pending" } else { "history_pending" },
-            )
-        }
+        _ => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            if purge { "purge_pending" } else { "history_pending" },
+        ),
     };
     let message = match code {
         "idempotency_conflict" => "this idempotency key belongs to another request",
@@ -162,7 +167,9 @@ pub(super) async fn delete_history(
     let memory = std::sync::Arc::clone(&state.mem);
     let prepared = crate::runtime::blocking::spawn_blocking(move || {
         let registry = memory.agent_registry().ok_or(ErasureRefusal::Unsupported)?;
-        registry.begin_history_erase(&request)
+        registry
+            .begin_history_erase(&request)
+            .context(ErasureStep::PrepareHistory)
     })
     .await;
     let work = match prepared {
@@ -171,7 +178,7 @@ pub(super) async fn delete_history(
         Ok(Err(error)) => return failure(&error, false),
         Err(error) => return failure(&error.into(), false),
     };
-    if let Err(error) = drain(&work).await {
+    if let Err(error) = drain(&work).await.context(ErasureStep::DrainJobs) {
         return failure(&error, false);
     }
     let memory = std::sync::Arc::clone(&state.mem);
@@ -180,6 +187,7 @@ pub(super) async fn delete_history(
             .agent_registry()
             .ok_or(ErasureRefusal::Unsupported)?
             .finish_history_erase(&work)
+            .context(ErasureStep::FinishHistory)
     })
     .await
     {
@@ -305,6 +313,7 @@ pub(super) async fn post_purge(
             .agent_registry()
             .ok_or(ErasureRefusal::Unsupported)?
             .begin_agent_purge(&request)
+            .context(ErasureStep::PreparePurge)
     })
     .await;
     let work = match prepared {
@@ -313,7 +322,7 @@ pub(super) async fn post_purge(
         Ok(Err(error)) => return failure(&error, true),
         Err(error) => return failure(&error.into(), true),
     };
-    if let Err(error) = drain(&work).await {
+    if let Err(error) = drain(&work).await.context(ErasureStep::DrainJobs) {
         return failure(&error, true);
     }
     let memory = std::sync::Arc::clone(&state.mem);
@@ -323,6 +332,7 @@ pub(super) async fn post_purge(
             .agent_registry()
             .ok_or(ErasureRefusal::Unsupported)?
             .finish_history_erase(&erased_work)
+            .context(ErasureStep::FinishHistory)
     })
     .await
     {
@@ -339,6 +349,7 @@ pub(super) async fn post_purge(
             .agent_registry()
             .ok_or(ErasureRefusal::Unsupported)?
             .finish_agent_purge(&work)
+            .context(ErasureStep::FinishPurge)
     })
     .await
     {
