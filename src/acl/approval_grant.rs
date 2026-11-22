@@ -260,7 +260,7 @@ impl WitnessKeyring {
 
     fn persist_to(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
-            crate::util::create_private_dir_all(parent)
+            crate::util::create_secret_dir_all(parent)
                 .with_context(|| format!("create key dir {}", parent.display()))?;
         }
         let persisted = PersistedWitnessKey {

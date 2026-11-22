@@ -224,7 +224,7 @@ impl AccountCrypto {
     }
 
     fn write_wrapped(&self, account_id: &str, dek: &Zeroizing<[u8; DEK_LEN]>) -> Result<(), CryptoError> {
-        crate::util::create_private_dir_all(&self.key_dir).map_err(|error| CryptoError::Store(error.to_string()))?;
+        crate::util::create_secret_dir_all(&self.key_dir).map_err(|error| CryptoError::Store(error.to_string()))?;
         let store = crate::security::SecretStore::new(&self.secrets_dir, true);
         let wrapped = store
             .encrypt(&hex::encode(dek.as_ref()))

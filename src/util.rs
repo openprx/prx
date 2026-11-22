@@ -2,9 +2,28 @@
 //!
 //! This module contains reusable helper functions used across the codebase.
 
-/// Create every missing directory with owner-only permissions.
+/// Create missing parents normally and only the leaf with owner-only permissions.
 /// Existing entries are left untouched; callers validate opened handles.
 pub(crate) fn create_private_dir_all(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        match std::fs::DirBuilder::new().mode(0o700).create(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(path)
+}
+
+/// Create every missing ancestor and leaf of a secret store owner-only.
+/// Existing entries are left untouched; secret owners validate opened handles.
+pub(crate) fn create_secret_dir_all(path: &std::path::Path) -> std::io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]

@@ -209,7 +209,7 @@ pub fn load_or_create_host_id(state_dir: &std::path::Path) -> Result<String> {
         }
     }
     if let Some(parent) = path.parent() {
-        crate::util::create_private_dir_all(parent)?;
+        crate::util::create_secret_dir_all(parent)?;
     }
     let host_id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
     std::fs::write(&path, &host_id)?;

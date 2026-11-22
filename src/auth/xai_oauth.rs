@@ -419,7 +419,7 @@ pub fn parse_code_from_redirect(input: &str, expected_state: Option<&str>) -> Re
 pub fn save_pending_login(state_dir: &Path, encrypt: bool, pending: &PendingXaiLogin) -> Result<()> {
     let path = pending_path(state_dir);
     if let Some(parent) = path.parent() {
-        crate::util::create_private_dir_all(parent)?;
+        crate::util::create_secret_dir_all(parent)?;
     }
     let secret_store = SecretStore::new(state_dir, encrypt);
     let encrypted_code_verifier = secret_store.encrypt(&pending.code_verifier)?;
