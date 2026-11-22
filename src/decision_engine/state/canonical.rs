@@ -25,8 +25,6 @@ struct CanonicalTrusted<'a> {
     constraints: Vec<&'a str>,
     delivery: [bool; 3],
     exclusions: Vec<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    model_admission: Option<&'a [u8; 32]>,
     owner_id: Option<&'a str>,
     policy_version: &'a str,
     resolved_model: &'a str,
@@ -150,7 +148,6 @@ pub(super) fn serialize(state: &CausalState) -> Result<String, serde_json::Error
                 trusted.delivery.approval_channel,
             ],
             exclusions: borrowed_set(trusted.exclusions.iter().map(AsRef::as_ref)),
-            model_admission: trusted.model_admission.as_ref().map(|policy| policy.digest()),
             owner_id: trusted.owner_id.as_deref(),
             policy_version: trusted.policy_version.as_ref(),
             resolved_model: trusted.resolved_model.as_ref(),

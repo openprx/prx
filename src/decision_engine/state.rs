@@ -16,7 +16,7 @@ use crate::tools::capability::turn_state::{RouterHistoryReadBinding, SideEffectM
 #[cfg(test)]
 use crate::tools::capability::{
     contract::CatalogGeneration,
-    turn_state::{ConstraintCode, DeliveryConstraints, TrustedParts, TurnBudgets, TurnSurfaceKind, model_admission},
+    turn_state::{ConstraintCode, DeliveryConstraints, TrustedParts, TurnBudgets, TurnSurfaceKind},
 };
 
 #[cfg(test)]
@@ -387,7 +387,6 @@ pub(crate) mod fixtures {
             surface: TurnSurfaceKind::Interactive,
             side_effect_mode: SideEffectMode::ReadOnly,
             exclusions: vec![Arc::from("shell"), Arc::from("browser")],
-            model_admission: None,
             constraints: vec![
                 ConstraintCode::new("no_destructive_filesystem"),
                 ConstraintCode::new("external_send_requires_approval"),

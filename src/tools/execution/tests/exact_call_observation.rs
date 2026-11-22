@@ -299,7 +299,6 @@ async fn discovered_mcp_trace_preserves_the_published_server_namespace() {
             publication_policy: &SurfacePolicy::default(),
             tiering: &crate::config::ToolTieringConfig::default(),
             security: &security,
-            pinned_model: "prx_model",
             channel: false,
             inherited_exclusions: &[],
             sender: "prx_user",

@@ -137,7 +137,7 @@ pub(super) fn message_runtime_snapshot(
         // folded or excluded: every tool the level allows is published.
         tool_tiering: config
             .tool_tiering
-            .at_level(config.autonomy.level)
+            .at_level(config.autonomy.level, config.autonomy.evaluation_sandbox)
             .for_channel_surface(),
     }
 }

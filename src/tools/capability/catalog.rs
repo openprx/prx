@@ -303,8 +303,6 @@ pub(crate) struct CapabilityCatalog {
     by_id: BTreeMap<CapabilityId, usize>,
     by_name: BTreeMap<String, usize>,
     binding_roots: BTreeSet<String>,
-    model_root_slots: BTreeMap<String, Vec<usize>>,
-    model_layout: [u8; 32],
     generation: CatalogGeneration,
     search_index: super::search::SearchIndex,
 }
@@ -315,9 +313,6 @@ pub(crate) struct CatalogView<'a> {
     entries: OnceLock<Vec<&'a CapabilityEntry>>,
     generation: CatalogGeneration,
     by_id: &'a BTreeMap<CapabilityId, usize>,
-    pub(super) model_names: &'a BTreeMap<String, usize>,
-    pub(super) model_root_slots: &'a BTreeMap<String, Vec<usize>>,
-    pub(super) model_layout: [u8; 32],
     pub(super) search_index: &'a super::search::SearchIndex,
     pub(super) all_entries: &'a [CapabilityEntry],
     families: [bool; CapabilityTarget::ALL.len()],
@@ -504,32 +499,20 @@ impl CapabilityCatalog {
         let mut by_id = BTreeMap::new();
         let mut by_name = BTreeMap::new();
         let mut binding_roots = BTreeSet::new();
-        let mut model_root_slots: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-        let mut layout = ring::digest::Context::new(&ring::digest::SHA256);
-        layout.update(b"model-admission-slot-layout-v1");
         for (index, entry) in entries.iter_mut().enumerate() {
             entry.generation = generation;
             by_id.insert(entry.id.clone(), index);
             by_name.insert(entry.public_name.clone(), index);
-            model_root_slots.entry(entry.root.clone()).or_default().push(index);
-            for name in [&entry.public_name, &entry.root] {
-                layout.update(&(name.len() as u64).to_be_bytes());
-                layout.update(name.as_bytes());
-            }
             if entry.binding_digest.is_some() {
                 binding_roots.insert(entry.root.clone());
             }
         }
         let search_index = super::search::SearchIndex::build(&entries);
-        let mut model_layout = [0_u8; 32];
-        model_layout.copy_from_slice(layout.finish().as_ref());
         Self {
             entries,
             by_id,
             by_name,
             binding_roots,
-            model_root_slots,
-            model_layout,
             generation,
             search_index,
         }
@@ -544,9 +527,6 @@ impl CapabilityCatalog {
             surface: None,
             search_index: &self.search_index,
             by_id: &self.by_id,
-            model_names: &self.by_name,
-            model_root_slots: &self.model_root_slots,
-            model_layout: self.model_layout,
             all_entries: &self.entries,
             families: CapabilityTarget::ALL.map(|family| scope.families.is_empty() || scope.families.contains(&family)),
             channel: scope.channel,
@@ -802,24 +782,6 @@ fn verify_child_descriptor(entry: &CapabilityEntry, current: &ToolDescriptor) ->
 }
 
 impl<'a> CatalogView<'a> {
-    pub(crate) const fn model_admission_layout(&self) -> &[u8; 32] {
-        &self.model_layout
-    }
-
-    pub(crate) fn model_admission_entry<'b>(
-        &'b self,
-        entry: &'b CapabilityEntry,
-    ) -> crate::tools::capability::turn_state::model_admission::ModelAdmissionEntry<'b> {
-        crate::tools::capability::turn_state::model_admission::ModelAdmissionEntry {
-            public_name: &entry.public_name,
-            root: &entry.root,
-            generation: self.generation().0,
-            layout: &self.model_layout,
-            public_slot: self.model_names.get(entry.public_name.as_str()).copied(),
-            root_slot: self.model_names.get(entry.root.as_str()).copied(),
-        }
-    }
-
     /// Narrow a view without copying entries, schemas, bindings or the search index.
     pub(crate) const fn with_surface(&self, surface: &'a SurfacePolicy) -> Self {
         Self {
@@ -828,9 +790,6 @@ impl<'a> CatalogView<'a> {
             entries: OnceLock::new(),
             generation: self.generation,
             by_id: self.by_id,
-            model_names: self.model_names,
-            model_root_slots: self.model_root_slots,
-            model_layout: self.model_layout,
             search_index: self.search_index,
             all_entries: self.all_entries,
             families: self.families,

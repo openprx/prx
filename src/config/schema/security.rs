@@ -1,4 +1,4 @@
-use super::{Deserialize, HashMap, JsonSchema, PathBuf, Serialize};
+use super::{Deserialize, JsonSchema, PathBuf, Serialize};
 
 // ── Security Config ─────────────────────────────────────────────────
 
@@ -231,9 +231,6 @@ pub struct ToolTieringConfig {
     /// Defaults to [`DEFAULT_CHANNEL_EXCLUDED_TOOLS`]; set to `[]` to expose the
     /// full operator surface on channels again.
     pub channel_exclude: Vec<String>,
-    /// Optional exact-model tool allowlists. When a model key is present, only
-    /// matching tools from the decision-selected set are exposed.
-    pub model_allowlists: HashMap<String, Vec<String>>,
 }
 
 impl Default for ToolTieringConfig {
@@ -245,7 +242,6 @@ impl Default for ToolTieringConfig {
                 .iter()
                 .map(|name| (*name).to_string())
                 .collect(),
-            model_allowlists: HashMap::new(),
         }
     }
 }
@@ -254,10 +250,9 @@ impl ToolTieringConfig {
     /// The tiering policy an IM channel session runs under.
     ///
     /// `channel_exclude` is folded into `always_exclude` rather than applied as a
-    /// separate stage so that every consumer of this config — capability routing,
-    /// the prompt compilers' `core_dependency_is_available`, and the model
-    /// allowlist intersection — sees one boundary instead of three. An operator
-    /// who re-enables a `channel_exclude` tool through `always_include` keeps
+    /// separate stage so that every consumer of this config — capability routing
+    /// and the prompt compilers' `core_dependency_is_available` — sees the
+    /// same boundary. An operator who re-enables a `channel_exclude` tool through `always_include` keeps
     /// it: such a name is not folded in here, so the default is a default and
     /// not a ceiling. `always_include` never overrides `always_exclude`, which
     /// capability publication applies first on every surface.
@@ -280,16 +275,19 @@ impl ToolTieringConfig {
 
     /// The tiering policy at a turn's level. At Full PRX publishes every tool
     /// the level allows: `always_exclude` and `channel_exclude` are ignored
-    /// and only `always_include` and the model allowlists stay. Below Full
-    /// the configured policy applies unchanged.
+    /// and `always_include` stays. Evaluation sandboxes retain their tool
+    /// exclusions even at Full. Below Full the configured policy is unchanged.
     #[must_use]
-    pub fn at_level(&self, level: crate::security::AutonomyLevel) -> std::borrow::Cow<'_, Self> {
-        if level == crate::security::AutonomyLevel::Full {
+    pub fn at_level(
+        &self,
+        level: crate::security::AutonomyLevel,
+        evaluation_sandbox: bool,
+    ) -> std::borrow::Cow<'_, Self> {
+        if level == crate::security::AutonomyLevel::Full && !evaluation_sandbox {
             std::borrow::Cow::Owned(Self {
                 always_include: self.always_include.clone(),
                 always_exclude: Vec::new(),
                 channel_exclude: Vec::new(),
-                model_allowlists: self.model_allowlists.clone(),
             })
         } else {
             std::borrow::Cow::Borrowed(self)

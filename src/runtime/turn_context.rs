@@ -333,7 +333,6 @@ pub(crate) fn validate_agent_retrieval_provenance(
     model_ref: &str,
     policy_version: &str,
     exclusions: &[Arc<str>],
-    model_admission: Option<&dyn crate::tools::capability::turn_state::model_admission::ModelAdmissionView>,
 ) -> Result<(), TurnOriginMismatch> {
     if trusted.owner_isolated() != proof.owner_isolated()
         || trusted.surface != proof.surface()
@@ -347,8 +346,6 @@ pub(crate) fn validate_agent_retrieval_provenance(
         || trusted.resolved_model.as_ref() != model_ref
         || trusted.policy_version.as_ref() != policy_version
         || trusted.exclusions != exclusions
-        || trusted.model_admission.as_deref().map(|policy| policy.digest())
-            != model_admission.map(|policy| policy.digest())
         || trusted
             .constraints
             .iter()

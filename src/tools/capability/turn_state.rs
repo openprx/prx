@@ -1,7 +1,6 @@
 //! The neutral turn scope shared by execution, recovery and the decision
 //! engine (R15, R52): surface kind, side-effect mode, budgets, delivery
-//! constraints and the trusted parts of a turn, plus the exact-call and
-//! model-admission helpers. Nothing here imports the decision engine.
+//! constraints and the trusted parts of a turn, plus exact-call helpers. Nothing here imports the decision engine.
 
 use std::fmt;
 use std::sync::Arc;
@@ -12,7 +11,6 @@ use serde::{Deserialize, Serialize};
 use crate::tools::capability::contract::CatalogGeneration;
 
 pub(crate) mod exact_calls;
-pub(crate) mod model_admission;
 
 /// The model identifier the builtin reports.
 pub const MODEL_VERSION: &str = "builtin-v4";
@@ -125,9 +123,7 @@ pub(crate) struct TrustedParts {
     pub(crate) surface: TurnSurfaceKind,
     pub(crate) side_effect_mode: SideEffectMode,
     /// Explicit excluded capability names (global, channel, child manifest).
-    /// Exact-model policy has a separate compact commitment below.
     pub(crate) exclusions: Vec<Arc<str>>,
-    pub(crate) model_admission: Option<Arc<dyn model_admission::ModelAdmissionView>>,
     /// Explicit structural user restrictions, as codes.
     pub(crate) constraints: Vec<ConstraintCode>,
     pub(crate) approval_pending: bool,
@@ -150,14 +146,10 @@ impl TrustedParts {
         self.constraints.iter().any(|code| code.as_str() == "owner_isolated")
     }
 
-    pub(crate) fn excludes_entry(&self, entry: model_admission::ModelAdmissionEntry<'_>) -> bool {
+    pub(crate) fn excludes_entry(&self, entry: &super::catalog::CapabilityEntry) -> bool {
         self.exclusions
             .iter()
             .any(|name| name.as_ref() == entry.public_name || name.as_ref() == entry.root)
-            || self
-                .model_admission
-                .as_ref()
-                .is_some_and(|policy| policy.excludes(entry))
     }
 }
 

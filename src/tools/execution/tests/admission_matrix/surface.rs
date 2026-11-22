@@ -16,7 +16,6 @@ fn surface_context(
         service,
         service.current_descriptors(),
         config,
-        "prx_model",
         channel,
         |_| eligible,
     )));
@@ -117,18 +116,6 @@ async fn registered_unpublished_tool_is_denied_outside_surface() {
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
 }
 
-#[tokio::test]
-async fn model_allowlist_excluded_tool_is_refused() {
-    let fixture = fixture();
-    let service = allow_service(&fixture);
-    let mut config = crate::config::ToolTieringConfig::default();
-    config
-        .model_allowlists
-        .insert("prx_model".into(), vec!["project_tool".into()]);
-    let context = surface_context(&service, &config, false, true);
-    assert_refused(&service, &fixture, context, "config_reload").await;
-}
-
 /// `channel_exclude` is folded at publication. The excluded name is never
 /// published, so dispatch is Denied with no backend call and no decision context.
 #[tokio::test]
@@ -189,7 +176,6 @@ async fn production_channel_surface_omits_channel_excluded_tool() {
         publication_policy: &publication_policy,
         tiering: &tiering,
         security: &security,
-        pinned_model: "prx_model",
         channel: true,
         inherited_exclusions: &[],
         sender: "prx_user",

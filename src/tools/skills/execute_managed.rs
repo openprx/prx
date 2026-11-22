@@ -107,7 +107,10 @@ impl SkillExecuteTool {
             excluded: self
                 .config
                 .tool_tiering
-                .at_level(crate::tools::effective_autonomy::call_policy(&self.security).autonomy)
+                .at_level(
+                    crate::tools::effective_autonomy::call_policy(&self.security).autonomy,
+                    self.security.evaluation_sandbox,
+                )
                 .always_exclude
                 .clone(),
             sender: caller("sender"),

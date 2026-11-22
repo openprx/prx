@@ -54,7 +54,6 @@ impl Provider for SurfaceProvider {
 fn decision_free_surface(
     tools: Vec<Box<dyn Tool>>,
     tiering: crate::config::ToolTieringConfig,
-    pinned_model: &str,
     channel: bool,
     tool_calls_allowed: bool,
 ) -> (ToolExecutionService, crate::tools::execution::admission::TurnSurface) {
@@ -77,7 +76,6 @@ fn decision_free_surface(
         publication_policy: &publication_policy,
         tiering: &tiering,
         security: &security,
-        pinned_model,
         channel,
         inherited_exclusions: &[],
         sender: "prx_user",
@@ -166,13 +164,7 @@ async fn model_without_native_tools_gets_no_tool_surface() {
         name: "project_tool".to_owned(),
         execution_order: Arc::clone(&dispatches),
     })];
-    let (service, surface) = decision_free_surface(
-        tools,
-        crate::config::ToolTieringConfig::default(),
-        "prx-local-model",
-        false,
-        false,
-    );
+    let (service, surface) = decision_free_surface(tools, crate::config::ToolTieringConfig::default(), false, false);
     assert!(!surface.contains("project_tool"));
     let specs: Vec<crate::tools::ToolSpec> = service
         .descriptors()
@@ -216,63 +208,6 @@ async fn model_without_native_tools_gets_no_tool_surface() {
     assert_eq!(outcome.status, ToolExecutionStatus::Denied);
     assert_eq!(provider.sends.load(Ordering::SeqCst), 1);
     assert!(dispatches.lock().unwrap().is_empty());
-}
-
-/// A `hint:` route executes a different spelling, but the operator allowlist is
-/// keyed on the model pinned at ingress.
-#[tokio::test]
-async fn hint_routed_turn_applies_the_pinned_model_allowlist() {
-    let workspace = tempfile::tempdir().expect("test workspace");
-    let mut config = workspace_config(workspace.path());
-    config.model_routes = vec![crate::config::ModelRouteConfig {
-        settings: Default::default(),
-        hint: "fast".to_string(),
-        provider: "ollama".to_string(),
-        model: "prx-local-model".to_string(),
-        api_key: None,
-        credential_ref: None,
-    }];
-    // The route destination must verify NativeTools, the same as a pinned turn.
-    config.providers.models.push(
-        serde_json::from_value(serde_json::json!({
-            "provider":"ollama", "model":"prx-local-model", "operations":["chat"], "native_tools":true,
-        }))
-        .expect("fixture route destination descriptor"),
-    );
-    config
-        .tool_tiering
-        .model_allowlists
-        .insert("prx-local-model".into(), vec!["project_tool".into()]);
-    let dispatches = Arc::new(Mutex::new(Vec::new()));
-    let registry = project_tool_registry(&dispatches, &["project_tool", "other_tool"]);
-    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace.path()).expect("test memory"));
-    let admitted = AdmittedTurn::with_model(config, "reply", registry, memory, ("ollama", "hint:fast")).await;
-    let decision = admitted.decision();
-    assert_eq!(decision.proof.model_name(), "hint:fast");
-    assert_eq!(decision.proof.model_binding().pinned_model(), "prx-local-model");
-    assert!(
-        decision.service.model_can_call_tools(decision.proof),
-        "the route destination must verify NativeTools"
-    );
-    let surface = crate::tools::surface_owner::build(crate::tools::surface_owner::SurfaceParts {
-        execution: decision.service.execution(),
-        catalog: decision.service.catalog(),
-        publication_policy: decision.service.publication_policy(),
-        tiering: decision.service.tool_tiering(),
-        security: decision.service.security(),
-        pinned_model: decision.proof.model_binding().pinned_model(),
-        channel: decision.service.channel_surface(),
-        inherited_exclusions: &[],
-        sender: decision.proof.policy_sender(),
-        channel_name: decision.proof.policy_channel(),
-        chat_type: decision.proof.policy_chat_type(),
-        tool_calls_allowed: decision.service.model_can_call_tools(decision.proof),
-    });
-    assert!(surface.contains("project_tool"), "the allowed tool was not published");
-    assert!(
-        !surface.contains("other_tool"),
-        "the hint spelling bypassed the pinned model allowlist"
-    );
 }
 
 // ---------------------------------------------------------------------------

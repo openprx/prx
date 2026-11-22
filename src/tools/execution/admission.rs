@@ -86,7 +86,6 @@ pub(crate) struct TurnSurface {
     published: BTreeSet<String>,
     capability_ids: Arc<BTreeMap<String, String>>,
     exclusions: BTreeSet<String>,
-    model_allowlist: Option<BTreeSet<String>>,
 }
 
 impl TurnSurface {
@@ -97,7 +96,6 @@ impl TurnSurface {
         service: &ToolExecutionService,
         candidates: Vec<ToolDescriptor>,
         config: &ToolTieringConfig,
-        model: &str,
         channel: bool,
         mut eligible: impl FnMut(&ToolDescriptor) -> bool,
     ) -> Self {
@@ -107,16 +105,11 @@ impl TurnSurface {
             config.clone()
         };
         let exclusions: BTreeSet<_> = effective.always_exclude.into_iter().collect();
-        let model_allowlist = config
-            .model_allowlists
-            .get(model)
-            .map(|names| names.iter().cloned().collect());
         let mut surface = Self {
             registry_generation: live_generation(service),
             published: BTreeSet::new(),
             capability_ids: Arc::new(BTreeMap::new()),
             exclusions,
-            model_allowlist,
         };
         if surface.registry_generation.is_none() {
             // Fail closed: without a generation no later call can be proven current.
@@ -127,7 +120,6 @@ impl TurnSurface {
             let name = &descriptor.public_name;
             if surface.exclusions.contains(name)
                 || surface.exclusions.contains(&descriptor.backend_name)
-                || !crate::tools::capability::policy::model_allows_tool_name(model, name, &config.model_allowlists)
                 || !eligible(&descriptor)
             {
                 continue;
@@ -176,9 +168,7 @@ impl TurnSurface {
     }
 
     pub(crate) fn contains(&self, name: &str) -> bool {
-        self.published.contains(name)
-            && !self.exclusions.contains(name)
-            && self.model_allowlist.as_ref().is_none_or(|names| names.contains(name))
+        self.published.contains(name) && !self.exclusions.contains(name)
     }
 }
 

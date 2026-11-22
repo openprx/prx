@@ -107,7 +107,7 @@ pub(crate) fn runtime_dependency_spec(
     anyhow::ensure!(
         entry.generation == trusted.catalog_generation
             && !view.surface_excludes(entry)
-            && !trusted.excludes_entry(view.model_admission_entry(entry))
+            && !trusted.excludes_entry(entry)
             && (trusted.channel.is_none() || entry.channel_eligible)
             && crate::tools::execution::decide_tool_execution(
                 &port.facts().policy,

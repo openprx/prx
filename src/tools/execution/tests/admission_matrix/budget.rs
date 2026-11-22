@@ -57,7 +57,6 @@ async fn pre_invoke_recheck_denies_missing_budget() {
         &service,
         service.current_descriptors(),
         &crate::config::ToolTieringConfig::default(),
-        "prx_model",
         false,
         |_| true,
     )));

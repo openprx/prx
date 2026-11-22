@@ -741,8 +741,7 @@
           "memory_reindex",
           "document_sync",
           "document_ingest"
-        ],
-        "model_allowlists": {}
+        ]
       }
     },
     "tunnel": {
@@ -6071,17 +6070,6 @@
           "items": {
             "type": "string"
           }
-        },
-        "model_allowlists": {
-          "description": "Optional exact-model tool allowlists. When a model key is present, only\nmatching tools from the decision-selected set are exposed.",
-          "type": "object",
-          "additionalProperties": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          },
-          "default": {}
         }
       }
     },

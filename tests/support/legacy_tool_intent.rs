@@ -487,30 +487,7 @@ pub fn select_tools_for_intent<'a>(
 }
 
 #[cfg(test)]
-use crate::tools::capability::policy::{core_dependency_is_available, model_allows_tool_name};
-
-/// Intersect a selected capability surface with its exact-model allowlist.
-///
-/// Keeping this as a second-stage intersection preserves the global
-/// `always_exclude` boundary and prevents a model allowlist from enabling a
-/// capability that selection or operator policy already removed.
-pub fn apply_model_tool_allowlist<'a, S: std::hash::BuildHasher>(
-    selected: Vec<&'a dyn Tool>,
-    model: &str,
-    model_allowlists: &std::collections::HashMap<String, Vec<String>, S>,
-) -> Vec<&'a dyn Tool> {
-    let Some(allowlist) = model_allowlists.get(model) else {
-        return selected;
-    };
-
-    let filtered = selected
-        .into_iter()
-        .filter(|tool| allowlist.iter().any(|name| tool.supports_name(name)))
-        .collect::<Vec<_>>();
-
-    tracing::debug!(model, allowed = ?allowlist, filtered = filtered.len(), "model tool allowlist applied");
-    filtered
-}
+use crate::tools::capability::policy::core_dependency_is_available;
 
 /// Session-scoped, monotonically growing tool exposure.
 ///
@@ -749,48 +726,6 @@ mod tests {
             "chat_profile_update must be visible even when the message has no memory keywords"
         );
         assert_eq!(tools[0].tier(), ToolTier::Core);
-    }
-
-    #[test]
-    fn model_allowlist_intersects_intent_selected_tools() {
-        let tmp = TempDir::new().unwrap();
-        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
-        let tools: Vec<Box<dyn Tool>> = vec![
-            Box::new(ChatProfileUpdateTool::new(
-                Arc::clone(&memory),
-                Arc::new(SecurityPolicy::default()),
-            )),
-            Box::new(crate::tools::ShellTool::new(
-                Arc::new(crate::runtime::NativeRuntime::new()),
-                std::path::PathBuf::from("."),
-            )),
-        ];
-        // `run shell` names no category, so the stateless fallback is what a
-        // gateway/console turn would publish here.
-        let selected = resolve_tools_for_intent(&tools, "run shell", &[], &[], UnroutedToolPolicy::PublishEverything);
-        let allowlists = std::collections::HashMap::from([("small-model".to_string(), vec!["shell".to_string()])]);
-
-        let filtered = apply_model_tool_allowlist(selected, "small-model", &allowlists);
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].name(), "shell");
-
-        let unconfigured =
-            resolve_tools_for_intent(&tools, "run shell", &[], &[], UnroutedToolPolicy::PublishEverything);
-        assert_eq!(
-            apply_model_tool_allowlist(unconfigured, "other-model", &allowlists).len(),
-            2
-        );
-        assert!(model_allows_tool_name("small-model", "shell", &allowlists));
-        assert!(!model_allows_tool_name(
-            "small-model",
-            "chat_profile_update",
-            &allowlists
-        ));
-        assert!(model_allows_tool_name(
-            "other-model",
-            "chat_profile_update",
-            &allowlists
-        ));
     }
 
     struct TieredProbe {
@@ -1083,19 +1018,12 @@ mod tests {
     }
 
     #[test]
-    fn core_dependency_availability_honors_exclusion_and_model_allowlist() {
+    fn core_dependency_availability_honors_exclusion() {
         let mut config = crate::config::ToolTieringConfig::default();
-        assert!(core_dependency_is_available("skill_read", "model", &config));
+        assert!(core_dependency_is_available("skill_read", &config));
 
         config.always_exclude.push("skill_read".to_string());
-        assert!(!core_dependency_is_available("skill_read", "model", &config));
-
-        config.always_exclude.clear();
-        config
-            .model_allowlists
-            .insert("small-model".to_string(), vec!["shell".to_string()]);
-        assert!(!core_dependency_is_available("skill_read", "small-model", &config));
-        assert!(core_dependency_is_available("skill_read", "other-model", &config));
+        assert!(!core_dependency_is_available("skill_read", &config));
     }
 
     /// A request the English keyword table cannot read, but which is

@@ -17,7 +17,7 @@ The turn pipeline runs in this order:
    the system prompt from identity, behavior, channel context and admitted skill
    metadata; enrich the input only from the decision's selected evidence.
 2. Resolve selected tools from the pinned runtime catalog with configuration,
-   model allowlists, runtime availability and exact MCP/WASM definitions.
+   runtime availability and exact MCP/WASM definitions.
 3. Apply runtime middleware, then reapply non-negotiable exposure filters.
 4. Compile the final core and appended-discovery `ToolSpec` lists into
    `CompiledToolContext`. Each list is canonicalized separately. Core names

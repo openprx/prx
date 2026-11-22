@@ -17,17 +17,13 @@ use crate::runtime::decision_accounting::AccountingScope;
 use crate::runtime::turn_publication::TurnRuntimeService;
 use crate::runtime::turn_source::TurnSourceProof;
 use crate::security::decision_id::DecisionId;
-use crate::security::runtime_key::{DecisionKey, KeyDomain};
-use crate::tools::capability::catalog::CatalogView;
+use crate::security::runtime_key::KeyDomain;
 use crate::tools::capability::child::ChildCapabilityManifest;
 use crate::tools::capability::turn_state::{DeliveryConstraints, TrustedParts, TurnBudgets};
 use crate::tools::surface_owner::facts::PublicationFacts;
-use crate::tools::traits::Tool;
 
 pub(super) struct EffectiveAgentExclusions {
     pub(super) names: Vec<Arc<str>>,
-    pub(super) model_admission:
-        Option<Arc<dyn crate::tools::capability::turn_state::model_admission::ModelAdmissionView>>,
 }
 
 impl EffectiveAgentExclusions {
@@ -61,32 +57,16 @@ pub(super) fn turn_level(
 pub(super) fn effective_agent_exclusions(
     level: crate::security::AutonomyLevel,
     config: &crate::config::Config,
-    registry: &[Box<dyn Tool>],
-    catalog: &CatalogView<'_>,
-    model_name: &str,
-    policy_version: &str,
-    key: &DecisionKey,
 ) -> EffectiveAgentExclusions {
     let names: BTreeSet<Arc<str>> = config
         .tool_tiering
-        .at_level(level)
+        .at_level(level, config.autonomy.evaluation_sandbox)
         .always_exclude
         .iter()
         .map(|name| Arc::from(name.as_str()))
         .collect();
-    let model_admission = config.tool_tiering.model_allowlists.get(model_name).map(|allowlist| {
-        crate::tools::capability::model_policy::ModelAdmission::fresh(
-            registry,
-            catalog,
-            model_name,
-            allowlist,
-            policy_version,
-            key,
-        ) as Arc<dyn crate::tools::capability::turn_state::model_admission::ModelAdmissionView>
-    });
     EffectiveAgentExclusions {
         names: names.into_iter().collect(),
-        model_admission,
     }
 }
 
@@ -141,16 +121,8 @@ impl TurnRuntimeService {
             .map_err(AgentDecisionError::PendingApproval)?;
         let catalog = self.catalog_view();
         let model_ref: Arc<str> = Arc::from(format!("{}:{}", model.provider_label(), model.model()));
-        let effective_exclusions = effective_agent_exclusions(
-            turn_level(&self.security, proof),
-            &self.generation.effective,
-            &self.registry,
-            &catalog,
-            model.model(),
-            &self.policy_version,
-            &self.state_key,
-        )
-        .for_source(proof);
+        let effective_exclusions =
+            effective_agent_exclusions(turn_level(&self.security, proof), &self.generation.effective).for_source(proof);
         let g6_slice = budget.budgets.tokens;
         let trusted = TrustedParts {
             workspace_id: Arc::from(proof.workspace_id()),
@@ -176,7 +148,6 @@ impl TurnRuntimeService {
                 }
             },
             exclusions: effective_exclusions.names,
-            model_admission: effective_exclusions.model_admission,
             constraints: {
                 let mut constraints = Vec::new();
                 if proof.owner_isolated() {

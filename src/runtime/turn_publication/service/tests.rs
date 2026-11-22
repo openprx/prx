@@ -25,14 +25,6 @@ fn pinned_policy_version_is_order_independent_and_tracks_policy_changes() {
     first.cost.prices.insert("provider/b".to_string(), b.clone());
     second.cost.prices.insert("provider/b".to_string(), b);
     second.cost.prices.insert("provider/a".to_string(), a);
-    first
-        .tool_tiering
-        .model_allowlists
-        .insert("model/a".to_string(), vec!["tool/b".to_string(), "tool/a".to_string()]);
-    second
-        .tool_tiering
-        .model_allowlists
-        .insert("model/a".to_string(), vec!["tool/a".to_string(), "tool/b".to_string()]);
     let stable = pinned_policy_version(&first, &security, &surface, &key).unwrap();
     assert_eq!(
         stable,

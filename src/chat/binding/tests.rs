@@ -654,7 +654,6 @@ async fn guarded_plan_admission_preserves_mode_and_owned_capture() {
                 &trusted.resolved_model,
                 &trusted.policy_version,
                 &trusted.exclusions,
-                trusted.model_admission.as_deref(),
             )
             .is_ok()
         );
@@ -665,7 +664,6 @@ async fn guarded_plan_admission_preserves_mode_and_owned_capture() {
                 &trusted.resolved_model,
                 &trusted.policy_version,
                 &trusted.exclusions,
-                trusted.model_admission.as_deref(),
             )
             .is_err()
         );

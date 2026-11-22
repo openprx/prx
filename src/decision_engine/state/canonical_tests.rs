@@ -424,38 +424,3 @@ fn canonical_distinguishes_mixed_delivery_and_empty_optionals() {
         );
     }
 }
-
-#[test]
-fn model_admission_canonical_commits_only_digest_and_none_keeps_legacy_bytes() {
-    use crate::tools::capability::catalog::{CapabilityCatalog, CatalogScope, CatalogSources, SurfacePolicy};
-    use crate::tools::capability::model_policy::ModelAdmission;
-    let key = fixtures::key();
-    let catalog =
-        CapabilityCatalog::build(&[], &CatalogSources::default(), &SurfacePolicy::default()).expect("empty catalog");
-    let view = catalog.view(&CatalogScope::default());
-    let policy = ModelAdmission::fresh(&[], &view, "prx-model", &[], "prx-policy", &key);
-    let mut state = canonical_fixture(&key, 3);
-    assert_oracle(&state, &key);
-    let mut parts = state.trusted.parts().clone();
-    parts.model_admission = Some(Arc::clone(&policy) as Arc<dyn super::model_admission::ModelAdmissionView>);
-    state.trusted = TrustedState::from_runtime(parts);
-    let mut expected: serde_json::Value =
-        serde_json::from_str(&legacy_canonical(&state)).expect("old scalar canonical oracle");
-    expected
-        .get_mut("trusted")
-        .expect("trusted object")
-        .as_object_mut()
-        .expect("trusted map")
-        .insert(
-            "model_admission".into(),
-            serde_json::to_value(policy.digest()).expect("fixed digest"),
-        );
-    assert_eq!(
-        state.canonical().expect("test: canonical state serializes"),
-        serde_json::to_string(&expected).expect("oracle canonical JSON")
-    );
-    let mut parts = state.trusted.parts().clone();
-    parts.model_admission = None;
-    state.trusted = TrustedState::from_runtime(parts);
-    assert_oracle(&state, &key);
-}

@@ -684,8 +684,6 @@ The refusal is one error that lists every refused tool with its keyword
 
 - **Every model:** `always_exclude = ["cron", "memory_get", …]` under
   `[tool_tiering]`.
-- **This model only:** a `[tool_tiering.model_allowlists]` entry for the model
-  that lists the tools it may use, without the refused ones.
 - **One MCP alias** (`<prefix>__<server>__<tool>`): `deny_tools = ["<tool>"]`
   under `[mcp.servers.<server>]`. Tiering excludes whole tools, so it cannot
   remove a single alias of the MCP router; `deny_tools` does, for every model.

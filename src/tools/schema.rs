@@ -1421,8 +1421,7 @@ impl std::fmt::Display for ToolSchemaRefusals {
             "{TOOL_SCHEMA_REFUSALS_MARKER}{count} tool(s) for a '{dialect}' endpoint: {listed}. Nothing was sent; \
              the whole request fails closed. Declared by: {source}. To use this endpoint, stop offering these \
              tools to model '{model}': for every model, `always_exclude = [{quoted}]` under `[tool_tiering]`; \
-             for this model only, list the tools it may use in `[tool_tiering.model_allowlists]` \
-             (\"{model}\" = [...]) without these; an MCP alias `<prefix>__<server>__<tool>` is removed with \
+             an MCP alias `<prefix>__<server>__<tool>` is removed with \
              `deny_tools = [\"<tool>\"]` under `[mcp.servers.<server>]`. Sub-agents and session workers do not \
              apply `[tool_tiering]`. If the endpoint does accept root combinators after all, declare \
              `[[providers.tool_dialects]]` provider = \"{provider}\" model = \"{model}\" tool_schema = \"raw\"{fill_in}. \

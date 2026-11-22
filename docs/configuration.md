@@ -8,7 +8,7 @@ engine as owning everything:
 - **Prompt recall** is independent scoped recall (owner, workspace, session). It
   is not selected by the decision engine.
 - **Tool surface** is built by the surface owner: registry ∩ ACL ∩
-  `always_exclude` / channel exclusions ∩ model allowlist ∩ catalog eligibility.
+  `always_exclude` / channel exclusions ∩ catalog eligibility.
   The surface is built even when the advisory engine is off. Authorized search
   stays available when deferred tools exist, including for brief inputs.
 - **Targeted gateway turns** (`[gateway] targeted_agents`, default `false`) use
@@ -156,7 +156,7 @@ and the module-gate family are absorbed on load; they are not live switches.
 | `[security]` | `workspace_hooks` omitted when off |
 | `[compliance.interaction_notice]` | `version = "1"`; default notice text; `applicability = "required"`; `exception_owner`/`exception_reviewed_at` unset |
 | `[compliance.eu_ai_act]` | classification `status = "unclassified"`; `owner`/`assessed_at` unset; `incident_store_path` unset; declaration fields all optional/empty |
-| `[tool_tiering]` | `always_include = []`; `always_exclude = []`; `channel_exclude` the operations/development set; `model_allowlists = {}` |
+| `[tool_tiering]` | `always_include = []`; `always_exclude = []`; `channel_exclude` the operations/development set |
 | `[providers]` | `[providers.ollama] num_ctx` unset. `[[providers.tool_dialects]]`: `provider` required; `model` unset (all models); `tool_schema`/`tool_call` unset (`raw` / `native`). `[[providers.models]]`: `provider` required; `model` unset; `operations`, `native_tools`, `vision_input`, `streaming`, `structured_output`, `tool_schema_dialect`, `tool_call_dialect`, `context_window` all unset. See later sections |
 | `[model_settings.<id>]` | catalog levels and explicit parameters; omitted keys stay with the catalog |
 
@@ -791,13 +791,6 @@ allow_executable_proposals = false
 # [[skills_lifecycle.suites]]
 # skill_id = "release-notes"
 # suite_digest = "<64 lowercase hex digits>"
-
-# Optional exact-model tool allowlists constrain the published surface for
-# that model. Models without an entry keep the ordinary tool set. An empty
-# list deliberately exposes no tools. Quote model names containing `/` or `:`
-# in TOML.
-[tool_tiering.model_allowlists]
-"gemma4-e2b" = ["shell", "file_read", "file_write"]
 
 # `full` has no permission limits: no confirmation prompts, and the native file
 # tools and shell skip `workspace_only` and `forbidden_paths`. Below `full`,

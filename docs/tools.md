@@ -2,7 +2,7 @@
 
 Built-in and dynamically discovered tools are organized by category. The
 provider-visible surface is built by the **surface owner**: registry ∩ ACL ∩
-`always_exclude` / channel exclusions ∩ model allowlist ∩ catalog eligibility.
+`always_exclude` / channel exclusions ∩ catalog eligibility.
 That assembly does not read the advisory decision engine, so a turn still has a
 surface when `[decision_engine] enabled = false`. Runtime health, MCP metadata,
 and the active WASM generation feed the registry. The resulting immutable
@@ -299,12 +299,9 @@ See [Turn gates and evidence](decision-engine.md#turn-gates-and-evidence) and
 
 `always_exclude` removes names from the eligible surface. `always_include`
 prefers direct publication and can restore a default channel exclusion, but it
-does not bypass explicit exclusions, model allowlists, readiness, child scope,
-cost admission or approval. An exact-model `model_allowlists` entry intersects
-the eligible set; an empty list disables tools for that model. Matching follows
-the tool backend's supported names: accepting one alias admits that root's
-published aliases, while explicit exclusions still apply. Each admission and
-execution provenance check reevaluates the current backend support.
+does not bypass explicit exclusions, readiness, child scope, cost admission or approval.
+At Full, ordinary turns ignore `always_exclude` and channel exclusions; evaluation
+sandboxes retain their tool exclusions.
 
 A request in another language does not expose the full registry. The decision
 may select discovery, and admitted AnswerDirectly or Execute turns may expose
@@ -330,7 +327,7 @@ turn in a conversation. Clearing history is not a substitute for revoking an
 approval or closing a live execution scope.
 
 If a tool is missing, check its runtime registration and readiness, explicit
-and channel exclusions, model allowlist, inherited child boundary, then the
+and channel exclusions, inherited child boundary, then the
 current decision and any pending approval. Naming a tool in text is not an
 approval, and `always_include` does not guarantee that a decision selects it.
 For example, the following makes these tools candidates for direct publication
@@ -1927,7 +1924,7 @@ store, and suites cannot offer configuration-management tools.
 
 Model turns retain a snapshot of admitted tool names and schema fingerprints.
 Publication intersects the registered tools with the source ACL, operator and
-channel exclusions, the exact model allowlist, and channel eligibility. Canonical
+channel exclusions and channel eligibility. Canonical
 dispatch denies names outside the published surface before policy or backend
 execution, independently of decision selection. Owner isolation and private
 filesystem owner/workspace matching remain mandatory. A changed live registry,

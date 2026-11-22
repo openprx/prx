@@ -1,6 +1,6 @@
 //! Decision-free model-turn surface construction.
 //!
-//! Registry ∩ ACL ∩ always_exclude/channel exclusions ∩ model allowlist ∩
+//! Registry ∩ ACL ∩ always_exclude/channel exclusions ∩
 //! catalog `channel_eligible`, assembled here so a turn still has a surface
 //! when the decision engine is off. Callers pass the binding, registry, ACL,
 //! config and catalog; this module does not read `TurnRuntimeService`.
@@ -17,7 +17,6 @@ pub(crate) struct SurfaceParts<'a> {
     pub publication_policy: &'a SurfacePolicy,
     pub tiering: &'a ToolTieringConfig,
     pub security: &'a SecurityPolicy,
-    pub pinned_model: &'a str,
     pub channel: bool,
     pub inherited_exclusions: &'a [String],
     pub sender: &'a str,
@@ -28,9 +27,12 @@ pub(crate) struct SurfaceParts<'a> {
 
 pub(crate) fn build(parts: SurfaceParts<'_>) -> TurnSurface {
     // At Full the configured and inherited exclusions are ignored: every
-    // tool the level allows is published (the model allowlist stays).
-    let full = parts.security.autonomy == crate::security::AutonomyLevel::Full;
-    let mut config = parts.tiering.at_level(parts.security.autonomy).into_owned();
+    // tool the level allows is published. Evaluation sandboxes retain exclusions.
+    let full = parts.security.autonomy == crate::security::AutonomyLevel::Full && !parts.security.evaluation_sandbox;
+    let mut config = parts
+        .tiering
+        .at_level(parts.security.autonomy, parts.security.evaluation_sandbox)
+        .into_owned();
     if !full {
         config.always_exclude.extend(parts.inherited_exclusions.iter().cloned());
     }
@@ -54,7 +56,6 @@ pub(crate) fn build(parts: SurfaceParts<'_>) -> TurnSurface {
         parts.execution,
         candidates,
         &config,
-        parts.pinned_model,
         parts.channel && !full,
         |descriptor| {
             parts

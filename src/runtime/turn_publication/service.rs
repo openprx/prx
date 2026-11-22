@@ -229,16 +229,6 @@ pub(in crate::runtime) fn pinned_policy_version(
             )
         })
         .collect();
-    let allowlists: BTreeMap<_, _> = config
-        .tool_tiering
-        .model_allowlists
-        .iter()
-        .map(|(model, names)| {
-            let mut names = names.clone();
-            names.sort();
-            (model, names)
-        })
-        .collect();
     let encoded = serde_json::to_vec(&(
         "cdp-policy-semantics-v1",
         crate::decision_engine::cost_model::LATENCY_DEFAULT_VERSION,
@@ -259,7 +249,6 @@ pub(in crate::runtime) fn pinned_policy_version(
             &config.tool_tiering.always_include,
             &config.tool_tiering.always_exclude,
             &config.tool_tiering.channel_exclude,
-            allowlists,
         ),
         (
             config.cost.daily_limit_usd.to_bits(),

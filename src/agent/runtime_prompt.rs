@@ -88,11 +88,7 @@ fn build_runtime_system_prompt_with(
     native_tools: bool,
 ) -> String {
     let bootstrap_max_chars = if config.agent.compact_context { Some(6000) } else { None };
-    let skills = if crate::tools::capability::policy::core_dependency_is_available(
-        "skill_read",
-        model_name,
-        &config.tool_tiering,
-    ) {
+    let skills = if crate::tools::capability::policy::core_dependency_is_available("skill_read", &config.tool_tiering) {
         skills
     } else {
         &[]

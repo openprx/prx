@@ -71,8 +71,8 @@ impl PublicationRules<'_, '_> {
     }
 
     /// The turn's own scope still matches its facts and catalog: workspace,
-    /// owner and inherited child seal (G1), catalog and model-admission
-    /// generation (G3) and the pinned serving model (G7).
+    /// owner and inherited child seal (G1), catalog generation (G3) and the
+    /// pinned serving model (G7).
     pub(crate) fn turn_scope_admits(&self) -> bool {
         let trusted = self.trusted;
         let generation = self.catalog.generation();
@@ -90,10 +90,6 @@ impl PublicationRules<'_, '_> {
             && child_valid
             && trusted.channel.as_deref().is_none_or(|channel| !channel.is_empty())
             && trusted.catalog_generation == generation
-            && trusted
-                .model_admission
-                .as_ref()
-                .is_none_or(|policy| policy.matches_layout(generation.0, self.catalog.model_admission_layout()))
             && self.facts.model_ref.as_ref() == trusted.resolved_model.as_ref()
             && self.facts.model_can_chat
     }
@@ -196,19 +192,11 @@ impl PublicationRules<'_, '_> {
                 .exclusions
                 .iter()
                 .any(|name| name.as_ref() == entry.public_name || name.as_ref() == entry.root)
-            || trusted.model_admission.as_ref().is_some_and(|policy| {
-                policy.matches_layout(generation.0, self.catalog.model_admission_layout())
-                    && policy.excludes(self.catalog.model_admission_entry(entry))
-            })
             || (trusted.channel.is_some() && !entry.channel_eligible)
         {
             return blocked(2, "excluded");
         }
         if trusted.catalog_generation != generation
-            || trusted
-                .model_admission
-                .as_ref()
-                .is_some_and(|policy| !policy.matches_layout(generation.0, self.catalog.model_admission_layout()))
             || reference.generation != generation
             || entry.generation != generation
             || !self.catalog.contains(&entry.id)

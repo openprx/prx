@@ -784,15 +784,6 @@ impl Config {
             }
         }
 
-        for (model, tools) in &self.tool_tiering.model_allowlists {
-            if model.trim().is_empty() {
-                anyhow::bail!("tool_tiering.model_allowlists model key must not be empty");
-            }
-            if let Some((index, _)) = tools.iter().enumerate().find(|(_, tool)| tool.trim().is_empty()) {
-                anyhow::bail!("tool_tiering.model_allowlists[{model:?}][{index}] must not be empty");
-            }
-        }
-
         self.router.validate()?;
         self.validate_provider_tool_dialects()?;
         self.validate_provider_models()?;

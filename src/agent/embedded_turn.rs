@@ -346,7 +346,6 @@ async fn run_work(
                         publication_policy: service.publication_policy(),
                         tiering: service.tool_tiering(),
                         security: service.security(),
-                        pinned_model: source.model_binding().pinned_model(),
                         channel: service.channel_surface(),
                         inherited_exclusions: &[],
                         sender: source.policy_sender(),

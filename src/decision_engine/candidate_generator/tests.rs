@@ -52,8 +52,6 @@ enum Blocker {
     Surface,
     /// An explicit name/root exclusion of the turn (G2 prefilter).
     Exclusion,
-    /// A matching-layout model admission policy (G2 prefilter).
-    ModelAdmission,
     /// Not channel-eligible on a channel turn (G2 prefilter).
     Channel,
 }
@@ -89,7 +87,7 @@ fn write_tool() -> Vec<Box<dyn Tool>> {
     )))]
 }
 
-/// The ten structural fixtures; 7–10 each have a family and a discovery
+/// Structural fixtures; 7, 8 and 10 each have a family and a discovery
 /// variant. The blocker names the condition the deleted admission probe
 /// annotated; the structural generator ignores it.
 fn ten_fixtures() -> Vec<Fixture> {
@@ -141,12 +139,7 @@ fn ten_fixtures() -> Vec<Fixture> {
             action: CausalActionKind::UseTool,
         },
     ];
-    for (number, blocker) in [
-        (7, Blocker::Surface),
-        (8, Blocker::Exclusion),
-        (9, Blocker::ModelAdmission),
-        (10, Blocker::Channel),
-    ] {
+    for (number, blocker) in [(7, Blocker::Surface), (8, Blocker::Exclusion), (10, Blocker::Channel)] {
         fixtures.push(family(number, blocker));
         fixtures.push(discovery(number, blocker));
     }
@@ -213,17 +206,6 @@ fn with_ten_fixture(
     };
     match fixture.blocker {
         Blocker::Exclusion => trusted.exclusions.push(Arc::from(fixture.target)),
-        Blocker::ModelAdmission => {
-            // An empty allowlist denies every visible entry of this layout.
-            trusted.model_admission = Some(crate::tools::capability::model_policy::ModelAdmission::fresh(
-                &registry,
-                &unrestricted,
-                "prx-model",
-                &[],
-                "prx-policy",
-                &key,
-            ));
-        }
         // Catalog entries are built without `channel_allowed`.
         Blocker::Channel => trusted.channel = Some(Arc::from("terminal")),
         _ => {}

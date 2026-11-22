@@ -546,10 +546,6 @@ max_response_size = 10485760
 provider = "duckduckgo"              # duckduckgo | brave
 # brave_api_key = ""                  # required only for brave
 
-# Optional exact-model tool allowlists (applied after intent tiering)
-# [tool_tiering.model_allowlists]
-# "small-local-model" = ["shell", "file_read"]
-
 [multimodal]
 
 [media]
@@ -573,10 +569,6 @@ max_response_size = 10485760
 [web_search]
 provider = "duckduckgo"               # duckduckgo | brave
 # brave_api_key = ""                   # required only for brave
-
-# Optional exact-model tool allowlists (applied after intent tiering)
-# [tool_tiering.model_allowlists]
-# "small-local-model" = ["shell", "file_read"]
 
 [multimodal]
 # max_image_size_bytes = 20971520

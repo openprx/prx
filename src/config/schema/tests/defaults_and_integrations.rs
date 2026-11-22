@@ -417,31 +417,6 @@ async fn a_selection_names_an_inline_key_or_a_credential_reference() {
 }
 
 #[test]
-async fn config_validates_model_tool_allowlists() {
-    let mut config = Config::default();
-    config
-        .tool_tiering
-        .model_allowlists
-        .insert("gemma4-e2b".into(), vec!["shell".into(), "file_read".into()]);
-    config.validate().expect("a named model and non-empty tools are valid");
-
-    config
-        .tool_tiering
-        .model_allowlists
-        .insert(" ".into(), vec!["shell".into()]);
-    let error = config.validate().unwrap_err().to_string();
-    assert!(error.contains("model key must not be empty"), "{error}");
-
-    config.tool_tiering.model_allowlists.remove(" ");
-    config
-        .tool_tiering
-        .model_allowlists
-        .insert("broken-model".into(), vec!["".into()]);
-    let error = config.validate().unwrap_err().to_string();
-    assert!(error.contains("broken-model"), "{error}");
-}
-
-#[test]
 async fn config_requires_delegate_wildcard_to_be_exclusive() {
     let mut config = Config::default();
     config.agents.insert(

@@ -454,7 +454,6 @@ async fn operator_task_cells(
             publication_policy: service.publication_policy(),
             tiering: service.tool_tiering(),
             security: service.security(),
-            pinned_model: proof.model_binding().pinned_model(),
             channel: service.channel_surface(),
             inherited_exclusions: &[],
             sender: proof.policy_sender(),

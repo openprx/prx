@@ -193,7 +193,7 @@ pub(crate) fn discovery_entries(
                 || matches!(entry.exposure, Exposure::Direct) && (offered_direct.contains(&entry.id) || core))
             && rules.owner_isolation_admits(entry)
             && entry.availability.level >= CapabilityAvailabilityLevel::Configured
-            && !trusted.excludes_entry(view.model_admission_entry(entry))
+            && !trusted.excludes_entry(entry)
             && !rules.restricts_discovery(entry)
             && (trusted.channel.is_none() || entry.channel_eligible)
             && proof
@@ -247,7 +247,7 @@ pub(crate) fn capability_search_spec(
     let trusted = port.trusted();
     let view = port.catalog_view();
     if view.surface_excludes(entry)
-        || trusted.excludes_entry(view.model_admission_entry(entry))
+        || trusted.excludes_entry(entry)
         || (trusted.channel.is_some() && !entry.channel_eligible)
         || matches!(entry.exposure, Exposure::Unavailable { .. })
         || entry.availability.level < CapabilityAvailabilityLevel::Configured

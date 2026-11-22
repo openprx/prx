@@ -45,11 +45,6 @@ impl TurnSurfacePort for TurnSurfaceBinding<'_> {
         let exclusions = super::opening::effective_agent_exclusions(
             super::opening::turn_level(&service.security, proof),
             &service.generation.effective,
-            &service.registry,
-            &catalog,
-            model.model(),
-            &service.policy_version,
-            &service.state_key,
         )
         .for_source(proof);
         super::validate_agent_retrieval_provenance(
@@ -58,7 +53,6 @@ impl TurnSurfacePort for TurnSurfaceBinding<'_> {
             &model_ref,
             &service.policy_version,
             &exclusions.names,
-            exclusions.model_admission.as_deref(),
         )?;
         anyhow::ensure!(
             context.runtime().routing_input.as_str()
