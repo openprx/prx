@@ -800,6 +800,13 @@ impl SessionsSpawnTool {
         .await?;
 
         if mode == "process" {
+            let process_parent_frames = caller.as_ref().and_then(|caller| {
+                let context = caller.context();
+                context
+                    .live_turn
+                    .as_ref()
+                    .map(|live| live.0.frames(&context.envelope, &std::collections::HashSet::new()))
+            });
             let (process_config_dir, process_config_generation) =
                 process_config_source.ok_or_else(|| anyhow::anyhow!("process config source was not resolved"))?;
             let process_provider_selection = if ordinary_publication.is_some() {
@@ -1083,6 +1090,7 @@ impl SessionsSpawnTool {
                                 process_source_launch,
                                 process_batch_id.as_deref(),
                                 process_worker_mailbox.as_ref(),
+                                process_parent_frames,
                                 #[cfg(test)]
                                 test_worker_executable.as_ref(),
                             )

@@ -26,6 +26,7 @@ pub struct StreamHub {
 struct HubState {
     connections: HashMap<String, Arc<StreamQueue>>,
     runs: HashMap<(String, String), bool>,
+    producers: HashMap<(String, String), std::sync::Weak<Producer>>,
 }
 #[derive(Default)]
 pub(crate) struct StreamQueue {
@@ -36,8 +37,25 @@ pub(crate) struct StreamQueue {
 struct QueueState {
     frames: VecDeque<Value>,
     gaps: HashSet<String>,
+    failed: bool,
+}
+impl QueueState {
+    fn gap(&mut self, run: &str) {
+        if self.gaps.len() == CONNECTION_FRAMES && !self.gaps.contains(run) {
+            self.failed = true;
+        } else {
+            self.gaps.insert(run.to_owned());
+        }
+    }
 }
 impl StreamQueue {
+    pub(crate) fn failed(&self) -> bool {
+        self.state.lock().failed
+    }
+    pub(crate) fn pending(&self) -> bool {
+        let state = self.state.lock();
+        state.failed || !state.frames.is_empty() || !state.gaps.is_empty()
+    }
     pub(crate) fn pop(&self) -> Option<Value> {
         let mut state = self.state.lock();
         if let Some(run) = state.gaps.iter().next().cloned() {
@@ -47,7 +65,7 @@ impl StreamQueue {
         state.frames.pop_front()
     }
     fn gap(&self, run: &str) {
-        self.state.lock().gaps.insert(run.to_owned());
+        self.state.lock().gap(run);
         self.notify.notify_one();
     }
     fn push(&self, frame: Value) {
@@ -55,7 +73,7 @@ impl StreamQueue {
         if state.frames.len() == CONNECTION_FRAMES {
             if let Some(old) = state.frames.pop_front() {
                 if let Some(run) = old.get("run_id").and_then(Value::as_str) {
-                    state.gaps.insert(run.to_owned());
+                    state.gap(run);
                 }
             }
         }
@@ -108,6 +126,15 @@ impl StreamHub {
     ) -> Arc<dyn LiveFrameSink> {
         let owner = envelope.resolved_owner_id();
         let run = envelope.run_id.clone().unwrap_or_default();
+        let existing = self
+            .state
+            .lock()
+            .producers
+            .get(&(owner.clone(), run.clone()))
+            .and_then(std::sync::Weak::upgrade);
+        if let Some(producer) = existing {
+            return producer;
+        }
         let mut scope = root.clone();
         if let Some(object) = scope.as_object_mut() {
             object.insert("session".into(), json!(envelope.session_key));
@@ -137,11 +164,19 @@ impl StreamHub {
             rx,
             Arc::clone(&gap),
         ));
-        Arc::new(Producer {
+        let producer = Arc::new(Producer {
             tx,
             gap,
             child: envelope.parent_run_id.is_some(),
-        })
+        });
+        self.state.lock().producers.insert(
+            (
+                envelope.resolved_owner_id(),
+                envelope.run_id.clone().unwrap_or_default(),
+            ),
+            Arc::downgrade(&producer),
+        );
+        producer
     }
 }
 struct Producer {
@@ -214,6 +249,9 @@ async fn coalesce(
 ) {
     let mut buffer = crate::agent::stream_buffer::StreamBoundaryBuffer::new();
     let mut raw_bytes = 0usize;
+    let mut structured = String::new();
+    let mut holding = false;
+    let mut suppress_text = false;
     let mut text = String::new();
     let mut frames = VecDeque::new();
     let mut idx = 0u64;
@@ -226,9 +264,16 @@ async fn coalesce(
                 match value {
                     Some(value) if value.get("kind").and_then(Value::as_str) == Some("delta") => {
                         if let Some(delta) = value.get("text").and_then(Value::as_str) {
+                            if suppress_text || gap.load(Ordering::Relaxed) { suppress_text = true; continue; }
                             raw_bytes = raw_bytes.saturating_add(delta.len());
                             if raw_bytes > RAW_BYTES {
-                                buffer = crate::agent::stream_buffer::StreamBoundaryBuffer::new(); raw_bytes = 0; gap.store(true, Ordering::Relaxed);
+                                buffer = crate::agent::stream_buffer::StreamBoundaryBuffer::new(); structured.clear(); holding = true; suppress_text = true; raw_bytes = 0; gap.store(true, Ordering::Relaxed);
+                            } else if holding || delta.contains(['<','{','[']) {
+                                if !holding {
+                                    if let Some(tail) = buffer.flush_all() { text.push_str(&crate::agent::sanitize::sanitize_stream_chunk(&tail, &tools)); }
+                                    holding = true;
+                                }
+                                structured.push_str(delta);
                             } else if let Some(chunk) = buffer.push(delta) {
                                 raw_bytes = 0;
                                 text.push_str(&crate::agent::sanitize::sanitize_stream_chunk(&chunk, &tools));
@@ -236,27 +281,35 @@ async fn coalesce(
                         }
                     }
                     Some(value) => {
+                        suppress_text = false;
+                        if holding { text.push_str(&crate::agent::sanitize::sanitize_stream_chunk(&structured, &tools)); structured.clear(); holding = false; raw_bytes = 0; }
                         if let Some(tail) = buffer.flush_all() { text.push_str(&crate::agent::sanitize::sanitize_stream_chunk(&tail, &tools)); raw_bytes = 0; }
+                        while !text.is_empty() {
+                            let end = prefix(&text, TEXT_BYTES);
+                            let delta: String = text.drain(..end).collect();
+                            frames.push_back(json!({"kind":"delta","text":delta}));
+                        }
                         frames.push_back(value);
                     }
                     None => {
                         closed = true;
+                        if holding { text.push_str(&crate::agent::sanitize::sanitize_stream_chunk(&structured, &tools)); structured.clear(); holding = false; }
                         if let Some(tail) = buffer.flush_all() { text.push_str(&crate::agent::sanitize::sanitize_stream_chunk(&tail, &tools)); }
                     }
                 }
             }
             _ = tick.tick() => {
-                if gap.swap(false, Ordering::Relaxed) { hub.gap(&owner, &run); buffer = crate::agent::stream_buffer::StreamBoundaryBuffer::new(); raw_bytes = 0; }
+                if gap.swap(false, Ordering::Relaxed) { hub.gap(&owner, &run); buffer = crate::agent::stream_buffer::StreamBoundaryBuffer::new(); structured.clear(); holding = false; suppress_text = true; raw_bytes = 0; }
                 // A short safe text tail is flushed on the pacing boundary too.
-                if raw_bytes > 0 {
+                if raw_bytes > 0 && !holding {
                     if let Some(tail) = buffer.flush_all() { text.push_str(&crate::agent::sanitize::sanitize_stream_chunk(&tail, &tools)); }
                     raw_bytes = 0;
                 }
-                let next = if !text.is_empty() {
+                let next = frames.pop_front().or_else(|| if !text.is_empty() {
                     let end = prefix(&text, TEXT_BYTES);
                     let delta: String = text.drain(..end).collect();
                     Some(json!({"kind":"delta","text":delta}))
-                } else { frames.pop_front() };
+                } else { None });
                 if let Some(frame) = next {
                     if let Some(next_idx) = idx.checked_add(1) {
                         idx = next_idx;
@@ -270,5 +323,7 @@ async fn coalesce(
             }
         }
     }
-    hub.state.lock().runs.remove(&(owner, run));
+    let mut state = hub.state.lock();
+    state.runs.remove(&(owner.clone(), run.clone()));
+    state.producers.remove(&(owner, run));
 }

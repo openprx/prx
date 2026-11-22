@@ -1,4 +1,4 @@
-//! Optional live ingress adapters. Registry entries exist only for live rf roots.
+//! Optional, infallible ingress adapters inherited through trusted child contexts.
 use crate::agent::turn_contracts::ToolLoopEvent;
 use crate::runtime::envelope::RuntimeEnvelope;
 use std::sync::Arc;

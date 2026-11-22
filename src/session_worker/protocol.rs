@@ -387,6 +387,8 @@ pub struct WorkerSegmentTerminal {
 /// Result returned by `session-worker` on stdout.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerResult {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub denials: Vec<super::denials::WorkerDenial>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ordinary_completion: Option<OrdinaryWorkerCompletionEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -665,6 +667,7 @@ mod tests {
     #[test]
     fn worker_result_roundtrip_json() {
         let result = WorkerResult {
+            denials: Vec::new(),
             ordinary_completion: None,
             operator_completion: None,
             success: false,

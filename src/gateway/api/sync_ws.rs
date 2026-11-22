@@ -168,6 +168,7 @@ async fn run(
     let mut missed = 0u8;
     let mut dirty = true;
     let mut pending: Option<Value> = None;
+    let mut replayed = after >= initial.head;
     loop {
         if dirty && window.len() < WINDOW_EVENTS && bytes < WINDOW_BYTES && pending.is_none() {
             let mut page = read(store, owner, after, 1)
@@ -181,6 +182,9 @@ async fn run(
             }
             pending = page.events.pop();
             dirty = pending.is_some();
+            if pending.is_none() {
+                replayed = true;
+            }
         }
         if let Some(event) = pending.as_ref() {
             let size = serde_json::to_vec(event)
@@ -200,7 +204,10 @@ async fn run(
                 tokio::task::yield_now().await;
             }
         }
-        if after >= initial.head {
+        if streams.failed() {
+            return Err((1011, "stream queue exhausted"));
+        }
+        if replayed {
             if let Some(frame) = streams.pop() {
                 send(socket, &frame).await.map_err(|_| (1011, "stream send failed"))?;
             }
@@ -229,8 +236,8 @@ async fn run(
                 send(socket,&json!({"type":"ping"})).await.map_err(|_|(1011,"send failed"))?;missed+=1;dirty=true;
             }
             ()=notify.notified()=>dirty=true,
-            ()=streams.notify.notified(), if after >= initial.head=>{},
-            ()=std::future::ready(()),if ready=>{}
+            ()=streams.notify.notified(), if replayed=>{},
+            ()=std::future::ready(()),if ready || (replayed && streams.pending())=>{}
         }
     }
 }

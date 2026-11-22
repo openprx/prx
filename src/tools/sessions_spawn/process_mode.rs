@@ -55,6 +55,7 @@ impl WorkerUnverifiedFailure {
             .filter(|error| !error.trim().is_empty())
             .unwrap_or_else(|| "the worker reported no error".to_owned());
         ProcessWorkerOutcome::Finished(crate::session_worker::protocol::WorkerResult {
+            denials: Vec::new(),
             ordinary_completion: None,
             operator_completion: None,
             success: false,
@@ -104,6 +105,7 @@ pub(super) async fn run_sub_agent_process(
     source_launch: Option<crate::runtime::operator_spawn::process::ProcessSourceLaunch>,
     batch_id: Option<&str>,
     mailbox: Option<&Arc<dyn crate::session_worker::mailbox_binding::WorkerMailboxFactory>>,
+    parent_frames: Option<Arc<dyn crate::agent::live_frames::LiveFrameSink>>,
     #[cfg(test)] test_worker_executable: Option<&TestWorkerExecutable>,
 ) -> anyhow::Result<ProcessWorkerOutcome> {
     if source_fabric.is_some_and(|fabric| fabric.memory().requires_scoped_execution()) {
@@ -764,6 +766,13 @@ pub(super) async fn run_sub_agent_process(
                     )
                     .await?;
                     verified.confirm_reaped(run_id)?;
+                    if let Some(frames) = &parent_frames {
+                        for denial in &verified.result.denials {
+                            if denial.cause == crate::tools::ApprovalDenialCause::NoResolver {
+                                frames.child_denial(&denial.tool, run_id);
+                            }
+                        }
+                    }
                     Ok(ProcessWorkerOutcome::OrdinaryVerifiedFinished(verified))
                 } else if let Some(generation) = &operator_generation {
                     let mut verified = process_terminal::operator::verify(
@@ -777,6 +786,13 @@ pub(super) async fn run_sub_agent_process(
                     )
                     .await?;
                     verified.confirm_reaped(run_id)?;
+                    if let Some(frames) = &parent_frames {
+                        for denial in &verified.result.denials {
+                            if denial.cause == crate::tools::ApprovalDenialCause::NoResolver {
+                                frames.child_denial(&denial.tool, run_id);
+                            }
+                        }
+                    }
                     Ok(ProcessWorkerOutcome::OperatorVerifiedFinished(verified))
                 } else {
                     anyhow::ensure!(

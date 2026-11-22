@@ -1,4 +1,5 @@
 pub(crate) mod completion;
+pub(crate) mod denials;
 #[cfg(unix)]
 pub(crate) mod manifest_reference;
 pub mod protocol;

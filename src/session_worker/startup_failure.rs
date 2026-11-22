@@ -27,6 +27,7 @@ pub(crate) struct WorkerOutput {
 fn validate_failure(result: &WorkerResult) -> anyhow::Result<()> {
     anyhow::ensure!(
         !result.success
+            && result.denials.is_empty()
             && result.output.is_empty()
             && result.error.as_deref().is_some_and(|error| !error.is_empty())
             && result.tokens_used.is_none()
@@ -86,6 +87,7 @@ impl AuthenticatedStartupFailure {
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(!run_id.is_empty(), "startup failure run identity missing");
         let result = WorkerResult {
+            denials: Vec::new(),
             ordinary_completion: None,
             operator_completion: None,
             success: false,

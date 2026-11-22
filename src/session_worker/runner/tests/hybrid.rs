@@ -251,6 +251,7 @@ async fn hybrid_worker_result_creates_private_draft_and_parent_merge_request() {
         .with_agent_id("agent-a")
         .with_persona_id("persona-a");
     let result = WorkerResult {
+        denials: Vec::new(),
         ordinary_completion: None,
         operator_completion: None,
         success: true,
@@ -404,6 +405,7 @@ async fn hybrid_worker_draft_obeys_readonly_resource_gate() {
         .with_session_key("telegram:chat-1:alice")
         .with_run_id("run-hybrid");
     let result = WorkerResult {
+        denials: Vec::new(),
         ordinary_completion: None,
         operator_completion: None,
         success: true,

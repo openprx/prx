@@ -890,6 +890,7 @@ async fn run_owned_manifest(
         None
     };
 
+    let process_denials = Arc::new(crate::session_worker::denials::DenialSink::default());
     let run_future = boxed_worker_segments(|| async {
         let initial_history = Vec::new();
 
@@ -951,6 +952,7 @@ async fn run_owned_manifest(
             &mut steer_rx,
             &mut mailbox_rx,
             |mut segment_history, cancel, raw_steer| {
+                let process_denials = Arc::clone(&process_denials);
                 let tools_registry = Arc::clone(tools_registry_ref);
                 let memory = Arc::clone(memory_ref);
                 let child_segments = child_segments_ref.clone();
@@ -1048,7 +1050,14 @@ async fn run_owned_manifest(
                     // returns no advice without constructing anything.
                     let routing = admitted_turn.routing();
                     let advice = routing.service.advisory().analyze_turn(routing.runtime, &cancel).await;
-                    let adapter = child_turn.as_ref().map(|turn| turn.adapter());
+                    let adapter = child_turn.as_ref().map(|turn| {
+                        let mut adapter = turn.adapter();
+                        adapter.live_frames =
+                            Some(Arc::clone(&process_denials) as Arc<dyn crate::agent::live_frames::LiveFrameSink>);
+                        adapter.tool_execution_context.approval_ledger = None;
+                        adapter.tool_execution_context.pending_approval_denied = true;
+                        adapter
+                    });
                     let child_execution = adapter.as_ref().map(|adapter| adapter.tool_execution_context.clone());
                     let child_scope = child_execution.as_ref().map(|context| {
                         let envelope = &context.envelope;
@@ -1162,6 +1171,7 @@ async fn run_owned_manifest(
             let tokens_used = trace.tokens_used;
             (
                 WorkerResult {
+                    denials: Vec::new(),
                     ordinary_completion: None,
                     operator_completion: None,
                     success: true,
@@ -1178,6 +1188,7 @@ async fn run_owned_manifest(
         }
         Err(error) => (
             WorkerResult {
+                denials: Vec::new(),
                 ordinary_completion: None,
                 operator_completion: None,
                 success: false,
@@ -1193,6 +1204,7 @@ async fn run_owned_manifest(
         ),
     };
 
+    worker_result.denials = process_denials.take()?;
     if let Some(segments) = child_segments.as_ref() {
         let recorded = segments.recorded_count().await;
         let confirmed = u64::try_from(segments.completion.usage.confirmed_count())?;

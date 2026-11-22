@@ -159,6 +159,7 @@ pub async fn run_from_stdin(
         Ok(value) => value,
         Err(error) => {
             let result = WorkerResult {
+                denials: Vec::new(),
                 ordinary_completion: None,
                 operator_completion: None,
                 success: false,
@@ -185,6 +186,7 @@ pub async fn run_from_stdin(
         explicit_config_dir.as_deref(),
     ) {
         let result = WorkerResult {
+            denials: Vec::new(),
             ordinary_completion: None,
             operator_completion: None,
             success: false,
@@ -203,6 +205,7 @@ pub async fn run_from_stdin(
                 return write_worker_result(failure.envelope());
             }
             WorkerResult {
+                denials: Vec::new(),
                 ordinary_completion: None,
                 operator_completion: None,
                 success: false,
