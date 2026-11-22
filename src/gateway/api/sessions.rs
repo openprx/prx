@@ -2384,7 +2384,12 @@ async fn run_console_message_job_work(
                     terminal_guard
                         .finish_failure(&error, cancellation.is_cancelled())
                         .await
-                        .map_err(|_| "Console terminal cleanup persistence is unconfirmed".to_owned())?;
+                        .map_err(|_| {
+                            format!(
+                                "Console terminal cleanup persistence is unconfirmed ({})",
+                                terminal_guard.failure_reason()
+                            )
+                        })?;
                 }
                 if let Some(tools) = crate::providers::tool_schema_refused_tools(&error) {
                     // A configuration problem, not a failed job: the caller
@@ -2421,7 +2426,12 @@ async fn run_console_message_job_work(
                 terminal_guard
                     .finish_error(&anyhow::anyhow!("Console assistant persistence authorization denied"))
                     .await
-                    .map_err(|_| "Console terminal cleanup persistence is unconfirmed".to_owned())?;
+                    .map_err(|_| {
+                        format!(
+                            "Console terminal cleanup persistence is unconfirmed ({})",
+                            terminal_guard.failure_reason()
+                        )
+                    })?;
             }
             return Ok(jobs::JobOutput::new(status, body.0));
         }
@@ -2474,8 +2484,13 @@ async fn run_console_message_job_work(
         {
             Ok(receipt) => receipt,
             Err(error) => {
-                tracing::warn!(error = %error, "Failed to commit shared console terminal event");
-                return Err("Console terminal persistence is unconfirmed".to_owned());
+                let reason = terminal_guard.failure_reason();
+                tracing::warn!(
+                    reason,
+                    error = %crate::agent::diagnostics::error_class(&error),
+                    "Failed to commit shared console terminal event"
+                );
+                return Err(format!("Console terminal persistence is unconfirmed ({reason})"));
             }
         };
 
@@ -2528,7 +2543,12 @@ async fn run_console_message_job_work(
         terminal_guard
             .finish_failure(&anyhow::anyhow!(error.clone()), cancellation.is_cancelled())
             .await
-            .map_err(|_| "Console terminal cleanup persistence is unconfirmed".to_owned())?;
+            .map_err(|_| {
+                format!(
+                    "Console terminal cleanup persistence is unconfirmed ({})",
+                    terminal_guard.failure_reason()
+                )
+            })?;
     }
     result
 }

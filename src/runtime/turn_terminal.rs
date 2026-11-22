@@ -316,6 +316,97 @@ pub(crate) struct TurnTerminalGuard {
 struct TerminalState {
     pending: Option<crate::agent::terminal::TurnTerminalDraft>,
     finished: bool,
+    /// The reason code of the last failed flush.
+    failure: Option<&'static str>,
+}
+
+/// The persistence step of a terminal, in the order the steps run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalPersistStep {
+    AuxiliaryReceipt,
+    ChildCleanup,
+    TerminalCommit,
+    UsageRecord,
+}
+
+/// A terminal that could not be persisted: the step that failed and its
+/// error. The error text may quote stored input, so only [`Self::reason`]
+/// leaves the process in a job error or a log line.
+struct TerminalPersistFailure {
+    step: TerminalPersistStep,
+    error: anyhow::Error,
+}
+
+impl TerminalPersistFailure {
+    /// The reason of a failure that happened before any persistence step.
+    const UNCLASSIFIED: &'static str = "terminal_persistence_failed";
+
+    /// The closed reason code: the failed step, or the refused recovery key
+    /// whatever step met it.
+    fn reason(&self) -> &'static str {
+        if self
+            .error
+            .downcast_ref::<crate::memory::recovery_authority::RecoveryKeyUnavailable>()
+            .is_some()
+        {
+            return "recovery_key_unavailable";
+        }
+        match self.step {
+            TerminalPersistStep::AuxiliaryReceipt => "auxiliary_receipt_failed",
+            TerminalPersistStep::ChildCleanup => "child_cleanup_incomplete",
+            TerminalPersistStep::TerminalCommit => "terminal_commit_failed",
+            TerminalPersistStep::UsageRecord => "usage_record_failed",
+        }
+    }
+}
+
+/// The single persistence sequence of a terminal, shared by the guard's
+/// flush and its interrupted cleanup: auxiliary receipts, descendant drain,
+/// the canonical terminal commit, then the segment usage record.
+async fn persist_terminal(
+    auxiliary_calls: &[Arc<super::auxiliary_call::AuxiliaryProviderCall>],
+    child_cleanup: Option<&ChildCleanupBarrier>,
+    fabric: &crate::memory::MemoryFabric,
+    config: &crate::config::Config,
+    mut proposal: crate::agent::terminal::TurnTerminalDraft,
+    usage: Option<(
+        &TerminalUsageCollector,
+        &crate::runtime::turn_context::OpenedTurn,
+        &crate::runtime::envelope::RuntimeEnvelope,
+    )>,
+) -> Result<crate::agent::terminal::TurnTerminalReceipt, TerminalPersistFailure> {
+    persist_auxiliary_replies(auxiliary_calls, fabric, config, &mut proposal)
+        .await
+        .map_err(|error| TerminalPersistFailure {
+            step: TerminalPersistStep::AuxiliaryReceipt,
+            error,
+        })?;
+    // Settling a completed auxiliary call does not assert parent or child
+    // completion. Preserve its known cost even when descendant drain fails.
+    if let Some(cleanup) = child_cleanup {
+        cleanup.wait().await.map_err(|error| TerminalPersistFailure {
+            step: TerminalPersistStep::ChildCleanup,
+            error,
+        })?;
+    }
+    // Keep the canonical writer in its existing owner, with a bounded
+    // heap await state rather than adding another terminal task owner.
+    let receipt = Box::pin(finalize_terminal(fabric, config, proposal))
+        .await
+        .map_err(|error| TerminalPersistFailure {
+            step: TerminalPersistStep::TerminalCommit,
+            error,
+        })?;
+    if let Some((collector, context, envelope)) = usage {
+        collector
+            .record_with_recovery(&receipt, context, envelope)
+            .await
+            .map_err(|error| TerminalPersistFailure {
+                step: TerminalPersistStep::UsageRecord,
+                error,
+            })?;
+    }
+    Ok(receipt)
 }
 
 impl TurnTerminalGuard {
@@ -475,30 +566,45 @@ impl TurnTerminalGuard {
             self.cleanup_ticket.as_ref(),
             super::turn_cleanup::diagnostic::StageName::TerminalFlush,
         );
-        let mut proposal = self
+        let proposal = self
             .state
             .lock()
             .pending
             .clone()
             .ok_or_else(|| anyhow::anyhow!("runtime terminal proposal missing"))?;
-        persist_auxiliary_replies(&self.auxiliary_calls, &self.fabric, &self.config, &mut proposal).await?;
-        // Settling a completed auxiliary call does not assert parent or child
-        // completion. Preserve its known cost even when descendant drain fails.
-        if let Some(cleanup) = &self.child_cleanup {
-            cleanup.wait().await?;
-        }
-        // Keep the canonical writer in its existing owner, with a bounded
-        // heap await state rather than adding another terminal task owner.
-        let receipt = Box::pin(finalize_terminal(&self.fabric, &self.config, proposal)).await?;
-        if let Some(collector) = &self.usage_collector {
-            collector
-                .record_with_recovery(&receipt, &self.context, &self.envelope)
-                .await?;
-        }
+        let usage = self
+            .usage_collector
+            .as_deref()
+            .map(|collector| (collector, self.context.as_ref(), &self.envelope));
+        let receipt = match Box::pin(persist_terminal(
+            &self.auxiliary_calls,
+            self.child_cleanup.as_deref(),
+            &self.fabric,
+            &self.config,
+            proposal,
+            usage,
+        ))
+        .await
+        {
+            Ok(receipt) => receipt,
+            Err(failure) => {
+                self.state.lock().failure = Some(failure.reason());
+                return Err(failure.error);
+            }
+        };
         self.state.lock().finished = true;
         #[cfg(test)]
         stage.finish();
         Ok(receipt)
+    }
+
+    /// The closed reason code of the last failed persistence of this
+    /// terminal, for a payload-free job error or log line.
+    pub(crate) fn failure_reason(&self) -> &'static str {
+        self.state
+            .lock()
+            .failure
+            .unwrap_or(TerminalPersistFailure::UNCLASSIFIED)
     }
 
     pub(crate) async fn finish_error(&self, error: &anyhow::Error) -> anyhow::Result<()> {
@@ -735,7 +841,7 @@ impl Drop for TurnTerminalGuard {
             return;
         }
         let pending = state.pending.take();
-        let mut proposal = pending.unwrap_or_else(|| {
+        let proposal = pending.unwrap_or_else(|| {
             self.abort_commit(
                 if std::thread::panicking() {
                     crate::agent::terminal::TurnTerminalStatus::Failed
@@ -764,20 +870,18 @@ impl Drop for TurnTerminalGuard {
                         cleanup_ticket.as_ref(),
                         super::turn_cleanup::diagnostic::StageName::TerminalDropFinalize,
                     );
-                    let result = async {
-                        persist_auxiliary_replies(&auxiliary_calls, &fabric, &config, &mut proposal).await?;
-                        if let Some(cleanup) = child_cleanup {
-                            cleanup.wait().await?;
-                        }
-                        let receipt = finalize_terminal(&fabric, &config, proposal).await?;
-                        if let Some(collector) = &usage_collector {
-                            let envelope = observation_envelope
-                                .as_ref()
-                                .ok_or_else(|| anyhow::anyhow!("segment observation envelope missing"))?;
-                            collector.record_with_recovery(&receipt, &context, envelope).await?;
-                        }
-                        Ok::<_, anyhow::Error>(receipt)
-                    }
+                    let usage = usage_collector
+                        .as_deref()
+                        .zip(observation_envelope.as_ref())
+                        .map(|(collector, envelope)| (collector, context.as_ref(), envelope));
+                    let result = Box::pin(persist_terminal(
+                        &auxiliary_calls,
+                        child_cleanup.as_deref(),
+                        &fabric,
+                        &config,
+                        proposal,
+                        usage,
+                    ))
                     .await;
                     #[cfg(test)]
                     if result.is_ok() {
@@ -785,18 +889,20 @@ impl Drop for TurnTerminalGuard {
                     } else {
                         drop(stage);
                     }
-                    if let Err(error) = &result {
-                        tracing::error!(error = %crate::agent::diagnostics::error_class(error), "Runtime interrupted terminal cleanup remains incomplete");
-                    }
+                    let result = result.map(|_| ()).map_err(|failure| {
+                        let reason = failure.reason();
+                        tracing::error!(
+                            reason,
+                            error = %crate::agent::diagnostics::error_class(&failure.error),
+                            "Runtime interrupted terminal cleanup remains incomplete"
+                        );
+                        format!("terminal cleanup persistence failed ({reason})")
+                    });
                     if let Some(ticket) = cleanup_ticket {
                         ticket.finish(result.is_ok());
                     }
                     if let Some(ack) = cleanup_ack {
-                        let _ = ack.send(
-                            result
-                                .map(|_| ())
-                                .map_err(|_| "terminal cleanup persistence failed".to_owned()),
-                        );
+                        let _ = ack.send(result);
                     }
                 };
                 #[cfg(test)]
