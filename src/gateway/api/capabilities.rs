@@ -36,7 +36,7 @@ use std::borrow::Cow;
 
 /// The tokens effective in this running daemon, sorted ascending. A token is
 /// listed only when its whole earliest usable form is on main.
-const CAPABILITY_TOKENS: [&str; 14] = [
+const CAPABILITY_TOKENS: [&str; 16] = [
     "agent_catalog_v1",
     "agent_crud_v1",
     "agent_limits_v1",
@@ -51,6 +51,8 @@ const CAPABILITY_TOKENS: [&str; 14] = [
     "message_target_v1",
     "owner_id_stable_v1",
     "session_key_v1",
+    "sync_snapshot_v1",
+    "sync_ws_v1",
 ];
 
 /// Tokens effective only while `gateway.targeted_agents` is on in this
@@ -68,6 +70,11 @@ fn advertised_tokens(state: &AppState) -> (Vec<&'static str>, Vec<&'static str>)
         capabilities.sort_unstable();
     } else {
         available.push(TARGETED_AGENTS_TOKEN);
+    }
+    if state.mem.sync_store().is_none() {
+        capabilities.retain(|token| !matches!(*token, "sync_snapshot_v1" | "sync_ws_v1"));
+        available.extend(["sync_snapshot_v1", "sync_ws_v1"]);
+        available.sort_unstable();
     }
     (capabilities, available)
 }
@@ -94,6 +101,8 @@ const CREDENTIAL_QUERY_KEYS: [&str; 6] = ["access_token", "api_key", "auth", "au
 
 #[derive(Serialize)]
 struct CapabilitiesBody {
+    engine: &'static str,
+    engine_instance_id: String,
     prx_version: &'static str,
     commit: &'static str,
     api: u32,
@@ -238,7 +247,12 @@ pub(super) async fn guard(State(state): State<AppState>, mut request: Request, n
         && pairs
             .iter()
             .all(|(key, value)| key == CONFIRM_QUERY_KEY && (value == "true" || value == "false"));
-    if !pairs.is_empty() && !confirm_only {
+    let snapshot_query = request.method() == Method::GET
+        && request.uri().path().ends_with("/sync/snapshot")
+        && pairs
+            .iter()
+            .all(|(key, _)| matches!(key.as_str(), "page_token" | "limit"));
+    if !pairs.is_empty() && !confirm_only && !snapshot_query {
         return coded_error(
             StatusCode::BAD_REQUEST,
             "field_invalid",
@@ -343,8 +357,17 @@ pub(super) fn method_not_allowed_allowing(allow: &'static str) -> Response {
 /// `GET /api/capabilities`: the PRX version and commit, and the tokens
 /// effective in this running daemon and those only available in this build.
 pub(super) async fn get_capabilities(State(state): State<AppState>) -> Response {
+    let Some(owner) = state.pairing.install_owner() else {
+        return coded_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage_unavailable",
+            "install owner identity unavailable",
+        );
+    };
     let (capabilities, available) = advertised_tokens(&state);
     Json(CapabilitiesBody {
+        engine: "prx",
+        engine_instance_id: owner.as_str().to_owned(),
         prx_version: PRX_VERSION,
         commit: PRX_COMMIT,
         api: CAPABILITIES_API,

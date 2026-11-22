@@ -188,6 +188,10 @@ const SQLITE_SEPARATE_MODULES: &[&str] = &[
     "rf_forget.rs",
     // AC-1b2a rf message attempt rows; SQL on connections the backend passes in, opens nothing.
     "rf_messages.rs",
+    "sync_journal.rs",
+    "sync_projection.rs",
+    "sync_snapshot.rs",
+    "sync_lifecycle.rs",
     "router_history.rs",
     "router_learning.rs",
     // W1 content-free write log; SQL on transactions the backend passes in, opens nothing.

@@ -523,8 +523,8 @@ pairing off the listing is unchanged.
 | `message_idempotency_v1` | The message route deduplicates by an idempotency key, with the replay response, the restart rule and 7-day key retention; cancel by run id; job cancel of an rf run's job answers a coded `404 job_unknown` once PRX no longer knows the job, while a job id PRX never issued keeps the legacy uncoded `404` (see Cancel under Message idempotency) | advertised (AC-1b2a) |
 | `message_delete_v1` | A message, one run's reply, or a batch of messages can be deleted as tombstones; a deleted key replays `409 message_deleted` (see Message delete) | advertised (AC-1b2b) |
 | `message_forget_writes_v1` | The three delete routes take `"forget_writes": true` and also forget the memories and documents the deleted runs wrote, with counts (see Message delete) | advertised (W2) |
-| `sync_snapshot_v1` | `GET /api/sync/snapshot` returns the owner's sessions and turns; an expired cursor gets `410 snapshot_expired` | not yet |
-| `sync_ws_v1` | `GET /api/sync/ws` carries the durable journal kinds with hello, welcome, ack and cursor resume, the root and parent link fields, `turn.failed{prx_restart,retryable:true}` journaled at start, the config-changed startup check and every C§4 close | not yet |
+| `sync_snapshot_v1` | `GET /api/sync/snapshot` returns a consistent paged inventory; expired page tokens get `410 snapshot_expired` | advertised (SQLite) |
+| `sync_ws_v1` | `GET /api/sync/ws` carries the durable journal kinds with hello, welcome, ack and cursor resume, the root and parent link fields, `turn.failed{prx_restart,retryable:true}` journaled at start, the config-changed startup check and every C§4 close | advertised (SQLite) |
 | `stream_frames_v1` | Turns stream `stream` frames with `delta` and `tool_status`, a per-run index and `stream_gap` | not yet |
 | `run_approvals_v1` | Pending tool approvals can be approved and continued, including child-run approvals keyed by the root session, with `cancelled` and `cause` | not yet |
 | `history_erase_v1` | An agent's history can be erased through the erase route, which returns a receipt | advertised (RF-UNIT-A) |
@@ -601,3 +601,74 @@ Purge is never implicit in agent DELETE. The receipt is permanent and an
 already purged agent returns it under any later key without doing work.
 Keys are retained at least seven days; the same key with another agent name
 returns `409 idempotency_conflict`.
+
+
+### Sync snapshot and durable WebSocket (B1)
+
+`GET /api/capabilities` also returns `engine:"prx"` and
+`engine_instance_id`, the same stable install owner id as `GET /api/owner`.
+Consumers namespace engine-local ids by that pair. SQLite backends advertise
+`sync_snapshot_v1` and `sync_ws_v1`; other backends list them in `available`.
+B1 does not advertise `stream_frames_v1` or `run_approvals_v1`.
+
+Both sync routes require a paired Authorization bearer. Cookies and URL
+credentials grant no sync access. They sit outside the ordinary API minute
+limiter. Only snapshot accepts `page_token` and `limit` query parameters.
+Invalid queries use `400 field_invalid`; unsupported backends use the coded
+`storage_unavailable` error.
+
+Snapshot returns `{epoch,cursor,snapshot_id,rows:[{kind,key,payload}],next}`.
+**This shape supersedes the C section 4 `{sessions,agents}` sketch.** Rows are
+ordered session, agent, child_session, approval, erase_receipt, turn. Turn
+payloads use exactly the message ids returned by the messages/history route.
+A first page fixes the journal head and message-event high-water mark in one
+SQLite transaction and materializes content-free inventory references. Later
+pages preserve that cut, projecting payloads from their sources; deletion or
+erasure projects a tombstone instead of stale plaintext. Each page has 1 to
+500 rows (default 500), an owner-bound opaque `next` token, and one stable
+snapshot id/cursor. Tokens expire ten minutes after the last page read:
+`410 snapshot_expired` requires a new snapshot. At most two valid cuts per
+owner are retained; a third returns `429 rate_limited`.
+
+WebSocket hello is `{"type":"hello","proto":1,"cursor":null}` or a saved
+`"<epoch>:<seq>"` cursor. Null starts at the retained journal's beginning.
+Welcome is `{type:"welcome",epoch,head_seq}`; events replay in sequence before
+live delivery. The install epoch is 32 lowercase hex characters and survives
+restart. Headers retain owner scope and stable identity; the four descendant
+fields `parent_session,parent_run_id,root_session,root_run_id` are all present
+or all absent. A root's fields are absent; descendants carry the root agent's
+incarnation and retain their own session/run. User messages from both delivery
+modes and authoritative final assistant messages are `turn.appended`; tool,
+reasoning and intermediate assistant content are excluded.
+
+The journal stores headers/source references only, atomically with each source
+write, and retains fourteen days. Erased sources are content-free tombstones.
+The server pauses reads at 256 unacknowledged events or 4 MiB encoded bytes;
+ACKs above the last sent sequence close 1008. Durable events are never dropped.
+Server frames are at most 1 MiB; larger message payloads carry
+`{message_id,oversized:true,bytes}` and must be fetched over messages/history.
+Client frames are bounded to 4 KiB before JSON decode. Only hello, ack and JSON
+pong are accepted. JSON ping is sent every fifteen seconds; two unanswered
+ping windows close 4408. A full ACK window has no separate timeout.
+
+Close codes: 4001 `superseded` when a new owner connection replaces the old;
+4410 after `resync_required{epoch}` for a mismatched epoch or expired cursor
+(no welcome first); 1008 for malformed grammar, second hello or a missing
+hello after ten seconds; 1009 for oversized client frames; 1001 on shutdown;
+1011 for journal errors. Failed upgrade authentication is HTTP
+`401 auth_failed`. Reconnect from the last durably committed ACK, and use a
+fresh snapshot after 4410. Pending runs proven orphaned by their ingress
+lifetime are interrupted before serving, once, with
+`turn.failed{reason:"prx_restart",retryable:true}`; their outstanding approvals
+receive `approval.decided{decision:"cancelled"}`. PRX never reruns their input.
+Config finalize writes revision events; startup repairs missed publications.
+
+`history.erased.counts` for history erase is that operation's own per-store
+unsigned row counts, including sorted zero-valued store entries. Purge emits
+one event per purged incarnation. Every such event has the same `erase_id`
+(the purge receipt id), `scope:"agent"`, its own `incarnation`, and the
+**unchanged operation-wide purge receipt counts**. Consumers deduplicate
+counts by `erase_id`; never sum the repeated map across incarnation events.
+Receipt inventory survives journal retention. Config and erase payloads carry
+only identity/revision/status/count metadata; journal and snapshot reference
+rows carry no message text, reasoning, tool arguments or credentials.
