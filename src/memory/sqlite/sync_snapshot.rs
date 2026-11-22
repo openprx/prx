@@ -238,6 +238,12 @@ pub(super) fn page(
         |r| r.get(0),
     )?;
     let next = more.then(|| format!("{id}:{last}"));
+    if !more {
+        // The final page owns its projected rows; no outstanding page needs
+        // this cut or its owner slot after this transaction commits.
+        tx.execute("DELETE FROM sync_snapshot_rows WHERE snapshot_id=?1", [&id])?;
+        tx.execute("DELETE FROM sync_snapshots WHERE id=?1", [&id])?;
+    }
     tx.commit()?;
     Ok(SnapshotPage {
         cursor: format!("{epoch}:{head}"),

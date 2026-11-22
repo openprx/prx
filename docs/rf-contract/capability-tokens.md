@@ -624,8 +624,11 @@ pages preserve that cut, projecting payloads from their sources; deletion or
 erasure projects a tombstone instead of stale plaintext. Each page has 1 to
 500 rows (default 500), an owner-bound opaque `next` token, and one stable
 snapshot id/cursor. Tokens expire ten minutes after the last page read:
-`410 snapshot_expired` requires a new snapshot. At most two valid cuts per
-owner are retained; a third returns `429 rate_limited`.
+`410 snapshot_expired` requires a new snapshot. At most two cuts with pages
+outstanding are retained per owner; a third returns `429 rate_limited`.
+Serving the final page (no `next`) immediately releases that cut and its slot
+in the same transaction, including an empty or single-page snapshot. Tokens
+for a drained cut are no longer valid.
 
 After erasure, a fresh snapshot may omit erased turn rows. It still inventories
 an `erase_receipt` for each completed history erase, including receipts within
