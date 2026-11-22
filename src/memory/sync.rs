@@ -8,6 +8,10 @@ use tokio_util::sync::CancellationToken;
 /// Resource and cursor failures exposed by the sync routes.
 #[derive(Debug, thiserror::Error)]
 pub enum SyncError {
+    #[error("sync storage unavailable")]
+    Storage,
+    #[error("invalid sync source or header identity")]
+    InvalidSource,
     #[error("the snapshot page token expired")]
     SnapshotExpired,
     #[error("two snapshots are already active")]
@@ -50,8 +54,8 @@ pub trait SyncStore: Send + Sync {
     fn disconnect(&self, owner: &str, connection: &Arc<CancellationToken>);
     fn journal(&self, owner: &str, after: i64, limit: usize) -> anyhow::Result<JournalPage>;
     fn snapshot(&self, owner: &str, token: Option<&str>, limit: usize) -> anyhow::Result<SnapshotPage>;
-    fn configure(&self, workspace: &str, owner: &str, config: &crate::config::Config) -> anyhow::Result<()>;
-    fn refresh_config(&self, config: &crate::config::Config) -> anyhow::Result<()>;
+    fn configure(&self, workspace: &str, owner: &str) -> anyhow::Result<()>;
+    fn refresh_config(&self, config: &crate::config::Config, revision: &str) -> anyhow::Result<()>;
     fn restart_candidates(&self, after: &str) -> anyhow::Result<Vec<RestartCandidate>>;
-    fn shutdown(&self);
+    fn shutdown_signal(&self) -> CancellationToken;
 }

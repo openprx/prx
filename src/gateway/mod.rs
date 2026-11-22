@@ -1313,7 +1313,8 @@ impl crate::config::PreparedConfigGeneration for PreparedGatewayTurnRuntime {
     }
 
     fn finalize(&mut self) {
-        self.agents.finalize();
+        self.agents
+            .finalize(&self.generation.config_generation().source_revision.fingerprint_sha256);
     }
 }
 
@@ -2328,6 +2329,7 @@ async fn run_gateway_inner(
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE));
 
+    api::sync_startup::startup(&state, &shutdown).await?;
     let api_routes = api::router(state.clone()).layer(RequestBodyLimitLayer::new(MAX_API_BODY_SIZE));
 
     // Build router with middleware

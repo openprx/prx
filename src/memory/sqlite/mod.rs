@@ -26,6 +26,7 @@ mod rf_delete;
 mod rf_forget;
 mod rf_messages;
 mod sync_journal;
+mod sync_lifecycle;
 mod sync_projection;
 mod sync_snapshot;
 mod write_log;
@@ -449,7 +450,7 @@ impl SqliteMemory {
             ),
         }
 
-        let sync_runtime = Arc::new(sync_journal::Runtime::default());
+        let sync_runtime = sync_journal::for_database(&db_path)?;
         sync_journal::install_notify(&mut pool.write(), &sync_runtime)?;
         Ok(Self {
             sync_runtime,

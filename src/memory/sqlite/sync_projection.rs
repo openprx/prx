@@ -13,32 +13,97 @@ pub(super) fn event(conn: &Connection, h: &Header) -> anyhow::Result<Value> {
     let mut value = serde_json::to_value(h)?;
     let object = value
         .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("invalid sync header"))?;
+        .ok_or_else(|| crate::memory::sync::SyncError::InvalidSource)?;
     object.remove("owner");
     object.remove("source_ref");
+    object.remove("timestamp");
     object.insert("type".into(), json!("event"));
     let mut body = payload(conn, h)?;
     let p = body
         .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("invalid sync payload"))?;
+        .ok_or_else(|| crate::memory::sync::SyncError::InvalidSource)?;
     p.insert("session_key".into(), json!(h.session));
     p.insert("agent".into(), json!(h.agent));
     p.insert("incarnation".into(), json!(h.incarnation));
     if let Some(root) = &h.root_session {
         p.insert("root_session".into(), json!(root));
+        p.insert("root_run_id".into(), json!(h.root_run_id));
+        p.insert("parent_session".into(), json!(h.parent_session));
+        p.insert("parent_run_id".into(), json!(h.parent_run_id));
     }
     if let Some(run) = &h.run_id {
         p.insert("run_id".into(), json!(run));
     }
     let bytes = serde_json::to_vec(&body)?.len();
     if bytes > MAX_PAYLOAD {
-        body = json!({"message_id":body.get("message_id"),"oversized":true,"bytes":bytes,"session_key":h.session,"agent":h.agent,"incarnation":h.incarnation});
+        let mut marker = json!({"message_id":body.get("message_id"),"oversized":true,"bytes":bytes,"session_key":h.session,"agent":h.agent,"incarnation":h.incarnation});
+        for key in [
+            "run_id",
+            "parent_session",
+            "parent_run_id",
+            "root_session",
+            "root_run_id",
+        ] {
+            if let Some(value) = body.get(key) {
+                marker
+                    .as_object_mut()
+                    .ok_or_else(|| crate::memory::sync::SyncError::InvalidSource)?
+                    .insert(key.into(), value.clone());
+            }
+        }
+        body = marker;
     }
     object.insert("payload".into(), body);
     Ok(value)
 }
 
 pub(super) fn payload(conn: &Connection, h: &Header) -> anyhow::Result<Value> {
+    if let Some(reference) = h.source_ref.strip_prefix("final:") {
+        let (marker, message) = reference
+            .split_once(':')
+            .ok_or(crate::memory::sync::SyncError::InvalidSource)?;
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM message_events WHERE event_id=?1 AND owner_id=?2)",
+            params![marker, h.owner],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Ok(json!({"message_id":message,"deleted":true,"timestamp":h.timestamp}));
+        }
+        let mut source = h.clone();
+        source.source_ref = format!("event:{message}");
+        return payload(conn, &source);
+    }
+    if h.kind == "child_session.upsert" {
+        return super::sync_lifecycle::child_payload(conn, h);
+    }
+    if let Some(id) = h.source_ref.strip_prefix("approval-cancel:") {
+        return Ok(json!({"approval_id":id,"decision":"cancelled"}));
+    }
+
+    if let Some(reference) = h.source_ref.strip_prefix("deleted:") {
+        let (event_id, message_id) = reference
+            .split_once(':')
+            .ok_or_else(|| crate::memory::sync::SyncError::InvalidSource)?;
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT raw_payload_json FROM message_events WHERE event_id=?1 AND owner_id=?2",
+                params![event_id, h.owner],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        let mut payload: Value = raw
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?
+            .unwrap_or_else(|| json!({"deleted":true}));
+        payload
+            .as_object_mut()
+            .ok_or_else(|| crate::memory::sync::SyncError::InvalidSource)?
+            .insert("message_id".into(), json!(message_id));
+        return Ok(payload);
+    }
     if let Some(id) = h.source_ref.strip_prefix("session:") {
         return Ok(conn
             .query_row(
@@ -61,7 +126,7 @@ pub(super) fn payload(conn: &Connection, h: &Header) -> anyhow::Result<Value> {
     if let Some(id) = h.source_ref.strip_prefix("erase:") {
         return Ok(conn.query_row("SELECT w.receipt,w.counts FROM agent_erase_work w JOIN agent_erase_receipts r ON r.erase_id=w.erase_id WHERE w.erase_id=?1 AND r.owner_id=?2",params![id,h.owner],|r|Ok((r.get::<_,Option<String>>(0)?,r.get::<_,String>(1)?))).optional()?.map(|(receipt,counts)|->anyhow::Result<Value>{
             let mut receipt:Value=receipt.as_deref().map(serde_json::from_str).transpose()?.unwrap_or_else(||json!({"erase_id":id}));
-            let obj=receipt.as_object_mut().ok_or_else(||anyhow::anyhow!("invalid erase receipt"))?;
+            let obj=receipt.as_object_mut().ok_or_else(||crate::memory::sync::SyncError::InvalidSource)?;
             obj.insert("counts".into(),serde_json::from_str(&counts)?);Ok(receipt)
         }).transpose()?.unwrap_or_else(||json!({"erase_id":id,"deleted":true})));
     }
@@ -84,10 +149,14 @@ pub(super) fn payload(conn: &Connection, h: &Header) -> anyhow::Result<Value> {
     let id = h
         .source_ref
         .strip_prefix("event:")
-        .ok_or_else(|| anyhow::anyhow!("unknown journal source"))?;
+        .ok_or_else(|| crate::memory::sync::SyncError::InvalidSource)?;
+    let deleted:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM message_events e WHERE e.event_id=?1 AND e.owner_id=?2 AND (EXISTS(SELECT 1 FROM agent_erase_fences f WHERE f.scope_id=e.ma_scope_id) OR EXISTS(SELECT 1 FROM rf_message_attempts a WHERE a.workspace_id=e.workspace_id AND a.owner_id=e.owner_id AND ((a.deleted_at IS NOT NULL AND (a.message_event_id=e.event_id OR a.run_id=e.run_id)) OR (a.reply_deleted_at IS NOT NULL AND a.run_id=e.run_id AND a.message_event_id<>e.event_id)))))",params![id,h.owner],|r|r.get(0))?;
+    if deleted {
+        return Ok(json!({"message_id":id,"deleted":true,"timestamp":h.timestamp}));
+    }
     let row=conn.query_row("SELECT role,event_type,CASE WHEN length(CAST(content AS BLOB))<=?3 THEN content ELSE '' END,created_at,CASE WHEN length(CAST(raw_payload_json AS BLOB))<=?3 THEN raw_payload_json ELSE NULL END,length(CAST(content AS BLOB)),parent_session_key FROM message_events WHERE event_id=?1 AND owner_id=?2",params![id,h.owner,i64::try_from(MAX_PAYLOAD)?],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,i64>(5)?,r.get::<_,Option<String>>(6)?))).optional()?;
     let Some((role, kind, content, timestamp, raw, bytes, _)) = row else {
-        return Ok(json!({"message_id":id,"deleted":true}));
+        return Ok(json!({"message_id":id,"deleted":true,"timestamp":h.timestamp}));
     };
     if kind == "message.deleted" {
         return Ok(json!({"message_id":id,"deleted":true,"timestamp":timestamp}));
@@ -100,29 +169,10 @@ pub(super) fn payload(conn: &Connection, h: &Header) -> anyhow::Result<Value> {
     match h.kind.as_str() {
         "turn.deleted" => Ok(raw),
         "turn.failed" => Ok(
-            json!({"reason":if kind=="turn.admission.failed" {"terminal_persistence_failed"} else {"provider_error"},"retryable":false}),
+            json!({"reason":if kind=="turn.admission.failed" {"terminal_persistence_failed"} else if raw.get("provider_outcome").is_some_and(|value|!value.is_null()) {"provider_error"}else{"internal"},"retryable":false}),
         ),
         "turn.cancelled" => Ok(json!({})),
         "session.upsert" => Ok(json!({"session_key":h.session,"channel":"spawn","created_at":timestamp})),
-        "child_session.upsert" => {
-            let terminal = kind == "turn.finalized" || kind == "turn.admission.failed";
-            let status = if terminal {
-                match raw.get("status").and_then(Value::as_str) {
-                    Some("completed" | "succeeded" | "silent") => "succeeded",
-                    Some("cancelled") => "cancelled",
-                    _ => "failed",
-                }
-            } else {
-                "running"
-            };
-            let mut p = json!({"status":status,"mode":"task","started_at":timestamp});
-            if terminal {
-                p.as_object_mut()
-                    .ok_or_else(|| anyhow::anyhow!("invalid child payload"))?
-                    .insert("ended_at".into(), json!(timestamp));
-            }
-            Ok(p)
-        }
         _ => {
             let message_id: Option<String> = conn
                 .query_row(
@@ -141,7 +191,7 @@ pub(super) fn payload(conn: &Connection, h: &Header) -> anyhow::Result<Value> {
             if let Some((client, turn)) = input {
                 let obj = value
                     .as_object_mut()
-                    .ok_or_else(|| anyhow::anyhow!("invalid turn payload"))?;
+                    .ok_or_else(|| crate::memory::sync::SyncError::InvalidSource)?;
                 obj.insert("client_message_id".into(), json!(client));
                 obj.insert("deliver".into(), json!(if turn { "turn" } else { "context" }));
             }
@@ -150,11 +200,14 @@ pub(super) fn payload(conn: &Connection, h: &Header) -> anyhow::Result<Value> {
     }
 }
 
-pub(super) fn refresh_config(memory: &SqliteMemory, config: &crate::config::Config) -> anyhow::Result<()> {
+pub(super) fn refresh_config(
+    memory: &SqliteMemory,
+    config: &crate::config::Config,
+    revision: &str,
+) -> anyhow::Result<()> {
     use sha2::{Digest, Sha256};
-    use std::io::Read;
     let conn = memory.pool.write();
-    let tx = crate::runtime::sqlite_pool::begin_immediate(&conn)?;
+    let tx: rusqlite::Transaction<'_> = crate::runtime::sqlite_pool::begin_immediate(&conn)?;
     let identity: Option<(String, String)> = tx
         .query_row(
             "SELECT workspace,owner_id FROM sync_meta WHERE owner_id IS NOT NULL",
@@ -165,19 +218,13 @@ pub(super) fn refresh_config(memory: &SqliteMemory, config: &crate::config::Conf
     let Some((workspace, owner)) = identity else {
         return Ok(());
     };
-    let mut bytes = Vec::new();
-    std::fs::File::open(&config.config_path)?
-        .take(4 * 1024 * 1024 + 1)
-        .read_to_end(&mut bytes)?;
-    anyhow::ensure!(bytes.len() <= 4 * 1024 * 1024, "config exceeds sync revision bound");
-    let revision = hex::encode(Sha256::digest(&bytes));
     let mut agents = config
         .agents
         .iter()
         .map(|(name, agent)| {
             Ok((
                 name.clone(),
-                hex::encode(Sha256::digest(serde_json::to_vec(agent)?)),
+                crate::config::agent_revision::config_revision(agent)?,
                 agent.enabled,
             ))
         })
@@ -188,6 +235,8 @@ pub(super) fn refresh_config(memory: &SqliteMemory, config: &crate::config::Conf
             config.default_provider.as_deref(),
             config.default_model.as_deref(),
             &config.autonomy,
+            config.default_temperature,
+            &config.tool_tiering,
         ))?)),
         true,
     ));
@@ -216,15 +265,23 @@ pub(super) fn refresh_config(memory: &SqliteMemory, config: &crate::config::Conf
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
-        let incarnation:Option<String>=tx.query_row("SELECT incarnation FROM agent_incarnations WHERE workspace_id=?1 AND owner_id=?2 AND agent_key=?3 ORDER BY state='active' DESC LIMIT 1",params![workspace,owner,key],|r|r.get(0)).optional()?;
+        let incarnation: Option<String> = if deleted {
+            prior.as_ref().map(|(inc, _, _, _)| inc.clone())
+        } else {
+            tx.query_row("SELECT incarnation FROM agent_incarnations WHERE workspace_id=?1 AND owner_id=?2 AND agent_key=?3 ORDER BY state='active' DESC LIMIT 1",params![workspace,owner,key],|r|r.get(0)).optional()?
+        };
         let incarnation = if let Some(incarnation) = incarnation {
             incarnation
         } else if deleted {
             continue;
         } else {
-            let incarnation = uuid::Uuid::new_v4().to_string();
+            let incarnation = if name == "main" {
+                super::agent_migration::main_incarnation(&tx, &workspace, &owner)?
+            } else {
+                uuid::Uuid::new_v4().to_string()
+            };
             tx.execute(
-                "INSERT INTO agent_incarnations VALUES(?1,?2,?3,?4,'active',?5)",
+                "INSERT OR IGNORE INTO agent_incarnations VALUES(?1,?2,?3,?4,'active',?5)",
                 params![workspace, owner, key, incarnation, fingerprint],
             )?;
             incarnation
@@ -242,7 +299,7 @@ pub(super) fn refresh_config(memory: &SqliteMemory, config: &crate::config::Conf
                 owner,
                 name,
                 incarnation,
-                if deleted { None } else { Some(&revision) },
+                if deleted { None } else { Some(revision) },
                 enabled,
                 deleted
             ],

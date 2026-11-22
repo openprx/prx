@@ -28,7 +28,7 @@ fn bounded(col: &str, max: usize) -> String {
 }
 
 /// The active Main incarnation of (W,O), minted on first use.
-fn main_incarnation(conn: &Connection, workspace: &str, owner: &str) -> anyhow::Result<String> {
+pub(super) fn main_incarnation(conn: &Connection, workspace: &str, owner: &str) -> anyhow::Result<String> {
     let existing: Option<String> = conn
         .query_row(
             "SELECT incarnation FROM agent_incarnations

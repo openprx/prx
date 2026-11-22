@@ -75,7 +75,10 @@ fn interrupt(conn: &Connection, workspace_id: &str, owner_id: &str, run_id: &str
     if changed == 1 {
         super::sync_journal::interrupted(conn, workspace_id, owner_id, run_id)?;
     }
-    Ok(changed == 1)
+    if changed == 1 {
+        return Ok(true);
+    }
+    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM rf_message_attempts WHERE workspace_id=?1 AND owner_id=?2 AND run_id=?3 AND interrupted=1)",params![workspace_id,owner_id,run_id],|r|r.get(0))?)
 }
 
 /// Write the attempt row inside the input's append transaction, after the

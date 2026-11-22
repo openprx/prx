@@ -655,6 +655,24 @@ fn record_deleted(
             format!("event:{event_id}"),
         );
         header.run_id = attempt.run_id.clone();
+        let message_id = match side {
+            Side::Message => Some(attempt.input_event_id.clone()),
+            Side::Reply => tx
+                .query_row(
+                    "SELECT event_id FROM message_events WHERE workspace_id=?1 AND owner_id=?2 AND idempotency_key=?3",
+                    params![
+                        target.workspace_id,
+                        target.owner_id,
+                        format!("turn:{}:assistant", attempt.run_id.as_deref().unwrap_or_default())
+                    ],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?,
+        };
+        // A failed/interrupted run can have no assistant row. Its input
+        // remains the stable history anchor; side/run_id identify the reply.
+        let message_id = message_id.unwrap_or_else(|| attempt.input_event_id.clone());
+        header.source_ref = format!("deleted:{event_id}:{message_id}");
         super::sync_journal::append(tx, &header)?;
     }
     Ok(())

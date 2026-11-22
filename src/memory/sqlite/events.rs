@@ -1991,6 +1991,7 @@ impl SqliteMemory {
                 params![event_id],
                 Self::memory_event_from_row,
             )?;
+            super::sync_lifecycle::memory_written(&tx,&event)?;
             tx.commit()?;
             Ok(event)
         })

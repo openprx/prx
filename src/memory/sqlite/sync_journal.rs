@@ -11,7 +11,22 @@ use tokio_util::sync::CancellationToken;
 #[derive(Default)]
 pub(super) struct Runtime {
     pub notify: Arc<Notify>,
+    shutdown: Mutex<CancellationToken>,
     connections: Mutex<BTreeMap<String, Arc<CancellationToken>>>,
+}
+
+pub(super) fn for_database(path: &std::path::Path) -> anyhow::Result<Arc<Runtime>> {
+    type Registry = Mutex<BTreeMap<std::path::PathBuf, std::sync::Weak<Runtime>>>;
+    static REGISTRY: std::sync::OnceLock<Registry> = std::sync::OnceLock::new();
+    let path = std::fs::canonicalize(path)?;
+    let mut entries = REGISTRY.get_or_init(Mutex::default).lock();
+    entries.retain(|_, runtime| runtime.strong_count() > 0);
+    if let Some(runtime) = entries.get(&path).and_then(std::sync::Weak::upgrade) {
+        return Ok(runtime);
+    }
+    let runtime = Arc::new(Runtime::default());
+    entries.insert(path, Arc::downgrade(&runtime));
+    Ok(runtime)
 }
 
 /// The hook runs under the sole writer guard. Journal readers acquire that
@@ -26,6 +41,11 @@ pub(super) fn install_notify(conn: &mut Connection, runtime: &Arc<Runtime>) -> a
 }
 
 pub(super) fn init_schema(conn: &Connection) -> anyhow::Result<()> {
+    let existed: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='sync_journal' AND type='table')",
+        [],
+        |r| r.get(0),
+    )?;
     conn.execute_batch("CREATE TABLE IF NOT EXISTS sync_meta(
         singleton INTEGER PRIMARY KEY CHECK(singleton=1),epoch TEXT NOT NULL,
         floor INTEGER NOT NULL DEFAULT 0,last_prune INTEGER NOT NULL DEFAULT 0,
@@ -35,7 +55,7 @@ pub(super) fn init_schema(conn: &Connection) -> anyhow::Result<()> {
         owner_id TEXT NOT NULL,kind TEXT NOT NULL,session TEXT NOT NULL,
         agent TEXT NOT NULL,incarnation TEXT NOT NULL,run_id TEXT,
         parent_session TEXT,parent_run_id TEXT,root_session TEXT,root_run_id TEXT,
-        source_ref TEXT NOT NULL,created_at INTEGER NOT NULL,
+        source_ref TEXT NOT NULL,created_at INTEGER NOT NULL,source_created_at TEXT NOT NULL,
         CHECK((parent_session IS NULL AND parent_run_id IS NULL AND root_session IS NULL AND root_run_id IS NULL)
            OR (parent_session IS NOT NULL AND parent_run_id IS NOT NULL AND root_session IS NOT NULL AND root_run_id IS NOT NULL))) STRICT;
         CREATE INDEX IF NOT EXISTS sync_journal_owner ON sync_journal(owner_id,seq);
@@ -51,10 +71,19 @@ pub(super) fn init_schema(conn: &Connection) -> anyhow::Result<()> {
         [uuid::Uuid::new_v4().simple().to_string()],
     )?;
     super::sync_snapshot::init_schema(conn)?;
+    if !existed {
+        conn.execute(
+            "UPDATE sync_meta SET epoch=?1,floor=0,last_prune=0",
+            [uuid::Uuid::new_v4().simple().to_string()],
+        )?;
+        conn.execute("DELETE FROM sync_snapshot_rows", [])?;
+        conn.execute("DELETE FROM sync_snapshots", [])?;
+        conn.execute("DELETE FROM sync_agent_state", [])?;
+    }
     Ok(())
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Header {
     pub seq: i64,
     pub event_id: String,
@@ -74,6 +103,7 @@ pub(super) struct Header {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub root_run_id: Option<String>,
     pub source_ref: String,
+    pub timestamp: String,
 }
 impl Header {
     pub fn new(owner: &str, kind: &str, session: &str, agent: &str, incarnation: &str, source_ref: String) -> Self {
@@ -91,6 +121,7 @@ impl Header {
             root_session: None,
             root_run_id: None,
             source_ref,
+            timestamp: chrono::Utc::now().to_rfc3339(),
         }
     }
     pub fn row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
@@ -108,27 +139,41 @@ impl Header {
             root_session: row.get(10)?,
             root_run_id: row.get(11)?,
             source_ref: row.get(12)?,
+            timestamp: row.get(13)?,
         })
     }
 }
-pub(super) const COLUMNS: &str = "seq,event_id,owner_id,kind,session,agent,incarnation,run_id,parent_session,parent_run_id,root_session,root_run_id,source_ref";
+pub(super) const COLUMNS: &str = "seq,event_id,owner_id,kind,session,agent,incarnation,run_id,parent_session,parent_run_id,root_session,root_run_id,source_ref,source_created_at";
 
 pub(super) fn append(conn: &Connection, h: &Header) -> anyhow::Result<()> {
-    anyhow::ensure!(!conn.is_autocommit(), "sync append requires its source transaction");
-    conn.execute("INSERT OR IGNORE INTO sync_journal(event_id,owner_id,kind,session,agent,incarnation,run_id,parent_session,parent_run_id,root_session,root_run_id,source_ref,created_at)
-        VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",params![h.event_id,h.owner,h.kind,h.session,h.agent,h.incarnation,h.run_id,h.parent_session,h.parent_run_id,h.root_session,h.root_run_id,h.source_ref,chrono::Utc::now().timestamp()])?;
+    anyhow::ensure!(!conn.is_autocommit(), crate::memory::sync::SyncError::InvalidSource);
+    let written=conn.execute("INSERT INTO sync_journal(event_id,owner_id,kind,session,agent,incarnation,run_id,parent_session,parent_run_id,root_session,root_run_id,source_ref,created_at,source_created_at)
+        SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14 WHERE NOT EXISTS(SELECT 1 FROM sync_journal WHERE event_id=?1)",params![h.event_id,h.owner,h.kind,h.session,h.agent,h.incarnation,h.run_id,h.parent_session,h.parent_run_id,h.root_session,h.root_run_id,h.source_ref,chrono::Utc::now().timestamp(),h.timestamp])?;
+    if written == 0 {
+        let mut stored = conn.query_row(
+            &format!("SELECT {COLUMNS} FROM sync_journal WHERE event_id=?1"),
+            [&h.event_id],
+            Header::row,
+        )?;
+        stored.seq = h.seq;
+        stored.timestamp = h.timestamp.clone();
+        anyhow::ensure!(stored == *h, crate::memory::sync::SyncError::InvalidSource);
+    }
     Ok(())
 }
 
 /// Resolve descendants through durable ancestry to the rf admission, whose
 /// partition is the root's purge stamp. Never relabel from current config.
 pub(super) fn event_header(conn: &Connection, id: &str, kind: &str) -> anyhow::Result<Option<Header>> {
-    let event:Option<(String,String,Option<String>,Option<String>,String)>=conn.query_row(
-        "SELECT workspace_id,session_key,run_id,parent_run_id,owner_id FROM message_events WHERE event_id=?1 AND owner_id IS NOT NULL AND session_key IS NOT NULL",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
-    let Some((workspace, session, run, parent, owner)) = event else {
+    let event:Option<(String,String,Option<String>,Option<String>,String,String)>=conn.query_row(
+        "SELECT workspace_id,session_key,run_id,parent_run_id,owner_id,created_at FROM message_events WHERE event_id=?1 AND owner_id IS NOT NULL AND session_key IS NOT NULL",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
+    let Some((workspace, session, run, parent, owner, timestamp)) = event else {
         return Ok(None);
     };
-    let root_run = parent.as_deref().or(run.as_deref());
+    // Prefer the root already recorded by WriteProvenance, then traverse
+    // event ancestry before the child's first attributed effect exists.
+    let provenance_root:Option<String>=conn.query_row("SELECT root_run_id FROM memory_write_log WHERE run_id=?1 AND agent_partition IN(SELECT scope_id FROM agent_scopes WHERE workspace_id=?2 AND owner_id=?3) ORDER BY id LIMIT 1",params![run,workspace,owner],|r|r.get(0)).optional()?;
+    let root_run = provenance_root.as_deref().or(parent.as_deref()).or(run.as_deref());
     let root:Option<(String,String,String,Option<String>,Option<String>)>=conn.query_row(
         "WITH RECURSIVE family(run) AS (SELECT ?1 UNION SELECT e.parent_run_id FROM message_events e JOIN family f ON e.run_id=f.run WHERE e.workspace_id=?2 AND e.owner_id=?3 AND e.parent_run_id IS NOT NULL)
         SELECT a.session_key,a.agent_key,s.incarnation,a.run_id,s.session_key FROM rf_message_attempts a JOIN agent_scopes s ON s.scope_id=a.ma_scope_id WHERE a.workspace_id=?2 AND a.owner_id=?3 AND (a.run_id IN(SELECT run FROM family) OR a.message_event_id=?4) LIMIT 1",
@@ -138,12 +183,14 @@ pub(super) fn event_header(conn: &Connection, id: &str, kind: &str) -> anyhow::R
     };
     let mut h = Header::new(&owner, kind, &session, &agent, &incarnation, format!("event:{id}"));
     h.run_id = run;
+    h.timestamp = timestamp;
+
     if let Some(parent) = parent {
         let parent_session:Option<String>=conn.query_row("SELECT session_key FROM message_events WHERE workspace_id=?1 AND owner_id=?2 AND run_id=?3 AND session_key IS NOT NULL LIMIT 1",params![workspace,owner,parent],|r|r.get(0)).optional()?;
         h.parent_session = Some(parent_session.unwrap_or_else(|| root_session.clone()));
         h.parent_run_id = Some(parent);
         h.root_session = Some(root_session);
-        h.root_run_id = Some(root_id.ok_or_else(|| anyhow::anyhow!("child root has no run"))?);
+        h.root_run_id = Some(root_id.ok_or_else(|| crate::memory::sync::SyncError::InvalidSource)?);
     }
     Ok(Some(h))
 }
@@ -168,6 +215,11 @@ pub(super) fn event_written(conn: &Connection, event: &crate::memory::MessageEve
             append(conn, &h)?;
         }
     }
+    if event.role == "user" && h.parent_run_id.is_some() {
+        h.kind = "turn.appended".into();
+        h.event_id = format!("turn.appended:{}", h.source_ref);
+        append(conn, &h)?;
+    }
     if event.event_type == "turn.finalized" || event.event_type == "turn.admission.failed" {
         let payload: serde_json::Value = event
             .raw_payload_json
@@ -190,8 +242,11 @@ pub(super) fn event_written(conn: &Connection, event: &crate::memory::MessageEve
             append(conn, &h)?;
         }
         if let Some(assistant) = payload.get("assistant_event_id").and_then(serde_json::Value::as_str) {
-            if let Some(assistant) = event_header(conn, assistant, "turn.appended")? {
-                append(conn, &assistant)?;
+            if let Some(mut header) = event_header(conn, assistant, "turn.appended")? {
+                // The final marker is the publication source, including on
+                // paths whose assistant row was prepared in an earlier tx.
+                header.source_ref = format!("final:{}:{assistant}", event.event_id);
+                append(conn, &header)?;
             }
         }
         if h.parent_run_id.is_some() {
@@ -219,6 +274,7 @@ pub(super) fn admission(
         format!("attempt:{}", event.event_id),
     );
     h.run_id = admission.run.as_ref().map(|r| r.run_id.clone());
+    h.timestamp = event.created_at.clone();
     if h.run_id.is_some() {
         append(conn, &h)?;
     }
@@ -259,6 +315,7 @@ pub(super) fn interrupted(conn: &Connection, workspace: &str, owner: &str, run: 
             h.source_ref = format!("interrupt:{run}");
             h.event_id = format!("interrupt:{run}");
             append(conn, &h)?;
+            super::sync_lifecycle::cancel_approvals(conn, &h, workspace, run)?;
         }
     }
     Ok(())
@@ -266,7 +323,7 @@ pub(super) fn interrupted(conn: &Connection, workspace: &str, owner: &str, run: 
 
 pub(super) fn prune(conn: &Connection) -> anyhow::Result<()> {
     let now = chrono::Utc::now().timestamp();
-    conn.execute("UPDATE sync_meta SET floor=MAX(floor,COALESCE((SELECT MAX(seq) FROM sync_journal WHERE created_at<?1),0)),last_prune=?2 WHERE last_prune<?2-3600",params![now-14*86400,now])?;
+    conn.execute("UPDATE sync_meta SET floor=MAX(floor,COALESCE((SELECT MAX(seq) FROM sync_journal WHERE created_at<?1 AND seq<COALESCE((SELECT MIN(seq) FROM sync_journal WHERE created_at>=?1),9223372036854775807)),0)),last_prune=?2 WHERE last_prune<?2-3600",params![now-14*86400,now])?;
     conn.execute("DELETE FROM sync_journal WHERE seq<=(SELECT floor FROM sync_meta)", [])?;
     Ok(())
 }
@@ -277,12 +334,12 @@ impl SyncStore for SqliteMemory {
     }
     fn connect(&self, owner: &str) -> Arc<CancellationToken> {
         let token = Arc::new(CancellationToken::new());
-        if let Some(old) = self
+        let old = self
             .sync_runtime
             .connections
             .lock()
-            .insert(owner.into(), Arc::clone(&token))
-        {
+            .insert(owner.into(), Arc::clone(&token));
+        if let Some(old) = old {
             old.cancel();
         }
         token
@@ -295,8 +352,13 @@ impl SyncStore for SqliteMemory {
     }
     fn journal(&self, owner: &str, after: i64, limit: usize) -> anyhow::Result<JournalPage> {
         let writer = self.pool.write();
-        let tx = crate::runtime::sqlite_pool::begin_immediate(&writer)?;
-        prune(&tx)?;
+        let last: i64 = writer.query_row("SELECT last_prune FROM sync_meta", [], |r| r.get(0))?;
+        if chrono::Utc::now().timestamp() - last >= 3600 {
+            let tx = crate::runtime::sqlite_pool::begin_immediate(&writer)?;
+            prune(&tx)?;
+            tx.commit()?;
+        }
+        let tx = rusqlite::Transaction::new_unchecked(&writer, rusqlite::TransactionBehavior::Deferred)?;
         let (epoch, floor, head) = tx.query_row(
             "SELECT epoch,floor,MAX(floor,COALESCE((SELECT MAX(seq) FROM sync_journal),0)) FROM sync_meta",
             [],
@@ -316,8 +378,8 @@ impl SyncStore for SqliteMemory {
         tx.commit()?;
         Ok(JournalPage {
             epoch,
-            floor,
             head,
+            floor,
             events,
         })
     }
@@ -329,17 +391,19 @@ impl SyncStore for SqliteMemory {
     ) -> anyhow::Result<crate::memory::sync::SnapshotPage> {
         super::sync_snapshot::page(self, owner, token, limit)
     }
-    fn configure(&self, workspace: &str, owner: &str, config: &crate::config::Config) -> anyhow::Result<()> {
-        let conn = self.pool.write();
+    fn configure(&self, workspace: &str, owner: &str) -> anyhow::Result<()> {
+        let writer = self.pool.write();
+        let conn: &Connection = &writer;
         conn.execute(
             "UPDATE sync_meta SET workspace=?1,owner_id=?2 WHERE singleton=1",
             params![workspace, owner],
         )?;
-        drop(conn);
-        self.refresh_config(config)
+        let previous = std::mem::replace(&mut *self.sync_runtime.shutdown.lock(), CancellationToken::new());
+        previous.cancel();
+        Ok(())
     }
-    fn refresh_config(&self, config: &crate::config::Config) -> anyhow::Result<()> {
-        super::sync_projection::refresh_config(self, config)
+    fn refresh_config(&self, config: &crate::config::Config, revision: &str) -> anyhow::Result<()> {
+        super::sync_projection::refresh_config(self, config, revision)
     }
     fn restart_candidates(&self, after: &str) -> anyhow::Result<Vec<RestartCandidate>> {
         let conn = self.pool.write();
@@ -354,9 +418,7 @@ impl SyncStore for SqliteMemory {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?)
     }
-    fn shutdown(&self) {
-        for token in self.sync_runtime.connections.lock().values() {
-            token.cancel();
-        }
+    fn shutdown_signal(&self) -> CancellationToken {
+        self.sync_runtime.shutdown.lock().clone()
     }
 }

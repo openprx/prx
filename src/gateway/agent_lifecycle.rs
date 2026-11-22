@@ -2,11 +2,10 @@
 //! barrier shared by config reload and targeted resolves, the startup latch
 //! and the reload participant's retire, rollback and refresh steps.
 
-use crate::config::{Config, DelegateAgentConfig};
+use crate::config::Config;
 use crate::memory::Memory;
 use crate::memory::agent_registry::RetiredIncarnation;
 use parking_lot::Mutex;
-use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,47 +15,7 @@ pub(crate) fn agent_key(name: &str) -> String {
     format!("n:{name}")
 }
 
-/// The non-secret fields that identify an agent's configuration, in the order
-/// they are hashed. `api_key` is never part of it; the credential is named by
-/// reference only.
-#[derive(Serialize)]
-struct RevisionPreimage<'a> {
-    provider: &'a str,
-    model: &'a str,
-    system_prompt: Option<&'a str>,
-    credential_ref: Option<&'a str>,
-    temperature: Option<f64>,
-    max_depth: u32,
-    agentic: bool,
-    allowed_tools: &'a [String],
-    identity_dir: Option<&'a str>,
-    memory_scope: Option<&'a str>,
-    spawn_enabled: Option<bool>,
-    enabled: bool,
-    autonomy: Option<crate::security::AutonomyLevel>,
-    limits: &'a crate::config::AgentLimits,
-}
-
-/// Lowercase SHA-256 over the serialized preimage.
-pub(crate) fn config_revision(agent: &DelegateAgentConfig) -> anyhow::Result<String> {
-    let preimage = serde_json::to_string(&RevisionPreimage {
-        provider: &agent.provider,
-        model: &agent.model,
-        system_prompt: agent.system_prompt.as_deref(),
-        credential_ref: agent.credential_ref.as_deref(),
-        temperature: agent.temperature,
-        max_depth: agent.max_depth,
-        agentic: agent.agentic,
-        allowed_tools: &agent.allowed_tools,
-        identity_dir: agent.identity_dir.as_deref(),
-        memory_scope: agent.memory_scope.as_deref(),
-        spawn_enabled: agent.spawn_enabled,
-        enabled: agent.enabled,
-        autonomy: agent.autonomy,
-        limits: &agent.limits,
-    })?;
-    Ok(crate::memory::SqliteMemory::schema_migration_checksum(&preimage))
-}
+pub(crate) use crate::config::agent_revision::config_revision;
 
 fn revisions(config: &Config) -> anyhow::Result<BTreeMap<String, String>> {
     config
@@ -170,8 +129,13 @@ impl AgentReconcile {
 
     /// The new config is published: lift the block and refresh. While the
     /// latch is set, this is also the sweep that can clear it.
-    pub(crate) fn finalize(&self) {
+    pub(crate) fn finalize(&self, revision: &str) {
         self.lift();
         self.lifecycle.reconcile(self.memory.as_ref(), &self.next, false);
+        if let Some(sync) = self.memory.sync_store() {
+            if let Err(error) = sync.refresh_config(&self.next, revision) {
+                tracing::warn!(error_kind=%crate::agent::diagnostics::error_class(&error),"sync config publication will be repaired at startup");
+            }
+        }
     }
 }
