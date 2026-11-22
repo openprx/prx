@@ -30,6 +30,22 @@ pub(super) struct EffectiveAgentExclusions {
         Option<Arc<dyn crate::tools::capability::turn_state::model_admission::ModelAdmissionView>>,
 }
 
+impl EffectiveAgentExclusions {
+    pub(super) fn for_source(mut self, proof: &dyn TurnSourceProof) -> Self {
+        // Every child consumes the root's sole child depth. Operator children
+        // carry separate authority rather than an ordinary child manifest.
+        if proof
+            .child_scope()
+            .is_some_and(|scope| scope.gate_inputs().0.authority.remaining_depth == 0)
+            || proof.operator_task_authority_id().is_some()
+            || proof.operator_process_authority_id().is_some()
+        {
+            self.names.extend([Arc::from("sessions_spawn"), Arc::from("delegate")]);
+        }
+        self
+    }
+}
+
 /// The level a turn runs at: a child turn's sealed scope level (a named
 /// agent's own level may differ from the hosting service's), else the
 /// service's policy level.
@@ -133,7 +149,8 @@ impl TurnRuntimeService {
             model.model(),
             &self.policy_version,
             &self.state_key,
-        );
+        )
+        .for_source(proof);
         let g6_slice = budget.budgets.tokens;
         let trusted = TrustedParts {
             workspace_id: Arc::from(proof.workspace_id()),

@@ -1228,6 +1228,15 @@ pub enum ToolExecutionDecision {
 pub trait EffectPolicy: Send + Sync {
     fn autonomy_level(&self) -> crate::security::AutonomyLevel;
     fn decide(&self, descriptor: &ToolDescriptor, context: &ToolExecutionContext) -> ToolExecutionDecision;
+    /// Bind a bridge-approved call to the policy's trusted runtime scope.
+    /// Policies without a grant issuer leave resource gates fail-closed.
+    fn approved_call_grant(
+        &self,
+        _command: &ToolExecutionCommand,
+        _context: &ToolExecutionContext,
+    ) -> Option<serde_json::Value> {
+        None
+    }
     /// The decision at the call's effective level, which a child scope may
     /// set apart from the service's own level.
     fn decide_at(
@@ -1253,6 +1262,23 @@ impl SecurityEffectPolicy {
 }
 
 impl EffectPolicy for SecurityEffectPolicy {
+    fn approved_call_grant(
+        &self,
+        command: &ToolExecutionCommand,
+        context: &ToolExecutionContext,
+    ) -> Option<serde_json::Value> {
+        let scope =
+            crate::agent::turn_contracts::ScopeContext::from_execution_context(&self.policy, context, &context.chat_id);
+        let grant = crate::agent::execution_policy::runtime_approval_grant_for_call(
+            &command.name,
+            &command.arguments,
+            Some(&scope),
+        )?;
+        serde_json::to_value(grant)
+            .inspect_err(|_| tracing::warn!("bridge approval grant encoding failed"))
+            .ok()
+    }
+
     fn autonomy_level(&self) -> crate::security::AutonomyLevel {
         self.policy.autonomy
     }
@@ -3170,7 +3196,13 @@ impl ToolExecutionService {
             outcome.approval_denial_cause = Some(ApprovalDenialCause::NoResolver);
             return outcome;
         }
-        if decision == ToolExecutionDecision::Ask && !prx_operator_ask && channel_gate.is_some() {
+        // A supervised bridge owns its approval UI even when PRX also asks.
+        // A bridge that does not force approval keeps the durable PRX route.
+        if decision == ToolExecutionDecision::Ask
+            && channel_gate
+                .as_ref()
+                .is_some_and(|gate| !prx_operator_ask || gate.force_ask)
+        {
             let approval_resolution: std::pin::Pin<
                 Box<
                     dyn std::future::Future<Output = Option<crate::agent::turn_contracts::ApprovalDecision>>
@@ -3221,6 +3253,9 @@ impl ToolExecutionService {
             self.record_approval_resolution(&command, &context, &input_sha256, ApprovalVerdict::Approved, None, None)
                 .await;
             runtime_approval_granted = true;
+            if prx_operator_ask {
+                runtime_grant = self.policy.approved_call_grant(&command, &context);
+            }
         } else if decision == ToolExecutionDecision::Ask {
             let (approval, ledger_route) = self
                 .resolve_ordinary_approval(ToolApprovalRequest {

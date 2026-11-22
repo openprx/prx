@@ -50,7 +50,8 @@ impl TurnSurfacePort for TurnSurfaceBinding<'_> {
             model.model(),
             &service.policy_version,
             &service.state_key,
-        );
+        )
+        .for_source(proof);
         super::validate_agent_retrieval_provenance(
             proof,
             &context.runtime().trusted,

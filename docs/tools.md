@@ -1440,8 +1440,7 @@ Agentic `delegate` configurations require an explicit non-empty
 `allowed_tools`. A named list is intersected with the eligible parent registry;
 unknown or ineligible names fail before the provider turn starts. The exclusive
 wildcard form `allowed_tools = ["*"]` inherits the eligible parent tool surface
-within the admitted child authority. Nested delegation still requires its own
-selected capability, source binding and reduced-depth authority. An empty list
+within the admitted child authority. Children cannot spawn or delegate. An empty list
 never means “inherit all.” Delegate task logs retain the parent tracing subscriber;
 provider endpoint userinfo remains redacted.
 
@@ -1469,28 +1468,21 @@ reduced depth remain bound by the seal. An empty child set cannot derive another
 strict subset. This does not override the explicit agentic `delegate` configuration
 requirements above or bypass the normal launch and execution gates.
 
-### Recursive child grants
+### Child depth
 
-A `sessions_spawn` child can spawn its own children by default: a child
-session equals the main session, so an omitted `allow_delegation` means `true`,
-on the spawn request and on a batch entry. An explicit
-`allow_delegation: false` makes a child that cannot spawn. Where the depth
-bound leaves no room for a child that can spawn, an omitted flag falls back to
-a child that cannot, while an explicit `true` is refused. There is no
-operator setting: a child's `sessions_spawn` passes exactly the same gates as a
-root session's `sessions_spawn` at the same autonomy level, and nothing
-recursion-specific is added. In Full autonomy there is no approval and no
-gate; in Supervised the ordinary side-effect approval applies, as for a root
-spawn; in ReadOnly the spawn is refused, as for a root spawn. With an explicit
-`false`, a spawn keeps its existing capability set. A non-boolean opt-in is
-refused before any batch member is journaled or started.
+Children cannot spawn or delegate, at any autonomy level, in task or process
+mode. The main process can launch any number of children, including batches,
+and select each child's agent, model, provider and mode. The sealed depth is
+one at the root and zero in each child. A child is never offered
+`sessions_spawn` or `delegate`; a child call that still reaches dispatch is
+refused by the depth check.
 
-The only bounds are depth, funding and integrity:
+An omitted `allow_delegation` or explicit `false` launches a non-delegating
+child. Explicit `true` is refused because no child depth remains. A non-boolean
+value is refused before any batch member is journaled or started.
 
-- **Depth.** The child's sealed manifest keeps `sessions_spawn` and is a strict
-  subset of its authenticated parent. Every generation consumes one level of
-  the sealed remaining depth, and a child whose depth would reach zero cannot
-  derive another recursive child.
+Funding and integrity checks remain:
+
 - **Funding.** Each child receives half of its parent's currently unallocated
   monetary balance, rounded down to whole cents and bounded by its sealed
   ceiling; that share is subtracted from the parent before the child starts.

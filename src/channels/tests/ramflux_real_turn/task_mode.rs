@@ -125,7 +125,7 @@ async fn child_scope_round(supervised: bool) {
         runs: runs.clone(),
     });
     crate::providers::test_fixture::register(&provider_name, parent.clone());
-    let mut ctx = runtime(
+    let mut ctx = runtime_autonomy(
         dir.path(),
         channel.clone(),
         parent,
@@ -138,6 +138,7 @@ async fn child_scope_round(supervised: bool) {
             always_include: vec!["sessions_spawn".into(), "memory_store".into()],
             ..crate::config::ToolTieringConfig::default()
         },
+        config.autonomy.level,
     );
     assert!(tools_handle.set(&ctx.tools_registry));
     let mutable = Arc::get_mut(&mut ctx).unwrap();

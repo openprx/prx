@@ -732,16 +732,6 @@ async fn execute_admitted_spawn(tool: &SessionsSpawnTool, arguments: serde_json:
     execute_admitted_spawn_with_plane(tool, arguments, false, None, Vec::new()).await
 }
 
-/// `execute_admitted_spawn` with the root dispatch under `approval`, as a
-/// root turn's runtime adapter runs it under the run's approval strategy.
-async fn execute_admitted_spawn_with_approval(
-    tool: &SessionsSpawnTool,
-    arguments: serde_json::Value,
-    approval: Arc<dyn crate::tools::ApprovalStrategy>,
-) -> anyhow::Result<ToolResult> {
-    execute_admitted_spawn_with_plane(tool, arguments, false, Some(approval), Vec::new()).await
-}
-
 async fn execute_enabled_admitted_spawn(
     tool: &SessionsSpawnTool,
     arguments: serde_json::Value,

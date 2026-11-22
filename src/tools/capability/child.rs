@@ -415,7 +415,7 @@ fn decode_worker_refs(
 
 /// The depth bound of a child chain, counted from its root, for every child
 /// kind and level.
-pub const MAX_CHILD_DEPTH: u8 = 8;
+pub const MAX_CHILD_DEPTH: u8 = 1;
 
 /// A child's capability set against its parent's: a subset when the child or
 /// its parent runs at Full, a strict subset when both run below Full.

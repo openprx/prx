@@ -17,8 +17,6 @@ const DONE: &str = "PRX-RECURSIVE-DONE";
 /// Bound on recorded model requests; further requests are answered but not kept.
 const MAX_SEEN: usize = 64;
 const RUN_DEADLINE: Duration = Duration::from_secs(30);
-/// The existing dispatch-approval refusal (`kill_and_events.rs`).
-const NO_RESOLVER: &str = "approval required but no approval resolver is available";
 /// Loopback Ollama model with no price row: zero-price exempt.
 const FREE_MODEL: &str = "prx-free-model";
 /// A word `PRX-SEARCH=<query>` in a task makes its model call
@@ -29,7 +27,6 @@ const SEARCH: &str = "PRX-SEARCH=";
 #[derive(Clone, Debug)]
 struct Seen {
     own_task: String,
-    tools: Vec<String>,
     results: Vec<String>,
 }
 
@@ -88,11 +85,6 @@ fn own_task(text: &str) -> String {
     text.split(NEXT).next().unwrap_or_default().to_owned()
 }
 
-/// A task whose model spawns `next` (spawn arguments) before answering.
-fn chain(label: &str, next: Option<serde_json::Value>) -> String {
-    next.map_or_else(|| label.to_owned(), |next| format!("{label} {NEXT}{next}{END}"))
-}
-
 fn spawn_args(task: String) -> serde_json::Value {
     json!({"task": task, "mode": "task"})
 }
@@ -138,15 +130,10 @@ impl crate::providers::Provider for ScriptedProvider {
             })
             .map(|message| message.content.clone())
             .collect();
-        let tools = request
-            .tools
-            .map(|specs| specs.iter().map(|spec| spec.name.clone()).collect())
-            .unwrap_or_default();
         let answered = results.len();
         let next = self.0.answer(
             Seen {
                 own_task: own_task(first_user),
-                tools,
                 results,
             },
             first_user,
@@ -194,19 +181,9 @@ fn ollama_reply(script: &Script, request: &serde_json::Value) -> serde_json::Val
         })
         .filter_map(|message| message["content"].as_str().map(str::to_owned))
         .collect();
-    let tools = request["tools"]
-        .as_array()
-        .map(|tools| {
-            tools
-                .iter()
-                .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default();
     let next = script.answer(
         Seen {
             own_task: own_task(first_user),
-            tools,
             results,
         },
         first_user,
@@ -225,49 +202,13 @@ fn ollama_reply(script: &Script, request: &serde_json::Value) -> serde_json::Val
 struct Fixture {
     tool: SessionsSpawnTool,
     script: Script,
-    registry: Arc<Vec<Box<dyn Tool>>>,
     _server: TaskTraceServer,
-    /// The real store every level records into.
-    memory: Arc<dyn Memory>,
     _workspace: tempfile::TempDir,
 }
 
 struct Options {
     level: AutonomyLevel,
     daily_cap_cents: Option<u32>,
-}
-
-/// An operator resolver that grants every request and counts consultations.
-#[derive(Default)]
-struct GrantingResolver {
-    asked: std::sync::atomic::AtomicUsize,
-}
-
-#[async_trait]
-impl crate::agent::turn_contracts::ApprovalResolver for GrantingResolver {
-    async fn resolve(
-        &self,
-        request: &crate::approval::ApprovalRequest,
-        _channel: &str,
-    ) -> crate::agent::turn_contracts::ApprovalDecision {
-        if request.tool_name == "sessions_spawn" {
-            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-        crate::agent::turn_contracts::ApprovalDecision::Grant
-    }
-}
-
-/// The production run approval strategy a root turn's adapter runs under:
-/// an approval manager and `resolver` (CR-CI-3: a Supervised root spawn is
-/// approved through it, never through a grant in the arguments).
-fn run_approval(tool: &SessionsSpawnTool, resolver: Arc<GrantingResolver>) -> Arc<dyn crate::tools::ApprovalStrategy> {
-    crate::agent::execution_policy::run_approval_strategy(
-        Some(Arc::new(crate::approval::ApprovalManager::new())),
-        Some(resolver as Arc<dyn crate::agent::turn_contracts::ApprovalResolver>),
-        "wacli",
-        Arc::clone(&tool.security),
-        None,
-    )
 }
 
 async fn fixture(options: Options) -> Fixture {
@@ -361,17 +302,13 @@ async fn build_fixture(
     Fixture {
         tool,
         script,
-        registry,
         _server: server,
-        memory,
         _workspace: workspace,
     }
 }
 
 #[derive(Debug)]
 struct Run {
-    id: String,
-    parent: Option<String>,
     task: String,
     status: SubAgentStatus,
 }
@@ -403,8 +340,6 @@ async fn settled(tool: &SessionsSpawnTool, expected: usize) -> Vec<Run> {
                 return runs
                     .iter()
                     .map(|run| Run {
-                        id: run.id.clone(),
-                        parent: run.parent_run_id.clone(),
                         task: run.task.clone(),
                         status: run.status.clone(),
                     })
@@ -427,111 +362,6 @@ fn run_for<'a>(runs: &'a [Run], label: &str) -> &'a Run {
 }
 
 /// Full: neither the root nor its child needs a grant to spawn.
-#[tokio::test]
-async fn full_root_and_child_spawn_without_grant() {
-    let fixture = fixture(Options {
-        level: AutonomyLevel::Full,
-        daily_cap_cents: None,
-    })
-    .await;
-    let task = chain("PRX-CHILD.", Some(spawn_args("PRX-GRANDCHILD.".to_owned())));
-    let result = execute_admitted_spawn(&fixture.tool, spawn_args(task))
-        .await
-        .expect("test: ungranted Full root spawn");
-    assert!(result.success, "{:?}", result.error);
-    let runs = settled(&fixture.tool, 2).await;
-    let child = run_for(&runs, "PRX-CHILD.");
-    let grandchild = run_for(&runs, "PRX-GRANDCHILD.");
-    assert_eq!(child.output(), Some(DONE));
-    assert_eq!(grandchild.output(), Some(DONE));
-    assert_eq!(grandchild.parent.as_deref(), Some(child.id.as_str()));
-}
-
-/// Supervised, root and recursive child alike, in two layers. (1) Without an
-/// approval resolver both dispatches are refused at dispatch approval with
-/// the same literal, with no run and no model request for the refused spawn.
-/// (2) Through the production run approval strategy with an approving
-/// resolver both dispatches are approved, the runtime grant each approval
-/// issues passes the spawn's side-effect gate, and the child runs.
-#[tokio::test]
-async fn supervised_child_follows_root_dispatch_approval() {
-    // (1) Root: the execution service's default strategy refuses.
-    let refused = fixture(Options {
-        level: AutonomyLevel::Supervised,
-        daily_cap_cents: None,
-    })
-    .await;
-    let error = execute_admitted_spawn(&refused.tool, spawn_args("PRX-REFUSED-ROOT.".to_owned()))
-        .await
-        .expect_err("an unapproved root spawn must not execute");
-    assert_eq!(error.to_string(), NO_RESOLVER);
-    assert!(refused.tool.active_runs_snapshot().await.is_empty());
-    assert!(refused.script.for_task("PRX-REFUSED-ROOT.").is_empty());
-    // (1) Child: a root spawn approved by the run approval resolver starts a
-    // child whose run has no resolver (no factory); its own spawn is refused
-    // with the same literal and starts nothing.
-    let task = chain(
-        "PRX-SUPERVISED-CHILD.",
-        Some(spawn_args("PRX-REFUSED-LEAF.".to_owned())),
-    );
-    let root_approval = run_approval(&refused.tool, Arc::new(GrantingResolver::default()));
-    let started = execute_admitted_spawn_with_approval(&refused.tool, spawn_args(task), root_approval)
-        .await
-        .expect("test: approved root spawn");
-    assert!(started.success, "{:?}", started.error);
-    let runs = settled(&refused.tool, 1).await;
-    assert_eq!(runs.len(), 1, "the refused child spawn registered no run: {runs:?}");
-    let child = refused.script.for_task("PRX-SUPERVISED-CHILD.");
-    assert!(
-        child
-            .iter()
-            .any(|seen| seen.results.iter().any(|result| result.contains(NO_RESOLVER))),
-        "the child's spawn is refused at dispatch approval: {child:?}"
-    );
-    assert!(refused.script.for_task("PRX-REFUSED-LEAF.").is_empty());
-
-    // (2) The root runs under the run approval strategy (an approval manager
-    // and the approving resolver); each task child's run mints the same
-    // resolver from the run factory. Neither dispatch carries a grant.
-    let resolver = Arc::new(GrantingResolver::default());
-    let minted: Arc<dyn crate::agent::turn_contracts::ApprovalResolver> = resolver.clone();
-    let approving = fixture_with(
-        Options {
-            level: AutonomyLevel::Supervised,
-            daily_cap_cents: None,
-        },
-        Some(crate::agent::turn_request::SpawnApprovalResolverFactory::new(
-            move |_| Arc::clone(&minted),
-        )),
-    )
-    .await;
-    let root_approval = run_approval(&approving.tool, Arc::clone(&resolver));
-    let task = chain("PRX-APPROVED-CHILD.", Some(spawn_args("PRX-APPROVED-LEAF.".to_owned())));
-    let started = execute_admitted_spawn_with_approval(&approving.tool, spawn_args(task), root_approval)
-        .await
-        .expect("test: approved root spawn");
-    assert!(started.success, "{:?}", started.error);
-    let runs = settled(&approving.tool, 2).await;
-    let child = run_for(&runs, "PRX-APPROVED-CHILD.");
-    let leaf = run_for(&runs, "PRX-APPROVED-LEAF.");
-    assert_eq!(child.output(), Some(DONE));
-    assert_eq!(leaf.output(), Some(DONE));
-    assert_eq!(leaf.parent.as_deref(), Some(child.id.as_str()));
-    assert!(
-        approving
-            .script
-            .for_task("PRX-APPROVED-CHILD.")
-            .iter()
-            .all(|seen| seen.results.iter().all(|result| !result.contains(NO_RESOLVER))),
-        "the child's spawn is not refused at dispatch approval"
-    );
-    assert_eq!(
-        resolver.asked.load(std::sync::atomic::Ordering::SeqCst),
-        2,
-        "the resolver decided the root spawn and the child spawn"
-    );
-}
-
 /// ReadOnly: the opt-in changes nothing; the root spawn is refused exactly
 /// as without it and no child exists.
 #[tokio::test]
@@ -557,36 +387,6 @@ async fn read_only_root_spawn_is_refused_as_without_recursion() {
     assert_eq!(outcomes.first(), outcomes.get(1), "the opt-in changes the refusal");
     assert!(fixture.tool.active_runs_snapshot().await.is_empty());
     assert!(fixture.script.for_task("PRX-READ-ONLY.").is_empty());
-}
-
-/// A root whose catalog has `sessions_spawn` and other tools but no
-/// `delegate` derives a recursive child.
-#[tokio::test]
-async fn root_without_delegate_derives_a_recursive_child() {
-    let fixture = fixture(Options {
-        level: AutonomyLevel::Supervised,
-        daily_cap_cents: None,
-    })
-    .await;
-    assert!(
-        fixture.registry.iter().all(|tool| tool.name() != "delegate") && fixture.registry.len() > 1,
-        "test: the catalog has other tools and no delegate"
-    );
-    let root_approval = run_approval(&fixture.tool, Arc::new(GrantingResolver::default()));
-    let result =
-        execute_admitted_spawn_with_approval(&fixture.tool, spawn_args("PRX-NO-DELEGATE.".to_owned()), root_approval)
-            .await
-            .expect("test: approved root spawn");
-    assert!(result.success, "{:?}", result.error);
-    let runs = settled(&fixture.tool, 1).await;
-    assert_eq!(run_for(&runs, "PRX-NO-DELEGATE.").output(), Some(DONE));
-    let seen = fixture.script.for_task("PRX-NO-DELEGATE.");
-    assert!(
-        seen.first()
-            .is_some_and(|seen| seen.tools.iter().any(|tool| tool == "sessions_spawn")
-                && !seen.tools.iter().any(|tool| tool == "delegate")),
-        "the child keeps sessions_spawn without a delegate tool: {seen:?}"
-    );
 }
 
 /// An exhausted allowance carves a zero-funded child: its paid send reaches
@@ -624,171 +424,4 @@ async fn exhausted_allowance_spawns_a_zero_funded_child() {
     );
     assert_eq!(run_for(&runs, "PRX-FREE.").output(), Some(DONE));
     assert!(!fixture.script.for_task("PRX-FREE.").is_empty());
-}
-
-/// Page size and page bound of a store read-back through the repository.
-const STORE_PAGE: usize = 256;
-const MAX_STORE_PAGES: usize = 16;
-
-/// A reader of the fixture workspace scoped to `session_key`: it sees every
-/// workspace-visible row plus that session's own rows.
-fn store_principal(fixture: &Fixture, session_key: Option<&str>) -> MemoryPrincipal {
-    MemoryPrincipal {
-        workspace_id: fixture.tool.workspace_dir.to_string_lossy().into_owned(),
-        session_key: session_key.map(str::to_owned),
-        ..MemoryPrincipal::default()
-    }
-}
-
-/// Every message event `principal` may read, oldest first (bounded).
-async fn stored_rows(fixture: &Fixture, principal: &MemoryPrincipal) -> Vec<crate::memory::MessageEvent> {
-    let mut rows = Vec::new();
-    let mut after = 0;
-    for page_index in 0..MAX_STORE_PAGES {
-        let page = fixture
-            .memory
-            .list_message_events_since(principal, after, STORE_PAGE)
-            .await
-            .expect("test: read message events");
-        let Some(last) = page.last() else {
-            return rows;
-        };
-        assert!(last.id > after, "test: the message-event cursor advances");
-        after = last.id;
-        rows.extend(page);
-        assert!(
-            page_index + 1 < MAX_STORE_PAGES,
-            "test: the store exceeded the read bound"
-        );
-    }
-    rows
-}
-
-/// I1: a Full child that inherited `sessions_spawn` keeps it on its surface
-/// even though its input names a tool outside its sealed manifest
-/// (`capability_search`); the named tool is dropped from the request, never
-/// the delegation.
-#[tokio::test]
-async fn full_child_naming_an_unsealed_tool_still_spawns_a_grandchild() {
-    let fixture = fixture(Options {
-        level: AutonomyLevel::Full,
-        daily_cap_cents: None,
-    })
-    .await;
-    let task = chain(
-        "PRX-NAMING-CHILD. Use sessions_spawn and capability_search.",
-        Some(spawn_args("PRX-NAMED-GRANDCHILD.".to_owned())),
-    );
-    let result = execute_admitted_spawn(&fixture.tool, spawn_args(task))
-        .await
-        .expect("test: Full root spawn");
-    assert!(result.success, "{:?}", result.error);
-    let runs = settled(&fixture.tool, 2).await;
-    let seen = fixture.script.for_task("PRX-NAMING-CHILD.");
-    assert!(
-        seen.first()
-            .is_some_and(|seen| seen.tools.iter().any(|tool| tool == "sessions_spawn")),
-        "the naming child lists sessions_spawn: {seen:?}"
-    );
-    let child = run_for(&runs, "PRX-NAMING-CHILD.");
-    let grandchild = run_for(&runs, "PRX-NAMED-GRANDCHILD.");
-    assert_eq!(grandchild.parent.as_deref(), Some(child.id.as_str()));
-    assert_eq!(child.output(), Some(DONE));
-    assert_eq!(grandchild.output(), Some(DONE));
-}
-
-/// I4: every spawned run records under `spawn:<run_id>` and links to its
-/// caller through `parent_session_key`; nothing lands under the turn root's
-/// chat key.
-#[tokio::test]
-async fn spawned_runs_record_under_their_own_session_keys() {
-    const ROOT_SCOPE: &str = "chat:prx-session";
-    let fixture = fixture(Options {
-        level: AutonomyLevel::Full,
-        daily_cap_cents: None,
-    })
-    .await;
-    let task = chain("PRX-KEYED-CHILD.", Some(spawn_args("PRX-KEYED-GRANDCHILD.".to_owned())));
-    let root = SpawnExecutionContext::seed_turn_context("prx-root-turn".to_owned(), ROOT_SCOPE.to_owned());
-    let result = SPAWN_EXECUTION_CONTEXT
-        .scope(root, execute_admitted_spawn(&fixture.tool, spawn_args(task)))
-        .await
-        .expect("test: Full root spawn under a chat turn root");
-    assert!(result.success, "{:?}", result.error);
-    let runs = settled(&fixture.tool, 2).await;
-    let child = run_for(&runs, "PRX-KEYED-CHILD.");
-    let grandchild = run_for(&runs, "PRX-KEYED-GRANDCHILD.");
-    assert_eq!(grandchild.parent.as_deref(), Some(child.id.as_str()));
-
-    let child_key = format!("spawn:{}", child.id);
-    let grandchild_key = format!("spawn:{}", grandchild.id);
-    let child_rows = stored_rows(&fixture, &store_principal(&fixture, Some(&child_key))).await;
-    // The caller link the child's input carries is the root caller's own
-    // conversation key: the caller's message is recorded under it.
-    let root_key = child_rows
-        .iter()
-        .find(|row| {
-            row.source == "sessions_spawn" && row.role == "user" && row.run_id.as_deref() == Some(child.id.as_str())
-        })
-        .and_then(|row| row.parent_session_key.clone())
-        .expect("test: the child's input names its caller's session");
-    assert!(root_key != ROOT_SCOPE && !root_key.starts_with("spawn:"), "{root_key}");
-    let root_rows = stored_rows(&fixture, &store_principal(&fixture, Some(&root_key))).await;
-    assert!(
-        root_rows.iter().any(|row| row.source == "channel"
-            && row.role == "user"
-            && row.session_key.as_deref() == Some(root_key.as_str())),
-        "the root caller's message is recorded under {root_key}"
-    );
-    assert!(
-        root_rows
-            .iter()
-            .all(|row| !(row.source == "sessions_spawn" && row.session_key.as_deref() == Some(root_key.as_str()))),
-        "no spawned-run row lands under the caller's key"
-    );
-    for (run, key, parent_key) in [
-        (child, child_key.as_str(), root_key.as_str()),
-        (grandchild, grandchild_key.as_str(), child_key.as_str()),
-    ] {
-        let rows = stored_rows(&fixture, &store_principal(&fixture, Some(key))).await;
-        let own: Vec<_> = rows
-            .iter()
-            .filter(|row| row.source == "sessions_spawn" && row.run_id.as_deref() == Some(run.id.as_str()))
-            .collect();
-        assert!(!own.is_empty(), "{key}: the run recorded rows");
-        assert!(
-            own.iter().all(|row| row.session_key.as_deref() == Some(key)),
-            "{key}: every row of the run uses its own key: {own:?}"
-        );
-        let keyed: Vec<_> = rows
-            .iter()
-            .filter(|row| row.source == "sessions_spawn" && row.session_key.as_deref() == Some(key))
-            .collect();
-        assert!(
-            keyed
-                .iter()
-                .all(|row| row.parent_session_key.as_deref() == Some(parent_key)),
-            "{key}: every row links to its caller {parent_key}: {keyed:?}"
-        );
-    }
-    let child_tools: Vec<_> = child_rows
-        .iter()
-        .filter(|row| {
-            row.event_type.starts_with("tool.execution.") && row.session_key.as_deref() == Some(child_key.as_str())
-        })
-        .collect();
-    assert!(!child_tools.is_empty(), "the child's spawn call recorded tool rows");
-    assert!(
-        child_tools
-            .iter()
-            .all(|row| row.parent_session_key.as_deref() == Some(root_key.as_str())),
-        "the child's tool rows name its parent: {child_tools:?}"
-    );
-    let scope_rows = stored_rows(&fixture, &store_principal(&fixture, Some(ROOT_SCOPE))).await;
-    assert!(
-        scope_rows
-            .iter()
-            .all(|row| !(row.source == "sessions_spawn" && row.session_key.as_deref() == Some(ROOT_SCOPE))),
-        "no spawned-run row lands under the turn root's chat key"
-    );
 }

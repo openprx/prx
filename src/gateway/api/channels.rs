@@ -1056,7 +1056,10 @@ mod tests {
         let recorder = RecordingChannel::new(false);
         let denied_publication = published(&recorder);
         let mut denied_config = scoped_config(denied_workspace.path(), &[], None);
-        denied_config.autonomy.level = AutonomyLevel::Supervised;
+        denied_config.autonomy.scopes.rules = vec![ScopeRule {
+            send_deny: vec![format!("{CHANNEL}:{RECIPIENT}")],
+            ..ScopeRule::default()
+        }];
         let (denied_url, _denied_port, denied_server) = serve(test_app_state(denied_config)).await;
         let (denied_status, refusal_body) = post_raw(
             &denied_url,

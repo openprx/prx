@@ -16,10 +16,6 @@
 //! (`parent::PARENT_DEADLINE`, `provider::WORKER_DEADLINE`,
 //! `provider::HOLD_WAIT`) and every guard cleans up on failure.
 
-#[path = "ordinary_process_worker/lineage.rs"]
-mod lineage;
-#[path = "ordinary_process_worker/operator.rs"]
-mod operator;
 #[path = "ordinary_process_worker/parent.rs"]
 mod parent;
 #[path = "ordinary_process_worker/provider.rs"]

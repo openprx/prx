@@ -382,6 +382,11 @@ impl OrdinaryChildPublication {
             .carve_ordinary_child(self.scope().gate_inputs().0.authority.max_cost_cents)
     }
 
+    /// The exact live registry behind the pinned parent catalog.
+    pub(crate) fn registry(&self) -> Arc<Vec<Box<dyn Tool>>> {
+        Arc::clone(&self.inner.service.registry)
+    }
+
     /// Derive an in-process worker from the actual parent publication. It
     /// borrows the parent's complete catalog and keeps its exact selected
     /// scope; it never creates a durable grant or loads a workspace key.

@@ -1373,7 +1373,8 @@ impl DelegateLoopResources {
             "delegate resolved child compaction window"
         );
 
-        let registry = Arc::new(sub_tools);
+        // Execute against the same live registry that issued the sealed catalog.
+        let registry = child_source.authority.publication.registry();
         let DelegateTaskContext {
             cancellation,
             cleanup_owner,
@@ -1401,7 +1402,7 @@ impl DelegateLoopResources {
                 let owner = cleanup_owner
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("ordinary delegate cleanup owner missing"))?;
-                let service = publication.child_service(caller, allowed_tools, Some(Arc::clone(&registry)))?;
+                let service = publication.child_service(caller, allowed_tools, None)?;
                 owner.retain_child_service(Arc::clone(&service))?;
                 (service, Arc::clone(&publication.generation().effective))
             };
