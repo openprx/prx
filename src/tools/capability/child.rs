@@ -250,8 +250,18 @@ impl ChildCapabilityManifest {
         if parent.authority.remaining_depth == 0 {
             return Err(ChildManifestError::DepthExhausted);
         }
-        let allowed: BTreeSet<_> = requested.iter().cloned().collect();
-        if allowed.len() >= parent.allowed.len() || !allowed.is_subset(&parent.allowed) {
+        let child_level = match level {
+            ChildLevel::Parent => parent.authority.level,
+            ChildLevel::NamedAgent(named) => named,
+        };
+        // A Full child gets the tool set of its own level (the whole parent
+        // set); below Full the child is a strict subset of its parent.
+        let allowed: BTreeSet<_> = if child_level == AutonomyLevel::Full {
+            parent.allowed.clone()
+        } else {
+            requested.iter().cloned().collect()
+        };
+        if !subset_within(&allowed, &parent.allowed, child_level, parent.authority.level) {
             return Err(ChildManifestError::NotStrictSubset);
         }
         if allowed
@@ -303,7 +313,12 @@ impl ChildCapabilityManifest {
         if self.catalog_generation != parent.catalog_generation {
             return Err(ChildManifestError::StaleReference);
         }
-        if self.allowed.len() >= parent.allowed.len() || !self.allowed.is_subset(&parent.allowed) {
+        if !subset_within(
+            &self.allowed,
+            &parent.allowed,
+            self.authority.level,
+            parent.authority.level,
+        ) {
             return Err(ChildManifestError::NotStrictSubset);
         }
         if self.authority.owner != parent.authority.owner
@@ -388,6 +403,22 @@ fn decode_worker_refs(
         }
     }
     Ok(allowed)
+}
+
+/// The depth bound of a child chain, counted from its root, for every child
+/// kind and level.
+pub const MAX_CHILD_DEPTH: u8 = 8;
+
+/// A child's capability set against its parent's: a subset when the child or
+/// its parent runs at Full, a strict subset when both run below Full.
+fn subset_within(
+    child: &BTreeSet<CapabilityRef>,
+    parent: &BTreeSet<CapabilityRef>,
+    level: AutonomyLevel,
+    parent_level: AutonomyLevel,
+) -> bool {
+    child.is_subset(parent)
+        && (level == AutonomyLevel::Full || parent_level == AutonomyLevel::Full || child.len() < parent.len())
 }
 
 fn append(out: &mut Vec<u8>, value: &[u8]) {

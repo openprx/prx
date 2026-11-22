@@ -100,7 +100,9 @@ impl ChildCapabilityManifest {
         if parent_authority_id.to_string() != wire.parent_decision_id
             || wire.owner.is_empty()
             || wire.workspace.is_empty()
-            || wire.allowed.len() >= parent.allowed.len()
+            || (wire.level != crate::security::AutonomyLevel::Full
+                && parent.authority.level != crate::security::AutonomyLevel::Full
+                && wire.allowed.len() >= parent.allowed.len())
         {
             return Err(invalid());
         }

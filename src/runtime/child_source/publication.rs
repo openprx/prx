@@ -13,7 +13,6 @@ use crate::runtime::turn_publication::PublicationLoopRuntime;
 use crate::runtime::turn_publication::TurnRuntimeService;
 use crate::runtime::turn_publication::service::pinned_policy_version;
 use crate::runtime::turn_source::TurnSourceProof;
-use crate::tools::capability::catalog::CatalogScope;
 use crate::tools::capability::contract::CapabilityRef;
 use crate::tools::capability::turn_state::TurnSurfaceKind;
 use crate::tools::execution::ToolExecutionService;
@@ -439,14 +438,18 @@ impl OrdinaryChildPublication {
         if let Some(allowed_tools) = allowed_tools {
             policy.allowed_tools = Some(allowed_tools);
         }
+        // Every scope member must be on the parent's surface. The child's own
+        // allowance and exclusions only narrow what it publishes: a child at
+        // a level below its Full parent holds the parent's whole set and
+        // publishes the part its allowance names; a call outside the
+        // published surface is refused at dispatch.
         let parent_view = parent.catalog_view();
-        let view = parent.catalog.view(&CatalogScope::default()).with_surface(&policy);
         for reference in &self.scope().gate_inputs().0.allowed {
-            let entry = view
+            let entry = parent_view
                 .entry_any(&reference.id)
                 .context("ordinary child capability missing")?;
             anyhow::ensure!(
-                !view.surface_excludes(entry) && !parent_view.surface_excludes(entry),
+                !parent_view.surface_excludes(entry),
                 "ordinary child capability exceeds publication policy"
             );
         }

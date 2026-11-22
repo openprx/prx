@@ -245,25 +245,25 @@ impl TurnRuntimeService {
             // complete request still strictly narrows the parent.
             requested.push(reference);
         }
-        // A model-only child requests no tools. The empty set is a strict
-        // subset of a parent that owns a delegator; it must not inherit the
-        // parent's tools merely to make delegation possible. The manifest
-        // still binds owner, budget, catalog generation and reduced depth.
-        if requested.len() >= allowed.len() {
-            return None;
-        }
-        // Strictly shrinking finite sets already bound a chain. This records
-        // that bound within the existing wire representation; it introduces
-        // no runtime concurrency setting or retired max_spawn_depth key.
-        let remaining_depth = u8::try_from(allowed.len()).unwrap_or(u8::MAX);
-        let max_cost_cents = u32::try_from(trusted.budgets.micro_usd / 10_000)
-            .unwrap_or(u32::MAX)
-            .min(self.security.max_cost_per_day_cents);
         let level = if trusted.side_effect_mode == SideEffectMode::ReadOnly {
             AutonomyLevel::ReadOnly
         } else {
             self.security.autonomy
         };
+        // A model-only child requests no tools. Below Full the empty set is a
+        // strict subset of a parent that owns a delegator; it must not inherit
+        // the parent's tools merely to make delegation possible. A Full child
+        // gets the tool set of its level. The manifest still binds owner,
+        // budget, catalog generation and reduced depth.
+        let child_level = inherited.map_or(level, |manifest| manifest.authority.level);
+        if child_level != AutonomyLevel::Full && requested.len() >= allowed.len() {
+            return None;
+        }
+        // A chain is bounded by a fixed depth from its root.
+        let remaining_depth = crate::tools::capability::child::MAX_CHILD_DEPTH;
+        let max_cost_cents = u32::try_from(trusted.budgets.micro_usd / 10_000)
+            .unwrap_or(u32::MAX)
+            .min(self.security.max_cost_per_day_cents);
         let parent = CapabilityConstraints {
             parent_authority_id: decision_id.into(),
             allowed,

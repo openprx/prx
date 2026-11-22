@@ -71,13 +71,13 @@ impl OperatorChildPublication {
         let remaining = runtime.workspace_remaining_micro_usd()?;
         let authority = crate::runtime::child_source::ParentAuthority::for_run(
             source.run_id(),
-            allowed.clone(),
+            allowed,
             crate::tools::capability::child::AuthorityEnvelope {
                 owner: source.owner_id().to_owned(),
                 workspace: source.workspace_id().to_owned(),
                 level: security.autonomy,
                 max_cost_cents: security.max_cost_per_day_cents,
-                remaining_depth: u8::try_from(allowed.len()).unwrap_or(u8::MAX),
+                remaining_depth: crate::tools::capability::child::MAX_CHILD_DEPTH,
                 delegation: None,
             },
             *service.catalog.generation(),

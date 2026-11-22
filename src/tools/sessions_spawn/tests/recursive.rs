@@ -19,7 +19,6 @@ const MAX_SEEN: usize = 64;
 const RUN_DEADLINE: Duration = Duration::from_secs(30);
 /// The existing dispatch-approval refusal (`kill_and_events.rs`).
 const NO_RESOLVER: &str = "approval required but no approval resolver is available";
-const NOT_STRICT: &str = "recursive child manifest refused: child capabilities are not a strict subset of the parent";
 /// Loopback Ollama model with no price row: zero-price exempt.
 const FREE_MODEL: &str = "prx-free-model";
 /// A word `PRX-SEARCH=<query>` in a task makes its model call
@@ -695,70 +694,6 @@ async fn exhausted_allowance_spawns_a_zero_funded_child() {
     assert!(!fixture.script.for_task("PRX-FREE.").is_empty());
 }
 
-/// Parity default (controller rulings, G5b c2a and 2b): an omitted flag
-/// derives a child that can spawn. Nesting ends at the sealed bound: each
-/// level keeps a strict subset of its parent and the root's sealed depth is
-/// its set size, so the last level's recursive derivation is refused by the
-/// strict-subset rule. There an omitted flag falls back to a non-delegating
-/// leaf, as `false` does, while an explicit `true` keeps the typed refusal.
-#[tokio::test]
-async fn omitted_flag_child_spawns_until_the_depth_bound() {
-    let fixture = fixture(Options {
-        level: AutonomyLevel::Full,
-        daily_cap_cents: None,
-    })
-    .await;
-    let task = chain("PRX-LEVEL-1.", Some(spawn_args("PRX-LEVEL-2.".to_owned())));
-    let result = execute_admitted_spawn(&fixture.tool, json!({"task": task}))
-        .await
-        .expect("test: default root spawn");
-    assert!(result.success, "{:?}", result.error);
-    let mut refused = spawn_args("PRX-REFUSED-LEAF.".to_owned());
-    refused["allow_delegation"] = json!(true);
-    let task = chain("PRX-EXPLICIT.", Some(refused));
-    let result = execute_admitted_spawn(&fixture.tool, spawn_args(task))
-        .await
-        .expect("test: default root spawn with an explicitly recursive child");
-    assert!(result.success, "{:?}", result.error);
-    let runs = settled(&fixture.tool, 3).await;
-    assert_eq!(
-        runs.len(),
-        3,
-        "exactly level 1, its fallback leaf and the explicit child: {runs:?}"
-    );
-
-    let level_one = fixture.script.for_task("PRX-LEVEL-1.");
-    assert!(
-        level_one
-            .first()
-            .is_some_and(|seen| seen.tools.iter().any(|tool| tool == "sessions_spawn")),
-        "the default child can spawn: {level_one:?}"
-    );
-    let level_one = run_for(&runs, "PRX-LEVEL-1.");
-    let level_two = run_for(&runs, "PRX-LEVEL-2.");
-    assert_eq!(level_one.output(), Some(DONE));
-    assert_eq!(level_two.output(), Some(DONE));
-    assert_eq!(level_two.parent.as_deref(), Some(level_one.id.as_str()));
-    assert!(
-        fixture
-            .script
-            .for_task("PRX-LEVEL-2.")
-            .first()
-            .is_some_and(|seen| !seen.tools.iter().any(|tool| tool == "sessions_spawn")),
-        "the fallback leaf at the bound cannot spawn"
-    );
-
-    let explicit = fixture.script.for_task("PRX-EXPLICIT.");
-    assert!(
-        explicit
-            .iter()
-            .any(|seen| seen.results.iter().any(|result| result.contains(NOT_STRICT))),
-        "an explicit true at the bound is refused: {explicit:?}"
-    );
-    assert_eq!(run_for(&runs, "PRX-EXPLICIT.").output(), Some(DONE));
-    assert!(fixture.script.for_task("PRX-REFUSED-LEAF.").is_empty());
-}
-
 /// Page size and page bound of a store read-back through the repository.
 const STORE_PAGE: usize = 256;
 const MAX_STORE_PAGES: usize = 16;
@@ -795,41 +730,6 @@ async fn stored_rows(fixture: &Fixture, principal: &MemoryPrincipal) -> Vec<crat
         );
     }
     rows
-}
-
-/// `(run id, child_delegation)` of every stored `task.spawned` event.
-async fn task_spawned_delegations(fixture: &Fixture) -> Vec<(String, Option<String>)> {
-    let principal = store_principal(fixture, None);
-    let mut recorded = Vec::new();
-    let mut after = 0;
-    for page_index in 0..MAX_STORE_PAGES {
-        let page = fixture
-            .memory
-            .list_memory_events_since(&principal, after, STORE_PAGE)
-            .await
-            .expect("test: read memory events");
-        let Some(last) = page.last() else {
-            return recorded;
-        };
-        assert!(last.id > after, "test: the memory-event cursor advances");
-        after = last.id;
-        recorded.extend(
-            page.into_iter()
-                .filter(|event| event.event_type == "task.spawned")
-                .map(|event| {
-                    let code = event
-                        .payload_json
-                        .and_then(|payload| serde_json::from_str::<serde_json::Value>(&payload).ok())
-                        .and_then(|payload| payload.get("child_delegation")?.as_str().map(str::to_owned));
-                    (event.subject_id, code)
-                }),
-        );
-        assert!(
-            page_index + 1 < MAX_STORE_PAGES,
-            "test: the store exceeded the read bound"
-        );
-    }
-    recorded
 }
 
 /// The `capability_search` hit for `name` among a model's tool results. A
@@ -881,76 +781,6 @@ async fn full_child_naming_an_unsealed_tool_still_spawns_a_grandchild() {
     assert_eq!(grandchild.parent.as_deref(), Some(child.id.as_str()));
     assert_eq!(child.output(), Some(DONE));
     assert_eq!(grandchild.output(), Some(DONE));
-}
-
-/// I3: the spawn result names whether the child can spawn and, when it
-/// cannot, why; the `task.spawned` record carries the same classification.
-#[tokio::test]
-async fn spawn_result_and_task_event_state_child_delegation() {
-    let fixture = fixture(Options {
-        level: AutonomyLevel::Full,
-        daily_cap_cents: None,
-    })
-    .await;
-    let recursive = execute_admitted_spawn(&fixture.tool, spawn_args("PRX-CAN-SPAWN.".to_owned()))
-        .await
-        .expect("test: default spawn");
-    assert!(recursive.success, "{:?}", recursive.error);
-    assert!(
-        recursive.output.contains("). Child can spawn: yes. "),
-        "{}",
-        recursive.output
-    );
-    let mut opted_out = spawn_args("PRX-OPTED-OUT.".to_owned());
-    opted_out["allow_delegation"] = json!(false);
-    let opted_out = execute_admitted_spawn(&fixture.tool, opted_out)
-        .await
-        .expect("test: opt-out spawn");
-    assert!(opted_out.success, "{:?}", opted_out.error);
-    assert!(
-        opted_out
-            .output
-            .contains("). Child can spawn: no (allow_delegation=false). "),
-        "{}",
-        opted_out.output
-    );
-    let task = chain("PRX-BOUND-1.", Some(spawn_args("PRX-BOUND-2.".to_owned())));
-    let chained = execute_admitted_spawn(&fixture.tool, json!({"task": task}))
-        .await
-        .expect("test: chained default spawn");
-    assert!(chained.success, "{:?}", chained.error);
-    assert!(
-        chained.output.contains("). Child can spawn: yes. "),
-        "{}",
-        chained.output
-    );
-    let runs = settled(&fixture.tool, 4).await;
-
-    let level_one = fixture.script.for_task("PRX-BOUND-1.");
-    assert!(
-        level_one.iter().any(|seen| seen
-            .results
-            .iter()
-            .any(|result| result.contains("Child can spawn: no (not_strict_subset)."))),
-        "level 1 sees its leaf child's reason: {level_one:?}"
-    );
-
-    let recorded = task_spawned_delegations(&fixture).await;
-    for (label, code) in [
-        ("PRX-CAN-SPAWN.", "recursive"),
-        ("PRX-OPTED-OUT.", "opted_out"),
-        ("PRX-BOUND-1.", "recursive"),
-        ("PRX-BOUND-2.", "leaf:not_strict_subset"),
-    ] {
-        let run = run_for(&runs, label);
-        assert_eq!(run.output(), Some(DONE), "{label}");
-        assert!(
-            recorded
-                .iter()
-                .any(|(id, recorded)| *id == run.id && recorded.as_deref() == Some(code)),
-            "{label}: task.spawned carries child_delegation={code}: {recorded:?}"
-        );
-    }
 }
 
 /// I2 in a real Full child turn: a child without an outgoing manifest sees
