@@ -268,9 +268,18 @@ impl RunApprovalResolver {
             self.approvals.entries.lock().remove(&id);
             decided
         };
+        if decision == Decision::Cancelled {
+            return Ok(ToolApprovalDecision::Cancelled {
+                reason: "approval cancelled".to_owned(),
+            });
+        }
         if decision != Decision::Approved {
             return Ok(ToolApprovalDecision::Denied {
-                cause: crate::tools::ApprovalDenialCause::UserRejected,
+                cause: if decision == Decision::Expired {
+                    crate::tools::ApprovalDenialCause::NoAnswer
+                } else {
+                    crate::tools::ApprovalDenialCause::UserRejected
+                },
                 reason: format!("approval {}", decision.as_str()),
             });
         }
