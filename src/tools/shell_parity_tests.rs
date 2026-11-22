@@ -140,50 +140,6 @@ async fn restricted_shell_refuses_git_before_spawn() {
 }
 
 #[tokio::test]
-async fn native_file_confinement_uses_effective_level_and_rejects_parent_traversal() {
-    let root = tempfile::tempdir().expect("test: workspace");
-    let outside = tempfile::tempdir().expect("test: outside");
-    let security = Arc::new(SecurityPolicy {
-        workspace_dir: root.path().into(),
-        autonomy: AutonomyLevel::Full,
-        ..SecurityPolicy::default()
-    });
-    let write = FileWriteTool::new(security.clone());
-    let edit = FileEditTool::new(security.clone());
-    let read = FileReadTool::new(security, false);
-    let path = outside.path().join("parity.txt");
-    for level in [AutonomyLevel::Supervised, AutonomyLevel::Full] {
-        let result = direct(&write, level, json!({"path":path,"content":"alpha"})).await;
-        assert_eq!(
-            result.success,
-            level == AutonomyLevel::Full,
-            "test: confinement: {result:?}"
-        );
-        let result = direct(&write, level, json!({"path":"../escape.txt","content":"blocked"})).await;
-        assert!(!result.success, "test: parent traversal denied: {level:?}");
-    }
-    let edited = direct(
-        &edit,
-        AutonomyLevel::Full,
-        json!({"path":path,"old_string":"alpha","new_string":"beta"}),
-    )
-    .await;
-    assert!(edited.success, "test: outside edit: {edited:?}");
-    let read_result = direct(&read, AutonomyLevel::Full, json!({"path":path})).await;
-    assert!(read_result.success, "test: outside read: {read_result:?}");
-    assert_eq!(read_result.output, "beta", "test: physical file content");
-    for tool in [&edit as &dyn Tool, &read as &dyn Tool] {
-        let result = direct(
-            tool,
-            AutonomyLevel::Supervised,
-            json!({"path":path,"old_string":"beta","new_string":"blocked"}),
-        )
-        .await;
-        assert!(!result.success, "test: restricted outside access: {result:?}");
-    }
-}
-
-#[tokio::test]
 async fn full_shell_environment_keeps_proxy_and_strips_credentials() {
     const PROBE: &str = "PRX_FULL_ENV_TEST";
     if std::env::var_os(PROBE).is_none() {

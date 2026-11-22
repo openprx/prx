@@ -970,8 +970,18 @@ async fn run_turn_unguarded(
         }
 
         let media_artifacts = hooks.media_artifacts();
-        let mut prepared_messages =
-            multimodal::prepare_messages_for_provider(history, multimodal_config, media_artifacts.as_ref()).await?;
+        // Media sources load at the turn's effective level (a child turn's
+        // sealed level, else the service's): at Full they are not confined
+        // to the workspace.
+        let media_level = crate::runtime::turn_source::TurnSourceProof::child_scope(proof).map_or_else(
+            || service.security().autonomy,
+            |scope| scope.gate_inputs().0.authority.level,
+        );
+        let mut prepared_messages = crate::tools::effective_autonomy::scope(
+            media_level,
+            multimodal::prepare_messages_for_provider(history, multimodal_config, media_artifacts.as_ref()),
+        )
+        .await?;
         // Corrective instructions are appended at the tail, not as request-local
         // `system` context. A system message here is folded into the leading
         // one by `coalesce_system_messages_at_front` below, which appends bytes

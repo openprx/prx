@@ -67,6 +67,7 @@ async fn session_switch_fail_closes_pending_approvals_and_resets_mirror() {
     });
     let plan = diff_apply::parse_unified_diff(
         "diff --git a/foo.txt b/foo.txt\n--- a/foo.txt\n+++ b/foo.txt\n@@ -1 +1 @@\n-old\n+new\n",
+        crate::security::AutonomyLevel::Supervised,
     )
     .expect("valid diff fixture");
     let mut pending_diff_apply = Some(PendingDiffApply {

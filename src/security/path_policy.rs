@@ -23,6 +23,31 @@ pub(crate) fn resolve_request_path(root: &Path, request: &str) -> std::io::Resul
     Ok(std::path::absolute(root)?.join(crate::config::expand_home(Path::new(request))))
 }
 
+/// Resolve a request at Full: absolute paths and `..` are allowed. The path
+/// is joined to the root and normalised lexically (a `..` above the
+/// filesystem root stays at the root); the operating system decides the
+/// rest. A NUL byte is still refused.
+pub fn resolve_full_request_path(root: &Path, request: &str) -> std::io::Result<PathBuf> {
+    if request.contains('\0') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid file path",
+        ));
+    }
+    let joined = std::path::absolute(root)?.join(crate::config::expand_home(Path::new(request)));
+    let mut normalized = PathBuf::new();
+    for part in joined.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other),
+        }
+    }
+    Ok(normalized)
+}
+
 /// The below-Full confinement of a file_write or file_edit target, run by the
 /// tool's precheck and again at execute time. The outer error is a policy
 /// refusal; the inner one is a target that does not resolve (reported by

@@ -227,7 +227,12 @@ fn oversized_diff_marker() -> String {
     "x".repeat(DIFF_APPLY_MAX_BYTES.saturating_add(1))
 }
 
-pub(crate) fn parse_unified_diff(diff: &str) -> Result<DiffApplyPlan, DiffApplyError> {
+/// `level` is Main's configured level (the operator-only diff path): at Full
+/// absolute paths and `..` are accepted.
+pub(crate) fn parse_unified_diff(
+    diff: &str,
+    level: crate::security::AutonomyLevel,
+) -> Result<DiffApplyPlan, DiffApplyError> {
     if diff.len() > DIFF_APPLY_MAX_BYTES || diff.lines().count() > DIFF_APPLY_MAX_LINES {
         return Err(DiffApplyError::Oversized);
     }
@@ -288,9 +293,9 @@ pub(crate) fn parse_unified_diff(diff: &str) -> Result<DiffApplyPlan, DiffApplyE
             ));
         }
         let is_add = old_path == "/dev/null";
-        let path = normalize_diff_path(&new_path)?;
+        let path = normalize_diff_path(&new_path, level)?;
         if !is_add {
-            let old_normalized = normalize_diff_path(&old_path)?;
+            let old_normalized = normalize_diff_path(&old_path, level)?;
             if old_normalized != path {
                 return Err(DiffApplyError::Unsupported(
                     "rename patches are not supported".to_string(),
@@ -387,7 +392,7 @@ fn parse_header_path(line: &str, prefix: &str) -> Result<String, DiffApplyError>
     Ok(path.to_string())
 }
 
-fn normalize_diff_path(path: &str) -> Result<String, DiffApplyError> {
+fn normalize_diff_path(path: &str, level: crate::security::AutonomyLevel) -> Result<String, DiffApplyError> {
     if path.starts_with('"') || path == "/dev/null" {
         return Err(DiffApplyError::RejectedPath(path.to_string()));
     }
@@ -396,7 +401,8 @@ fn normalize_diff_path(path: &str) -> Result<String, DiffApplyError> {
         .or_else(|| path.strip_prefix("b/"))
         .unwrap_or(path);
     let path = stripped.trim();
-    if path.is_empty() || Path::new(path).is_absolute() || path.contains("..") || path.contains('\0') {
+    let confined = level != crate::security::AutonomyLevel::Full;
+    if path.is_empty() || path.contains('\0') || (confined && (Path::new(path).is_absolute() || path.contains(".."))) {
         return Err(DiffApplyError::RejectedPath(path.to_string()));
     }
     Ok(path.to_string())
@@ -479,26 +485,15 @@ struct PreparedWrite {
 }
 
 async fn validate_target(file: &FilePatch, security: &SecurityPolicy) -> Result<PathBuf, DiffApplyError> {
-    if !security.is_path_allowed(&file.path) {
-        return Err(DiffApplyError::RejectedPath(file.path.clone()));
-    }
-    let full_path = security.workspace_dir.join(&file.path);
-    let Some(parent) = full_path.parent() else {
-        return Err(DiffApplyError::RejectedPath("missing parent directory".to_string()));
+    // The diff path is the operator's: `security` carries Main's configured
+    // level. At Full the target resolves freely (symlinks followed).
+    let target = if security.autonomy == crate::security::AutonomyLevel::Full {
+        crate::security::approval_operation::resolve_full_target(&security.workspace_dir, &file.path)
+            .await
+            .map_err(|err| DiffApplyError::RejectedPath(format!("failed to resolve target: {err}")))?
+    } else {
+        confined_target(file, security).await?
     };
-    let resolved_parent = tokio::fs::canonicalize(parent)
-        .await
-        .map_err(|err| DiffApplyError::RejectedPath(format!("failed to resolve parent: {err}")))?;
-    if !security.is_resolved_path_allowed(&resolved_parent) {
-        return Err(DiffApplyError::RejectedPath(format!(
-            "resolved parent escapes workspace: {}",
-            resolved_parent.display()
-        )));
-    }
-    let Some(file_name) = full_path.file_name() else {
-        return Err(DiffApplyError::RejectedPath("missing file name".to_string()));
-    };
-    let target = resolved_parent.join(file_name);
     reject_protected_memory_path(&target, security)?;
     match tokio::fs::symlink_metadata(&target).await {
         Ok(meta) => {
@@ -530,6 +525,31 @@ async fn validate_target(file: &FilePatch, security: &SecurityPolicy) -> Result<
         Err(err) => return Err(DiffApplyError::Io(format!("failed to stat {}: {err}", file.path))),
     }
     Ok(target)
+}
+
+/// The below-Full target: inside the workspace, resolved through its
+/// canonical parent.
+async fn confined_target(file: &FilePatch, security: &SecurityPolicy) -> Result<PathBuf, DiffApplyError> {
+    if !security.is_path_allowed(&file.path) {
+        return Err(DiffApplyError::RejectedPath(file.path.clone()));
+    }
+    let full_path = security.workspace_dir.join(&file.path);
+    let Some(parent) = full_path.parent() else {
+        return Err(DiffApplyError::RejectedPath("missing parent directory".to_string()));
+    };
+    let resolved_parent = tokio::fs::canonicalize(parent)
+        .await
+        .map_err(|err| DiffApplyError::RejectedPath(format!("failed to resolve parent: {err}")))?;
+    if !security.is_resolved_path_allowed(&resolved_parent) {
+        return Err(DiffApplyError::RejectedPath(format!(
+            "resolved parent escapes workspace: {}",
+            resolved_parent.display()
+        )));
+    }
+    let Some(file_name) = full_path.file_name() else {
+        return Err(DiffApplyError::RejectedPath("missing file name".to_string()));
+    };
+    Ok(resolved_parent.join(file_name))
 }
 
 fn reject_protected_memory_path(target: &Path, security: &SecurityPolicy) -> Result<(), DiffApplyError> {
@@ -738,7 +758,10 @@ mod tests {
     #[test]
     fn parse_rejects_literal_oversized_cap() {
         let oversized = format!("--- a/x\n+++ b/x\n@@ -1 +1 @@\n-{}\n+x\n", "a".repeat(262_145));
-        assert_eq!(parse_unified_diff(&oversized), Err(DiffApplyError::Oversized));
+        assert_eq!(
+            parse_unified_diff(&oversized, crate::security::AutonomyLevel::Supervised),
+            Err(DiffApplyError::Oversized)
+        );
     }
 
     #[test]
@@ -758,7 +781,9 @@ mod tests {
             "GP-9: oversized fenced block must be capped before full block buffering"
         );
         assert_eq!(
-            blocks.first().map(|block| parse_unified_diff(block)),
+            blocks
+                .first()
+                .map(|block| parse_unified_diff(block, crate::security::AutonomyLevel::Supervised)),
             Some(Err(DiffApplyError::Oversized))
         );
     }
@@ -774,7 +799,10 @@ mod tests {
                 .join("\n")
         );
         assert_eq!(oversized.lines().count(), 2_001);
-        assert_eq!(parse_unified_diff(&oversized), Err(DiffApplyError::Oversized));
+        assert_eq!(
+            parse_unified_diff(&oversized, crate::security::AutonomyLevel::Supervised),
+            Err(DiffApplyError::Oversized)
+        );
     }
 
     #[test]
@@ -786,7 +814,7 @@ mod tests {
             "Binary files a/a and b/a differ\n",
         ] {
             assert!(matches!(
-                parse_unified_diff(diff),
+                parse_unified_diff(diff, crate::security::AutonomyLevel::Supervised),
                 Err(DiffApplyError::Unsupported(_) | DiffApplyError::Malformed(_))
             ));
         }
@@ -802,7 +830,7 @@ mod tests {
                     -Subproject commit 1111111111111111111111111111111111111111\n\
                     +Subproject commit 2222222222222222222222222222222222222222\n";
         assert!(matches!(
-            parse_unified_diff(diff),
+            parse_unified_diff(diff, crate::security::AutonomyLevel::Supervised),
             Err(DiffApplyError::Unsupported(message)) if message == "Subproject commit patches are not supported"
         ));
     }
@@ -815,6 +843,7 @@ mod tests {
             .expect("seed");
         let plan = parse_unified_diff(
             "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n--- /dev/null\n+++ b/b.txt\n@@ -0,0 +1 @@\n+added\n",
+            crate::security::AutonomyLevel::Supervised,
         )
         .expect("plan");
         let result = execute_plan(&plan, &policy(temp.path())).await.expect("apply");
@@ -836,7 +865,11 @@ mod tests {
         tokio::fs::write(&target, format!("old\n{}", "x".repeat(DIFF_APPLY_MAX_BYTES)))
             .await
             .expect("seed oversized target");
-        let plan = parse_unified_diff(&diff_for("big.txt", "old", "new")).expect("plan");
+        let plan = parse_unified_diff(
+            &diff_for("big.txt", "old", "new"),
+            crate::security::AutonomyLevel::Supervised,
+        )
+        .expect("plan");
 
         let err = execute_plan(&plan, &policy(temp.path()))
             .await
@@ -856,7 +889,11 @@ mod tests {
         tokio::fs::write(temp.path().join("small.txt"), "old\n")
             .await
             .expect("seed");
-        let plan = parse_unified_diff(&diff_for("small.txt", "old", "new")).expect("plan");
+        let plan = parse_unified_diff(
+            &diff_for("small.txt", "old", "new"),
+            crate::security::AutonomyLevel::Supervised,
+        )
+        .expect("plan");
 
         let result = execute_plan(&plan, &policy(temp.path())).await.expect("apply");
 
@@ -879,7 +916,7 @@ mod tests {
             .await
             .expect("seed b");
         let plan = parse_unified_diff(
-            "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-stale\n+changed\n",
+            "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-stale\n+changed\n", crate::security::AutonomyLevel::Supervised
         )
         .expect("plan");
         let err = execute_plan(&plan, &policy(temp.path())).await.expect_err("stale");
@@ -907,7 +944,7 @@ mod tests {
             diff_for("memory/topic.md", "x", "y"),
         ];
         for diff in cases {
-            let parsed = parse_unified_diff(&diff);
+            let parsed = parse_unified_diff(&diff, crate::security::AutonomyLevel::Supervised);
             if let Ok(plan) = parsed {
                 assert!(execute_plan(&plan, &policy(temp.path())).await.is_err());
             }
@@ -929,7 +966,11 @@ mod tests {
             .await
             .expect("outside seed");
         unix_fs::symlink(outside.path().join("target.txt"), temp.path().join("link.txt")).expect("symlink");
-        let plan = parse_unified_diff(&diff_for("link.txt", "old", "new")).expect("plan");
+        let plan = parse_unified_diff(
+            &diff_for("link.txt", "old", "new"),
+            crate::security::AutonomyLevel::Supervised,
+        )
+        .expect("plan");
         let err = execute_plan(&plan, &policy(temp.path())).await.expect_err("symlink");
         assert!(matches!(err, DiffApplyError::RejectedPath(_)));
         assert_eq!(
@@ -944,7 +985,11 @@ mod tests {
     async fn directory_target_is_rejected() {
         let temp = tempfile::TempDir::new().expect("tempdir");
         tokio::fs::create_dir(temp.path().join("dir.txt")).await.expect("dir");
-        let plan = parse_unified_diff(&diff_for("dir.txt", "old", "new")).expect("plan");
+        let plan = parse_unified_diff(
+            &diff_for("dir.txt", "old", "new"),
+            crate::security::AutonomyLevel::Supervised,
+        )
+        .expect("plan");
         let err = execute_plan(&plan, &policy(temp.path())).await.expect_err("dir");
         assert!(matches!(err, DiffApplyError::RejectedPath(_)));
     }

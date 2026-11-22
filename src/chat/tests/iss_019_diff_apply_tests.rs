@@ -6,7 +6,11 @@ use crate::security::policy::AutonomyLevel;
 use std::sync::Arc;
 
 fn plan() -> diff_apply::DiffApplyPlan {
-    diff_apply::parse_unified_diff("--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n").expect("valid plan")
+    diff_apply::parse_unified_diff(
+        "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n",
+        crate::security::AutonomyLevel::Supervised,
+    )
+    .expect("valid plan")
 }
 
 fn policy(workspace: &std::path::Path) -> SecurityPolicy {

@@ -418,7 +418,10 @@ pub(super) fn collect_at_path_candidates(
     let Some(filter) = input.at_path_filter_at_cursor() else {
         return Vec::new();
     };
-    if filter.starts_with('/') || filter.starts_with('~') || !security.is_path_allowed(&filter) {
+    // `security` carries Main's configured level (an operator-only path):
+    // at Full candidates are not confined to the workspace.
+    let full = security.autonomy == crate::security::AutonomyLevel::Full;
+    if !full && (filter.starts_with('/') || filter.starts_with('~') || !security.is_path_allowed(&filter)) {
         return Vec::new();
     }
     let normalized = filter.trim_start_matches("./");
@@ -430,10 +433,15 @@ pub(super) fn collect_at_path_candidates(
         ("", normalized)
     };
     let base_for_policy = if base_rel.is_empty() { "." } else { base_rel };
-    if !security.is_path_allowed(base_for_policy) {
+    if !full && !security.is_path_allowed(base_for_policy) {
         return Vec::new();
     }
-    let base_abs = if base_rel.is_empty() {
+    let base_abs = if full {
+        match crate::security::path_policy::resolve_full_request_path(workspace_dir, base_for_policy) {
+            Ok(path) => path,
+            Err(_) => return Vec::new(),
+        }
+    } else if base_rel.is_empty() {
         workspace_dir.to_path_buf()
     } else {
         workspace_dir.join(base_rel)
@@ -441,7 +449,7 @@ pub(super) fn collect_at_path_candidates(
     let Ok(base_resolved) = base_abs.canonicalize() else {
         return Vec::new();
     };
-    if !security.is_resolved_path_allowed(&base_resolved) {
+    if !full && !security.is_resolved_path_allowed(&base_resolved) {
         return Vec::new();
     }
     let Ok(entries) = std::fs::read_dir(&base_resolved) else {
@@ -470,13 +478,13 @@ pub(super) fn collect_at_path_candidates(
         {
             continue;
         }
-        if !security.is_path_allowed(&rel) {
+        if !full && !security.is_path_allowed(&rel) {
             continue;
         }
         let Ok(resolved) = entry.path().canonicalize() else {
             continue;
         };
-        if !security.is_resolved_path_allowed(&resolved) {
+        if !full && !security.is_resolved_path_allowed(&resolved) {
             continue;
         }
         let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());

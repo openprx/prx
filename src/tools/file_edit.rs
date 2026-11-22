@@ -117,7 +117,8 @@ impl FileEditTool {
 
         let full = super::effective_autonomy::current() == Some(crate::security::AutonomyLevel::Full);
         let resolved_target = if full {
-            crate::security::approval_operation::resolve_file_target(self.working_root(), path, false).await
+            // Full: absolute paths, `..` and symlinks resolve; the OS decides.
+            crate::security::approval_operation::resolve_full_target(self.working_root(), path).await
         } else {
             // Below Full: the same confinement the precheck ran, re-checked now.
             match crate::security::path_policy::confine_file_target(&self.security, self.working_root(), path, false)

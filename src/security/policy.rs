@@ -984,6 +984,32 @@ impl<'a> SideEffectGate<'a> {
         command: &str,
         grant: Option<&ApprovalGrant>,
     ) -> Result<CommandRiskLevel, String> {
+        self.authorize_command_execution_for(None, execution_root, tool_name, command, grant)
+    }
+
+    /// [`Self::authorize_command_execution_at`] for a call whose caller
+    /// passes its effective `level`: at Full the path-argument checks
+    /// (forbidden, dynamic and substituted paths) are skipped; a NUL byte is
+    /// still refused.
+    pub fn authorize_command_execution_at_level(
+        self,
+        level: AutonomyLevel,
+        execution_root: Option<&Path>,
+        tool_name: &str,
+        command: &str,
+        grant: Option<&ApprovalGrant>,
+    ) -> Result<CommandRiskLevel, String> {
+        self.authorize_command_execution_for(Some(level), execution_root, tool_name, command, grant)
+    }
+
+    fn authorize_command_execution_for(
+        self,
+        level: Option<AutonomyLevel>,
+        execution_root: Option<&Path>,
+        tool_name: &str,
+        command: &str,
+        grant: Option<&ApprovalGrant>,
+    ) -> Result<CommandRiskLevel, String> {
         // P3-10: bound gate re-entrancy depth. The guard restores the previous
         // depth on every return path (including the deny below) because it is
         // dropped at end of scope.
@@ -997,9 +1023,9 @@ impl<'a> SideEffectGate<'a> {
         let command_risk = self.policy.command_risk_level(command);
         let runtime_approval_granted =
             grant.is_some_and(|grant| grant.permits_command(tool_name, command, command_risk, now));
-        let mut result = self
-            .policy
-            .validate_command_execution_at(execution_root, command, runtime_approval_granted);
+        let mut result =
+            self.policy
+                .validate_command_execution_at(level, execution_root, command, runtime_approval_granted);
         // M5 replay defense: when a v2 grant actually authorized this allowed
         // command, atomically consume one use. If the grant is already exhausted
         // (single-use replayed inside the 60s window, or a concurrent caller won
@@ -1625,17 +1651,28 @@ impl SecurityPolicy {
         command: &str,
         runtime_approval_granted: bool,
     ) -> Result<CommandRiskLevel, String> {
-        self.validate_command_execution_at(None, command, runtime_approval_granted)
+        self.validate_command_execution_at(None, None, command, runtime_approval_granted)
     }
 
     /// Validate against the shell's selected directory; None means workspace.
+    /// `level` is the caller's effective level, never this policy's own: at
+    /// Full the path-argument checks are skipped and only a NUL byte is
+    /// refused. Without a level every check applies.
     pub fn validate_command_execution_at(
         &self,
+        level: Option<AutonomyLevel>,
         execution_root: Option<&Path>,
         command: &str,
         runtime_approval_granted: bool,
     ) -> Result<CommandRiskLevel, String> {
-        if let Some(violation) = forbidden_path_argument(
+        if level == Some(AutonomyLevel::Full) {
+            if command.contains('\0') {
+                return Err(
+                    crate::security::PathRefusal::shell(crate::security::PathRefusalReason::InvalidPath, "")
+                        .to_string(),
+                );
+            }
+        } else if let Some(violation) = forbidden_path_argument(
             self,
             crate::security::path_policy::effective_root(execution_root, self),
             command,

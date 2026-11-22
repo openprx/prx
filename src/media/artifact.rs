@@ -188,7 +188,17 @@ impl MediaArtifactOwner {
     }
 
     async fn read_workspace_file(&self, source: &str, max_bytes: usize) -> Result<LoadedArtifact, ArtifactError> {
-        let (bytes, resolved) = read_workspace_source_bounded(&self.workspace_dir, source, max_bytes).await?;
+        let (bytes, resolved) =
+            if crate::tools::effective_autonomy::current() == Some(crate::security::AutonomyLevel::Full) {
+                // Full: a local source is not confined to the workspace; the
+                // path resolves (absolute, `..`, symlinks) and the OS decides.
+                let resolved = crate::security::approval_operation::resolve_full_target(&self.workspace_dir, source)
+                    .await
+                    .map_err(|_| ArtifactError::InvalidLocalFile(source.to_string()))?;
+                (read_file_bounded(&resolved, max_bytes).await?, resolved)
+            } else {
+                read_workspace_source_bounded(&self.workspace_dir, source, max_bytes).await?
+            };
         Ok(LoadedArtifact {
             bytes,
             source_kind: ArtifactSourceKind::WorkspaceFile,

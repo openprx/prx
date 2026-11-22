@@ -144,8 +144,11 @@ impl Tool for ImageInfoTool {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
-        // Restrict reads to workspace directory to prevent arbitrary file exfiltration
-        if !self.security.is_path_allowed(path_str) {
+        // Restrict reads to workspace directory to prevent arbitrary file
+        // exfiltration below Full. At Full the path resolves freely.
+        let full = crate::tools::effective_autonomy::call_policy(&self.security).autonomy
+            == crate::security::AutonomyLevel::Full;
+        if !full && !self.security.is_path_allowed(path_str) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -154,7 +157,20 @@ impl Tool for ImageInfoTool {
         }
 
         // Resolve the path within the workspace and canonicalize to block symlink escapes
-        let full_path = self.security.workspace_dir.join(path_str);
+        let full_path = if full {
+            match crate::security::path_policy::resolve_full_request_path(&self.security.workspace_dir, path_str) {
+                Ok(path) => path,
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("File not found: {path_str} ({e})")),
+                    });
+                }
+            }
+        } else {
+            self.security.workspace_dir.join(path_str)
+        };
 
         let resolved_path = match tokio::fs::canonicalize(&full_path).await {
             Ok(p) => p,
@@ -167,7 +183,7 @@ impl Tool for ImageInfoTool {
             }
         };
 
-        if !self.security.is_resolved_path_allowed(&resolved_path) {
+        if !full && !self.security.is_resolved_path_allowed(&resolved_path) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),

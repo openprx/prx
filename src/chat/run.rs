@@ -2341,7 +2341,7 @@ Retry with a compatible model: /provider {shown} <model>",
                         emit_chat_output("No applicable fenced diff block found in this conversation.");
                         continue;
                     };
-                    let plan = match diff_apply::parse_unified_diff(&diff) {
+                    let plan = match diff_apply::parse_unified_diff(&diff, config.autonomy.level) {
                         Ok(plan) => plan,
                         Err(error) => {
                             emit_chat_output(&format!("Diff apply rejected: {error}. Workspace unchanged."));

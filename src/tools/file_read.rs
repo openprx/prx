@@ -160,8 +160,8 @@ impl FileReadTool {
 
         let full = super::effective_autonomy::current() == Some(crate::security::AutonomyLevel::Full);
         let resolved_path = if full {
-            // Full still rejects parent traversal through the shared resolver.
-            match crate::security::approval_operation::resolve_file_target(self.working_root(), path, false).await {
+            // Full: absolute paths, `..` and symlinks resolve; the OS decides.
+            match crate::security::approval_operation::resolve_full_target(self.working_root(), path).await {
                 Ok(full_path) => tokio::fs::canonicalize(&full_path).await,
                 Err(error) => Err(error),
             }

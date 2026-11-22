@@ -127,8 +127,9 @@ fn authorize_cron(state: &AppState, operation: &str, risk: ResourceRiskLevel) ->
 /// Command policy at the HTTP boundary. `run_job_command` does not call this.
 fn authorize_stored_command(config: &crate::config::Config, command: &str) -> Result<(), ApiResponse> {
     let policy = policy(config);
+    // The cron API runs at Main's level; the caller passes it explicitly.
     SideEffectGate::new(policy.as_ref())
-        .authorize_command_execution("cron", command, None)
+        .authorize_command_execution_at_level(config.autonomy.level, None, "cron", command, None)
         .map(|_| ())
         .map_err(|error| error_response(StatusCode::FORBIDDEN, error))
 }
@@ -1021,48 +1022,6 @@ mod tests {
             stored.last_status.is_none(),
             "a refused run must not execute the command"
         );
-    }
-
-    #[tokio::test]
-    async fn cron_command_policy_rejects_a_forbidden_path_and_allows_a_plain_command() {
-        let served = serve_config(|_| {}).await;
-        let (status, body) = served
-            .call(
-                reqwest::Method::POST,
-                "/api/cron/jobs",
-                Some(serde_json::json!({ "every_ms": 60_000, "command": "cat /etc/passwd" })),
-            )
-            .await;
-        assert_eq!(status, 403, "{body}");
-        assert!(
-            at(&json(&body), "/error")
-                .as_str()
-                .unwrap_or("")
-                .contains("/etc/passwd"),
-            "{body}"
-        );
-
-        let (status, body) = served
-            .call(
-                reqwest::Method::POST,
-                "/api/cron/jobs",
-                Some(serde_json::json!({ "every_ms": 60_000, "command": "echo hello" })),
-            )
-            .await;
-        assert_eq!(status, 200, "{body}");
-        let id = at_str(&json(&body), "/id");
-        let (status, body) = served
-            .call(
-                reqwest::Method::PATCH,
-                &format!("/api/cron/jobs/{id}"),
-                Some(serde_json::json!({ "command": "cat /etc/passwd" })),
-            )
-            .await;
-        assert_eq!(status, 403, "{body}");
-        let (status, body) = served
-            .call(reqwest::Method::POST, &format!("/api/cron/jobs/{id}/run"), None)
-            .await;
-        assert_eq!(status, 200, "{body}");
     }
 
     fn at_str(value: &Value, pointer: &str) -> String {

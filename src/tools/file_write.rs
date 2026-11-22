@@ -84,7 +84,8 @@ impl FileWriteTool {
 
         let full = super::effective_autonomy::current() == Some(crate::security::AutonomyLevel::Full);
         let resolved_target = if full {
-            crate::security::approval_operation::resolve_file_target(self.working_root(), path, true).await
+            // Full: absolute paths, `..` and symlinks resolve; the OS decides.
+            crate::security::approval_operation::resolve_full_target(self.working_root(), path).await
         } else {
             // Below Full: the same confinement the precheck ran, re-checked now.
             match crate::security::path_policy::confine_file_target(&self.security, self.working_root(), path, true)
@@ -149,19 +150,22 @@ impl FileWriteTool {
         // Re-resolve afterward: a symlink change must not redirect the write
         // away from the exact operation just authorized.
         tokio::fs::create_dir_all(resolved_parent).await?;
-        let current =
-            crate::security::approval_operation::resolve_file_target(self.working_root(), path, false).await?;
-        if current != resolved_target
-            || !full
-                && !self
+        // Below Full the target must still be the authorized one and inside
+        // the workspace. At Full the resolved path is opened as resolved.
+        if !full {
+            let current =
+                crate::security::approval_operation::resolve_file_target(self.working_root(), path, false).await?;
+            if current != resolved_target
+                || !self
                     .security
                     .is_resolved_path_allowed(current.parent().ok_or_else(|| anyhow::anyhow!("file parent missing"))?)
-        {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("File path changed after authorization".to_owned()),
-            });
+            {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some("File path changed after authorization".to_owned()),
+                });
+            }
         }
 
         let existing_contents = match read_existing_file_for_diff(&resolved_target).await {

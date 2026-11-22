@@ -203,8 +203,11 @@ impl Tool for ImageTool {
             });
         }
 
-        // Security check for local paths (skip for HTTP(S) URLs and data URIs)
-        for ref_str in &image_refs {
+        // Security check for local paths (skip for HTTP(S) URLs and data
+        // URIs). At Full local paths are not confined to the workspace.
+        let full = crate::tools::effective_autonomy::call_policy(&self.security).autonomy
+            == crate::security::AutonomyLevel::Full;
+        for ref_str in image_refs.iter().filter(|_| !full) {
             if ref_str.starts_with("http://") || ref_str.starts_with("https://") || ref_str.starts_with("data:") {
                 continue;
             }

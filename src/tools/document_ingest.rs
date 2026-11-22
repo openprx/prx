@@ -32,14 +32,22 @@ impl DocumentIngestRuntime {
     ) -> anyhow::Result<(String, Option<String>, Option<String>, Option<String>)> {
         let path = args.get("path").and_then(serde_json::Value::as_str).map(str::trim);
         if let Some(path) = path.filter(|path| !path.is_empty()) {
-            if !self.security.is_path_allowed(path) {
+            // At Full the document path is not confined to the workspace.
+            let full = crate::tools::effective_autonomy::call_policy(&self.security).autonomy
+                == crate::security::AutonomyLevel::Full;
+            if !full && !self.security.is_path_allowed(path) {
                 anyhow::bail!("Document path is blocked by the workspace security policy: {path}");
             }
-            let candidate = self.workspace_dir.join(path);
+            let candidate = if full {
+                crate::security::path_policy::resolve_full_request_path(&self.workspace_dir, path)
+                    .map_err(|error| anyhow::anyhow!("Failed to resolve document path {path}: {error}"))?
+            } else {
+                self.workspace_dir.join(path)
+            };
             let resolved = tokio::fs::canonicalize(&candidate)
                 .await
                 .map_err(|error| anyhow::anyhow!("Failed to resolve document path {path}: {error}"))?;
-            if !self.security.is_resolved_path_allowed(&resolved) || !resolved.is_file() {
+            if (!full && !self.security.is_resolved_path_allowed(&resolved)) || !resolved.is_file() {
                 anyhow::bail!("Document path escapes the workspace or is not a regular file: {path}");
             }
             let metadata = tokio::fs::metadata(&resolved).await?;

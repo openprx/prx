@@ -369,6 +369,34 @@ pub(crate) async fn resolve_file_target(
     Ok(resolved.join(name))
 }
 
+/// Resolve a file tool target at Full: [`super::path_policy::resolve_full_request_path`],
+/// then symlinks are followed. An existing target is canonicalised; a
+/// symlink whose target does not exist yet is followed link by link, so the
+/// tool opens the resolved path. A missing plain target keeps its
+/// normalised path.
+pub async fn resolve_full_target(root: &std::path::Path, path: &str) -> std::io::Result<std::path::PathBuf> {
+    /// The link chain bound, as the kernel's own symlink limit.
+    const MAX_LINK_HOPS: usize = 40;
+    let mut target = super::path_policy::resolve_full_request_path(root, path)?;
+    for _ in 0..MAX_LINK_HOPS {
+        if let Ok(resolved) = tokio::fs::canonicalize(&target).await {
+            return Ok(resolved);
+        }
+        match tokio::fs::symlink_metadata(&target).await {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let link = tokio::fs::read_link(&target).await?;
+                let base = target.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+                target = super::path_policy::resolve_full_request_path(&base, &link.to_string_lossy())?;
+            }
+            _ => return Ok(target),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "too many levels of symbolic links",
+    ))
+}
+
 /// Use the same operation and risk for approval and the backend's own gate.
 pub(crate) fn file_operation(
     tool: &str,
