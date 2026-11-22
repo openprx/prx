@@ -180,7 +180,12 @@ const fn windows_task_name() -> &'static str {
 
 pub async fn handle_command(command: &crate::ServiceCommands, config: &Config, init_system: InitSystem) -> Result<()> {
     match command {
-        crate::ServiceCommands::Install { .. } => install(config, init_system).await,
+        crate::ServiceCommands::Install { user, .. } => {
+            if *user && cfg!(target_os = "linux") && init_system.resolve()? == InitSystem::Openrc {
+                anyhow::bail!("service_user_unsupported: OpenRC installation requires a system service");
+            }
+            install(config, init_system).await
+        }
         crate::ServiceCommands::Start => start(config, init_system).await,
         crate::ServiceCommands::Stop => stop(config, init_system).await,
         crate::ServiceCommands::Restart => restart(config, init_system).await,

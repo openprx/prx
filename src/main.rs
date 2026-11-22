@@ -1797,10 +1797,19 @@ async fn async_main(cli: Cli) -> Result<()> {
     }
 
     if let Commands::Onboard { provider, model, .. } = &cli.command {
-        runtime::host_bootstrap::onboard(cli.config_dir.as_deref(), provider, model.as_deref(), &mut std::io::stdin()).await?;
+        runtime::host_bootstrap::onboard(
+            cli.config_dir.as_deref(),
+            provider,
+            model.as_deref(),
+            &mut std::io::stdin(),
+        )
+        .await?;
         return Ok(());
     }
-    if let Commands::Token { command: TokenCommands::Issue { out, force } } = &cli.command {
+    if let Commands::Token {
+        command: TokenCommands::Issue { out, force },
+    } = &cli.command
+    {
         let config = Config::load_or_init_with_config_dir(cli.config_dir.as_deref()).await?;
         let owner = runtime::host_bootstrap::issue_token(config, out, *force).await?;
         println!("{}\n{}", out.display(), owner);
