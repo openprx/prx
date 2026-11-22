@@ -425,6 +425,9 @@ fn strip_attributes_and_visibility(fragment: &str) -> String {
 pub(super) struct TypeIndex {
     fields: BTreeMap<String, Vec<String>>,
     returns: BTreeMap<String, Vec<String>>,
+    /// Return types of the functions that take `self`, by name: the only
+    /// candidates for a method call `value.name()` on an unknown receiver.
+    receiver_returns: BTreeMap<String, Vec<String>>,
     /// Field types of one production struct, by `(struct name, field name)`.
     struct_fields: BTreeMap<(String, String), Vec<String>>,
     /// Return types of the methods of one production type (`impl` and
@@ -546,6 +549,7 @@ impl TypeIndex {
             let Some(close) = matching_close(chars, cursor) else {
                 continue;
             };
+            let takes_self = takes_self(&text(&chars[cursor + 1..close]));
             cursor = skip_whitespace(chars, close + 1);
             let return_type = if chars.get(cursor) == Some(&'-') && chars.get(cursor + 1) == Some(&'>') {
                 let start = cursor + 2;
@@ -576,7 +580,23 @@ impl TypeIndex {
                     .or_default()
                     .push(return_type.clone());
             }
+            if takes_self {
+                self.receiver_returns
+                    .entry(name.clone())
+                    .or_default()
+                    .push(return_type.clone());
+            }
             self.returns.entry(name).or_default().push(return_type);
+        }
+    }
+
+    /// Every declared return type of a call to `callee`. A method call
+    /// (`value.callee()`) cannot reach an associated function without `self`.
+    fn call_returns(&self, callee: &str, method_call: bool) -> Option<&Vec<String>> {
+        if method_call {
+            self.receiver_returns.get(callee)
+        } else {
+            self.returns.get(callee)
         }
     }
 
@@ -747,6 +767,19 @@ fn strip_references(declared: &str) -> &str {
         rest = strip_lifetime(after.strip_prefix("mut ").unwrap_or(after));
     }
     rest
+}
+
+/// Whether a parameter list starts with a `self` receiver (`self`,
+/// `mut self`, `&self`, `&'a mut self`, `self: Arc<Self>`).
+fn takes_self(parameters: &str) -> bool {
+    let first = parameters.trim_start();
+    let first = first
+        .strip_prefix('&')
+        .map_or(first, |rest| strip_lifetime(rest.trim_start()));
+    let first = first.strip_prefix("mut ").map_or(first, str::trim_start);
+    first
+        .strip_prefix("self")
+        .is_some_and(|rest| !rest.starts_with(is_ident_char))
 }
 
 fn strip_lifetime(declared: &str) -> &str {
@@ -1018,7 +1051,8 @@ impl Scope<'_> {
         if let Some(callee) = call_name(expression) {
             // A method of a receiver whose type is known: that type's own
             // declaration; otherwise every declaration of the name.
-            if let Some(receiver) = method_receiver(expression)
+            let receiver = method_receiver(expression);
+            if let Some(receiver) = receiver
                 && depth < 4
             {
                 let receiver_types = self.declared_types_at(receiver, depth + 1);
@@ -1035,7 +1069,11 @@ impl Scope<'_> {
                     return declared;
                 }
             }
-            return self.index.returns.get(callee).cloned().unwrap_or_default();
+            return self
+                .index
+                .call_returns(callee, receiver.is_some())
+                .cloned()
+                .unwrap_or_default();
         }
         if is_path(expression)
             && let Some((owner, field)) = expression.rsplit_once('.')
@@ -1196,8 +1234,7 @@ impl Scope<'_> {
         if FLAG_PREDICATES.contains(&callee) {
             return self
                 .index
-                .returns
-                .get(callee)
+                .call_returns(callee, receiver.is_some())
                 .is_none_or(|declared| declared.iter().all(|declared| self.index.is_typed_type(declared)));
         }
         if NUMERIC_METHODS.contains(&callee) {
@@ -1210,8 +1247,7 @@ impl Scope<'_> {
             }
         }
         self.index
-            .returns
-            .get(callee)
+            .call_returns(callee, receiver.is_some())
             .is_some_and(|declared| declared.iter().all(|declared| self.index.is_typed_type(declared)))
     }
 }
