@@ -8,6 +8,7 @@ use crate::memory::traits::{
     MemoryPrincipal, MemoryReadMode, MemoryStoreMetadata, MessageEvent, MessageEventInput, RetrievalTrace,
     RetrievalTraceInput, SessionContextQuery, SharedContextQuery,
 };
+use crate::runtime::sqlite_pool::begin_immediate;
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Utc;
@@ -407,7 +408,8 @@ impl Memory for SqliteMemory {
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<usize> {
             let conn = pool.write();
             conn.execute_batch("PRAGMA secure_delete = ON")?;
-            let tx = conn.unchecked_transaction()?;
+            // Reads the schema, then deletes: a write transaction.
+            let tx = begin_immediate(&conn)?;
             let has_ingress: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='ingress_recovery')",
                 [],

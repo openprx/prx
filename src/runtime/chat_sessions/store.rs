@@ -59,7 +59,7 @@ use anyhow::{Context, Result};
 use parking_lot::{Mutex, MutexGuard};
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::runtime::sqlite_pool::{BoundedBusyBudget, bounded_busy_remaining};
+use crate::runtime::sqlite_pool::{BoundedBusyBudget, begin_immediate, bounded_busy_remaining};
 
 use super::{AssignPrincipal, Disposition, ResultStatus};
 
@@ -863,8 +863,8 @@ impl MailboxStore for SqliteMailboxStore {
 
     fn complete_assignment(&self, assignment_id: &str, result: &StoredResult) -> Result<()> {
         self.measure(|| {
-            let mut conn = self.conn()?;
-            let tx = conn.transaction()?;
+            let conn = self.conn()?;
+            let tx = begin_immediate(&conn)?;
             tx.execute(
                 "DELETE FROM chat_assignments WHERE assignment_id = ?1",
                 params![assignment_id],
@@ -878,8 +878,8 @@ impl MailboxStore for SqliteMailboxStore {
 
     fn cascade_session(&self, session_id: &str, results: &[StoredResult]) -> Result<()> {
         self.measure(|| {
-            let mut conn = self.conn()?;
-            let tx = conn.transaction()?;
+            let conn = self.conn()?;
+            let tx = begin_immediate(&conn)?;
             // The cascade is what removes the queued rows, so `foreign_keys`
             // being on is load-bearing rather than decorative.
             tx.execute("DELETE FROM chat_sessions WHERE session_id = ?1", params![session_id])?;

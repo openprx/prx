@@ -8,6 +8,7 @@ use crate::memory::traits::{
     DecisionMemoryHit, Memory, MemoryCategory, MemoryEntry, MemoryReadMode, MemoryStoreMetadata,
     validate_memory_write_target,
 };
+use crate::runtime::sqlite_pool::begin_immediate;
 use crate::self_system::evolution::record::Actor;
 use anyhow::Context;
 use chrono::{Local, Utc};
@@ -206,8 +207,8 @@ impl SqliteMemory {
         let escaped = prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
         let pattern = format!("{escaped}%");
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<usize> {
-            let mut conn = pool.write();
-            let tx = conn.transaction()?;
+            let conn = pool.write();
+            let tx = begin_immediate(&conn)?;
             let affected = tx.execute("DELETE FROM memories WHERE key LIKE ?1 ESCAPE '\\'", params![pattern])?;
             tx.commit()?;
             Ok(affected)
@@ -312,7 +313,7 @@ impl SqliteMemory {
 
             let outcome = crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<WriteOutcome> {
                 let conn = pool.write();
-                let tx = super::agent_migration::begin_immediate(&conn)?;
+                let tx = begin_immediate(&conn)?;
                 let now = Local::now().to_rfc3339();
                 let cat = Self::category_to_str(&category);
                 let id = Uuid::new_v4().to_string();
@@ -2004,7 +2005,7 @@ impl SqliteMemory {
         let reason = reason.to_string();
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Option<String>> {
             let conn = pool.write();
-            let tx = super::agent_migration::begin_immediate(&conn)?;
+            let tx = begin_immediate(&conn)?;
             // FIX-P1-11: snapshot the row's value before soft-deleting it. We DO NOT
             // physically delete from `memories`; we record a trash row so it can be
             // restored within the grace window. Parent stamp is read inside the

@@ -168,7 +168,10 @@ impl SqliteTelemetryWriter {
         let mut connection = rusqlite::Connection::open(path)?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version != SCHEMA_VERSION {
-            let transaction = connection.transaction()?;
+            // The engine may not import the runtime, so it begins IMMEDIATE through
+            // rusqlite directly (the store-wide invariant: a write transaction
+            // takes the write lock up front).
+            let transaction = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             transaction.execute_batch("DROP TABLE IF EXISTS engine_analyses; DROP TABLE IF EXISTS engine_outcomes;")?;
             transaction.execute_batch(SCHEMA)?;
             transaction.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
@@ -243,7 +246,9 @@ impl SqliteTelemetryWriter {
 impl TelemetryWriter for SqliteTelemetryWriter {
     fn append_fifo(&mut self, record: TelemetryRecord, cap: usize) -> anyhow::Result<()> {
         let cap = i64::try_from(cap)?;
-        let transaction: rusqlite::Transaction<'_> = self.connection.transaction()?;
+        let transaction: rusqlite::Transaction<'_> = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         match record {
             TelemetryRecord::Analysis(analysis) => {
                 transaction.execute(

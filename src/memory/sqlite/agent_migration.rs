@@ -4,7 +4,8 @@
 //! sessions whose channel is `console`. Nothing is guessed: a row whose
 //! workspace, owner or session cannot be proven stays NULL and is counted.
 
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use crate::runtime::sqlite_pool::begin_immediate;
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use super::SqliteMemory;
 use crate::memory::agent_registry::MAIN_REVISION_PREIMAGE;
@@ -215,11 +216,6 @@ pub(super) fn resolve_input_scope(
         return Err(AgentScopeRefused.into());
     }
     resolve_write_scope(tx, partition, session_key).map(Some)
-}
-
-/// `BEGIN IMMEDIATE` for every stamped writer (appendix B).
-pub(super) fn begin_immediate(conn: &Connection) -> anyhow::Result<Transaction<'_>> {
-    Ok(Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?)
 }
 
 /// Mint the write scope in a short committed transaction when lookup misses.

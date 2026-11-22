@@ -23,6 +23,7 @@ use crate::cron::{
     DeliveryPrincipal, JobCreator, JobOrigin, JobType, Schedule, SessionTarget, next_run_for_schedule,
     schedule_cron_expression, validate_schedule,
 };
+use crate::runtime::sqlite_pool::in_write_scope;
 use crate::security::agent_level::CreatorStamp;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
@@ -1655,7 +1656,7 @@ pub fn record_run(
         // Wrap INSERT + pruning DELETE in an explicit transaction so that
         // if the DELETE fails, the INSERT is rolled back and the run table
         // cannot grow unboundedly.
-        let tx = conn.unchecked_transaction()?;
+        let tx = crate::runtime::sqlite_pool::begin_immediate(conn)?;
 
         tx.execute(
             "INSERT INTO cron_runs (job_id, started_at, finished_at, status, output, duration_ms)
@@ -1916,8 +1917,7 @@ fn insert_job_event(
         status,
         payload_json,
     );
-    conn.execute_batch("SAVEPOINT cron_event_with_outbox")?;
-    let result = (|| -> Result<()> {
+    in_write_scope(conn, || {
         conn.execute(
             "INSERT INTO cron_job_events (
                 event_id, job_id, workspace_id, owner_id, topic_id, parent_task_id, source_message_event_id,
@@ -1953,20 +1953,7 @@ fn insert_job_event(
         )
         .context("Failed to insert cron event outbox row")?;
         Ok(())
-    })();
-    match result {
-        Ok(()) => {
-            conn.execute_batch("RELEASE SAVEPOINT cron_event_with_outbox")?;
-            Ok(())
-        }
-        Err(error) => {
-            let _ = conn.execute_batch(
-                "ROLLBACK TO SAVEPOINT cron_event_with_outbox;
-                 RELEASE SAVEPOINT cron_event_with_outbox;",
-            );
-            Err(error)
-        }
-    }
+    })
 }
 
 /// Lineage fields used to enrich a mirrored cron event. Backend-agnostic

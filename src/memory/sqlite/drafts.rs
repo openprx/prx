@@ -1,6 +1,7 @@
 //! Memory draft lifecycle.
 
 use crate::memory::traits::{MemoryDraft, MemoryDraftInput, MemoryPrincipal};
+use crate::runtime::sqlite_pool::begin_immediate;
 use chrono::Utc;
 use rusqlite::params;
 use uuid::Uuid;
@@ -13,7 +14,7 @@ impl SqliteMemory {
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<MemoryDraft> {
             let conn = pool.write();
-            let tx = super::agent_migration::begin_immediate(&conn)?;
+            let tx = begin_immediate(&conn)?;
             let now = Utc::now().to_rfc3339();
             let draft_id = input.draft_id.unwrap_or_else(|| Uuid::new_v4().to_string());
             let category = Self::category_to_str(&input.category);
@@ -175,7 +176,7 @@ impl SqliteMemory {
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Option<MemoryDraft>> {
             let conn = pool.write();
-            let tx = super::agent_migration::begin_immediate(&conn)?;
+            let tx = begin_immediate(&conn)?;
             let mut draft = match tx.query_row(
                 "SELECT id, draft_id, workspace_id, owner_id, worker_run_id, parent_run_id, session_key,
                         agent_id, persona_id, key, content, category, source_event_id,
@@ -324,7 +325,7 @@ impl SqliteMemory {
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Option<MemoryDraft>> {
             let conn = pool.write();
-            let tx = super::agent_migration::begin_immediate(&conn)?;
+            let tx = begin_immediate(&conn)?;
             let mut draft = match tx.query_row(
                 "SELECT id, draft_id, workspace_id, owner_id, worker_run_id, parent_run_id, session_key,
                         agent_id, persona_id, key, content, category, source_event_id,

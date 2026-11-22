@@ -39,7 +39,7 @@
 //! turns work that is merely queued into an error.
 
 #[cfg(feature = "whatsapp-web")]
-use crate::runtime::sqlite_pool::{SqliteConnectionPool, default_read_pool_size};
+use crate::runtime::sqlite_pool::{SqliteConnectionPool, begin_immediate, default_read_pool_size};
 #[cfg(feature = "whatsapp-web")]
 use async_trait::async_trait;
 #[cfg(feature = "whatsapp-web")]
@@ -713,7 +713,7 @@ impl AppSyncStore for RusqliteStore {
         self.with_write(move |conn: &mut Connection| {
             // One transaction for the batch: a partially applied MAC batch
             // would make the app-state patch unverifiable on the next sync.
-            let tx = to_store_err!(conn.transaction())?;
+            let tx = to_store_err!(begin_immediate(conn))?;
             for (index_mac, value_mac) in encoded {
                 to_store_err!(execute: tx.execute(
                     "INSERT OR REPLACE INTO app_state_mutation_macs
@@ -763,7 +763,7 @@ impl AppSyncStore for RusqliteStore {
         }
 
         self.with_write(move |conn: &mut Connection| {
-            let tx = to_store_err!(conn.transaction())?;
+            let tx = to_store_err!(begin_immediate(conn))?;
             for index_mac_json in encoded {
                 to_store_err!(execute: tx.execute(
                     "DELETE FROM app_state_mutation_macs
@@ -812,7 +812,7 @@ impl ProtocolStore for RusqliteStore {
         let now = chrono::Utc::now().timestamp();
 
         self.with_write(move |conn: &mut Connection| {
-            let tx = to_store_err!(conn.transaction())?;
+            let tx = to_store_err!(begin_immediate(conn))?;
             for device_jid in device_jids {
                 to_store_err!(execute: tx.execute(
                     "INSERT OR IGNORE INTO skdm_recipients (group_jid, device_jid, device_id, created_at)
@@ -1098,7 +1098,7 @@ impl ProtocolStore for RusqliteStore {
         // transaction: split across two connections a concurrent caller could
         // observe the same marks and forget a sender key twice.
         self.with_write(move |conn: &mut Connection| {
-            let tx = to_store_err!(conn.transaction())?;
+            let tx = to_store_err!(begin_immediate(conn))?;
 
             let mut result = Vec::new();
             {

@@ -2547,8 +2547,7 @@ fn insert_task_event(
 ) -> Result<()> {
     let event_id = Uuid::new_v4().to_string();
     let created_at = Utc::now().to_rfc3339();
-    conn.execute_batch("SAVEPOINT xin_task_event_append")?;
-    let append = (|| -> Result<()> {
+    crate::runtime::sqlite_pool::in_write_scope(conn, || {
         conn.execute(
             "INSERT INTO xin_task_events (
             event_id, task_id, workspace_id, owner_id, topic_id, parent_task_id, source_message_event_id,
@@ -2586,20 +2585,7 @@ fn insert_task_event(
         )
         .context("Failed to enqueue xin task event mirror")?;
         Ok(())
-    })();
-    match append {
-        Ok(()) => {
-            conn.execute_batch("RELEASE SAVEPOINT xin_task_event_append")?;
-            Ok(())
-        }
-        Err(error) => {
-            let _ = conn.execute_batch(
-                "ROLLBACK TO SAVEPOINT xin_task_event_append;
-                 RELEASE SAVEPOINT xin_task_event_append;",
-            );
-            Err(error)
-        }
-    }
+    })
 }
 
 fn build_xin_task_event_mirror(

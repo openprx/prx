@@ -4,6 +4,7 @@ use crate::memory::traits::{
     AgentScopeRefused, ChatProfile, ConversationSessionSummary, ConversationTurn, MemoryEvent, MemoryEventInput,
     MemoryPrincipal, MessageEvent, MessageEventInput, PartitionKey, SessionContextQuery, SharedContextQuery,
 };
+use crate::runtime::sqlite_pool::begin_immediate;
 use chrono::Utc;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use std::sync::Arc;
@@ -1936,7 +1937,7 @@ impl SqliteMemory {
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<MemoryEvent> {
             let conn = pool.write();
-            let tx = super::agent_migration::begin_immediate(&conn)?;
+            let tx = begin_immediate(&conn)?;
             let now = Utc::now().to_rfc3339();
             let event_id = input.event_id.unwrap_or_else(|| Uuid::new_v4().to_string());
             let bound_scope = super::agent_migration::resolve_input_scope(

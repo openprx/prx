@@ -70,6 +70,7 @@ mod agent_scope_tests;
 use crate::config::{
     EmbeddingRouteConfig, IdentityBindingConfig, MemoryConfig, StorageProviderConfig, UserPolicyConfig,
 };
+use crate::runtime::sqlite_pool::begin_immediate;
 use anyhow::Context;
 use chrono::Local;
 use rusqlite::{Connection, params};
@@ -617,10 +618,14 @@ fn upsert_acl_bootstrap(
     }
 
     let db_path = workspace_dir.join("memory").join("brain.db");
-    let conn = Connection::open(db_path)?;
+    let mut conn = Connection::open(db_path)?;
+    // Every other connection to brain.db (the store's pool) waits on the
+    // shared busy handler; this one must too, or its write fails at once
+    // while the store holds the lock.
+    crate::runtime::sqlite_pool::install_busy_handler(&mut conn)?;
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
 
-    let tx = conn.unchecked_transaction()?;
+    let tx = begin_immediate(&conn)?;
     let now = Local::now().to_rfc3339();
 
     for binding in identity_bindings {

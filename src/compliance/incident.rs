@@ -1,3 +1,4 @@
+use crate::runtime::sqlite_pool::begin_immediate;
 use std::fs;
 use std::path::Path;
 
@@ -209,7 +210,7 @@ impl IncidentStore {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
-        let tx = self.conn.transaction()?;
+        let tx = begin_immediate(&self.conn)?;
         tx.execute(
             "INSERT INTO serious_incidents(
                  incident_id, system_reference, awareness_at, causal_link, severity,
@@ -238,7 +239,7 @@ impl IncidentStore {
         let incident_id = non_empty(incident_id, "incident_id")?;
         let report = non_empty(report, "initial_report")?;
         let now = Utc::now().to_rfc3339();
-        let tx = self.conn.transaction()?;
+        let tx = begin_immediate(&self.conn)?;
         let updated = tx.execute(
             "UPDATE serious_incidents SET initial_report = ?1, updated_at = ?2
              WHERE incident_id = ?3 AND status = 'open'",
@@ -269,7 +270,7 @@ impl IncidentStore {
             content_sha256: sha256_text(&content),
             content,
         };
-        let tx = self.conn.transaction()?;
+        let tx = begin_immediate(&self.conn)?;
         tx.execute(
             "INSERT INTO serious_incident_supplements(
                  supplement_id, incident_id, recorded_at, content, content_sha256
@@ -297,7 +298,7 @@ impl IncidentStore {
         let summary = non_empty(summary, "closure_summary")?;
         let closed_at = closed_at.to_rfc3339();
         let now = Utc::now().to_rfc3339();
-        let tx = self.conn.transaction()?;
+        let tx = begin_immediate(&self.conn)?;
         let updated = tx.execute(
             "UPDATE serious_incidents
              SET status='closed', closed_at=?1, closure_summary=?2, updated_at=?3

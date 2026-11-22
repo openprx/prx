@@ -227,11 +227,7 @@ pub(super) const NON_TOOL_RECEIVER_PRODUCERS: &[(&str, &str)] = &[
     ),
     (
         "begin_immediate(..)",
-        "BEGIN IMMEDIATE rusqlite Transaction for stamped writers",
-    ),
-    (
-        "super::agent_migration::begin_immediate(..)",
-        "BEGIN IMMEDIATE rusqlite Transaction for stamped writers",
+        "the shared BEGIN IMMEDIATE rusqlite Transaction for every write transaction",
     ),
     (
         "open_approval_ledger(..)",
@@ -262,8 +258,8 @@ pub(super) const NON_TOOL_RECEIVER_PRODUCERS: &[(&str, &str)] = &[
         "the memory SQLite snapshot reader's rusqlite Connection accessor",
     ),
     (
-        "to_store_err!(conn.transaction())",
-        "the WhatsApp store's error-mapping macro around `Connection::transaction()`",
+        "to_store_err!(begin_immediate(..))",
+        "the WhatsApp store's error-mapping macro around the shared `begin_immediate()`",
     ),
 ];
 

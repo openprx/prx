@@ -2,7 +2,7 @@
 //! workers. TEMP triggers update the durable index in the data transaction.
 
 use crate::memory::erasure::{ErasureOrigin, ErasureStore};
-use crate::runtime::sqlite_pool::{SqliteConnectionPool, SqliteWriteGuard};
+use crate::runtime::sqlite_pool::{SqliteConnectionPool, SqliteWriteGuard, begin_immediate};
 use parking_lot::Mutex;
 use rusqlite::{OptionalExtension, params};
 use std::{
@@ -357,8 +357,8 @@ impl ErasureStore for MemoryPool {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
     fn erase_rows(&self, origin: &ErasureOrigin) -> anyhow::Result<()> {
-        let mut conn = self.write();
-        let tx = conn.transaction()?;
+        let conn = self.write();
+        let tx = begin_immediate(&conn)?;
         tx.execute_batch("PRAGMA defer_foreign_keys=ON")?;
         tx.execute(
             "UPDATE ramflux_tombstones SET sealed=1 WHERE account=?1 AND conversation=?2 AND message=?3",
@@ -384,8 +384,8 @@ impl ErasureStore for MemoryPool {
         Ok(())
     }
     fn finish_delete(&self, origin: &ErasureOrigin) -> anyhow::Result<()> {
-        let mut conn = self.write();
-        let tx = conn.transaction()?;
+        let conn = self.write();
+        let tx = begin_immediate(&conn)?;
         tx.execute(
             "UPDATE ramflux_tombstones SET sealed=1 WHERE account=?1 AND conversation=?2 AND message=?3",
             params![origin.account, origin.conversation, origin.message],

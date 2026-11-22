@@ -137,6 +137,58 @@ fn wait_for_database_lock(attempts: i32) -> bool {
     true
 }
 
+/// Begin a transaction that may write: `BEGIN IMMEDIATE`.
+///
+/// Store invariant: every SQLite transaction that may write begins
+/// IMMEDIATE; only read-only transactions stay deferred. A deferred
+/// transaction takes a read snapshot at its first read and upgrades at its
+/// first write. On a WAL database, when another connection to the same file
+/// committed in between, that upgrade fails at once with `SQLITE_BUSY`
+/// without consulting the busy handler. Taking the write lock up front lets
+/// the connection's busy handler wait instead.
+///
+/// The caller must not already be inside a transaction on `conn`; nested
+/// atomic writes go through [`in_write_scope`].
+pub fn begin_immediate(conn: &Connection) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+    rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+}
+
+/// Run `write` atomically on `conn`, whether or not a transaction is open.
+///
+/// On an autocommit connection the scope is its own `BEGIN IMMEDIATE`
+/// transaction (see [`begin_immediate`]); inside an open transaction it is a
+/// savepoint, so a failure undoes only this scope's writes. One fixed
+/// savepoint name is enough: SQLite keeps savepoints on a stack and releases
+/// the innermost one of a given name, and these scopes nest strictly. A bare
+/// `SAVEPOINT` on an autocommit connection would instead begin a deferred
+/// transaction, which is what the invariant forbids.
+pub fn in_write_scope<T>(conn: &Connection, write: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+    if conn.is_autocommit() {
+        let transaction = begin_immediate(conn)?;
+        let value = write()?;
+        transaction.commit()?;
+        return Ok(value);
+    }
+    conn.execute_batch("SAVEPOINT prx_write_scope")?;
+    match write() {
+        Ok(value) => {
+            conn.execute_batch("RELEASE SAVEPOINT prx_write_scope")?;
+            Ok(value)
+        }
+        Err(error) => {
+            if let Err(rollback) =
+                conn.execute_batch("ROLLBACK TO SAVEPOINT prx_write_scope; RELEASE SAVEPOINT prx_write_scope;")
+            {
+                tracing::warn!(
+                    error = %crate::agent::diagnostics::error_class(&rollback),
+                    "SQLite write scope savepoint rollback failed"
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
 /// Make `conn` wait for a contended database lock instead of returning
 /// `SQLITE_BUSY`.
 ///

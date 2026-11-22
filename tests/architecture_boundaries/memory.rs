@@ -94,7 +94,7 @@ const ALLOWED_BRAIN_DB_OPENS_OUTSIDE_SQLITE_REPOSITORY: &[&str] = &[
     "src/memory/hygiene.rs::prunes_old_conversation_rows_in_sqlite_backend::let conn = Connection::open(&db_path).unwrap();",
     "src/memory/hygiene.rs::prunes_old_daily_rows_in_sqlite_backend::let conn = Connection::open(&db_path).unwrap();",
     "src/memory/mod.rs::hygiene_and_snapshot_run_after_the_schema_exists_on_a_fresh_workspace::Connection::open(memory_dir.join(\"brain.db\"))",
-    "src/memory/mod.rs::upsert_acl_bootstrap::let conn = Connection::open(db_path)?;",
+    "src/memory/mod.rs::upsert_acl_bootstrap::let mut conn = Connection::open(db_path)?;",
     // Test-only snapshot fixtures: isolated empty database and hydrated-row readback.
     "src/memory/snapshot.rs::empty_snapshot_db::let conn = Connection::open(db_dir.join(\"brain.db\")).unwrap();",
     "src/memory/snapshot.rs::hydration_rejects_ramflux_origin_without_scoped_key::let conn = Connection::open(tmp.path().join(\"memory/brain.db\")).unwrap();",

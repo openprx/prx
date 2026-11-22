@@ -7,6 +7,7 @@ use crate::memory::traits::{
     DocumentSearchResult, MemoryLink, MemoryLinkInput, MemoryPrincipal, PartitionKey, RetrievalTrace,
     RetrievalTraceInput,
 };
+use crate::runtime::sqlite_pool::begin_immediate;
 use chrono::{Local, Utc};
 use rusqlite::{OptionalExtension, params, params_from_iter, types::Value};
 use uuid::Uuid;
@@ -140,7 +141,7 @@ impl SqliteMemory {
             let cache_max = i64::try_from(self.cache_max).unwrap_or(i64::MAX);
             let outcome = crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<IngestOutcome> {
                 let conn = pool.write();
-                let tx = super::agent_migration::begin_immediate(&conn)?;
+                let tx = begin_immediate(&conn)?;
                 let now = Utc::now().to_rfc3339();
                 let document_id = input.document_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
                 let content_sha256 = Self::content_sha256_hex(&input.content);
@@ -634,7 +635,7 @@ impl SqliteMemory {
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<MemoryLink> {
             let conn = pool.write();
-            let tx = super::agent_migration::begin_immediate(&conn)?;
+            let tx = begin_immediate(&conn)?;
             let now = Utc::now().to_rfc3339();
             let link_id = input.link_id.unwrap_or_else(|| Uuid::new_v4().to_string());
             let bound_scope = super::agent_migration::resolve_input_scope(
@@ -710,7 +711,7 @@ impl SqliteMemory {
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<RetrievalTrace> {
             let conn = pool.write();
-            let tx = super::agent_migration::begin_immediate(&conn)?;
+            let tx = begin_immediate(&conn)?;
             let now = Utc::now().to_rfc3339();
             let trace_id = input.trace_id.unwrap_or_else(|| Uuid::new_v4().to_string());
             let candidate_count = i64::try_from(input.candidate_count).unwrap_or(i64::MAX);
@@ -799,7 +800,7 @@ impl SqliteMemory {
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<CompactionRun> {
             let conn = pool.write();
-            let tx = super::agent_migration::begin_immediate(&conn)?;
+            let tx = begin_immediate(&conn)?;
             let now = Utc::now().to_rfc3339();
             let run_id = input.run_id.unwrap_or_else(|| Uuid::new_v4().to_string());
             let source_message_count = i64::try_from(input.source_message_count).unwrap_or(i64::MAX);
