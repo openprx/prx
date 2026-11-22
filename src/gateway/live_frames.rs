@@ -195,6 +195,9 @@ impl LiveFrameSink for Producer {
     fn thinking(&self) {
         self.send(json!({"kind":"typing","state":"thinking"}));
     }
+    fn awaiting_approval(&self, tool: &str) {
+        self.send(json!({"kind":"tool_status","tool":tool,"phase":"awaiting_approval"}));
+    }
     fn child_denial(&self, tool: &str, child_run_id: &str) {
         self.send(json!({"kind":"tool_status","tool":tool,"phase":"denied","cause":"no_resolver","child_run_id":child_run_id}));
     }
@@ -214,7 +217,10 @@ impl LiveFrameSink for Producer {
             ToolLoopEvent::ToolFinished { name, outcome, .. } => {
                 let (phase, cause) = match outcome {
                     ToolCallOutcome::Ok => ("succeeded", None),
-                    ToolCallOutcome::Denied { cause } => ("denied", cause.map(|c| c.as_str())),
+                    ToolCallOutcome::Denied { cause } => (
+                        "denied",
+                        cause.map(crate::security::approval_ledger::run_call::rf_denial_cause),
+                    ),
                     ToolCallOutcome::Refused | ToolCallOutcome::PlanOnly => ("denied", None),
                     ToolCallOutcome::Cancelled => ("cancelled", Some("cancelled")),
                     ToolCallOutcome::AwaitingApproval => ("awaiting_approval", None),

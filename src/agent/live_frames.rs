@@ -6,6 +6,7 @@ use std::sync::Arc;
 pub(crate) trait LiveFrameSink: Send + Sync {
     fn emit(&self, event: &ToolLoopEvent);
     fn thinking(&self);
+    fn awaiting_approval(&self, tool: &str);
     fn child_denial(&self, tool: &str, child_run_id: &str);
 }
 

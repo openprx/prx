@@ -218,7 +218,7 @@ impl SecretStore {
         } else {
             let key = generate_random_key();
             if let Some(parent) = self.key_path.parent() {
-                fs::create_dir_all(parent)?;
+                crate::util::create_private_dir_all(parent)?;
             }
             fs::write(&self.key_path, hex_encode(&key)).context("Failed to write secret key file")?;
 

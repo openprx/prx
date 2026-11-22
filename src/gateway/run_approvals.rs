@@ -176,11 +176,13 @@ impl RunApprovalResolver {
         anyhow::ensure!((1..=86400).contains(&self.wait_secs), "invalid approval wait");
         let mut arguments = request.command.arguments.clone();
         crate::security::redaction::redact_json_value(&mut arguments);
-        let mut summary = crate::security::redact(&format!(
-            "{} {}",
-            request.descriptor.public_name,
-            serde_json::to_string(&arguments)?
-        ));
+        let preview = arguments
+            .get("command")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or(serde_json::to_string(&arguments)?);
+        let mut summary =
+            crate::security::redaction::redact_secrets(&format!("{}: {}", request.descriptor.public_name, preview));
         let mut end = summary.len().min(512);
         while !summary.is_char_boundary(end) {
             end = end.saturating_sub(1);
@@ -257,6 +259,8 @@ impl RunApprovalResolver {
                 .get(&id)
                 .cloned()
                 .context("approval waiter missing")?;
+            self.frames(&request.context.envelope, &HashSet::new())
+                .awaiting_approval(&request.descriptor.public_name);
             let fresh = created.is_some();
             let mut rx = entry.outcome.subscribe();
             if fresh {

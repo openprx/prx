@@ -710,7 +710,7 @@ or replayed; the final durable `turn.appended` remains authoritative.
 `tool_status` contains `{tool,phase}` without arguments or results. Phases are
 `started`, `succeeded`, `failed`, `denied`, `cancelled`, and `awaiting_approval`.
 Optional `cause` appears only on denied/failed/cancelled phases and uses typed
-approval or termination causes: `user_rejected`, `no_answer`,
+approval or termination causes: `owner_denied`, `expired`,
 `no_approval_surface`, `no_terminal`, `prompt_unavailable`, `concurrent_pending`,
 `session_switched`, `no_resolver`, `channel_denied`, `ledger_refused`, or
 `cancelled`. Process workers have no approval relay in this unit. Their
@@ -731,10 +731,13 @@ expiry returns `410 approval_expired`. This path does not consult Main's level.
 
 The exact-call ledger owns the pending row and one-shot grant. Its pending
 source and `approval.pending{approval_id,run_id,tool,agent,summary,expires_at}`
-header commit together. The summary uses the existing secret redactor and is
+header commit together. The summary contains the tool name and an argument
+preview (for example, `shell: ls -la /tmp`), uses the existing secret redactor, and is
 at most 512 UTF-8 bytes. A single decision is committed as
 `approval.decided{approval_id,run_id,decision,cause?}` in the source resolution
-transaction. Only denied decisions include `cause:"owner_denied"`. Only an
+transaction. Denied decisions include `cause:"owner_denied"`; expired decisions
+include `cause:"expired"`. The same rf cause names appear on `tool_status`;
+Console retains its internal cause names. Only an
 approved decision consumes the exact grant and continues execution. Denial or
 expiry returns a denied tool result and the loop continues to its final turn.
 Cancellation and restart close outstanding approvals transactionally. Full

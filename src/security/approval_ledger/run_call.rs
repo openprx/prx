@@ -119,6 +119,15 @@ pub(crate) struct PendingCallPage {
     pub(crate) next_cursor: Option<i64>,
 }
 
+/// The rf wire names for internal approval denial causes. Console uses `as_str`.
+pub(crate) const fn rf_denial_cause(cause: crate::tools::ApprovalDenialCause) -> &'static str {
+    match cause {
+        crate::tools::ApprovalDenialCause::UserRejected => "owner_denied",
+        crate::tools::ApprovalDenialCause::NoAnswer => "expired",
+        other => other.as_str(),
+    }
+}
+
 /// Construct with the service's pinned workspace, state key and witness keyring.
 /// Owner/session parameters must come from the authenticated transport envelope.
 pub(crate) struct ApprovalLedgerPort<'a> {
@@ -306,7 +315,8 @@ impl ApprovalLedgerPort<'_> {
             )
             .await?;
         let cause = match decision {
-            "denied" => Some("owner_denied"),
+            "denied" => Some(rf_denial_cause(crate::tools::ApprovalDenialCause::UserRejected)),
+            "expired" => Some(rf_denial_cause(crate::tools::ApprovalDenialCause::NoAnswer)),
             _ => None,
         };
         let value = serde_json::json!({"approval_id":pending.authority.call_id(),"run_id":pending.authority.run_id,"decision":decision,"cause":cause});

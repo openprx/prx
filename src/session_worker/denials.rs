@@ -27,6 +27,8 @@ impl DenialSink {
 }
 impl LiveFrameSink for DenialSink {
     fn thinking(&self) {}
+    // Process workers have no approval relay; only typed denials enter completion.
+    fn awaiting_approval(&self, _tool: &str) {}
     fn child_denial(&self, tool: &str, _child_run_id: &str) {
         self.record(tool);
     }

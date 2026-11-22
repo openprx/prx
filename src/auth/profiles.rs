@@ -426,7 +426,7 @@ impl AuthProfilesStore {
 
     fn write_persisted_locked(&self, persisted: &PersistedAuthProfiles) -> Result<()> {
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)
+            crate::util::create_private_dir_all(parent)
                 .with_context(|| format!("Failed to create auth profile directory at {}", parent.display()))?;
         }
 
@@ -514,7 +514,7 @@ impl AuthProfilesStore {
 
     fn acquire_lock(&self) -> Result<AuthProfileLockGuard> {
         if let Some(parent) = self.lock_path.parent() {
-            fs::create_dir_all(parent)
+            crate::util::create_private_dir_all(parent)
                 .with_context(|| format!("Failed to create lock directory at {}", parent.display()))?;
         }
 
