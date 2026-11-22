@@ -101,10 +101,103 @@ impl HotReloadManager {
 const SETTLE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 const SETTLE_RETRIES: u32 = 10;
 
-/// An outcome the watcher still has to settle, and how often it tried.
+/// An outcome the watcher still has to settle, how often it tried, and when
+/// it tries again.
 struct PendingSettlement {
     seen: crate::config::manage::WatcherActivation,
     attempts: u32,
+    next_retry: std::time::Instant,
+}
+
+impl PendingSettlement {
+    fn new(seen: crate::config::manage::WatcherActivation, attempts: u32) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            seen,
+            attempts,
+            next_retry: now.checked_add(SETTLE_RETRY_INTERVAL).unwrap_or(now),
+        }
+    }
+}
+
+/// Settle the waiting outcome again once its retry deadline passed, whether
+/// or not other events arrived meanwhile.
+fn retry_due_settlement(
+    shared: &SharedConfig,
+    runtime: Option<&tokio::runtime::Handle>,
+    pending: &mut Option<PendingSettlement>,
+) {
+    if !pending
+        .as_ref()
+        .is_some_and(|waiting| std::time::Instant::now() >= waiting.next_retry)
+    {
+        return;
+    }
+    let Some(waiting) = pending.take() else {
+        return;
+    };
+    let attempts = waiting.attempts.saturating_add(1);
+    if let Some(seen) = settle_deferred(shared, runtime, waiting.seen) {
+        if attempts < SETTLE_RETRIES {
+            *pending = Some(PendingSettlement::new(seen, attempts));
+        } else {
+            tracing::debug!("No deferred configuration record names the evaluated revision");
+        }
+    }
+}
+
+/// Whether a filesystem event can have changed a file's content or name.
+/// Opens, reads and closes without a write (`Access` other than
+/// `Close(Write)`) and access-time updates cannot; reporting them made the
+/// watcher's own read of `config.toml` re-trigger it forever.
+fn may_change_content(kind: &notify::EventKind) -> bool {
+    use notify::event::{AccessKind, AccessMode, MetadataKind, ModifyKind};
+    match kind {
+        notify::EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
+        notify::EventKind::Access(_) => false,
+        notify::EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime)) => false,
+        notify::EventKind::Any
+        | notify::EventKind::Create(_)
+        | notify::EventKind::Modify(_)
+        | notify::EventKind::Remove(_)
+        | notify::EventKind::Other => true,
+    }
+}
+
+/// The platform watcher, with events that cannot change content dropped
+/// before they reach the debouncer.
+struct ContentChangeWatcher {
+    inner: notify::RecommendedWatcher,
+}
+
+impl notify::Watcher for ContentChangeWatcher {
+    fn new<F: notify::EventHandler>(mut event_handler: F, config: notify::Config) -> notify::Result<Self> {
+        let filtered = move |event: notify::Result<notify::Event>| {
+            if event.as_ref().is_ok_and(|event| !may_change_content(&event.kind)) {
+                return;
+            }
+            event_handler.handle_event(event);
+        };
+        Ok(Self {
+            inner: notify::RecommendedWatcher::new(filtered, config)?,
+        })
+    }
+
+    fn watch(&mut self, path: &std::path::Path, recursive_mode: notify::RecursiveMode) -> notify::Result<()> {
+        self.inner.watch(path, recursive_mode)
+    }
+
+    fn unwatch(&mut self, path: &std::path::Path) -> notify::Result<()> {
+        self.inner.unwatch(path)
+    }
+
+    fn configure(&mut self, option: notify::Config) -> notify::Result<bool> {
+        self.inner.configure(option)
+    }
+
+    fn kind() -> notify::WatcherKind {
+        notify::RecommendedWatcher::kind()
+    }
 }
 
 /// Settle the CLI's `activation_deferred` record for the content this
@@ -215,7 +308,7 @@ fn settle_unchanged_event(
     pending: &mut Option<PendingSettlement>,
 ) {
     if let Some(seen) = unchanged_active_outcome(shared, content_hash) {
-        *pending = settle_deferred(shared, runtime, seen).map(|seen| PendingSettlement { seen, attempts: 0 });
+        *pending = settle_deferred(shared, runtime, seen).map(|seen| PendingSettlement::new(seen, 0));
     }
 }
 
@@ -227,7 +320,7 @@ fn run_watcher(
     runtime: Option<tokio::runtime::Handle>,
 ) -> anyhow::Result<()> {
     use notify::RecursiveMode;
-    use notify_debouncer_mini::{DebounceEventResult, new_debouncer};
+    use notify_debouncer_mini::{DebounceEventResult, new_debouncer_opt};
 
     let (tx, rx) = std::sync::mpsc::channel::<DebounceEventResult>();
     let debounce_ms = std::time::Duration::from_secs(1);
@@ -236,7 +329,10 @@ fn run_watcher(
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
 
-    let mut debouncer = new_debouncer(debounce_ms, tx)?;
+    let mut debouncer = new_debouncer_opt::<_, ContentChangeWatcher>(
+        notify_debouncer_mini::Config::default().with_timeout(debounce_ms),
+        tx,
+    )?;
     debouncer.watcher().watch(&watch_root, RecursiveMode::Recursive)?;
 
     let mut last_content_hash = compute_config_fingerprint_gated(&config_path).ok();
@@ -248,8 +344,7 @@ fn run_watcher(
             restart_required: Vec::new(),
         },
     };
-    let mut pending =
-        settle_deferred(&shared, runtime.as_ref(), started).map(|seen| PendingSettlement { seen, attempts: 0 });
+    let mut pending = settle_deferred(&shared, runtime.as_ref(), started).map(|seen| PendingSettlement::new(seen, 0));
     ready.store(true, Ordering::Release);
 
     tracing::info!(
@@ -259,26 +354,23 @@ fn run_watcher(
     );
 
     loop {
-        let result = match rx.recv_timeout(SETTLE_RETRY_INTERVAL) {
-            Ok(result) => result,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                // Retry an outcome whose record was not recorded yet.
-                if let Some(mut waiting) = pending.take() {
-                    waiting.attempts += 1;
-                    if let Some(seen) = settle_deferred(&shared, runtime.as_ref(), waiting.seen) {
-                        if waiting.attempts < SETTLE_RETRIES {
-                            pending = Some(PendingSettlement {
-                                seen,
-                                attempts: waiting.attempts,
-                            });
-                        } else {
-                            tracing::debug!("No deferred configuration record names the evaluated revision");
-                        }
-                    }
-                }
-                continue;
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        // Block until an event arrives; wake for a retry only while an
+        // outcome waits to be settled, so an idle watcher reads nothing.
+        let received = match pending.as_ref().map(|waiting| waiting.next_retry) {
+            Some(deadline) => match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+                Ok(result) => Some(result),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            },
+            None => match rx.recv() {
+                Ok(result) => Some(result),
+                Err(std::sync::mpsc::RecvError) => break,
+            },
+        };
+        // Retry an outcome whose record was not recorded yet.
+        retry_due_settlement(&shared, runtime.as_ref(), &mut pending);
+        let Some(result) = received else {
+            continue;
         };
         match result {
             Ok(events) => {
@@ -321,7 +413,7 @@ fn run_watcher(
                 // content, and the older record is superseded by it.
                 pending = watcher_outcome(&shared, &reloaded, &content_hash)
                     .and_then(|seen| settle_deferred(&shared, runtime.as_ref(), seen))
-                    .map(|seen| PendingSettlement { seen, attempts: 0 });
+                    .map(|seen| PendingSettlement::new(seen, 0));
                 match reloaded {
                     Ok(report) => {
                         log_diff(&previous, &shared.load_full());
