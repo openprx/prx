@@ -193,6 +193,23 @@ impl RunApprovalResolver {
                 .map(str::to_owned)
                 .context("approval root scope missing")
         };
+        // Provision the waiter before the source commit can wake the WS consumer.
+        let registered = Mutex::new(None::<String>);
+        let register_pending = |pending: &PendingCall| {
+            let id = pending.authority().call_id();
+            let mut entries = self.approvals.entries.lock();
+            if let std::collections::hash_map::Entry::Vacant(slot) = entries.entry(id.clone()) {
+                let (outcome, _) = watch::channel(None);
+                slot.insert(Arc::new(Entry {
+                    ledger: ledger.clone(),
+                    pending: pending.clone(),
+                    claimed: AtomicBool::new(false),
+                    outcome,
+                    cancel: self.cancellation.child_token(),
+                }));
+                *registered.lock() = Some(id);
+            }
+        };
         let pending = port
             .record_pending_rf(
                 &request.context.envelope,
@@ -207,39 +224,48 @@ impl RunApprovalResolver {
                     incarnation: text("incarnation")?,
                     wait_secs: self.wait_secs,
                 },
+                &register_pending,
             )
-            .await?;
+            .await;
+        let created = registered.into_inner();
+        let pending = match pending {
+            Ok(pending) => pending,
+            Err(error) => {
+                if let Some(id) = created {
+                    self.approvals.entries.lock().remove(&id);
+                }
+                return Err(error);
+            }
+        };
         let id = pending.authority().call_id();
         let saved = ledger
             .memory
             .find_message_event_by_idempotency_key(&ledger.workspace, &format!("rf-decision:{id}"))
             .await?;
         let decision = if let Some(saved) = saved {
+            if created.is_some() {
+                self.approvals.entries.lock().remove(&id);
+            }
             let value: Value =
                 serde_json::from_str(saved.raw_payload_json.as_deref().context("approval decision missing")?)?;
             serde_json::from_value::<Decision>(value.get("decision").cloned().context("approval decision missing")?)?
         } else {
-            let (outcome, mut rx) = watch::channel(None);
-            let proposed = Arc::new(Entry {
-                ledger: ledger.clone(),
-                pending: pending.clone(),
-                claimed: AtomicBool::new(false),
-                outcome,
-                cancel: self.cancellation.child_token(),
-            });
-            let (entry, fresh) = {
-                let mut entries = self.approvals.entries.lock();
-                match entries.entry(id.clone()) {
-                    std::collections::hash_map::Entry::Occupied(old) => (Arc::clone(old.get()), false),
-                    std::collections::hash_map::Entry::Vacant(slot) => {
-                        slot.insert(Arc::clone(&proposed));
-                        (proposed, true)
-                    }
-                }
-            };
+            let entry = self
+                .approvals
+                .entries
+                .lock()
+                .get(&id)
+                .cloned()
+                .context("approval waiter missing")?;
+            let fresh = created.is_some();
+            let mut rx = entry.outcome.subscribe();
             if fresh {
                 let waiter = Arc::clone(&entry);
                 tokio::spawn(async move {
+                    let observed = *rx.borrow_and_update();
+                    if observed.is_some() {
+                        return;
+                    }
                     let seconds = (waiter.pending.expires_at() - chrono::Utc::now())
                         .to_std()
                         .unwrap_or_default();

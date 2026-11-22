@@ -248,7 +248,7 @@ impl ApprovalLedgerPort<'_> {
         tool: &str,
         arguments: &serde_json::Value,
     ) -> anyhow::Result<PendingCall> {
-        self.record_pending_target(envelope, capability, tool, arguments, None, None)
+        self.record_pending_target(envelope, capability, tool, arguments, None, None, None)
             .await
     }
 
@@ -263,7 +263,7 @@ impl ApprovalLedgerPort<'_> {
             fingerprint: entry.fingerprint,
             generation: entry.generation,
         };
-        self.record_pending_target(envelope, &capability, &entry.root, arguments, Some(entry), None)
+        self.record_pending_target(envelope, &capability, &entry.root, arguments, Some(entry), None, None)
             .await
     }
 
@@ -273,14 +273,23 @@ impl ApprovalLedgerPort<'_> {
         entry: &crate::tools::capability::catalog::CapabilityEntry,
         arguments: &serde_json::Value,
         rf: RfPending,
+        on_pending: &(dyn Fn(&PendingCall) + Send + Sync),
     ) -> anyhow::Result<PendingCall> {
         let capability = crate::tools::capability::contract::CapabilityRef {
             id: entry.id.clone(),
             fingerprint: entry.fingerprint,
             generation: entry.generation,
         };
-        self.record_pending_target(envelope, &capability, &entry.root, arguments, Some(entry), Some(rf))
-            .await
+        self.record_pending_target(
+            envelope,
+            &capability,
+            &entry.root,
+            arguments,
+            Some(entry),
+            Some(rf),
+            Some(on_pending),
+        )
+        .await
     }
 
     pub(crate) async fn record_rf_decision(&self, pending: &PendingCall, decision: &str) -> anyhow::Result<()> {
@@ -329,6 +338,7 @@ impl ApprovalLedgerPort<'_> {
         arguments: &serde_json::Value,
         entry: Option<&crate::tools::capability::catalog::CapabilityEntry>,
         rf: Option<RfPending>,
+        on_pending: Option<&(dyn Fn(&PendingCall) + Send + Sync)>,
     ) -> anyhow::Result<PendingCall> {
         // Canonical ingress envelopes may derive their owner instead of
         // storing an override. The durable source below must still match the
@@ -423,7 +433,11 @@ impl ApprovalLedgerPort<'_> {
             .await?
             .is_some()
         {
-            return self.inspect(owner, &envelope.session_key, &authority).await;
+            let pending = self.inspect(owner, &envelope.session_key, &authority).await?;
+            if let Some(on_pending) = on_pending {
+                on_pending(&pending);
+            }
+            return Ok(pending);
         }
         let pending = PendingCall {
             authority,
@@ -458,6 +472,9 @@ impl ApprovalLedgerPort<'_> {
             rf,
         };
         let signed = self.sign(b"call.pending", pending)?;
+        if let Some(on_pending) = on_pending {
+            on_pending(&signed.record);
+        }
         let event = self
             .write(
                 &source,
