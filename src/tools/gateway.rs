@@ -1322,4 +1322,180 @@ mod tests {
             assert!(schema.contains(reason), "the description must name {reason}: {schema}");
         }
     }
+
+    #[tokio::test]
+    async fn config_patch_output_never_carries_url_userinfo() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = split_config(&tmp).await;
+        let tool = GatewayTool::new(new_shared(cfg), "anthropic", "claude-sonnet-4-6", vec![]).with_security(Arc::new(
+            SecurityPolicy {
+                autonomy: crate::security::AutonomyLevel::Supervised,
+                ..SecurityPolicy::default()
+            },
+        ));
+        let key = "custom:http://alice:userinfo-sentinel-pw@127.0.0.1:1/v1/model-a";
+
+        let mut args = trusted_patch(json!({ "cost": { "prices": { key: { "input": 1.0, "output": 2.0 } } } }));
+        let refused = tool.execute(args.clone()).await.unwrap();
+        assert!(!refused.success, "a credentialed price key needs confirmation");
+        assert!(!refused.error.unwrap_or_default().contains("userinfo-sentinel-pw"));
+
+        args["confirm_high_risk"] = json!(true);
+        args["revision"] = json!(ConfigTransactions::base_revision(&tool.config.desired()));
+        let result = tool.execute(args).await.unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert!(!result.output.contains("userinfo-sentinel-pw"), "{}", result.output);
+        assert!(result.output.contains("[redacted]@"), "{}", result.output);
+    }
+
+    #[tokio::test]
+    async fn config_patch_confirmation_is_bound_to_a_revision() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = split_config(&tmp).await;
+        let shared = new_shared(cfg);
+        let tool = GatewayTool::new(Arc::clone(&shared), "anthropic", "claude-sonnet-4-6", vec![]).with_security(
+            Arc::new(SecurityPolicy {
+                autonomy: crate::security::AutonomyLevel::Supervised,
+                ..SecurityPolicy::default()
+            }),
+        );
+
+        let mut args = trusted_patch(json!({ "api_key": "sentinel-patched-root" }));
+        args["confirm_high_risk"] = json!(true);
+        let refused = tool.execute(args.clone()).await.unwrap();
+        assert!(!refused.success, "an unbound confirmation must be refused");
+        let error = refused.error.unwrap_or_default();
+        assert!(error.contains("if_match"), "{error}");
+        assert!(
+            error.contains("revision=\""),
+            "the refusal names the revision to send: {error}"
+        );
+        assert!(!error.contains("sentinel-patched-root"), "{error}");
+        assert_ne!(
+            shared.desired().config.api_key.as_deref(),
+            Some("sentinel-patched-root")
+        );
+
+        args["revision"] = json!(ConfigTransactions::base_revision(&shared.desired()));
+        let result = tool.execute(args).await.unwrap();
+        assert!(result.success, "{:?}", result.error);
+
+        let schema = tool.execution_schema().to_string();
+        assert!(schema.contains("\"revision\""), "{schema}");
+    }
+
+    #[tokio::test]
+    async fn config_patch_cannot_move_a_route_key_to_another_provider_by_renaming_the_route() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        cfg.model_routes = vec![crate::config::ModelRouteConfig {
+            settings: Default::default(),
+            hint: "fast".into(),
+            provider: "openrouter".into(),
+            model: "vendor/route-model".into(),
+            api_key: Some("sentinel-rename-route-key".into()),
+            credential_ref: None,
+        }];
+        for (provider, model) in [("openrouter", "vendor/route-model"), ("anthropic", "claude-sonnet-4-5")] {
+            cfg.providers.models.push(
+                toml::from_str(&format!(
+                    "provider = \"{provider}\"\nmodel = \"{model}\"\noperations = [\"chat\"]\n"
+                ))
+                .unwrap(),
+            );
+        }
+        cfg.save().await.unwrap();
+        let loaded = Config::load_from_path(&cfg.config_path, cfg.workspace_dir.clone()).unwrap();
+        let shared = new_shared(loaded);
+        let tool = GatewayTool::new(Arc::clone(&shared), "openrouter", "vendor/route-model", vec![]).with_security(
+            Arc::new(SecurityPolicy {
+                autonomy: crate::security::AutonomyLevel::Supervised,
+                ..SecurityPolicy::default()
+            }),
+        );
+        let before = tokio::fs::read_to_string(&cfg.config_path).await.unwrap();
+
+        let result = tool
+            .execute(trusted_patch(json!({
+                "model_routes": [{
+                    "hint": "fast2",
+                    "provider": "anthropic",
+                    "model": "claude-sonnet-4-5",
+                    "api_key": "sentinel-rename-route-key"
+                }]
+            })))
+            .await
+            .unwrap();
+        assert!(
+            !result.success,
+            "the route key changed providers unconfirmed: {result:?}"
+        );
+        let error = result.error.unwrap_or_default();
+        assert!(
+            error.contains("sends a stored credential to a different provider"),
+            "{error}"
+        );
+        assert!(!error.contains("sentinel-rename-route-key"), "{error}");
+        assert_eq!(tokio::fs::read_to_string(&cfg.config_path).await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn config_patch_switching_the_default_away_from_the_root_key_is_high_risk() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            default_provider: Some("openai".into()),
+            default_model: Some("gpt-4o".into()),
+            api_key: Some("sentinel-root-owner-key".into()),
+            ..Config::default()
+        };
+        cfg.providers.models = vec![crate::config::schema::ProviderModelConfig {
+            provider: "anthropic".into(),
+            model: Some("claude-sonnet-4-5".into()),
+            operations: Some(vec![crate::config::schema::ModelOperationSetting::Chat]),
+            native_tools: None,
+            vision_input: None,
+            streaming: None,
+            structured_output: None,
+            tool_schema_dialect: None,
+            tool_call_dialect: None,
+            context_window: None,
+        }];
+        cfg.save().await.unwrap();
+        let cfg = Config::load_from_path(&cfg.config_path, cfg.workspace_dir.clone()).unwrap();
+        let shared = new_shared(cfg);
+        let tool = GatewayTool::new(Arc::clone(&shared), "anthropic", "claude-sonnet-4-6", vec![]).with_security(
+            Arc::new(SecurityPolicy {
+                autonomy: crate::security::AutonomyLevel::Supervised,
+                ..SecurityPolicy::default()
+            }),
+        );
+        let before = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+
+        let mut args = trusted_patch(json!({ "default_provider": "anthropic", "default_model": "claude-sonnet-4-5" }));
+        let refused = tool.execute(args.clone()).await.unwrap();
+        assert!(!refused.success, "the root key changed hands unconfirmed");
+        let error = refused.error.unwrap_or_default();
+        assert!(
+            error.contains("sends a stored credential to a different provider"),
+            "{error}"
+        );
+        assert!(!error.contains("sentinel-root-owner-key"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("config.toml")).unwrap(),
+            before,
+            "nothing was written"
+        );
+
+        args["confirm_high_risk"] = json!(true);
+        args["revision"] = json!(ConfigTransactions::base_revision(&shared.desired()));
+        let result = tool.execute(args).await.unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(shared.desired().config.default_provider.as_deref(), Some("anthropic"));
+    }
 }
