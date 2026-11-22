@@ -202,6 +202,7 @@ fn ollama_reply(script: &Script, request: &serde_json::Value) -> serde_json::Val
 struct Fixture {
     tool: SessionsSpawnTool,
     script: Script,
+    _registry: Arc<Vec<Box<dyn Tool>>>,
     _server: TaskTraceServer,
     _workspace: tempfile::TempDir,
 }
@@ -302,6 +303,7 @@ async fn build_fixture(
     Fixture {
         tool,
         script,
+        _registry: registry,
         _server: server,
         _workspace: workspace,
     }

@@ -448,9 +448,20 @@ impl OrdinaryChildPublication {
         if let Some(allowed_tools) = allowed_tools {
             policy.allowed_tools = Some(allowed_tools);
         }
+        let parent_view = parent.catalog_view();
+        if task.is_none() {
+            // An in-process delegate receives its sealed tool selection up
+            // front, even when the parent's registry also serves discovery.
+            // Keep the exact parent catalog and executor for alias parity.
+            for reference in &self.scope().gate_inputs().0.allowed {
+                let entry = parent_view
+                    .entry_any(&reference.id)
+                    .context("ordinary delegate capability missing")?;
+                policy.direct_names.insert(entry.public_name.clone());
+            }
+        }
         // Only Full may narrow a child's publication at this stage. Below
         // Full, every sealed member must remain on both published surfaces.
-        let parent_view = parent.catalog_view();
         let view = parent.catalog.view(&CatalogScope::default()).with_surface(&policy);
         let full = self.scope().gate_inputs().0.authority.level == crate::security::AutonomyLevel::Full;
         for reference in &self.scope().gate_inputs().0.allowed {

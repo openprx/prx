@@ -266,7 +266,7 @@ impl PublicationRules<'_, '_> {
             .filter_map(|entry| {
                 let delegate = is_delegator(&entry.public_name);
                 let reference = entry_ref(entry);
-                let directly_exposed = matches!(entry.exposure, Exposure::Direct);
+                let directly_exposed = self.catalog.directly_exposes(entry);
                 let minted_delegator = delegate
                     && outgoing_child
                     && (self.trusted.surface != TurnSurfaceKind::Interactive || self.full_autonomy());
@@ -328,7 +328,7 @@ impl PublicationRules<'_, '_> {
                 entry.fingerprint == reference.fingerprint
                     && entry.generation == reference.generation
                     && is_delegator(&entry.public_name)
-                    && (matches!(entry.exposure, Exposure::Direct)
+                    && (self.catalog.directly_exposes(entry)
                         || outgoing_child
                             && (self.trusted.surface != TurnSurfaceKind::Interactive || self.full_autonomy()))
             })

@@ -838,6 +838,13 @@ impl<'a> CatalogView<'a> {
         }
     }
 
+    pub(crate) fn directly_exposes(&self, entry: &CapabilityEntry) -> bool {
+        matches!(entry.exposure, Exposure::Direct)
+            || self
+                .surface
+                .is_some_and(|surface| surface.direct_names.contains(&entry.public_name))
+    }
+
     pub(crate) fn surface_excludes(&self, entry: &CapabilityEntry) -> bool {
         self.surface.is_some_and(|surface| {
             !surface.permits(&entry.public_name, &entry.root, &entry.target)

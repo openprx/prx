@@ -514,7 +514,7 @@ async fn the_gateway_key_still_reaches_the_gateway_provider() {
 const F1_SPAWN_ROOT_SENTINEL: &str = "C0F-SPAWN-ROOT-SENTINEL";
 
 /// A routed parent keeps its route key for an inherited child, while a
-/// direct-model child returns to the configured root connection.
+/// child explicitly selecting the root provider returns to its connection.
 #[tokio::test]
 async fn child_provider_root_branch_uses_resolved_root_credential_on_wire() {
     use crate::providers::credential_probe::{CredentialProbe, PROBE_MODEL};
@@ -573,9 +573,12 @@ async fn child_provider_root_branch_uses_resolved_root_credential_on_wire() {
     assert!(!route.saw("PRX-HINT-ROOT-WIRE"));
     assert!(root.requests().is_empty());
 
-    let direct = execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "probe", "model": PROBE_MODEL})))
-        .await
-        .expect("test: direct override spawn result");
+    let direct = execute_admitted_spawn(
+        &tool,
+        with_spawn_grant(json!({"task": "probe", "provider": root_provider, "model": PROBE_MODEL})),
+    )
+    .await
+    .expect("test: direct override spawn result");
     assert!(direct.success, "{:?}", direct.error);
     assert_eq!(root.wait_for_requests(1, std::time::Duration::from_secs(10)).await, 1);
     assert!(root.saw("PRX-HINT-ROOT-WIRE"));
