@@ -633,7 +633,7 @@ async fn child_publication_builds_the_advisory_driver_only_when_enabled() -> any
                     .ordinary_child_publication
                     .clone()
                     .context("ordinary parent binding captured no child publication")?;
-                let child = publication.child_service(&bound, None, None)?;
+                let child = publication.child_service(&bound, None, None, &[])?;
                 assert_eq!(
                     child.advisory().factory().is_some(),
                     enabled,

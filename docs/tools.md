@@ -374,7 +374,9 @@ always_include = ["git_operations"]
 Delegated and session-worker turns still honor an agent's explicit
 `allowed_tools` boundary. `allowed_tools = ["*"]` inherits the complete parent
 eligible capability set, including dynamically discovered MCP and WASM aliases;
-a narrower allowlist intentionally exposes only the named capabilities. Task
+a narrower allowlist intentionally exposes only the named capabilities. An
+in-process delegate offers explicitly named tools directly. Wildcard-inherited
+tools retain the parent's exposure: deferred tools stay behind `capability_search`. Task
 children proxy the live parent registry. Process workers reconstruct native,
 Skill, MCP, WASM, Hook, memory, network, scheduling, session orchestration,
 daemon messaging, and Gateway tools from the parent's sealed configuration.

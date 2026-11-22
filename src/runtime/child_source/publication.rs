@@ -394,9 +394,10 @@ impl OrdinaryChildPublication {
         caller: &crate::tools::ToolExecutionContext,
         allowed_tools: Option<BTreeSet<String>>,
         registry: Option<Arc<Vec<Box<dyn Tool>>>>,
+        direct_tools: &[String],
     ) -> anyhow::Result<Arc<TurnRuntimeService>> {
         self.verify_caller(caller)?;
-        self.derive_child_service(allowed_tools, None, registry, &[])
+        self.derive_child_service(allowed_tools, None, registry, &[], direct_tools)
     }
 
     pub(crate) fn task_service(
@@ -408,7 +409,7 @@ impl OrdinaryChildPublication {
     ) -> anyhow::Result<Arc<TurnRuntimeService>> {
         anyhow::ensure!(self == task.publication(), "ordinary task publication differs");
         task.verify()?;
-        self.derive_child_service(allowed_tools, Some(task), Some(registry), excluded_tools)
+        self.derive_child_service(allowed_tools, Some(task), Some(registry), excluded_tools, &[])
     }
 
     fn derive_child_service(
@@ -417,6 +418,7 @@ impl OrdinaryChildPublication {
         task: Option<Arc<super::ordinary_task::OrdinaryTaskAuthority>>,
         task_registry: Option<Arc<Vec<Box<dyn Tool>>>>,
         excluded_tools: &[String],
+        direct_tools: &[String],
     ) -> anyhow::Result<Arc<TurnRuntimeService>> {
         let runtime = self.loop_runtime()?.clone();
         let parent = &self.inner.service;
@@ -450,14 +452,16 @@ impl OrdinaryChildPublication {
         }
         let parent_view = parent.catalog_view();
         if task.is_none() {
-            // An in-process delegate receives its sealed tool selection up
-            // front, even when the parent's registry also serves discovery.
+            // Explicitly named delegate tools are offered up front. Wildcard
+            // members keep the parent's exposure, including deferred discovery.
             // Keep the exact parent catalog and executor for alias parity.
             for reference in &self.scope().gate_inputs().0.allowed {
                 let entry = parent_view
                     .entry_any(&reference.id)
                     .context("ordinary delegate capability missing")?;
-                policy.direct_names.insert(entry.public_name.clone());
+                if direct_tools.iter().any(|name| name.trim() == entry.public_name) {
+                    policy.direct_names.insert(entry.public_name.clone());
+                }
             }
         }
         // Only Full may narrow a child's publication at this stage. Below

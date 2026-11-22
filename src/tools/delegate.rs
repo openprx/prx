@@ -1219,8 +1219,8 @@ impl DelegateLoopResources {
             );
         }
         let answer_only = child_source.is_some() && !agent_config.agentic;
-        // At Full the agent's `allowed_tools` is ignored: the child inherits
-        // every tool its level allows.
+        // At Full the child inherits every tool its level allows. Explicit
+        // `allowed_tools` names remain direct-publication preferences.
         let full = child_source
             .as_ref()
             .is_some_and(|source| source.authority.publication.level() == crate::security::AutonomyLevel::Full);
@@ -1406,7 +1406,7 @@ impl DelegateLoopResources {
                 let owner = cleanup_owner
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("ordinary delegate cleanup owner missing"))?;
-                let service = publication.child_service(caller, allowed_tools, None)?;
+                let service = publication.child_service(caller, allowed_tools, None, &agent_config.allowed_tools)?;
                 owner.retain_child_service(Arc::clone(&service))?;
                 (service, Arc::clone(&publication.generation().effective))
             };
