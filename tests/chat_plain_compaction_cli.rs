@@ -168,6 +168,7 @@ impl<'a> HeldChat<'a> {
         self.running.send(line);
     }
 
+    #[cfg(not(feature = "terminal-tui"))]
     fn interrupt(&self) {
         self.running.interrupt();
     }
@@ -356,6 +357,7 @@ fn newest_user_text(request: &serde_json::Value) -> String {
 }
 
 /// Longest wait for the cancelled call's connection to close.
+#[cfg(not(feature = "terminal-tui"))]
 const CANCEL_DEADLINE: Duration = Duration::from_secs(30);
 
 /// The user line whose first call the provider refuses as a context overflow.

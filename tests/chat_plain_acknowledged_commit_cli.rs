@@ -525,6 +525,7 @@ fn cost_right_after_a_reply_reports_that_turns_exact_usage() {
 }
 
 /// The text of `message`.
+#[cfg(not(feature = "terminal-tui"))]
 fn text_of(message: &serde_json::Value) -> String {
     match &message["content"] {
         serde_json::Value::String(text) => text.clone(),
