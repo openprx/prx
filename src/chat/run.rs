@@ -284,6 +284,7 @@ async fn run_internal(
         tools_registry,
     ) = startup::session_tools(
         &config,
+        &ctx.config_manager,
         provider_name,
         model_name,
         temperature,

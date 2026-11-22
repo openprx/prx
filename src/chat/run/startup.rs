@@ -53,6 +53,7 @@ pub(super) fn chat_memory(
 
 pub(super) fn session_tools(
     config: &Config,
+    shared_config: &crate::config::SharedConfig,
     provider_name: &str,
     model_name: &str,
     temperature: f64,
@@ -146,6 +147,17 @@ pub(super) fn session_tools(
     let scheduled_input_handle = crate::chat::scheduled_input::ScheduledInputHandle::default();
 
     if controlled.is_none() {
+        if security.autonomy == crate::security::AutonomyLevel::Full {
+            base_tools_vec.push(Box::new(
+                crate::tools::GatewayTool::new(
+                    Arc::clone(shared_config),
+                    provider_name,
+                    model_name,
+                    vec![terminal.name().to_string()],
+                )
+                .with_security(Arc::clone(security)),
+            ));
+        }
         // Sibling tools share the same single-source registry (only the v1a four;
         // `subagents`/`sessions_history` are intentionally not registered in chat —
         // see plan §C.0 blocker 4).

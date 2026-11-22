@@ -140,6 +140,13 @@ that the user's whole task succeeded or validate arbitrary assistant prose.
 
 ## Chat tool discovery and delivery
 
+At Full autonomy, plain and TUI `prx chat` publish the `gateway` management tool.
+Its `config.patch` and `restart` actions accept the local operator and its
+children or local jobs. Full `config.patch` skips high-risk confirmation while
+retaining revision binding. Remote principals remain refused; paired gateway
+and Console turns do not publish this tool. Below Full, the terminal tool
+registry is unchanged.
+
 A uniquely named read-only operation can acquire its own evidence before generic
 context retrieval, even if the request also mentions a tool with side effects.
 This only orders recovery: discovery, freshness checks, explicit restrictions
