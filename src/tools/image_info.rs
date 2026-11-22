@@ -147,7 +147,8 @@ impl Tool for ImageInfoTool {
         // Restrict reads to workspace directory to prevent arbitrary file
         // exfiltration below Full. At Full the path resolves freely.
         let full = crate::tools::effective_autonomy::call_policy(&self.security).autonomy
-            == crate::security::AutonomyLevel::Full;
+            == crate::security::AutonomyLevel::Full
+            && !self.security.evaluation_sandbox;
         if !full && !self.security.is_path_allowed(path_str) {
             return Ok(ToolResult {
                 success: false,

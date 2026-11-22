@@ -334,6 +334,10 @@ pub const DEFAULT_AUTONOMY_MAX_COST_PER_DAY_CENTS: u32 = 500;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AutonomyConfig {
+    /// Runtime-owned evaluator confinement; never configurable or serialized.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub evaluation_sandbox: bool,
     /// Autonomy level: `readonly` (alias `read_only`), `supervised`, or `full` (default).
     #[serde(default)]
     pub level: AutonomyLevel,
@@ -368,6 +372,7 @@ pub struct AutonomyConfig {
 impl Default for AutonomyConfig {
     fn default() -> Self {
         Self {
+            evaluation_sandbox: false,
             level: AutonomyLevel::Full,
             workspace_only: default_workspace_only(),
             forbidden_paths: default_forbidden_paths(),

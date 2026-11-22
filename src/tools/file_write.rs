@@ -82,7 +82,8 @@ impl FileWriteTool {
             });
         }
 
-        let full = super::effective_autonomy::current() == Some(crate::security::AutonomyLevel::Full);
+        let full = super::effective_autonomy::current() == Some(crate::security::AutonomyLevel::Full)
+            && !self.security.evaluation_sandbox;
         let resolved_target = if full {
             // Full: absolute paths, `..` and symlinks resolve; the OS decides.
             crate::security::approval_operation::resolve_full_target(self.working_root(), path).await

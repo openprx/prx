@@ -5,6 +5,7 @@ use std::future::Future;
 
 tokio::task_local! {
     static CURRENT: AutonomyLevel;
+    static EVALUATION_PATH_POLICY: SecurityPolicy;
 }
 
 pub(crate) fn current() -> Option<AutonomyLevel> {
@@ -28,4 +29,18 @@ pub(crate) fn call_policy(held: &SecurityPolicy) -> Cow<'_, SecurityPolicy> {
             ..held.clone()
         })
     }
+}
+
+/// Carry evaluator path restrictions through media preparation without changing
+/// the media owner's public API or the call's Full network/tool behavior.
+pub(crate) async fn scope_evaluation_paths<T>(policy: &SecurityPolicy, future: impl Future<Output = T>) -> T {
+    if policy.evaluation_sandbox {
+        EVALUATION_PATH_POLICY.scope(policy.clone(), future).await
+    } else {
+        future.await
+    }
+}
+
+pub(crate) fn evaluation_path_policy() -> Option<SecurityPolicy> {
+    EVALUATION_PATH_POLICY.try_with(Clone::clone).ok()
 }

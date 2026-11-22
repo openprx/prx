@@ -216,6 +216,7 @@ impl AgentCaseExecutor {
             SideEffects::None => crate::security::AutonomyLevel::ReadOnly,
             SideEffects::WorkspaceWrite => crate::security::AutonomyLevel::Full,
         };
+        config.autonomy.evaluation_sandbox = true;
         config.autonomy.workspace_only = true;
         // The run may not touch its own evaluator state through the file tools:
         // the cost ledger, memory, lifecycle store, installed skill and config.

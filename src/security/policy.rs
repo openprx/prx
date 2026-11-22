@@ -1203,6 +1203,8 @@ pub fn resource_operation_hash(tool_name: &str, operation_name: &str) -> u64 {
 /// Security policy enforced on all tool executions
 #[derive(Debug, Clone)]
 pub struct SecurityPolicy {
+    /// Preserve evaluator path confinement even when its tools run at Full.
+    pub evaluation_sandbox: bool,
     pub autonomy: AutonomyLevel,
     pub workspace_dir: PathBuf,
     pub workspace_only: bool,
@@ -1665,7 +1667,7 @@ impl SecurityPolicy {
         command: &str,
         runtime_approval_granted: bool,
     ) -> Result<CommandRiskLevel, String> {
-        if level == Some(AutonomyLevel::Full) {
+        if level == Some(AutonomyLevel::Full) && !self.evaluation_sandbox {
             if command.contains('\0') {
                 return Err(
                     crate::security::PathRefusal::shell(crate::security::PathRefusalReason::InvalidPath, "")
@@ -1865,6 +1867,7 @@ impl SecurityPolicy {
     /// Build from config sections
     pub fn from_config(autonomy_config: &crate::config::AutonomyConfig, workspace_dir: &Path) -> Self {
         Self {
+            evaluation_sandbox: autonomy_config.evaluation_sandbox,
             autonomy: autonomy_config.level,
             workspace_dir: workspace_dir.to_path_buf(),
             workspace_only: autonomy_config.workspace_only,

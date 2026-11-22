@@ -206,7 +206,8 @@ impl Tool for ImageTool {
         // Security check for local paths (skip for HTTP(S) URLs and data
         // URIs). At Full local paths are not confined to the workspace.
         let full = crate::tools::effective_autonomy::call_policy(&self.security).autonomy
-            == crate::security::AutonomyLevel::Full;
+            == crate::security::AutonomyLevel::Full
+            && !self.security.evaluation_sandbox;
         for ref_str in image_refs.iter().filter(|_| !full) {
             if ref_str.starts_with("http://") || ref_str.starts_with("https://") || ref_str.starts_with("data:") {
                 continue;
@@ -275,10 +276,13 @@ impl Tool for ImageTool {
         let messages = vec![ChatMessage::user(content)];
 
         // Normalize image references (local → base64 data URI, remote → validated data URI)
-        let prepared = multimodal::prepare_messages_for_provider(
-            &messages,
-            &self.multimodal_config,
-            self.media_artifacts.as_ref(),
+        let prepared = crate::tools::effective_autonomy::scope_evaluation_paths(
+            &self.security,
+            multimodal::prepare_messages_for_provider(
+                &messages,
+                &self.multimodal_config,
+                self.media_artifacts.as_ref(),
+            ),
         )
         .await
         .map_err(|e| anyhow::anyhow!("Image preparation failed: {e}"))?;

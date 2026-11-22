@@ -487,7 +487,7 @@ struct PreparedWrite {
 async fn validate_target(file: &FilePatch, security: &SecurityPolicy) -> Result<PathBuf, DiffApplyError> {
     // The diff path is the operator's: `security` carries Main's configured
     // level. At Full the target resolves freely (symlinks followed).
-    let target = if security.autonomy == crate::security::AutonomyLevel::Full {
+    let target = if security.autonomy == crate::security::AutonomyLevel::Full && !security.evaluation_sandbox {
         crate::security::approval_operation::resolve_full_target(&security.workspace_dir, &file.path)
             .await
             .map_err(|err| DiffApplyError::RejectedPath(format!("failed to resolve target: {err}")))?

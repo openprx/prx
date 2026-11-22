@@ -34,7 +34,8 @@ impl DocumentIngestRuntime {
         if let Some(path) = path.filter(|path| !path.is_empty()) {
             // At Full the document path is not confined to the workspace.
             let full = crate::tools::effective_autonomy::call_policy(&self.security).autonomy
-                == crate::security::AutonomyLevel::Full;
+                == crate::security::AutonomyLevel::Full
+                && !self.security.evaluation_sandbox;
             if !full && !self.security.is_path_allowed(path) {
                 anyhow::bail!("Document path is blocked by the workspace security policy: {path}");
             }

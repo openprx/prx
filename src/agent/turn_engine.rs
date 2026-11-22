@@ -979,7 +979,10 @@ async fn run_turn_unguarded(
         );
         let mut prepared_messages = crate::tools::effective_autonomy::scope(
             media_level,
-            multimodal::prepare_messages_for_provider(history, multimodal_config, media_artifacts.as_ref()),
+            crate::tools::effective_autonomy::scope_evaluation_paths(
+                service.security(),
+                multimodal::prepare_messages_for_provider(history, multimodal_config, media_artifacts.as_ref()),
+            ),
         )
         .await?;
         // Corrective instructions are appended at the tail, not as request-local

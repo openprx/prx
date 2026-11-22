@@ -158,7 +158,8 @@ impl FileReadTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'path' parameter"))?;
 
-        let full = super::effective_autonomy::current() == Some(crate::security::AutonomyLevel::Full);
+        let full = super::effective_autonomy::current() == Some(crate::security::AutonomyLevel::Full)
+            && !self.security.evaluation_sandbox;
         let resolved_path = if full {
             // Full: absolute paths, `..` and symlinks resolve; the OS decides.
             match crate::security::approval_operation::resolve_full_target(self.working_root(), path).await {

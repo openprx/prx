@@ -420,7 +420,7 @@ pub(super) fn collect_at_path_candidates(
     };
     // `security` carries Main's configured level (an operator-only path):
     // at Full candidates are not confined to the workspace.
-    let full = security.autonomy == crate::security::AutonomyLevel::Full;
+    let full = security.autonomy == crate::security::AutonomyLevel::Full && !security.evaluation_sandbox;
     if !full && (filter.starts_with('/') || filter.starts_with('~') || !security.is_path_allowed(&filter)) {
         return Vec::new();
     }
