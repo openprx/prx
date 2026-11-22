@@ -688,7 +688,6 @@ Receipt inventory survives journal retention. Config and erase payloads carry
 only identity/revision/status/count metadata; journal and snapshot reference
 rows carry no message text, reasoning, tool arguments or credentials.
 
-
 ### Live frames and run approvals (B2)
 
 Live frames use `{type:"stream",session,agent,incarnation,run_id,idx,kind,...}`.

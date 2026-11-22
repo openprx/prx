@@ -3445,7 +3445,6 @@ replaces these settings with the rest of its managed configuration.
 See [the rf contract](rf-contract/capability-tokens.md#agent-admission-limits-agent_limits_v1)
 for readback, refusal and retry semantics.
 
-
 The rf gateway's approve-and-continue wait is `approval_wait_secs`: set it in
 `[agent]` for Main or `[agents.<name>]` for a named agent. It defaults to 600
 seconds and accepts 1–86400. Waiting pauses that turn's idle detector; other
