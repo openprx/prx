@@ -92,7 +92,8 @@ fn sqlite_rows(config: &Config, items: &mut Vec<DiagItem>) {
 
 /// Whether recovery can be activated for `database`: the same read-only
 /// ancestor and memory-directory rules the runtime applies. A refusal is an
-/// error because every turn's terminal write then fails.
+/// error: crash recovery is off and every rf turn is refused
+/// (`storage_unavailable`, reason `recovery_unavailable`).
 #[cfg(unix)]
 fn recovery_directory(database: &std::path::Path, items: &mut Vec<DiagItem>) {
     match crate::memory::sqlite::inspect_recovery_directory(database) {
