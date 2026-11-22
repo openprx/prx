@@ -267,6 +267,10 @@ impl ManagedSessionTool {
 
 #[async_trait]
 impl Tool for ManagedSessionTool {
+    fn process_worker_compatible(&self) -> bool {
+        false
+    }
+
     fn name(&self) -> &str {
         "managed_session"
     }

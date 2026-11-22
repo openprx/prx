@@ -195,9 +195,21 @@ impl OrdinaryProcessLaunch {
         )?;
         let (cents, _) = publication.allocate_child_budget()?;
         let (issued, original_parent) = publication.scope().gate_inputs();
+        // Seal only backends a worker can reconstruct. Interactive event-loop
+        // tools remain in the parent catalog, but are not worker capabilities.
+        let references: Vec<_> = issued.allowed.iter().cloned().collect();
+        let allowed = publication
+            .inner
+            .service
+            .catalog
+            .resolve(&references)?
+            .into_iter()
+            .filter(|entry| entry.process_worker_compatible)
+            .map(crate::tools::surface_owner::publication::entry_ref)
+            .collect();
         let narrowed = issued.clone().with_cost_ceiling(original_parent, cents)?;
         let scope = crate::tools::capability::child::VerifiedChildScope::new(narrowed, original_parent)?
-            .rebind_process_key(key)?;
+            .rebind_process_key(key, allowed)?;
         let (child, parent) = scope.gate_inputs();
         let input = receipt
             .map(|receipt| -> anyhow::Result<_> {

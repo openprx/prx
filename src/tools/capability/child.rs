@@ -174,13 +174,21 @@ impl VerifiedChildScope {
     }
 
     /// Re-seal an already verified scope for an authenticated process channel.
-    /// This transfers the existing authority without deriving another child,
+    /// Retain only reconstructible backends, without deriving another child,
     /// widening the capability set, or consuming depth a second time.
-    pub(crate) fn rebind_process_key(&self, key: Arc<DecisionKey>) -> Result<Self, ChildManifestError> {
+    pub(crate) fn rebind_process_key(
+        &self,
+        key: Arc<DecisionKey>,
+        allowed: BTreeSet<CapabilityRef>,
+    ) -> Result<Self, ChildManifestError> {
         self.manifest.verify(&self.parent)?;
+        if !allowed.is_subset(&self.manifest.allowed) {
+            return Err(ChildManifestError::AuthorityWidened);
+        }
         let mut parent = self.parent.as_ref().clone();
         parent.key = key;
         let mut manifest = self.manifest.clone();
+        manifest.allowed = allowed;
         manifest.seal = manifest.compute_seal(&parent.key);
         Self::new(manifest, &parent)
     }
