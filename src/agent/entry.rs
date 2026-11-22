@@ -1554,6 +1554,18 @@ pub(crate) fn resolve_agent_model_choice(
     })
 }
 
+fn resolve_named_model_choice(config: &Config, name: &str) -> Result<AgentModelChoice> {
+    use crate::providers::credentials::{CredentialRef, LegacySlot};
+    let agent = config.agents.get(name).ok_or_else(|| anyhow::anyhow!("creator_gone"))?;
+    let credential = if let Some(id) = &agent.credential_ref { CredentialRef::Profile { id: id.clone() } }
+        else if agent.api_key.as_deref().is_some_and(|key| !key.trim().is_empty()) { CredentialRef::LegacyInline(LegacySlot::Agent(name.to_owned())) }
+        else { providers::selection::credential_for(config, &agent.provider) };
+    let catalog = providers::selection::catalog_for(config);
+    let route = providers::selection::route_target(&catalog, &agent.provider, &agent.model)?.cloned();
+    let resolved = providers::selection::check_with(config, &catalog, &agent.provider, &agent.model, credential, &providers::catalog::Requirement::chat(), providers::catalog::UnknownPolicy::Invocation)?;
+    Ok(AgentModelChoice { provider_name: agent.provider.clone(), model_name: agent.model.clone(), model_binding: AgentModelBinding::from_resolved(&resolved, route), resolved, catalog })
+}
+
 /// The provider an agent entry runs on, and the only connection it may use.
 ///
 /// The root credential, base URL and rotation keys are released only when
@@ -1618,7 +1630,16 @@ pub(crate) async fn run_with_runtime_envelope(
 ) -> Result<String> {
     let config_source = config_source.into();
     let config = config_source.effective();
-    let scheduled_admission = super::scheduled_source::validate_current(
+    let named_job = super::automation::select(config, runtime_envelope_override.as_ref())?;
+    let mut runtime_envelope_override = runtime_envelope_override;
+    let mut scheduled_tool_scope = scheduled_tool_scope;
+    if let (Some(job), Some(envelope)) = (&named_job, runtime_envelope_override.as_mut()) {
+        envelope.agent_partition = Some(job.partition(envelope));
+        if let Some(scope) = scheduled_tool_scope.as_mut() {
+            scope.context.envelope.agent_partition = envelope.agent_partition.clone();
+        }
+    }
+    let mut scheduled_admission = super::scheduled_source::validate_current(
         runtime_envelope_override.as_ref(),
         scheduled_tool_scope.as_ref(),
         &shutdown,
@@ -1628,6 +1649,9 @@ pub(crate) async fn run_with_runtime_envelope(
         runtime_envelope_override.is_none() || scheduled_admission.is_some(),
         "agent runtime override requires an admitted scheduled source"
     );
+    if let (Some(job), Some(admission), Some(envelope)) = (&named_job, scheduled_admission.as_mut(), runtime_envelope_override.as_ref()) {
+        admission.job_metadata = Some(job.metadata(envelope));
+    }
     // Validate scoped identity before bootstrap can initialize persistence.
     // Scheduled sources retain their attempt/lease run id through terminal
     // recording and child lineage instead of acquiring a second CLI run id.
@@ -1662,7 +1686,11 @@ pub(crate) async fn run_with_runtime_envelope(
 
     // D-065 M-1: resolve before the bootstrap, so a refused selection runs
     // no memory hygiene, snapshot, database, plugin or tool setup.
-    let choice = resolve_agent_model_choice(config, provider_override.as_deref(), model_override.as_deref())?;
+    let choice = if let Some(job) = &named_job {
+        resolve_named_model_choice(config, job.name.as_str())?
+    } else {
+        resolve_agent_model_choice(config, provider_override.as_deref(), model_override.as_deref())?
+    };
     // ── Wire up subsystems via RuntimeBootstrap (D1 step 2) ──────
     // The internal agent engine is always a full single-shot run with no
     // memory-only early-exit (unlike chat's `--list-sessions`), so it always
@@ -1676,6 +1704,26 @@ pub(crate) async fn run_with_runtime_envelope(
         scheduled_tool_scope.as_ref(),
     )
     .await?;
+
+    let _agent_permit = if let (Some(job), Some(envelope)) = (&named_job, runtime_envelope_override.as_ref()) {
+        let memory = ctx.memory.as_ref().ok_or_else(|| anyhow::anyhow!("agent_backend_unsupported"))?;
+        job.validate(memory.as_ref(), envelope)?;
+        let result = crate::runtime::agent_admission::wait(&ctx.config, &envelope.resolved_owner_id(), job.name.as_str()).await;
+        // Retirement while waiting must refuse before any provider access.
+        job.validate(memory.as_ref(), envelope)?;
+        match result {
+            Ok(permit) => permit,
+            Err(error) => {
+                let fabric = MemoryFabric::new(Arc::clone(memory), envelope.workspace_id.clone()).with_event_recording(ctx.config.memory.event_recording_config());
+                let metadata = job.metadata(envelope);
+                let mut payload = metadata;
+                payload["reason"] = serde_json::json!(error.to_string());
+                payload["retryable"] = serde_json::json!(false);
+                fabric.record_runtime_event_idempotent(envelope.message_scope(), "scheduled.skipped", "scheduled run skipped", Some(serde_json::to_string(&payload)?), format!("{}:skipped", envelope.run_id.as_deref().unwrap_or_default())).await?;
+                return Err(error.into());
+            }
+        }
+    } else { None };
 
     // Scheduled cleanup owns the published writer even if this entry future is
     // dropped before a decision or terminal proposal is available.
@@ -1990,7 +2038,10 @@ pub(crate) async fn run_with_runtime_envelope(
                 let (decision_service, decision_proof, decision_context, route_decision, advice) = &decision_turn;
                 let decision_proof = *decision_proof;
                 let selected_skills = decision_service.agent_prompt_skills(decision_proof, decision_context)?;
-                let system_prompt = build_runtime_system_prompt(&config, model_name, &selected_skills, native_tools);
+                let system_prompt = match &named_job {
+                    Some(job) => job.prompt(&config)?,
+                    None => build_runtime_system_prompt(&config, model_name, &selected_skills, native_tools),
+                };
 
                 // Auto-save user message to memory (skip short/trivial messages)
                 if config.memory.should_auto_promote_user_message(&msg) {

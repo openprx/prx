@@ -315,7 +315,7 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
         }
     }
     match command {
-        Commands::Init { .. } => anyhow::bail!("BUG: Init command should have been handled earlier"),
+        Commands::Init { .. } | Commands::Onboard { .. } | Commands::Token { .. } => anyhow::bail!("BUG: Init command should have been handled earlier"),
         Commands::Completions { .. } => anyhow::bail!("BUG: Completions command should have been handled earlier"),
         Commands::SessionWorker { .. } => anyhow::bail!("BUG: SessionWorker command should have been handled earlier"),
         #[cfg(feature = "test-mock")]
@@ -445,7 +445,11 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
             Ok(())
         }
 
-        Commands::Status => {
+        Commands::Status { json } => {
+            if json {
+                println!("{}", serde_json::json!({"runtime_path":runtime::host_bootstrap::runtime_path(&config)?}));
+                return Ok(());
+            }
             println!("🦀 OpenPRX Status");
             println!();
             println!("Version:     {}", env!("CARGO_PKG_VERSION"));
@@ -847,7 +851,7 @@ mod tests {
         assert!(!starts_agent_runtime(&Commands::Channel {
             channel_command: ChannelCommands::List
         }));
-        assert!(!starts_agent_runtime(&Commands::Status));
+        assert!(!starts_agent_runtime(&Commands::Status { json: false }));
         assert!(!starts_agent_runtime(&Commands::Providers {
             providers_command: None
         }));
@@ -867,7 +871,7 @@ mod tests {
     #[test]
     fn whitelist_excludes_query_and_management_commands() {
         // A representative sample of query / management commands — none long-running.
-        assert!(!should_bind_signal(&Commands::Status));
+        assert!(!should_bind_signal(&Commands::Status { json: false }));
         assert!(!should_bind_signal(&Commands::Providers {
             providers_command: None
         }));

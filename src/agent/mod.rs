@@ -1,3 +1,4 @@
+pub(crate) mod automation;
 #[allow(clippy::module_inception)]
 pub mod agent;
 pub(crate) mod channel_approval;

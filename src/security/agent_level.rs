@@ -155,6 +155,7 @@ pub fn scheduled_level(
     } else {
         match (creator.level, creator.agent.as_deref()) {
             (Some(stored), Some(agent)) => match creator_current_level(agent, config) {
+                Some(current) if agent.starts_with("n:") => current?,
                 Some(current) => stored.min(current?),
                 None => AutonomyLevel::Supervised.min(main),
             },

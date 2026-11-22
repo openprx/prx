@@ -23,7 +23,7 @@ pub use store::{
     add_shell_job_with_lineage_and_approval_grant, add_shell_job_with_lineage_approval_and_delete,
     claim_job_if_current, claim_job_if_current_for_manual_run, claim_terminal_job_for_manual_rerun, due_jobs,
     finish_claimed_run, get_job, job_claim_is_current, job_created_via, job_creator, list_job_events, list_jobs,
-    list_runs, mark_job_operator, record_claim_lost, record_delivery_withheld, record_terminal_manual_run, remove_job,
+    list_runs, job_revision, mark_job_operator, record_claim_lost, record_delivery_withheld, record_terminal_manual_run, remove_job,
     renew_job_claim, unmarked_shell_jobs, update_job,
 };
 pub use types::{

@@ -24,7 +24,7 @@ impl std::fmt::Display for SpawnActionUnpartitioned {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "{}: spawn_batch, join, chat_sessions and chat_assign are unavailable to a named agent",
+            "{}: chat_sessions and chat_assign are unavailable to a named agent",
             self.code()
         )
     }
@@ -232,7 +232,7 @@ impl Tool for SessionsSpawnTool {
         // caller's owner started; the local-process operator sees them all. A
         // run outside the scope answers exactly like a missing one.
         let owner_scope = sessions_read_model::RunOwnerScope::from_args(&args);
-        if owner_scope.is_agent() && matches!(action, "spawn_batch" | "join" | "chat_sessions" | "chat_assign") {
+        if owner_scope.is_agent() && matches!(action, "chat_sessions" | "chat_assign") {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),

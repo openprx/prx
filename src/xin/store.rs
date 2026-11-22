@@ -312,7 +312,7 @@ pub fn update_task(config: &Config, task_id: &str, patch: &XinTaskPatch) -> Resu
         let changed = conn
             .execute(
                 "UPDATE xin_tasks
-             SET name = ?1, description = ?2, priority = ?3, payload = ?4,
+             SET version = version + 1, name = ?1, description = ?2, priority = ?3, payload = ?4,
                  interval_secs = ?5, enabled = ?6, max_failures = ?7, updated_at = ?8,
                  approval_grant_json = ?9,
                  created_via = COALESCE(?12, created_via),
@@ -700,7 +700,7 @@ fn set_task_control_state(config: &Config, task_id: &str, action: &str) -> Resul
             "resume" => {
                 conn.execute(
                     "UPDATE xin_tasks
-                     SET enabled = 1,
+                     SET version = version + 1, enabled = 1,
                          status = CASE WHEN status = 'cancelled' THEN 'pending' ELSE status END,
                          next_run_at = CASE WHEN status = 'cancelled' THEN ?1 ELSE next_run_at END,
                          updated_at = ?1
@@ -1418,7 +1418,7 @@ pub fn add_step_with_creator_stamp(
         let changed = conn
             .execute(
                 "UPDATE xin_goals
-                 SET steps_total = steps_total + 1,
+                 SET version = version + 1, steps_total = steps_total + 1,
                      status = CASE WHEN status = 'completed' THEN 'running' ELSE status END,
                      completed_at = CASE WHEN status = 'completed' THEN NULL ELSE completed_at END,
                      final_output = CASE WHEN status = 'completed' THEN NULL ELSE final_output END,
@@ -1514,14 +1514,14 @@ fn set_goal_control_state(config: &Config, goal_id: &str, action: &str) -> Resul
         match action {
             "pause" => {
                 conn.execute(
-                    "UPDATE xin_goals SET enabled = 0, updated_at = ?1 WHERE id = ?2",
+                    "UPDATE xin_goals SET version = version + 1, enabled = 0, updated_at = ?1 WHERE id = ?2",
                     params![now.to_rfc3339(), goal_id],
                 )?;
             }
             "resume" => {
                 conn.execute(
                     "UPDATE xin_goals
-                     SET enabled = 1,
+                     SET version = version + 1, enabled = 1,
                          status = CASE
                              WHEN status = 'cancelled' AND steps_completed = 0 THEN 'pending'
                              WHEN status = 'cancelled' THEN 'running'
@@ -1536,7 +1536,7 @@ fn set_goal_control_state(config: &Config, goal_id: &str, action: &str) -> Resul
             "cancel" => {
                 conn.execute(
                     "UPDATE xin_goals
-                     SET enabled = 0, status = 'cancelled', completed_at = ?1, updated_at = ?1
+                     SET version = version + 1, enabled = 0, status = 'cancelled', completed_at = ?1, updated_at = ?1
                      WHERE id = ?2",
                     params![now.to_rfc3339(), goal_id],
                 )?;
@@ -2804,6 +2804,7 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
         "PRAGMA foreign_keys = ON;
 
          CREATE TABLE IF NOT EXISTS xin_tasks (
+            version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
             id               TEXT PRIMARY KEY,
             owner_id         TEXT,
             topic_id         TEXT,
@@ -2890,6 +2891,7 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
             ON xin_event_outbox(delivered_at, created_at);
 
          CREATE TABLE IF NOT EXISTS xin_goals (
+            version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
             id                      TEXT PRIMARY KEY,
             owner_id                TEXT,
             topic_id                TEXT,
@@ -4694,4 +4696,9 @@ mod tests {
         assert_eq!(updated.payload, "git status");
         assert_eq!(task_created_via(&config, &task.id).unwrap(), JobCreator::AgentTool);
     }
+}
+
+/// A step runs against the goal revision; edits to steps advance that goal.
+pub fn task_revision(config: &Config, id: &str) -> Result<u64> {
+    with_connection(config, |conn| Ok(u64::try_from(conn.query_row("SELECT version FROM xin_tasks WHERE id=?1 UNION ALL SELECT g.version FROM xin_steps s JOIN xin_goals g ON g.id=s.goal_id WHERE s.id=?1 LIMIT 1", [id], |r| r.get::<_, i64>(0))?)?))
 }

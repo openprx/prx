@@ -54,7 +54,7 @@ fn inventory(conn: &Connection, id: &str, owner: &str, head: i64, water: i64) ->
             ),
         )?;
     }
-    let mut q=conn.prepare(&format!("SELECT {COLUMNS} FROM sync_journal j WHERE owner_id=?1 AND kind='session.upsert' AND parent_run_id IS NOT NULL AND seq<=?2 AND seq=(SELECT MAX(k.seq) FROM sync_journal k WHERE k.owner_id=j.owner_id AND k.session=j.session AND k.kind=j.kind AND k.seq<=?2) ORDER BY session"))?;
+    let mut q=conn.prepare(&format!("SELECT {COLUMNS} FROM sync_journal j WHERE owner_id=?1 AND kind='session.upsert' AND (parent_run_id IS NOT NULL OR session LIKE 'cron:%' OR session LIKE 'xin:%') AND seq<=?2 AND seq=(SELECT MAX(k.seq) FROM sync_journal k WHERE k.owner_id=j.owner_id AND k.session=j.session AND k.kind=j.kind AND k.seq<=?2) ORDER BY session"))?;
     for h in q.query_map(params![owner, head], Header::row)? {
         let h = h?;
         save(conn, id, &mut ordinal, "session", &h.session, &h)?;

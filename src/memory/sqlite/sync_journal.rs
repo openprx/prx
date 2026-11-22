@@ -178,9 +178,11 @@ pub(super) fn event_header(conn: &Connection, id: &str, kind: &str) -> anyhow::R
         "WITH RECURSIVE family(run) AS (SELECT ?1 UNION SELECT e.parent_run_id FROM message_events e JOIN family f ON e.run_id=f.run WHERE e.workspace_id=?2 AND e.owner_id=?3 AND e.parent_run_id IS NOT NULL)
         SELECT a.session_key,a.agent_key,s.incarnation,a.run_id,s.session_key FROM rf_message_attempts a JOIN agent_scopes s ON s.scope_id=a.ma_scope_id WHERE a.workspace_id=?2 AND a.owner_id=?3 AND (a.run_id IN(SELECT run FROM family) OR a.message_event_id=?4) LIMIT 1",
         params![root_run,workspace,owner,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
-    let Some((root_session, agent, incarnation, root_id, _)) = root else {
-        return Ok(None);
+    let root = if root.is_some() { root } else {
+        conn.query_row("WITH RECURSIVE family(run) AS (SELECT ?1 UNION SELECT e.parent_run_id FROM message_events e JOIN family f ON e.run_id=f.run WHERE e.workspace_id=?2 AND e.owner_id=?3 AND e.parent_run_id IS NOT NULL) SELECT e.session_key,s.agent_key,s.incarnation,e.run_id,s.session_key FROM message_events e JOIN agent_scopes s ON s.scope_id=e.ma_scope_id WHERE e.workspace_id=?2 AND e.owner_id=?3 AND e.source IN ('cron','xin') AND e.parent_run_id IS NULL AND e.run_id IN(SELECT run FROM family) LIMIT 1", params![root_run, workspace, owner], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).optional()?
     };
+    let Some((root_session, agent, incarnation, root_id, _)) = root else { return Ok(None); };
+    let agent = agent.strip_prefix("n:").unwrap_or(&agent).to_owned();
     let mut h = Header::new(&owner, kind, &session, &agent, &incarnation, format!("event:{id}"));
     h.run_id = run;
     h.timestamp = timestamp;
@@ -232,6 +234,18 @@ pub(super) fn event_written(conn: &Connection, event: &crate::memory::MessageEve
             append(conn, &h)?;
         }
         return Ok(());
+    }
+    let scheduled_root = h.parent_run_id.is_none() && matches!(event.source, crate::memory::MessageEventSource::Cron | crate::memory::MessageEventSource::Xin);
+    if scheduled_root && (event.role == "user" || event.event_type == "scheduled.skipped") {
+        let first: bool = conn.query_row("SELECT NOT EXISTS(SELECT 1 FROM sync_journal WHERE owner_id=?1 AND session=?2 AND kind='session.upsert')",params![h.owner,h.session],|r|r.get(0))?;
+        if first {
+            h.kind = "session.upsert".into(); h.event_id = format!("session:{}",event.event_id); append(conn,&h)?;
+        }
+        h.kind = if event.event_type == "scheduled.skipped" { "turn.failed" } else { "turn.started" }.into();
+        h.event_id = format!("{}:{}",h.kind,event.event_id); append(conn,&h)?;
+        h.kind = "turn.appended".into();
+        h.event_id = format!("turn.appended:{}",event.event_id);
+        if event.role == "user" { append(conn,&h)?; }
     }
     // Root user rows are appended by admit, after their attempt is inserted.
     if h.parent_run_id.is_some() {

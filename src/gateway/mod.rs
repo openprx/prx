@@ -1878,6 +1878,7 @@ async fn run_gateway_inner(
     let addr: SocketAddr = format!("{host}:{port}").parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let actual_port = listener.local_addr()?.port();
+    let _runtime_file = crate::runtime::host_bootstrap::RuntimeFile::write(&config, actual_port, install_owner.as_str())?;
     let display_addr = format!("{host}:{actual_port}");
 
     // The chat-session mailbox is durable, and this is the one startup path

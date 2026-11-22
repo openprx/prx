@@ -58,6 +58,18 @@ pub(super) fn event(conn: &Connection, h: &Header) -> anyhow::Result<Value> {
 }
 
 pub(super) fn payload(conn: &Connection, h: &Header) -> anyhow::Result<Value> {
+    if h.kind == "session.upsert" && (h.session.starts_with("cron:") || h.session.starts_with("xin:")) {
+        let row: Option<(String,Option<String>)> = conn.query_row("SELECT created_at,raw_payload_json FROM message_events WHERE session_key=?1 AND owner_id=?2 AND parent_run_id IS NULL ORDER BY id LIMIT 1", params![h.session,h.owner], |r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        let Some((created_at, raw)) = row else { return Ok(json!({"deleted":true})); };
+        let metadata: Value = raw.as_deref().map(serde_json::from_str).transpose()?.unwrap_or_default();
+        return Ok(json!({"session_key":h.session,"channel":if h.session.starts_with("cron:") {"cron"} else {"xin"},"created_at":created_at,"metadata":{"job_id":metadata.get("job_id"),"job_version":metadata.get("job_version")}}));
+    }
+    if h.kind == "turn.failed" && (h.session.starts_with("cron:") || h.session.starts_with("xin:")) {
+        if let Some(id) = h.source_ref.strip_prefix("event:") {
+            let raw: Option<String> = conn.query_row("SELECT raw_payload_json FROM message_events WHERE event_id=?1 AND event_type='scheduled.skipped'",[id],|r|r.get(0)).optional()?.flatten();
+            if let Some(raw) = raw { let p:Value=serde_json::from_str(&raw)?; return Ok(json!({"reason":p.get("reason"),"retryable":false})); }
+        }
+    }
     if let Some(reference) = h.source_ref.strip_prefix("final:") {
         let (marker, message) = reference
             .split_once(':')

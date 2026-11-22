@@ -114,7 +114,7 @@ fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
 
 const fn cli_tracing_command(command: &Commands) -> cli_tracing::CliCommand {
     match command {
-        Commands::Init { .. } => cli_tracing::CliCommand::Init,
+        Commands::Init { .. } | Commands::Onboard { .. } | Commands::Token { .. } => cli_tracing::CliCommand::Init,
         Commands::Go { .. } => cli_tracing::CliCommand::Go,
         Commands::Chat { message: Some(_), .. } => cli_tracing::CliCommand::ChatMessage,
         Commands::Chat { .. } => cli_tracing::CliCommand::Chat,
@@ -122,7 +122,7 @@ const fn cli_tracing_command(command: &Commands) -> cli_tracing::CliCommand {
         Commands::Daemon { .. } => cli_tracing::CliCommand::Daemon,
         Commands::Service { .. } => cli_tracing::CliCommand::Service,
         Commands::Doctor { .. } => cli_tracing::CliCommand::Doctor,
-        Commands::Status => cli_tracing::CliCommand::Status,
+        Commands::Status { .. } => cli_tracing::CliCommand::Status,
         Commands::Tasks { .. } => cli_tracing::CliCommand::Tasks,
         Commands::Memory { .. } => cli_tracing::CliCommand::Memory,
         Commands::Evolution { .. } => cli_tracing::CliCommand::Evolution,
@@ -388,7 +388,31 @@ enum CompletionShell {
 }
 
 #[derive(Subcommand, Debug)]
+enum TokenCommands {
+    Issue {
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum Commands {
+    /// Configure a host non-interactively; read the provider key from stdin
+    Onboard {
+        #[arg(long, required = true)]
+        non_interactive: bool,
+        #[arg(long)]
+        provider: String,
+        #[arg(long, short = 'm')]
+        model: Option<String>,
+    },
+    /// Issue an install-owner bearer into a private output file
+    Token {
+        #[command(subcommand)]
+        command: TokenCommands,
+    },
     /// Initialize or repair configuration, channels and agent identity
     Init {
         /// Configuration preset (default: minimal)
@@ -661,7 +685,10 @@ Examples:
     },
 
     /// Show system status (full details)
-    Status,
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Inspect and terminate work running inside a live PRX process
     #[command(long_about = "\
@@ -1769,6 +1796,16 @@ async fn async_main(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
+    if let Commands::Onboard { provider, model, .. } = &cli.command {
+        runtime::host_bootstrap::onboard(cli.config_dir.as_deref(), provider, model.as_deref(), &mut std::io::stdin()).await?;
+        return Ok(());
+    }
+    if let Commands::Token { command: TokenCommands::Issue { out, force } } = &cli.command {
+        let config = Config::load_or_init_with_config_dir(cli.config_dir.as_deref()).await?;
+        let owner = runtime::host_bootstrap::issue_token(config, out, *force).await?;
+        println!("{}\n{}", out.display(), owner);
+        return Ok(());
+    }
     if matches!(&cli.command, Commands::Init { .. }) {
         return init_cli::run(&cli).await;
     }
@@ -3654,7 +3691,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             Ok(())
         }
 
-        AuthCommands::Status => {
+        AuthCommands::Status { .. } => {
             let data = auth_service.load_profiles()?;
             if data.profiles.is_empty() {
                 println!("No auth profiles configured.");
@@ -3702,7 +3739,7 @@ mod tests {
     /// `Commands::Gateway` to `CliCommand::Chat` fails the gateway row.
     fn commands_coverage_tag(command: &Commands) -> &'static str {
         match command {
-            Commands::Init { .. } => "Init",
+            Commands::Init { .. } | Commands::Onboard { .. } | Commands::Token { .. } => "Init",
             Commands::Go { .. } => "Go",
             Commands::Chat { message: Some(_), .. } => "ChatMessage",
             Commands::Chat { .. } => "Chat",
@@ -3710,7 +3747,7 @@ mod tests {
             Commands::Daemon { .. } => "Daemon",
             Commands::Service { .. } => "Service",
             Commands::Doctor { .. } => "Doctor",
-            Commands::Status => "Status",
+            Commands::Status { .. } => "Status",
             Commands::Tasks { .. } => "Tasks",
             Commands::Memory { .. } => "Memory",
             Commands::Evolution { .. } => "Evolution",

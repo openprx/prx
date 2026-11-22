@@ -189,7 +189,14 @@ pub use hooks::HookManager;
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ServiceCommands {
     /// Install daemon service unit for auto-start and restart
-    Install,
+    Install {
+        /// Explicitly install for the current OS user
+        #[arg(long)]
+        user: bool,
+        /// Accept non-interactive installation
+        #[arg(long)]
+        yes: bool,
+    },
     /// Start daemon service
     Start,
     /// Stop daemon service

@@ -277,6 +277,10 @@ impl AppContext {
         registry: Arc<Vec<Box<dyn Tool>>>,
         surface: crate::tools::capability::turn_state::TurnSurfaceKind,
     ) -> Result<Arc<crate::runtime::turn_publication::TurnRuntimeService>> {
+        self.publish_turn_runtimes_scoped(registry, surface, None).await
+    }
+
+    async fn publish_turn_runtimes_scoped(&self, registry: Arc<Vec<Box<dyn Tool>>>, surface: crate::tools::capability::turn_state::TurnSurfaceKind, targeted: Option<crate::runtime::turn_publication::TargetedSurface>) -> Result<Arc<crate::runtime::turn_publication::TurnRuntimeService>> {
         super::turn_publication::TurnPublication {
             generation: Arc::clone(&self.config_generation),
             registry,
@@ -302,7 +306,7 @@ impl AppContext {
                 }
             },
         }
-        .publish(surface)
+        .publish_scoped(surface, None, targeted)
         .await
     }
 }
@@ -317,6 +321,7 @@ impl RuntimeBootstrap {
             config.into(),
             profile,
             crate::tools::capability::turn_state::TurnSurfaceKind::AgentLoop,
+            None,
             None,
         )
         .await
@@ -334,6 +339,7 @@ impl RuntimeBootstrap {
             },
             profile,
             crate::tools::capability::turn_state::TurnSurfaceKind::Interactive,
+            None,
             None,
         )
         .await
@@ -399,7 +405,8 @@ impl RuntimeBootstrap {
                 Ok::<_, anyhow::Error>(Arc::clone(&scheduled.policy))
             })
             .transpose()?;
-        Self::build_inner(config_source, BootstrapProfile::AgentLoop, surface, policy).await
+        let targeted = crate::agent::automation::select(config, envelope)?.map(|job| job.surface(config)).transpose()?;
+        Self::build_inner(config_source, BootstrapProfile::AgentLoop, surface, policy, targeted).await
     }
 
     async fn build_inner(
@@ -407,6 +414,7 @@ impl RuntimeBootstrap {
         profile: BootstrapProfile,
         agent_surface: crate::tools::capability::turn_state::TurnSurfaceKind,
         security_override: Option<Arc<SecurityPolicy>>,
+        targeted: Option<crate::runtime::turn_publication::TargetedSurface>,
     ) -> Result<Arc<AppContext>> {
         // Wrap config once so all downstream users share the same allocation
         // (iron rule 7: Arc over deep copy). Arc<Config> deref-coerces to &Config
@@ -664,7 +672,7 @@ impl RuntimeBootstrap {
                 .ok_or_else(|| anyhow::anyhow!("AgentLoop decision publication requires its tool registry"))?;
             context.turn_service = Some(
                 context
-                    .publish_turn_runtimes(Arc::clone(registry), agent_surface)
+                    .publish_turn_runtimes_scoped(Arc::clone(registry), agent_surface, targeted)
                     .await?,
             );
         }

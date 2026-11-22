@@ -179,6 +179,7 @@ impl ScheduledAgentOrigin {
 /// Immutable admitted source and its creator-authorized execution actor.
 #[derive(Clone)]
 pub(super) struct ScheduledAdmission {
+    pub(super) job_metadata: Option<serde_json::Value>,
     envelope: RuntimeEnvelope,
     execution: crate::tools::ToolExecutionContext,
 }
@@ -401,9 +402,11 @@ impl ScheduledPendingInput {
                 self.choice.provider_name(),
                 self.choice.model_name()
             ));
-            self.fabric
-                .record_inbound_user_message_best_effort(scope, self.input.clone(), Some(self.key.clone()), "scheduled")
-                .await?
+            if let Some(metadata) = &self.admission.job_metadata {
+                Some(self.fabric.record_inbound_user_message(scope, self.input.clone(), Some(self.key.clone()), Some(serde_json::to_string(metadata)?)).await?)
+            } else {
+                self.fabric.record_inbound_user_message_best_effort(scope, self.input.clone(), Some(self.key.clone()), "scheduled").await?
+            }
         };
         if let Some(event) = event.as_ref().filter(|event| event.id > 0) {
             anyhow::ensure!(
@@ -612,6 +615,7 @@ pub(super) async fn validate_current(
             source.source = envelope.source;
             source.owner_id = Some(execution.envelope.resolved_owner_id());
             Ok(Some(ScheduledAdmission {
+                job_metadata: None,
                 envelope: source,
                 execution,
             }))

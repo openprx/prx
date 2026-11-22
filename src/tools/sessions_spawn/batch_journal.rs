@@ -24,6 +24,8 @@ struct Member {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OrdinarySource {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    partition: Option<crate::memory::AgentPartition>,
     parent_run: String,
     parent_session: String,
     config_generation: u64,
@@ -88,6 +90,7 @@ pub(crate) fn golden_plan_seal(key: &DecisionKey, plan: &GoldenPlan<'_>) -> anyh
         parent_decision: String::new(),
         parent_digest: String::new(),
         ordinary_source: OrdinarySource {
+            partition: None,
             parent_run: plan.parent_run.to_owned(),
             parent_session: plan.parent_session.to_owned(),
             config_generation: plan.config_generation,
@@ -126,6 +129,7 @@ impl PreparedBatch {
         }
         let fabric = publication.source_fabric();
         let source = OrdinarySource {
+            partition: caller.envelope.agent_partition.clone(),
             // The batch parent is the run its members name (a child segment
             // spawns as its task run, CR-CI-3).
             parent_run: publication.spawn_run_id().to_owned(),
@@ -184,9 +188,15 @@ impl PreparedBatch {
         let event = self
             .fabric
             .record_runtime_event_idempotent(
-                MessageEventScope::new("sessions_spawn", MemoryVisibility::Workspace)
-                    .with_owner_id(&self.fields.owner)
-                    .with_run_id(&self.fields.batch),
+                {
+                    let mut scope = MessageEventScope::new("sessions_spawn", MemoryVisibility::Workspace)
+                        .with_owner_id(&self.fields.owner).with_run_id(&self.fields.batch);
+                    scope.session_key = Some(self.fields.ordinary_source.parent_session.clone());
+                    scope.parent_run_id = Some(self.fields.ordinary_source.parent_run.clone());
+                    scope.parent_session_key = Some(self.fields.ordinary_source.parent_session.clone());
+                    scope.agent_partition = self.fields.ordinary_source.partition.clone();
+                    scope
+                },
                 &event_type,
                 "worker batch membership",
                 Some(payload.clone()),
@@ -235,9 +245,6 @@ pub(super) async fn read(
     else {
         return Ok(None);
     };
-    if !owners.admits(plan.owner_id.as_deref(), None) {
-        return Ok(None);
-    }
     let parsed: Signed = serde_json::from_str(plan.raw_payload_json.as_deref().context("batch payload missing")?)?;
     let key = DecisionKey::from_worker_channel(
         &crate::session_worker::transport_key::TransportSecret::existing()?.hmac_key(),
@@ -246,6 +253,8 @@ pub(super) async fn read(
         &parsed.fields.ordinary_source.config_revision,
     )?;
     let plan_fields = verify(&plan, fabric.workspace_id(), batch, "plan", &key)?;
+    if !owners.admits(plan.owner_id.as_deref(), plan_fields.ordinary_source.partition.as_ref()) { return Ok(None); }
+
     anyhow::ensure!(
         plan_fields.dispatched.is_none(),
         "batch plan contains a dispatch result"

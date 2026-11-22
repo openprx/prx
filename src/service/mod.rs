@@ -180,7 +180,7 @@ const fn windows_task_name() -> &'static str {
 
 pub async fn handle_command(command: &crate::ServiceCommands, config: &Config, init_system: InitSystem) -> Result<()> {
     match command {
-        crate::ServiceCommands::Install => install(config, init_system).await,
+        crate::ServiceCommands::Install { .. } => install(config, init_system).await,
         crate::ServiceCommands::Start => start(config, init_system).await,
         crate::ServiceCommands::Stop => stop(config, init_system).await,
         crate::ServiceCommands::Restart => restart(config, init_system).await,
