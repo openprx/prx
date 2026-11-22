@@ -1347,6 +1347,12 @@ pub async fn get_session_messages(
                 .into_response();
         }
     }) else {
+        // An id in the caller-key grammar names an rf session (Console ids
+        // start with `console-`, which the grammar excludes): a missing one
+        // is the coded `404 session_unknown`, like another owner's.
+        if rf_message::is_caller_session_key(&session_id) {
+            return rf_message::session_unknown();
+        }
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": "Session not found" })),

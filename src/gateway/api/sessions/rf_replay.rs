@@ -34,6 +34,12 @@ fn storage_unavailable(message: &str) -> Response {
     coded_error(StatusCode::INTERNAL_SERVER_ERROR, "storage_unavailable", message)
 }
 
+/// An rf message while user-message recording is off: its record cannot be
+/// kept, so nothing is written.
+pub(super) fn unrecorded() -> Response {
+    storage_unavailable(UNRECORDED)
+}
+
 pub(super) fn session_busy() -> Response {
     coded_error(
         StatusCode::CONFLICT,
@@ -237,7 +243,7 @@ pub(super) async fn refused_admission(state: &AppState, rf: Option<RfTurn>, erro
             drop(slot);
             lost_admission(state, &admission.key, &admission.request_hash).await
         }
-        _ => storage_unavailable(UNRECORDED),
+        _ => unrecorded(),
     }
 }
 
@@ -259,7 +265,7 @@ pub(super) async fn refused_context(
     error: &anyhow::Error,
 ) -> Response {
     if RfAdmissionRefused::of(error) == Some(RfAdmissionRefused::Unrecorded) {
-        return storage_unavailable(UNRECORDED);
+        return unrecorded();
     }
     lost_admission(state, key, request_hash).await
 }

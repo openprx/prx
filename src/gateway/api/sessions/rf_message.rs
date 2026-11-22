@@ -15,7 +15,7 @@
 //! block, and the whole input is neutralised on entry like any Console input.
 
 use super::super::ApiPrincipal;
-use super::super::capabilities::{RESERVED_SESSION_KEY_PREFIXES, coded_error, rf_session_refusal};
+use super::super::capabilities::{RESERVED_SESSION_KEY_PREFIXES, coded_error, coded_error_with, rf_session_refusal};
 use super::target::{AgentField, TargetError, TurnTarget};
 use super::{ConsoleSubmission, SelectedTurn, TargetRefusal, UploadGuard, rf_replay};
 use crate::gateway::AppState;
@@ -111,7 +111,7 @@ fn field_invalid(message: &str) -> Response {
     coded_error(StatusCode::BAD_REQUEST, "field_invalid", message)
 }
 
-fn session_unknown() -> Response {
+pub(super) fn session_unknown() -> Response {
     coded_error(
         StatusCode::NOT_FOUND,
         "session_unknown",
@@ -121,6 +121,43 @@ fn session_unknown() -> Response {
 
 fn storage_unavailable(message: &str) -> Response {
     coded_error(StatusCode::INTERNAL_SERVER_ERROR, "storage_unavailable", message)
+}
+
+/// A `turn` needs the recovery key: its attempt row names the ingress
+/// lifetime of the admitting process, which the restart rule claims, and only
+/// an activated key opens that lifetime. Without it a crashed turn could never
+/// be proven ended and would replay `running` for ever, so nothing is
+/// admitted. `prx doctor` names the refused path.
+fn recovery_unavailable() -> Response {
+    coded_error_with(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "storage_unavailable",
+        "a turn needs the recovery key, which this daemon refused: the state directory or one of its \
+         ancestors is not owned by this user or root, or is group/other-writable (prx doctor names it)",
+        Some(("reason", "recovery_unavailable")),
+    )
+}
+
+/// Whether this daemon's store refuses its recovery key. Activation is lazy,
+/// so it is attempted here (on the blocking pool) before a turn is admitted;
+/// a refusal is sticky for the store. A store without a recovery repository
+/// is not refused.
+async fn recovery_refused(state: &AppState) -> anyhow::Result<bool> {
+    let memory = std::sync::Arc::clone(&state.mem);
+    crate::runtime::blocking::spawn_blocking(move || {
+        let Some(repository) = memory.recovery_repository() else {
+            return Ok(false);
+        };
+        if repository.recovery_authority_refused() {
+            return Ok(true);
+        }
+        match repository.activate_recovery_authority() {
+            Ok(_) => Ok(false),
+            Err(error) if crate::memory::recovery_authority::is_key_unavailable(&error) => Ok(true),
+            Err(error) => Err(error),
+        }
+    })
+    .await?
 }
 
 /// The bearer check of `POST /api/sessions` (and its `GET`).
@@ -711,6 +748,17 @@ pub(super) async fn post_rf_message(
         };
         return record_context(&state, &session_id, &principal, selected, &content, admission).await;
     }
+    match recovery_refused(&state).await {
+        Ok(false) => {}
+        Ok(true) => return recovery_unavailable(),
+        Err(error) => {
+            tracing::warn!(
+                error_kind = super::console_error_kind(&error),
+                "Recovery key check failed"
+            );
+            return storage_unavailable("the recovery key could not be checked");
+        }
+    }
     let run_id = uuid::Uuid::new_v4().to_string();
     let job_id = uuid::Uuid::new_v4();
     let Some(slot) = TurnSlot::claim(&workspace, &session_id, &agent_key, &run_id) else {
@@ -780,6 +828,12 @@ async fn record_context(
         }
     };
     let config = &runtime.config_generation.effective;
+    // The context row is written by a fabric without the configured
+    // recording switches, so the switch is checked here, before any write.
+    let recording = config.memory.event_recording_config();
+    if !(recording.enabled && recording.record_user_messages) {
+        return rf_replay::unrecorded();
+    }
     let envelope = super::console_runtime_envelope_for_workspace(
         config.workspace_dir.to_string_lossy().into_owned(),
         session_id,
