@@ -2811,7 +2811,6 @@ fn provider_turn_finalizer_n3_out_of_order_releases_ordered_persistence_actions(
                 provider_name: "mock".to_string(),
                 model_name: "mock".to_string(),
                 history_len_before_user_turn: 0,
-                history_user_message: ChatMessage::user(user_input.to_string()),
                 compaction_epoch_at_start: 0,
                 assignment: None,
             },

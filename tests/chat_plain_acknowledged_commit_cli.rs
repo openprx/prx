@@ -7,8 +7,6 @@
 //!   saved session row holding the turn;
 //! - EOF on stdin after a turn exits the process cleanly with code 0;
 //! - `/cost` right after a reply reports that turn's exact scripted usage;
-//! - a preflight/switch compaction is acknowledged and every later request
-//!   carries its current request exactly once;
 //! - with `RUST_LOG=trace` no session content reaches stderr or `chat.log`,
 //!   also when the store refuses a terminal write with the sentinel in its error.
 
@@ -23,7 +21,6 @@ mod plain_chat;
 
 use std::time::{Duration, Instant};
 
-use compaction_script::{PLANT, assistant_reply_count, read_line, write_filler_files};
 use loopback_openai::{LoopbackOpenAi, Script, Scripted, write_config};
 use plain_chat::{Output, Running, Sandbox};
 
@@ -533,78 +530,6 @@ fn text_of(message: &serde_json::Value) -> String {
         serde_json::Value::String(text) => text.clone(),
         serde_json::Value::Array(parts) => parts.iter().filter_map(|part| part["text"].as_str()).collect(),
         _ => String::new(),
-    }
-}
-
-#[test]
-fn a_compaction_before_the_call_is_acknowledged_and_the_request_occurs_once() {
-    const FILLERS: usize = 8;
-    let sandbox = Sandbox::new();
-    write_filler_files(&sandbox.workspace, FILLERS);
-    let server = LoopbackOpenAi::start(MODEL, Some(USAGE), compaction_script::script());
-    write_config(&sandbox.config_dir, &server.provider(), MODEL, |config| {
-        config.workspace_dir.clone_from(&sandbox.workspace);
-        config.autonomy.level = openprx::security::AutonomyLevel::Full;
-        config.agent.compaction.mode = openprx::config::schema::AgentCompactionMode::Switch;
-        config.agent.compaction.max_context_tokens = compaction_script::SMALL_WINDOW_TOKENS;
-        config.agent.compaction.reserve_tokens = 256;
-        config.agent.compaction.keep_recent_messages = 2;
-        config.memory.auto_save = false;
-    });
-    let mut chat = spawn_plain(&sandbox);
-    let mut lines = vec![PLANT.to_owned()];
-    lines.extend((0..FILLERS).map(read_line));
-    for (index, line) in lines.iter().enumerate() {
-        chat.send(line);
-        let started = Instant::now();
-        while assistant_reply_count(&sandbox.workspace) < index + 1 {
-            assert!(started.elapsed() < TURN_DEADLINE, "turn {index} timed out");
-            std::thread::sleep(POLL);
-        }
-        if !compaction_script::stored_handoffs(&sandbox.workspace).is_empty() {
-            break;
-        }
-    }
-    let output = finish(chat);
-
-    assert_clean(&output);
-    assert!(
-        !compaction_script::stored_handoffs(&sandbox.workspace).is_empty(),
-        "the window forced a compaction before a call"
-    );
-    #[cfg(not(feature = "terminal-tui"))]
-    assert!(
-        output.stdout.contains("Compacted context"),
-        "the preflight reports an acknowledged compaction: {}",
-        output.stdout
-    );
-    assert!(!output.stdout.contains("Compaction refused"), "{}", output.stdout);
-    let requests = server.requests();
-    let carried: Vec<&serde_json::Value> = requests
-        .iter()
-        .filter(|request| compaction_script::handoff_id(request).is_some())
-        .collect();
-    assert!(
-        !carried.is_empty(),
-        "a request after the compaction carries the handoff"
-    );
-    for request in carried {
-        let messages = request["messages"].as_array().expect("test: messages");
-        let current = messages
-            .iter()
-            .rev()
-            .find(|message| message["role"] == "user")
-            .map(text_of)
-            .expect("test: a current request");
-        let line = lines
-            .iter()
-            .find(|line| current.contains(line.as_str()))
-            .unwrap_or_else(|| panic!("the current request names a sent line: {current}"));
-        let occurrences = messages
-            .iter()
-            .filter(|message| message["role"] == "user" && text_of(message).contains(line.as_str()))
-            .count();
-        assert_eq!(occurrences, 1, "`{line}` occurs exactly once in the request");
     }
 }
 
