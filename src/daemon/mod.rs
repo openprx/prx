@@ -65,10 +65,11 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
         );
         let gateway_host = host.clone();
         let gateway_shared = Arc::clone(&shared_config);
+        // Always available: retry within seconds, never a minute.
         handles.push(spawn_component_supervisor(
             "gateway",
             initial_backoff,
-            max_backoff,
+            max_backoff.min(crate::config::schema::GATEWAY_RESTART_MAX_BACKOFF_SECS),
             move || {
                 let host = gateway_host.clone();
                 let shared = Arc::clone(&gateway_shared);
@@ -603,17 +604,22 @@ where
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
     tokio::spawn(async move {
-        let mut backoff = initial_backoff_secs.max(1);
-        let max_backoff = max_backoff_secs.max(backoff);
+        let first_backoff = initial_backoff_secs.max(1);
+        let max_backoff = max_backoff_secs.max(first_backoff);
+        let mut backoff = first_backoff;
+        // Restarts since the component last ran healthy.
+        let mut attempt: u32 = 0;
 
         loop {
             crate::health::mark_component_starting(name);
+            let started = tokio::time::Instant::now();
             match run_component().await {
                 Ok(()) => {
                     crate::health::mark_component_error(name, "component exited unexpectedly");
                     tracing::warn!("Daemon component '{name}' exited unexpectedly");
                     // Clean exit — reset backoff since the component ran successfully
-                    backoff = initial_backoff_secs.max(1);
+                    backoff = first_backoff;
+                    attempt = 0;
                 }
                 Err(e) => {
                     // The whole chain: the outer context alone ("… failed")
@@ -623,7 +629,21 @@ where
                 }
             }
 
+            // A run that outlived the current backoff was healthy: it forgives
+            // the failures before it, so the next restart starts over.
+            if started.elapsed() > Duration::from_secs(backoff) {
+                backoff = first_backoff;
+                attempt = 0;
+            }
+            attempt = attempt.saturating_add(1);
+
             crate::health::bump_component_restart(name);
+            tracing::warn!(
+                component = name,
+                attempt,
+                delay_secs = backoff,
+                "Restarting daemon component after backoff"
+            );
             tokio::time::sleep(Duration::from_secs(backoff)).await;
             // Double backoff AFTER sleeping so first error uses initial_backoff
             backoff = backoff.saturating_mul(2).min(max_backoff);

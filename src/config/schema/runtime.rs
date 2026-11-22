@@ -282,6 +282,10 @@ pub(super) const fn default_channel_backoff_max_secs() -> u64 {
     60
 }
 
+/// Ceiling on the gateway component's restart backoff. The gateway is an
+/// always-available capability, so it never inherits the channel maximum.
+pub const GATEWAY_RESTART_MAX_BACKOFF_SECS: u64 = 5;
+
 pub(super) const fn default_scheduler_poll_secs() -> u64 {
     15
 }
