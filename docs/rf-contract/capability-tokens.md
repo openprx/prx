@@ -605,9 +605,7 @@ returns `409 idempotency_conflict`.
 
 ### Sync snapshot and durable WebSocket (B1)
 
-`GET /api/capabilities` also returns `engine:"prx"` and
-`engine_instance_id`, the same stable install owner id as `GET /api/owner`.
-Consumers namespace engine-local ids by that pair. SQLite backends advertise
+SQLite backends advertise
 `sync_snapshot_v1` and `sync_ws_v1`; other backends list them in `available`.
 B1 does not advertise `stream_frames_v1` or `run_approvals_v1`.
 

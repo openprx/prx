@@ -101,8 +101,6 @@ const CREDENTIAL_QUERY_KEYS: [&str; 6] = ["access_token", "api_key", "auth", "au
 
 #[derive(Serialize)]
 struct CapabilitiesBody {
-    engine: &'static str,
-    engine_instance_id: String,
     prx_version: &'static str,
     commit: &'static str,
     api: u32,
@@ -357,17 +355,8 @@ pub(super) fn method_not_allowed_allowing(allow: &'static str) -> Response {
 /// `GET /api/capabilities`: the PRX version and commit, and the tokens
 /// effective in this running daemon and those only available in this build.
 pub(super) async fn get_capabilities(State(state): State<AppState>) -> Response {
-    let Some(owner) = state.pairing.install_owner() else {
-        return coded_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "storage_unavailable",
-            "install owner identity unavailable",
-        );
-    };
     let (capabilities, available) = advertised_tokens(&state);
     Json(CapabilitiesBody {
-        engine: "prx",
-        engine_instance_id: owner.as_str().to_owned(),
         prx_version: PRX_VERSION,
         commit: PRX_COMMIT,
         api: CAPABILITIES_API,
