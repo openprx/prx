@@ -455,6 +455,14 @@ OS-paging context-page documents of the session that hold a deleted row (a
 page written during the deleted turn, or a page whose text holds the deleted
 text). They are not counted in `forgotten`.
 
+How a page is matched today: by the input event of the turn in which the page
+was written, or by the page text containing the first non-blank line of the
+deleted message (at most 64 characters). The match is by text, not by message
+id, so a very short message (for example `ok`) can remove other context pages
+of the same agent and session. Context pages are recall copies; transcripts
+and other sessions are never touched by this match. A client should tell the
+user that deleting a short message may also drop older recall context.
+
 **Replay.** A resend of a deleted message's key (`POST …/message` with that
 `client_message_id` for that agent) is `409 message_deleted`. The deleted mark
 lives in the message's idempotency record and is kept as long as the record
