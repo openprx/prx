@@ -916,7 +916,7 @@ impl SessionsSpawnTool {
             // Announcement gate inputs for the process-mode monitor. Same three
             // values the task-mode branch below captures, handed to the same
             // `deliver_or_withhold_notice`.
-            let process_announce_security = Arc::clone(launch_security);
+            let process_announce_security = policy_at_level(launch_security, child_level);
             let process_announce_origin = AnnounceOrigin::from_scope(spawn_scope.as_ref());
             let process_announce_history = history_arc.clone();
             // The worker's parent is the run its bound input names: the
@@ -1449,7 +1449,7 @@ impl SessionsSpawnTool {
         // Second handle, for the announcement gate: `security` above is moved
         // into the sub-agent's own loop, and the announcement is authorized only
         // once that loop has returned.
-        let announce_security = Arc::clone(launch_security);
+        let announce_security = policy_at_level(launch_security, child_level);
         // The launching turn's trusted identity, captured atomically with
         // `recipient` / `run_channel_name` from the same scope snapshot.
         let announce_origin = AnnounceOrigin::from_scope(spawn_scope.as_ref());
@@ -1859,4 +1859,20 @@ fn requested_agent_name(args: &serde_json::Value) -> Option<&str> {
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|agent| !agent.is_empty())
+}
+
+/// `policy` at the level of the run that sends an announcement: the gate
+/// applies the outbound scope at that run's level.
+fn policy_at_level(
+    policy: &Arc<crate::security::SecurityPolicy>,
+    level: crate::security::AutonomyLevel,
+) -> Arc<crate::security::SecurityPolicy> {
+    if policy.autonomy == level {
+        Arc::clone(policy)
+    } else {
+        Arc::new(crate::security::SecurityPolicy {
+            autonomy: level,
+            ..policy.as_ref().clone()
+        })
+    }
 }

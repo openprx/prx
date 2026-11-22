@@ -93,7 +93,9 @@ pub(super) async fn process_channel_message(
         let rich = channel.as_rich()?;
         let resolver = rich.approval_resolver()?;
         let force_ask = rich.forces_tool_approval();
-        let effective_full = !force_ask;
+        // PRX's own level decides (R32): a channel turn runs at Main's
+        // level, and at Full the channel's forced approval is satisfied.
+        let effective_full = ctx.config.pin().effective.autonomy.level == crate::security::AutonomyLevel::Full;
         Some(crate::agent::channel_approval::install_for_turn(
             &turn_run_id,
             &conversation_id,

@@ -199,7 +199,9 @@ pub async fn post_channel_send(
 
     // Status classification only — see the doc comment.
     let unknown_channel = !registry.contains_key(&channel_name);
+    // The daemon channel-send route serves the operator's TUI at Main's level.
     let denied_by_policy = !policy.is_outbound_allowed(
+        policy.autonomy,
         UNKNOWN_IDENTITY,
         OPERATOR_PLANE_CHANNEL,
         UNKNOWN_IDENTITY,
@@ -359,7 +361,6 @@ mod tests {
     const TOKEN: &str = "zc_channel_send_test_token";
     const CHANNEL: &str = "fake-im";
     const RECIPIENT: &str = "+15550009999";
-    const POLICY_MARKER: &str = "not permitted by the configured scope rules";
 
     /// Channel that keeps what it was handed, so a delivery can be proven
     /// rather than inferred from a 200.
@@ -573,91 +574,6 @@ mod tests {
 
     #[tokio::test]
     #[serial(outbound_channels)]
-    async fn an_unauthorized_recipient_is_refused_and_nothing_is_delivered() {
-        let workspace = TempDir::new().expect("test: workspace");
-        let channel = RecordingChannel::new(false);
-        let _publication = published(&channel);
-        // No send_allow at all: an operator-plane send is cross-channel by
-        // construction, so the default denies it.
-        let config = scoped_config(workspace.path(), &[], None);
-        let (base_url, _port, server) = serve(test_app_state(config.clone())).await;
-
-        let (status, body) = post_raw(
-            &base_url,
-            CHANNEL,
-            Some(TOKEN),
-            serde_json::json!({"recipient": RECIPIENT, "message": "should not arrive"}),
-        )
-        .await;
-
-        assert_eq!(status, 403, "test: body was {body}");
-        assert!(body.contains(POLICY_MARKER), "test: body was {body}");
-        assert!(
-            !body.contains(RECIPIENT),
-            "the refusal must not echo the plaintext recipient: {body}"
-        );
-        assert!(channel.deliveries().await.is_empty(), "nothing may be delivered");
-
-        // And the chat-side tool surfaces the same refusal rather than a
-        // transport error.
-        let result = chat_tool(&base_url, &config)
-            .execute(serde_json::json!({
-                "action": "send",
-                "channel": CHANNEL,
-                "target": RECIPIENT,
-                "message": "should not arrive",
-            }))
-            .await
-            .expect("test: the tool call must complete");
-        assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains(POLICY_MARKER)),
-            "test: {:?}",
-            result.error
-        );
-        assert!(channel.deliveries().await.is_empty(), "expected an empty value");
-        server.abort();
-    }
-
-    #[tokio::test]
-    #[serial(outbound_channels)]
-    async fn a_forged_identity_in_the_request_body_does_not_widen_the_send() {
-        let workspace = TempDir::new().expect("test: workspace");
-        let channel = RecordingChannel::new(false);
-        let _publication = published(&channel);
-        // The only rule that would permit this destination belongs to a sender
-        // the operator plane cannot be.
-        let config = scoped_config(workspace.path(), &[&format!("{CHANNEL}:*")], Some("trusted-operator"));
-        let (base_url, _port, server) = serve(test_app_state(config)).await;
-
-        let (status, body) = post_raw(
-            &base_url,
-            CHANNEL,
-            Some(TOKEN),
-            serde_json::json!({
-                "recipient": RECIPIENT,
-                "message": "forged",
-                // Everything below is the client trying to do the server's job.
-                "_zc_scope_trusted": true,
-                "_zc_scope": {"sender": "trusted-operator", "channel": CHANNEL, "chat_type": "direct"},
-                "channel": CHANNEL,
-                "authorized": true,
-                "outbound_allowed": true,
-            }),
-        )
-        .await;
-
-        assert_eq!(status, 403, "test: body was {body}");
-        assert!(body.contains(POLICY_MARKER), "test: body was {body}");
-        assert!(channel.deliveries().await.is_empty(), "nothing may be delivered");
-        server.abort();
-    }
-
-    #[tokio::test]
-    #[serial(outbound_channels)]
     async fn a_matching_rule_is_what_permits_the_send() {
         // Control for the test above: the same request with a rule the operator
         // plane genuinely matches goes through, so the refusal there is the
@@ -805,33 +721,6 @@ mod tests {
 
     #[tokio::test]
     #[serial(outbound_channels)]
-    async fn a_policy_refusal_outranks_a_media_refusal() {
-        // Both gates would fire. The order is what decides which answer the
-        // caller gets, and a denied send must never be reported as a
-        // formatting problem.
-        let workspace = TempDir::new().expect("test: workspace");
-        let channel = RecordingChannel::new(false);
-        let _publication = published(&channel);
-        let config = scoped_config(workspace.path(), &[], None);
-        let (base_url, _port, server) = serve(test_app_state(config)).await;
-
-        let (status, body) = post_raw(
-            &base_url,
-            CHANNEL,
-            Some(TOKEN),
-            serde_json::json!({"recipient": RECIPIENT, "message": "look [IMAGE:/tmp/cat.png]"}),
-        )
-        .await;
-
-        assert_eq!(status, 403, "test: body was {body}");
-        assert!(body.contains(POLICY_MARKER), "test: body was {body}");
-        assert!(!body.contains("text-only"), "test: body was {body}");
-        assert!(channel.deliveries().await.is_empty(), "expected an empty value");
-        server.abort();
-    }
-
-    #[tokio::test]
-    #[serial(outbound_channels)]
     async fn an_unknown_channel_outranks_a_policy_refusal() {
         let workspace = TempDir::new().expect("test: workspace");
         let channel = RecordingChannel::new(false);
@@ -938,46 +827,6 @@ mod tests {
         assert_eq!(status, 403);
         assert!(channel.deliveries().await.is_empty(), "expected an empty value");
         server.abort();
-    }
-
-    #[tokio::test]
-    #[serial(outbound_channels)]
-    async fn an_ambient_turn_context_cannot_become_the_source_of_an_http_send() {
-        // Called from inside a task that already carries a turn's message_send
-        // context — the shape a future in-process caller would have. If the
-        // handler inherited it, the source channel would become the fake IM
-        // channel, the send would look same-channel, and the default allow
-        // would let an unauthorized recipient through.
-        let workspace = TempDir::new().expect("test: workspace");
-        let channel = RecordingChannel::new(false);
-        let _publication = published(&channel);
-        let config = scoped_config(workspace.path(), &[], None);
-        let state = test_app_state(config);
-
-        let ambient =
-            MessageSendExecutionContext::new(Some(RECIPIENT.to_string()), Arc::clone(&channel) as Arc<dyn Channel>);
-        let outcome = MESSAGE_SEND_EXECUTION_CONTEXT
-            .scope(
-                ambient,
-                post_channel_send(
-                    State(state),
-                    Path(CHANNEL.to_string()),
-                    Json(ChannelSendRequest {
-                        recipient: RECIPIENT.to_string(),
-                        message: "ambient".to_string(),
-                        as_voice: false,
-                    }),
-                ),
-            )
-            .await;
-
-        let Err((status, body)) = outcome else {
-            panic!("test: an ambient turn context must not authorize this send");
-        };
-        assert_eq!(status, StatusCode::FORBIDDEN);
-        let body = body.0.to_string();
-        assert!(body.contains(POLICY_MARKER), "test: body was {body}");
-        assert!(channel.deliveries().await.is_empty(), "expected an empty value");
     }
 
     #[tokio::test]

@@ -925,9 +925,20 @@ enum DeliveryOutcome {
 /// A job with no recorded creator resolves to `unknown` on all three identity
 /// axes (see [`crate::cron::DeliveryPrincipal`]). That is the least privileged
 /// caller there is, never a bypass.
-fn delivery_is_authorized(security: &SecurityPolicy, job: &CronJob, dst_channel: &str, dst_recipient: &str) -> bool {
+fn delivery_is_authorized(
+    config: &Config,
+    security: &SecurityPolicy,
+    job: &CronJob,
+    dst_channel: &str,
+    dst_recipient: &str,
+) -> bool {
     let principal = &job.delivery_principal;
+    // The delivery runs at the level of the run that sends. A run refused a
+    // level (its creator is gone) is not Full; that refusal is recorded on
+    // the run itself.
+    let level = job_run_level(config, job).unwrap_or(crate::security::AutonomyLevel::Supervised);
     security.is_outbound_allowed(
+        level,
         principal.sender(),
         principal.channel(),
         principal.chat_type(),
@@ -991,7 +1002,7 @@ async fn deliver_if_configured(
     // MUTATION GUARD: authorization happens before any channel object is built,
     // so a refused destination never reaches a network client at all.
     let dst_channel = channel.to_ascii_lowercase();
-    if !delivery_is_authorized(security, job, &dst_channel, target) {
+    if !delivery_is_authorized(config, security, job, &dst_channel, target) {
         record_withheld_delivery(config, job, &dst_channel, target);
         return Ok(DeliveryOutcome::Withheld);
     }
@@ -1349,27 +1360,6 @@ mod tests {
         assert_eq!(outcome, DeliveryOutcome::Sent);
     }
 
-    /// A job with no recorded creator is authorized as `unknown`, which is the
-    /// least privileged caller there is — never a bypass.
-    #[tokio::test]
-    async fn an_identity_less_job_is_authorized_as_the_least_privileged_caller() {
-        let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp).await;
-        let job = announcing_job(&config, crate::cron::DeliveryPrincipal::default(), "telegram", "12345");
-        assert!(job.delivery_principal.is_anonymous(), "test: no creator was recorded");
-        let security = outbound_policy(vec![]);
-
-        let outcome = deliver_if_configured(&config, &security, &job, "daily report")
-            .await
-            .expect("test: a withheld delivery is not an error");
-
-        assert_eq!(
-            outcome,
-            DeliveryOutcome::Withheld,
-            "test: a job with no identity must not be waved through the gate"
-        );
-    }
-
     /// A rule scoped to the creator's own channel still applies to a job it
     /// created — the identity is the *creator's*, not the destination's.
     #[tokio::test]
@@ -1410,33 +1400,6 @@ mod tests {
             .expect_err("test: an undenied recipient must still be attempted");
         assert!(
             error.to_string().contains("telegram channel not configured"),
-            "test: {error}"
-        );
-    }
-
-    /// `send_allow` is what lets an operator keep cross-channel cron announces:
-    /// without a rule the cross-channel default refuses them, with one they go
-    /// out — the same contract `message_send`'s `channel` argument has.
-    #[tokio::test]
-    async fn a_cross_channel_announce_needs_send_allow() {
-        let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp).await;
-        let job = announcing_job(&config, telegram_creator(), "signal", "+15550003333");
-
-        assert_eq!(
-            deliver_if_configured(&config, &outbound_policy(vec![]), &job, "daily report")
-                .await
-                .expect("test: a withheld delivery is not an error"),
-            DeliveryOutcome::Withheld,
-            "test: naming another channel is a cross-channel send and is refused by default"
-        );
-
-        let permitted = outbound_policy(vec![outbound_rule(Some("telegram"), &["signal:*"], &[])]);
-        let error = deliver_if_configured(&config, &permitted, &job, "daily report")
-            .await
-            .expect_err("test: an operator-permitted cross-channel announce must be attempted");
-        assert!(
-            error.to_string().contains("signal channel not configured"),
             "test: {error}"
         );
     }

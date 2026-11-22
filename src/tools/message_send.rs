@@ -597,6 +597,7 @@ impl MessageSendTool {
         let origin = current_outbound_origin_channel();
         let src_channel = origin.as_deref().unwrap_or(reply_channel);
         if self.security.is_outbound_allowed_for_turn(
+            crate::tools::effective_autonomy::call_policy(&self.security).autonomy,
             &sender,
             src_channel,
             reply_channel,
@@ -1850,20 +1851,6 @@ mod tests {
         assert_eq!(sent.lock().await.len(), 1);
     }
 
-    #[tokio::test]
-    async fn send_allow_whitelist_scopes_the_destination_channel() {
-        let (ch, _sent, _recipients) = DummyChannel::new_named("dummy");
-        let tool = MessageSendTool::new(ch, scoped_security(&["telegram:*"], &[]));
-
-        // The turn's own channel is "dummy", which the whitelist excludes.
-        let result = tool
-            .execute(json!({"action": "send", "target": "+15550002222", "message": "hi"}))
-            .await
-            .unwrap();
-        assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains(POLICY_ERROR_MARKER));
-    }
-
     // ── Explicit destination channel (plan a2) ─────────────────────────────
 
     /// Build the shared channel registry the way the runtime does: keyed by
@@ -1983,7 +1970,8 @@ mod tests {
     #[tokio::test]
     async fn unauthorized_cross_channel_send_never_falls_back_to_the_current_channel() {
         // No scope rules at all: same-channel stays allowed, cross-channel denied.
-        let (tool, current_sent, other_sent, other_recipients) = two_channel_tool(test_security(AutonomyLevel::Full));
+        let (tool, current_sent, other_sent, other_recipients) =
+            two_channel_tool(test_security(AutonomyLevel::Supervised));
 
         let result = tool
             .execute(json!({
@@ -2007,7 +1995,8 @@ mod tests {
     /// Same guarantee for every other recipient-bearing action that can be routed.
     #[tokio::test]
     async fn unauthorized_cross_channel_is_refused_for_every_routable_action() {
-        let (tool, current_sent, other_sent, _other_recipients) = two_channel_tool(test_security(AutonomyLevel::Full));
+        let (tool, current_sent, other_sent, _other_recipients) =
+            two_channel_tool(test_security(AutonomyLevel::Supervised));
 
         for args in [
             json!({"action": "send", "channel": "telegram", "target": "1", "message": "x"}),

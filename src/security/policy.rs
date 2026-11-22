@@ -1953,16 +1953,29 @@ impl SecurityPolicy {
     /// `autonomy.scopes.default` is intentionally not consulted here: it
     /// governs tool access, and a `deny` default already blocks `message_send`
     /// itself before any recipient is resolved.
+    ///
+    /// `level` is the effective level of the run that sends, passed by the
+    /// caller: at Full the `send_allow` default-deny (the whitelist and the
+    /// channel default) does not apply and only `send_deny` refuses.
     #[must_use]
     pub fn is_outbound_allowed(
         &self,
+        level: AutonomyLevel,
         sender: &str,
         src_channel: &str,
         chat_type: &str,
         dst_channel: &str,
         dst_recipient: &str,
     ) -> bool {
-        self.is_outbound_allowed_for_turn(sender, src_channel, src_channel, chat_type, dst_channel, dst_recipient)
+        self.is_outbound_allowed_for_turn(
+            level,
+            sender,
+            src_channel,
+            src_channel,
+            chat_type,
+            dst_channel,
+            dst_recipient,
+        )
     }
 
     /// [`is_outbound_allowed`](Self::is_outbound_allowed) with the turn's
@@ -1979,6 +1992,7 @@ impl SecurityPolicy {
     #[must_use]
     pub fn is_outbound_allowed_for_turn(
         &self,
+        level: AutonomyLevel,
         sender: &str,
         src_channel: &str,
         reply_channel: &str,
@@ -2011,6 +2025,10 @@ impl SecurityPolicy {
             if whitelist.is_none() && !rule.send_allow.is_empty() {
                 whitelist = Some(rule);
             }
+        }
+        // Full: `send_deny` (swept above) is the only outbound limit.
+        if level == AutonomyLevel::Full {
+            return true;
         }
 
         whitelist.map_or(
@@ -3801,44 +3819,100 @@ mod tests {
     #[test]
     fn outbound_same_channel_allowed_without_any_rule() {
         let p = make_scope_policy(vec![], true);
-        assert!(p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "+15550001111"));
+        assert!(p.is_outbound_allowed(
+            AutonomyLevel::Supervised,
+            "alice",
+            "wacli",
+            "direct",
+            "wacli",
+            "+15550001111"
+        ));
     }
 
     #[test]
     fn outbound_same_channel_allowed_even_when_scope_default_is_deny() {
         // `autonomy.scopes.default` governs tool access, not recipients.
         let p = make_scope_policy(vec![], false);
-        assert!(p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "+15550001111"));
+        assert!(p.is_outbound_allowed(
+            AutonomyLevel::Supervised,
+            "alice",
+            "wacli",
+            "direct",
+            "wacli",
+            "+15550001111"
+        ));
     }
 
     #[test]
     fn outbound_cross_channel_denied_without_send_allow() {
         let p = make_scope_policy(vec![], true);
-        assert!(!p.is_outbound_allowed("alice", "wacli", "direct", "telegram", "12345"));
+        assert!(!p.is_outbound_allowed(
+            AutonomyLevel::Supervised,
+            "alice",
+            "wacli",
+            "direct",
+            "telegram",
+            "12345"
+        ));
     }
 
     #[test]
     fn outbound_cross_channel_allowed_by_send_allow() {
         let p = make_scope_policy(vec![outbound_rule(Some("wacli"), &["telegram:*"], &[])], true);
-        assert!(p.is_outbound_allowed("alice", "wacli", "direct", "telegram", "12345"));
+        assert!(p.is_outbound_allowed(
+            AutonomyLevel::Supervised,
+            "alice",
+            "wacli",
+            "direct",
+            "telegram",
+            "12345"
+        ));
         // A destination outside the whitelist stays denied, same channel included.
-        assert!(!p.is_outbound_allowed("alice", "wacli", "direct", "discord", "99"));
-        assert!(!p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "+1"));
+        assert!(!p.is_outbound_allowed(AutonomyLevel::Supervised, "alice", "wacli", "direct", "discord", "99"));
+        assert!(!p.is_outbound_allowed(AutonomyLevel::Supervised, "alice", "wacli", "direct", "wacli", "+1"));
     }
 
     #[test]
     fn outbound_send_deny_blocks_same_channel() {
         let p = make_scope_policy(vec![outbound_rule(None, &[], &["*:+15550001111"])], true);
-        assert!(!p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "+15550001111"));
-        assert!(p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "+15550002222"));
+        assert!(!p.is_outbound_allowed(
+            AutonomyLevel::Supervised,
+            "alice",
+            "wacli",
+            "direct",
+            "wacli",
+            "+15550001111"
+        ));
+        assert!(p.is_outbound_allowed(
+            AutonomyLevel::Supervised,
+            "alice",
+            "wacli",
+            "direct",
+            "wacli",
+            "+15550002222"
+        ));
     }
 
     #[test]
     fn outbound_send_deny_outranks_send_allow() {
         let p = make_scope_policy(vec![outbound_rule(None, &["*"], &["telegram:12345"])], true);
-        assert!(!p.is_outbound_allowed("alice", "wacli", "direct", "telegram", "12345"));
+        assert!(!p.is_outbound_allowed(
+            AutonomyLevel::Supervised,
+            "alice",
+            "wacli",
+            "direct",
+            "telegram",
+            "12345"
+        ));
         // Same rule still allows every other destination via the wildcard allow.
-        assert!(p.is_outbound_allowed("alice", "wacli", "direct", "telegram", "67890"));
+        assert!(p.is_outbound_allowed(
+            AutonomyLevel::Supervised,
+            "alice",
+            "wacli",
+            "direct",
+            "telegram",
+            "67890"
+        ));
     }
 
     /// R2: a rule carrying no outbound entry is not an outbound rule and must
@@ -3852,7 +3926,7 @@ mod tests {
         let p = make_scope_policy(vec![tools_only, outbound_rule(None, &[], &["*"])], true);
         // The `tools_deny`-only rule matches first but says nothing about
         // recipients, so the deny-everything rule below it still applies.
-        assert!(!p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "+1"));
+        assert!(!p.is_outbound_allowed(AutonomyLevel::Supervised, "alice", "wacli", "direct", "wacli", "+1"));
         // Its tool semantics are untouched: first-match-wins still governs those.
         assert!(!p.is_tool_allowed("shell", "alice", "wacli", "direct"));
     }
@@ -3868,9 +3942,23 @@ mod tests {
             ],
             true,
         );
-        assert!(!p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "+15550001111"));
+        assert!(!p.is_outbound_allowed(
+            AutonomyLevel::Supervised,
+            "alice",
+            "wacli",
+            "direct",
+            "wacli",
+            "+15550001111"
+        ));
         // Everything else still rides the first rule's whitelist.
-        assert!(p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "+15550002222"));
+        assert!(p.is_outbound_allowed(
+            AutonomyLevel::Supervised,
+            "alice",
+            "wacli",
+            "direct",
+            "wacli",
+            "+15550002222"
+        ));
     }
 
     /// R2 zero-regression: rule ordering still decides which whitelist applies,
@@ -3884,10 +3972,24 @@ mod tests {
             ],
             true,
         );
-        assert!(p.is_outbound_allowed("alice", "wacli", "direct", "telegram", "12345"));
-        assert!(!p.is_outbound_allowed("alice", "wacli", "direct", "discord", "99"));
+        assert!(p.is_outbound_allowed(
+            AutonomyLevel::Supervised,
+            "alice",
+            "wacli",
+            "direct",
+            "telegram",
+            "12345"
+        ));
+        assert!(!p.is_outbound_allowed(AutonomyLevel::Supervised, "alice", "wacli", "direct", "discord", "99"));
         // A telegram turn skips the first rule and lands on the wildcard one.
-        assert!(p.is_outbound_allowed("alice", "telegram", "direct", "discord", "99"));
+        assert!(p.is_outbound_allowed(
+            AutonomyLevel::Supervised,
+            "alice",
+            "telegram",
+            "direct",
+            "discord",
+            "99"
+        ));
     }
 
     /// R2 zero-regression: with no `send_*` entry configured anywhere, every
@@ -3897,16 +3999,16 @@ mod tests {
         let mut tools_only = outbound_rule(None, &[], &[]);
         tools_only.tools_deny = vec!["*".to_string()];
         let p = make_scope_policy(vec![tools_only], true);
-        assert!(p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "+1"));
-        assert!(!p.is_outbound_allowed("alice", "wacli", "direct", "telegram", "+1"));
+        assert!(p.is_outbound_allowed(AutonomyLevel::Supervised, "alice", "wacli", "direct", "wacli", "+1"));
+        assert!(!p.is_outbound_allowed(AutonomyLevel::Supervised, "alice", "wacli", "direct", "telegram", "+1"));
     }
 
     #[test]
     fn outbound_entry_channel_scoping_is_exact() {
         let p = make_scope_policy(vec![outbound_rule(None, &[], &["signal:+1"])], true);
-        assert!(!p.is_outbound_allowed("alice", "signal", "direct", "signal", "+1"));
+        assert!(!p.is_outbound_allowed(AutonomyLevel::Supervised, "alice", "signal", "direct", "signal", "+1"));
         // Same recipient on a different channel is untouched by the entry.
-        assert!(p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "+1"));
+        assert!(p.is_outbound_allowed(AutonomyLevel::Supervised, "alice", "wacli", "direct", "wacli", "+1"));
     }
 
     #[test]
@@ -3914,10 +4016,24 @@ mod tests {
         // The entry is still split at its *first* colon, so the recipient half
         // keeps every colon it was written with.
         let p = make_scope_policy(vec![outbound_rule(None, &[], &["telegram:12345:678"])], true);
-        assert!(!p.is_outbound_allowed("alice", "telegram", "group", "telegram", "12345:678"));
+        assert!(!p.is_outbound_allowed(
+            AutonomyLevel::Supervised,
+            "alice",
+            "telegram",
+            "group",
+            "telegram",
+            "12345:678"
+        ));
         // A colon in a non-JID recipient is part of the identifier — a Telegram
         // forum topic is not its parent chat — so it is never folded away.
-        assert!(p.is_outbound_allowed("alice", "telegram", "group", "telegram", "12345"));
+        assert!(p.is_outbound_allowed(
+            AutonomyLevel::Supervised,
+            "alice",
+            "telegram",
+            "group",
+            "telegram",
+            "12345"
+        ));
     }
 
     // ── R1: derivable recipient aliases ─────────────────────────────────
@@ -3927,12 +4043,47 @@ mod tests {
     #[test]
     fn outbound_send_deny_folds_jid_device_suffix_and_server_case() {
         let p = make_scope_policy(vec![outbound_rule(None, &[], &["wacli:1234@s.whatsapp.net"])], true);
-        assert!(!p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "1234@s.whatsapp.net"));
-        assert!(!p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "1234:2@s.whatsapp.net"));
-        assert!(!p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "1234@s.whatsapp.net:2"));
-        assert!(!p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "1234@S.WhatsApp.Net"));
+        assert!(!p.is_outbound_allowed(
+            AutonomyLevel::Supervised,
+            "alice",
+            "wacli",
+            "direct",
+            "wacli",
+            "1234@s.whatsapp.net"
+        ));
+        assert!(!p.is_outbound_allowed(
+            AutonomyLevel::Supervised,
+            "alice",
+            "wacli",
+            "direct",
+            "wacli",
+            "1234:2@s.whatsapp.net"
+        ));
+        assert!(!p.is_outbound_allowed(
+            AutonomyLevel::Supervised,
+            "alice",
+            "wacli",
+            "direct",
+            "wacli",
+            "1234@s.whatsapp.net:2"
+        ));
+        assert!(!p.is_outbound_allowed(
+            AutonomyLevel::Supervised,
+            "alice",
+            "wacli",
+            "direct",
+            "wacli",
+            "1234@S.WhatsApp.Net"
+        ));
         // A different account is untouched.
-        assert!(p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "9999@s.whatsapp.net"));
+        assert!(p.is_outbound_allowed(
+            AutonomyLevel::Supervised,
+            "alice",
+            "wacli",
+            "direct",
+            "wacli",
+            "9999@s.whatsapp.net"
+        ));
     }
 
     /// The WhatsApp Cloud API strips a leading `+` before sending, so the two
@@ -3940,9 +4091,30 @@ mod tests {
     #[test]
     fn outbound_send_deny_folds_leading_plus() {
         let p = make_scope_policy(vec![outbound_rule(None, &[], &["whatsapp:+15550001111"])], true);
-        assert!(!p.is_outbound_allowed("alice", "whatsapp", "direct", "whatsapp", "+15550001111"));
-        assert!(!p.is_outbound_allowed("alice", "whatsapp", "direct", "whatsapp", "15550001111"));
-        assert!(p.is_outbound_allowed("alice", "whatsapp", "direct", "whatsapp", "15550002222"));
+        assert!(!p.is_outbound_allowed(
+            AutonomyLevel::Supervised,
+            "alice",
+            "whatsapp",
+            "direct",
+            "whatsapp",
+            "+15550001111"
+        ));
+        assert!(!p.is_outbound_allowed(
+            AutonomyLevel::Supervised,
+            "alice",
+            "whatsapp",
+            "direct",
+            "whatsapp",
+            "15550001111"
+        ));
+        assert!(p.is_outbound_allowed(
+            AutonomyLevel::Supervised,
+            "alice",
+            "whatsapp",
+            "direct",
+            "whatsapp",
+            "15550002222"
+        ));
     }
 
     /// Signal classifies a recipient as a UUID with `Uuid::parse_str`, which
@@ -3963,11 +4135,25 @@ mod tests {
             "2b1d0e7a9c3f4a5b8d6e7f0a1b2c3d4e",
         ] {
             assert!(
-                !p.is_outbound_allowed("alice", "signal", "direct", "signal", spelling),
+                !p.is_outbound_allowed(
+                    AutonomyLevel::Supervised,
+                    "alice",
+                    "signal",
+                    "direct",
+                    "signal",
+                    spelling
+                ),
                 "{spelling} should be denied"
             );
         }
-        assert!(p.is_outbound_allowed("alice", "signal", "direct", "signal", "+15550001111"));
+        assert!(p.is_outbound_allowed(
+            AutonomyLevel::Supervised,
+            "alice",
+            "signal",
+            "direct",
+            "signal",
+            "+15550001111"
+        ));
     }
 
     /// Folding widens denial only. A whitelist is matched exactly, because a
@@ -3975,16 +4161,37 @@ mod tests {
     #[test]
     fn outbound_send_allow_is_never_widened_by_alias_folding() {
         let p = make_scope_policy(vec![outbound_rule(None, &["wacli:1234@s.whatsapp.net"], &[])], true);
-        assert!(p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "1234@s.whatsapp.net"));
-        assert!(!p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "1234:2@s.whatsapp.net"));
+        assert!(p.is_outbound_allowed(
+            AutonomyLevel::Supervised,
+            "alice",
+            "wacli",
+            "direct",
+            "wacli",
+            "1234@s.whatsapp.net"
+        ));
+        assert!(!p.is_outbound_allowed(
+            AutonomyLevel::Supervised,
+            "alice",
+            "wacli",
+            "direct",
+            "wacli",
+            "1234:2@s.whatsapp.net"
+        ));
     }
 
     /// The channel half of a deny entry is never folded — only the recipient is.
     #[test]
     fn outbound_deny_folding_does_not_cross_channels() {
         let p = make_scope_policy(vec![outbound_rule(None, &[], &["wacli:+1234"])], true);
-        assert!(!p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "1234"));
-        assert!(p.is_outbound_allowed("alice", "telegram", "direct", "telegram", "1234"));
+        assert!(!p.is_outbound_allowed(AutonomyLevel::Supervised, "alice", "wacli", "direct", "wacli", "1234"));
+        assert!(p.is_outbound_allowed(
+            AutonomyLevel::Supervised,
+            "alice",
+            "telegram",
+            "direct",
+            "telegram",
+            "1234"
+        ));
     }
 
     /// A LID and the same contact's phone JID are different numbers, so no
@@ -3993,7 +4200,14 @@ mod tests {
     #[test]
     fn outbound_send_deny_cannot_fold_a_lid_onto_a_phone_jid() {
         let phone_only = make_scope_policy(vec![outbound_rule(None, &[], &["wacli:1234@s.whatsapp.net"])], true);
-        assert!(phone_only.is_outbound_allowed("alice", "wacli", "direct", "wacli", "5678@lid"));
+        assert!(phone_only.is_outbound_allowed(
+            AutonomyLevel::Supervised,
+            "alice",
+            "wacli",
+            "direct",
+            "wacli",
+            "5678@lid"
+        ));
 
         let both = make_scope_policy(
             vec![outbound_rule(
@@ -4003,11 +4217,32 @@ mod tests {
             )],
             true,
         );
-        assert!(!both.is_outbound_allowed("alice", "wacli", "direct", "wacli", "1234@s.whatsapp.net"));
-        assert!(!both.is_outbound_allowed("alice", "wacli", "direct", "wacli", "5678@lid"));
+        assert!(!both.is_outbound_allowed(
+            AutonomyLevel::Supervised,
+            "alice",
+            "wacli",
+            "direct",
+            "wacli",
+            "1234@s.whatsapp.net"
+        ));
+        assert!(!both.is_outbound_allowed(
+            AutonomyLevel::Supervised,
+            "alice",
+            "wacli",
+            "direct",
+            "wacli",
+            "5678@lid"
+        ));
 
         let whole_channel = make_scope_policy(vec![outbound_rule(None, &[], &["wacli:*"])], true);
-        assert!(!whole_channel.is_outbound_allowed("alice", "wacli", "direct", "wacli", "5678@lid"));
+        assert!(!whole_channel.is_outbound_allowed(
+            AutonomyLevel::Supervised,
+            "alice",
+            "wacli",
+            "direct",
+            "wacli",
+            "5678@lid"
+        ));
     }
 
     #[test]
@@ -4160,11 +4395,39 @@ mod tests {
         rule.chat_type = Some("group".into());
         let p = make_scope_policy(vec![rule], true);
         // Every criterion matches → deny-all applies.
-        assert!(!p.is_outbound_allowed("uuid:mallory", "signal", "group", "signal", "+1"));
+        assert!(!p.is_outbound_allowed(
+            AutonomyLevel::Supervised,
+            "uuid:mallory",
+            "signal",
+            "group",
+            "signal",
+            "+1"
+        ));
         // Any mismatch → rule skipped → same-channel default allows.
-        assert!(p.is_outbound_allowed("uuid:alice", "signal", "group", "signal", "+1"));
-        assert!(p.is_outbound_allowed("uuid:mallory", "signal", "direct", "signal", "+1"));
-        assert!(p.is_outbound_allowed("uuid:mallory", "telegram", "group", "telegram", "+1"));
+        assert!(p.is_outbound_allowed(
+            AutonomyLevel::Supervised,
+            "uuid:alice",
+            "signal",
+            "group",
+            "signal",
+            "+1"
+        ));
+        assert!(p.is_outbound_allowed(
+            AutonomyLevel::Supervised,
+            "uuid:mallory",
+            "signal",
+            "direct",
+            "signal",
+            "+1"
+        ));
+        assert!(p.is_outbound_allowed(
+            AutonomyLevel::Supervised,
+            "uuid:mallory",
+            "telegram",
+            "group",
+            "telegram",
+            "+1"
+        ));
     }
 
     #[test]

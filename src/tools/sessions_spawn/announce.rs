@@ -92,7 +92,16 @@ pub(crate) fn announce_is_authorized(
     let (sender, chat_type) = origin.map_or(("unknown", "unknown"), |origin| {
         (origin.sender.as_str(), origin.chat_type.as_str())
     });
-    security.is_outbound_allowed(sender, dst_channel, chat_type, dst_channel, recipient)
+    // The notice is sent at the level of the run that sends it: callers pass
+    // a policy at that level.
+    security.is_outbound_allowed(
+        security.autonomy,
+        sender,
+        dst_channel,
+        chat_type,
+        dst_channel,
+        recipient,
+    )
 }
 
 /// Which of this tool's self-initiated messages is being delivered.
