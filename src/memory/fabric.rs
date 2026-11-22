@@ -279,11 +279,20 @@ impl MemoryFabric {
         self
     }
 
-    /// Recording is on and a recovery repository is available.
+    /// Recording is on and a recovery repository is available whose key was
+    /// not refused.
     pub(crate) fn records_recovery_terminal(&self) -> bool {
+        // A refused recovery key keeps chat on the unrecorded-recovery path
+        // (`RecoveryKeyUnavailable`: startup and chat continue). Its inputs
+        // were admitted without recovery, so their terminals are written
+        // without it too; choosing the recovery writer here would fail every
+        // terminal on the key it cannot load.
         self.event_recording.enabled
             && self.event_recording.record_user_messages
-            && self.memory.recovery_repository().is_some()
+            && self
+                .memory
+                .recovery_repository()
+                .is_some_and(|repository| !repository.recovery_authority_refused())
     }
 
     pub(crate) async fn with_ingress_recovery(

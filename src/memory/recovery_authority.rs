@@ -279,6 +279,10 @@ pub struct RecoveryTerminalConflict;
 /// initialize this capability. Rotation is an operator operation after drain.
 pub trait RecoveryRepository: Send + Sync {
     fn activate_recovery_authority(&self) -> anyhow::Result<String>;
+    /// Whether activation was refused for this handle. The refusal is sticky,
+    /// so admission and the terminal writer read the same answer: an input
+    /// admitted without recovery is finalized without it. Reads no file.
+    fn recovery_authority_refused(&self) -> bool;
     fn recovery_mac(
         &self,
         key_id: Option<&str>,

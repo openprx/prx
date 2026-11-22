@@ -838,6 +838,10 @@ pub(in crate::memory::sqlite) fn publish_in(
 }
 
 impl RecoveryRepository for SqliteMemory {
+    fn recovery_authority_refused(&self) -> bool {
+        self.recovery_unavailable.get().is_some()
+    }
+
     fn activate_recovery_authority(&self) -> anyhow::Result<String> {
         // Unavailable key material is sticky for this handle: never retried or
         // regenerated. A successful activation is not memoized, so every call
