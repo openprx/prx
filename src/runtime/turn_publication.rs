@@ -50,10 +50,18 @@ pub(crate) fn surface_policy(
         std::borrow::Cow::Borrowed(configured)
     };
     let excluded_names = tiering.always_exclude.iter().cloned().collect();
-    let direct_names = direct_tool_names(
+    let mut direct_names = direct_tool_names(
         &tiering,
         surface == crate::tools::capability::turn_state::TurnSurfaceKind::Interactive,
     );
+    if surface == crate::tools::capability::turn_state::TurnSurfaceKind::Server {
+        direct_names.extend(
+            ["sessions_send", "session_status"]
+                .into_iter()
+                .filter(|name| !tiering.always_exclude.iter().any(|excluded| excluded == name))
+                .map(str::to_owned),
+        );
+    }
     crate::tools::capability::catalog::SurfacePolicy {
         allowed_tools: None,
         excluded_names,

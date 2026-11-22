@@ -1947,6 +1947,8 @@ rejects writes when a PII detector is unavailable and reports
 
 Gateway turns register `sessions_send` and `session_status` beside
 `sessions_spawn`, `sessions_list` and `sessions_history`, sharing the same
-run registry and owner/agent scope used in terminal chat. Named targeted
+run registry and owner/agent scope used in terminal chat. Both session tools
+are directly published for gateway Main and named turns, subject to explicit
+operator exclusions and the existing execution gates. Named targeted
 agents at Full have the Full tool surface, including shell and file writes;
 Supervised and ReadOnly retain their existing restrictions.
