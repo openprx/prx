@@ -835,6 +835,33 @@ async fn run_console_runtime_turn(
         .effective_compaction(&provider_label, &turn_runtime.model);
     effective_compaction.config = decision.context.main_compaction().clone();
     crate::providers::context_window::trace_effective_compaction_resolution(&effective_compaction);
+    let live_scope =
+        if let (Some(store), Some(source)) = (state.mem.sync_store(), turn_envelope.source_message_event_id.clone()) {
+            let owner = turn_envelope.resolved_owner_id();
+            crate::runtime::blocking::spawn_blocking(move || store.live_scope(&owner, &source)).await??
+        } else {
+            None
+        };
+    let live = live_scope.map(|scope| {
+        let wait_secs = target
+            .and_then(|target| config_snapshot.agents.get(target.name.as_str()))
+            .map_or(config_snapshot.agent.approval_wait_secs, |agent| {
+                agent.approval_wait_secs
+            });
+        std::sync::Arc::new(crate::gateway::run_approvals::RunApprovalResolver {
+            scope,
+            streams: std::sync::Arc::clone(&state.rf_streams),
+            approvals: std::sync::Arc::clone(&state.rf_approvals),
+            cancellation: decision.cancellation.clone(),
+            wait_secs,
+        }) as std::sync::Arc<dyn crate::agent::live_frames::LiveTurn>
+    });
+    let live_frames = live.as_ref().map(|live| {
+        live.frames(
+            &turn_envelope,
+            &crate::agent::sanitize::known_tool_names(turn_runtime.tools_registry.as_ref()),
+        )
+    });
     let provider_started_at = chrono::Utc::now();
     let loop_result = run_turn(
         &mut history,
@@ -870,18 +897,22 @@ async fn run_console_runtime_turn(
             approval: None,
             approval_resolver: None,
             runtime_adapter: Some(crate::agent::turn_contracts::ToolLoopRuntimeAdapter {
+                live_frames,
                 guarded_delivery: false,
                 provider_trace: decision
                     .provider_trace
                     .as_ref()
                     .map(|(trace, _)| std::sync::Arc::clone(trace)),
                 events: None,
-                stream_provider: false,
+                stream_provider: live.is_some(),
                 tool_execution_service: None,
                 tool_execution_context: {
-                    let context = crate::tools::ToolExecutionContext::new(turn_envelope.clone(), "private")
+                    let mut context = crate::tools::ToolExecutionContext::new(turn_envelope.clone(), "private")
                         .with_dispatch_origin(crate::tools::DispatchOrigin::ModelTurn);
-                    if target.is_some() {
+                    context.live_turn = live
+                        .as_ref()
+                        .map(|live| crate::agent::live_frames::LiveTurnRef(std::sync::Arc::clone(live)));
+                    if target.is_some() && live.is_none() {
                         // Until MA-04 a targeted call that needs approval ends
                         // denied: no durable ledger route, no pending decision.
                         context.with_pending_approval_denied()
@@ -1550,9 +1581,39 @@ pub(super) async fn post_decision_approval(
     Path((session_id, decision_id)): Path<(String, String)>,
     axum::Extension(principal): axum::Extension<super::ApiPrincipal>,
     headers: HeaderMap,
-    Json(request): Json<DecisionApprovalRequest>,
+    Json(request): Json<serde_json::Value>,
 ) -> Response {
     let owner_authenticated = super::owner_authenticated(&state, &headers);
+    match rf_message::keyed_session(&state, &session_id).await {
+        Some(true) => {
+            if !owner_authenticated {
+                return super::capabilities::coded_error(
+                    StatusCode::UNAUTHORIZED,
+                    "auth_failed",
+                    "paired bearer required",
+                );
+            }
+            return crate::gateway::run_approvals::decide(
+                &state,
+                &principal.owner_id,
+                &session_id,
+                &decision_id,
+                request,
+            )
+            .await;
+        }
+        None => {
+            return super::capabilities::coded_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "storage_unavailable",
+                "session lookup failed",
+            );
+        }
+        Some(false) => {}
+    }
+    let Ok(request) = serde_json::from_value::<DecisionApprovalRequest>(request) else {
+        return json_error(StatusCode::UNPROCESSABLE_ENTITY, "invalid approval body");
+    };
     call_approval_action(
         state,
         session_id,
@@ -2944,6 +3005,8 @@ mod tests {
         let config = crate::config::new_shared(config);
         config.register_participant(PARTICIPANT.get_or_init(|| Arc::new(TestConfigParticipant)));
         AppState {
+            rf_streams: Default::default(),
+            rf_approvals: Default::default(),
             config,
             provider,
             model,

@@ -49,6 +49,7 @@ pub struct RestartCandidate {
 
 /// Transactional SQLite sync surface; callers offload synchronous store work.
 pub trait SyncStore: Send + Sync {
+    fn live_scope(&self, owner: &str, event: &str) -> anyhow::Result<Option<Value>>;
     fn notify(&self) -> Arc<Notify>;
     fn connect(&self, owner: &str) -> Arc<CancellationToken>;
     fn disconnect(&self, owner: &str, connection: &Arc<CancellationToken>);

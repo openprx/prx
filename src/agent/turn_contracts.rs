@@ -464,6 +464,7 @@ pub(crate) trait ToolLoopEventSink: Send + Sync {
 /// outcome remain inside `turn_engine::run_turn`.
 #[derive(Clone)]
 pub(crate) struct ToolLoopRuntimeAdapter {
+    pub live_frames: Option<Arc<dyn crate::agent::live_frames::LiveFrameSink>>,
     /// Interactive chat buffers provider text until response guards and outbound
     /// middleware accept it, so rendered text equals the persisted reply.
     pub guarded_delivery: bool,
@@ -570,6 +571,9 @@ pub trait ApprovalResolver: Send + Sync {
 pub(super) async fn emit_tool_loop_event(adapter: &ToolLoopRuntimeAdapter, event: ToolLoopEvent) -> Result<()> {
     // Anything reaching a user-visible sink is progress by definition.
     crate::agent::idle::beat(crate::agent::idle::ProgressKind::ChannelOutput);
+    if let Some(live) = &adapter.live_frames {
+        live.emit(&event);
+    }
     let Some(events) = adapter.events.as_ref() else {
         return Ok(());
     };

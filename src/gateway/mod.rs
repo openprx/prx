@@ -31,6 +31,8 @@ mod compat;
 mod h2_control;
 pub use h2_control::run_gateway_controlled;
 mod jobs;
+mod live_frames;
+mod run_approvals;
 pub(crate) mod turn_source;
 
 /// The reserved issuer component of every built-in (non-bearer) MCP origin.
@@ -972,6 +974,8 @@ fn gateway_channel_webhook_operation(channel: &str, action: &str) -> String {
 /// Shared state for all axum handlers
 #[derive(Clone)]
 pub struct AppState {
+    pub rf_streams: Arc<live_frames::StreamHub>,
+    pub rf_approvals: Arc<run_approvals::ApprovalHub>,
     /// Sole configuration generation owner used by every gateway path.
     pub config: crate::config::SharedConfig,
     /// Test fixtures' provider, served by `pin_turn_runtime` when a test
@@ -2273,6 +2277,8 @@ async fn run_gateway_inner(
     }));
 
     let state = AppState {
+        rf_streams: Default::default(),
+        rf_approvals: Default::default(),
         config: Arc::clone(&shared_config_for_reload),
         #[cfg(test)]
         provider: fixture_provider,
@@ -3136,6 +3142,7 @@ async fn run_gateway_chat_with_multimodal(
                             approval_resolver: None,
                             runtime_adapter: Some({
                                 crate::agent::turn_contracts::ToolLoopRuntimeAdapter {
+                                    live_frames: None,
                                     guarded_delivery: false,
                                     provider_trace: None,
                                     events: None,

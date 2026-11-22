@@ -536,6 +536,17 @@ pub use observability::*;
 mod autonomy;
 pub use autonomy::*;
 
+pub(super) const fn default_approval_wait_secs() -> u64 {
+    600
+}
+fn deserialize_approval_wait_secs<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    let value = <u64 as serde::Deserialize>::deserialize(deserializer)?;
+    if (1..=86400).contains(&value) {
+        Ok(value)
+    } else {
+        Err(serde::de::Error::custom("approval_wait_secs must be within 1..=86400"))
+    }
+}
 mod runtime;
 pub use runtime::*;
 

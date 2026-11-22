@@ -140,6 +140,8 @@ fn budget_webhook_state(
 ) -> (AppState, Arc<dyn Memory>) {
     let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).expect("test: sqlite memory"));
     let mut state = AppState {
+        rf_streams: Default::default(),
+        rf_approvals: Default::default(),
         config: crate::config::new_shared(config),
         mem: Arc::clone(&memory),
         tools_registry: Arc::new(tools),

@@ -572,6 +572,7 @@ struct H2ExecutionMetadata {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolExecutionContext {
+    pub(crate) live_turn: Option<crate::agent::live_frames::LiveTurnRef>,
     h2_metadata: Option<Box<H2ExecutionMetadata>>,
     pub(crate) dispatch_origin: DispatchOrigin,
     pub(crate) turn_surface: Option<Arc<admission::TurnSurface>>,
@@ -648,6 +649,7 @@ impl ToolExecutionContext {
             .or_else(|| envelope.task_id.clone())
             .unwrap_or_else(|| envelope.session_key.clone());
         Self {
+            live_turn: None,
             h2_metadata: None,
             dispatch_origin: DispatchOrigin::Internal,
             turn_surface: None,

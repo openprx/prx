@@ -30,6 +30,13 @@ impl AgentLimits {
 /// Configuration for a delegate sub-agent used by the `delegate` tool.
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DelegateAgentConfig {
+    /// rf approve-and-continue wait; Console approvals retain their own expiry.
+    #[serde(
+        default = "super::default_approval_wait_secs",
+        deserialize_with = "super::deserialize_approval_wait_secs"
+    )]
+    #[schemars(range(min = 1, max = 86400))]
+    pub approval_wait_secs: u64,
     #[serde(default)]
     pub limits: AgentLimits,
     /// Provider name (e.g. "ollama", "openrouter", "anthropic")
@@ -85,6 +92,7 @@ impl DelegateAgentConfig {
     #[must_use]
     pub const fn on(provider: String, model: String) -> Self {
         Self {
+            approval_wait_secs: super::default_approval_wait_secs(),
             provider,
             model,
             limits: AgentLimits {

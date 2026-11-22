@@ -167,6 +167,29 @@ pub(super) fn payload(conn: &Connection, h: &Header) -> anyhow::Result<Value> {
         .transpose()?
         .unwrap_or_default();
     match h.kind.as_str() {
+        "approval.pending" => {
+            let record = raw.get("record").ok_or(crate::memory::sync::SyncError::InvalidSource)?;
+            let authority: crate::security::approval_ledger::keys::RunCallAuthority = serde_json::from_value(
+                record
+                    .get("authority")
+                    .cloned()
+                    .ok_or(crate::memory::sync::SyncError::InvalidSource)?,
+            )?;
+            Ok(
+                json!({"approval_id":authority.call_id(),"tool":record.pointer("/rf/tool"),"summary":record.pointer("/rf/summary"),"expires_at":record.get("expires_at")}),
+            )
+        }
+        "approval.decided" => {
+            let mut value = json!({"approval_id":raw.get("approval_id"),"decision":raw.get("decision")});
+            if raw.get("decision").and_then(Value::as_str) == Some("denied") {
+                if let Some(cause) = raw.get("cause").filter(|v| !v.is_null()) {
+                    if let Some(object) = value.as_object_mut() {
+                        object.insert("cause".into(), cause.clone());
+                    }
+                }
+            }
+            Ok(value)
+        }
         "turn.deleted" => Ok(raw),
         "turn.failed" => Ok(
             json!({"reason":if kind=="turn.admission.failed" {"terminal_persistence_failed"} else if raw.get("provider_outcome").is_some_and(|value|!value.is_null()) {"provider_error"}else{"internal"},"retryable":false}),

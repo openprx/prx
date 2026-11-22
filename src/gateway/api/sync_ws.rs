@@ -39,7 +39,7 @@ pub(super) async fn ws(
     upgrade
         .max_message_size(4096)
         .max_frame_size(4096)
-        .on_upgrade(move |socket| super::sync_ws::serve(socket, store, principal.owner_id))
+        .on_upgrade(move |socket| super::sync_ws::serve(socket, store, principal.owner_id, state.rf_streams))
 }
 
 const MAX_FRAME: usize = 1024 * 1024;
@@ -92,13 +92,20 @@ fn decode(message: Message) -> Result<Client, u16> {
     }
 }
 
-pub(super) async fn serve(mut socket: WebSocket, store: Arc<dyn SyncStore>, owner: String) {
+pub(super) async fn serve(
+    mut socket: WebSocket,
+    store: Arc<dyn SyncStore>,
+    owner: String,
+    hub: Arc<crate::gateway::live_frames::StreamHub>,
+) {
+    let streams = hub.connect(&owner);
     let connection = store.connect(&owner);
     let shutdown = store.shutdown_signal();
-    let result = run(&mut socket, &store, &owner, &connection, &shutdown).await;
+    let result = run(&mut socket, &store, &owner, &connection, &shutdown, &streams).await;
     if let Err((code, reason)) = result {
         close(&mut socket, code, reason).await;
     }
+    hub.disconnect(&owner, &streams);
     store.disconnect(&owner, &connection);
 }
 
@@ -108,6 +115,7 @@ async fn run(
     owner: &str,
     connection: &tokio_util::sync::CancellationToken,
     shutdown: &tokio_util::sync::CancellationToken,
+    streams: &crate::gateway::live_frames::StreamQueue,
 ) -> Result<(), (u16, &'static str)> {
     let hello = tokio::select! {
         ()=connection.cancelled()=>return Err((4001,"superseded")),
@@ -192,6 +200,11 @@ async fn run(
                 tokio::task::yield_now().await;
             }
         }
+        if after >= initial.head {
+            if let Some(frame) = streams.pop() {
+                send(socket, &frame).await.map_err(|_| (1011, "stream send failed"))?;
+            }
+        }
         let ready = dirty && pending.is_none() && window.len() < WINDOW_EVENTS && bytes < WINDOW_BYTES;
         tokio::select! {
             biased;
@@ -216,6 +229,7 @@ async fn run(
                 send(socket,&json!({"type":"ping"})).await.map_err(|_|(1011,"send failed"))?;missed+=1;dirty=true;
             }
             ()=notify.notified()=>dirty=true,
+            ()=streams.notify.notified(), if after >= initial.head=>{},
             ()=std::future::ready(()),if ready=>{}
         }
     }

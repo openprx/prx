@@ -982,6 +982,8 @@ mod tests {
         std::fs::create_dir_all(&workspace).expect("test: workspace dir");
         let memory = SqliteMemory::new(&workspace).expect("test: sqlite memory");
         AppState {
+            rf_streams: Default::default(),
+            rf_approvals: Default::default(),
             config: crate::config::new_shared(config),
             provider: Arc::new(UnusedProvider),
             model: "test-model".into(),

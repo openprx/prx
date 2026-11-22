@@ -2,6 +2,9 @@
 use super::{ToolApprovalDecision, ToolApprovalRequest, ToolExecutionService};
 impl ToolExecutionService {
     pub(super) async fn resolve_ordinary_approval(&self, request: ToolApprovalRequest) -> (ToolApprovalDecision, bool) {
+        if let Some(live) = request.context.live_turn.clone() {
+            return (live.0.approve(request).await, false);
+        }
         if let Some(ledger) = request.context.approval_ledger.clone()
             && (request.descriptor.backend_name == "mcp_call"
                 || crate::security::approval_operation::grant_op_for_call(

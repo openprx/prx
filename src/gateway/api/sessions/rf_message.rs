@@ -262,7 +262,7 @@ pub(super) async fn post_keyed_session(
 /// only that route writes. `None` when the row could not be read; a backend
 /// without the lookup holds no such session. Ids outside the caller-key
 /// grammar are never looked up.
-async fn keyed_session(state: &AppState, session_id: &str) -> Option<bool> {
+pub(super) async fn keyed_session(state: &AppState, session_id: &str) -> Option<bool> {
     if !is_caller_session_key(session_id) {
         return Some(false);
     }

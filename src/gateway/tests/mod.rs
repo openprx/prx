@@ -682,6 +682,8 @@ pub(crate) async fn drive_disabled_engine_webhook_entry(workspace: &std::path::P
         },
     );
     let mut state = AppState {
+        rf_streams: Default::default(),
+        rf_approvals: Default::default(),
         config: crate::config::new_shared(config),
         provider,
         model: "test-model".into(),
@@ -750,6 +752,8 @@ fn webhook_test_state_at(provider: Arc<dyn Provider>, workspace: std::path::Path
     config.workspace_dir = workspace.clone();
     config.config_path = workspace.join("config.toml");
     AppState {
+        rf_streams: Default::default(),
+        rf_approvals: Default::default(),
         config: crate::config::new_shared(config),
         provider,
         model: "test-model".into(),
@@ -1153,6 +1157,8 @@ pub(crate) async fn drive_search_webhook_entry(mut config: Config, input: &str) 
     let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace)?);
     let registry = crate::agent::turn_tests::reachability::registry(&config, Arc::clone(&memory));
     let mut state = AppState {
+        rf_streams: Default::default(),
+        rf_approvals: Default::default(),
         config: crate::config::new_shared(config.clone()),
         provider,
         model,

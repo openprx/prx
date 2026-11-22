@@ -53,6 +53,20 @@ pub(crate) struct PendingCall {
     operation_match: OpIdMatch,
     risk: RiskLevel,
     expires_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) rf: Option<RfPending>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RfPending {
+    pub tool: String,
+    pub summary: String,
+    pub root_session: String,
+    pub root_run_id: String,
+    pub agent: String,
+    pub incarnation: String,
+    pub wait_secs: u64,
 }
 
 impl PendingCall {
@@ -61,6 +75,9 @@ impl PendingCall {
     }
     pub(crate) const fn subject(&self) -> &Subject {
         &self.subject
+    }
+    pub(crate) fn expires_at(&self) -> DateTime<Utc> {
+        self.expires_at
     }
     #[cfg(test)]
     pub(crate) fn source_event_id(&self) -> &str {
@@ -231,7 +248,7 @@ impl ApprovalLedgerPort<'_> {
         tool: &str,
         arguments: &serde_json::Value,
     ) -> anyhow::Result<PendingCall> {
-        self.record_pending_target(envelope, capability, tool, arguments, None)
+        self.record_pending_target(envelope, capability, tool, arguments, None, None)
             .await
     }
 
@@ -246,8 +263,52 @@ impl ApprovalLedgerPort<'_> {
             fingerprint: entry.fingerprint,
             generation: entry.generation,
         };
-        self.record_pending_target(envelope, &capability, &entry.root, arguments, Some(entry))
+        self.record_pending_target(envelope, &capability, &entry.root, arguments, Some(entry), None)
             .await
+    }
+
+    pub(crate) async fn record_pending_rf(
+        &self,
+        envelope: &crate::runtime::envelope::RuntimeEnvelope,
+        entry: &crate::tools::capability::catalog::CapabilityEntry,
+        arguments: &serde_json::Value,
+        rf: RfPending,
+    ) -> anyhow::Result<PendingCall> {
+        let capability = crate::tools::capability::contract::CapabilityRef {
+            id: entry.id.clone(),
+            fingerprint: entry.fingerprint,
+            generation: entry.generation,
+        };
+        self.record_pending_target(envelope, &capability, &entry.root, arguments, Some(entry), Some(rf))
+            .await
+    }
+
+    pub(crate) async fn record_rf_decision(&self, pending: &PendingCall, decision: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(pending.rf.is_some(), "not an rf approval");
+        let source = self
+            .source(
+                pending,
+                &pending.subject.owner_id,
+                pending
+                    .subject
+                    .session_key
+                    .as_deref()
+                    .context("approval session missing")?,
+            )
+            .await?;
+        let cause = match decision {
+            "denied" => Some("owner_denied"),
+            _ => None,
+        };
+        let value = serde_json::json!({"approval_id":pending.authority.call_id(),"run_id":pending.authority.run_id,"decision":decision,"cause":cause});
+        self.write(
+            &source,
+            &format!("rf-decision:{}", pending.authority.call_id()),
+            "tool.approval.resolved",
+            &value,
+        )
+        .await?;
+        Ok(())
     }
 
     async fn record_pending_target(
@@ -257,6 +318,7 @@ impl ApprovalLedgerPort<'_> {
         tool: &str,
         arguments: &serde_json::Value,
         entry: Option<&crate::tools::capability::catalog::CapabilityEntry>,
+        rf: Option<RfPending>,
     ) -> anyhow::Result<PendingCall> {
         // Canonical ingress envelopes may derive their owner instead of
         // storing an override. The durable source below must still match the
@@ -381,7 +443,9 @@ impl ApprovalLedgerPort<'_> {
             operation,
             operation_match,
             risk,
-            expires_at: Utc::now() + chrono::Duration::minutes(4),
+            expires_at: Utc::now()
+                + chrono::Duration::seconds(rf.as_ref().map_or(240, |rf| i64::try_from(rf.wait_secs).unwrap_or(600))),
+            rf,
         };
         let signed = self.sign(b"call.pending", pending)?;
         let event = self

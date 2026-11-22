@@ -9,6 +9,8 @@ async fn metrics_endpoint_renders_prometheus_output() {
 
     let observer: Arc<dyn crate::observability::Observer> = prom;
     let state = AppState {
+        rf_streams: Default::default(),
+        rf_approvals: Default::default(),
         config: crate::config::new_shared(Config::default()),
         provider: Arc::new(MockProvider::default()),
         model: "test-model".into(),
@@ -66,6 +68,8 @@ async fn s2_5_p1c_metrics_endpoint_exposes_chat_when_observer_noop() {
     crate::observability::chat_metrics::inc_dispatch_drop("s2_5_p1c_noop_drop");
 
     let state = AppState {
+        rf_streams: Default::default(),
+        rf_approvals: Default::default(),
         config: crate::config::new_shared(Config::default()),
         provider: Arc::new(MockProvider::default()),
         model: "test-model".into(),

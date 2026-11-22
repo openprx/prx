@@ -150,6 +150,8 @@ async fn platform_real_adapters_send_only_to_owned_tls_endpoint() {
 
 fn platform_webhook_state(provider: Arc<dyn Provider>) -> AppState {
     AppState {
+        rf_streams: Default::default(),
+        rf_approvals: Default::default(),
         whatsapp: Some(Arc::new(WhatsAppChannel::new(
             "wa-token".into(),
             "endpoint-id".into(),

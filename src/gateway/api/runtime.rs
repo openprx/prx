@@ -496,6 +496,8 @@ mod tests {
         config.workspace_dir = workspace.to_path_buf();
         let memory = SqliteMemory::new(workspace).expect("test: sqlite memory");
         AppState {
+            rf_streams: Default::default(),
+            rf_approvals: Default::default(),
             config: crate::config::new_shared(config),
             provider: Arc::new(GatedProvider {
                 gate: Arc::new(tokio::sync::Semaphore::new(usize::from(u8::MAX))),

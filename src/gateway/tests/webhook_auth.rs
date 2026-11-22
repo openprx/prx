@@ -10,6 +10,8 @@ async fn webhook_token_hash_rejects_missing_header() {
     let secret = generate_test_secret();
 
     let state = AppState {
+        rf_streams: Default::default(),
+        rf_approvals: Default::default(),
         config: crate::config::new_shared(Config::default()),
         provider,
         model: "test-model".into(),
@@ -64,6 +66,8 @@ async fn webhook_token_hash_rejects_invalid_header() {
     let wrong_secret = generate_test_secret();
 
     let state = AppState {
+        rf_streams: Default::default(),
+        rf_approvals: Default::default(),
         config: crate::config::new_shared(Config::default()),
         provider,
         model: "test-model".into(),
@@ -147,6 +151,8 @@ async fn webhook_signature_rejects_missing_header() {
     let secret = generate_test_secret();
 
     let state = AppState {
+        rf_streams: Default::default(),
+        rf_approvals: Default::default(),
         config: crate::config::new_shared(Config::default()),
         provider,
         model: "test-model".into(),
@@ -231,6 +237,8 @@ async fn nextcloud_talk_webhook_returns_not_found_when_not_configured() {
     let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
     let state = AppState {
+        rf_streams: Default::default(),
+        rf_approvals: Default::default(),
         config: crate::config::new_shared(Config::default()),
         provider,
         model: "test-model".into(),
@@ -292,6 +300,8 @@ async fn nextcloud_talk_webhook_rejects_invalid_signature() {
     let invalid_signature = "deadbeef";
 
     let state = AppState {
+        rf_streams: Default::default(),
+        rf_approvals: Default::default(),
         config: crate::config::new_shared(Config::default()),
         provider,
         model: "test-model".into(),

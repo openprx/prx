@@ -512,6 +512,8 @@ fn app_state_is_clone() {
 /// for exercising the gateway authorization helpers in isolation.
 pub(super) fn authz_test_state(config: Config) -> AppState {
     AppState {
+        rf_streams: Default::default(),
+        rf_approvals: Default::default(),
         config: crate::config::new_shared(config),
         provider: Arc::new(MockProvider::default()),
         model: "test-model".into(),
@@ -636,6 +638,8 @@ fn turn_runtime_swap_keeps_in_flight_generation_pinned_and_is_reversible() {
 #[tokio::test]
 async fn metrics_endpoint_returns_hint_when_prometheus_is_disabled() {
     let state = AppState {
+        rf_streams: Default::default(),
+        rf_approvals: Default::default(),
         config: crate::config::new_shared(Config::default()),
         provider: Arc::new(MockProvider::default()),
         model: "test-model".into(),

@@ -409,6 +409,8 @@ async fn webhook_autosave_stores_distinct_keys_per_request() {
     config.workspace_dir = workspace.path().to_path_buf();
 
     let mut state = AppState {
+        rf_streams: Default::default(),
+        rf_approvals: Default::default(),
         config: crate::config::new_shared(config),
         provider,
         model: "test-model".into(),
@@ -490,6 +492,8 @@ async fn webhook_autosave_skips_group_reply_target() {
     config.workspace_dir = workspace.path().to_path_buf();
 
     let mut state = AppState {
+        rf_streams: Default::default(),
+        rf_approvals: Default::default(),
         config: crate::config::new_shared(config),
         provider,
         model: "test-model".into(),
@@ -588,6 +592,8 @@ async fn webhook_autosave_excludes_live_input_from_prompt() {
     config.workspace_dir = workspace.path().to_path_buf();
 
     let mut state = AppState {
+        rf_streams: Default::default(),
+        rf_approvals: Default::default(),
         config: crate::config::new_shared(config),
         provider,
         model: "test-model".into(),

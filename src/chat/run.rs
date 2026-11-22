@@ -4277,6 +4277,7 @@ Retry with a compatible model: /provider {shown} <model>",
                                 approval_resolver: None,
                                 // Supervised calls ask on the terminal (CR-2), as on the reducer path.
                                 runtime_adapter: chat_turn_binding.as_ref().map(|binding| crate::agent::turn_contracts::ToolLoopRuntimeAdapter {
+                                    live_frames: None,
                                     guarded_delivery: true,
                                     provider_trace: binding.retained_provider_trace(),
                                     events: Some(Arc::clone(&inline_compaction) as Arc<dyn crate::agent::turn_contracts::ToolLoopEventSink>),

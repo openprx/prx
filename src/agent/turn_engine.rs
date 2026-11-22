@@ -1355,6 +1355,9 @@ async fn run_turn_unguarded(
             !runtime_adapter.stream_provider || crate::runtime::experiment_stage::current().is_none(),
             "experiment solver streaming has no admitted physical accounting adapter"
         );
+        if let Some(live) = &runtime_adapter.live_frames {
+            live.thinking();
+        }
         let chat_result = if runtime_adapter.stream_provider {
             parameter_capture
                 .scope(run_streaming_provider_turn(

@@ -763,6 +763,7 @@ impl ChildProviderBinding {
             .map(|caller_run| caller_run.root_run_id().to_owned());
         if let Some(receipt) = receipt {
             let mut execution = receipt.execution_context(proof.as_ref())?;
+            execution.live_turn = caller.context().live_turn.clone();
             if root_run_id.is_some() {
                 execution.envelope.root_run_id = root_run_id;
             }
@@ -801,9 +802,10 @@ impl ChildProviderBinding {
         envelope.config_generation_id = Some(proof.config_generation_id());
         envelope.config_source_revision = Some(proof.config_source_revision().to_owned());
         envelope.agent_partition = inherited_partition(proof.memory_scope().agent_partition.as_ref());
-        let execution = crate::tools::ToolExecutionContext::new(envelope, proof.policy_chat_type())
+        let mut execution = crate::tools::ToolExecutionContext::new(envelope, proof.policy_chat_type())
             .with_dispatch_origin(crate::tools::DispatchOrigin::ModelTurn)
             .with_incoming_child(proof.as_ref())?;
+        execution.live_turn = caller.context().live_turn.clone();
         Ok((proof, execution))
     }
 }

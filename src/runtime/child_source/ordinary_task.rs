@@ -236,9 +236,10 @@ impl OrdinaryTaskSegments {
         envelope.run_id = Some(run);
         envelope.task_id = Some(self.authority.proof.run_id().to_owned());
         envelope.source_message_event_id = proof.source_event_id().map(str::to_owned);
-        let execution = ToolExecutionContext::new(envelope, proof.policy_chat_type())
+        let mut execution = ToolExecutionContext::new(envelope, proof.policy_chat_type())
             .with_dispatch_origin(crate::tools::DispatchOrigin::ModelTurn)
             .with_incoming_child(proof.as_ref())?;
+        execution.live_turn = self.authority.execution.live_turn.clone();
         self.next = following;
         self.previous_input = next_previous;
         Ok((proof, execution))

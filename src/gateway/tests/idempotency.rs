@@ -394,6 +394,8 @@ async fn webhook_records_gateway_message_events() {
     let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
 
     let mut state = AppState {
+        rf_streams: Default::default(),
+        rf_approvals: Default::default(),
         config: crate::config::new_shared(config),
         provider,
         model: "test-model".into(),
@@ -712,6 +714,8 @@ async fn s2_5_p1c_metrics_endpoint_exposes_chat_counters() {
 
     let observer: Arc<dyn crate::observability::Observer> = prom;
     let state = AppState {
+        rf_streams: Default::default(),
+        rf_approvals: Default::default(),
         config: crate::config::new_shared(Config::default()),
         provider: Arc::new(MockProvider::default()),
         model: "test-model".into(),

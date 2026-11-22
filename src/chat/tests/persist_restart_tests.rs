@@ -213,6 +213,7 @@ async fn persist_completed_chat(
             approval: None,
             approval_resolver: None,
             runtime_adapter: Some(crate::agent::turn_contracts::ToolLoopRuntimeAdapter {
+                live_frames: None,
                 guarded_delivery: false,
                 provider_trace: binding.retained_provider_trace(),
                 events: None,

@@ -292,6 +292,7 @@ impl ChannelAdmittedTurn {
                 .with_approval_ledger(self.service.execution_approval_ledger());
         execution.chat_id = self.envelope.recipient.clone().unwrap_or_default();
         crate::agent::turn_contracts::ToolLoopRuntimeAdapter {
+            live_frames: None,
             guarded_delivery: false,
             provider_trace: Some(Arc::clone(&self.trace)),
             events: None,

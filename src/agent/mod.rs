@@ -15,6 +15,7 @@ pub(crate) mod entry;
 pub(crate) mod execution_policy;
 pub(crate) mod history;
 pub mod idle;
+pub(crate) mod live_frames;
 pub mod memory_loader;
 pub mod prompt;
 pub(crate) mod prompt_cache_metrics;

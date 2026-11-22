@@ -62,6 +62,8 @@ fn production_mcp_app_state(
     let participant: Arc<dyn crate::config::ConfigGenerationParticipant> = owner.clone();
     manager.register_participant(&participant);
     let state = AppState {
+        rf_streams: Default::default(),
+        rf_approvals: Default::default(),
         config: manager,
         provider,
         model,

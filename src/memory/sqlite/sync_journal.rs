@@ -199,6 +199,32 @@ pub(super) fn event_written(conn: &Connection, event: &crate::memory::MessageEve
     let Some(mut h) = event_header(conn, &event.event_id, "turn.appended")? else {
         return Ok(());
     };
+    if event.event_type == "approval.call.pending" || event.event_type == "tool.approval.resolved" {
+        let raw: serde_json::Value = event
+            .raw_payload_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?
+            .unwrap_or_default();
+        let kind =
+            if event.event_type == "approval.call.pending" && raw.pointer("/record/rf").is_some_and(|v| !v.is_null()) {
+                Some("approval.pending")
+            } else if event.event_type == "tool.approval.resolved" && raw.get("approval_id").is_some() {
+                Some("approval.decided")
+            } else {
+                None
+            };
+        if let Some(kind) = kind {
+            h.kind = kind.into();
+            if kind == "approval.decided" {
+                if let Some(id) = raw.get("approval_id").and_then(serde_json::Value::as_str) {
+                    h.event_id = format!("approval-decided:{id}");
+                }
+            }
+            append(conn, &h)?;
+        }
+        return Ok(());
+    }
     // Root user rows are appended by admit, after their attempt is inserted.
     if h.parent_run_id.is_some() {
         let first: bool = conn.query_row(
@@ -329,6 +355,18 @@ pub(super) fn prune(conn: &Connection) -> anyhow::Result<()> {
 }
 
 impl SyncStore for SqliteMemory {
+    fn live_scope(&self, owner: &str, event: &str) -> anyhow::Result<Option<serde_json::Value>> {
+        let reader = self.pool.read()?;
+        let conn = reader.connection()?;
+        let Some(h) = event_header(&conn, event, "stream")? else {
+            return Ok(None);
+        };
+        anyhow::ensure!(h.owner == owner, crate::memory::sync::SyncError::InvalidSource);
+        Ok(Some(
+            serde_json::json!({"session":h.session,"agent":h.agent,"incarnation":h.incarnation,"run_id":h.run_id}),
+        ))
+    }
+
     fn notify(&self) -> Arc<Notify> {
         Arc::clone(&self.sync_runtime.notify)
     }

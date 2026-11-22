@@ -58,6 +58,8 @@ fn app_state_with_memory(config: Config, memory: Arc<dyn crate::memory::Memory>)
     let workspace = config.workspace_dir.clone();
     std::fs::create_dir_all(&workspace).expect("test: workspace dir");
     AppState {
+        rf_streams: Default::default(),
+        rf_approvals: Default::default(),
         config: crate::config::new_shared(config),
         provider: Arc::new(UnusedProvider),
         model: "test-model".into(),

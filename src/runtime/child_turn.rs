@@ -242,13 +242,24 @@ impl ChildSegmentTurn {
     }
 
     pub(crate) fn adapter(&self) -> ToolLoopRuntimeAdapter {
+        let live = self.execution.live_turn.clone();
+        let mut context = self.execution.clone();
+        if live.is_some() {
+            context.approval_ledger = self.service.execution_approval_ledger();
+        }
         ToolLoopRuntimeAdapter {
+            live_frames: live.map(|live| {
+                live.0.frames(
+                    &self.execution.envelope,
+                    &crate::agent::sanitize::known_tool_names(self.service.registry.as_ref()),
+                )
+            }),
             guarded_delivery: false,
             provider_trace: Some(Arc::clone(&self.provider_trace)),
             events: None,
             stream_provider: false,
             tool_execution_service: None,
-            tool_execution_context: self.execution.clone(),
+            tool_execution_context: context,
             allowed_tool_names: None,
         }
     }

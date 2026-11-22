@@ -727,6 +727,7 @@ impl AdmittedTurn {
 
     pub(crate) fn adapter(&self) -> crate::agent::turn_contracts::ToolLoopRuntimeAdapter {
         crate::agent::turn_contracts::ToolLoopRuntimeAdapter {
+            live_frames: None,
             guarded_delivery: false,
             provider_trace: None,
             events: None,

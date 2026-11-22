@@ -582,6 +582,8 @@ mod tests {
         let workspace = config.workspace_dir.clone();
         let memory = SqliteMemory::new(&workspace).expect("test: sqlite memory");
         AppState {
+            rf_streams: Default::default(),
+            rf_approvals: Default::default(),
             config: crate::config::new_shared(config),
             provider: Arc::new(UnusedProvider),
             model: "test-model".into(),

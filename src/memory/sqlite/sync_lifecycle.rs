@@ -117,7 +117,7 @@ pub(super) fn cancel_approvals(conn: &Connection, root: &Header, workspace: &str
         let mut h = root.clone();
         h.kind = "approval.decided".into();
         h.source_ref = format!("approval-cancel:{id}");
-        h.event_id = format!("approval-cancel:{id}");
+        h.event_id = format!("approval-decided:{id}");
         append(conn, &h)?;
     }
     Ok(())

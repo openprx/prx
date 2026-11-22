@@ -392,6 +392,8 @@ fn scratch_config() -> Config {
 /// Build a minimal `AppState` for gateway integration tests.
 fn build_test_app_state(overrides: TestAppStateOverrides) -> AppState {
     AppState {
+        rf_streams: Default::default(),
+        rf_approvals: Default::default(),
         config: new_shared(scratch_config()),
         model: "test-model".into(),
         temperature: 0.0,

@@ -13,7 +13,7 @@ use axum::{
 
 mod agent_erasure;
 mod agents;
-mod capabilities;
+pub(in crate::gateway) mod capabilities;
 mod causal;
 mod channels;
 mod chat_sessions;

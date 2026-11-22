@@ -78,7 +78,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 // The detector's own clock. `tokio::time::Instant` is the monotonic clock that
 // `tokio::time::sleep` — the watchdog's only way of waiting — is measured
@@ -349,6 +349,7 @@ impl ProgressKind {
 /// wedged one.
 #[derive(Debug)]
 pub struct ProgressBeat {
+    approval_waiters: AtomicUsize,
     origin: Instant,
     /// Milliseconds since [`Self::origin`] at the last recorded event.
     last_ms: AtomicU64,
@@ -366,6 +367,7 @@ pub struct ProgressBeat {
 impl ProgressBeat {
     fn new(parent: Option<Arc<Self>>) -> Self {
         Self {
+            approval_waiters: AtomicUsize::new(0),
             origin: Instant::now(),
             last_ms: AtomicU64::new(0),
             events: AtomicU64::new(0),
@@ -402,6 +404,9 @@ impl ProgressBeat {
     /// polling it costs nothing and can never disturb the turn it observes.
     #[must_use]
     pub fn idle_for(&self) -> Duration {
+        if self.approval_waiters.load(Ordering::Relaxed) > 0 {
+            return Duration::ZERO;
+        }
         let last = Duration::from_millis(self.last_ms.load(Ordering::Relaxed));
         self.origin.elapsed().saturating_sub(last)
     }
@@ -644,6 +649,28 @@ where
             continue;
         };
         return Err(terminate(reason, threshold, label, cancel, &beat, started).await);
+    }
+}
+
+/// Pause this turn and its waiters only while an rf approval is pending.
+pub(crate) struct ApprovalWait(Option<Arc<ProgressBeat>>);
+pub(crate) fn pause_for_approval() -> ApprovalWait {
+    let beat = current_beat();
+    let mut current = beat.as_deref();
+    while let Some(beat) = current {
+        beat.approval_waiters.fetch_add(1, Ordering::Relaxed);
+        current = beat.parent.as_deref();
+    }
+    ApprovalWait(beat)
+}
+impl Drop for ApprovalWait {
+    fn drop(&mut self) {
+        let mut current = self.0.as_deref();
+        while let Some(beat) = current {
+            beat.stamp(ProgressKind::ChannelOutput);
+            beat.approval_waiters.fetch_sub(1, Ordering::Relaxed);
+            current = beat.parent.as_deref();
+        }
     }
 }
 
