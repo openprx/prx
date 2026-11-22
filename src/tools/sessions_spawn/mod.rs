@@ -154,10 +154,6 @@ const PROCESS_OUTPUT_DRAIN_TIMEOUT_SECS: u64 = 1;
 const PROCESS_REAP_TIMEOUT_SECS: u64 = 5;
 const PROCESS_TERMINATION_REQUEST_TIMEOUT_SECS: u64 = 5;
 const MAX_SUBPROCESS_OUTPUT: u64 = 10 * 1024 * 1024;
-const DEFAULT_SUB_AGENT_SYSTEM_PROMPT: &str = "\
-You are a sub-agent handling a specific delegated task. \
-Complete the task thoroughly and report results concisely. \
-Focus only on the assigned task; do not ask clarifying questions.";
 const PROCESS_MEMORY_STRATEGY_SHARED: &str = "shared_fabric";
 const PROCESS_MEMORY_STRATEGY_ISOLATED: &str = "isolated_private";
 const PROCESS_MEMORY_STRATEGY_HYBRID: &str = "hybrid";

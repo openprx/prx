@@ -170,11 +170,12 @@ impl OperatorChildPublication {
             Arc::ptr_eq(&registry, &parent.registry),
             "operator task registry differs from source"
         );
-        // A named agent runs at its own configured level; an ordinary child
-        // at the operator's.
+        // Full operators start Full children; below Full a named agent
+        // retains its configured level.
         let level = crate::security::agent_level::named_child_level(
             &parent.generation.effective,
             task.logical_scope().agent_id.as_deref(),
+            parent.security.autonomy,
         )
         .unwrap_or(parent.security.autonomy);
         let security = if level == parent.security.autonomy {
@@ -291,8 +292,8 @@ impl OperatorChildPublication {
 }
 
 impl OperatorChildPublication {
-    /// `level` is the level the process child runs at: a named agent's
-    /// configured level or the operator's, sealed into the publication.
+    /// `level` is the centrally derived child level, including Full
+    /// inheritance from the operator, sealed into the publication.
     pub(crate) fn bind_process_publication(
         &self,
         id: uuid::Uuid,

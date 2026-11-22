@@ -39,6 +39,23 @@ pub(crate) fn build_runtime_system_prompt(
     )
 }
 
+/// Build every delegated child's execution contract with the same runtime
+/// sections as chat, followed by its role and tool-evidence requirements.
+/// The caller supplies the child's workspace and sealed autonomy in `config`;
+/// the runtime safety section renders the Full sentence exactly once.
+pub(crate) fn build_delegated_system_prompt(
+    config: &Config,
+    model_name: &str,
+    skills: &[crate::skills::Skill],
+    native_tools: bool,
+    delegated_prompt: &str,
+) -> String {
+    let runtime_prompt = build_runtime_system_prompt(config, model_name, skills, native_tools);
+    format!(
+        "{runtime_prompt}\n\n## Delegated Agent Instructions\n\n{delegated_prompt}\n\n## Execution Integrity\n\nWhen the delegated task requires reading, writing, running, or verifying files, perform those operations with the provided tools before reporting completion. Never claim that a file, command, or check succeeded unless the corresponding tool actually produced the result."
+    )
+}
+
 /// The system prompt of an interactive chat session. In a build whose chat
 /// turns run through the reducer driver (`terminal-tui`), every assistant
 /// turn is replayed with its tool evidence, so the prompt states what the

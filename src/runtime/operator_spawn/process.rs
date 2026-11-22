@@ -281,6 +281,7 @@ impl OperatorProcessLaunch {
             crate::security::agent_level::named_child_level(
                 &source.generation.effective,
                 self.scope.agent_id.as_deref(),
+                source.security.autonomy,
             )
             .unwrap_or(source.security.autonomy),
         )?;

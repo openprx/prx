@@ -29,6 +29,7 @@ pub(super) async fn operator_process_publication(
         crate::security::agent_level::named_child_level(
             &snapshots.generation.effective,
             authority.logical_scope().agent_id.as_deref(),
+            snapshots.generation.effective.autonomy.level,
         ),
         &snapshots.parent,
         &snapshots.catalog,

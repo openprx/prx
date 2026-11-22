@@ -68,9 +68,9 @@ pub(crate) struct ChildCapabilityManifest {
     pub parent_authority_id: ParentAuthorityId,
     pub allowed: BTreeSet<CapabilityRef>,
     pub authority: AuthorityEnvelope,
-    /// The level derived from a named agent's configuration when the child
-    /// is that agent, bound into the seal. Only a child carrying it may run
-    /// above its parent, and then exactly at it.
+    /// The centrally derived child level override, bound into the seal.
+    /// Full parents keep children Full; below Full a named agent may run
+    /// at its configured level, including above its parent.
     pub agent_level: Option<AutonomyLevel>,
     pub catalog_generation: CatalogGeneration,
     pub seal: [u8; 32],
@@ -81,13 +81,13 @@ pub(crate) struct ChildCapabilityManifest {
 pub enum ChildLevel {
     /// An ordinary child runs at its parent's effective level.
     Parent,
-    /// A named-agent child runs at the level derived from that agent's
-    /// configuration (`security::agent_level::named_child_level`).
+    /// A child runs at the override centrally derived from the parent's
+    /// effective level and the named agent's configuration.
     NamedAgent(AutonomyLevel),
 }
 
 impl ChildLevel {
-    /// `NamedAgent` for a configured named agent, else `Parent`.
+    /// `NamedAgent` for a centrally derived override, else `Parent`.
     pub(crate) fn from_named(level: Option<AutonomyLevel>) -> Self {
         level.map_or(Self::Parent, Self::NamedAgent)
     }

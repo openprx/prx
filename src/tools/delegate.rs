@@ -747,10 +747,14 @@ impl Tool for DelegateTool {
         let child_source = if let Some(caller) = caller.as_ref()
             && let Some(publication) = &caller.context().ordinary_child_publication
         {
-            // The named agent runs at its own configured level, sealed into
-            // the child scope.
+            // Full parents keep the named child Full; below Full the
+            // configured agent level is sealed into its scope.
             let level = crate::tools::capability::child::ChildLevel::from_named(
-                crate::security::agent_level::named_child_level(&publication.generation().effective, Some(agent_name)),
+                crate::security::agent_level::named_child_level(
+                    &publication.generation().effective,
+                    Some(agent_name),
+                    publication.level(),
+                ),
             );
             let publication = publication.with_child_level(level)?;
             let caller = caller.with_ordinary_publication(publication.clone())?;
@@ -1439,7 +1443,7 @@ impl DelegateLoopResources {
             let turn = &mut child_turn;
             turn.project_history(history.len() + 1);
 
-            let prompt = turn.prompt_with_skills(&role_prompt)?;
+            let prompt = turn.system_prompt(&child_config, &role_prompt)?;
             if let Some(system) = history.first_mut().filter(|message| message.role == "system") {
                 *system = ChatMessage::system(prompt);
             } else if !prompt.is_empty() {

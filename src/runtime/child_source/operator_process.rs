@@ -139,6 +139,7 @@ impl OperatorProcessAuthority {
             crate::security::agent_level::named_child_level(
                 &source.generation.effective,
                 self.initial_scope.agent_id.as_deref(),
+                security.autonomy,
             ),
             &source.parent,
             &source.catalog,

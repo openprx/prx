@@ -1468,6 +1468,20 @@ reduced depth remain bound by the seal. An empty child set cannot derive another
 strict subset. This does not override the explicit agentic `delegate` configuration
 requirements above or bypass the normal launch and execution gates.
 
+Task and process children use the same runtime system-prompt structure as the
+parent: workspace, model, available skills, native-tool guidance and safety,
+followed by the delegated agent's role and execution-integrity instructions.
+The task remains the first user message, with scoped recalled context applied
+as before. The Full autonomy sentence is rendered once for Full children.
+
+A Full spawning turn starts every child at Full, including a named agent whose
+configured level is lower. Below Full, an unnamed child keeps its parent's
+level and a named child uses its configured level (or Main's when unset).
+The default child model and provider come from the spawning turn's current
+selection, including terminal switches. Explicit request overrides take priority;
+a named agent's model and provider apply only when that agent is requested.
+These rules apply to individual spawns, batch members and delegates.
+
 ### Child depth
 
 Children cannot spawn or delegate, at any autonomy level, in task or process

@@ -1,17 +1,16 @@
 use super::delegation;
 use super::{
-    AllowedToolProxy, AnnounceOrigin, DEFAULT_SUB_AGENT_SYSTEM_PROMPT, HistoryEntry, MemoryScope, OutboundNotice,
-    OwnerLossReason, ProcessFinalization, ProcessModeRunSeed, ProcessRunControl, ProcessWorkerOutcome,
-    SPAWN_EXECUTION_CONTEXT, STEER_CHANNEL_CAPACITY, SessionsSpawnTool, SpawnExecutionContext, SpawnRecordCodes,
-    SpawnScope, SubAgentRun, SubAgentStatus, TaskRunControl, TerminationCause, boxed_spawn_field,
-    commit_process_terminal_state, current_spawn_execution_context, deliver_or_withhold_notice,
-    exited_without_result_reason, format_announce_message, new_process_mode_run, normalize_process_memory_strategy,
-    parse_memory_scope, parse_spawn_scope, process_terminal, record_owner_loss_terminal, record_spawn_request_event,
-    record_spawn_result_event, record_spawn_result_event_keyed, refresh_tools_for_explicit_allowlist,
-    register_killable_process_run, resolve_tools_for_agent, resolve_worker_workspace_root, run_sub_agent_process,
-    run_sub_agent_task, running_run_count, spawn_event_scope, spawn_lineage, spawn_session_key, spawn_started_text,
-    sub_agent_reported_failure, task_failure_reason, task_terminal, termination_cause, watch_process_mode_monitor,
-    watch_task_mode_monitor,
+    AllowedToolProxy, AnnounceOrigin, HistoryEntry, MemoryScope, OutboundNotice, OwnerLossReason, ProcessFinalization,
+    ProcessModeRunSeed, ProcessRunControl, ProcessWorkerOutcome, SPAWN_EXECUTION_CONTEXT, STEER_CHANNEL_CAPACITY,
+    SessionsSpawnTool, SpawnExecutionContext, SpawnRecordCodes, SpawnScope, SubAgentRun, SubAgentStatus,
+    TaskRunControl, TerminationCause, boxed_spawn_field, commit_process_terminal_state,
+    current_spawn_execution_context, deliver_or_withhold_notice, exited_without_result_reason, format_announce_message,
+    new_process_mode_run, normalize_process_memory_strategy, parse_memory_scope, parse_spawn_scope, process_terminal,
+    record_owner_loss_terminal, record_spawn_request_event, record_spawn_result_event, record_spawn_result_event_keyed,
+    refresh_tools_for_explicit_allowlist, register_killable_process_run, resolve_tools_for_agent,
+    resolve_worker_workspace_root, run_sub_agent_process, run_sub_agent_task, running_run_count, spawn_event_scope,
+    spawn_lineage, spawn_session_key, spawn_started_text, sub_agent_reported_failure, task_failure_reason,
+    task_terminal, termination_cause, watch_process_mode_monitor, watch_task_mode_monitor,
 };
 use crate::providers;
 use crate::runtime::child_source::publication::ChildDelegation;
@@ -174,9 +173,13 @@ impl SessionsSpawnTool {
             Some(caller) => match caller.context().ordinary_child_publication.as_ref() {
                 Some(publication) => {
                     let config = &publication.generation().effective;
-                    // A named agent runs at its own configured level, sealed
-                    // into its scope; an ordinary child keeps the caller's.
-                    let named = crate::security::agent_level::named_child_level(config, requested_agent_name(args));
+                    // Full parents keep every child Full; below Full a named
+                    // agent retains its configured level.
+                    let named = crate::security::agent_level::named_child_level(
+                        config,
+                        requested_agent_name(args),
+                        publication.level(),
+                    );
                     let full = named.unwrap_or_else(|| publication.level()) == crate::security::AutonomyLevel::Full;
                     let served = self.child_serves_delegator(args, config, full)?;
                     let (selected, delegation) = publication.select_for_spawn(caller.context(), recursive, served)?;
@@ -217,8 +220,12 @@ impl SessionsSpawnTool {
         // The level the child runs at, recorded on `task.spawned`.
         let child_level = ordinary_publication.map_or_else(
             || {
-                crate::security::agent_level::named_child_level(child_model_config, requested_agent_name(args))
-                    .unwrap_or(launch_security.autonomy)
+                crate::security::agent_level::named_child_level(
+                    child_model_config,
+                    requested_agent_name(args),
+                    launch_security.autonomy,
+                )
+                .unwrap_or(launch_security.autonomy)
             },
             crate::runtime::child_source::publication::OrdinaryChildPublication::level,
         );
@@ -1525,7 +1532,7 @@ impl SessionsSpawnTool {
             });
             (prompt, tools)
         } else {
-            (DEFAULT_SUB_AGENT_SYSTEM_PROMPT.to_string(), tools)
+            (crate::identity::delegated::DEFAULT_PROMPT.to_owned(), tools)
         };
 
         // Register the run.

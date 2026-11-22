@@ -235,9 +235,8 @@ impl OrdinaryChildPublication {
         })
     }
 
-    /// The same selected capabilities at a child's own level: a named agent
-    /// runs at its configured level (sealed into the scope), an ordinary child
-    /// keeps this publication's level. The parent half stays shared.
+    /// The same selected capabilities at the centrally derived child level,
+    /// sealed into its scope. The authenticated parent half stays shared.
     pub(crate) fn with_child_level(
         &self,
         level: crate::tools::capability::child::ChildLevel,
@@ -568,11 +567,15 @@ impl OrdinaryChildPublication {
         &self.inner.service.generation
     }
 
+    /// Inherit the actual model pinned for this parent turn, including a
+    /// terminal model/provider switch or a resolved route. Shared tool defaults
+    /// may still describe the gateway's startup selection.
     pub(crate) fn model_source(&self) -> (&str, &str, &crate::providers::credentials::CredentialRef) {
+        let binding = self.inner.source.model_binding();
         (
-            self.inner.source.provider_name(),
-            self.inner.source.model_name(),
-            self.inner.source.model_binding().credential_reference(),
+            binding.pinned_provider_label(),
+            binding.pinned_model(),
+            binding.credential_reference(),
         )
     }
 

@@ -200,23 +200,22 @@ impl ChildSegmentTurn {
         self.service.agent_prompt_skills(self.proof.as_ref(), &self.decision)
     }
 
-    pub(crate) fn prompt_with_skills(&self, base: &str) -> anyhow::Result<String> {
+    pub(crate) fn system_prompt(&self, config: &crate::config::Config, delegated: &str) -> anyhow::Result<String> {
         let skills = self.prompt_skills()?;
-        let metadata = crate::skills::skills_to_prompt(&skills, std::path::Path::new(self.proof.workspace_id()));
-        let mut prompt = base.to_owned();
-        let level = self.execution.child_scope.as_ref().map_or_else(
+        let model = self.service.resolve_agent_model(self.proof.as_ref())?;
+        let mut child_config = config.clone();
+        child_config.workspace_dir = std::path::PathBuf::from(self.proof.workspace_id());
+        child_config.autonomy.level = self.execution.child_scope.as_ref().map_or_else(
             || self.service.security().autonomy,
             |scope| scope.gate_inputs().0.authority.level,
         );
-        if level == crate::security::AutonomyLevel::Full {
-            prompt.push_str("\n\n");
-            prompt.push_str(crate::agent::prompt::FULL_AUTONOMY_SAFETY);
-        }
-        if !metadata.is_empty() {
-            prompt.push_str("\n\n");
-            prompt.push_str(&metadata);
-        }
-        Ok(prompt)
+        Ok(crate::agent::runtime_prompt::build_delegated_system_prompt(
+            &child_config,
+            model.model(),
+            &skills,
+            self.service.model_can_call_tools(self.proof.as_ref()),
+            delegated,
+        ))
     }
 
     pub(crate) fn compaction(&self) -> &crate::config::AgentCompactionConfig {

@@ -40,15 +40,11 @@ pub(super) fn build_worker_system_prompt_with_skills(
 ) -> String {
     let mut worker_config = config.clone();
     worker_config.workspace_dir = manifest.workspace_dir.clone();
-    let runtime_prompt = crate::agent::runtime_prompt::build_runtime_system_prompt(
+    crate::agent::runtime_prompt::build_delegated_system_prompt(
         &worker_config,
         &manifest.model,
         skills,
         native_tools,
-    );
-    let delegated_prompt = resolve_system_prompt(manifest);
-
-    format!(
-        "{runtime_prompt}\n\n## Delegated Agent Instructions\n\n{delegated_prompt}\n\n## Execution Integrity\n\nWhen the delegated task requires reading, writing, running, or verifying files, perform those operations with the provided tools before reporting completion. Never claim that a file, command, or check succeeded unless the corresponding tool actually produced the result."
+        &resolve_system_prompt(manifest),
     )
 }

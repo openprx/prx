@@ -356,7 +356,7 @@ pub(super) async fn run_sub_agent_task(
                         child_service,
                         child_source.clone(),
                         child_fabric_owned.clone(),
-                        child_config_owned,
+                        Arc::clone(&child_config_owned),
                         cleanup_parent.as_ref().context("child segment cleanup owner missing")?,
                         &cancel_token_owned,
                         child_usage_owned,
@@ -366,7 +366,7 @@ pub(super) async fn run_sub_agent_task(
                     let _ = segment_admitted.send(());
 
                     if let Some(system) = initial_system {
-                        let system = child_turn.prompt_with_skills(&system)?;
+                        let system = child_turn.system_prompt(&child_config_owned, &system)?;
                         if let Some(previous) = task_history.first_mut().filter(|message| message.role == "system") {
                             *previous = ChatMessage::system(system);
                         } else {

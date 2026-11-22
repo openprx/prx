@@ -72,11 +72,11 @@
       "type": "string"
     },
     "model": {
-      "description": "For 'spawn' and 'spawn_batch': model override. Defaults to the gateway model.",
+      "description": "For 'spawn' and 'spawn_batch': model override. Defaults to the spawning turn's current model; a named agent uses its configured model.",
       "type": "string"
     },
     "provider": {
-      "description": "For 'spawn' and 'spawn_batch': provider override. Must be a provider the operator configured (the gateway provider, a named agent's provider, a fallback provider or a model route); any other provider, including an unconfigured 'custom:<url>', is refused. Defaults to the agent config provider, then the gateway provider.",
+      "description": "For 'spawn' and 'spawn_batch': provider override. Must be a provider the operator configured (the gateway provider, a named agent's provider, a fallback provider or a model route); any other provider, including an unconfigured 'custom:<url>', is refused. Defaults to the spawning turn's current provider; a named agent uses its configured provider.",
       "type": "string"
     },
     "recipient": {

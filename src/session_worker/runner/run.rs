@@ -138,7 +138,10 @@ fn worker_sealed_level(
     ordinary: Option<&crate::runtime::child_source::ordinary_process::OrdinaryProcessSnapshots>,
     operator: Option<&crate::runtime::operator_spawn::process::OperatorProcessSnapshots>,
 ) -> Result<crate::security::AutonomyLevel> {
-    let named = crate::security::agent_level::named_child_level(config, manifest.agent_id.as_deref());
+    let parent_level = ordinary.map_or(config.autonomy.level, |ordinary| {
+        ordinary.scope.gate_inputs().1.authority.level
+    });
+    let named = crate::security::agent_level::named_child_level(config, manifest.agent_id.as_deref(), parent_level);
     let level = if let Some(ordinary) = ordinary {
         let scope = ordinary.scope.gate_inputs().0;
         anyhow::ensure!(

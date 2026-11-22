@@ -3,8 +3,9 @@
 //! Every reader of a turn's, a call's or a scheduled run's level asks these
 //! pure functions. A level that is unset or unreadable is never read as
 //! `Full`: a stored creator with an unreadable spelling is capped at
-//! `Supervised`. A child runs at its parent's level unless it is a named
-//! agent, which runs at its own configured level ([`named_child_level`]).
+//! `Supervised`. A Full parent always starts Full children. Below Full, a
+//! child keeps its parent's level unless it names an agent, whose configured
+//! level applies ([`named_child_level`]).
 use crate::config::Config;
 use crate::security::AutonomyLevel;
 
@@ -19,11 +20,14 @@ pub fn agent_level(own: Option<AutonomyLevel>, main: AutonomyLevel) -> AutonomyL
     own.unwrap_or(main)
 }
 
-/// The level a named-agent child runs at: the agent's configured level, or
-/// Main's when it sets none. `None` when `agent` names no configured agent;
-/// such a child runs at its parent's level.
+/// A Full parent always starts a Full child. Otherwise a configured named
+/// agent uses its own level, or Main's when unset. `None` means the child
+/// keeps its parent's level.
 #[must_use]
-pub fn named_child_level(config: &Config, agent: Option<&str>) -> Option<AutonomyLevel> {
+pub fn named_child_level(config: &Config, agent: Option<&str>, parent: AutonomyLevel) -> Option<AutonomyLevel> {
+    if parent == AutonomyLevel::Full {
+        return Some(AutonomyLevel::Full);
+    }
     agent
         .and_then(|name| config.agents.get(name))
         .map(|configured| agent_level(configured.autonomy, config.autonomy.level))
