@@ -897,7 +897,10 @@ async fn run_agent(
     task: &XinTask,
     authority: XinRuntimeAuthority,
 ) -> (bool, String) {
-    if !security.can_act() && !crate::xin::store::task_creator(config, &task.id).is_ok_and(|(_, creator)| creator.agent.as_deref().is_some_and(|agent| agent.starts_with("n:"))) {
+    if !security.can_act()
+        && !crate::xin::store::task_creator(config, &task.id)
+            .is_ok_and(|(_, creator)| creator.agent.as_deref().is_some_and(|agent| agent.starts_with("n:")))
+    {
         return (false, "blocked by security policy: autonomy is read-only".into());
     }
     let level = match task_run_level(config, task) {
@@ -955,6 +958,7 @@ async fn run_agent(
                 response
             },
         ),
+        Err(e) if e.is::<crate::runtime::agent_admission::AdmissionError>() => (false, e.to_string()),
         Err(e) => (false, format!("agent task failed: {e}")),
     }
 }

@@ -391,6 +391,15 @@ impl PostgresCronStore {
         })
     }
 
+    pub fn job_revision(&self, job_id: &str) -> Result<u64> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt("SELECT version FROM cron_jobs WHERE id=$1", &[&job_id])?
+                .with_context(|| format!("Cron job '{job_id}' not found"))?;
+            Ok(u64::try_from(row.try_get::<_, i64>(0)?)?)
+        })
+    }
+
     pub fn job_creator(&self, job_id: &str) -> Result<(JobCreator, CreatorStamp)> {
         self.with_client(|client| {
             let row = client
@@ -416,7 +425,7 @@ impl PostgresCronStore {
         let changed = self.with_client(|client| {
             client
                 .execute(
-                    "UPDATE cron_jobs SET created_via = 'operator_cli' WHERE id = $1",
+                    "UPDATE cron_jobs SET version=version+1, created_via = 'operator_cli' WHERE id = $1",
                     &[&job_id],
                 )
                 .context("Failed to mark cron job as the operator's")
@@ -929,7 +938,7 @@ impl PostgresCronStore {
             let changed = tx
                 .execute(
                     "UPDATE cron_jobs
-                     SET expression = $1, command = $2, schedule = $3, job_type = $4, prompt = $5, name = $6,
+                     SET version=version+1, expression = $1, command = $2, schedule = $3, job_type = $4, prompt = $5, name = $6,
                          session_target = $7, model = $8, enabled = $9, delivery = $10, delete_after_run = $11,
                          next_run = $12, last_run = $13, last_status = $14, last_output = $15,
                          terminal_state = $16, approval_grant_json = $17, claim_owner = $18,
@@ -1745,6 +1754,7 @@ fn init_schema(client: &mut Client) -> Result<()> {
         .batch_execute(
             "CREATE TABLE IF NOT EXISTS cron_jobs (
                 id               TEXT PRIMARY KEY,
+                version          BIGINT NOT NULL DEFAULT 1 CHECK(version>0),
                 owner_id         TEXT,
                 topic_id         TEXT,
                 parent_task_id   TEXT,
@@ -2159,6 +2169,7 @@ mod tests {
                      DROP TABLE IF EXISTS cron_runs;
                      DROP TABLE IF EXISTS cron_jobs;
                      CREATE TABLE cron_jobs (
+                        version BIGINT NOT NULL DEFAULT 1,
                         id TEXT PRIMARY KEY,
                         owner_id TEXT,
                         topic_id TEXT,

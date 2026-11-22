@@ -111,6 +111,16 @@ impl XinTool {
     }
 
     fn enforce_owner_scope(&self, cfg: &Config, args: &serde_json::Value, action: &str) -> Option<ToolResult> {
+        if let Some(id) = args
+            .get("task_id")
+            .or_else(|| args.get("goal_id"))
+            .or_else(|| args.get("step_id"))
+            .and_then(serde_json::Value::as_str)
+        {
+            if !named_subject_matches(cfg, args, id) {
+                return Some(tool_error("Xin subject not found in the caller's agent scope"));
+            }
+        }
         let scope = parse_xin_lineage_scope(cfg, args);
         let Some(expected_owner) = scope.owner_id.as_deref() else {
             return None;
@@ -154,6 +164,20 @@ impl XinTool {
             _ => false,
         };
         denied.then(|| tool_error("Xin subject not found in the caller's owner scope"))
+    }
+}
+
+fn named_subject_matches(config: &Config, args: &serde_json::Value, id: &str) -> bool {
+    match crate::tools::execution::trusted_scope_read_partition(args) {
+        Ok(Some(crate::memory::AgentPartition {
+            key: crate::memory::PartitionKey::Named { name, incarnation },
+            ..
+        })) => store::task_creator(config, id).is_ok_and(|(_, stamp)| {
+            stamp.agent.as_deref()
+                == Some(crate::security::agent_level::creator_agent_named(name.as_str(), &incarnation).as_str())
+        }),
+        Ok(_) => true,
+        Err(_) => false,
     }
 }
 
@@ -633,10 +657,11 @@ impl Tool for XinTool {
                         let tasks = tasks
                             .into_iter()
                             .filter(|task| {
-                                caller_scope
-                                    .owner_id
-                                    .as_deref()
-                                    .is_none_or(|owner| task.owner_id.as_deref() == Some(owner))
+                                named_subject_matches(&cfg, &args, &task.id)
+                                    && caller_scope
+                                        .owner_id
+                                        .as_deref()
+                                        .is_none_or(|owner| task.owner_id.as_deref() == Some(owner))
                             })
                             .collect::<Vec<_>>();
                         if tasks.is_empty() {
@@ -759,10 +784,11 @@ impl Tool for XinTool {
                 goals
                     .into_iter()
                     .filter(|goal| {
-                        caller_scope
-                            .owner_id
-                            .as_deref()
-                            .is_none_or(|owner| goal.owner_id.as_deref() == Some(owner))
+                        named_subject_matches(&cfg, &args, &goal.id)
+                            && caller_scope
+                                .owner_id
+                                .as_deref()
+                                .is_none_or(|owner| goal.owner_id.as_deref() == Some(owner))
                     })
                     .collect::<Vec<_>>()
             }) {
@@ -856,10 +882,11 @@ impl Tool for XinTool {
                     Ok(tasks) => tasks
                         .into_iter()
                         .filter(|task| {
-                            caller_scope
-                                .owner_id
-                                .as_deref()
-                                .is_none_or(|owner| task.owner_id.as_deref() == Some(owner))
+                            named_subject_matches(&cfg, &args, &task.id)
+                                && caller_scope
+                                    .owner_id
+                                    .as_deref()
+                                    .is_none_or(|owner| task.owner_id.as_deref() == Some(owner))
                         })
                         .collect::<Vec<_>>(),
                     Err(e) => {

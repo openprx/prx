@@ -235,13 +235,43 @@ fn missing_job(error: &anyhow::Error, id: &str) -> bool {
     error.to_string() == format!("Cron job '{id}' not found")
 }
 
-fn redact_job(job: &CronJob) -> Result<Value, ApiResponse> {
+fn redact_job(config: &crate::config::Config, job: &CronJob) -> Result<Value, ApiResponse> {
     let mut value = serde_json::to_value(job).map_err(|error| {
         tracing::warn!(%error, "cron job could not be encoded");
         error_response(StatusCode::INTERNAL_SERVER_ERROR, "cron job could not be encoded")
     })?;
     if let Some(object) = value.as_object_mut() {
         object.remove("approval_grant_json");
+        let (creator, version) =
+            crate::cron::agent_jobs::metadata(config, &job.id, crate::cron::agent_jobs::Kind::Cron)
+                .map_err(|_| unavailable("cron job identity unavailable"))?;
+        object.insert(
+            "creator_agent".into(),
+            json!(crate::cron::agent_jobs::creator_name(&creator)),
+        );
+        object.insert(
+            "creator_incarnation".into(),
+            json!(
+                creator
+                    .agent
+                    .as_deref()
+                    .and_then(|s| s.strip_prefix("n:"))
+                    .and_then(|s| s.split_once(':'))
+                    .map(|(_, incarnation)| incarnation)
+            ),
+        );
+        object.insert("version".into(), json!(version));
+        object.insert("kind".into(), json!("cron"));
+        object.insert(
+            "next_run_at".into(),
+            json!(job.next_run.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+        );
+        let schedule = match &job.schedule {
+            Schedule::Cron { expr, .. } => expr.clone(),
+            Schedule::At { at } => at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            Schedule::Every { every_ms } => format!("every {every_ms}ms"),
+        };
+        object.insert("schedule".into(), json!(schedule));
     }
     Ok(value)
 }
@@ -307,9 +337,16 @@ fn owner_of<'a>(lineage: &'a CronJobLineage) -> Result<&'a str, ApiResponse> {
         .ok_or_else(|| error_response(StatusCode::FORBIDDEN, "cron owner cannot be derived for this API token"))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct JobsQuery {
+    agent: Option<String>,
+}
+
 pub(super) async fn list_jobs(
     State(state): State<AppState>,
     Extension(principal): Extension<ApiPrincipal>,
+    Query(query): Query<JobsQuery>,
 ) -> ApiResponse {
     let config = state.config.load_full();
     let lineage = match require_owner(&config, &principal) {
@@ -324,8 +361,16 @@ pub(super) async fn list_jobs(
         Ok(jobs) => {
             let mut visible = Vec::new();
             for job in jobs.into_iter().filter(|job| owns(job, owner)) {
-                match redact_job(&job) {
-                    Ok(value) => visible.push(value),
+                match redact_job(&config, &job) {
+                    Ok(value) => {
+                        if query
+                            .agent
+                            .as_deref()
+                            .is_none_or(|name| value.get("creator_agent").and_then(Value::as_str) == Some(name))
+                        {
+                            visible.push(value);
+                        }
+                    }
                     Err(response) => return response,
                 }
             }
@@ -363,7 +408,7 @@ pub(super) async fn get_job(
             return unavailable("cron job events are unavailable");
         }
     };
-    let mut body = match redact_job(&job) {
+    let mut body = match redact_job(&config, &job) {
         Ok(body) => body,
         Err(response) => return response,
     };
@@ -500,7 +545,7 @@ pub(super) async fn create_job(
         }
     };
     match created {
-        Ok(job) => match redact_job(&job) {
+        Ok(job) => match redact_job(&config, &job) {
             Ok(value) => (StatusCode::OK, Json(value)),
             Err(response) => response,
         },
@@ -591,7 +636,7 @@ pub(super) async fn patch_job(
         ..CronJobPatch::default()
     };
     match cron::update_job(&config, id, patch) {
-        Ok(job) => match redact_job(&job) {
+        Ok(job) => match redact_job(&config, &job) {
             Ok(value) => (StatusCode::OK, Json(value)),
             Err(response) => response,
         },
@@ -634,7 +679,7 @@ fn set_enabled(state: &AppState, principal: &ApiPrincipal, id: &str, enabled: bo
         cron::pause_job(&config, id)
     };
     match updated {
-        Ok(job) => match redact_job(&job) {
+        Ok(job) => match redact_job(&config, &job) {
             Ok(value) => (StatusCode::OK, Json(value)),
             Err(response) => response,
         },

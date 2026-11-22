@@ -1557,13 +1557,31 @@ pub(crate) fn resolve_agent_model_choice(
 fn resolve_named_model_choice(config: &Config, name: &str) -> Result<AgentModelChoice> {
     use crate::providers::credentials::{CredentialRef, LegacySlot};
     let agent = config.agents.get(name).ok_or_else(|| anyhow::anyhow!("creator_gone"))?;
-    let credential = if let Some(id) = &agent.credential_ref { CredentialRef::Profile { id: id.clone() } }
-        else if agent.api_key.as_deref().is_some_and(|key| !key.trim().is_empty()) { CredentialRef::LegacyInline(LegacySlot::Agent(name.to_owned())) }
-        else { providers::selection::credential_for(config, &agent.provider) };
+    let credential = if let Some(id) = &agent.credential_ref {
+        CredentialRef::Profile { id: id.clone() }
+    } else if agent.api_key.as_deref().is_some_and(|key| !key.trim().is_empty()) {
+        CredentialRef::LegacyInline(LegacySlot::Agent(name.to_owned()))
+    } else {
+        providers::selection::credential_for(config, &agent.provider)
+    };
     let catalog = providers::selection::catalog_for(config);
     let route = providers::selection::route_target(&catalog, &agent.provider, &agent.model)?.cloned();
-    let resolved = providers::selection::check_with(config, &catalog, &agent.provider, &agent.model, credential, &providers::catalog::Requirement::chat(), providers::catalog::UnknownPolicy::Invocation)?;
-    Ok(AgentModelChoice { provider_name: agent.provider.clone(), model_name: agent.model.clone(), model_binding: AgentModelBinding::from_resolved(&resolved, route), resolved, catalog })
+    let resolved = providers::selection::check_with(
+        config,
+        &catalog,
+        &agent.provider,
+        &agent.model,
+        credential,
+        &providers::catalog::Requirement::chat(),
+        providers::catalog::UnknownPolicy::Invocation,
+    )?;
+    Ok(AgentModelChoice {
+        provider_name: agent.provider.clone(),
+        model_name: agent.model.clone(),
+        model_binding: AgentModelBinding::from_resolved(&resolved, route),
+        resolved,
+        catalog,
+    })
 }
 
 /// The provider an agent entry runs on, and the only connection it may use.
@@ -1649,7 +1667,11 @@ pub(crate) async fn run_with_runtime_envelope(
         runtime_envelope_override.is_none() || scheduled_admission.is_some(),
         "agent runtime override requires an admitted scheduled source"
     );
-    if let (Some(job), Some(admission), Some(envelope)) = (&named_job, scheduled_admission.as_mut(), runtime_envelope_override.as_ref()) {
+    if let (Some(job), Some(admission), Some(envelope)) = (
+        &named_job,
+        scheduled_admission.as_mut(),
+        runtime_envelope_override.as_ref(),
+    ) {
         admission.job_metadata = Some(job.metadata(envelope));
     }
     // Validate scoped identity before bootstrap can initialize persistence.
@@ -1686,6 +1708,11 @@ pub(crate) async fn run_with_runtime_envelope(
 
     // D-065 M-1: resolve before the bootstrap, so a refused selection runs
     // no memory hygiene, snapshot, database, plugin or tool setup.
+    let temperature = named_job
+        .as_ref()
+        .and_then(|job| config.agents.get(job.name.as_str()))
+        .and_then(|agent| agent.temperature)
+        .unwrap_or(temperature);
     let choice = if let Some(job) = &named_job {
         resolve_named_model_choice(config, job.name.as_str())?
     } else {
@@ -1706,24 +1733,37 @@ pub(crate) async fn run_with_runtime_envelope(
     .await?;
 
     let _agent_permit = if let (Some(job), Some(envelope)) = (&named_job, runtime_envelope_override.as_ref()) {
-        let memory = ctx.memory.as_ref().ok_or_else(|| anyhow::anyhow!("agent_backend_unsupported"))?;
+        let memory = ctx
+            .memory
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("agent_backend_unsupported"))?;
         job.validate(memory.as_ref(), envelope)?;
-        let result = crate::runtime::agent_admission::wait(&ctx.config, &envelope.resolved_owner_id(), job.name.as_str()).await;
+        let result =
+            crate::runtime::agent_admission::wait(&ctx.config, &envelope.resolved_owner_id(), job.name.as_str()).await;
         // Retirement while waiting must refuse before any provider access.
         job.validate(memory.as_ref(), envelope)?;
         match result {
             Ok(permit) => permit,
             Err(error) => {
-                let fabric = MemoryFabric::new(Arc::clone(memory), envelope.workspace_id.clone()).with_event_recording(ctx.config.memory.event_recording_config());
-                let metadata = job.metadata(envelope);
-                let mut payload = metadata;
-                payload["reason"] = serde_json::json!(error.to_string());
-                payload["retryable"] = serde_json::json!(false);
-                fabric.record_runtime_event_idempotent(envelope.message_scope(), "scheduled.skipped", "scheduled run skipped", Some(serde_json::to_string(&payload)?), format!("{}:skipped", envelope.run_id.as_deref().unwrap_or_default())).await?;
+                super::scheduled_source::begin_decision()?;
+                let fabric = MemoryFabric::new(Arc::clone(memory), envelope.workspace_id.clone())
+                    .with_event_recording(ctx.config.memory.event_recording_config());
+                let payload = serde_json::json!({"job_id":envelope.task_id,"job_version":job.version,"reason":error.to_string(),"retryable":false});
+                fabric
+                    .record_runtime_event_idempotent(
+                        envelope.message_scope(),
+                        "scheduled.skipped",
+                        "scheduled run skipped",
+                        Some(serde_json::to_string(&payload)?),
+                        format!("{}:skipped", envelope.run_id.as_deref().unwrap_or_default()),
+                    )
+                    .await?;
                 return Err(error.into());
             }
         }
-    } else { None };
+    } else {
+        None
+    };
 
     // Scheduled cleanup owns the published writer even if this entry future is
     // dropped before a decision or terminal proposal is available.

@@ -1,4 +1,3 @@
-pub mod host_bootstrap;
 pub(crate) mod agent_admission;
 pub(crate) mod auxiliary_call;
 pub mod blocking;
@@ -15,6 +14,7 @@ pub mod envelope;
 pub(crate) mod evolution_model;
 pub(crate) mod experiment_stage;
 pub(crate) mod h2_entry;
+pub mod host_bootstrap;
 pub(crate) mod lesson_delivery;
 pub(crate) mod logical_clock;
 pub mod native;

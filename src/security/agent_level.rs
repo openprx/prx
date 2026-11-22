@@ -134,7 +134,8 @@ pub fn scheduled_agent_refusal(
 
 /// The level a scheduled run (cron job, Xin task or goal step) runs at.
 ///
-/// - Work the local operator created keeps Main's live level.
+/// - Named-agent work uses that agent's own live level.
+/// - Non-agent work the local operator created keeps Main's live level.
 /// - Otherwise the stored creator level, lowered to the creator's current
 ///   level. A row with no recorded creator runs at Main's level; a creator
 ///   with an unreadable spelling is capped at `Supervised`. A named creator
@@ -150,12 +151,13 @@ pub fn scheduled_level(
     caller: Option<AutonomyLevel>,
 ) -> Result<AutonomyLevel, ScheduledLevelError> {
     let main = config.autonomy.level;
-    let base = if operator {
+    let base = if let Some(agent) = creator.agent.as_deref().filter(|agent| agent.starts_with("n:")) {
+        creator_current_level(agent, config).ok_or(ScheduledLevelError::CreatorGone)??
+    } else if operator {
         main
     } else {
         match (creator.level, creator.agent.as_deref()) {
             (Some(stored), Some(agent)) => match creator_current_level(agent, config) {
-                Some(current) if agent.starts_with("n:") => current?,
                 Some(current) => stored.min(current?),
                 None => AutonomyLevel::Supervised.min(main),
             },

@@ -418,7 +418,7 @@ pub fn mark_job_operator(config: &Config, job_id: &str) -> Result<()> {
     }
     let changed = with_connection(config, |conn| {
         conn.execute(
-            "UPDATE cron_jobs SET created_via = 'operator_cli' WHERE id = ?1",
+            "UPDATE cron_jobs SET version=version+1, created_via = 'operator_cli' WHERE id = ?1",
             params![job_id],
         )
         .context("Failed to mark cron job as the operator's")
@@ -1053,8 +1053,8 @@ pub fn update_job_at(config: &Config, job_id: &str, patch: CronJobPatch, now: Da
                  claim_owner = ?18, attempt_id = ?19, claimed_at = ?20, claim_expires_at = ?21,
                  creator_sender = ?31, creator_channel = ?32, creator_chat_type = ?33,
                  created_via = COALESCE(?34, created_via),
-                 creator_level = CASE WHEN ?35 THEN ?36 ELSE creator_level END,
-                 creator_agent = CASE WHEN ?35 THEN ?37 ELSE creator_agent END
+                 creator_level = CASE WHEN ?35 AND COALESCE(substr(creator_agent,1,2),'')<>'n:' THEN ?36 ELSE creator_level END,
+                 creator_agent = CASE WHEN ?35 AND COALESCE(substr(creator_agent,1,2),'')<>'n:' THEN ?37 ELSE creator_agent END
              WHERE id = ?22 AND next_run = ?23
                AND (schedule = ?24 OR (schedule IS NULL AND expression = ?25))
                AND last_status IS ?26
@@ -1143,7 +1143,7 @@ pub fn reschedule_after_run(config: &Config, job: &CronJob, success: bool, outpu
     }
     let now = Utc::now();
     let next_run = next_run_for_schedule(&job.schedule, now)?;
-    let status = if success { "ok" } else { "error" };
+    let status = super::agent_jobs::run_status(success,output);
     let bounded_output = stored_cron_output(output);
 
     with_connection(config, |conn| {
@@ -1292,7 +1292,7 @@ fn finish_claimed_run_with_schedule(
         );
     }
 
-    let status = if success { "ok" } else { "error" };
+    let status = super::agent_jobs::run_status(success,output);
     let terminal_state = if success {
         CronJobTerminalState::Succeeded
     } else {
@@ -1412,7 +1412,7 @@ fn finish_sqlite_recurring_claimed_run(
     disable_after: bool,
     advance_schedule: bool,
 ) -> Result<bool> {
-    let status = if success { "ok" } else { "error" };
+    let status = super::agent_jobs::run_status(success,output);
     let bounded_output = stored_cron_output(output);
     let next_run = if advance_schedule {
         next_run_for_schedule(&job.schedule, finished_at)?
@@ -1555,7 +1555,7 @@ pub fn record_terminal_manual_run(
             config.cron.max_run_history,
         );
     }
-    let status = if success { "ok" } else { "error" };
+    let status = super::agent_jobs::run_status(success,output);
     let bounded_output = stored_cron_output(output);
     let keep = i64::from(config.cron.max_run_history.max(1));
     let schedule_json = serde_json::to_string(&job.schedule)?;
@@ -1904,6 +1904,7 @@ fn insert_job_event(
     status: Option<&str>,
     payload_json: Option<&str>,
 ) -> Result<()> {
+    super::agent_jobs::remember_cron(conn, job_id)?;
     let event_id = Uuid::new_v4().to_string();
     let mirrored_payload = cron_job_event_payload(
         job_id,
@@ -2152,7 +2153,8 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&mut Connection) -> Result
     crate::runtime::sqlite_pool::install_busy_handler(&mut conn)?;
 
     conn.execute_batch(
-        "PRAGMA foreign_keys = ON;
+        "PRAGMA foreign_keys = ON; PRAGMA secure_delete=ON;
+         CREATE TABLE IF NOT EXISTS cron_job_owners(job_id TEXT PRIMARY KEY,owner_id TEXT,creator_agent TEXT NOT NULL);
          CREATE TABLE IF NOT EXISTS cron_jobs (
             id               TEXT PRIMARY KEY,
             version          INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
@@ -2636,6 +2638,7 @@ mod tests {
         let conn = Connection::open(&db_path).unwrap();
         conn.execute_batch(
             "CREATE TABLE cron_jobs (
+                version INTEGER NOT NULL DEFAULT 1,
                 id               TEXT PRIMARY KEY,
                 expression       TEXT NOT NULL,
                 command          TEXT NOT NULL,
@@ -3850,5 +3853,14 @@ mod tests {
 
 /// The persisted job revision, independent of claims and execution attempts.
 pub fn job_revision(config: &Config, id: &str) -> Result<u64> {
-    with_connection(config, |conn| Ok(u64::try_from(conn.query_row("SELECT version FROM cron_jobs WHERE id=?1", [id], |r| r.get::<_, i64>(0))?)?))
+    if let Some(store) = pg_store(config)? {
+        return store.job_revision(id);
+    }
+    with_connection(config, |conn| {
+        Ok(u64::try_from(conn.query_row(
+            "SELECT version FROM cron_jobs WHERE id=?1",
+            [id],
+            |r| r.get::<_, i64>(0),
+        )?)?)
+    })
 }

@@ -42,6 +42,8 @@ use target::{
 
 #[derive(Serialize)]
 pub(super) struct SessionSummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<serde_json::Value>,
     session_id: String,
     sender: String,
     channel: String,
@@ -1335,7 +1337,31 @@ pub async fn get_sessions(
             }
 
             let status = derive_session_status(&session.last_message_preview, session.message_count);
+            let metadata = if matches!(session.channel.as_str(), "cron" | "xin") {
+                let memory = std::sync::Arc::clone(&state.mem);
+                let owner = api_principal.owner_id.clone();
+                let key = session.session_key.clone();
+                match crate::runtime::blocking::spawn_blocking(move || {
+                    memory
+                        .sync_store()
+                        .map_or(Ok(None), |sync| sync.session_metadata(&owner, &key))
+                })
+                .await
+                {
+                    Ok(Ok(metadata)) => metadata,
+                    _ => {
+                        return super::capabilities::coded_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "storage_unavailable",
+                            "scheduled session metadata unavailable",
+                        );
+                    }
+                }
+            } else {
+                None
+            };
             response.push(SessionSummary {
+                metadata,
                 session_id: session.session_key,
                 sender: session.sender,
                 channel: session.channel,

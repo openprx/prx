@@ -204,6 +204,7 @@ fn bind_key(conn: &Connection, request: &AgentPurge, agent: &str, purge_id: &str
 
 /// Called after the shared history adapter and the config transaction finish.
 pub(super) fn finish(memory: &SqliteMemory, work: &EraseWork) -> anyhow::Result<serde_json::Value> {
+    let external_counts = crate::cron::agent_jobs::purge(work)?;
     let writer = memory.pool.write();
     let tx = begin_immediate(&writer)?;
     let existing: Option<String> = tx.query_row(
@@ -229,7 +230,9 @@ pub(super) fn finish(memory: &SqliteMemory, work: &EraseWork) -> anyhow::Result<
             .query_map(params![work.workspace, work.owner, key], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
-    let receipt = serde_json::json!({"name":work.agent,"incarnations":incarnations,"counts":serde_json::from_str::<std::collections::BTreeMap<String,u64>>(&counts)?,
+    let mut counts = serde_json::from_str::<std::collections::BTreeMap<String, u64>>(&counts)?;
+    counts.extend(external_counts);
+    let receipt = serde_json::json!({"name":work.agent,"incarnations":incarnations,"counts":counts,
         "completed_at":chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs,true)});
     tx.execute("UPDATE agent_incarnations SET state='retired' WHERE workspace_id=?1 AND owner_id=?2 AND agent_key=?3 AND state='retiring'",params![work.workspace,work.owner,key])?;
     tx.execute("UPDATE agent_purge_progress SET state='erased',after_scope_id=(SELECT MAX(a.scope_id) FROM agent_scopes a

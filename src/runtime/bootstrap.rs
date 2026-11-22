@@ -280,7 +280,12 @@ impl AppContext {
         self.publish_turn_runtimes_scoped(registry, surface, None).await
     }
 
-    async fn publish_turn_runtimes_scoped(&self, registry: Arc<Vec<Box<dyn Tool>>>, surface: crate::tools::capability::turn_state::TurnSurfaceKind, targeted: Option<crate::runtime::turn_publication::TargetedSurface>) -> Result<Arc<crate::runtime::turn_publication::TurnRuntimeService>> {
+    async fn publish_turn_runtimes_scoped(
+        &self,
+        registry: Arc<Vec<Box<dyn Tool>>>,
+        surface: crate::tools::capability::turn_state::TurnSurfaceKind,
+        targeted: Option<crate::runtime::turn_publication::TargetedSurface>,
+    ) -> Result<Arc<crate::runtime::turn_publication::TurnRuntimeService>> {
         super::turn_publication::TurnPublication {
             generation: Arc::clone(&self.config_generation),
             registry,
@@ -405,7 +410,9 @@ impl RuntimeBootstrap {
                 Ok::<_, anyhow::Error>(Arc::clone(&scheduled.policy))
             })
             .transpose()?;
-        let targeted = crate::agent::automation::select(config, envelope)?.map(|job| job.surface(config)).transpose()?;
+        let targeted = crate::agent::automation::select(config, envelope)?
+            .map(|job| job.surface(config))
+            .transpose()?;
         Self::build_inner(config_source, BootstrapProfile::AgentLoop, surface, policy, targeted).await
     }
 

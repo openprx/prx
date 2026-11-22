@@ -642,7 +642,12 @@ async fn delete(
         status: "retired",
         revision,
     };
+    let pause_jobs = || {
+        crate::cron::agent_jobs::retire(&state.config.load_full(), &principal.owner_id, name.as_str())
+            .map_err(|_| Refusal::storage("the agent jobs could not be paused"))
+    };
     if registry.live(&key)?.is_some_and(|(_, retired)| retired) {
+        pause_jobs()?;
         return Ok((StatusCode::OK, answer(snapshot(state)?.revision)));
     }
     if !state.config.desired().config.agents.contains_key(name.as_str()) {
@@ -663,6 +668,7 @@ async fn delete(
         .store
         .retire_removed(&registry.workspace, &BTreeSet::from([key]))
         .map_err(|_| Refusal::storage("the agent registry could not retire the agent"))?;
+    pause_jobs()?;
     Ok((StatusCode::OK, answer(snapshot.revision)))
 }
 

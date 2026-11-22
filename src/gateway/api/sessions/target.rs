@@ -365,14 +365,28 @@ pub(super) fn resolve_incarnation(
 /// Reserve the same root-turn slot used by scheduled named-agent runs.
 pub(super) use crate::runtime::agent_admission::AgentTurnPermit;
 
-pub(super) fn admit_agent_turn(config: &Config, owner: &str, name: &str) -> Result<Option<AgentTurnPermit>, Box<Response>> {
+pub(super) fn admit_agent_turn(
+    config: &Config,
+    owner: &str,
+    name: &str,
+) -> Result<Option<AgentTurnPermit>, Box<Response>> {
     crate::runtime::agent_admission::admit(config, owner, name).map_err(|error| {
         let (status, code, retry) = match error {
             crate::runtime::agent_admission::AdmissionError::Busy => (StatusCode::TOO_MANY_REQUESTS, "agent_busy", 1),
-            crate::runtime::agent_admission::AdmissionError::Budget => (StatusCode::TOO_MANY_REQUESTS, "agent_budget_exhausted", u64::try_from(86_400 - chrono::Utc::now().timestamp().rem_euclid(86_400)).unwrap_or(86_400)),
-            crate::runtime::agent_admission::AdmissionError::Storage => (StatusCode::INTERNAL_SERVER_ERROR, "storage_unavailable", 1),
+            crate::runtime::agent_admission::AdmissionError::Budget => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "agent_budget_exhausted",
+                u64::try_from(86_400 - chrono::Utc::now().timestamp().rem_euclid(86_400)).unwrap_or(86_400),
+            ),
+            crate::runtime::agent_admission::AdmissionError::Storage => {
+                (StatusCode::INTERNAL_SERVER_ERROR, "storage_unavailable", 1)
+            }
         };
-        let mut response = crate::gateway::api::capabilities::coded_error(status, code, "the agent admission limit could not be satisfied");
+        let mut response = crate::gateway::api::capabilities::coded_error(
+            status,
+            code,
+            "the agent admission limit could not be satisfied",
+        );
         if let Ok(value) = axum::http::HeaderValue::from_str(&retry.to_string()) {
             response.headers_mut().insert(axum::http::header::RETRY_AFTER, value);
         }

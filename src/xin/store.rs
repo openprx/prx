@@ -241,6 +241,7 @@ fn stored_creator(conn: &Connection, task_or_step_id: &str) -> Result<(JobCreato
              SELECT g.created_via, g.creator_level, g.creator_agent
                FROM xin_steps s JOIN xin_goals g ON g.id = s.goal_id
               WHERE s.id = ?1
+             UNION ALL SELECT created_via,creator_level,creator_agent FROM xin_goals WHERE id=?1
              LIMIT 1",
             params![task_or_step_id],
             |row| {
@@ -263,7 +264,7 @@ fn stored_creator(conn: &Connection, task_or_step_id: &str) -> Result<(JobCreato
 pub fn mark_task_operator(config: &Config, task_id: &str) -> Result<()> {
     let changed = with_connection(config, |conn| {
         conn.execute(
-            "UPDATE xin_tasks SET created_via = 'operator_cli' WHERE id = ?1",
+            "UPDATE xin_tasks SET version=version+1, created_via = 'operator_cli' WHERE id = ?1",
             params![task_id],
         )
         .context("Failed to mark xin task as the operator's")
@@ -316,8 +317,8 @@ pub fn update_task(config: &Config, task_id: &str, patch: &XinTaskPatch) -> Resu
                  interval_secs = ?5, enabled = ?6, max_failures = ?7, updated_at = ?8,
                  approval_grant_json = ?9,
                  created_via = COALESCE(?12, created_via),
-                 creator_level = CASE WHEN ?13 THEN ?14 ELSE creator_level END,
-                 creator_agent = CASE WHEN ?13 THEN ?15 ELSE creator_agent END
+                 creator_level = CASE WHEN ?13 AND COALESCE(substr(creator_agent,1,2),'')<>'n:' THEN ?14 ELSE creator_level END,
+                 creator_agent = CASE WHEN ?13 AND COALESCE(substr(creator_agent,1,2),'')<>'n:' THEN ?15 ELSE creator_agent END
              WHERE id = ?10 AND updated_at = ?11",
                 params![
                     task.name,
@@ -693,7 +694,7 @@ fn set_task_control_state(config: &Config, task_id: &str, action: &str) -> Resul
         match action {
             "pause" => {
                 conn.execute(
-                    "UPDATE xin_tasks SET enabled = 0, updated_at = ?1 WHERE id = ?2",
+                    "UPDATE xin_tasks SET version=version+1, enabled = 0, updated_at = ?1 WHERE id = ?2",
                     params![now.to_rfc3339(), task_id],
                 )?;
             }
@@ -711,7 +712,7 @@ fn set_task_control_state(config: &Config, task_id: &str, action: &str) -> Resul
             "cancel" => {
                 conn.execute(
                     "UPDATE xin_tasks
-                     SET enabled = 0, status = 'cancelled', lease_owner = NULL,
+                     SET version=version+1, enabled = 0, status = 'cancelled', lease_owner = NULL,
                          lease_expires_at = NULL, last_heartbeat_at = NULL, updated_at = ?1
                      WHERE id = ?2",
                     params![now.to_rfc3339(), task_id],
@@ -905,7 +906,7 @@ pub(crate) fn disable_system_tasks_except(
                 continue;
             }
             let changed = conn.execute(
-                "UPDATE xin_tasks SET enabled = 0, updated_at = ?1
+                "UPDATE xin_tasks SET version=version+1, enabled = 0, updated_at = ?1
                  WHERE id = ?2 AND enabled = 1",
                 params![now.to_rfc3339(), task_id],
             )?;
@@ -976,7 +977,7 @@ pub fn commit_task_execution(
         } else {
             conn.execute(
                 "UPDATE xin_tasks
-                 SET status = 'failed', last_run_at = ?1, last_status = 'error',
+                 SET status = 'failed', last_run_at = ?1, last_status = CASE WHEN ?2 IN ('agent_busy','agent_budget_exhausted') THEN 'skipped' ELSE 'error' END,
                      last_output = ?2, run_count = run_count + 1,
                      fail_count = fail_count + 1,
                      lease_owner = NULL, lease_expires_at = NULL, updated_at = ?1
@@ -1028,7 +1029,7 @@ pub fn commit_task_execution(
             task_id,
             started_at,
             finished_at,
-            if success { "ok" } else { "error" },
+            crate::cron::agent_jobs::run_status(success,output),
             Some(&bounded),
             duration_ms,
         )?;
@@ -1422,7 +1423,7 @@ pub fn add_step_with_creator_stamp(
                      status = CASE WHEN status = 'completed' THEN 'running' ELSE status END,
                      completed_at = CASE WHEN status = 'completed' THEN NULL ELSE completed_at END,
                      final_output = CASE WHEN status = 'completed' THEN NULL ELSE final_output END,
-                     updated_at = ?1, creator_level = ?3, creator_agent = ?4, created_via = ?5
+                     updated_at = ?1, creator_level = CASE WHEN substr(creator_agent,1,2)='n:' THEN creator_level ELSE ?3 END, creator_agent = CASE WHEN substr(creator_agent,1,2)='n:' THEN creator_agent ELSE ?4 END, created_via = ?5
                  WHERE id = ?2",
                 params![
                     now.to_rfc3339(),
@@ -1621,7 +1622,7 @@ pub fn retry_step(config: &Config, step_id: &str) -> Result<XinStep> {
         )?;
         conn.execute(
             "UPDATE xin_goals
-             SET enabled = 1, status = CASE WHEN ?1 = 0 THEN 'pending' ELSE 'running' END,
+             SET version=version+1, enabled = 1, status = CASE WHEN ?1 = 0 THEN 'pending' ELSE 'running' END,
                  steps_completed = ?1, completed_at = NULL, final_output = NULL, updated_at = ?2
              WHERE id = ?3",
             params![completed, now.to_rfc3339(), goal_id],
@@ -2193,7 +2194,7 @@ pub(crate) fn adopt_legacy_task(config: &Config, task_id: &str) -> Result<Option
         )
         .context("Failed to link adopted Xin task to goal")?;
         conn.execute(
-            "UPDATE xin_tasks SET enabled = 0, updated_at = ?1 WHERE id = ?2",
+            "UPDATE xin_tasks SET version=version+1, enabled = 0, updated_at = ?1 WHERE id = ?2",
             params![now.to_rfc3339(), task_id],
         )
         .context("Failed to disable adopted Xin task")?;
@@ -2545,6 +2546,7 @@ fn insert_task_event(
     status: Option<&str>,
     payload_json: Option<&str>,
 ) -> Result<()> {
+    crate::cron::agent_jobs::remember_xin(conn, task_id)?;
     let event_id = Uuid::new_v4().to_string();
     let created_at = Utc::now().to_rfc3339();
     crate::runtime::sqlite_pool::in_write_scope(conn, || {
@@ -2801,7 +2803,8 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
     crate::runtime::sqlite_pool::install_busy_handler(&mut conn)?;
 
     conn.execute_batch(
-        "PRAGMA foreign_keys = ON;
+        "PRAGMA foreign_keys = ON; PRAGMA secure_delete=ON;
+         CREATE TABLE IF NOT EXISTS xin_job_owners(job_id TEXT PRIMARY KEY,owner_id TEXT,creator_agent TEXT NOT NULL);
 
          CREATE TABLE IF NOT EXISTS xin_tasks (
             version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
@@ -3160,6 +3163,7 @@ mod tests {
         let conn = Connection::open(&db_path).unwrap();
         conn.execute_batch(
             "CREATE TABLE xin_tasks (
+                version INTEGER NOT NULL DEFAULT 1,
                 id               TEXT PRIMARY KEY,
                 name             TEXT NOT NULL,
                 description      TEXT,
@@ -4700,5 +4704,7 @@ mod tests {
 
 /// A step runs against the goal revision; edits to steps advance that goal.
 pub fn task_revision(config: &Config, id: &str) -> Result<u64> {
-    with_connection(config, |conn| Ok(u64::try_from(conn.query_row("SELECT version FROM xin_tasks WHERE id=?1 UNION ALL SELECT g.version FROM xin_steps s JOIN xin_goals g ON g.id=s.goal_id WHERE s.id=?1 LIMIT 1", [id], |r| r.get::<_, i64>(0))?)?))
+    with_connection(config, |conn| {
+        Ok(u64::try_from(conn.query_row("SELECT version FROM xin_tasks WHERE id=?1 UNION ALL SELECT g.version FROM xin_steps s JOIN xin_goals g ON g.id=s.goal_id WHERE s.id=?1 UNION ALL SELECT version FROM xin_goals WHERE id=?1 LIMIT 1", [id], |r| r.get::<_, i64>(0))?)?)
+    })
 }

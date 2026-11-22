@@ -23,6 +23,7 @@ mod cron_jobs;
 mod decision_engine;
 mod hooks;
 mod identity;
+mod xin_jobs;
 pub(in crate::gateway) use identity::verify_startup_identity;
 mod jobs;
 mod logs;
@@ -137,7 +138,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/decision-engine/credential", put(decision_engine::put_credential))
         .route_layer(middleware::from_fn(decision_engine::refuse_secrets_in_url));
 
-    let protected_routes = Router::new()
+    let protected_routes = Router::new().merge(xin_jobs::router(state.clone()))
         .route("/status", get(status::get_status))
         .route("/identity",get(identity::get_identity))
         .route("/sessions/approvals", get(sessions::get_session_approvals))

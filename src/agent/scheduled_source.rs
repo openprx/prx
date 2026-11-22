@@ -403,9 +403,25 @@ impl ScheduledPendingInput {
                 self.choice.model_name()
             ));
             if let Some(metadata) = &self.admission.job_metadata {
-                Some(self.fabric.record_inbound_user_message(scope, self.input.clone(), Some(self.key.clone()), Some(serde_json::to_string(metadata)?)).await?)
+                Some(
+                    self.fabric
+                        .record_inbound_user_message(
+                            scope,
+                            self.input.clone(),
+                            Some(self.key.clone()),
+                            Some(serde_json::to_string(metadata)?),
+                        )
+                        .await?,
+                )
             } else {
-                self.fabric.record_inbound_user_message_best_effort(scope, self.input.clone(), Some(self.key.clone()), "scheduled").await?
+                self.fabric
+                    .record_inbound_user_message_best_effort(
+                        scope,
+                        self.input.clone(),
+                        Some(self.key.clone()),
+                        "scheduled",
+                    )
+                    .await?
             }
         };
         if let Some(event) = event.as_ref().filter(|event| event.id > 0) {

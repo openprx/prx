@@ -1,6 +1,6 @@
-pub(crate) mod automation;
 #[allow(clippy::module_inception)]
 pub mod agent;
+pub(crate) mod automation;
 pub(crate) mod channel_approval;
 pub mod classifier;
 pub(crate) mod compaction;

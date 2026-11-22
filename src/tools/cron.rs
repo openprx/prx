@@ -110,7 +110,7 @@ impl CronTool {
     fn refuse_unless_caller_may_manage(cfg: &Config, args: &serde_json::Value, job_id: &str) -> Option<ToolResult> {
         let caller = CallerScope::from_args(cfg, args);
         let job = cron::get_job(cfg, job_id).ok()?;
-        if caller.admits(&job) {
+        if caller.admits(cfg, &job) {
             return None;
         }
         Some(ToolResult {
@@ -137,7 +137,7 @@ impl CronTool {
     fn hide_unless_caller_may_read(cfg: &Config, args: &serde_json::Value, job_id: &str) -> Option<ToolResult> {
         let caller = CallerScope::from_args(cfg, args);
         let admitted = match cron::get_job(cfg, job_id) {
-            Ok(job) => caller.admits(&job),
+            Ok(job) => caller.admits(cfg, &job),
             Err(error) => {
                 if matches!(caller, CallerScope::Unrestricted) {
                     return None;
@@ -408,6 +408,7 @@ struct RunView {
 enum CallerScope {
     Unrestricted,
     Owner(Option<String>),
+    Named { owner: Option<String>, creator: String },
 }
 
 impl CallerScope {
@@ -419,14 +420,31 @@ impl CallerScope {
         if !trusted || scope_is_local_process_operator(args) {
             return Self::Unrestricted;
         }
-        Self::Owner(cron::lineage_from_trusted_scope(cfg, args).owner_id)
+        let owner = cron::lineage_from_trusted_scope(cfg, args).owner_id;
+        match crate::tools::execution::trusted_scope_read_partition(args) {
+            Ok(Some(crate::memory::AgentPartition {
+                key: crate::memory::PartitionKey::Named { name, incarnation },
+                ..
+            })) => Self::Named {
+                owner,
+                creator: crate::security::agent_level::creator_agent_named(name.as_str(), &incarnation),
+            },
+            Ok(_) => Self::Owner(owner),
+            Err(_) => Self::Owner(None),
+        }
     }
 
-    fn admits(&self, job: &cron::CronJob) -> bool {
+    fn admits(&self, cfg: &Config, job: &cron::CronJob) -> bool {
         match self {
             Self::Unrestricted => true,
             Self::Owner(Some(owner)) => job.owner_id.as_deref() == Some(owner.as_str()),
             Self::Owner(None) => false,
+            Self::Named { owner, creator } => {
+                owner
+                    .as_deref()
+                    .is_some_and(|owner| job.owner_id.as_deref() == Some(owner))
+                    && cron::job_creator(cfg, &job.id).is_ok_and(|(_, stamp)| stamp.agent.as_ref() == Some(creator))
+            }
         }
     }
 }
@@ -704,9 +722,11 @@ impl Tool for CronTool {
                     return Ok(r);
                 }
                 let caller = CallerScope::from_args(&cfg, &args);
-                match cron::list_jobs(&cfg)
-                    .map(|jobs| jobs.into_iter().filter(|job| caller.admits(job)).collect::<Vec<_>>())
-                {
+                match cron::list_jobs(&cfg).map(|jobs| {
+                    jobs.into_iter()
+                        .filter(|job| caller.admits(&cfg, job))
+                        .collect::<Vec<_>>()
+                }) {
                     Ok(jobs) => {
                         if jobs.is_empty() {
                             return Ok(ToolResult {
@@ -826,7 +846,7 @@ impl Tool for CronTool {
                 let jobs = cron::list_jobs(&cfg)
                     .unwrap_or_default()
                     .into_iter()
-                    .filter(|job| caller.admits(job))
+                    .filter(|job| caller.admits(&cfg, job))
                     .collect::<Vec<_>>();
                 let terminal_count = jobs.iter().filter(|job| job.terminal_state.is_some()).count();
                 let enabled_count = jobs

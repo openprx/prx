@@ -178,10 +178,14 @@ pub(super) fn event_header(conn: &Connection, id: &str, kind: &str) -> anyhow::R
         "WITH RECURSIVE family(run) AS (SELECT ?1 UNION SELECT e.parent_run_id FROM message_events e JOIN family f ON e.run_id=f.run WHERE e.workspace_id=?2 AND e.owner_id=?3 AND e.parent_run_id IS NOT NULL)
         SELECT a.session_key,a.agent_key,s.incarnation,a.run_id,s.session_key FROM rf_message_attempts a JOIN agent_scopes s ON s.scope_id=a.ma_scope_id WHERE a.workspace_id=?2 AND a.owner_id=?3 AND (a.run_id IN(SELECT run FROM family) OR a.message_event_id=?4) LIMIT 1",
         params![root_run,workspace,owner,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
-    let root = if root.is_some() { root } else {
+    let root = if root.is_some() {
+        root
+    } else {
         conn.query_row("WITH RECURSIVE family(run) AS (SELECT ?1 UNION SELECT e.parent_run_id FROM message_events e JOIN family f ON e.run_id=f.run WHERE e.workspace_id=?2 AND e.owner_id=?3 AND e.parent_run_id IS NOT NULL) SELECT e.session_key,s.agent_key,s.incarnation,e.run_id,s.session_key FROM message_events e JOIN agent_scopes s ON s.scope_id=e.ma_scope_id WHERE e.workspace_id=?2 AND e.owner_id=?3 AND e.source IN ('cron','xin') AND e.parent_run_id IS NULL AND e.run_id IN(SELECT run FROM family) LIMIT 1", params![root_run, workspace, owner], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).optional()?
     };
-    let Some((root_session, agent, incarnation, root_id, _)) = root else { return Ok(None); };
+    let Some((root_session, agent, incarnation, root_id, _)) = root else {
+        return Ok(None);
+    };
     let agent = agent.strip_prefix("n:").unwrap_or(&agent).to_owned();
     let mut h = Header::new(&owner, kind, &session, &agent, &incarnation, format!("event:{id}"));
     h.run_id = run;
@@ -235,17 +239,33 @@ pub(super) fn event_written(conn: &Connection, event: &crate::memory::MessageEve
         }
         return Ok(());
     }
-    let scheduled_root = h.parent_run_id.is_none() && matches!(event.source, crate::memory::MessageEventSource::Cron | crate::memory::MessageEventSource::Xin);
+    let scheduled_root = h.parent_run_id.is_none()
+        && matches!(
+            event.source,
+            crate::memory::MessageEventSource::Cron | crate::memory::MessageEventSource::Xin
+        );
     if scheduled_root && (event.role == "user" || event.event_type == "scheduled.skipped") {
-        let first: bool = conn.query_row("SELECT NOT EXISTS(SELECT 1 FROM sync_journal WHERE owner_id=?1 AND session=?2 AND kind='session.upsert')",params![h.owner,h.session],|r|r.get(0))?;
-        if first {
-            h.kind = "session.upsert".into(); h.event_id = format!("session:{}",event.event_id); append(conn,&h)?;
+        h.kind = "session.upsert".into();
+        h.event_id = format!("session:{}", event.event_id);
+        append(conn, &h)?;
+        if event.role == "user" {
+            project_scheduled(conn, &event.event_id)?;
+        } else {
+            conn.execute("INSERT INTO sessions(session_key,channel,sender,owner_id,created_at,updated_at) VALUES(?1,?2,?2,?3,?4,?4) ON CONFLICT(session_key) DO UPDATE SET updated_at=excluded.updated_at WHERE sessions.owner_id=excluded.owner_id",params![h.session,event.source.as_str(),h.owner,event.created_at])?;
         }
-        h.kind = if event.event_type == "scheduled.skipped" { "turn.failed" } else { "turn.started" }.into();
-        h.event_id = format!("{}:{}",h.kind,event.event_id); append(conn,&h)?;
+        h.kind = if event.event_type == "scheduled.skipped" {
+            "turn.failed"
+        } else {
+            "turn.started"
+        }
+        .into();
+        h.event_id = format!("{}:{}", h.kind, event.event_id);
+        append(conn, &h)?;
         h.kind = "turn.appended".into();
-        h.event_id = format!("turn.appended:{}",event.event_id);
-        if event.role == "user" { append(conn,&h)?; }
+        h.event_id = format!("turn.appended:{}", event.event_id);
+        if event.role == "user" {
+            append(conn, &h)?;
+        }
     }
     // Root user rows are appended by admit, after their attempt is inserted.
     if h.parent_run_id.is_some() {
@@ -295,6 +315,9 @@ pub(super) fn event_written(conn: &Connection, event: &crate::memory::MessageEve
                 // paths whose assistant row was prepared in an earlier tx.
                 header.source_ref = format!("final:{}:{assistant}", event.event_id);
                 append(conn, &header)?;
+                if scheduled_root {
+                    project_scheduled(conn, assistant)?;
+                }
             }
         }
         if let Some(run) = &event.run_id {
@@ -306,6 +329,14 @@ pub(super) fn event_written(conn: &Connection, event: &crate::memory::MessageEve
             append(conn, &h)?;
         }
     }
+    Ok(())
+}
+
+/// Transcript projection shares the source/journal transaction and its erase stamp.
+fn project_scheduled(conn: &Connection, event: &str) -> anyhow::Result<()> {
+    conn.execute("INSERT INTO sessions(session_key,channel,sender,owner_id,created_at,updated_at) SELECT session_key,channel,COALESCE(sender,source),owner_id,created_at,created_at FROM message_events WHERE event_id=?1 ON CONFLICT(session_key) DO UPDATE SET updated_at=excluded.updated_at WHERE sessions.owner_id=excluded.owner_id AND sessions.channel=excluded.channel",[event])?;
+    conn.execute("INSERT INTO conversation_turns(session_key,owner_id,role,content,timestamp,message_id,message_event_id,agent_id,persona_id,visibility,ma_scope_id) SELECT session_key,owner_id,role,content,created_at,event_id,event_id,agent_id,persona_id,visibility,ma_scope_id FROM message_events WHERE event_id=?1 AND NOT EXISTS(SELECT 1 FROM conversation_turns WHERE message_event_id=?1)",[event])?;
+    conn.execute("UPDATE sessions SET message_count=(SELECT COUNT(*) FROM conversation_turns t WHERE t.session_key=sessions.session_key AND t.owner_id=sessions.owner_id),last_message_preview=(SELECT substr(content,1,120) FROM message_events WHERE event_id=?1) WHERE session_key=(SELECT session_key FROM message_events WHERE event_id=?1) AND owner_id=(SELECT owner_id FROM message_events WHERE event_id=?1)",[event])?;
     Ok(())
 }
 
@@ -380,6 +411,13 @@ pub(super) fn prune(conn: &Connection) -> anyhow::Result<()> {
 }
 
 impl SyncStore for SqliteMemory {
+    fn session_metadata(&self, owner: &str, session: &str) -> anyhow::Result<Option<serde_json::Value>> {
+        let reader = self.pool.read()?;
+        let conn = reader.connection()?;
+        let raw:Option<String>=conn.query_row("SELECT raw_payload_json FROM message_events WHERE owner_id=?1 AND session_key=?2 AND source IN ('cron','xin') AND parent_run_id IS NULL AND (role='user' OR event_type='scheduled.skipped') ORDER BY id DESC LIMIT 1",params![owner,session],|r|r.get(0)).optional()?.flatten();
+        raw.as_deref().map(serde_json::from_str).transpose().map_err(Into::into)
+    }
+
     fn live_scope(&self, owner: &str, event: &str) -> anyhow::Result<Option<serde_json::Value>> {
         let reader = self.pool.read()?;
         let conn = reader.connection()?;
