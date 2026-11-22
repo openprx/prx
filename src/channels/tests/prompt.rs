@@ -111,7 +111,14 @@ impl Memory for RecallMemory {
 #[test]
 fn prompt_contains_all_sections() {
     let ws = make_workspace();
-    let prompt = build_system_prompt(ws.path(), "test-model", &[], None, None);
+    let prompt = build_system_prompt(
+        ws.path(),
+        "test-model",
+        &[],
+        None,
+        None,
+        crate::security::AutonomyLevel::Supervised,
+    );
 
     // Section headers
     assert!(
@@ -128,7 +135,14 @@ fn prompt_contains_all_sections() {
 #[test]
 fn base_prompt_does_not_advertise_entrypoint_tool_hints() {
     let ws = make_workspace();
-    let prompt = build_system_prompt(ws.path(), "gpt-4o", &[], None, None);
+    let prompt = build_system_prompt(
+        ws.path(),
+        "gpt-4o",
+        &[],
+        None,
+        None,
+        crate::security::AutonomyLevel::Supervised,
+    );
 
     assert!(!prompt.contains("**shell**"));
     assert!(!prompt.contains("Run commands"));
@@ -138,7 +152,14 @@ fn base_prompt_does_not_advertise_entrypoint_tool_hints() {
 #[test]
 fn base_prompt_excludes_request_local_tool_protocol() {
     let ws = make_workspace();
-    let prompt = build_system_prompt(ws.path(), "gpt-4o", &[], None, None);
+    let prompt = build_system_prompt(
+        ws.path(),
+        "gpt-4o",
+        &[],
+        None,
+        None,
+        crate::security::AutonomyLevel::Supervised,
+    );
 
     assert!(
         !prompt.contains("## Tool Use Protocol"),
@@ -149,7 +170,14 @@ fn base_prompt_excludes_request_local_tool_protocol() {
 #[test]
 fn prompt_injects_safety() {
     let ws = make_workspace();
-    let prompt = build_system_prompt(ws.path(), "model", &[], None, None);
+    let prompt = build_system_prompt(
+        ws.path(),
+        "model",
+        &[],
+        None,
+        None,
+        crate::security::AutonomyLevel::Supervised,
+    );
 
     assert!(prompt.contains("Do not exfiltrate private data"));
     assert!(prompt.contains("Do not run destructive commands"));
@@ -159,7 +187,14 @@ fn prompt_injects_safety() {
 #[test]
 fn prompt_injects_workspace_files() {
     let ws = make_workspace();
-    let prompt = build_system_prompt(ws.path(), "model", &[], None, None);
+    let prompt = build_system_prompt(
+        ws.path(),
+        "model",
+        &[],
+        None,
+        None,
+        crate::security::AutonomyLevel::Supervised,
+    );
 
     assert!(prompt.contains("### SOUL.md"), "missing SOUL.md header");
     assert!(prompt.contains("Be helpful"), "missing SOUL content");
@@ -183,7 +218,14 @@ fn prompt_injects_workspace_files() {
 fn prompt_missing_identity_files_are_skipped() {
     let tmp = TempDir::new().unwrap();
     // Empty workspace — no files at all
-    let prompt = build_system_prompt(tmp.path(), "model", &[], None, None);
+    let prompt = build_system_prompt(
+        tmp.path(),
+        "model",
+        &[],
+        None,
+        None,
+        crate::security::AutonomyLevel::Supervised,
+    );
 
     assert!(!prompt.contains("### SOUL.md"));
     assert!(!prompt.contains("### AGENTS.md"));
@@ -208,7 +250,14 @@ fn build_identity_prompt_loads_existing_files_only() {
 fn prompt_bootstrap_only_if_exists() {
     let ws = make_workspace();
     // No BOOTSTRAP.md — should not appear
-    let prompt = build_system_prompt(ws.path(), "model", &[], None, None);
+    let prompt = build_system_prompt(
+        ws.path(),
+        "model",
+        &[],
+        None,
+        None,
+        crate::security::AutonomyLevel::Supervised,
+    );
     assert!(
         !prompt.contains("### BOOTSTRAP.md"),
         "BOOTSTRAP.md should not appear when missing"
@@ -216,7 +265,14 @@ fn prompt_bootstrap_only_if_exists() {
 
     // Create BOOTSTRAP.md — should appear
     std::fs::write(ws.path().join("BOOTSTRAP.md"), "# Bootstrap\nFirst run.").unwrap();
-    let prompt2 = build_system_prompt(ws.path(), "model", &[], None, None);
+    let prompt2 = build_system_prompt(
+        ws.path(),
+        "model",
+        &[],
+        None,
+        None,
+        crate::security::AutonomyLevel::Supervised,
+    );
     assert!(
         prompt2.contains("### BOOTSTRAP.md"),
         "BOOTSTRAP.md should appear when present"
@@ -232,7 +288,14 @@ fn prompt_no_daily_memory_injection() {
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     std::fs::write(memory_dir.join(format!("{today}.md")), "# Daily\nSome note.").unwrap();
 
-    let prompt = build_system_prompt(ws.path(), "model", &[], None, None);
+    let prompt = build_system_prompt(
+        ws.path(),
+        "model",
+        &[],
+        None,
+        None,
+        crate::security::AutonomyLevel::Supervised,
+    );
 
     // Daily notes should NOT be in the system prompt (on-demand via tools)
     assert!(
@@ -245,7 +308,14 @@ fn prompt_no_daily_memory_injection() {
 #[test]
 fn prompt_runtime_metadata() {
     let ws = make_workspace();
-    let prompt = build_system_prompt(ws.path(), "claude-sonnet-4", &[], None, None);
+    let prompt = build_system_prompt(
+        ws.path(),
+        "claude-sonnet-4",
+        &[],
+        None,
+        None,
+        crate::security::AutonomyLevel::Supervised,
+    );
 
     assert!(prompt.contains("Model: claude-sonnet-4"));
     assert!(prompt.contains(&format!("OS: {}", std::env::consts::OS)));
@@ -273,7 +343,14 @@ fn prompt_skills_are_lazy_and_include_declared_tools() {
         embedding: None,
     }];
 
-    let prompt = build_system_prompt(ws.path(), "model", &skills, None, None);
+    let prompt = build_system_prompt(
+        ws.path(),
+        "model",
+        &skills,
+        None,
+        None,
+        crate::security::AutonomyLevel::Supervised,
+    );
 
     assert!(prompt.contains("<available_skills>"), "missing skills XML");
     assert!(prompt.contains("<name>code-review</name>"));
@@ -309,7 +386,14 @@ fn prompt_skills_escape_reserved_xml_chars() {
         embedding: None,
     }];
 
-    let prompt = build_system_prompt(ws.path(), "model", &skills, None, None);
+    let prompt = build_system_prompt(
+        ws.path(),
+        "model",
+        &skills,
+        None,
+        None,
+        crate::security::AutonomyLevel::Supervised,
+    );
 
     assert!(prompt.contains("<name>code&lt;review&gt;&amp;</name>"));
     assert!(prompt.contains("<description>Review &quot;unsafe&quot; and &apos;risky&apos; bits</description>"));
@@ -326,7 +410,14 @@ fn prompt_truncation() {
     let big_content = "x".repeat(BOOTSTRAP_MAX_CHARS + 1000);
     std::fs::write(ws.path().join("AGENTS.md"), &big_content).unwrap();
 
-    let prompt = build_system_prompt(ws.path(), "model", &[], None, None);
+    let prompt = build_system_prompt(
+        ws.path(),
+        "model",
+        &[],
+        None,
+        None,
+        crate::security::AutonomyLevel::Supervised,
+    );
 
     assert!(prompt.contains("truncated at"), "large files should be truncated");
     assert!(!prompt.contains(&big_content), "full content should not appear");
@@ -337,7 +428,14 @@ fn prompt_empty_files_skipped() {
     let ws = make_workspace();
     std::fs::write(ws.path().join("TOOLS.md"), "").unwrap();
 
-    let prompt = build_system_prompt(ws.path(), "model", &[], None, None);
+    let prompt = build_system_prompt(
+        ws.path(),
+        "model",
+        &[],
+        None,
+        None,
+        crate::security::AutonomyLevel::Supervised,
+    );
 
     // Empty file should not produce a header
     assert!(!prompt.contains("### TOOLS.md"), "empty files should be skipped");
@@ -359,7 +457,14 @@ fn channel_log_truncation_is_utf8_safe_for_multibyte_text() {
 #[test]
 fn runtime_prompt_excludes_channel_delivery_context() {
     let ws = make_workspace();
-    let prompt = build_system_prompt(ws.path(), "model", &[], None, None);
+    let prompt = build_system_prompt(
+        ws.path(),
+        "model",
+        &[],
+        None,
+        None,
+        crate::security::AutonomyLevel::Supervised,
+    );
 
     assert!(!prompt.contains("## Channel Capabilities"));
     assert!(!prompt.contains("running as a messaging bot"));
@@ -369,7 +474,14 @@ fn runtime_prompt_excludes_channel_delivery_context() {
 #[test]
 fn channel_prompt_includes_channel_delivery_context() {
     let ws = make_workspace();
-    let base_prompt = build_system_prompt(ws.path(), "model", &[], None, None);
+    let base_prompt = build_system_prompt(
+        ws.path(),
+        "model",
+        &[],
+        None,
+        None,
+        crate::security::AutonomyLevel::Supervised,
+    );
     let msg = traits::ChannelMessage {
         channel: "telegram".to_string(),
         reply_target: "chat-1".to_string(),
@@ -500,7 +612,14 @@ fn current_conversation_prompt_renders_thread_self_consistently() {
 #[test]
 fn prompt_workspace_path() {
     let ws = make_workspace();
-    let prompt = build_system_prompt(ws.path(), "model", &[], None, None);
+    let prompt = build_system_prompt(
+        ws.path(),
+        "model",
+        &[],
+        None,
+        None,
+        crate::security::AutonomyLevel::Supervised,
+    );
 
     assert!(prompt.contains(&format!("Working directory: `{}`", ws.path().display())));
 }

@@ -98,7 +98,14 @@ fn aieos_identity_from_file() {
         aieos_inline: None,
     };
 
-    let prompt = build_system_prompt(tmp.path(), "model", &[], Some(&config), None);
+    let prompt = build_system_prompt(
+        tmp.path(),
+        "model",
+        &[],
+        Some(&config),
+        None,
+        crate::security::AutonomyLevel::Supervised,
+    );
 
     // Should contain AIEOS sections
     assert!(prompt.contains("## Identity"));
@@ -132,7 +139,14 @@ fn aieos_identity_from_inline() {
         aieos_inline: Some(r#"{"identity":{"names":{"first":"Claw"}}}"#.into()),
     };
 
-    let prompt = build_system_prompt(std::env::temp_dir().as_path(), "model", &[], Some(&config), None);
+    let prompt = build_system_prompt(
+        std::env::temp_dir().as_path(),
+        "model",
+        &[],
+        Some(&config),
+        None,
+        crate::security::AutonomyLevel::Supervised,
+    );
 
     assert!(prompt.contains("**Name:** Claw"));
     assert!(prompt.contains("## Identity"));
@@ -149,7 +163,14 @@ fn aieos_fallback_to_openclaw_on_parse_error() {
     };
 
     let ws = make_workspace();
-    let prompt = build_system_prompt(ws.path(), "model", &[], Some(&config), None);
+    let prompt = build_system_prompt(
+        ws.path(),
+        "model",
+        &[],
+        Some(&config),
+        None,
+        crate::security::AutonomyLevel::Supervised,
+    );
 
     // Should fall back to OpenClaw format when AIEOS file is not found
     // (Error is logged to stderr with filename, not included in prompt)
@@ -168,7 +189,14 @@ fn aieos_empty_uses_openclaw() {
     };
 
     let ws = make_workspace();
-    let prompt = build_system_prompt(ws.path(), "model", &[], Some(&config), None);
+    let prompt = build_system_prompt(
+        ws.path(),
+        "model",
+        &[],
+        Some(&config),
+        None,
+        crate::security::AutonomyLevel::Supervised,
+    );
 
     // Should use OpenClaw format (not configured for AIEOS)
     assert!(prompt.contains("### SOUL.md"));
@@ -186,7 +214,14 @@ fn openclaw_format_uses_bootstrap_files() {
     };
 
     let ws = make_workspace();
-    let prompt = build_system_prompt(ws.path(), "model", &[], Some(&config), None);
+    let prompt = build_system_prompt(
+        ws.path(),
+        "model",
+        &[],
+        Some(&config),
+        None,
+        crate::security::AutonomyLevel::Supervised,
+    );
 
     // Should use OpenClaw format even if aieos_path is set
     assert!(prompt.contains("### SOUL.md"));
@@ -198,7 +233,14 @@ fn openclaw_format_uses_bootstrap_files() {
 fn none_identity_config_uses_openclaw() {
     let ws = make_workspace();
     // Pass None for identity config
-    let prompt = build_system_prompt(ws.path(), "model", &[], None, None);
+    let prompt = build_system_prompt(
+        ws.path(),
+        "model",
+        &[],
+        None,
+        None,
+        crate::security::AutonomyLevel::Supervised,
+    );
 
     // Should use OpenClaw format
     assert!(prompt.contains("### SOUL.md"));

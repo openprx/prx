@@ -783,6 +783,7 @@ pub(super) async fn run_channel_turn(
                 crate::providers::traits::ProviderRequestMode::NonStreaming,
             )
             .native_tool_calling,
+        security.autonomy,
     );
     let bot_identity = target_channel.as_ref().and_then(|channel| channel.bot_identity());
     let mut system_prompt = build_channel_system_prompt(

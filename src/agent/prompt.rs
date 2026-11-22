@@ -16,7 +16,14 @@ pub struct PromptContext<'a> {
     pub identity_config: Option<&'a IdentityConfig>,
     pub bootstrap_max_chars: Option<usize>,
     pub native_tools: bool,
+    /// The turn's effective level; it selects the safety paragraph.
+    pub autonomy: crate::security::AutonomyLevel,
 }
+
+/// The safety paragraph of a Full turn's system prompt.
+pub const FULL_AUTONOMY_SAFETY: &str = "You are running with full autonomy. PRX applies no restrictions to commands, \
+     paths, network access or tools; only operating-system permissions apply. Act directly and do not ask for \
+     confirmation unless the user asked you to.";
 
 pub trait PromptSection: Send + Sync {
     fn name(&self) -> &str;
@@ -250,7 +257,10 @@ impl PromptSection for SafetySection {
         "safety"
     }
 
-    fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
+    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        if ctx.autonomy == crate::security::AutonomyLevel::Full {
+            return Ok(format!("## Safety\n\n{FULL_AUTONOMY_SAFETY}"));
+        }
         Ok("## Safety\n\n- Do not exfiltrate private data.\n- Do not run destructive commands without asking.\n- Do not bypass oversight or approval mechanisms.\n- Prefer `trash` over `rm` (recoverable beats gone forever).\n- When in doubt, ask before acting externally.".into())
     }
 }
@@ -424,6 +434,7 @@ mod tests {
             identity_config: None,
             bootstrap_max_chars: None,
             native_tools: true,
+            autonomy: crate::security::AutonomyLevel::Supervised,
         };
         let prompt = IdentitySection.build(&ctx).unwrap();
         assert!(prompt.contains("Managed identity sentinel"));
@@ -450,6 +461,7 @@ mod tests {
             identity_config: Some(&identity_config),
             bootstrap_max_chars: None,
             native_tools: true,
+            autonomy: crate::security::AutonomyLevel::Supervised,
         };
 
         let section = IdentitySection;
@@ -479,6 +491,7 @@ mod tests {
             identity_config: None,
             bootstrap_max_chars: None,
             native_tools: true,
+            autonomy: crate::security::AutonomyLevel::Supervised,
         };
         let prompt = IdentitySection.build(&ctx).unwrap();
 
@@ -500,6 +513,7 @@ mod tests {
             identity_config: None,
             bootstrap_max_chars: None,
             native_tools: true,
+            autonomy: crate::security::AutonomyLevel::Supervised,
         };
         let prompt = IdentitySection.build(&ctx).unwrap();
 
@@ -516,6 +530,7 @@ mod tests {
             identity_config: None,
             bootstrap_max_chars: None,
             native_tools: true,
+            autonomy: crate::security::AutonomyLevel::Supervised,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(prompt.contains("## Your Task"));
@@ -535,6 +550,7 @@ mod tests {
             identity_config: None,
             bootstrap_max_chars: None,
             native_tools: true,
+            autonomy: crate::security::AutonomyLevel::Supervised,
         };
         let builder = SystemPromptBuilder::with_defaults();
 
@@ -599,6 +615,7 @@ mod tests {
             identity_config: None,
             bootstrap_max_chars: None,
             native_tools: true,
+            autonomy: crate::security::AutonomyLevel::Supervised,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -619,6 +636,7 @@ mod tests {
             identity_config: None,
             bootstrap_max_chars: None,
             native_tools: true,
+            autonomy: crate::security::AutonomyLevel::Supervised,
         };
 
         let rendered = DateTimeSection.build(&ctx).unwrap();
@@ -654,6 +672,7 @@ mod tests {
             identity_config: None,
             bootstrap_max_chars: None,
             native_tools: true,
+            autonomy: crate::security::AutonomyLevel::Supervised,
         };
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
@@ -676,6 +695,7 @@ mod tests {
             identity_config: None,
             bootstrap_max_chars: None,
             native_tools: false,
+            autonomy: crate::security::AutonomyLevel::Supervised,
         };
 
         let prompt = TaskSection.build(&ctx).unwrap();
@@ -705,6 +725,7 @@ mod tests {
                 identity_config: None,
                 bootstrap_max_chars: None,
                 native_tools,
+                autonomy: crate::security::AutonomyLevel::Supervised,
             };
             let section = TaskSection.build(&ctx).expect("test: task section builds");
             for grammar in ["<tool_call>", "<function="] {

@@ -88,6 +88,7 @@ fn build_runtime_system_prompt_with(
         Some(&config.identity),
         bootstrap_max_chars,
         native_tools,
+        config.autonomy.level,
     )
 }
 

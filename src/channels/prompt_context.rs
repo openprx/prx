@@ -195,6 +195,7 @@ pub fn build_system_prompt(
     skills: &[crate::skills::Skill],
     identity_config: Option<&crate::config::IdentityConfig>,
     bootstrap_max_chars: Option<usize>,
+    autonomy: crate::security::AutonomyLevel,
 ) -> String {
     build_system_prompt_with_mode(
         workspace_dir,
@@ -203,6 +204,7 @@ pub fn build_system_prompt(
         identity_config,
         bootstrap_max_chars,
         false,
+        autonomy,
     )
 }
 
@@ -213,6 +215,7 @@ pub fn build_system_prompt_with_mode(
     identity_config: Option<&crate::config::IdentityConfig>,
     bootstrap_max_chars: Option<usize>,
     native_tools: bool,
+    autonomy: crate::security::AutonomyLevel,
 ) -> String {
     build_system_prompt_with_builder(
         crate::agent::prompt::SystemPromptBuilder::with_defaults(),
@@ -222,6 +225,7 @@ pub fn build_system_prompt_with_mode(
         identity_config,
         bootstrap_max_chars,
         native_tools,
+        autonomy,
     )
 }
 
@@ -235,6 +239,7 @@ pub(crate) fn build_system_prompt_with_builder(
     identity_config: Option<&crate::config::IdentityConfig>,
     bootstrap_max_chars: Option<usize>,
     native_tools: bool,
+    autonomy: crate::security::AutonomyLevel,
 ) -> String {
     let context = crate::agent::prompt::PromptContext {
         workspace_dir,
@@ -243,6 +248,7 @@ pub(crate) fn build_system_prompt_with_builder(
         identity_config,
         bootstrap_max_chars,
         native_tools,
+        autonomy,
     };
     builder.build(&context).unwrap_or_else(|error| {
         tracing::error!(%error, "failed to build canonical system prompt");

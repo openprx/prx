@@ -411,6 +411,10 @@ async fn run_work(
         identity_config: Some(&agent.identity_config),
         bootstrap_max_chars: None,
         native_tools: service.model_can_call_tools(source),
+        autonomy: crate::runtime::turn_source::TurnSourceProof::child_scope(source).map_or_else(
+            || service.security().autonomy,
+            |scope| scope.gate_inputs().0.authority.level,
+        ),
     })?;
     let mut history = agent.tool_dispatcher.to_provider_messages(&agent.history);
     if let Some(first) = history.first_mut().filter(|message| message.role == "system") {

@@ -145,6 +145,10 @@ pub(crate) fn redacted_projection(
     constraints.dedup();
     let constraints = recent(&constraints, MAX_CONSTRAINTS, "constraints", &mut manifest);
 
+    // The approval a candidate shows the model is fed from the turn's
+    // admission: a Full turn (guarded write) requests no approval.
+    let approval_admitted =
+        trusted.side_effect_mode == crate::tools::capability::turn_state::SideEffectMode::GuardedWrite;
     let candidates: Vec<Value> = candidates
         .into_iter()
         .map(|derived| {
@@ -154,7 +158,11 @@ pub(crate) fn redacted_projection(
                 "action": candidate.action().as_str(),
                 "target": candidate.target().as_str(),
                 "side_effect": candidate.side_effect().as_str(),
-                "approval": candidate.approval().code(),
+                "approval": if approval_admitted {
+                    crate::tools::capability::contract::ApprovalRequirement::None.code()
+                } else {
+                    candidate.approval().code()
+                },
                 "cost_bucket": candidate
                     .estimated_cost()
                     .map_or(UNKNOWN_COST_BUCKET, |cost| bucket(cost.micro_usd, &COST_BUCKETS)),
