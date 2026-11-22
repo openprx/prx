@@ -318,17 +318,19 @@ async fn execute_one_unrecorded(
     let execution_context = adapter.tool_execution_context.clone();
     let cancellation = cancellation.cloned();
     // Every memory or document write of this call is attributed to the
-    // turn's run narrowed to this call's operation id.
-    let outcome = crate::memory::write_provenance::scope_operation(&tool_call_id, async {
-        if matches!(call.name.as_str(), "delegate" | "sessions_spawn") {
-            spawn_delegation_tool(service.clone(), command, execution_context, cancellation)
+    // turn's run narrowed to this call's operation id; a delegation task is
+    // spawned inside the scope so it captures that narrowed provenance.
+    let service = Arc::clone(service);
+    let execute: ScopedToolExecution = if matches!(call.name.as_str(), "delegate" | "sessions_spawn") {
+        Box::pin(async move {
+            spawn_delegation_tool(service, command, execution_context, cancellation)
                 .join()
                 .await
-        } else {
-            Ok(service.execute(command, execution_context, cancellation).await)
-        }
-    })
-    .await?;
+        })
+    } else {
+        Box::pin(async move { Ok(service.execute(command, execution_context, cancellation).await) })
+    };
+    let outcome = crate::memory::write_provenance::scope_operation(&tool_call_id, execute).await?;
     let awaiting_approval = outcome.status == crate::tools::ToolExecutionStatus::AwaitingApproval;
     let success = outcome.succeeded();
     // Legacy failures can be backend refusals. Only process facts establish
@@ -361,6 +363,11 @@ async fn execute_one_unrecorded(
 
 type ToolExecutionFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = crate::tools::ToolExecutionOutcome> + Send>>;
+
+/// One call's execution, boxed so only a pointer moves through the write
+/// provenance scope's frames.
+type ScopedToolExecution =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<crate::tools::ToolExecutionOutcome>> + Send>>;
 
 /// Delegation backends contain another complete agent loop. Start their fixed
 /// execution pipeline in a separate task so the backend gets a fresh worker

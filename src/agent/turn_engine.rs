@@ -150,9 +150,11 @@ pub(crate) async fn run_turn(
         .and_then(|adapter| adapter.provider_trace.clone());
     let started = std::time::Instant::now();
     let provenance = turn_write_provenance(&services);
+    // The loop future is boxed before the scope takes it, so only a pointer
+    // moves through the scope's frames.
     let inner = Box::pin(crate::memory::write_provenance::scope_turn(
         provenance,
-        run_turn_unguarded(history, request, services, delivery),
+        Box::pin(run_turn_unguarded(history, request, services, delivery)),
     ));
     let result = crate::agent::idle::run_guarded(
         crate::agent::idle::configured(),
