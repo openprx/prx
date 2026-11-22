@@ -35,9 +35,10 @@ const BATCH_MAX: usize = 100;
 const BODY_MAX_BYTES: usize = 64 * 1024;
 
 const AGENT_RULE: &str = "agent must be \"main\" or an agent name";
-const BODY_RULE: &str = "the body must be {\"agent\"?} with agent a string";
+const BODY_RULE: &str =
+    "the body must be {\"agent\"?,\"forget_writes\"?} with agent a string and forget_writes a boolean";
 const REPLY_BODY_RULE: &str = "forget_writes must be a boolean";
-const BATCH_RULE: &str = "the body must be {\"ids\":[1 to 100 client_message_id strings],\"agent\"?}";
+const BATCH_RULE: &str = "the body must be {\"ids\":[1 to 100 client_message_id strings],\"agent\"?,\"forget_writes\"?} with forget_writes a boolean";
 
 fn field_invalid(message: &str) -> Response {
     coded_error(StatusCode::BAD_REQUEST, "field_invalid", message)

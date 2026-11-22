@@ -18,6 +18,7 @@
 
 use super::SqliteMemory;
 use crate::memory::rf_messages::{RfForgetCounts, RfForgetRefused};
+use crate::memory::topic::delete_orphan_topic;
 use crate::memory::write_provenance::WriteProvenance;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
@@ -334,33 +335,6 @@ fn delete_memory(tx: &Connection, memory_id: &str) -> anyhow::Result<bool> {
         delete_orphan_topic(tx, &topic_id)?;
     }
     Ok(deleted)
-}
-
-/// A memory write derives a topic from the memory's text (its title is a
-/// prefix of the content). Once nothing references the topic any more, it
-/// goes with the memory, with its participants and aliases.
-fn delete_orphan_topic(tx: &Connection, topic_id: &str) -> anyhow::Result<()> {
-    let referenced: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM memories WHERE topic_id = ?1)
-             OR EXISTS(SELECT 1 FROM documents WHERE topic_id = ?1)
-             OR EXISTS(SELECT 1 FROM document_chunks WHERE topic_id = ?1)
-             OR EXISTS(SELECT 1 FROM topic_aliases WHERE to_topic_id = ?1)",
-        params![topic_id],
-        |row| row.get(0),
-    )?;
-    if referenced {
-        return Ok(());
-    }
-    for statement in [
-        "DELETE FROM topic_participants WHERE topic_id = ?1",
-        "DELETE FROM topic_aliases WHERE from_topic_id = ?1",
-    ] {
-        tx.execute(statement, params![topic_id])?;
-    }
-    if tx.execute("DELETE FROM topics WHERE id = ?1", params![topic_id])? > 0 {
-        tx.execute("INSERT INTO topics_fts(topics_fts) VALUES('rebuild')", [])?;
-    }
-    Ok(())
 }
 
 /// Delete one document with its chunks and derived copies; `false` when it

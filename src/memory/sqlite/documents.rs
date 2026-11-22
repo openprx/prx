@@ -2,6 +2,7 @@
 
 use super::vector;
 use crate::memory::principal::{OwnerPrincipal, Role};
+use crate::memory::topic::delete_orphan_topic;
 use crate::memory::traits::{
     AgentScopeRefused, CompactionRun, CompactionRunInput, DocumentChunkRecord, DocumentIngestInput, DocumentRecord,
     DocumentSearchResult, MemoryLink, MemoryLinkInput, MemoryPrincipal, PartitionKey, RetrievalTrace,
@@ -165,6 +166,14 @@ impl SqliteMemory {
                 if expected_salt.is_some() && bound_scope != expected_salt {
                     return Ok(IngestOutcome::Retry);
                 }
+                let previous_topic_id: Option<String> = tx
+                    .query_row(
+                        "SELECT topic_id FROM documents WHERE document_id = ?1",
+                        params![document_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .flatten();
                 let coalesce = super::agent_migration::scope_coalesce_set("documents");
                 let scope_guard = super::agent_migration::scope_conflict_guard("documents", false);
                 let changed = tx.execute(
@@ -283,6 +292,12 @@ impl SqliteMemory {
                             cache_max,
                         )?;
                     }
+                }
+
+                if let Some(previous) = previous_topic_id.as_deref()
+                    && Some(previous) != input.topic_id.as_deref()
+                {
+                    delete_orphan_topic(&tx, previous)?;
                 }
 
                 if let Some(provenance) = provenance.as_deref() {

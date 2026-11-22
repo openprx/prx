@@ -3,7 +3,7 @@
 use super::vector;
 use crate::memory::filter::{MemorySafetyFilter, SourceMetadata, safety_rejection_message};
 use crate::memory::principal::{ChatType, MemoryWriteContext, Principal, classify_memory, log_access, post_filter};
-use crate::memory::topic::resolve_topic;
+use crate::memory::topic::{delete_orphan_topic, resolve_topic};
 use crate::memory::traits::{
     DecisionMemoryHit, Memory, MemoryCategory, MemoryEntry, MemoryReadMode, MemoryStoreMetadata,
     validate_memory_write_target,
@@ -337,6 +337,11 @@ impl SqliteMemory {
                     return Ok(WriteOutcome::Retry);
                 }
 
+                let previous_topic_id: Option<String> = tx
+                    .query_row("SELECT topic_id FROM memories WHERE key = ?1", params![&key], |row| row.get(0))
+                    .optional()?
+                    .flatten();
+
                 if let Some(ctx) = write_ctx {
                     if let Some(owner) = isolated_owner.as_deref() {
                         let stored_owner: Option<Option<String>> = tx
@@ -440,6 +445,11 @@ impl SqliteMemory {
                         }
                         .into());
                     }
+                    if let Some(previous) = previous_topic_id.as_deref()
+                        && Some(previous) != topic_id.as_deref()
+                    {
+                        delete_orphan_topic(&tx, previous)?;
+                    }
                 } else {
                     let coalesce = super::agent_migration::scope_coalesce_set("memories");
                     let scope_guard = super::agent_migration::scope_conflict_guard("memories", false);
@@ -499,6 +509,11 @@ impl SqliteMemory {
                             key: key.clone(),
                         }
                         .into());
+                    }
+                    if let Some(previous) = previous_topic_id.as_deref()
+                        && Some(previous) != metadata.topic_id.as_deref()
+                    {
+                        delete_orphan_topic(&tx, previous)?;
                     }
                 }
 
