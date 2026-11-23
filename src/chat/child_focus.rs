@@ -344,18 +344,37 @@ impl ChildFocus {
                         None,
                         turns.iter().map(|turn| (turn.role.as_str(), turn.content.as_str())),
                     );
-                    if let crate::agent::compaction::CompactionBuild::Patch(patch) =
-                        crate::agent::compaction::build_configurable_compaction_patch_with_source_history(
-                            &history,
-                            &source,
-                            provider.as_ref(),
-                            &record.model,
-                            &ctx.generation.effective.agent.compaction,
-                            Some(&audit),
-                            crate::agent::compaction::MANUAL_COMPACT_TRIGGER,
-                        )
-                        .await?
-                    {
+                    let mut compaction = ctx.generation.effective.agent.compaction.clone();
+                    let mut built = None;
+                    // Steering segments can have distinct run provenance. Keep
+                    // more recent turns rather than invent an exact handoff for
+                    // an ambiguous cold window. Every attempted patch still
+                    // goes through the normal transcript provenance checks.
+                    const MAX_CHILD_COMPACTION_BOUNDARIES: usize = 16;
+                    for _ in 0..MAX_CHILD_COMPACTION_BOUNDARIES {
+                        if let crate::agent::compaction::CompactionBuild::Patch(patch) =
+                            crate::agent::compaction::build_configurable_compaction_patch_with_source_history(
+                                &history,
+                                &source,
+                                provider.as_ref(),
+                                &record.model,
+                                &compaction,
+                                Some(&audit),
+                                crate::agent::compaction::MANUAL_COMPACT_TRIGGER,
+                            )
+                            .await?
+                        {
+                            built = Some(patch);
+                            break;
+                        }
+                        if compaction.mode != crate::config::AgentCompactionMode::Switch
+                            || compaction.keep_recent_messages >= history.len()
+                        {
+                            break;
+                        }
+                        compaction.keep_recent_messages = compaction.keep_recent_messages.saturating_add(2);
+                    }
+                    if let Some(patch) = built {
                         crate::agent::compaction::apply_compaction_patch_exact(&mut history, &patch)?;
                         turns = history
                             .into_iter()
@@ -366,7 +385,9 @@ impl ChildFocus {
                             })
                             .collect();
                     } else {
-                        return Ok(Some("Child context has no older complete turn to compact.".into()));
+                        return Ok(Some(
+                            "Child compaction unavailable: no older complete window has exact durable transcript provenance. Context retained.".into(),
+                        ));
                     }
                 }
                 _ => {}
