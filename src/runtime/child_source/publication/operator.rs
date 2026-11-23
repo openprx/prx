@@ -68,6 +68,14 @@ impl IndependentChildPublication {
                 generation: entry.generation,
             })
             .collect();
+        tracing::debug!(
+            mailbox = source.mailbox_child_source_id().is_some(),
+            level = ?security.autonomy,
+            shell_visible = service.catalog_view().iter_entries().any(|entry| entry.public_name == "shell"),
+            shell_allowed = allowed.iter().any(|reference| reference.id.as_str().ends_with(":shell")),
+            shell_registered = service.registry.iter().any(|tool| tool.supports_name("shell")),
+            "independent child capability source captured"
+        );
         let remaining = runtime.workspace_remaining_micro_usd()?;
         let authority = crate::runtime::child_source::ParentAuthority::for_run(
             source.run_id(),
@@ -212,6 +220,12 @@ impl IndependentChildPublication {
         let served = parent
             .catalog
             .served_references(&execution, &self.authority.constraints.allowed);
+        tracing::debug!(
+            mailbox,
+            shell_registered = registry.iter().any(|tool| tool.supports_name("shell")),
+            shell_served = served.iter().any(|reference| reference.id.as_str().ends_with(":shell")),
+            "independent child executor bound"
+        );
         let mut policy = parent.publication_policy.clone();
         // The frozen capability set is a membership limit. Full has no
         // permission limits (R51/OV-4): a Full task publishes under the
