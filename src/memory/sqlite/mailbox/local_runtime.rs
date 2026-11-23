@@ -151,6 +151,13 @@ impl SqliteMailbox {
         }
         let known:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM message_events WHERE workspace_id=?1 AND owner_id=?2 AND session_key=?3) OR EXISTS(SELECT 1 FROM sessions WHERE owner_id=?2 AND session_key=?3) OR EXISTS(SELECT 1 FROM child_sessions WHERE workspace_id=?1 AND owner_id=?2 AND session_id=?3) OR EXISTS(SELECT 1 FROM agent_scopes WHERE workspace_id=?1 AND owner_id=?2 AND session_key=?3 AND agent_key=?4)",params![workspace,address.owner,address.session,crate::messaging::mailbox::agent_key(&address.agent)?],|r|r.get(0)).map_err(storage_error)?;
         if !known && !registered {
+            tracing::debug!(
+                workspace = %crate::agent::diagnostics::text_class(workspace),
+                owner = %crate::agent::diagnostics::text_class(&address.owner),
+                session = %crate::agent::diagnostics::text_class(&address.session),
+                agent = %crate::agent::diagnostics::text_class(&address.agent),
+                "mailbox receiver lookup missed"
+            );
             return Err(crate::messaging::mailbox::unauthorized(
                 crate::messaging::mailbox::UnauthorizedReason::ReceiverUnknown,
             ));
