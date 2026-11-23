@@ -796,14 +796,15 @@ store as normal provider management:
 
 ```sh
 # Supply the provider key on stdin through a private pipe.
-prx onboard --non-interactive --provider <id> --model <model>
+prx init --provider <id> --model <model> --from-stdin
 prx token issue --out <private-token-path>
 prx service install --user --yes
 prx service start
 prx status --json
 ```
 
-`--model` is optional. The provider key is read only from stdin and stored
+`init` uses non-interactive quick setup by default; `--model` is optional.
+With `--from-stdin`, the provider key is read only from stdin and stored
 through the encrypted provider-credential reference store, with its existing
 0600 `.secret_key`. Missing inputs fail nonzero with a typed message. Provider
 keys never belong in argv, environment variables, logs or plaintext files.

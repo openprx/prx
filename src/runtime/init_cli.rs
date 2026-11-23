@@ -88,12 +88,14 @@ pub(crate) async fn run(cli: &Cli) -> Result<()> {
         if channels_only && (*from_stdin || from_env.is_some()) {
             bail!("--channels-only does not accept --from-stdin or --from-env");
         }
-        let api_key = manage_cli::secret_from(
-            *from_stdin,
-            from_env.as_deref(),
-            &mut std::io::stdin(),
-            &|name: &str| std::env::var(name).ok(),
-        )?
+        let provider_secret = if *from_stdin {
+            Some(super::host_bootstrap::provider_key(&mut std::io::stdin())?)
+        } else {
+            None
+        };
+        let api_key = manage_cli::secret_from(false, from_env.as_deref(), &mut std::io::stdin(), &|name: &str| {
+            std::env::var(name).ok()
+        })?
         .or_else(|| api_key.clone());
         let provider = provider.clone();
         let model = model.clone();
@@ -144,6 +146,11 @@ pub(crate) async fn run(cli: &Cli) -> Result<()> {
             } else {
                 spec.generate(&target, *force).await?;
                 openprx::config::Config::load_or_init_with_config_dir(config_dir).await?
+            };
+            let config = if let Some(secret) = provider_secret {
+                super::host_bootstrap::store_provider_key(config, &secret).await?
+            } else {
+                config
             };
             if let Some(decision) = &decision {
                 let text = match decision_secret {

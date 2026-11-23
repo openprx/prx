@@ -90,51 +90,35 @@ pub async fn issue_token(config: Config, out: &Path, force: bool) -> Result<Stri
     Ok(owner.to_string())
 }
 
-/// Configure the provider selection without passing secret material through arguments.
-pub async fn onboard(
-    config_dir: Option<&str>,
-    provider: &str,
-    model: Option<&str>,
-    stdin: &mut dyn Read,
-) -> Result<Config> {
+/// Bounded provider-key input shared with `prx init --from-stdin`.
+pub(crate) fn provider_key(stdin: &mut dyn Read) -> Result<zeroize::Zeroizing<String>> {
     const MAX_CREDENTIAL_BYTES: u64 = 64 * 1024;
-    if provider.trim().is_empty() {
-        return Err(BootstrapError::Missing("provider").into());
-    }
-    if model.is_some_and(|model| model.trim().is_empty()) {
-        return Err(BootstrapError::Missing("model").into());
-    }
-    let id = crate::providers::ProviderId::of(provider);
-    let name = id
-        .catalog_name()
-        .context(BootstrapError::Invalid("provider requires a catalog identity"))?
-        .to_owned();
     let mut secret = zeroize::Zeroizing::new(String::new());
     stdin.take(MAX_CREDENTIAL_BYTES + 1).read_to_string(&mut secret)?;
     if secret.len() as u64 > MAX_CREDENTIAL_BYTES {
         return Err(BootstrapError::Invalid("provider key too large").into());
     }
-    let secret = secret.trim_end_matches(['\r', '\n']);
+    let trimmed_len = secret.trim_end_matches(['\r', '\n']).len();
+    secret.truncate(trimmed_len);
     if secret.trim().is_empty() {
         return Err(BootstrapError::Missing("provider key on stdin").into());
     }
-    // Generate the normal minimal configuration first, without a plaintext key.
-    let config = crate::initialization::wizard::run_quick_setup(
-        None,
-        Some(provider),
-        model,
-        None,
-        config_dir,
-        crate::config::init::Spec::Minimal,
-        false,
-    )
-    .await?;
+    Ok(secret)
+}
+
+/// Persist only through the approved encrypted provider-reference store.
+pub(crate) async fn store_provider_key(config: Config, secret: &str) -> Result<Config> {
+    let provider = crate::providers::selection::default_provider(&config).to_owned();
+    let name = crate::providers::ProviderId::of(&provider)
+        .catalog_name()
+        .context(BootstrapError::Invalid("provider requires a catalog identity"))?
+        .to_owned();
     anyhow::ensure!(config.secrets.encrypt, "credential_encryption_required");
     crate::config::manage::service::ManagementService::deferred(crate::config::new_shared(config.clone()))
-        .set_credential(provider.to_owned(), name, secret.to_owned(), ConfigActor::Cli)
+        .set_credential(provider, name, secret.to_owned(), ConfigActor::Cli)
         .await
         .map_err(|error| anyhow::anyhow!("{error}"))?;
-    Ok(config)
+    Config::load_from_path(&config.config_path, config.workspace_dir)
 }
 
 /// The gateway binding owns this file, including when supervised by the daemon.

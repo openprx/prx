@@ -114,7 +114,7 @@ fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
 
 const fn cli_tracing_command(command: &Commands) -> cli_tracing::CliCommand {
     match command {
-        Commands::Init { .. } | Commands::Onboard { .. } | Commands::Token { .. } => cli_tracing::CliCommand::Init,
+        Commands::Init { .. } | Commands::Token { .. } => cli_tracing::CliCommand::Init,
         Commands::Go { .. } => cli_tracing::CliCommand::Go,
         Commands::Chat { message: Some(_), .. } => cli_tracing::CliCommand::ChatMessage,
         Commands::Chat { .. } => cli_tracing::CliCommand::Chat,
@@ -399,15 +399,6 @@ enum TokenCommands {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Configure a host non-interactively; read the provider key from stdin
-    Onboard {
-        #[arg(long, required = true)]
-        non_interactive: bool,
-        #[arg(long)]
-        provider: String,
-        #[arg(long, short = 'm')]
-        model: Option<String>,
-    },
     /// Issue an install-owner bearer into a private output file
     Token {
         #[command(subcommand)]
@@ -1796,16 +1787,6 @@ async fn async_main(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
-    if let Commands::Onboard { provider, model, .. } = &cli.command {
-        runtime::host_bootstrap::onboard(
-            cli.config_dir.as_deref(),
-            provider,
-            model.as_deref(),
-            &mut std::io::stdin(),
-        )
-        .await?;
-        return Ok(());
-    }
     if let Commands::Token {
         command: TokenCommands::Issue { out, force },
     } = &cli.command
@@ -3748,7 +3729,7 @@ mod tests {
     /// `Commands::Gateway` to `CliCommand::Chat` fails the gateway row.
     fn commands_coverage_tag(command: &Commands) -> &'static str {
         match command {
-            Commands::Init { .. } | Commands::Onboard { .. } | Commands::Token { .. } => "Init",
+            Commands::Init { .. } | Commands::Token { .. } => "Init",
             Commands::Go { .. } => "Go",
             Commands::Chat { message: Some(_), .. } => "ChatMessage",
             Commands::Chat { .. } => "Chat",
