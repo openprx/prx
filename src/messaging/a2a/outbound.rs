@@ -245,7 +245,7 @@ fn attempt_reason(error: &anyhow::Error) -> &'static str {
     }
     "peer_attempt_failed"
 }
-fn status_reason(status: u16) -> &'static str {
+const fn status_reason(status: u16) -> &'static str {
     match status {
         400 => "field_invalid",
         401 => "peer_unauthenticated",
