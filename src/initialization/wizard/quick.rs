@@ -139,14 +139,6 @@ pub async fn run_quick_setup(
             crate::providers::selection::default_model(config),
         )
     };
-    // Preflight before generation can archive a previous configuration.
-    // The staged candidate is checked again before the atomic commit.
-    let mut preflight = if target.join("config.toml").exists() {
-        Config::load_from_path(&target.join("config.toml"), target.join("workspace"))?
-    } else {
-        Config::default()
-    };
-    customize(&mut preflight)?;
     let report = spec.generate_customized(&target, force, Some(&customize), None).await?;
     report.print();
     report.into_result()?;

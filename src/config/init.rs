@@ -119,11 +119,8 @@ impl Spec {
         let main_toml = main_config_template(self);
         let workspace_dir = target_dir.join("workspace");
         let mut report = InitReport::default();
-        let archive = if regenerating {
-            archive_previous_config(target_dir, &config_path)?
-        } else {
-            None
-        };
+        let mut preservation = None;
+        let mut reset_reason = None;
         // Recorded before anything is written, because the sidecar this run
         // writes describes this build's defaults, not the previous build's.
         let previous_defaults = if regenerating {
@@ -142,8 +139,8 @@ impl Spec {
         let (effective_main, effective_fragments) = if regenerating {
             let (merged_main, merged_fragments, outcome) =
                 preserve_previous_settings(&config_path, &main_toml, &fragments, previous_defaults.as_ref())?;
-            report.record_preservation(&outcome, archive.as_deref());
-            preserved_revision = outcome.base_revision.or(preserved_revision);
+            preserved_revision = outcome.base_revision.clone().or(preserved_revision);
+            preservation = Some(outcome);
             (merged_main, merged_fragments)
         } else {
             (main_toml.clone(), fragments.clone())
@@ -160,10 +157,9 @@ impl Spec {
                 // archive, the reason is printed, and `into_result` exits non-zero
                 // so neither a human nor a script can mistake this for a clean run.
                 Err(error) if regenerating => {
-                    report.record_reset(
-                        &format!("the preserved settings do not validate against this build ({error:#})"),
-                        archive.as_deref(),
-                    );
+                    reset_reason = Some(format!(
+                        "the preserved settings do not validate against this build ({error:#})"
+                    ));
                     super::files::plan_mutation(&config_path, &workspace_dir, main_toml, fragments)?
                 }
                 Err(error) => return Err(error),
@@ -175,6 +171,18 @@ impl Spec {
             candidate.validate()?;
             let (main, fragments) = candidate.to_split_toml_strings()?;
             plan = super::files::plan_mutation(&config_path, &workspace_dir, main, fragments)?;
+        }
+        // Admission must finish before even a backup directory is written.
+        let archive = if regenerating {
+            archive_previous_config(target_dir, &config_path)?
+        } else {
+            None
+        };
+        if let Some(outcome) = preservation {
+            report.record_preservation(&outcome, archive.as_deref());
+        }
+        if let Some(reason) = reset_reason {
+            report.record_reset(&reason, archive.as_deref());
         }
         let committed = super::files::commit_mutation_guarded(plan, preserved_revision.as_deref(), move |before| {
             anyhow::ensure!(
