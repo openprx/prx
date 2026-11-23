@@ -104,14 +104,14 @@ impl EncryptedScope {
     fn seal_event_payload(&self, input: &mut crate::memory::MessageEventInput) -> anyhow::Result<()> {
         if let Some(payload) = input.raw_payload_json.take() {
             let key = input.idempotency_key.as_deref().unwrap_or("event");
-            input.raw_payload_json = Some(self.seal_payload(input.source, key, &payload)?);
+            input.raw_payload_json = Some(self.seal_payload(&input.source, key, &payload)?);
         }
         Ok(())
     }
 
     fn seal_payload(
         &self,
-        source: crate::memory::MessageEventSource,
+        source: &crate::memory::MessageEventSource,
         key: &str,
         payload: &str,
     ) -> anyhow::Result<String> {
@@ -498,7 +498,7 @@ impl Memory for EncryptedScope {
         let key = event.idempotency_key.as_deref().unwrap_or("event");
         event.content = self.seal(key, &event.content)?;
         if let Some(payload) = event.raw_payload_json.take() {
-            event.raw_payload_json = Some(self.seal_payload(event.source, key, &payload)?);
+            event.raw_payload_json = Some(self.seal_payload(&event.source, key, &payload)?);
         }
         self.inner.project_console_message_until(&event, deadline).await
     }
@@ -1033,7 +1033,7 @@ impl Memory for EncryptedScope {
                 self.seal_event_content(&mut event)?;
                 if let Some(payload) = event.raw_payload_json.take() {
                     let key = event.idempotency_key.as_deref().unwrap_or("event");
-                    event.raw_payload_json = Some(self.seal_payload(event.source, key, &payload)?);
+                    event.raw_payload_json = Some(self.seal_payload(&event.source, key, &payload)?);
                 }
             }
         }
@@ -1088,7 +1088,7 @@ impl Memory for EncryptedScope {
                         .raw_payload_json
                         .clone()
                         .context("stored recovery payload missing")?,
-                    _ => self.seal_payload(event.source, key, &payload)?,
+                    _ => self.seal_payload(&event.source, key, &payload)?,
                 });
             }
         }
@@ -1133,7 +1133,7 @@ impl Memory for EncryptedScope {
                                     .clone()
                                     .context("stored recovery payload missing")?
                             }
-                            _ => reveal.seal_payload(final_input.source, key, &payload)?,
+                            _ => reveal.seal_payload(&final_input.source, key, &payload)?,
                         });
                     }
                     Ok(())
