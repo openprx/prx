@@ -168,10 +168,6 @@ impl IndependentChildPublication {
         let parent = &self.service;
         let mailbox = task.mailbox_turn();
         let child_names: BTreeSet<String> = registry.iter().map(|tool| tool.name().to_owned()).collect();
-        anyhow::ensure!(
-            mailbox || Arc::ptr_eq(&registry, &parent.registry),
-            "operator task registry differs from source"
-        );
         // Full operators start Full children; below Full a named agent
         // retains its configured level.
         let level = crate::security::agent_level::named_child_level(
@@ -211,6 +207,12 @@ impl IndependentChildPublication {
             )
             .with_idempotency_memory(Arc::clone(&parent.memory)),
         );
+        // Named children can carry allowlist/memory-isolation proxies. Their
+        // served contracts must match the frozen parent capabilities; Arc
+        // identity of the containing vector does not establish that parity.
+        let served = parent
+            .catalog
+            .served_references(&execution, &self.authority.constraints.allowed);
         let mut policy = parent.publication_policy.clone();
         // The frozen capability set is a membership limit. Full has no
         // permission limits (R51/OV-4): a Full task publishes under the
@@ -224,7 +226,7 @@ impl IndependentChildPublication {
                     fingerprint: entry.fingerprint,
                     generation: entry.generation,
                 };
-                if self.authority.constraints.allowed.contains(&reference) {
+                if served.contains(&reference) {
                     names.insert(entry.public_name.clone());
                 } else {
                     // Explicit exclusions also prevent root aliases from admitting
@@ -242,7 +244,11 @@ impl IndependentChildPublication {
                 .excluded_names
                 .extend(["sessions_spawn".to_owned(), "delegate".to_owned()]);
         }
-        parent.catalog.check_parity(&execution)?;
+        if level == crate::security::AutonomyLevel::Full {
+            parent.catalog.check_parity(&execution)?;
+        } else {
+            parent.catalog.check_published_parity(&execution, &served)?;
+        }
         let policy_version =
             pinned_policy_version(&parent.generation.effective, &security, &policy, &parent.state_key)?;
         let factory = DecisionBackendFactory::from_config(
