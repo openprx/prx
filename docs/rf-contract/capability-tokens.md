@@ -17,6 +17,11 @@ tokens it does not know.
    shape `{"error":{"code":"<code>","message":"<text>"}}`.
 4. PRX never adds a static path segment under `/api/agents/` that starts with
    `a_`, and never mints a session key that starts with `rf-`.
+5. Error codes and `tool_status.cause` values are open sets. Adding a new code
+   for an input PRX now refuses (for example `400 model_capabilities_unknown`
+   for a model without declared capabilities) or a new cause value is not a
+   change of meaning and gets no new token. A client treats an unknown code by
+   its HTTP status and an unknown cause by its phase.
 
 ## General errors
 
@@ -78,7 +83,8 @@ sorted ascending, with no duplicates.
   `false` when it would fail for a missing credential. The key is omitted when
   the lookup itself fails.
 - `tools`: `[{"name","read_only"}]`, Main's published tool surface without
-  `cron` and `xin`, sorted by name.
+  the turn-control tools `capability_search` and `stay_silent`, sorted by name.
+  `cron` and `xin` are listed: named agents may use them (unit C).
 - `reserved_names`: agent names no named agent may take (`catalog`, `main`).
 - `defaults`: `{"autonomy"}`, Main's effective autonomy level (`readonly`,
   `supervised` or `full`).
@@ -722,7 +728,11 @@ approval, pre-approval refusal, or termination causes: `owner_denied`, `expired`
 `path_active_shell_substitution`, `invalid_arguments`, `unknown_tool`,
 `stale_capability`, `service_unavailable`, `barrier_timeout`, or
 `tool_not_exposed`. Other tool failures use `failed`, `indeterminate`,
-`preparation_denied`, or `idempotency_conflict`. Plan-mode
+`preparation_denied`, or `idempotency_conflict`. The `cause` set is open:
+PRX may add cause values under the same token without a new token. The phase
+decides the outcome; a client that does not know a cause value treats the call
+as the phase says (`denied` stays denied) and shows it as a generic refusal.
+Plan-mode
 interception uses `plan_only`. Every denied/failed tool outcome commits a `tool.call.refused`
 journal row before its live frame, including scheduler refusals before service
 entry. Rows retain the internal `reason` and the same mapped `cause` as the
