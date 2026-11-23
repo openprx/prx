@@ -102,36 +102,42 @@ impl EncryptedScope {
     /// Keep only routing metadata visible to SQLite's transactional child hook.
     /// Source text and the complete original payload remain encrypted.
     fn seal_event_payload(&self, input: &mut crate::memory::MessageEventInput) -> anyhow::Result<()> {
-        let Some(payload) = input.raw_payload_json.take() else {
-            return Ok(());
-        };
-        let key = input.idempotency_key.as_deref().unwrap_or("event");
-        let sealed = self.seal(&format!("{key}:payload"), &payload)?;
-        let value = serde_json::from_str::<serde_json::Value>(&payload).ok();
-        let child = matches!(
-            input.source,
-            crate::memory::MessageEventSource::SessionsSpawn | crate::memory::MessageEventSource::SessionWorker
-        );
-        input.raw_payload_json = Some(if child {
-            let mut wrapper = serde_json::Map::new();
-            wrapper.insert("encrypted_child_payload".into(), sealed.into());
-            if let Some(record) = value.as_ref().and_then(|value| value.get("child_session_record")) {
-                let record: crate::memory::child_sessions::ChildSessionRecord = serde_json::from_value(record.clone())?;
-                anyhow::ensure!(record.context.is_empty(), "launch metadata cannot expose child history");
-                wrapper.insert("child_session_record".into(), serde_json::to_value(record)?);
-            }
-            if let Some(status) = value
-                .as_ref()
-                .and_then(|value| value.get("status"))
-                .and_then(serde_json::Value::as_str)
-            {
-                wrapper.insert("status".into(), status.into());
-            }
-            serde_json::Value::Object(wrapper).to_string()
-        } else {
-            sealed
-        });
+        if let Some(payload) = input.raw_payload_json.take() {
+            let key = input.idempotency_key.as_deref().unwrap_or("event");
+            input.raw_payload_json = Some(self.seal_payload(input.source, key, &payload)?);
+        }
         Ok(())
+    }
+
+    fn seal_payload(
+        &self,
+        source: crate::memory::MessageEventSource,
+        key: &str,
+        payload: &str,
+    ) -> anyhow::Result<String> {
+        let sealed = self.seal(&format!("{key}:payload"), payload)?;
+        if !matches!(
+            source,
+            crate::memory::MessageEventSource::SessionsSpawn | crate::memory::MessageEventSource::SessionWorker
+        ) {
+            return Ok(sealed);
+        }
+        let value = serde_json::from_str::<serde_json::Value>(payload).ok();
+        let mut wrapper = serde_json::Map::new();
+        wrapper.insert("encrypted_child_payload".into(), sealed.into());
+        if let Some(record) = value.as_ref().and_then(|value| value.get("child_session_record")) {
+            let record: crate::memory::child_sessions::ChildSessionRecord = serde_json::from_value(record.clone())?;
+            anyhow::ensure!(record.context.is_empty(), "launch metadata cannot expose child history");
+            wrapper.insert("child_session_record".into(), serde_json::to_value(record)?);
+        }
+        if let Some(status) = value
+            .as_ref()
+            .and_then(|value| value.get("status"))
+            .and_then(serde_json::Value::as_str)
+        {
+            wrapper.insert("status".into(), status.into());
+        }
+        Ok(serde_json::Value::Object(wrapper).to_string())
     }
 
     fn open_aad(&self, record_hash: &str, stored: &str) -> Option<String> {
@@ -492,7 +498,7 @@ impl Memory for EncryptedScope {
         let key = event.idempotency_key.as_deref().unwrap_or("event");
         event.content = self.seal(key, &event.content)?;
         if let Some(payload) = event.raw_payload_json.take() {
-            event.raw_payload_json = Some(self.seal(&format!("{key}:payload"), &payload)?);
+            event.raw_payload_json = Some(self.seal_payload(event.source, key, &payload)?);
         }
         self.inner.project_console_message_until(&event, deadline).await
     }
@@ -1027,7 +1033,7 @@ impl Memory for EncryptedScope {
                 self.seal_event_content(&mut event)?;
                 if let Some(payload) = event.raw_payload_json.take() {
                     let key = event.idempotency_key.as_deref().unwrap_or("event");
-                    event.raw_payload_json = Some(self.seal(&format!("{key}:payload"), &payload)?);
+                    event.raw_payload_json = Some(self.seal_payload(event.source, key, &payload)?);
                 }
             }
         }
@@ -1082,7 +1088,7 @@ impl Memory for EncryptedScope {
                         .raw_payload_json
                         .clone()
                         .context("stored recovery payload missing")?,
-                    _ => self.seal(&format!("{key}:payload"), &payload)?,
+                    _ => self.seal_payload(event.source, key, &payload)?,
                 });
             }
         }
@@ -1127,7 +1133,7 @@ impl Memory for EncryptedScope {
                                     .clone()
                                     .context("stored recovery payload missing")?
                             }
-                            _ => reveal.seal(&format!("{key}:payload"), &payload)?,
+                            _ => reveal.seal_payload(final_input.source, key, &payload)?,
                         });
                     }
                     Ok(())
