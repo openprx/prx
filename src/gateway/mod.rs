@@ -29,6 +29,7 @@ mod compat;
 mod h2_control;
 mod jobs;
 mod live_frames;
+mod mailbox;
 #[cfg(test)]
 mod platform_test_transport;
 mod run_approvals;

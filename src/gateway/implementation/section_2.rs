@@ -1034,6 +1034,23 @@ async fn run_gateway_chat_with_multimodal(
         Some(owner_id) => runtime_envelope.with_owner_id(owner_id),
         None => runtime_envelope,
     };
+    let mut runtime_envelope = runtime_envelope;
+    let messaging = if config_snapshot.memory.backend == "sqlite" {
+        Some(crate::messaging::runtime::MessagingRuntime::for_config(&config_snapshot)?)
+    } else {
+        None
+    };
+    let _mailbox_gate = if let Some(runtime) = &messaging {
+        let address = runtime.address(
+            &runtime_envelope.resolved_owner_id(),
+            &runtime_envelope.session_key,
+            runtime_envelope.agent_id.as_deref().unwrap_or("main"),
+        );
+        runtime_envelope.source_message_event_id = mailbox::causation(runtime, &runtime_envelope)?;
+        Some(crate::messaging::receiver::gate(&address).lock_owned().await)
+    } else {
+        None
+    };
     *stage = TurnFailureClass::ReplayLookup;
     if fabric.records_recovery_terminal() {
         if let Some(key) = fabric_ctx.idempotency_key.as_deref() {
@@ -1083,6 +1100,7 @@ async fn run_gateway_chat_with_multimodal(
         .record(message.to_owned(), fabric_ctx.idempotency_key.clone())
         .await?;
     let runtime_envelope = source_receipt.envelope().clone();
+    mailbox::register(state, fabric_ctx, &runtime_envelope)?;
     let base_scope = runtime_envelope.message_scope();
     *stage = TurnFailureClass::SourceBinding;
     let gateway_proof = source_receipt.bind(&turn_runtime, fabric_ctx)?;
