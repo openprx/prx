@@ -315,6 +315,25 @@ impl ChildFocus {
                 }
                 "/compact" => {
                     let provider = ctx.provider(&record)?;
+                    let runtime = crate::messaging::runtime::MessagingRuntime::for_config(&ctx.generation.effective)?;
+                    let address = runtime.address(&record.owner, &record.session_key, &record.agent);
+                    let scope = runtime.resolve_scope(&address)?;
+                    let mut envelope = crate::runtime::envelope::RuntimeEnvelope::sessions_spawn(
+                        &record.workspace,
+                        &record.session_key,
+                        uuid::Uuid::new_v4().to_string(),
+                    );
+                    envelope.owner_id = Some(record.owner.clone());
+                    envelope.owner_isolated = true;
+                    envelope.agent_id = Some(record.agent.clone());
+                    envelope.agent_partition = Some(runtime.store.partition(&scope)?);
+                    let audit = crate::agent::document_ingest::DocumentIngestRuntime::from_envelope(
+                        Arc::clone(ctx.memory),
+                        &envelope,
+                    )
+                    .bound_to_newest_user_input()
+                    .await?
+                    .context("child compaction requires a durable transcript")?;
                     let mut history: Vec<_> = turns
                         .iter()
                         .map(|turn| {
@@ -332,7 +351,7 @@ impl ChildFocus {
                             provider.as_ref(),
                             &record.model,
                             &ctx.generation.effective.agent.compaction,
-                            None,
+                            Some(&audit),
                             crate::agent::compaction::MANUAL_COMPACT_TRIGGER,
                         )
                         .await?
