@@ -301,7 +301,10 @@ impl IndependentChildPublication {
             events: Arc::clone(&parent.events),
             state_key: Arc::clone(&parent.state_key),
             policy_version,
-            recordable: parent.recordable,
+            // This service owns an unrecorded child recovery scope, as an
+            // ordinary task does. Its run's live approval resolver must own
+            // Ask suspension, rather than the parent's deferred ledger adapter.
+            recordable: false,
             registry,
             execution,
             memory: Arc::clone(&parent.memory),
