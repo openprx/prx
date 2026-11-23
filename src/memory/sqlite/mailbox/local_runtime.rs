@@ -6,6 +6,33 @@ use crate::messaging::{CausalChain, SessionAddr};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
 impl SqliteMailbox {
+    /// Recheck a sealed process launch against the still-live adopted input.
+    pub(crate) fn validate_adopted_input(
+        &self,
+        workspace: &str,
+        target: &SessionAddr,
+        event: uuid::Uuid,
+        text: &str,
+        message: uuid::Uuid,
+    ) -> MailboxResult<()> {
+        let scope = self.session_scope(workspace, target, false)?;
+        let receipt = {
+            let writer = self.memory.pool.write();
+            let id: i64 = writer.query_row(
+                "SELECT id FROM prx_mailbox_receipts WHERE workspace_id=?1 AND owner_id=?2 AND ma_scope_id=?3 AND message_id=?4",
+                params![workspace,target.owner,scope.scope_id.to_string(),message.as_bytes().as_slice()],
+                |row|row.get(0),
+            ).map_err(storage_error)?;
+            super::receipt::load(&writer, id)?.result(&writer)?
+        };
+        if receipt.state != crate::messaging::DeliveryState::Consumed
+            || receipt.adopted_message_event_id != Some(event)
+            || receipt.chain.depth >= 8
+        {
+            return Err(MailboxError::InvalidMetadata);
+        }
+        self.validate_input(workspace, target, event, text, message, &receipt)
+    }
     pub(crate) fn partition(
         &self,
         scope: &crate::messaging::mailbox::MailboxScope,

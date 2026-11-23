@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
 pub(crate) struct ParentSource {
+    mailbox_child_source_id: Option<uuid::Uuid>,
     cost_root_agent: Option<crate::cost::types::RootAgent>,
     owner_isolated: bool,
     workspace_id: String,
@@ -58,6 +59,8 @@ struct RecallScope {
 #[serde(deny_unknown_fields)]
 struct SourceFields {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    mailbox_child_source_id: Option<uuid::Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     cost_root_agent: Option<crate::cost::types::RootAgent>,
     // Required signed provenance: old payloads must not default to unisolated.
     owner_isolated: bool,
@@ -81,6 +84,7 @@ struct SourceFields {
 impl ParentSource {
     pub(crate) fn capture(proof: &dyn crate::runtime::turn_source::TurnSourceProof) -> Self {
         Self {
+            mailbox_child_source_id: proof.mailbox_child_source_id(),
             owner_isolated: proof.owner_isolated(),
             cost_root_agent: proof.cost_root_agent(),
             workspace_id: proof.workspace_id().to_owned(),
@@ -101,6 +105,9 @@ impl ParentSource {
     }
     pub(crate) fn cost_root_agent(&self) -> Option<crate::cost::types::RootAgent> {
         self.cost_root_agent.clone()
+    }
+    pub(crate) const fn mailbox_child_source_id(&self) -> Option<uuid::Uuid> {
+        self.mailbox_child_source_id
     }
     pub(crate) const fn owner_isolated(&self) -> bool {
         self.owner_isolated
@@ -169,6 +176,7 @@ impl ParentSource {
 
     fn process_payload(&self) -> anyhow::Result<String> {
         let fields = SourceFields {
+            mailbox_child_source_id: self.mailbox_child_source_id,
             owner_isolated: self.owner_isolated,
             cost_root_agent: self.cost_root_agent.clone(),
             workspace_id: self.workspace_id.clone(),
@@ -244,10 +252,12 @@ impl ParentSource {
             fields.task_run_id.is_none()
                 && ((fields.surface == "interactive"
                     && fields.policy_channel == "terminal"
-                    && fields.policy_sender == "local-user")
+                    && fields.policy_sender == "local-user"
+                    && fields.mailbox_child_source_id.is_none())
                     || (fields.surface == "server"
                         && fields.policy_channel == "mailbox"
                         && fields.policy_sender == "session"
+                        && fields.mailbox_child_source_id.is_some()
                         && fields.cost_root_agent.is_some()))
                 && !fields.run_id.is_empty()
                 && !fields.session_key.is_empty()
@@ -269,6 +279,7 @@ impl ParentSource {
             "operator worker provenance differs from signed publication"
         );
         Ok(Self {
+            mailbox_child_source_id: fields.mailbox_child_source_id,
             owner_isolated: fields.owner_isolated,
             cost_root_agent: fields.cost_root_agent,
             workspace_id: fields.workspace_id,
@@ -331,6 +342,10 @@ impl ParentSource {
             "ordinary worker parent provenance signature is invalid"
         );
         let fields: SourceFields = serde_json::from_str(&snapshot.payload)?;
+        anyhow::ensure!(
+            fields.mailbox_child_source_id.is_none(),
+            "mailbox source requires operator worker admission"
+        );
         let surface = match fields.surface.as_str() {
             "interactive" => TurnSurfaceKind::Interactive,
             "agent_loop" => TurnSurfaceKind::AgentLoop,
@@ -365,6 +380,7 @@ impl ParentSource {
             "ordinary worker parent provenance differs from verified scope"
         );
         Ok(Self {
+            mailbox_child_source_id: None,
             owner_isolated: fields.owner_isolated,
             cost_root_agent: fields.cost_root_agent,
             workspace_id: fields.workspace_id,
@@ -425,6 +441,7 @@ mod tests {
 
     fn parent(owner_isolated: bool) -> ParentSource {
         ParentSource {
+            mailbox_child_source_id: None,
             cost_root_agent: None,
             owner_isolated,
             workspace_id: "prx_workspace".to_owned(),

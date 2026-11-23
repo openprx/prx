@@ -34,20 +34,65 @@ pub(crate) async fn restore_input(
             .find_owned_message_event(fabric.workspace_id(), parent_source.owner_id(), id)
             .await?
             .context("operator worker parent event is unavailable")?;
+        let mailbox = parent_source.mailbox_child_source_id();
+        if let Some(message) = mailbox {
+            anyhow::ensure!(
+                event.source.as_str() == "prx_mailbox"
+                    && event.session_key.as_deref() == Some(worker.session_scope_key.as_str())
+                    && event.content == parent_source.routing_input(),
+                "mailbox worker adopted input differs from signed source"
+            );
+            let config = std::sync::Arc::clone(&snapshots.generation.effective);
+            let parent = parent_source.clone();
+            let session = worker.session_scope_key.clone();
+            let agent = worker.agent_id.clone().unwrap_or_else(|| "main".to_owned());
+            let run = worker.run_id.clone();
+            let adopted = uuid::Uuid::parse_str(id)?;
+            let memory = fabric.memory();
+            crate::runtime::blocking::spawn_blocking(move || {
+                let runtime = crate::messaging::runtime::MessagingRuntime::for_config(&config)?;
+                let target = runtime.address(parent.owner_id(), &session, &agent);
+                runtime.store.validate_adopted_input(
+                    parent.workspace_id(),
+                    &target,
+                    adopted,
+                    parent.routing_input(),
+                    message,
+                )?;
+                let child = memory
+                    .child_session_store()
+                    .context("mailbox child storage unavailable")?
+                    .sessions(parent.workspace_id(), parent.owner_id())?
+                    .into_iter()
+                    .find(|child| child.session_key == session)
+                    .context("mailbox child unavailable")?;
+                anyhow::ensure!(
+                    child.parent_session == parent.session_key()
+                        && child.parent_run == parent.run_id()
+                        && child.runs.last() == Some(&run)
+                        && child.mode == "process",
+                    "mailbox worker differs from persisted child lineage"
+                );
+                Ok::<_, anyhow::Error>(())
+            })
+            .await??;
+        }
         anyhow::ensure!(
             event.id > 0
                 && event.event_id == id
                 && event.workspace_id == parent_source.workspace_id()
                 && event.owner_id.as_deref() == Some(parent_source.owner_id())
-                && event.run_id.as_deref() == Some(parent_source.run_id())
-                && event.session_key.as_deref() == Some(parent_source.session_key())
+                && (mailbox.is_some()
+                    || (event.run_id.as_deref() == Some(parent_source.run_id())
+                        && event.session_key.as_deref() == Some(parent_source.session_key())))
                 && event.role == "user"
                 && event.event_type == "message.created"
-                && crate::runtime::turn_source::recorded_input_matches(
-                    parent_source.surface(),
-                    &event,
-                    parent_source.routing_input(),
-                ),
+                && (mailbox.is_some()
+                    || crate::runtime::turn_source::recorded_input_matches(
+                        parent_source.surface(),
+                        &event,
+                        parent_source.routing_input(),
+                    )),
             "operator worker parent event differs from signed provenance"
         );
     }

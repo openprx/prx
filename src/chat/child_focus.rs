@@ -325,7 +325,9 @@ impl ChildFocus {
                     );
                     envelope.owner_id = Some(record.owner.clone());
                     envelope.owner_isolated = true;
-                    envelope.agent_id = Some(record.agent.clone());
+                    // Unnamed child transcript rows carry no presentation
+                    // agent id. The verified partition already confines reads.
+                    envelope.agent_id = (record.agent != "main").then(|| record.agent.clone());
                     envelope.agent_partition = Some(runtime.store.partition(&scope)?);
                     let audit = crate::agent::document_ingest::DocumentIngestRuntime::from_envelope(
                         Arc::clone(ctx.memory),
