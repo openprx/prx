@@ -167,7 +167,6 @@ impl IndependentChildPublication {
         task.verify()?;
         let parent = &self.service;
         let mailbox = task.mailbox_turn();
-        let child_names: BTreeSet<String> = registry.iter().map(|tool| tool.name().to_owned()).collect();
         // Full operators start Full children; below Full a named agent
         // retains its configured level.
         let level = crate::security::agent_level::named_child_level(
@@ -234,9 +233,9 @@ impl IndependentChildPublication {
                     policy.excluded_names.insert(entry.public_name.clone());
                 }
             }
-            if mailbox {
-                names.retain(|name| child_names.contains(name));
-            }
+            // Mailbox publication was rebuilt against today's agent config.
+            // The retained spawn tool's old registry is not another grant or
+            // restriction; served references above use the fresh publication.
             policy.allowed_tools = Some(names);
         }
         if mailbox {
