@@ -2016,3 +2016,10 @@ First GET the same URL for its incarnation, then send that UUID in `If-Match`
 and a fresh `Idempotency-Key`. The receiver derives the terminal owner from its
 workspace; callers cannot supply a different owner. The Console erase route
 remains `DELETE /api/sessions/{id}/agents/{agent}/history`.
+
+By default, erase keeps owner memories and documents and lists their IDs in
+`retained`. Send `{"forget_writes":true}` to remove those writes and their
+derived copies too. Saved transcript snapshots and context pages are always
+cleared. An open terminal chat discards the erased conversation and starts a
+fresh chat; its previous cached history cannot be saved again. Rows written
+before session scoping was introduced are outside this erase contract.

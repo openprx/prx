@@ -126,17 +126,28 @@ impl ModeRunner for ChatRunner {
             (None, None) => {}
             _ => anyhow::bail!("controlled H2 chat requires both explicit ceilings and authority lifetime"),
         }
-        chat::run(
-            me.config,
-            me.provider,
-            me.model,
-            me.temperature,
-            me.plain,
-            me.session.or_else(|| me.continue_last.then(|| "last".to_string())),
-            me.list_sessions,
-            shutdown,
-        )
-        .await
+        let mut session = me.session.or_else(|| me.continue_last.then(|| "last".to_string()));
+        loop {
+            let result = chat::run(
+                me.config.clone(),
+                me.provider.clone(),
+                me.model.clone(),
+                me.temperature,
+                me.plain,
+                session.clone(),
+                me.list_sessions,
+                shutdown.child_token(),
+            )
+            .await;
+            match result {
+                Err(error) if error.is::<chat::SessionErased>() && !shutdown.is_cancelled() => {
+                    // The old chat drained before returning this marker. A new
+                    // identity cannot inherit callbacks or cached erased text.
+                    session = None;
+                }
+                result => return result,
+            }
+        }
     }
 }
 

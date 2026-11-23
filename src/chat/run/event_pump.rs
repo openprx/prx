@@ -7,6 +7,9 @@ loop {
                 } else {true}
             });
             inbox.drain();
+            history.clear();
+            session_erased = true;
+            break None;
         }
 
         if message_inbox.as_ref().is_some_and(|inbox|inbox.session()!=chat_session_key) {

@@ -73,7 +73,7 @@ pub(super) fn chat_message_event_scope(
     model_name: &str,
 ) -> MessageEventScope {
     let chat_session_id = chat_session_id_from_key(chat_session_key);
-    RuntimeEnvelope::chat_canonical(workspace_id, chat_session_id, MemoryVisibility::Workspace)
+    chat_runtime_envelope(workspace_id, chat_session_id)
         .with_recipient(format!("{provider_name}/{model_name}"))
         .with_run_id(chat_run_id.to_string())
         .message_scope()
@@ -84,8 +84,15 @@ pub(super) fn chat_message_event_scope(
 /// for read-merge so the read principal unions canonical + legacy history.
 pub(crate) fn chat_runtime_envelope(workspace_id: &str, chat_session_key: &str) -> RuntimeEnvelope {
     let chat_session_id = chat_session_id_from_key(chat_session_key);
-    RuntimeEnvelope::chat_canonical(workspace_id.to_string(), chat_session_id, MemoryVisibility::Workspace)
-        .with_recipient("terminal:user")
+    let envelope =
+        RuntimeEnvelope::chat_canonical(workspace_id.to_string(), chat_session_id, MemoryVisibility::Workspace)
+            .with_recipient("terminal:user");
+    let partition = crate::memory::AgentPartition {
+        workspace_id: workspace_id.into(),
+        owner_id: envelope.resolved_owner_id(),
+        key: crate::memory::PartitionKey::Main,
+    };
+    envelope.with_agent_partition(partition)
 }
 
 #[cfg(test)]

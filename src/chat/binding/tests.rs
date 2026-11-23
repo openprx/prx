@@ -280,6 +280,7 @@ async fn chat_production_save_excludes_live_input_without_useful_feedback() {
         &binding.envelope().session_key,
         "prx input",
         binding.envelope().source_message_event_id.as_deref(),
+        None,
     )
     .await
     .unwrap();

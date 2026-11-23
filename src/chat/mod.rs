@@ -91,6 +91,7 @@ mod file_mention;
 mod input_queue;
 mod line_approval;
 mod message_inbox;
+pub use message_inbox::SessionErased;
 mod model_commands;
 mod output;
 mod plain_queue;

@@ -217,7 +217,7 @@ fn every_live_hook_manager_owner_drains_at_shutdown() {
         "src/gateway/implementation/section_2.rs",
         "src/channels/startup.rs",
         "src/chat/run.rs",
-        "src/agent/entry.rs",
+        "src/agent/entry/section_2.rs",
         "src/session_worker/runner/run.rs",
     ] {
         let source =

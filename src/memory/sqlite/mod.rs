@@ -47,10 +47,12 @@ pub(crate) use recovery_outbox::{
 #[cfg(test)]
 pub(crate) use recovery_terminal::crash_before_commit;
 pub(crate) use recovery_terminal::map_after_prefix;
+mod history_retention;
 mod router_history;
 mod router_learning;
 mod rows;
 mod schema;
+pub(crate) mod terminal_epoch;
 
 use super::embeddings::EmbeddingProvider;
 use super::principal::{ChatType, MemoryWriteContext, Principal, Role, Visibility, resolve_principal};

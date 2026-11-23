@@ -118,7 +118,8 @@
             let _ = crate::agent::entry::save_current_input(&memory_fabric,
                 admitted_binding.envelope().run_id.as_deref().context("chat turn run id missing")?,
                 &admitted_binding.envelope().session_key,
-                &safe_user_input, chat_user_event.as_ref().map(|event| event.event_id.as_str())).await;
+                &safe_user_input, chat_user_event.as_ref().map(|event| event.event_id.as_str()),
+                admitted_binding.envelope().agent_partition.clone()).await;
         }
 
         // Inject memory context

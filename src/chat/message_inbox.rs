@@ -3,6 +3,24 @@ use crate::channels::traits::ChannelMessage;
 use crate::messaging::runtime::{MessageInput, MessagingRuntime, SessionInbox};
 use std::sync::Arc;
 
+#[derive(Debug, thiserror::Error)]
+#[error("terminal_session_erased: cached history discarded; starting a new chat")]
+pub struct SessionErased;
+
+pub(super) async fn pin_epoch(config: &crate::config::Config, session: &str) -> anyhow::Result<()> {
+    if config.memory.backend != "sqlite" {
+        return Ok(());
+    }
+    let config = config.clone();
+    let session = session.to_owned();
+    crate::runtime::blocking::spawn_blocking(move || {
+        let runtime = MessagingRuntime::for_config(&config)?;
+        let owner = super::chat_runtime_envelope(&runtime.workspace, &session).resolved_owner_id();
+        runtime.store.pin_terminal_epoch(&runtime.workspace, &owner, &session)
+    })
+    .await?
+}
+
 pub(super) struct ChatInbox {
     pub(super) runtime: Arc<MessagingRuntime>,
     inbox: SessionInbox,

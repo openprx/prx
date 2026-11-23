@@ -577,12 +577,16 @@ Success is `200 {"status":"erased","scope":{"session","agent","incarnation"},
 "erase_id","generation","remaining":0,"incarnation"}`. Generations start at
 1 and advance only after verified erasure; replay returns the saved receipt.
 The old scope stays sealed. A new turn uses the replacement generation.
-Erasure removes scoped transcripts, events, memories/documents and derived
-copies, mailbox payloads and approvals. Main erasure preserves other sessions
+Erasure removes scoped transcripts, events, saved snapshots, context pages,
+mailbox payloads and approvals. Owner memories/documents are kept by default
+and listed in `retained:{memories:[{id,key}],documents:[id]}`. Main erasure preserves other sessions
 and shared configuration. Context pages are selected by scope, never by text.
 Payload-free message keys remain deleted so an old message retry cannot
 restore its content. With `forget_writes`, the run families' writes are also
-forgotten and the receipt adds `forgotten:{created,touched}`.
+forgotten and the receipt adds `forgotten:{created,touched}`. This policy also
+applies to the paired terminal history route. A running terminal chat is fenced
+by its erased generation and restarts with a fresh conversation. Late writes
+from its old generation are refused; erased snapshots are never restored.
 
 `503 history_pending` requires retry with the same key; it never certifies
 zero residue. `409 incarnation_mismatch` includes `current_incarnation`.

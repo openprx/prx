@@ -261,6 +261,7 @@ fn erase_rows(
     counts: &mut BTreeMap<String, u64>,
     erase_id: Option<&str>,
     keep_message_keys: bool,
+    preserve_memories: bool,
 ) -> anyhow::Result<()> {
     check_manifest(conn)?;
     let tables = stamped_tables(conn)?;
@@ -279,7 +280,7 @@ fn erase_rows(
     // Defer links while every member of the scoped family is removed.
     conn.execute_batch("PRAGMA defer_foreign_keys=ON")?;
     for (table, columns) in &tables {
-        let condition = erase_predicate(table, columns);
+        let condition = erase_condition(table, columns, preserve_memories);
         let amount: i64 = conn.query_row(&format!("SELECT count(*) FROM \"{table}\""), [], |row| row.get(0))?;
         *counts.entry(table.clone()).or_default() = u64::try_from(amount)?;
         if let Some(erase_id) = erase_id {
@@ -307,7 +308,8 @@ fn erase_rows(
         }
         let ids = {
             let mut query = conn.prepare(&format!(
-                "SELECT {id_column} FROM {table} WHERE ma_scope_id IN(SELECT value FROM json_each(?1))"
+                "SELECT {id_column} FROM {table} WHERE {}",
+                erase_condition(table, &["ma_scope_id".into()], preserve_memories)
             ))?;
             query
                 .query_map([scopes], |row| row.get::<_, String>(0))?
@@ -335,7 +337,10 @@ fn erase_rows(
             )?;
         } else {
             conn.execute(
-                &format!("DELETE FROM \"{table}\" WHERE {}", erase_predicate(table, columns)),
+                &format!(
+                    "DELETE FROM \"{table}\" WHERE {}",
+                    erase_condition(table, columns, preserve_memories)
+                ),
                 [scopes],
             )?;
         }
@@ -372,7 +377,16 @@ fn erase_rows(
     Ok(())
 }
 
-fn verify(conn: &Connection, scopes: &str, keep_message_keys: bool) -> anyhow::Result<()> {
+fn erase_condition(table: &str, columns: &[String], preserve_memories: bool) -> String {
+    let condition = erase_predicate(table, columns);
+    if preserve_memories {
+        format!("({condition}) AND NOT ({})", super::history_retention::kept(table))
+    } else {
+        condition
+    }
+}
+
+fn verify(conn: &Connection, scopes: &str, keep_message_keys: bool, preserve_memories: bool) -> anyhow::Result<()> {
     check_manifest(conn)?;
     for (table, columns) in stamped_tables(conn)? {
         let payload = if table == "rf_message_attempts" && keep_message_keys {
@@ -383,7 +397,7 @@ fn verify(conn: &Connection, scopes: &str, keep_message_keys: bool) -> anyhow::R
         let remaining: i64 = conn.query_row(
             &format!(
                 "SELECT count(*) FROM \"{table}\" WHERE ({}){payload}",
-                erase_predicate(&table, &columns)
+                erase_condition(&table, &columns, preserve_memories)
             ),
             [scopes],
             |row| row.get(0),
@@ -490,13 +504,22 @@ pub(super) fn finish_history(memory: &SqliteMemory, work: &EraseWork) -> anyhow:
                     forgotten.documents_touched += found.documents_touched;
                 }
             }
-            erase_rows(&tx, &scopes, &mut counts, Some(&work.erase_id), !work.purge).context(ErasureStep::EraseRows)?;
+            erase_rows(
+                &tx,
+                &scopes,
+                &mut counts,
+                Some(&work.erase_id),
+                !work.purge,
+                !work.purge && !work.forget_writes,
+            )
+            .context(ErasureStep::EraseRows)?;
             // Session previews are shared by agents; derive them again from survivors.
             tx.execute("UPDATE sessions SET last_message_preview=COALESCE((SELECT substr(c.content,1,200) FROM conversation_turns c
                 WHERE c.session_key=sessions.session_key AND c.deleted_at IS NULL ORDER BY c.id DESC LIMIT 1),''),
                 message_count=(SELECT count(*) FROM conversation_turns c WHERE c.session_key=sessions.session_key AND c.deleted_at IS NULL)
                 WHERE session_key IN(SELECT session_key FROM agent_scopes WHERE scope_id IN(SELECT value FROM json_each(?1)))",[&scopes])?;
-            verify(&tx, &scopes, !work.purge).context(ErasureStep::VerifyCoverage)?;
+            verify(&tx, &scopes, !work.purge, !work.purge && !work.forget_writes)
+                .context(ErasureStep::VerifyCoverage)?;
             tx.execute(
                 "UPDATE agent_erase_work SET main_erased=1,counts=?2,forgotten=?3 WHERE erase_id=?1",
                 params![
@@ -514,7 +537,7 @@ pub(super) fn finish_history(memory: &SqliteMemory, work: &EraseWork) -> anyhow:
         .context(ErasureStep::TruncateWal)?;
     let conn = memory.pool.write();
     let tx = begin_immediate(&conn)?;
-    verify(&tx, &scopes, !work.purge).context(ErasureStep::VerifyCoverage)?;
+    verify(&tx, &scopes, !work.purge, !work.purge && !work.forget_writes).context(ErasureStep::VerifyCoverage)?;
     let existing: Option<String> = tx.query_row(
         "SELECT receipt FROM agent_erase_work WHERE erase_id=?1",
         [&work.erase_id],
@@ -530,6 +553,12 @@ pub(super) fn finish_history(memory: &SqliteMemory, work: &EraseWork) -> anyhow:
     )?;
     let mut receipt = serde_json::json!({"status":"erased","scope":{"session":work.session,"agent":work.agent,"incarnation":work.incarnation},
         "erase_id":work.erase_id,"generation":work.generation,"remaining":0,"incarnation":work.incarnation});
+    if !work.forget_writes && !work.purge {
+        receipt
+            .as_object_mut()
+            .context("erase receipt must be an object")?
+            .insert("retained".into(), super::history_retention::list(&tx, &scopes)?);
+    }
     if work.forget_writes {
         let counts: crate::memory::RfForgetCounts = serde_json::from_str(&forgotten)?;
         receipt.as_object_mut().context("erase receipt must be an object")?.insert("forgotten".to_owned(),serde_json::json!({"created":counts.memories_created+counts.documents_created,"touched":counts.memories_touched+counts.documents_touched}));
@@ -627,8 +656,15 @@ fn erase_side_stores(memory: &SqliteMemory, work: &EraseWork, scopes: &str) -> a
             serde_json::from_str::<BTreeMap<String, u64>>(&old)?
         } else {
             let mut counts = BTreeMap::new();
-            erase_rows(&tx, scopes, &mut counts, None, !work.purge)?;
-            verify(&tx, scopes, !work.purge)?;
+            erase_rows(
+                &tx,
+                scopes,
+                &mut counts,
+                None,
+                !work.purge,
+                !work.purge && !work.forget_writes,
+            )?;
+            verify(&tx, scopes, !work.purge, !work.purge && !work.forget_writes)?;
             tx.execute(
                 "INSERT INTO agent_erase_side_progress VALUES(?1,?2)",
                 params![work.erase_id, serde_json::to_string(&counts)?],

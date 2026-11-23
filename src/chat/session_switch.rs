@@ -307,6 +307,8 @@ pub(super) async fn apply_chat_session_switch(
     persist: bool,
 ) -> Result<()> {
     bind_session_to_runtime_provider_model(&mut loaded_session, ctx.provider_name, ctx.model_name);
+    let key = crate::runtime::envelope::RuntimeEnvelope::chat_canonical_session_key(&loaded_session.id);
+    super::message_inbox::pin_epoch(ctx.config, &key).await?;
     // The reducer history and the provider view open with the same system
     // prompt from the acknowledged load on.
     let leading_system_prompt =

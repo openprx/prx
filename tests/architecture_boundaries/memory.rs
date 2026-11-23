@@ -171,6 +171,8 @@ const SQLITE_BACKEND_FILES: &[&str] = &[
 /// Older child modules that were never part of the exemption for the
 /// repository root and stay scanned like any other file.
 const SQLITE_SEPARATE_MODULES: &[&str] = &[
+    "history_retention.rs",
+    "terminal_epoch.rs",
     "agent_purge.rs",
     // R3d transactional branch copy; runs on the backend's pool, opens nothing.
     "branch_copy.rs",
@@ -460,7 +462,7 @@ fn runtime_and_message_events_preserve_typed_config_generation_columns() {
         }
     }
 
-    for relative in ["src/agent/entry.rs", "src/chat/binding.rs"] {
+    for relative in ["src/agent/entry/section_1.rs", "src/chat/binding.rs"] {
         let source = fs::read_to_string(repository_root().join(relative))
             .unwrap_or_else(|error| panic!("read {relative}: {error}"));
         assert!(

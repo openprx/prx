@@ -209,6 +209,7 @@ pub(super) fn resolve_input_scope(
     workspace_id: &str,
     owner_id: Option<&str>,
 ) -> anyhow::Result<Option<String>> {
+    super::terminal_epoch::check(tx, workspace_id, owner_id, session_key)?;
     let Some(partition) = partition else {
         return Ok(None);
     };

@@ -363,6 +363,7 @@ async fn run_internal(
                 &skills,
                 native_tools,
             );
+            super::message_inbox::pin_epoch(&config, &chat_session_key).await?;
 
             #[cfg(feature = "terminal-tui")]
             let (initial_saved_session_entries, chat_mirror) =
@@ -843,6 +844,7 @@ async fn run_internal(
             // outer loop: it only `break`s with a real input message (or `None` on
             // shutdown). On a tick we poll the registry and surface results via the
             // dispatcher (single source, reaches both render paths), then keep waiting.
+            let mut session_erased = false;
             'chat: while let Some(input) = include!("run/event_pump.rs") {
                 turn_signal.ensure_history_commits_healthy()?;
                 let provider_queue_task_id = input.turn_task_id;
@@ -1070,6 +1072,9 @@ async fn run_internal(
             // The dispatcher is drained now: a save that failed during exit,
             // including one only seen while draining, has latched by this point, and
             // `/exit` or EOF must not report success over it.
+            if session_erased {
+                return Err(super::message_inbox::SessionErased.into());
+            }
             exit_summaries?;
             turn_signal.ensure_history_commits_healthy()?;
             finished?;

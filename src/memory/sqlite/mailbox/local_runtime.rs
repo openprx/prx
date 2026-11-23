@@ -6,6 +6,17 @@ use crate::messaging::{CausalChain, SessionAddr};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
 impl SqliteMailbox {
+    pub(crate) fn pin_terminal_epoch(&self, workspace: &str, owner: &str, session: &str) -> anyhow::Result<()> {
+        super::super::terminal_epoch::pin(
+            &self.memory,
+            &crate::memory::AgentPartition {
+                workspace_id: workspace.to_owned(),
+                owner_id: owner.to_owned(),
+                key: crate::memory::PartitionKey::Main,
+            },
+            session,
+        )
+    }
     /// Recheck a sealed process launch against the still-live adopted input.
     pub(crate) fn validate_adopted_input(
         &self,
