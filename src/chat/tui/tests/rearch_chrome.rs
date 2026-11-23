@@ -310,7 +310,7 @@ fn fullscreen_scroll_focus_rules_do_not_steal_input_or_child_keys() {
     );
     assert_eq!(
         dispatch_global_key(key(KeyCode::PageUp), &mut child_state),
-        KeyDispatch::PageTranscriptUp
+        KeyDispatch::PageSessionUp
     );
 }
 
