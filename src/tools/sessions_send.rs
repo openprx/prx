@@ -118,6 +118,13 @@ impl Tool for SessionsSendTool {
     }
 
     fn description(&self) -> &str {
+        if self.mailbox.is_some() || self.messaging.is_some() {
+            return "Send an ordinary message using 'to' to a logical session, including an idle child. \
+                Use its exact session_key (retain the spawn: prefix), or 'parent' from a child. \
+                An object target is {session, instance?, owner?, agent?}; local defaults use the caller's instance/owner and main agent. \
+                A remote target needs the full pinned SPIFFE instance ID and receiving owner's session. \
+                Use 'run_id' only to steer a currently running execution. Supply exactly one of 'to' or 'run_id', plus 'message'.";
+        }
         "Send a message to a running sub-agent session to redirect or update its instructions. \
          Use this for cross-session communication: inject new context, pivot the task, \
          or provide additional information to a running sub-agent. \
@@ -127,8 +134,8 @@ impl Tool for SessionsSendTool {
     fn parameters_schema(&self) -> serde_json::Value {
         if self.mailbox.is_some() || self.messaging.is_some() {
             return json!({"type":"object","additionalProperties":false,
-                "properties":{"run_id":{"type":"string","minLength":1},
-                "to":{"oneOf":[crate::messaging::send::target_schema(),{"type":"string","minLength":1}]},
+                "properties":{"run_id":{"type":"string","minLength":1,"description":"Live execution ID for steering only; omit when sending an ordinary message with to."},
+                "to":{"description":"Exact logical session_key (including spawn:), parent alias, or address object. Remote instance is a full pinned SPIFFE ID; owner/session belong to the receiver.","oneOf":[crate::messaging::send::target_schema(),{"type":"string","minLength":1}]},
                 "message":{"type":"string","minLength":1}},"required":["message"]});
         }
         json!({
