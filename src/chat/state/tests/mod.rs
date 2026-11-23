@@ -347,6 +347,7 @@ fn active_session_view_updated_writes_snapshot_and_dedups() {
     assert!(state.ui.active_session_view.is_none());
 
     let view = crate::chat::sessions::ActiveSessionView {
+        turns: Vec::new(),
         seq: 4,
         kind: "shell".to_string(),
         title: "tail -f app.log".to_string(),

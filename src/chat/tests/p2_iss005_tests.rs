@@ -54,6 +54,7 @@ fn active_session_live_refresh_preserves_nonzero_scroll_offset() {
         ring.push(format!("line {i}"));
     }
     let current = crate::chat::sessions::ActiveSessionView {
+        turns: Vec::new(),
         seq: 3,
         kind: "shell".to_string(),
         title: "watch logs".to_string(),

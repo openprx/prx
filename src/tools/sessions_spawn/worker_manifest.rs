@@ -135,6 +135,7 @@ pub(super) fn build_session_worker_manifest(
         operator_source: None,
         run_id: run_id.to_string(),
         task: task.to_string(),
+        seed_history: Vec::new(),
         provider_name: provider_name.to_string(),
         model: model.to_string(),
         route_hint: route_hint.map(str::to_string),

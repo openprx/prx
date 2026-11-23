@@ -8,8 +8,8 @@
 //! Two concerns:
 //!
 //! - [`FocusTarget`] — where plain text + Enter is routed. `Main` (the default)
-//!   sends to the main chat agent; `Session { seq }` routes the text as a
-//!   *steer* to the attached child session (head footgun: input target
+//!   sends to the main chat agent; `Session { seq }` starts or queues a
+//!   turn in the attached child session (head footgun: input target
 //!   ambiguity — see plan §0.2.1 A). The target is shown in the prompt with a
 //!   colour **and** a glyph so it is never colour-only (colour-blind / no-color
 //!   safe).
@@ -32,7 +32,7 @@ pub enum FocusTarget {
     /// Default: input goes to the main chat agent loop.
     #[default]
     Main,
-    /// Input is routed as a *steer* to the attached child TUI session `#seq`.
+    /// Input starts or queues a turn in the attached child TUI session `#seq`.
     Session { seq: u64 },
     /// Read-only conversation transcript viewer. It reuses the child viewport but
     /// never routes submitted text as a steer to a managed session.
@@ -130,6 +130,8 @@ pub struct SwitcherEntry {
 /// the TUI receives only this bounded, cloneable view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveSessionView {
+    /// Full public child transcript; never includes reasoning or source proofs.
+    pub turns: Vec<crate::memory::child_sessions::ChildTurn>,
     /// Display sequence `#N`.
     pub seq: u64,
     /// Stable lowercase kind label (`agent` / `shell`).
@@ -644,6 +646,7 @@ mod tests {
     #[test]
     fn active_session_view_scroll_offset_saturates_and_resumes_follow() {
         let view = ActiveSessionView {
+            turns: Vec::new(),
             seq: 1,
             kind: "agent".to_string(),
             title: "task".to_string(),
@@ -666,6 +669,7 @@ mod tests {
     #[test]
     fn active_session_view_clamps_when_visible_rows_exceed_lines() {
         let view = ActiveSessionView {
+            turns: Vec::new(),
             seq: 2,
             kind: "shell".to_string(),
             title: "cmd".to_string(),

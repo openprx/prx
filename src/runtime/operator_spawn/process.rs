@@ -140,9 +140,12 @@ impl super::OperatorSpawnSource {
                     .as_deref()
                     .is_some_and(|run| !run.is_empty() && run != self.proof.run_id())
                 && scope.owner_id.as_deref() == Some(self.proof.owner_id())
-                && scope.session_key.as_deref() == Some(self.proof.session_key())
+                && scope
+                    .session_key
+                    .as_deref()
+                    .is_some_and(|key| key.starts_with("spawn:"))
                 && scope.parent_run_id.as_deref() == Some(self.proof.run_id())
-                && scope.parent_session_key == scope.session_key
+                && scope.parent_session_key.as_deref() == Some(self.proof.session_key())
                 && scope.channel.as_deref() == Some(self.proof.policy_channel())
                 && scope.sender.as_deref() == Some(self.proof.policy_sender())
                 && scope.recipient == self.proof.memory_scope().chat_id

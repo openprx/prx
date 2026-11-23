@@ -152,6 +152,7 @@ const SQLITE_BACKEND_FILES: &[&str] = &[
     "drafts.rs",
     "erasure_pool.rs",
     "events.rs",
+    "event_append.rs",
     "evolution.rs",
     "fixture_readback.rs",
     "mailbox.rs",
@@ -162,6 +163,7 @@ const SQLITE_BACKEND_FILES: &[&str] = &[
     "recall.rs",
     "remote_tree.rs",
     "child_sessions.rs",
+    "child_turns.rs",
     "rows.rs",
     "schema.rs",
 ];
@@ -375,6 +377,7 @@ fn runtime_and_message_events_preserve_typed_config_generation_columns() {
             "child_sessions.rs",
             include_str!("../../src/memory/sqlite/child_sessions.rs"),
         ),
+        ("child_turns.rs", include_str!("../../src/memory/sqlite/child_turns.rs")),
         ("documents.rs", include_str!("../../src/memory/sqlite/documents.rs")),
         ("drafts.rs", include_str!("../../src/memory/sqlite/drafts.rs")),
         (
@@ -382,6 +385,10 @@ fn runtime_and_message_events_preserve_typed_config_generation_columns() {
             include_str!("../../src/memory/sqlite/erasure_pool.rs"),
         ),
         ("events.rs", include_str!("../../src/memory/sqlite/events.rs")),
+        (
+            "event_append.rs",
+            include_str!("../../src/memory/sqlite/event_append.rs"),
+        ),
         ("evolution.rs", include_str!("../../src/memory/sqlite/evolution.rs")),
         ("mailbox.rs", include_str!("../../src/memory/sqlite/mailbox.rs")),
         (

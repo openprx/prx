@@ -444,8 +444,8 @@ pub fn fullscreen_transcript_scroll_available<V: BottomChromeView + ?Sized>(stat
         && state.switcher().is_none()
         && state.saved_session_picker().is_none()
         && state.pending_tool_approval().is_none()
-        && state.active_session_view().is_none()
-        && !state.focus().is_child_view()
+        && state.active_session_view().is_none_or(|view| view.kind == "agent")
+        && (!state.focus().is_child_view() || state.focus().is_session())
 }
 
 /// Legacy compatibility hook for reasoning-card clicks.

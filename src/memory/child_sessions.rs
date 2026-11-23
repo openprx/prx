@@ -41,6 +41,13 @@ pub struct ScopedChildRecord {
 
 /// Opaque record schema belongs to chat; ownership and scope belong to storage.
 pub trait ChildSessionStore: Send + Sync {
+    /// Durable spawn sessions belonging to this authenticated owner/workspace.
+    fn sessions(&self, workspace: &str, owner: &str) -> anyhow::Result<Vec<ChildSessionRecord>>;
+    /// Full model-visible history, excluding internal lifecycle and reasoning rows.
+    fn history(&self, record: &ChildSessionRecord) -> anyhow::Result<Vec<ChildTurn>>;
+    /// Replace only a child's model-visible context and selection. Transcript
+    /// erasure remains the owner's separate history-erase operation.
+    fn replace_context(&self, record: &ChildSessionRecord, turns: &[ChildTurn]) -> anyhow::Result<()>;
     fn load(&self, key: &str, context: &ChildSessionContext) -> anyhow::Result<Option<ScopedChildRecord>>;
     /// Invoke the callback once inside the writer transaction. Failure leaves
     /// the record unchanged. New writes always require a complete live scope.
@@ -50,4 +57,34 @@ pub trait ChildSessionStore: Send + Sync {
         context: &ChildSessionContext,
         update: &mut dyn FnMut(Option<&str>) -> anyhow::Result<String>,
     ) -> anyhow::Result<ScopedChildRecord>;
+}
+
+/// A logical child session. Stored data is never execution authority: every
+/// continuation must be admitted from a fresh parent/operator source.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChildSessionRecord {
+    pub workspace: String,
+    pub owner: String,
+    pub session_key: String,
+    pub parent_session: String,
+    pub parent_run: String,
+    pub agent: String,
+    pub mode: String,
+    pub provider: String,
+    pub model: String,
+    pub level: crate::security::AutonomyLevel,
+    pub created_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
+    pub status: String,
+    pub runs: Vec<String>,
+    pub context_after: i64,
+    pub context: Vec<ChildTurn>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChildTurn {
+    pub role: String,
+    pub content: String,
+    pub timestamp: DateTime<Utc>,
 }

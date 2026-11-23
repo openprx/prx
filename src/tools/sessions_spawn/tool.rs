@@ -51,7 +51,7 @@ impl SessionsSpawnTool {
                         "properties": {
                             "action": {
                                 "type": "string",
-                                "enum": ["spawn", "spawn_batch", "join", "list", "kill", "history", "steer", "chat_sessions", "chat_assign"],
+                                "enum": ["spawn", "continue", "spawn_batch", "join", "list", "kill", "history", "steer", "chat_sessions", "chat_assign"],
                                 "default": "spawn",
                                 "description": "Action to perform, with the parameter it reads: 'spawn' task; \
                                  'spawn_batch' tasks; 'join' batch_id; 'list' none; 'kill' run_id; 'history' run_id; \
@@ -135,6 +135,7 @@ impl SessionsSpawnTool {
                                 "description": "For 'spawn', default true: whether the sub-agent posts its own result to the channel. \
                                                 A 'spawn_batch' member never announces; collect a batch with 'join' and report it once."
                             },
+                            "session_key": {"type":"string","description":"Stable spawn session key for continue."},
                             "last_n": {
                                 "type": "integer",
                                 "minimum": 1,
@@ -160,6 +161,10 @@ impl SessionsSpawnTool {
                         crate::tools::schema::ActionRequirement {
                             action: "spawn_batch",
                             required: &["tasks"],
+                        },
+                        crate::tools::schema::ActionRequirement {
+                            action: "continue",
+                            required: &["task"],
                         },
                         crate::tools::schema::ActionRequirement {
                             action: "kill",
@@ -240,6 +245,7 @@ impl Tool for SessionsSpawnTool {
         }
 
         match action {
+            "continue" => return self.execute_continue(&args).await,
             "list" => return self.execute_list(&owner_scope).await,
             "kill" => {
                 let run_id = args

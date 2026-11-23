@@ -347,6 +347,7 @@ async fn restore_operator_process(
     let launch = source.capture_process(scope, task, receipt, config_generation.clone())?;
     let workspace = &config.workspace_dir;
     let mut manifest = crate::session_worker::protocol::WorkerManifest {
+        seed_history: Vec::new(),
         parent_capability: None,
         ordinary_source: None,
         operator_source: None,

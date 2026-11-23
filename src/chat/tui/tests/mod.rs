@@ -174,6 +174,7 @@ fn long_strip_entries(count: u64) -> Vec<crate::chat::sessions::SwitcherEntry> {
 
 fn active_view(seq: u64, lines: Vec<String>, scroll_offset: usize) -> crate::chat::sessions::ActiveSessionView {
     crate::chat::sessions::ActiveSessionView {
+        turns: Vec::new(),
         seq,
         kind: "agent".to_string(),
         title: "\u{ac00}".repeat(13) + "-with-a-long-title",

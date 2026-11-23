@@ -60,6 +60,7 @@ struct WorkerRun {
 /// decision source, the run stops immediately after transport verification.
 fn manifest_for(config_dir: &Path, workspace_dir: &Path) -> WorkerManifest {
     WorkerManifest {
+        seed_history: Vec::new(),
         parent_capability: None,
         ordinary_source: None,
         operator_source: None,

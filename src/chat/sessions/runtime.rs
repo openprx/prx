@@ -177,6 +177,7 @@ pub struct ChatSessionsHandle {
     seq_map: Vec<(u64, SessionId)>,
     /// Next sequence number to hand out.
     next_seq: u64,
+    session_runs: HashMap<String, SessionId>,
     /// First time this handle observed a PTY as exited. PTY sessions do not
     /// carry `finished_at`, so cleanup ages them from this observation point.
     pty_terminal_seen_at: HashMap<SessionId, DateTime<Utc>>,
@@ -192,11 +193,28 @@ pub struct ChatSessionsHandle {
 }
 
 impl ChatSessionsHandle {
+    pub(crate) async fn child_run(&self, target: &str) -> Option<SubAgentRun> {
+        self.runs
+            .read()
+            .await
+            .iter()
+            .find(|run| run.id == target || run.session_scope_key == target)
+            .cloned()
+    }
+
+    pub(crate) async fn restore_child(&self, run: SubAgentRun) {
+        let mut runs = self.runs.write().await;
+        if !runs.iter().any(|old| old.session_scope_key == run.session_scope_key) {
+            runs.push(run);
+        }
+    }
+
     /// Build a handle over the supplied single-source agent registry Arc, with a
     /// fresh empty shell registry.
     #[must_use]
     pub fn new(runs: Arc<RwLock<Vec<SubAgentRun>>>) -> Self {
         Self {
+            session_runs: HashMap::new(),
             runs,
             shells: Arc::new(Mutex::new(Vec::new())),
             #[cfg(feature = "terminal-tui")]
@@ -349,7 +367,17 @@ impl ChatSessionsHandle {
     async fn refresh_seqs(&mut self) -> Vec<SubAgentRun> {
         let runs: Vec<SubAgentRun> = self.runs.read().await.clone();
         for run in &runs {
-            let _ = self.seq_for(&SessionId::from_run_id(&run.id));
+            let id = SessionId::from_run_id(&run.id);
+            if !run.session_scope_key.is_empty() {
+                if let Some(previous) = self.session_runs.insert(run.session_scope_key.clone(), id.clone()) {
+                    if previous != id {
+                        if let Some((_, mapped)) = self.seq_map.iter_mut().find(|(_, mapped)| *mapped == previous) {
+                            *mapped = id.clone();
+                        }
+                    }
+                }
+            }
+            let _ = self.seq_for(&id);
         }
         // Shells come after agents in seq order. Clone the ids out under the lock,
         // then assign (no await while the lock is held).

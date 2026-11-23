@@ -247,7 +247,7 @@ pub(super) async fn run_sub_agent_process(
     // it with an HMAC bound to the run id, an absolute expiry, and a digest of
     // the manifest contents. A leaked capability token therefore cannot be
     // replayed for a different run, after expiry, or with a tampered manifest.
-    let (manifest, sealed_capability, capability_expiry, mut mailbox_binding) = build_session_worker_manifest(
+    let (mut manifest, _, capability_expiry, mut mailbox_binding) = build_session_worker_manifest(
         run_id,
         task,
         provider_name,
@@ -285,6 +285,25 @@ pub(super) async fn run_sub_agent_process(
         mailbox,
     )
     .map_err(refused_here)?;
+
+    manifest.seed_history = history
+        .read()
+        .await
+        .iter()
+        .filter(|entry| entry.role != "system")
+        .map(|entry| crate::memory::child_sessions::ChildTurn {
+            role: entry.role.clone(),
+            content: entry.content.clone(),
+            timestamp: entry.timestamp,
+        })
+        .collect();
+    let sealed_capability = super::compute_worker_capability_with_key(
+        &launch_transport_key,
+        &manifest.run_id,
+        capability_expiry,
+        &super::manifest_signing_payload(&manifest)?,
+    );
+    manifest.parent_capability = Some(sealed_capability.clone());
 
     if let Some(reason) = process_control.termination_reason() {
         cleanup_process_worker_workspace(run_id, &worker_workspace, keep_workspace);

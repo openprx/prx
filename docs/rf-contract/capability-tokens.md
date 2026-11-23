@@ -657,6 +657,14 @@ WebSocket hello is `{"type":"hello","proto":1,"cursor":null}` or a saved
 A client Close frame, including normal code 1000, is echoed by flushing the
 protocol's queued close reply before the server drops the socket. This also
 applies when the client closes before hello.
+Child sessions retain `spawn:<first-run-id>` across continuation turns. Each
+continuation has a fresh run ID; `turn.started`, `turn.appended`, and
+`child_session.upsert` keep that turn's run and the four ancestry links.
+Consumers must accept repeated running-to-succeeded cycles for one child
+session key. Terminal-chat child sessions remain outside this journal.
+Process-child approvals remain denied with `no_resolver`; focused task-child
+approvals resolve only that child's pending call.
+
 Welcome is `{type:"welcome",epoch,head_seq}`; events replay in sequence before
 live delivery. The install epoch is 32 lowercase hex characters and survives
 restart. Headers retain owner scope and stable identity; the four descendant

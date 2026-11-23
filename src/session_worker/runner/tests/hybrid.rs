@@ -50,6 +50,7 @@ async fn hybrid_worker_shared_context_reads_parent_fabric() {
         .await
         .unwrap();
     let manifest = WorkerManifest {
+        seed_history: Vec::new(),
         parent_capability: Some("capability".to_string()),
         ordinary_source: None,
         operator_source: None,
@@ -170,6 +171,7 @@ async fn process_mode_worker_prompt_carries_no_other_owners_spawn_text() {
             .expect("test: seed a workspace event");
     }
     let manifest = WorkerManifest {
+        seed_history: Vec::new(),
         parent_capability: Some("capability".to_string()),
         ordinary_source: None,
         operator_source: None,
@@ -264,6 +266,7 @@ async fn hybrid_worker_result_creates_private_draft_and_parent_merge_request() {
         .await
         .unwrap();
     let manifest = WorkerManifest {
+        seed_history: Vec::new(),
         parent_capability: Some("capability".to_string()),
         ordinary_source: None,
         operator_source: None,
@@ -414,6 +417,7 @@ async fn hybrid_worker_draft_obeys_readonly_resource_gate() {
         tokens_used: None,
     };
     let manifest = WorkerManifest {
+        seed_history: Vec::new(),
         parent_capability: Some("capability".to_string()),
         ordinary_source: None,
         operator_source: None,

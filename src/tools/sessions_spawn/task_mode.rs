@@ -162,6 +162,10 @@ pub(super) async fn run_sub_agent_task(
         .try_with(|context| context.terminal_usage.clone())
         .ok()
         .flatten();
+    let _live_usage = match (child_usage.clone(), active_runs.clone(), run_id.clone()) {
+        (Some(usage), Some(runs), Some(run)) => Some(super::live_usage::observe(usage, runs, run)),
+        _ => None,
+    };
     anyhow::ensure!(
         (ordinary_segments.is_none() && operator_segments.is_none()) || child_usage.is_some(),
         "child segment usage owner missing"
@@ -224,7 +228,18 @@ pub(super) async fn run_sub_agent_task(
         .transpose()?;
 
     // --- Agentic loop with steering support ---
-    let mut history: Vec<ChatMessage> = Vec::new();
+    let mut history: Vec<ChatMessage> = history_out
+        .read()
+        .await
+        .iter()
+        .map(|entry| ChatMessage {
+            role: entry.role.clone(),
+            content: entry.content.clone(),
+        })
+        .collect();
+    if !history.is_empty() {
+        history.push(ChatMessage::user(task));
+    }
 
     // NeedsInput: deterministically restore a suspended run to `Running` before
     // re-entering the loop. Called on every path that *continues* running after a

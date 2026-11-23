@@ -82,6 +82,7 @@ pub(crate) mod approval_context;
 mod bootstrap;
 mod branch_copy;
 mod chat_events;
+mod child_focus;
 mod compaction;
 mod copy_select;
 #[cfg(feature = "terminal-tui")]

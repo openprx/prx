@@ -10,6 +10,7 @@ use std::sync::{
 use tokio_util::sync::CancellationToken;
 
 pub(crate) struct OperatorSpawnSource {
+    continuation: Option<crate::memory::child_sessions::ChildSessionRecord>,
     proof: OwnedTurnSourceProof,
     generation: Arc<crate::config::ConfigGeneration>,
     fabric: crate::memory::MemoryFabric,
@@ -33,6 +34,10 @@ impl Drop for OperatorLifetime {
 }
 
 tokio::task_local! { static OPERATOR_SPAWN: Arc<OperatorSpawnSource>; }
+
+pub(crate) fn current() -> Option<Arc<OperatorSpawnSource>> {
+    OPERATOR_SPAWN.try_with(Arc::clone).ok()
+}
 
 impl OperatorSpawnSource {
     pub(crate) fn new(
@@ -82,6 +87,7 @@ impl OperatorSpawnSource {
             "operator model source differs from pinned PMM selection"
         );
         Ok(Self {
+            continuation: None,
             catalog,
             resolved,
             route,
@@ -96,6 +102,22 @@ impl OperatorSpawnSource {
             child_issued: AtomicBool::new(false),
             cancellation: CancellationToken::new(),
         })
+    }
+
+    pub(crate) fn for_continuation(
+        mut self,
+        record: crate::memory::child_sessions::ChildSessionRecord,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            record.owner == self.proof.owner_id()
+                && record.workspace == self.proof.workspace_id()
+                && record.parent_session == self.proof.session_key()
+                && record.provider == self.proof.provider_name()
+                && record.model == self.proof.model_name(),
+            "operator continuation identity differs"
+        );
+        self.continuation = Some(record);
+        Ok(self)
     }
 
     pub(crate) async fn scope<F: std::future::Future>(self, work: F) -> F::Output {
@@ -135,8 +157,7 @@ impl OperatorSpawnSource {
         );
         scope.subject = scope.run_id.clone().map(crate::memory::MessageEventSubject::Task);
         scope.owner_id = Some(self.proof.owner_id().to_owned());
-        scope.session_key = Some(self.proof.session_key().to_owned());
-        scope.parent_session_key = scope.session_key.clone();
+        scope.parent_session_key = Some(self.proof.session_key().to_owned());
         scope.parent_run_id = Some(self.proof.run_id().to_owned());
         scope.channel = Some(self.proof.policy_channel().to_owned());
         scope.sender = Some(self.proof.policy_sender().to_owned());
@@ -169,7 +190,7 @@ pub(crate) fn claim(args: &serde_json::Value) -> anyhow::Result<Option<Arc<Opera
     anyhow::ensure!(
         args.as_object().is_some_and(|object| object.keys().all(|key| matches!(
             key.as_str(),
-            "task" | "provider" | "model" | "action"
+            "task" | "provider" | "model" | "action" | "session_key" | "mode" | "agent"
         ) || key
             == crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG)),
         "operator spawn contains uncaptured overrides"
@@ -181,7 +202,21 @@ pub(crate) fn claim(args: &serde_json::Value) -> anyhow::Result<Option<Arc<Opera
             && args
                 .get("action")
                 .and_then(serde_json::Value::as_str)
-                .is_none_or(|action| action == "spawn"),
+                .is_none_or(|action| action
+                    == if source.continuation.is_some() {
+                        "continue"
+                    } else {
+                        "spawn"
+                    })
+            && match &source.continuation {
+                Some(record) =>
+                    args.get("session_key").and_then(serde_json::Value::as_str) == Some(record.session_key.as_str())
+                        && args.get("mode").and_then(serde_json::Value::as_str) == Some(record.mode.as_str())
+                        && args.get("agent").and_then(serde_json::Value::as_str).unwrap_or("main") == record.agent,
+                None => !["session_key", "mode", "agent"]
+                    .iter()
+                    .any(|key| args.get(key).is_some()),
+            },
         "operator spawn differs from captured command"
     );
     anyhow::ensure!(

@@ -100,6 +100,7 @@ fn bare_arrows_scroll_transcript_and_child_views_not_history() {
     state.input.clear();
     state.focus = crate::chat::sessions::FocusTarget::Session { seq: 1 };
     state.active_session_view = Some(crate::chat::sessions::ActiveSessionView {
+        turns: Vec::new(),
         seq: 1,
         kind: "agent".to_string(),
         title: "task 1".to_string(),

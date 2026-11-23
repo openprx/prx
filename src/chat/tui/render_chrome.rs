@@ -847,6 +847,20 @@ pub(super) fn render_status_bar_line<V: BottomChromeView + ?Sized>(state: &V, wi
 
 #[allow(clippy::option_if_let_else)]
 pub(super) fn render_status_bar_text<V: BottomChromeView + ?Sized>(state: &V, width: u16) -> String {
+    if let Some(view) = state.active_session_view().filter(|view| view.kind == "agent") {
+        let usage = state
+            .sessions_entries()
+            .iter()
+            .find(|entry| entry.seq == view.seq)
+            .and_then(|entry| entry.token_usage_summary())
+            .and_then(crate::chat::session::format_session_token_usage_inline)
+            .unwrap_or_else(|| "0 tok | $0.0000".into());
+        return truncate_chars_with_ellipsis(
+            &format!(" PRX Chat | child #{} | {} | {usage} ", view.seq, view.title),
+            width,
+            state.ascii_fallback(),
+        );
+    }
     let title_str = state.session_title();
     let title = if title_str.is_empty() {
         "(new session)"

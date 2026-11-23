@@ -70,6 +70,44 @@ pub(super) async fn record_spawn_request_event(
         "parent_task_id": lineage.parent_task_id,
         "source_message_event_id": lineage.source_message_event_id
     });
+    let run = scope
+        .run_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("child run missing"))?;
+    let session = scope
+        .session_key
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("child session missing"))?;
+    let parent = scope
+        .parent_session_key
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("child parent session missing"))?;
+    let mut runs = super::continuation::current().map_or_else(Vec::new, |seed| seed.record.runs);
+    runs.push(run.to_owned());
+    metadata["child_session_record"] = serde_json::to_value(crate::memory::child_sessions::ChildSessionRecord {
+        workspace: fabric.workspace_id().to_owned(),
+        owner: scope
+            .owner_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("child owner missing"))?,
+        session_key: session.to_owned(),
+        parent_session: parent.to_owned(),
+        parent_run: scope
+            .parent_run_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("child parent run missing"))?,
+        agent: scope.agent_id.clone().unwrap_or_else(|| "main".into()),
+        mode: mode.to_owned(),
+        provider: provider_name.into_owned(),
+        model: selection.1.to_owned(),
+        level: codes.child_level,
+        created_at: chrono::Utc::now(),
+        ended_at: None,
+        status: "running".into(),
+        runs,
+        context_after: 0,
+        context: Vec::new(),
+    })?;
     let receipt =
         crate::runtime::child_source::record_child_input(fabric, scope, task, None, Some(metadata.to_string())).await?;
     delegation::append_task(&mut metadata, task)?;

@@ -15,6 +15,7 @@ use std::path::Path;
 
 pub(crate) fn base_manifest(workspace: &Path, capability: &str) -> WorkerManifest {
     WorkerManifest {
+        seed_history: Vec::new(),
         parent_capability: Some(capability.to_string()),
         ordinary_source: None,
         operator_source: None,

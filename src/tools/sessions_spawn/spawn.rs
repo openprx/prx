@@ -351,13 +351,8 @@ impl SessionsSpawnTool {
         // Every ordinary spawned run records under its own key; the caller
         // link is `parent_session_key` and `parent_run_id`. An operator
         // source keeps its authenticated session.
-        let session_scope_key = operator_source.as_ref().map_or_else(
-            || spawn_session_key(&run_id),
-            |source| {
-                use crate::runtime::turn_source::TurnSourceProof;
-                source.proof().session_key().to_owned()
-            },
-        );
+        let session_scope_key =
+            super::continuation::current().map_or_else(|| spawn_session_key(&run_id), |seed| seed.record.session_key);
 
         // The registry imposes no global fan-out or nesting limit. A child's
         // sealed delegation grant independently bounds its depth. An operator sees every
@@ -851,7 +846,8 @@ impl SessionsSpawnTool {
                 None => process_source_launch,
             };
             let temperature = resolved_temperature;
-            let history_arc: Arc<RwLock<Vec<HistoryEntry>>> = Arc::new(RwLock::new(Vec::new()));
+            let history_arc: Arc<RwLock<Vec<HistoryEntry>>> =
+                Arc::new(RwLock::new(super::continuation::seed_history()));
             let process_control = ProcessRunControl::new();
             // Process-mode steering: the sender lives in the registry exactly as
             // it does for task mode, so `sessions_send` / `sessions_spawn:steer`
@@ -886,7 +882,7 @@ impl SessionsSpawnTool {
                     batch_id: batch_id.map(str::to_string),
                 });
                 run.agent_partition = spawn_scope_for_event.agent_partition.clone();
-                runs.push(run);
+                super::continuation::register(&mut runs, run)?;
             }
 
             let model = resolved_model;
@@ -1377,7 +1373,7 @@ impl SessionsSpawnTool {
         }
 
         // Create shared history and steer channel for this run
-        let history_arc: Arc<RwLock<Vec<HistoryEntry>>> = Arc::new(RwLock::new(Vec::new()));
+        let history_arc: Arc<RwLock<Vec<HistoryEntry>>> = Arc::new(RwLock::new(super::continuation::seed_history()));
         // Class B — bounded. Steering messages are produced by operators and by
         // model tool calls, neither of which is rate-limited now that sub-agent
         // concurrency is uncapped, while the consumer only polls between tool
@@ -1633,32 +1629,35 @@ impl SessionsSpawnTool {
         // `abort_handle` is filled in right after `tokio::spawn` returns.
         {
             let mut runs = self.active_runs.write().await;
-            runs.push(SubAgentRun {
-                agent_partition: spawn_scope_for_event.agent_partition.clone(),
-                id: run_id.clone(),
-                task: task.to_string(),
-                owner_id: run_lineage.owner_id.clone(),
-                topic_id: run_lineage.topic_id.clone(),
-                source_message_event_id: run_lineage.source_message_event_id.clone(),
-                started_at: Utc::now(),
-                finished_at: None,
-                status: SubAgentStatus::Running,
-                recipient: recipient.clone(),
-                channel_name: run_channel_name.clone(),
-                abort_handle: None,
-                process_control: None,
-                task_control: Some(Arc::clone(&task_control)),
-                history: history_arc.clone(),
-                steer_tx: Some(steer_tx.clone()),
-                parent_run_id: parent_run_id.clone(),
-                session_scope_key: session_scope_key.clone(),
-                spawn_depth,
-                // Recursive delegation status is issued by no parent (P2-G4).
-                delegation: None,
-                token_usage_records: Vec::new(),
-                progress: Arc::clone(&task_progress),
-                batch_id: batch_id.map(str::to_string),
-            });
+            super::continuation::register(
+                &mut runs,
+                SubAgentRun {
+                    agent_partition: spawn_scope_for_event.agent_partition.clone(),
+                    id: run_id.clone(),
+                    task: task.to_string(),
+                    owner_id: run_lineage.owner_id.clone(),
+                    topic_id: run_lineage.topic_id.clone(),
+                    source_message_event_id: run_lineage.source_message_event_id.clone(),
+                    started_at: Utc::now(),
+                    finished_at: None,
+                    status: SubAgentStatus::Running,
+                    recipient: recipient.clone(),
+                    channel_name: run_channel_name.clone(),
+                    abort_handle: None,
+                    process_control: None,
+                    task_control: Some(Arc::clone(&task_control)),
+                    history: history_arc.clone(),
+                    steer_tx: Some(steer_tx.clone()),
+                    parent_run_id: parent_run_id.clone(),
+                    session_scope_key: session_scope_key.clone(),
+                    spawn_depth,
+                    // Recursive delegation status is issued by no parent (P2-G4).
+                    delegation: None,
+                    token_usage_records: Vec::new(),
+                    progress: Arc::clone(&task_progress),
+                    batch_id: batch_id.map(str::to_string),
+                },
+            )?;
         }
 
         // Registry row for this run. Parent captured on the spawning task, which

@@ -149,6 +149,7 @@ pub fn build_provider_worker_active_view_with_io(
     lines.push("view: read-only provider worker detail".to_string());
     lines.push("keys: PageUp/PageDown scroll, Esc returns to main".to_string());
     crate::chat::sessions::ActiveSessionView {
+        turns: Vec::new(),
         seq: sequence,
         kind: PROVIDER_WORKER_VIEW_KIND.to_string(),
         title,

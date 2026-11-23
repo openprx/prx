@@ -892,7 +892,17 @@ async fn run_owned_manifest(
 
     let process_denials = Arc::new(crate::session_worker::denials::DenialSink::default());
     let run_future = boxed_worker_segments(|| async {
-        let initial_history = Vec::new();
+        let mut initial_history: Vec<crate::providers::ChatMessage> = manifest
+            .seed_history
+            .iter()
+            .map(|turn| crate::providers::ChatMessage {
+                role: turn.role.clone(),
+                content: turn.content.clone(),
+            })
+            .collect();
+        if !initial_history.is_empty() {
+            initial_history.push(crate::providers::ChatMessage::user(&manifest.task));
+        }
 
         let observer = NoopObserver;
         let scope_ctx = match (

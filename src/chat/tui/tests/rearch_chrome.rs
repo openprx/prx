@@ -224,6 +224,7 @@ fn fullscreen_child_and_diff_views_use_large_panel_above_input() {
     });
     state.focus = crate::chat::sessions::FocusTarget::Session { seq: 7 };
     state.active_session_view = Some(crate::chat::sessions::ActiveSessionView {
+        turns: Vec::new(),
         seq: 7,
         kind: "agent".to_string(),
         title: "phase2 child".to_string(),
@@ -244,6 +245,7 @@ fn fullscreen_child_and_diff_views_use_large_panel_above_input() {
 
     state.focus = crate::chat::sessions::FocusTarget::Diff;
     state.active_session_view = Some(crate::chat::sessions::ActiveSessionView {
+        turns: Vec::new(),
         seq: DIFF_SESSION_SEQ,
         kind: crate::chat::sessions::model::ManagedKind::Diff.as_str().to_string(),
         title: "workspace diff".to_string(),
@@ -294,6 +296,7 @@ fn fullscreen_scroll_focus_rules_do_not_steal_input_or_child_keys() {
     let mut child_state = TuiState::new("provider", "model");
     child_state.focus = crate::chat::sessions::FocusTarget::Session { seq: 3 };
     child_state.active_session_view = Some(crate::chat::sessions::ActiveSessionView {
+        turns: Vec::new(),
         seq: 3,
         kind: "agent".to_string(),
         title: "child".to_string(),

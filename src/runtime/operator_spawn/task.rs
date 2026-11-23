@@ -57,8 +57,11 @@ impl OperatorSpawnSource {
                 && run_id != self.proof.run_id()
                 && scope.source == crate::memory::MessageEventSource::SessionsSpawn
                 && scope.owner_id.as_deref() == Some(self.proof.owner_id())
-                && scope.session_key.as_deref() == Some(self.proof.session_key())
-                && scope.parent_session_key == scope.session_key
+                && scope
+                    .session_key
+                    .as_deref()
+                    .is_some_and(|key| key.starts_with("spawn:"))
+                && scope.parent_session_key.as_deref() == Some(self.proof.session_key())
                 && scope.parent_run_id.as_deref() == Some(self.proof.run_id())
                 && scope.channel.as_deref() == Some(self.proof.policy_channel())
                 && scope.sender.as_deref() == Some(self.proof.policy_sender())
@@ -191,7 +194,7 @@ impl OperatorTaskAuthority {
                 && proof.surface() == crate::tools::capability::turn_state::TurnSurfaceKind::Worker
                 && proof.workspace_id() == self.source.proof.workspace_id()
                 && proof.owner_id() == self.source.proof.owner_id()
-                && proof.session_key() == self.source.proof.session_key()
+                && Some(proof.session_key()) == self.scope.session_key.as_deref()
                 && proof.task_id() == Some(self.run_id.as_str())
                 && proof.provider_name() == self.source.proof.provider_name()
                 && proof.model_name() == self.source.proof.model_name()
@@ -249,7 +252,7 @@ impl TurnSourceProof for OperatorTaskAuthority {
         self.source.proof.owner_id()
     }
     fn session_key(&self) -> &str {
-        self.source.proof.session_key()
+        self.scope.session_key.as_deref().unwrap_or_default()
     }
     fn run_id(&self) -> &str {
         &self.run_id

@@ -363,6 +363,7 @@ pub fn build_transcript_view(
         lines.push("(transcript is empty - PageUp/Home view history; /help for copy/export)".to_string());
     }
     crate::chat::sessions::ActiveSessionView {
+        turns: Vec::new(),
         seq: TRANSCRIPT_SESSION_SEQ,
         kind: crate::chat::sessions::model::ManagedKind::Transcript
             .as_str()
@@ -391,6 +392,7 @@ pub fn build_diff_view(
         lines.push("(no workspace diff)".to_string());
     }
     crate::chat::sessions::ActiveSessionView {
+        turns: Vec::new(),
         seq: DIFF_SESSION_SEQ,
         kind: crate::chat::sessions::model::ManagedKind::Diff.as_str().to_string(),
         title: if title.trim().is_empty() {

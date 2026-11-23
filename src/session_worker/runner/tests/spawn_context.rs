@@ -8,6 +8,7 @@ use crate::session_worker::runner::context::{
 #[tokio::test]
 async fn process_mode_restores_spawn_context_for_nested_runs() {
     let manifest = WorkerManifest {
+        seed_history: Vec::new(),
         parent_capability: Some("capability".to_string()),
         ordinary_source: None,
         operator_source: None,
@@ -90,6 +91,7 @@ async fn process_mode_restores_spawn_context_for_nested_runs() {
 #[test]
 fn worker_event_scope_preserves_spawn_lineage_and_owner_isolation() {
     let manifest = WorkerManifest {
+        seed_history: Vec::new(),
         parent_capability: Some("capability".to_string()),
         ordinary_source: None,
         operator_source: None,

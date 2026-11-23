@@ -127,6 +127,9 @@ pub struct WorkerManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_addr: Option<crate::messaging::SessionAddr>,
     pub task: String,
+    /// Prior public turns of a continued child, covered by the manifest MAC.
+    #[serde(default)]
+    pub seed_history: Vec<crate::memory::child_sessions::ChildTurn>,
     pub provider_name: String,
     pub model: String,
     /// Selected model route, when the parent resolved a `hint:` model.
@@ -407,6 +410,7 @@ mod tests {
     #[test]
     fn worker_manifest_roundtrip_json_preserves_owner_isolation() {
         let manifest = WorkerManifest {
+            seed_history: Vec::new(),
             parent_capability: Some("capability".into()),
             ordinary_source: None,
             operator_source: None,
@@ -594,6 +598,7 @@ mod tests {
     #[test]
     fn inherited_provenance_is_sealed_into_worker_manifest() {
         let mut manifest = WorkerManifest {
+            seed_history: Vec::new(),
             parent_capability: None,
             ordinary_source: None,
             operator_source: None,

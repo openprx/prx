@@ -126,6 +126,12 @@ pub(super) fn push_conversation_transcript_lines<'a, V: BottomChromeView + ?Size
     lines: &mut Vec<Line<'a>>,
     state: &'a V,
 ) {
+    if let Some(view) = state.active_session_view().filter(|view| view.kind == "agent") {
+        for turn in &view.turns {
+            render_public_message(lines, &turn.role, &turn.content, state.ascii_fallback());
+        }
+        return;
+    }
     for line in state.conversation_lines() {
         // Reasoning is diagnostic data, not a second completion summary. Keep
         // it in the backing conversation for Ctrl+O's verbose transcript, but
@@ -141,6 +147,16 @@ pub(super) fn push_live_turn_transcript_lines<'a, V: BottomChromeView + ?Sized>(
     lines: &mut Vec<Line<'a>>,
     state: &'a V,
 ) {
+    if let Some(view) = state.active_session_view().filter(|view| view.kind == "agent") {
+        if !view.lines.is_empty() {
+            push_assistant_rendered_lines(
+                lines,
+                render_streaming_assistant_markdown_lines(&view.lines.join("\n"), state.ascii_fallback()),
+                state.ascii_fallback(),
+            );
+        }
+        return;
+    }
     let Some(streaming) = state.streaming() else {
         return;
     };
@@ -321,6 +337,9 @@ pub fn render_fullscreen_chat_with_selection<V: BottomChromeView + ?Sized>(
 }
 
 pub(super) fn fullscreen_content_areas<V: BottomChromeView + ?Sized>(area: Rect, state: &V) -> (Rect, Option<Rect>) {
+    if state.active_session_view().is_some_and(|view| view.kind == "agent") {
+        return (area, None);
+    }
     if area.height == 0 || (state.pending_tool_approval().is_none() && state.active_session_view().is_none()) {
         return (area, None);
     }
@@ -504,9 +523,9 @@ pub(super) fn measure_wrapped_rows(lines: &[Line<'_>], width: u16) -> u16 {
 /// Pure function (apart from the &mut push target) — kept outside
 /// [`render_fullscreen_transcript`] so unit tests can drive it with a
 /// `Vec<Line<'_>>` sink.
-pub(super) fn render_conversation_line<'a>(lines: &mut Vec<Line<'a>>, conv_line: &'a ConversationLine, ascii: bool) {
-    match conv_line {
-        ConversationLine::User { content } => {
+fn render_public_message<'a>(lines: &mut Vec<Line<'a>>, role: &str, content: &'a str, ascii: bool) {
+    match role {
+        "user" => {
             // Claude Code style: `> ` prompt in dim gray (no bold), content in
             // default foreground on the same row when single-line; multi-line
             // continuation rows are dedented two spaces to align under the
@@ -522,7 +541,7 @@ pub(super) fn render_conversation_line<'a>(lines: &mut Vec<Line<'a>>, conv_line:
             }
             lines.push(Line::from(""));
         }
-        ConversationLine::Assistant { content } => {
+        "assistant" => {
             // PRX chat uses an explicit actor marker for assistant-authored
             // prose so it is visually distinct from tool IO and child-session
             // output when scanning a dense orchestration transcript.
@@ -531,6 +550,18 @@ pub(super) fn render_conversation_line<'a>(lines: &mut Vec<Line<'a>>, conv_line:
             push_assistant_rendered_lines(lines, rendered.iter().cloned(), ascii);
             lines.push(Line::from(""));
         }
+        _ => {
+            for text in content.lines() {
+                lines.push(Line::from(Span::styled(text, Style::default().fg(Color::DarkGray))));
+            }
+        }
+    }
+}
+
+pub(super) fn render_conversation_line<'a>(lines: &mut Vec<Line<'a>>, conv_line: &'a ConversationLine, ascii: bool) {
+    match conv_line {
+        ConversationLine::User { content } => render_public_message(lines, "user", content, ascii),
+        ConversationLine::Assistant { content } => render_public_message(lines, "assistant", content, ascii),
         ConversationLine::StreamingAssistant { content } => {
             // Same actor marker as finalized assistant text. A trailing cursor
             // glyph (`▌`, or `_` in ASCII mode) signals that more bytes are

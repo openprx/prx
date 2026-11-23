@@ -83,7 +83,7 @@ pub(super) fn build_active_session_attach_projection(
     ActiveSessionAttachProjection {
         view: build_active_session_view(seq, meta, tail_lines, ring_lines, truncated, 0),
         breadcrumb: format!(
-            "Attached session #{seq} (child viewport; input routes as steer). Type /detach or press Esc to stop."
+            "Attached session #{seq} (child session; input starts or queues a turn). Type /detach or press Esc to stop."
         ),
     }
 }
@@ -105,6 +105,7 @@ fn build_active_session_view(
     lines.extend(tail_lines);
     lines.extend(ring_lines);
     crate::chat::sessions::ActiveSessionView {
+        turns: Vec::new(),
         seq,
         kind,
         title,

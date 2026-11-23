@@ -376,6 +376,7 @@ impl Drop for ChatAdmissionGuard {
 /// Private fields keep mailbox content and decoded tool arguments from minting
 /// an operator command or replacing the model after verification.
 pub(super) struct ChatOperatorSpawn {
+    child: Option<crate::memory::child_sessions::ChildSessionRecord>,
     command: String,
     binding: ChatProviderBinding,
     task: String,
@@ -404,6 +405,7 @@ impl ChatOperatorSpawn {
         );
         binding.verify(generation, provider, provider_name, model_name)?;
         Ok(Self {
+            child: None,
             command: message.content.clone(),
             binding: ChatProviderBinding {
                 choice: binding.choice.clone(),
@@ -413,6 +415,30 @@ impl ChatOperatorSpawn {
             task: task.to_owned(),
             provider: binding.choice.provider_name().to_owned(),
             model: binding.choice.model_name().to_owned(),
+        })
+    }
+
+    pub(super) fn capture_child(
+        message: &crate::channels::traits::ChannelMessage,
+        task: &str,
+        record: crate::memory::child_sessions::ChildSessionRecord,
+        binding: ChatProviderBinding,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            super::is_local_operator_input(message)
+                && !message.sender_is_bot
+                && message.content.strip_prefix("/now ").unwrap_or(&message.content) == task
+                && !task.is_empty(),
+            "child input requires an actual local operator message"
+        );
+        binding.verify(&binding.generation, &binding.provider, &record.provider, &record.model)?;
+        Ok(Self {
+            command: message.content.clone(),
+            provider: record.provider.clone(),
+            model: record.model.clone(),
+            child: Some(record),
+            binding,
+            task: task.to_owned(),
         })
     }
 
@@ -464,7 +490,7 @@ impl ChatOperatorSpawn {
             )
         };
         let runtime = Arc::clone(publication.runtime_holder());
-        let source = crate::runtime::operator_spawn::OperatorSpawnSource::new(
+        let mut source = crate::runtime::operator_spawn::OperatorSpawnSource::new(
             binding.as_ref(),
             Arc::clone(generation),
             fabric,
@@ -474,13 +500,16 @@ impl ChatOperatorSpawn {
             publication,
             runtime,
         )?;
+        let mut args = serde_json::json!({ "task": self.task, "provider": self.provider, "model": self.model });
+        if let Some(record) = self.child {
+            args["action"] = "continue".into();
+            args["session_key"] = record.session_key.clone().into();
+            source = source.for_continuation(record)?;
+        }
         if let Some(guard) = admission_guard {
             guard.handoff();
         }
-        Ok((
-            serde_json::json!({ "task": self.task, "provider": self.provider, "model": self.model }),
-            source,
-        ))
+        Ok((args, source))
     }
 }
 

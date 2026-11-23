@@ -132,6 +132,26 @@ fn resolve_new_scope(tx: &Transaction<'_>, context: &ChildSessionContext, key: &
 }
 
 impl ChildSessionStore for SqliteMemory {
+    fn replace_context(
+        &self,
+        record: &crate::memory::child_sessions::ChildSessionRecord,
+        turns: &[crate::memory::child_sessions::ChildTurn],
+    ) -> anyhow::Result<()> {
+        super::child_turns::replace_context(self, record, turns)
+    }
+    fn sessions(
+        &self,
+        workspace: &str,
+        owner: &str,
+    ) -> anyhow::Result<Vec<crate::memory::child_sessions::ChildSessionRecord>> {
+        super::child_turns::sessions(self, workspace, owner)
+    }
+    fn history(
+        &self,
+        record: &crate::memory::child_sessions::ChildSessionRecord,
+    ) -> anyhow::Result<Vec<crate::memory::child_sessions::ChildTurn>> {
+        super::child_turns::history(self, record)
+    }
     fn load(&self, key: &str, context: &ChildSessionContext) -> anyhow::Result<Option<ScopedChildRecord>> {
         validate_key(key, context)?;
         let writer = self.pool.write();

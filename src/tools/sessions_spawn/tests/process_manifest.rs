@@ -149,6 +149,7 @@ async fn spawn_agent_uses_identity_prompt() {
 #[test]
 fn process_mode_task_arg_is_not_json_encoded() {
     let manifest = WorkerManifest {
+        seed_history: Vec::new(),
         parent_capability: Some("capability".to_string()),
         ordinary_source: None,
         operator_source: None,

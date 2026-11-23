@@ -1952,3 +1952,15 @@ are directly published for gateway Main and named turns, subject to explicit
 operator exclusions and the existing execution gates. Named targeted
 agents at Full have the Full tool surface, including shell and file writes;
 Supervised and ReadOnly retain their existing restrictions.
+
+### Continuing a child session
+
+`sessions_spawn` accepts `action="continue"`, `session_key` (or an earlier
+`run_id`), and `task`. The child retains its session key and public history,
+uses a fresh admitted run, and can continue after the parent chat is resumed
+following a restart. A child remains depth one and cannot spawn or delegate.
+In `prx chat`, Enter in a focused child starts a turn or queues behind its
+current turn. `/now` puts input first; `/steer` explicitly interrupts the
+current turn. Session commands operate on the focused child's context,
+model, history, usage, and task-mode approvals. `/level` displays the inherited
+level. Process-child approval calls remain denied with `no_resolver`.

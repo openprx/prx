@@ -101,6 +101,7 @@ fn s4_a_2_view_getters_parity() {
     state.ui.chat_mode = ChatMode::Auto;
     state.ui.autonomy_level = AutonomyLevel::ReadOnly;
     let active_view = crate::chat::sessions::ActiveSessionView {
+        turns: Vec::new(),
         seq: DIFF_SESSION_SEQ,
         kind: crate::chat::sessions::model::ManagedKind::Diff.as_str().to_string(),
         title: "workspace diff".to_string(),

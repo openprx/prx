@@ -34,7 +34,13 @@ pub(super) fn memory_written(conn: &Connection, event: &MemoryEvent) -> anyhow::
     h.source_ref = format!("memory:{}", event.event_id);
     h.event_id = format!("child:{}", event.event_id);
     h.timestamp = event.created_at.clone();
-    append(conn, &h)
+    append(conn, &h)?;
+    if event.event_type == "task.spawned" {
+        h.kind = "turn.started".into();
+        h.event_id = format!("child-turn:{}", event.event_id);
+        append(conn, &h)?;
+    }
+    Ok(())
 }
 
 pub(super) fn child_payload(conn: &Connection, h: &Header) -> anyhow::Result<Value> {
