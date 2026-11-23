@@ -4399,7 +4399,10 @@ async fn call_approval_action(
             let adapter = service.call_approval_strategy(envelope)?;
             let pending = adapter.port.inspect(&principal.owner_id, &session, &authority).await?;
             let receipt = match change {
-                None => serde_json::to_value(pending.view())?,
+                None => {
+                    anyhow::ensure!(!adapter.port.is_rf_decided(&pending).await?, "approval already decided");
+                    serde_json::to_value(pending.view())?
+                }
                 Some(DecisionApprovalChange::Review(approved)) => {
                     let expires_at = adapter
                         .port

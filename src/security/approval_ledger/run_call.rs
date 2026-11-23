@@ -701,6 +701,20 @@ impl ApprovalLedgerPort<'_> {
         Ok(event)
     }
 
+    pub(crate) async fn is_rf_decided(&self, pending: &PendingCall) -> anyhow::Result<bool> {
+        if pending.rf.is_none() {
+            return Ok(false);
+        }
+        Ok(self
+            .memory
+            .find_message_event_by_idempotency_key(
+                self.workspace,
+                &format!("rf-decision:{}", pending.authority.call_id()),
+            )
+            .await?
+            .is_some())
+    }
+
     pub(crate) async fn list_pending_calls(
         &self,
         owner: &str,
@@ -742,6 +756,9 @@ impl ApprovalLedgerPort<'_> {
                 .await
                 .is_err()
             {
+                continue;
+            }
+            if self.is_rf_decided(&record).await? {
                 continue;
             }
             if self
