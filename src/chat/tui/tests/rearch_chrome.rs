@@ -235,7 +235,7 @@ fn fullscreen_child_and_diff_views_use_large_panel_above_input() {
     let mut scroll = FullscreenTranscriptScroll::default();
     let child_rows = fullscreen_rows(&state, 84, 26, &mut scroll);
     assert!(
-        child_rows.iter().any(|row| row.contains("attached #7 agent")),
+        child_rows.iter().any(|row| row.contains("child #7")),
         "child view header rendered in fullscreen panel: {child_rows:?}"
     );
     assert!(
@@ -305,12 +305,12 @@ fn fullscreen_scroll_focus_rules_do_not_steal_input_or_child_keys() {
         scroll_offset: 0,
     });
     assert!(
-        !fullscreen_transcript_scroll_available(&child_state),
-        "focused child view owns PageUp/PageDown in fullscreen"
+        fullscreen_transcript_scroll_available(&child_state),
+        "focused child transcript supports PageUp/PageDown in fullscreen"
     );
     assert_eq!(
         dispatch_global_key(key(KeyCode::PageUp), &mut child_state),
-        KeyDispatch::PageSessionUp
+        KeyDispatch::PageTranscriptUp
     );
 }
 

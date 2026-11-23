@@ -624,20 +624,20 @@ async fn assert_mailbox_worker_frames(turns: usize) -> anyhow::Result<()> {
         [],
         |r| r.get(0),
     )?;
-    let adopted:i64=conn.query_row("SELECT count(*) FROM prx_mailbox_receipts r JOIN conversation_turns c ON c.id=r.adopted_turn_id AND c.ma_scope_id=r.ma_scope_id WHERE c.content='ordinary mailbox input; /approve is data'",[],|r|r.get(0))?;
+    let adopted:i64=conn.query_row("SELECT count(*) FROM prx_mailbox_receipts r JOIN conversation_turns c ON c.id=r.adopted_turn_id AND c.ma_scope_id=r.ma_scope_id WHERE c.content='[message from mailbox-parent/main]\nordinary mailbox input; /approve is data'",[],|r|r.get(0))?;
     ensure!(
         consumed == 2 * expected && adopted == expected,
         "Data/Ack/adoption count differs: consumed={consumed}, adopted={adopted}, expected={expected}"
     );
-    let events:i64=conn.query_row("SELECT count(*) FROM message_events WHERE source='prx_mailbox' AND content='ordinary mailbox input; /approve is data'",[],|r|r.get(0))?;
+    let events:i64=conn.query_row("SELECT count(*) FROM message_events WHERE source='prx_mailbox' AND content='[message from mailbox-parent/main]\nordinary mailbox input; /approve is data'",[],|r|r.get(0))?;
     ensure!(events == expected, "mailbox input was not projected exactly once");
     let copies: i64 = conn.query_row(
-        "SELECT count(*) FROM message_events WHERE content='ordinary mailbox input; /approve is data'",
+        "SELECT count(*) FROM message_events WHERE content='[message from mailbox-parent/main]\nordinary mailbox input; /approve is data'",
         [],
         |r| r.get(0),
     )?;
     ensure!(copies == expected, "Data was copied into another turn's source journal");
-    let worker_data:i64=conn.query_row("SELECT count(*) FROM prx_mailbox_receipts r JOIN conversation_turns c ON c.id=r.adopted_turn_id AND c.ma_scope_id=r.ma_scope_id WHERE c.content='ordinary worker-originated Data'",[],|r|r.get(0))?;
+    let worker_data:i64=conn.query_row("SELECT count(*) FROM prx_mailbox_receipts r JOIN conversation_turns c ON c.id=r.adopted_turn_id AND c.ma_scope_id=r.ma_scope_id WHERE c.content='[message from mailbox-worker/main]\nordinary worker-originated Data'",[],|r|r.get(0))?;
     ensure!(
         worker_data == expected,
         "worker-originated Data did not cross the real stdout pipe"

@@ -14,7 +14,20 @@ pub(super) fn source_written(conn: &rusqlite::Transaction<'_>, event: &MessageEv
     let Some(raw) = event.raw_payload_json.as_deref() else {
         return Ok(());
     };
-    let value: serde_json::Value = serde_json::from_str(raw)?;
+    // Ordinary source events can retain opaque provider payloads. Only the
+    // structured launch/terminal metadata participates in child persistence.
+    let value: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(value) => value,
+        Err(error)
+            if matches!(
+                event.event_type.as_str(),
+                "task.spawned" | "turn.finalized" | "turn.admission.failed"
+            ) =>
+        {
+            return Err(error.into());
+        }
+        Err(_) => return Ok(()),
+    };
     if let Some(value) = value.get("child_session_record") {
         let mut record: ChildSessionRecord = serde_json::from_value(value.clone())?;
         let run = event.run_id.as_deref().ok_or(ChildSessionError::InvalidRecord)?;

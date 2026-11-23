@@ -1054,7 +1054,7 @@ async fn child_session_reconstructs_mailbox_cursor() {
             .first()
             .expect("test: child_session_reconstructs_mailbox_cursor: first succeeds")
             .content,
-        "request-1",
+        "[message from source/main]\nrequest-1",
         "child session reconstructs mailbox cursor: atomic adoption or history projection changed"
     );
     registry

@@ -29,10 +29,11 @@ use super::*;
 /// all; both are still required to be documented, by
 /// [`every_action_is_named_where_the_model_reads_it`].
 const PARAMETER_ACTION_MATRIX: &[(&str, &[&str])] = &[
-    ("task", &["spawn", "chat_assign"]),
+    ("task", &["spawn", "continue", "chat_assign"]),
     ("tasks", &["spawn_batch"]),
     ("batch_id", &["join"]),
-    ("run_id", &["kill", "history", "steer"]),
+    ("run_id", &["kill", "history", "steer", "continue"]),
+    ("session_key", &["continue"]),
     ("message", &["steer"]),
     ("session_id", &["chat_assign"]),
     ("disposition", &["chat_assign"]),

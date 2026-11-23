@@ -713,7 +713,7 @@ mod module_ownership_tests {
     /// screen to the TUI.
     #[test]
     fn the_binary_prints_the_embedding_upgrade_notice_for_chat() {
-        let main = include_str!("main.rs");
+        let main = include_str!("main/section_2.rs");
         let call = "chat::print_embedding_upgrade_notice_to_stderr(&config);";
         let notice_at = main
             .find(call)

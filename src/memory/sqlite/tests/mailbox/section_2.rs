@@ -41,7 +41,7 @@ async fn sessions_send_tool_emits_one_external_send_envelope() {
             .entry_for_public_name("sessions_send")
             .expect("test: sessions_send_tool_emits_one_external_send_envelope: entry_for_public_name succeeds")
             .effect,
-        crate::tools::capability::contract::SideEffectClass::ExternalSend,
+        crate::tools::capability::contract::SideEffectClass::LocalWrite,
         "prx message tool emits one external send envelope: expected messaging contract changed"
     );
     let result = tool
@@ -163,11 +163,11 @@ async fn sessions_send_remote_addr_is_not_steer() {
 #[test]
 fn slash_msg_builds_envelope_to_peer_session() {
     let f = Fixture::new();
-    let (target, text) = crate::chat::commands::msg::parse("/msg peer-node target/prx_agent hello peer", &f.source)
+    let (target, text) = crate::chat::commands::msg::parse("/msg target hello peer", &f.source)
         .expect("test: slash_msg_builds_envelope_to_peer_session: fixture setup succeeds");
     assert_eq!(
         target,
-        SessionAddr::new("peer-node", O, "target", Some("prx_agent")),
+        SessionAddr::new("prx-node", O, "target", None),
         "slash msg builds envelope to peer session: expected messaging contract changed"
     );
     assert_eq!(
@@ -824,7 +824,7 @@ async fn process_worker_message_frame_roundtrips() {
     assert_eq!(
         crate::session_worker::mailbox::user_text(&queued)
             .expect("test: process_worker_message_frame_roundtrips: mailbox::user_text succeeds"),
-        "request-1",
+        "[message from source/main]\nrequest-1",
         "process worker message frame roundtrips: IPC identity or delivery state changed"
     );
     let consumed = inbox

@@ -62,8 +62,8 @@ impl SqliteMailbox {
         if message.stream_id.is_none() {
             return Err(MailboxError::StreamIdRequired);
         }
-        message.validate().map_err(|_| MailboxError::InvalidMetadata)?;
         validate_body(&message.body.mime, &message.body.bytes)?;
+        message.validate().map_err(|_| MailboxError::InvalidMetadata)?;
         if message.seq == 0 {
             return Err(MailboxError::InvalidMetadata);
         }

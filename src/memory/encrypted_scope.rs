@@ -99,6 +99,40 @@ impl EncryptedScope {
         Ok(())
     }
 
+    /// Keep only routing metadata visible to SQLite's transactional child hook.
+    /// Source text and the complete original payload remain encrypted.
+    fn seal_event_payload(&self, input: &mut crate::memory::MessageEventInput) -> anyhow::Result<()> {
+        let Some(payload) = input.raw_payload_json.take() else {
+            return Ok(());
+        };
+        let key = input.idempotency_key.as_deref().unwrap_or("event");
+        let sealed = self.seal(&format!("{key}:payload"), &payload)?;
+        let value = serde_json::from_str::<serde_json::Value>(&payload).ok();
+        let child = matches!(
+            input.source,
+            crate::memory::MessageEventSource::SessionsSpawn | crate::memory::MessageEventSource::SessionWorker
+        );
+        input.raw_payload_json = Some(if child {
+            let mut wrapper = serde_json::json!({"encrypted_child_payload": sealed});
+            if let Some(record) = value.as_ref().and_then(|value| value.get("child_session_record")) {
+                let record: crate::memory::child_sessions::ChildSessionRecord = serde_json::from_value(record.clone())?;
+                anyhow::ensure!(record.context.is_empty(), "launch metadata cannot expose child history");
+                wrapper["child_session_record"] = serde_json::to_value(record)?;
+            }
+            if let Some(status) = value
+                .as_ref()
+                .and_then(|value| value.get("status"))
+                .and_then(serde_json::Value::as_str)
+            {
+                wrapper["status"] = status.into();
+            }
+            wrapper.to_string()
+        } else {
+            sealed
+        });
+        Ok(())
+    }
+
     fn open_aad(&self, record_hash: &str, stored: &str) -> Option<String> {
         if !self.crypto.encryption_enabled() {
             return Some(stored.to_string());
@@ -161,6 +195,15 @@ impl EncryptedScope {
         let record_id = event.idempotency_key.clone().unwrap_or_else(|| "event".to_string());
         if let Some(plain) = self.open_record(&record_id, &event.content) {
             event.content = plain;
+        }
+        if let Some(payload) = event.raw_payload_json.as_deref()
+            && let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(payload)
+            && let Some(stored) = wrapper
+                .get("encrypted_child_payload")
+                .and_then(serde_json::Value::as_str)
+            && let Some(plain) = self.open_record(&format!("{record_id}:payload"), stored)
+        {
+            event.raw_payload_json = Some(plain);
         }
         if let Some(stored) = event.raw_payload_json.as_deref()
             && let Some(plain) = self.open_record(&format!("{record_id}:payload"), stored)
@@ -424,10 +467,7 @@ impl Memory for EncryptedScope {
         // Ingress keeps its capsule wrapper parseable. Every other event,
         // including the terminal marker, seals the payload so reply text is
         // not stored beside the ciphertext.
-        if let Some(payload) = input.raw_payload_json.clone() {
-            let record_id = input.idempotency_key.clone().unwrap_or_else(|| "event".to_string());
-            input.raw_payload_json = Some(self.seal(&format!("{record_id}:payload"), &payload)?);
-        }
+        self.seal_event_payload(&mut input)?;
         let event = self.inner.append_message_event(input).await?;
         Ok(self.reveal(event))
     }
@@ -438,10 +478,7 @@ impl Memory for EncryptedScope {
         deadline: std::time::Instant,
     ) -> anyhow::Result<crate::memory::MessageEvent> {
         self.seal_event_content(&mut input)?;
-        if let Some(payload) = input.raw_payload_json.take() {
-            let key = input.idempotency_key.as_deref().unwrap_or("event");
-            input.raw_payload_json = Some(self.seal(&format!("{key}:payload"), &payload)?);
-        }
+        self.seal_event_payload(&mut input)?;
         Ok(self.reveal(self.inner.append_message_event_until(input, deadline).await?))
     }
 

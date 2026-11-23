@@ -226,6 +226,15 @@ impl ChildLaunchSource {
                     .is_some_and(|run| !run.is_empty() && run != self.proof.run_id()),
             "operator child input requires a distinct spawn run"
         );
+        // Binding is the trusted boundary that assigns the logical child identity.
+        // Continuations already carry their persisted spawn key.
+        if !scope
+            .session_key
+            .as_deref()
+            .is_some_and(|key| key.starts_with("spawn:"))
+        {
+            scope.session_key = scope.run_id.as_ref().map(|run| format!("spawn:{run}"));
+        }
         scope.subject = scope.run_id.clone().map(crate::memory::MessageEventSubject::Task);
         scope.owner_id = Some(self.proof.owner_id().to_owned());
         scope.parent_session_key = Some(self.proof.session_key().to_owned());

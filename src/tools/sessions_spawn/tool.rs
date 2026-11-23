@@ -53,7 +53,7 @@ impl SessionsSpawnTool {
                                 "type": "string",
                                 "enum": ["spawn", "continue", "spawn_batch", "join", "list", "kill", "history", "steer", "chat_sessions", "chat_assign"],
                                 "default": "spawn",
-                                "description": "Action to perform, with the parameter it reads: 'spawn' task; \
+                                "description": "Action to perform, with the parameter it reads: 'spawn' task; 'continue' session_key + task; \
                                  'spawn_batch' tasks; 'join' batch_id; 'list' none; 'kill' run_id; 'history' run_id; \
                                  'steer' run_id + message; 'chat_sessions' none; 'chat_assign' session_id + task."
                             },
@@ -85,13 +85,13 @@ impl SessionsSpawnTool {
                             "task": {
                                 "type": "string",
                                 "minLength": 1,
-                                "description": "The work to be done, as instructions. Required by 'spawn' and by 'chat_assign' \
+                                "description": "The work to be done, as instructions. Required by 'spawn', 'continue' and by 'chat_assign' \
                                                 ('chat_assign' has no `message`, `prompt` or `text` parameter). Use `tasks` for \
                                                 'spawn_batch' and `message` for 'steer'."
                             },
                             "run_id": {
                                 "type": "string",
-                                "description": "Sub-agent run id returned by 'spawn' and listed by 'list'. Required by 'kill', 'history' and 'steer'. Not a chat session id."
+                                "description": "Sub-agent run id returned by 'spawn' and listed by 'list'. Required by 'kill', 'history' and 'steer'; alternative to session_key for 'continue'. Not a chat session id."
                             },
                             "message": {
                                 "type": "string",
@@ -135,7 +135,7 @@ impl SessionsSpawnTool {
                                 "description": "For 'spawn', default true: whether the sub-agent posts its own result to the channel. \
                                                 A 'spawn_batch' member never announces; collect a batch with 'join' and report it once."
                             },
-                            "session_key": {"type":"string","description":"Stable spawn session key for continue."},
+                            "session_key": {"type":"string","description":"For 'continue': stable spawn session key."},
                             "last_n": {
                                 "type": "integer",
                                 "minimum": 1,
@@ -201,7 +201,7 @@ impl Tool for SessionsSpawnTool {
 
     fn description(&self) -> &str {
         "Hand work to an async sub-agent or to a live `prx chat` session, and manage what is running. \
-         Actions and their parameters: 'spawn' (default) task -> run_id; 'spawn_batch' tasks -> batch_id; \
+         Actions and their parameters: 'spawn' (default) task -> run_id; 'continue' session_key + task; 'spawn_batch' tasks -> batch_id; \
          'join' batch_id (waits for every member, returns all results); 'list'; 'kill' run_id; \
          'history' run_id; 'steer' run_id + message; 'chat_sessions'; 'chat_assign' session_id + task. \
          Work text always goes in `task`, never `message`."

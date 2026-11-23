@@ -49,12 +49,14 @@ impl SqliteMailbox {
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(storage_error)?;
         let mut messages = Vec::new();
-        let mut first = std::collections::HashSet::new();
+        let mut remote_heads = std::collections::HashSet::new();
         for (_, stream_id, seq, idempotency, id, bytes, json) in rows {
-            if !first.insert(stream_id) {
+            let stream = stream::load(&tx, stream_id)?;
+            // Remote retry scheduling must hold the stream head during backoff.
+            // Local queue/IPC owners need every pending slot to advance it.
+            if stream.to.instance != self.local_instance && !remote_heads.insert(stream_id) {
                 continue;
             }
-            let stream = stream::load(&tx, stream_id)?;
             if stream.sender.as_ref() != Some(scope) {
                 return Err(MailboxError::StaleIncarnation);
             }

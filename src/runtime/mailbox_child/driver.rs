@@ -38,7 +38,7 @@ pub(crate) fn watch(parent: Arc<TurnRuntimeService>, owner: String, root: String
     }
     let runtime = crate::messaging::runtime::MessagingRuntime::for_config(&parent.generation.effective)?;
     let address = runtime.address(&owner, &root, &agent);
-    let scope = runtime.store.session_scope(&runtime.workspace, &address, false)?;
+    let scope = runtime.store.session_scope(&runtime.workspace, &address, true)?;
     let key = (runtime.workspace.clone(), owner.clone(), root.clone());
     let host = {
         let mut roots = ROOTS.get_or_init(Default::default).lock();
