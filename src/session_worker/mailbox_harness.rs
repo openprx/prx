@@ -246,12 +246,12 @@ pub async fn run(workspace: &Path, turns: usize) -> Result<()> {
     std::fs::create_dir_all(workspace)?;
     let workspace = std::fs::canonicalize(workspace)?;
     let config_dir = crate::config::process_config_dir().context("mailbox process fixture requires --config-dir")?;
-    let config = crate::config::Config::load_existing_read_only_with_config_dir(Some(
+    let mut config = crate::config::Config::load_existing_read_only_with_config_dir(Some(
         config_dir.to_str().context("mailbox config path must be UTF-8")?,
     ))
     .await?;
     ensure!(
-        config.workspace_dir == workspace,
+        std::fs::canonicalize(&config.workspace_dir)? == workspace,
         "mailbox fixture workspace differs from loaded config"
     );
     ensure!(
@@ -259,6 +259,7 @@ pub async fn run(workspace: &Path, turns: usize) -> Result<()> {
             && config.default_model.as_deref() == Some("prx-mailbox-model"),
         "mailbox fixture requires its scripted model"
     );
+    config.workspace_dir.clone_from(&workspace);
     let memory = Arc::new(SqliteMemory::new(&workspace)?);
     let store = SqliteMailbox::new(
         memory.as_ref().clone(),

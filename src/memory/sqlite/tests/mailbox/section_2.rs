@@ -175,7 +175,7 @@ fn slash_msg_builds_envelope_to_peer_session() {
         "slash msg builds envelope to peer session: expected messaging contract changed"
     );
     assert!(
-        crate::chat::commands::msg::parse("/msg local target/ ", &f.source).is_err(),
+        crate::chat::commands::msg::parse("/msg target ", &f.source).is_err(),
         "slash msg builds envelope to peer session: expected messaging contract changed"
     );
 }

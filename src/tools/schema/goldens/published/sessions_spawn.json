@@ -3,9 +3,10 @@
   "properties": {
     "action": {
       "default": "spawn",
-      "description": "Action to perform, with the parameter it reads: 'spawn' task; 'spawn_batch' tasks; 'join' batch_id; 'list' none; 'kill' run_id; 'history' run_id; 'steer' run_id + message; 'chat_sessions' none; 'chat_assign' session_id + task. Defaults to 'spawn' when omitted.",
+      "description": "Action to perform, with the parameter it reads: 'spawn' task; 'continue' session_key + task; 'spawn_batch' tasks; 'join' batch_id; 'list' none; 'kill' run_id; 'history' run_id; 'steer' run_id + message; 'chat_sessions' none; 'chat_assign' session_id + task. Defaults to 'spawn' when omitted.",
       "enum": [
         "spawn",
+        "continue",
         "spawn_batch",
         "join",
         "list",
@@ -84,7 +85,7 @@
       "type": "string"
     },
     "run_id": {
-      "description": "Sub-agent run id returned by 'spawn' and listed by 'list'. Required by 'kill', 'history' and 'steer'. Not a chat session id.",
+      "description": "Sub-agent run id returned by 'spawn' and listed by 'list'. Required by 'kill', 'history' and 'steer'; alternative to session_key for 'continue'. Not a chat session id.",
       "minLength": 1,
       "type": "string"
     },
@@ -93,8 +94,12 @@
       "minLength": 1,
       "type": "string"
     },
+    "session_key": {
+      "description": "For 'continue': stable spawn session key.",
+      "type": "string"
+    },
     "task": {
-      "description": "The work to be done, as instructions. Required by 'spawn' and by 'chat_assign' ('chat_assign' has no `message`, `prompt` or `text` parameter). Use `tasks` for 'spawn_batch' and `message` for 'steer'.",
+      "description": "The work to be done, as instructions. Required by 'spawn', 'continue' and by 'chat_assign' ('chat_assign' has no `message`, `prompt` or `text` parameter). Use `tasks` for 'spawn_batch' and `message` for 'steer'.",
       "minLength": 1,
       "type": "string"
     },
