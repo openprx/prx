@@ -8,12 +8,21 @@ use std::sync::Arc;
 
 pub(super) fn register(
     state: &AppState,
-    envelope: RuntimeEnvelope,
+    mut envelope: RuntimeEnvelope,
     principal: super::super::ApiPrincipal,
 ) -> anyhow::Result<()> {
     let config = state.config.load_full();
     if config.memory.backend != "sqlite" {
         return Ok(());
+    }
+    if let Some(crate::memory::AgentPartition {
+        key: crate::memory::PartitionKey::Named { name, .. },
+        ..
+    }) = &envelope.agent_partition
+    {
+        // Registration precedes target prompt binding. Use the already
+        // admitted partition rather than defaulting the named root to Main.
+        envelope.agent_id = Some(name.as_str().to_owned());
     }
     let runtime = MessagingRuntime::for_config(&config)?;
     crate::gateway::child_mailbox::register(state, &envelope)?;

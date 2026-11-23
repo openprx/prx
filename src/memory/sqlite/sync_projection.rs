@@ -117,7 +117,7 @@ pub(super) fn payload(conn: &Connection, h: &Header) -> anyhow::Result<Value> {
         source.source_ref = format!("event:{message}");
         return payload(conn, &source);
     }
-    if h.kind == "child_session.upsert" {
+    if h.kind == "child_session.upsert" || (h.kind == "turn.started" && h.source_ref.starts_with("memory:")) {
         return super::sync_lifecycle::child_payload(conn, h);
     }
     if let Some(id) = h.source_ref.strip_prefix("approval-cancel:") {
