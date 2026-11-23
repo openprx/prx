@@ -381,6 +381,22 @@ async fn check_plan_selections(plan: &ConfigPlan, actor: ConfigActor) -> Result<
         validate::durable_policy(actor)
     };
     blocking(move || {
+        if matches!(
+            actor,
+            ConfigActor::GatewayManagement | ConfigActor::GatewayConfigApi | ConfigActor::GatewayConfigFile
+        ) && current.as_ref().is_none_or(|current| {
+            crate::providers::selection::default_provider(current)
+                != crate::providers::selection::default_provider(&candidate)
+                || crate::providers::selection::default_model(current)
+                    != crate::providers::selection::default_model(&candidate)
+        }) {
+            crate::providers::catalog::admission::check_declared(
+                &candidate,
+                crate::providers::selection::default_provider(&candidate),
+                crate::providers::selection::default_model(&candidate),
+            )
+            .map_err(|error| ConfigTransactionError::Invalid(error.into()))?;
+        }
         let selections = validate::check_affected_selections(current.as_deref(), &candidate, policy);
         let references = validate::check_credential_references(current.as_deref(), &candidate);
         match (selections, references) {

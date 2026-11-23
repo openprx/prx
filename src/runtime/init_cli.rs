@@ -15,6 +15,8 @@ pub(crate) async fn run(cli: &Cli) -> Result<()> {
         from_env,
         provider,
         model,
+        native_tools,
+        no_native_tools,
         memory,
         decision_backend,
         decision_endpoint,
@@ -30,6 +32,8 @@ pub(crate) async fn run(cli: &Cli) -> Result<()> {
             || from_env.is_some()
             || provider.is_some()
             || model.is_some()
+            || *native_tools
+            || *no_native_tools
             || memory.is_some();
         anyhow::ensure!(
             !(*interactive && (*channels_only || explicit || decision_backend.is_some() || *decision_credential_stdin)),
@@ -137,6 +141,13 @@ pub(crate) async fn run(cli: &Cli) -> Result<()> {
                     api_key.as_deref(),
                     provider.as_deref(),
                     model.as_deref(),
+                    if *native_tools {
+                        Some(true)
+                    } else if *no_native_tools {
+                        Some(false)
+                    } else {
+                        None
+                    },
                     memory.as_deref(),
                     config_dir,
                     spec,

@@ -66,6 +66,7 @@ pub async fn run_quick_setup(
     credential_override: Option<&str>,
     provider: Option<&str>,
     model_override: Option<&str>,
+    native_tools: Option<bool>,
     memory_backend: Option<&str>,
     config_dir: Option<&str>,
     spec: Spec,
@@ -94,12 +95,58 @@ pub async fn run_quick_setup(
             );
             config.memory = memory_config_defaults_for_backend(backend);
         }
+        let selected_provider = crate::providers::selection::default_provider(config).to_owned();
+        let selected_model = crate::providers::selection::default_model(config).to_owned();
+        let catalog = crate::providers::catalog::CatalogView::release_only();
+        let released = catalog
+            .release_catalog()?
+            .model(&crate::providers::ProviderId::of(&selected_provider), &selected_model)
+            .is_some();
+        if !released {
+            // An explicit selection outside the release catalog always needs
+            // the operator's choice, even when repairing an existing tree.
+            let tools = native_tools
+                .ok_or_else(|| crate::providers::catalog::admission::ModelCapabilitiesUnknown::new(&selected_model))?;
+            let declaration = crate::config::schema::ProviderModelConfig {
+                provider: selected_provider.clone(),
+                model: Some(selected_model.clone()),
+                operations: Some(vec![crate::config::schema::ModelOperationSetting::Chat]),
+                native_tools: Some(tools),
+                vision_input: None,
+                streaming: None,
+                structured_output: None,
+                tool_schema_dialect: None,
+                tool_call_dialect: None,
+                context_window: None,
+            };
+            let id = crate::providers::ProviderId::of(&selected_provider);
+            if let Some(existing) = config.providers.models.iter_mut().find(|entry| {
+                crate::providers::ProviderId::of(&entry.provider) == id
+                    && entry
+                        .model
+                        .as_deref()
+                        .is_some_and(|name| name.trim().eq_ignore_ascii_case(&selected_model))
+            }) {
+                existing.operations = declaration.operations;
+                existing.native_tools = declaration.native_tools;
+            } else {
+                config.providers.models.push(declaration);
+            }
+        }
         check_onboarding_selection(
             config,
             crate::providers::selection::default_provider(config),
             crate::providers::selection::default_model(config),
         )
     };
+    // Preflight before generation can archive a previous configuration.
+    // The staged candidate is checked again before the atomic commit.
+    let mut preflight = if target.join("config.toml").exists() {
+        Config::load_from_path(&target.join("config.toml"), target.join("workspace"))?
+    } else {
+        Config::default()
+    };
+    customize(&mut preflight)?;
     let report = spec.generate_customized(&target, force, Some(&customize), None).await?;
     report.print();
     report.into_result()?;
@@ -128,6 +175,7 @@ pub(super) async fn run_quick_setup_with_home(
         credential,
         provider,
         model,
+        None,
         memory,
         target.to_str(),
         Spec::Minimal,

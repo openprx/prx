@@ -182,6 +182,9 @@ without a level reads back Main's level, the one it runs at.
   body; nothing is planned.
 - `400 agent_tools_invalid`, `400 field_invalid`: as above; also a query
   parameter other than `confirm_high_risk=true|false` on `PUT`/`DELETE`.
+- `400 model_capabilities_unknown`: the selected model is neither in the
+  release catalog nor declared in `[[providers.models]]`. Declare it through
+  model management before creating or replacing the agent; nothing is written.
 - `401 auth_failed`: a missing or invalid bearer, or a credential in the
   query string.
 - `404 agent_unknown`: no such agent (also `DELETE` of a name that never
@@ -804,6 +807,16 @@ prx status --json
 ```
 
 `init` uses non-interactive quick setup by default; `--model` is optional.
+A model outside PRX's release catalog requires exactly one of `--native-tools`
+or `--no-native-tools`, including with `--from-stdin`. Init writes a
+`[[providers.models]]` entry for that provider/model with `operations = ["chat"]`
+and the chosen `native_tools` boolean. Without a choice it fails nonzero with
+`model_capabilities_unknown`, naming both flags, before writing anything.
+Catalog models keep their catalog capabilities and need neither flag.
+Main model changes through the management API likewise reject an undeclared
+model with `400 {"error":{"code":"model_capabilities_unknown","message":"…"}}`.
+Existing configurations are not migrated.
+
 With `--from-stdin`, the provider key is read only from stdin and stored
 through the encrypted provider-credential reference store, with its existing
 0600 `.secret_key`. Missing inputs fail nonzero with a typed message. Provider

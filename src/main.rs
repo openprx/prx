@@ -443,6 +443,12 @@ enum Commands {
         /// Model ID override (used in quick mode)
         #[arg(short = 'm', long)]
         model: Option<String>,
+        /// Declare native tool support for a model outside the release catalog (quick mode)
+        #[arg(long, conflicts_with = "no_native_tools")]
+        native_tools: bool,
+        /// Declare that a model outside the release catalog has no native tools (quick mode)
+        #[arg(long, conflicts_with = "native_tools")]
+        no_native_tools: bool,
         /// Memory backend (sqlite, lucid, markdown, none) - used in quick mode, default: sqlite
         #[arg(long)]
         memory: Option<String>,

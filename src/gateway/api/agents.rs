@@ -122,6 +122,11 @@ fn respond<T: Serialize>(outcome: Outcome<(StatusCode, T)>) -> Response {
 fn refusal_of(error: ManageError) -> Refusal {
     let message = redact_provider_text(&error.to_string());
     match error {
+        ManageError::Transaction(ConfigTransactionError::Invalid(error))
+            if error.is::<crate::providers::catalog::admission::ModelCapabilitiesUnknown>() =>
+        {
+            Refusal::new(StatusCode::BAD_REQUEST, "model_capabilities_unknown", message)
+        }
         ManageError::NotFound(_) => Refusal::unknown(),
         ManageError::Credential(CredentialReferenceError::Store(_)) => {
             Refusal::storage("the credential store could not be read")

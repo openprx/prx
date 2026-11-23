@@ -1712,6 +1712,8 @@ fn candidate(current: &Config, change: &ManagedChange) -> Result<Config, ManageE
         ManagedChange::PutAgent { agent, spec } => {
             let (provider, _) = provider_arg(&spec.provider)?;
             let model = non_empty(&spec.model, "the model")?;
+            crate::providers::catalog::admission::check_declared(&next, &provider, &model)
+                .map_err(|error| ConfigTransactionError::Invalid(error.into()))?;
             let entry = next
                 .agents
                 .entry(agent.clone())

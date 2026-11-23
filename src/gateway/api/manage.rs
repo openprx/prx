@@ -543,6 +543,14 @@ fn manage_error_parts(
     let scrub = |message: &str| -> String { secrets(redact_provider_text(message).as_str()) };
     let message = scrub(&error.to_string());
     let (status, mut body) = match &error {
+        ManageError::Transaction(ConfigTransactionError::Invalid(error))
+            if error.is::<crate::providers::catalog::admission::ModelCapabilitiesUnknown>() =>
+        {
+            (
+                StatusCode::BAD_REQUEST,
+                json!({"error": {"code": "model_capabilities_unknown", "message": message}}),
+            )
+        }
         ManageError::Invalid(_) => (StatusCode::BAD_REQUEST, json!({"error": message})),
         ManageError::NotFound(_) => (StatusCode::NOT_FOUND, json!({"error": message})),
         ManageError::AlreadyExists(_) => (StatusCode::CONFLICT, json!({"error": message})),

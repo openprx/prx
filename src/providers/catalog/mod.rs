@@ -16,6 +16,7 @@
 //! catalog metadata.
 
 pub mod adapters;
+pub mod admission;
 pub mod descriptor;
 pub mod discovery;
 pub mod parameters;

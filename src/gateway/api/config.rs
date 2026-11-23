@@ -353,6 +353,16 @@ fn transaction_error_response(
     scrub: &dyn Fn(&str) -> String,
 ) -> Response {
     match error {
+        ConfigTransactionError::Invalid(error)
+            if error.is::<crate::providers::catalog::admission::ModelCapabilitiesUnknown>() =>
+        {
+            super::capabilities::coded_error_with(
+                StatusCode::BAD_REQUEST,
+                "model_capabilities_unknown",
+                &scrub(&error.to_string()),
+                None,
+            )
+        }
         ConfigTransactionError::Invalid(error) => {
             let message = scrub(&format!("{invalid_prefix}: {error:#}"));
             warn!("Refused configuration change: {message}");
@@ -1447,10 +1457,9 @@ mod tests {
     /// which the router then sent as the bearer credential. After: an array
     /// posted back exactly as it was redacted keeps the stored secret.
     /// D-034: a default changed through the configuration API is an operator
-    /// selection: refused on negative evidence with nothing written, accepted
-    /// (unverified) on no evidence.
+    /// selection: refused on negative evidence with nothing written.
     #[tokio::test]
-    async fn post_config_default_change_refuses_only_negative_evidence() {
+    async fn post_config_default_change_refuses_negative_evidence() {
         let (_dir, state, base, server) = on_disk(|config| {
             config.default_provider = Some("openrouter".to_string());
             config.default_model = Some("vendor/chat-model".to_string());
@@ -1468,12 +1477,6 @@ mod tests {
         assert!(body.contains("cannot be used for chat"), "{body}");
         assert_eq!(disk(&state), before, "nothing was written");
 
-        let (status, body) = post_config(&base, serde_json::json!({"default_model": "vendor/never-seen"})).await;
-        assert_eq!(status, 200, "an unverified default is an operator's choice: {body}");
-        assert!(
-            body.contains("unverified"),
-            "the response says it is unverified: {body}"
-        );
         server.abort();
     }
 
@@ -1614,11 +1617,11 @@ mod tests {
             config.default_model = Some("vendor/chat-model".to_string());
         })
         .await;
-        let (status, body) = post_config(&base, serde_json::json!({"default_model": "  vendor/other \t"})).await;
+        let (status, body) = post_config(&base, serde_json::json!({"default_model": "  openai/gpt-5-mini \t"})).await;
         assert_eq!(status, 200, "{body}");
         let config = state.config.desired().config.clone();
         let reloaded = Config::load_from_path(&config.config_path, config.workspace_dir.clone()).expect("test: reload");
-        assert_eq!(reloaded.default_model.as_deref(), Some("vendor/other"));
+        assert_eq!(reloaded.default_model.as_deref(), Some("openai/gpt-5-mini"));
         server.abort();
     }
 

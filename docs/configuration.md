@@ -216,6 +216,24 @@ prx auth login --provider xai
 prx auth login --provider xai --device-code
 ```
 
+For a model outside PRX's release catalog, quick setup requires exactly one
+of `--native-tools` or `--no-native-tools` (also with `--from-stdin`). For example:
+
+```sh
+prx init --provider openrouter --model vendor/custom-chat --native-tools --from-stdin
+```
+
+Init records `[[providers.models]]` with the selected `provider`, `model`,
+`operations = ["chat"]` and `native_tools = true` (or `false` for
+`--no-native-tools`). Without either flag it fails nonzero with the typed
+`model_capabilities_unknown` message naming both flags; nothing is written.
+Catalog models keep their existing behavior and require neither flag.
+Agent creation/replacement and Main model changes through management APIs
+reject a model absent from both the release catalog and operator declarations
+with HTTP 400 and `error.code = "model_capabilities_unknown"`. Declare custom
+models through model management first. Existing on-disk configurations are
+not migrated.
+
 Full setup over existing configuration requires `--force`. This repairs the
 configuration and retains explicit settings; supplied selections replace only
 their fields. `--interactive` rejects quick-setup value flags. `--channels-only`

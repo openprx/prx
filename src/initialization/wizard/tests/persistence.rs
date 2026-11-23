@@ -98,60 +98,6 @@ async fn quick_setup_stores_the_model_trimmed() {
     );
 }
 
-/// D-034: quick setup is an operator selection. A model PRX has no
-/// evidence for is accepted and marked unverified (a fresh install has
-/// no catalog yet); only negative evidence refuses, and nothing is then
-/// written.
-#[tokio::test]
-async fn quick_setup_accepts_an_unverified_model_and_refuses_only_negative_evidence() {
-    let tmp = TempDir::new().unwrap();
-    let config = run_quick_setup_with_home(
-        Some("sk-issue946"),
-        Some("openrouter"),
-        Some("custom-model-946"),
-        Some("sqlite"),
-        None,
-        tmp.path(),
-    )
-    .await
-    .expect("an unverified model is accepted at onboarding");
-    assert_eq!(config.default_model.as_deref(), Some("custom-model-946"));
-
-    let local = TempDir::new().unwrap();
-    run_quick_setup_with_home(
-        None,
-        Some("custom:http://127.0.0.1:9/v1"),
-        Some("my-local-model"),
-        Some("sqlite"),
-        None,
-        local.path(),
-    )
-    .await
-    .expect("a local endpoint's model is accepted");
-
-    let refused = TempDir::new().unwrap();
-    let error = run_quick_setup_with_home(
-        Some("sk-issue946"),
-        Some("anthropic"),
-        Some("openai/gpt-4o"),
-        Some("sqlite"),
-        None,
-        refused.path(),
-    )
-    .await
-    .expect_err("a model the provider cannot serve is refused");
-    let text = format!("{error:#}");
-    assert!(
-        !text.contains("prx models refresh"),
-        "no chicken-and-egg advice on a fresh install: {text}"
-    );
-    assert!(!text.contains("sk-issue946"), "{text}");
-    assert!(
-        !default_user_config_dir(refused.path()).join("config.toml").exists(),
-        "a refused quick setup wrote config.toml"
-    );
-}
-
 #[tokio::test]
 async fn quick_setup_without_model_uses_provider_default_model() {
     let tmp = TempDir::new().unwrap();
