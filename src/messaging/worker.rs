@@ -48,7 +48,10 @@ impl WorkerMailboxFactory for WorkerMailboxes {
             &manifest.session_scope_key,
             manifest.agent_id.as_deref().unwrap_or("main"),
         );
-        let inbox = self.runtime.register(address.clone())?;
+        // An idle child's TUI or gateway may already own its notification slot.
+        // The worker polls the same durable mailbox under the execution guard;
+        // it must not replace that registration when continuing the child.
+        let inbox = self.runtime.register_backend(address.clone())?;
         let scope = self.runtime.resolve_scope(&address)?;
         let execution = self
             .runtime
