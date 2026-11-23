@@ -20,6 +20,14 @@ use uuid::Uuid;
 const MAX_OUTPUT_BYTES: usize = 16 * 1024;
 const TRUNCATED_MARKER: &str = "\n...[truncated]";
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum JobLookupError {
+    #[error("Xin task '{0}' not found")]
+    Task(String),
+    #[error("Xin goal '{0}' not found")]
+    Goal(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XinTaskLease {
     pub worker_id: String,
@@ -151,11 +159,10 @@ pub fn get_task(config: &Config, task_id: &str) -> Result<XinTask> {
     with_connection(config, |conn| {
         let mut stmt = conn.prepare(SELECT_ALL_COLUMNS)?;
         let mut rows = stmt.query(params![task_id])?;
-        if let Some(row) = rows.next()? {
-            map_task_row(row).map_err(Into::into)
-        } else {
-            anyhow::bail!("Xin task '{task_id}' not found")
-        }
+        rows.next()?.map_or_else(
+            || Err(JobLookupError::Task(task_id.to_owned()).into()),
+            |row| map_task_row(row).map_err(Into::into),
+        )
     })
 }
 
@@ -689,7 +696,7 @@ fn set_task_control_state(config: &Config, task_id: &str, action: &str) -> Resul
         let now = authoritative_now(conn)?;
         let exists = load_task_lineage(conn, task_id)?.is_some();
         if !exists {
-            anyhow::bail!("Xin task '{task_id}' not found");
+            return Err(JobLookupError::Task(task_id.to_owned()).into());
         }
         match action {
             "pause" => {
@@ -761,7 +768,7 @@ pub fn remove_task(config: &Config, task_id: &str) -> Result<()> {
     })?;
 
     if changed == 0 {
-        anyhow::bail!("Xin task '{task_id}' not found");
+        return Err(JobLookupError::Task(task_id.to_owned()).into());
     }
     Ok(())
 }
@@ -1201,7 +1208,7 @@ pub fn list_runs(config: &Config, task_id: &str, limit: usize) -> Result<Vec<Xin
             .optional()?
             .is_some();
         if !exists {
-            anyhow::bail!("Xin task '{task_id}' not found");
+            return Err(JobLookupError::Task(task_id.to_owned()).into());
         }
         let mut stmt = conn.prepare(
             "SELECT id, task_id, started_at, finished_at, status, output, duration_ms
@@ -1435,7 +1442,7 @@ pub fn add_step_with_creator_stamp(
             )
             .context("Failed to bump goal steps_total")?;
         if changed == 0 {
-            anyhow::bail!("Xin goal '{goal_id}' not found");
+            return Err(JobLookupError::Goal(goal_id.to_owned()).into());
         }
         Ok(id)
     })?;
@@ -1448,11 +1455,10 @@ pub fn get_goal(config: &Config, goal_id: &str) -> Result<XinGoal> {
         let sql = format!("{SELECT_GOAL_COLUMNS} WHERE id = ?1");
         let mut stmt = conn.prepare(&sql)?;
         let mut rows = stmt.query(params![goal_id])?;
-        if let Some(row) = rows.next()? {
-            map_goal_row(row).map_err(Into::into)
-        } else {
-            anyhow::bail!("Xin goal '{goal_id}' not found")
-        }
+        rows.next()?.map_or_else(
+            || Err(JobLookupError::Goal(goal_id.to_owned()).into()),
+            |row| map_goal_row(row).map_err(Into::into),
+        )
     })
 }
 
@@ -1510,7 +1516,7 @@ fn set_goal_control_state(config: &Config, goal_id: &str, action: &str) -> Resul
             .optional()?
             .is_some();
         if !exists {
-            anyhow::bail!("Xin goal '{goal_id}' not found");
+            return Err(JobLookupError::Goal(goal_id.to_owned()).into());
         }
         match action {
             "pause" => {
@@ -1580,7 +1586,7 @@ pub fn remove_goal(config: &Config, goal_id: &str) -> Result<()> {
             .context("Failed to delete xin goal")
     })?;
     if changed == 0 {
-        anyhow::bail!("Xin goal '{goal_id}' not found");
+        return Err(JobLookupError::Goal(goal_id.to_owned()).into());
     }
     Ok(())
 }

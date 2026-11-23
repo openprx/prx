@@ -37,9 +37,10 @@ fn unknown(kind: Kind) -> Response {
     )
 }
 fn failure(error: &anyhow::Error, kind: Kind) -> Response {
-    if error
-        .downcast_ref::<rusqlite::Error>()
-        .is_some_and(|error| matches!(error, rusqlite::Error::QueryReturnedNoRows))
+    if error.downcast_ref::<store::JobLookupError>().is_some()
+        || error
+            .downcast_ref::<rusqlite::Error>()
+            .is_some_and(|error| matches!(error, rusqlite::Error::QueryReturnedNoRows))
     {
         return unknown(kind);
     }
