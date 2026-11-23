@@ -8,6 +8,22 @@ type Key = (String, String, String);
 static EPOCHS: OnceLock<parking_lot::Mutex<HashMap<Key, String>>> = OnceLock::new();
 const MAX_EPOCHS: usize = 4096;
 
+/// Runtime metadata writers can omit the partition; only a locally authenticated
+/// terminal pin can supply it. A caller-provided session name alone grants nothing.
+pub(super) fn partition(workspace: &str, owner: Option<&str>, session: Option<&str>) -> Option<AgentPartition> {
+    let (Some(epochs), Some(owner), Some(session)) = (EPOCHS.get(), owner, session) else {
+        return None;
+    };
+    epochs
+        .lock()
+        .contains_key(&(workspace.into(), owner.into(), session.into()))
+        .then(|| AgentPartition {
+            workspace_id: workspace.into(),
+            owner_id: owner.into(),
+            key: PartitionKey::Main,
+        })
+}
+
 pub(crate) fn pin(memory: &SqliteMemory, partition: &AgentPartition, session: &str) -> anyhow::Result<()> {
     anyhow::ensure!(matches!(partition.key, PartitionKey::Main), AgentScopeRefused);
     let writer = memory.pool.write();
