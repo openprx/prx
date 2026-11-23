@@ -24,7 +24,7 @@ use super::smart_gate::{
 };
 use super::supervisor::{
     channel_progress_line, channel_turn_label, finalize_draft_recording_activity, log_worker_join_result,
-    send_recording_activity, spawn_channel_draft_updater, spawn_scoped_typing_task,
+    send_recording_activity, spawn_scoped_typing_task,
 };
 use super::turn_failure::{classify_turn_failure, turn_error_id, turn_failure_notice};
 use super::{
@@ -888,7 +888,6 @@ pub(super) async fn run_channel_turn(
         None
     };
 
-    let draft_has_text = Arc::new(std::sync::atomic::AtomicBool::new(false));
     if rich_stream {
         if let Some(channel) = target_channel.as_ref() {
             if let Some(rich) = channel.as_rich() {
@@ -904,7 +903,7 @@ pub(super) async fn run_channel_turn(
             }
         }
     }
-    let (draft_updater, rich_delta_task) = if rich_stream {
+    let (mut draft_delta_rx, rich_delta_task) = if rich_stream {
         let task = match (delta_rx, target_channel.as_ref()) {
             (Some(rx), Some(channel)) => Some(tokio::spawn(crate::channels::rich_turn::consume_stream(
                 Arc::clone(channel),
@@ -915,19 +914,8 @@ pub(super) async fn run_channel_turn(
             _ => None,
         };
         (None, task)
-    } else if let (Some(rx), Some(draft_id_ref), Some(channel_ref)) =
-        (delta_rx, draft_message_id.as_deref(), target_channel.as_ref())
-    {
-        (
-            Some(spawn_channel_draft_updater(
-                Arc::clone(channel_ref),
-                msg.reply_target.clone(),
-                draft_id_ref.to_string(),
-                rx,
-                Arc::clone(&draft_has_text),
-            )),
-            None,
-        )
+    } else if draft_message_id.is_some() {
+        (delta_rx, None)
     } else {
         (None, None)
     };
@@ -960,12 +948,7 @@ pub(super) async fn run_channel_turn(
     let tool_event_channel_name = msg.channel.clone();
     let tool_event_sender_name = msg.sender.clone();
     let progress_draft = match (target_channel.as_ref(), draft_message_id.as_deref()) {
-        (Some(channel), Some(draft_id)) => Some((
-            Arc::clone(channel),
-            msg.reply_target.clone(),
-            draft_id.to_string(),
-            Arc::clone(&draft_has_text),
-        )),
+        (Some(channel), Some(draft_id)) => Some((Arc::clone(channel), msg.reply_target.clone(), draft_id.to_string())),
         _ => None,
     };
     let progress_started_at = started_at;
@@ -977,7 +960,43 @@ pub(super) async fn run_channel_turn(
     let rich_turn_id = turn_run_id.clone();
     let tool_event_forwarder = tokio::spawn(async move {
         let mut iteration_seen = 0usize;
-        while let Some(notif) = tool_event_rx.recv().await {
+        let mut notifications_open = true;
+        let mut draft_has_text = false;
+        let mut accumulated = String::new();
+        loop {
+            // The loop queues tool notifications before later reply deltas.
+            // One draft writer drains those notifications first, so scheduling
+            // cannot let the final text hide progress or be overwritten by it.
+            let notif = tokio::select! {
+                biased;
+                notif = tool_event_rx.recv(), if notifications_open => {
+                    match notif {
+                        Some(notif) => notif,
+                        None => { notifications_open = false; continue; }
+                    }
+                }
+                delta = async {
+                    match draft_delta_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => None,
+                    }
+                }, if draft_delta_rx.is_some() => {
+                    match delta {
+                        Some(delta) => {
+                            accumulated.push_str(&delta);
+                            draft_has_text = true;
+                            if let Some((channel, reply_target, draft_id)) = progress_draft.as_ref() {
+                                if let Err(e) = channel.update_draft(reply_target, draft_id, &accumulated).await {
+                                    tracing::debug!("Draft update failed: {e}");
+                                }
+                            }
+                        }
+                        None => draft_delta_rx = None,
+                    }
+                    continue;
+                }
+                else => break,
+            };
             // A progress note only ever lands in a draft that has no streamed
             // text in it yet, so it can never overwrite part of a reply.
             let progress = match &notif {
@@ -990,9 +1009,8 @@ pub(super) async fn run_channel_turn(
                 }
                 crate::agent::turn_contracts::ToolCallNotification::Finished { .. } => None,
             };
-            if let (Some(line), Some((channel, reply_target, draft_id, has_text))) = (progress, progress_draft.as_ref())
-            {
-                if !has_text.load(std::sync::atomic::Ordering::Acquire) {
+            if let (Some(line), Some((channel, reply_target, draft_id))) = (progress, progress_draft.as_ref()) {
+                if !draft_has_text {
                     if let Err(e) = channel.update_draft(reply_target, draft_id, &line).await {
                         tracing::debug!("Draft progress update failed: {e}");
                     }
@@ -1260,9 +1278,6 @@ pub(super) async fn run_channel_turn(
 
     drop(delta_tx);
     drop(tool_event_tx);
-    if let Some(handle) = draft_updater {
-        let _ = handle.await;
-    }
     let rich_last_version = if let Some(handle) = rich_delta_task {
         handle.await.unwrap_or(0)
     } else {

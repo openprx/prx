@@ -210,33 +210,6 @@ pub(super) fn log_worker_join_result(result: Result<(), tokio::task::JoinError>)
     }
 }
 
-/// Streamed assistant text written into a channel draft, one draft per turn.
-///
-/// `has_text` goes true the moment the first delta arrives and is the interlock
-/// with [`spawn_channel_progress_reporter`]: progress notes are only ever
-/// written into a draft that has no real text in it yet, so a long turn shows
-/// what it is doing without a reply ever being overwritten by a status line.
-/// Every update rewrites the whole accumulated string, so even a lost race with
-/// a progress note repairs itself on the next delta.
-pub(super) fn spawn_channel_draft_updater(
-    channel: Arc<dyn Channel>,
-    reply_target: String,
-    draft_id: String,
-    mut rx: tokio::sync::mpsc::Receiver<String>,
-    has_text: Arc<std::sync::atomic::AtomicBool>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut accumulated = String::new();
-        while let Some(delta) = rx.recv().await {
-            accumulated.push_str(&delta);
-            has_text.store(true, std::sync::atomic::Ordering::Release);
-            if let Err(e) = channel.update_draft(&reply_target, &draft_id, &accumulated).await {
-                tracing::debug!("Draft update failed: {e}");
-            }
-        }
-    })
-}
-
 /// One line of "still working" for a turn that has not produced text yet.
 pub(super) fn channel_progress_line(tool: &str, iteration: usize, elapsed: Duration) -> String {
     let secs = elapsed.as_secs();
