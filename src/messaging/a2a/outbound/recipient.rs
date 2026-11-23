@@ -75,7 +75,11 @@ impl RemoteTransport {
         let response = tokio::select! {
             () = cancellation.cancelled() => return Err(MailboxError::PeerUnavailable),
             response = request => response,
-        };
+        }
+        .inspect_err(|error| {
+            let (reason, os_code) = transport_reason(error);
+            tracing::warn!(reason, os_code, "A2A pin request failed");
+        });
         let pin = match response {
             Ok(response) => {
                 if response.status().as_u16() != 200 {
@@ -128,6 +132,32 @@ impl RemoteTransport {
             pin_expires_at: pin.expires_at,
         })
     }
+}
+fn transport_reason(error: &reqwest::Error) -> (&'static str, Option<i32>) {
+    use std::error::Error as _;
+    let mut cause = error.source();
+    while let Some(error) = cause {
+        if let Some(error) = error.downcast_ref::<std::io::Error>() {
+            let reason = match error.kind() {
+                std::io::ErrorKind::ConnectionRefused => "peer_connection_refused",
+                std::io::ErrorKind::TimedOut => "peer_timeout",
+                std::io::ErrorKind::NetworkUnreachable => "peer_network_unreachable",
+                std::io::ErrorKind::HostUnreachable => "peer_host_unreachable",
+                std::io::ErrorKind::PermissionDenied => "peer_network_permission_denied",
+                _ => "peer_io_failed",
+            };
+            return (reason, error.raw_os_error());
+        }
+        cause = error.source();
+    }
+    (
+        if error.is_timeout() {
+            "peer_timeout"
+        } else {
+            "peer_request_failed"
+        },
+        None,
+    )
 }
 fn offline(error: &reqwest::Error) -> bool {
     use std::error::Error as _;
