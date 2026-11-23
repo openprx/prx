@@ -526,10 +526,9 @@ loop {
                 continue;
             }
             _ = sessions_tick.tick() => {
-                // A dedicated mTLS listener may run in another process. Its durable
-                // mailbox writes cannot signal this process's in-memory inbox.
-                if config.a2a.messaging_enabled && let Some(inbox) = message_inbox.as_mut() {
-                    inbox.wake();
+                // Local daemon delivery works independently of peer messaging.
+                if let Some(inbox) = message_inbox.as_mut() {
+                    inbox.wake_from_daemon(&config).await;
                 }
                 // 1) Summary reflow: surface each newly-finished session once,
                 //    carrying its `#N` + status (plan §v1b). No auto-focus.

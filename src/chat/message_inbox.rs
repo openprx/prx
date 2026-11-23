@@ -26,6 +26,48 @@ impl ChatInbox {
             pending: Default::default(),
         }))
     }
+    /// Other local processes notify through durable storage while the owning
+    /// gateway is live. Without it, a human turn is the next polling boundary.
+    pub(super) async fn wake_from_daemon(&mut self, config: &crate::config::Config) {
+        let Ok(path) = crate::runtime::host_bootstrap::runtime_path(config) else {
+            return;
+        };
+        let port = crate::runtime::blocking::spawn_blocking(move || {
+            use std::io::Read as _;
+            const MAX_RUNTIME_BYTES: u64 = 4096;
+            let mut bytes = Vec::new();
+            std::fs::File::open(path)
+                .ok()?
+                .take(MAX_RUNTIME_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .ok()?;
+            if bytes.len() > MAX_RUNTIME_BYTES as usize {
+                return None;
+            }
+            let record: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+            let url = reqwest::Url::parse(record.get("api_base")?.as_str()?).ok()?;
+            if url.scheme() != "http" || url.host_str() != Some("127.0.0.1") {
+                return None;
+            }
+            url.port()
+        })
+        .await
+        .ok()
+        .flatten();
+        if let Some(port) = port
+            && matches!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(200),
+                    tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+                )
+                .await,
+                Ok(Ok(_))
+            )
+        {
+            self.wake();
+        }
+    }
+
     pub(super) const fn wake(&mut self) {
         self.wake = true;
     }
