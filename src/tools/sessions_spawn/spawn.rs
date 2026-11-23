@@ -1513,15 +1513,11 @@ impl SessionsSpawnTool {
             .approval_resolver_factory
             .as_ref()
             .map(|factory| factory.resolver_for(&run_id));
-        // NeedsInput: when (and only when) an approval resolver is attached, hand
-        // the loop the run registry + id so it can deterministically restore
-        // `AwaitingInput` -> `Running` on cancel-and-resume (steer). `None`
-        // elsewhere — without a resolver no run can ever suspend.
-        let (restore_active_runs, restore_run_id) = if run_approval_resolver.is_some() {
-            (Some(self.active_runs.clone()), Some(run_id.clone()))
-        } else {
-            (None, None)
-        };
+        // Only approval suspension needs the optional restoration registry.
+        // Every task still carries its admitted run identity, including mailbox
+        // continuations without an approval surface.
+        let restore_active_runs = run_approval_resolver.as_ref().map(|_| self.active_runs.clone());
+        let restore_run_id = Some(run_id.clone());
         let task_owned = task.to_string();
         let identity_workspace = child_model_config.workspace_dir.clone();
         let security = Arc::clone(launch_security);
