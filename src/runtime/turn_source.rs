@@ -85,6 +85,7 @@ pub(crate) const fn subject_task_id(subject: Option<&crate::memory::MessageEvent
 }
 
 mod sealed {
+    impl Sealed for crate::runtime::mailbox_child::MailboxChildProof {}
     impl Sealed for super::OwnedTurnSourceProof {}
     impl Sealed for crate::runtime::operator_spawn::task::OperatorTaskAuthority {}
     pub trait Sealed {}
@@ -96,6 +97,13 @@ mod sealed {
 }
 
 pub(crate) trait TurnSourceProof: sealed::Sealed + Send + Sync {
+    /// Opaque identity issued only after a durable mailbox-child readback.
+    fn mailbox_child_source_id(&self) -> Option<uuid::Uuid> {
+        None
+    }
+    fn cost_root_agent(&self) -> Option<crate::cost::types::RootAgent> {
+        None
+    }
     fn h2_entry_origin(&self) -> Option<&std::sync::Arc<super::h2_entry::VerifiedEntryOrigin>> {
         None
     }
@@ -240,6 +248,8 @@ impl TurnSourceProof for AgentTurnProof {
 /// from a durable child receipt and a runtime-issued parent grant.
 /// Neither fields nor deserialization can synthesize source authority.
 pub(crate) struct OwnedTurnSourceProof {
+    cost_root_agent: Option<crate::cost::types::RootAgent>,
+    mailbox_child_source_id: Option<uuid::Uuid>,
     h2_origin: Option<std::sync::Arc<super::h2_entry::VerifiedEntryOrigin>>,
     owner_isolated: bool,
     approval_review_adapter: Option<crate::security::approval_ledger::ApprovalReviewAdapter>,
@@ -338,6 +348,8 @@ impl OwnedTurnSourceProof {
         let selection = authority.model_selection();
         let generation = selection.generation;
         let proof = Self {
+            mailbox_child_source_id: None,
+            cost_root_agent: None,
             owner_isolated: parent.owner_isolated(),
             h2_origin: None,
             approval_review_adapter: None,
@@ -393,6 +405,8 @@ impl OwnedTurnSourceProof {
         let selection = authority.model_selection();
         let generation = selection.generation;
         let proof = Self {
+            mailbox_child_source_id: None,
+            cost_root_agent: parent.cost_root_agent(),
             owner_isolated: parent.owner_isolated(),
             h2_origin: None,
             approval_review_adapter: None,
@@ -487,6 +501,8 @@ impl OwnedTurnSourceProof {
             }
         };
         Ok(Self {
+            mailbox_child_source_id: None,
+            cost_root_agent: None,
             owner_isolated: actor.envelope.owner_isolated,
             h2_origin: None,
             approval_review_adapter: None,
@@ -711,6 +727,8 @@ impl OwnedTurnSourceProof {
 
     pub(crate) fn capture(proof: &dyn TurnSourceProof) -> Self {
         Self {
+            mailbox_child_source_id: proof.mailbox_child_source_id(),
+            cost_root_agent: proof.cost_root_agent(),
             owner_isolated: proof.owner_isolated(),
             h2_origin: proof.h2_entry_origin().cloned(),
             approval_review_adapter: proof.approval_review_adapter(),
@@ -748,6 +766,12 @@ impl OwnedTurnSourceProof {
 }
 
 impl TurnSourceProof for OwnedTurnSourceProof {
+    fn cost_root_agent(&self) -> Option<crate::cost::types::RootAgent> {
+        self.cost_root_agent.clone()
+    }
+    fn mailbox_child_source_id(&self) -> Option<uuid::Uuid> {
+        self.mailbox_child_source_id
+    }
     fn h2_entry_origin(&self) -> Option<&std::sync::Arc<super::h2_entry::VerifiedEntryOrigin>> {
         self.h2_origin.as_ref()
     }

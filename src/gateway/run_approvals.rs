@@ -117,13 +117,15 @@ pub(crate) struct RunApprovalResolver {
 }
 impl Drop for RunApprovalResolver {
     fn drop(&mut self) {
+        self.cancellation.cancel();
         let root = self.scope.get("run_id").and_then(Value::as_str);
         self.approvals.entries.lock().retain(|_, entry| {
-            if entry
-                .pending
-                .rf
-                .as_ref()
-                .is_some_and(|rf| Some(rf.root_run_id.as_str()) == root)
+            if entry.cancel.is_cancelled()
+                && entry
+                    .pending
+                    .rf
+                    .as_ref()
+                    .is_some_and(|rf| Some(rf.root_run_id.as_str()) == root)
             {
                 entry.cancel.cancel();
                 false

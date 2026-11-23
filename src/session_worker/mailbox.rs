@@ -153,7 +153,9 @@ pub fn user_text(message: &PrxMessage) -> MailboxResult<String> {
     }
     use base64::Engine as _;
     Ok(format!(
-        "[mailbox MIME {} base64]\n{}",
+        "[message from {}/{}]\n[mailbox MIME {} base64]\n{}",
+        message.from.session,
+        message.from.agent,
         serde_json::to_string(&message.body.mime).map_err(|_| MailboxError::InvalidMetadata)?,
         base64::engine::general_purpose::STANDARD.encode(&message.body.bytes)
     ))

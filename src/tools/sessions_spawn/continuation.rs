@@ -87,6 +87,8 @@ impl SessionsSpawnTool {
                     && (record.session_key == target || record.runs.iter().any(|run| run == target))
             })
             .context("child_session_unknown")?;
+        let address = crate::messaging::SessionAddr::new(fabric.workspace_id(), &owner, &record.session_key, None);
+        let _gate = crate::messaging::receiver::gate(&address).lock_owned().await;
         anyhow::ensure!(
             !self
                 .active_runs
@@ -98,17 +100,15 @@ impl SessionsSpawnTool {
                         run.status,
                         SubAgentStatus::Running | SubAgentStatus::AwaitingInput { .. }
                     )),
-            "child_session_busy"
+            crate::runtime::mailbox_child::ChildBusy
         );
         let mut history = store.history(&record)?;
         if let Some(input) = operator.as_ref().and_then(|source| source.message_input()) {
-            anyhow::ensure!(
-                history
-                    .last()
-                    .is_some_and(|turn| turn.role == "user" && turn.content == input.text),
-                "adopted input is not the pending child turn"
-            );
-            history.pop();
+            let position = history
+                .iter()
+                .rposition(|turn| turn.role == "user" && turn.content == input.text)
+                .context("adopted input is not the pending child turn")?;
+            history.remove(position);
         }
         let mut launch = args.clone();
         let object = launch

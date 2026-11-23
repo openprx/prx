@@ -904,6 +904,7 @@ async fn run_internal(
                 {
                     let result = super::message_inbox::send_command(
                         &config,
+                        &mem,
                         &chat_session_key,
                         attached_follow.as_ref().map(|id| id.as_str()),
                         &msg,

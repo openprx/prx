@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
 pub(crate) struct ParentSource {
+    cost_root_agent: Option<crate::cost::types::RootAgent>,
     owner_isolated: bool,
     workspace_id: String,
     owner_id: String,
@@ -56,6 +57,8 @@ struct RecallScope {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SourceFields {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cost_root_agent: Option<crate::cost::types::RootAgent>,
     // Required signed provenance: old payloads must not default to unisolated.
     owner_isolated: bool,
     workspace_id: String,
@@ -79,6 +82,7 @@ impl ParentSource {
     pub(crate) fn capture(proof: &dyn crate::runtime::turn_source::TurnSourceProof) -> Self {
         Self {
             owner_isolated: proof.owner_isolated(),
+            cost_root_agent: proof.cost_root_agent(),
             workspace_id: proof.workspace_id().to_owned(),
             owner_id: proof.owner_id().to_owned(),
             session_key: proof.session_key().to_owned(),
@@ -94,6 +98,9 @@ impl ParentSource {
             surface: proof.surface(),
             memory_scope: proof.memory_scope().clone(),
         }
+    }
+    pub(crate) fn cost_root_agent(&self) -> Option<crate::cost::types::RootAgent> {
+        self.cost_root_agent.clone()
     }
     pub(crate) const fn owner_isolated(&self) -> bool {
         self.owner_isolated
@@ -163,6 +170,7 @@ impl ParentSource {
     fn process_payload(&self) -> anyhow::Result<String> {
         let fields = SourceFields {
             owner_isolated: self.owner_isolated,
+            cost_root_agent: self.cost_root_agent.clone(),
             workspace_id: self.workspace_id.clone(),
             owner_id: self.owner_id.clone(),
             session_key: self.session_key.clone(),
@@ -234,9 +242,13 @@ impl ParentSource {
         let fields: SourceFields = serde_json::from_str(&snapshot.payload)?;
         anyhow::ensure!(
             fields.task_run_id.is_none()
-                && fields.surface == "interactive"
-                && fields.policy_channel == "terminal"
-                && fields.policy_sender == "local-user"
+                && ((fields.surface == "interactive"
+                    && fields.policy_channel == "terminal"
+                    && fields.policy_sender == "local-user")
+                    || (fields.surface == "server"
+                        && fields.policy_channel == "mailbox"
+                        && fields.policy_sender == "session"
+                        && fields.cost_root_agent.is_some()))
                 && !fields.run_id.is_empty()
                 && !fields.session_key.is_empty()
                 && fields.run_id != worker.run_id
@@ -244,7 +256,7 @@ impl ParentSource {
                 && fields.owner_id == publication.owner()
                 && worker.parent_run_id.as_deref() == Some(fields.run_id.as_str())
                 && worker.owner_id.as_deref() == Some(fields.owner_id.as_str())
-                && worker.session_scope_key == fields.session_key
+                && worker.session_scope_key.starts_with("spawn:")
                 && worker.scope_channel.as_deref() == Some(fields.policy_channel.as_str())
                 && worker.scope_sender.as_deref() == Some(fields.policy_sender.as_str())
                 && worker.scope_chat_type.as_deref() == Some(fields.policy_chat_type.as_str())
@@ -258,6 +270,7 @@ impl ParentSource {
         );
         Ok(Self {
             owner_isolated: fields.owner_isolated,
+            cost_root_agent: fields.cost_root_agent,
             workspace_id: fields.workspace_id,
             owner_id: fields.owner_id,
             session_key: fields.session_key,
@@ -270,7 +283,11 @@ impl ParentSource {
             policy_channel: fields.policy_channel,
             policy_sender: fields.policy_sender,
             policy_chat_type: fields.policy_chat_type,
-            surface: TurnSurfaceKind::Interactive,
+            surface: if fields.surface == "server" {
+                TurnSurfaceKind::Server
+            } else {
+                TurnSurfaceKind::Interactive
+            },
             memory_scope: MemoryWriteContext {
                 agent_partition: super::inherited_partition(fields.memory_scope.agent_partition.as_ref()),
                 session_key: None,
@@ -349,6 +366,7 @@ impl ParentSource {
         );
         Ok(Self {
             owner_isolated: fields.owner_isolated,
+            cost_root_agent: fields.cost_root_agent,
             workspace_id: fields.workspace_id,
             owner_id: fields.owner_id,
             session_key: fields.session_key,
@@ -407,6 +425,7 @@ mod tests {
 
     fn parent(owner_isolated: bool) -> ParentSource {
         ParentSource {
+            cost_root_agent: None,
             owner_isolated,
             workspace_id: "prx_workspace".to_owned(),
             owner_id: "prx_user".to_owned(),

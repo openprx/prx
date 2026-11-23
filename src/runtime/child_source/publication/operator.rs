@@ -22,13 +22,13 @@ use std::sync::Arc;
 /// Frozen upper bound for an operator-launched child below Full (a Full task
 /// is not limited by it, R51). The child still needs its own source/lifetime
 /// admission and per-call policy/approval checks.
-pub(crate) struct OperatorChildPublication {
+pub(crate) struct IndependentChildPublication {
     service: Arc<TurnRuntimeService>,
     source: crate::runtime::turn_source::OwnedTurnSourceProof,
     authority: crate::runtime::child_source::ParentAuthority,
 }
 
-impl OperatorChildPublication {
+impl IndependentChildPublication {
     /// The direct names an operator process child is sealed with (D5).
     pub(crate) fn chat_lineage_direct_tools(&self) -> Option<Vec<String>> {
         self.service.chat_lineage_direct_tools()
@@ -42,7 +42,7 @@ impl OperatorChildPublication {
         memory: &Arc<dyn Memory>,
         security: &Arc<SecurityPolicy>,
     ) -> anyhow::Result<Self> {
-        service.verify_operator_spawn_source(source, generation, memory, security)?;
+        service.verify_independent_child_source(source, generation, memory, security)?;
         // R26: the operator child is funded from the publication's runtime
         // holder, which pins the same generation and security policy.
         anyhow::ensure!(
@@ -113,7 +113,7 @@ impl OperatorChildPublication {
         security: &Arc<SecurityPolicy>,
     ) -> anyhow::Result<()> {
         self.service
-            .verify_operator_spawn_source(source, generation, memory, security)?;
+            .verify_independent_child_source(source, generation, memory, security)?;
         anyhow::ensure!(
             source.owner_id() == self.source.owner_id()
                 && source.session_key() == self.source.session_key()
@@ -147,7 +147,7 @@ impl OperatorChildPublication {
     }
 }
 
-impl OperatorChildPublication {
+impl IndependentChildPublication {
     pub(crate) fn loop_runtime(&self) -> anyhow::Result<&PublicationLoopRuntime> {
         self.service
             .loop_runtime
@@ -166,8 +166,10 @@ impl OperatorChildPublication {
         );
         task.verify()?;
         let parent = &self.service;
+        let mailbox = task.mailbox_turn();
+        let child_names: BTreeSet<String> = registry.iter().map(|tool| tool.name().to_owned()).collect();
         anyhow::ensure!(
-            Arc::ptr_eq(&registry, &parent.registry),
+            mailbox || Arc::ptr_eq(&registry, &parent.registry),
             "operator task registry differs from source"
         );
         // Full operators start Full children; below Full a named agent
@@ -178,6 +180,12 @@ impl OperatorChildPublication {
             parent.security.autonomy,
         )
         .unwrap_or(parent.security.autonomy);
+        let level = if mailbox { parent.security.autonomy } else { level };
+        let registry = if mailbox {
+            Arc::clone(&parent.registry)
+        } else {
+            registry
+        };
         let security = if level == parent.security.autonomy {
             Arc::clone(&parent.security)
         } else {
@@ -224,7 +232,15 @@ impl OperatorChildPublication {
                     policy.excluded_names.insert(entry.public_name.clone());
                 }
             }
+            if mailbox {
+                names.retain(|name| child_names.contains(name));
+            }
             policy.allowed_tools = Some(names);
+        }
+        if mailbox {
+            policy
+                .excluded_names
+                .extend(["sessions_spawn".to_owned(), "delegate".to_owned()]);
         }
         parent.catalog.check_parity(&execution)?;
         let policy_version =
@@ -291,7 +307,7 @@ impl OperatorChildPublication {
     }
 }
 
-impl OperatorChildPublication {
+impl IndependentChildPublication {
     /// `level` is the centrally derived child level, including Full
     /// inheritance from the operator, sealed into the publication.
     pub(crate) fn bind_process_publication(
@@ -331,7 +347,7 @@ impl OperatorChildPublication {
     }
 }
 
-impl OperatorChildPublication {
+impl IndependentChildPublication {
     pub(crate) fn bind_process_snapshots(
         &self,
         id: uuid::Uuid,
@@ -360,7 +376,7 @@ impl OperatorChildPublication {
 impl TurnRuntimeService {
     /// Local operator commands retain the actual Interactive publication.
     /// This validates source provenance without inventing a model decision.
-    pub(crate) fn verify_operator_spawn_source(
+    pub(crate) fn verify_independent_child_source(
         &self,
         source: &dyn TurnSourceProof,
         generation: &Arc<ConfigGeneration>,
@@ -368,17 +384,24 @@ impl TurnRuntimeService {
         security: &Arc<SecurityPolicy>,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.surface == TurnSurfaceKind::Interactive
+            ((self.surface == TurnSurfaceKind::Interactive
+                && source.policy_channel() == "terminal"
+                && source.policy_sender() == "local-user")
+                || (self.surface == TurnSurfaceKind::Server
+                    && source.mailbox_child_source_id().is_some()
+                    && source.policy_channel() == "mailbox"
+                    && source.policy_sender() == "session"))
                 && Arc::ptr_eq(&self.generation, generation)
                 && Arc::ptr_eq(&self.memory, memory)
                 && Arc::ptr_eq(&self.security, security)
-                && self.child_scope().is_none()
-                && source.policy_channel() == "terminal"
-                && source.policy_sender() == "local-user",
+                && self.child_scope().is_none(),
             "operator spawn differs from its actual runtime publication"
         );
         crate::runtime::turn_context::validate_agent_turn_origin(&self.generation, self.surface, source)?;
         self.check_live_parity()?;
+        if source.mailbox_child_source_id().is_some() {
+            return Ok(());
+        }
         let entry = self
             .catalog
             .entry_for_public_name("sessions_spawn")

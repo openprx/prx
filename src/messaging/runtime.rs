@@ -1,4 +1,5 @@
 //! Runtime-owned sender identity, durable local delivery and inbox wakeups.
+mod turns;
 use super::mailbox::{MailboxAuthority, MailboxError, MailboxPublished, MailboxReceipt, MailboxResult, MailboxScope};
 use super::send::{MailboxDestination, MailboxResolver, MailboxSender};
 use super::{PrxMessage, SessionAddr};
@@ -11,16 +12,19 @@ use std::{
     sync::{Arc, OnceLock, Weak},
 };
 use tokio::sync::mpsc;
+pub(crate) use turns::MessageTurnGuard;
 
 type RuntimeRegistry = Mutex<HashMap<PathBuf, Weak<MessagingRuntime>>>;
 static RUNTIMES: OnceLock<RuntimeRegistry> = OnceLock::new();
 
 pub struct MessagingRuntime {
+    turns: Mutex<HashMap<uuid::Uuid, HashMap<uuid::Uuid, turns::Active>>>,
+    caches: Mutex<HashMap<uuid::Uuid, HashMap<String, turns::Cached>>>,
     pub(crate) store: SqliteMailbox,
     pub(crate) workspace: String,
     pub(crate) instance: String,
     config: RwLock<Arc<crate::config::Config>>,
-    inboxes: Mutex<HashMap<SessionAddr, (uuid::Uuid, mpsc::Sender<()>)>>,
+    inboxes: Mutex<HashMap<SessionAddr, (uuid::Uuid, uuid::Uuid, mpsc::Sender<()>)>>,
     ready: Mutex<HashMap<SessionAddr, std::collections::VecDeque<MessageInput>>>,
 }
 
@@ -38,9 +42,14 @@ impl MessageInput {
             .receipt
             .adopted_message_event_id
             .ok_or(MailboxError::CorruptState)?;
-        runtime
-            .store
-            .validate_input(&runtime.workspace, &self.message.to, event, &self.text)
+        runtime.store.validate_input(
+            &runtime.workspace,
+            &self.message.to,
+            event,
+            &self.text,
+            self.message.id,
+            &self.receipt,
+        )
     }
 
     pub const fn auto_start(&self) -> bool {
@@ -49,6 +58,7 @@ impl MessageInput {
 }
 
 pub struct SessionInbox {
+    registration: uuid::Uuid,
     runtime: Arc<MessagingRuntime>,
     address: SessionAddr,
     scope: MailboxScope,
@@ -59,7 +69,7 @@ impl Drop for SessionInbox {
         let mut inboxes = self.runtime.inboxes.lock();
         if inboxes
             .get(&self.address)
-            .is_some_and(|(scope, _)| *scope == self.scope.scope_id)
+            .is_some_and(|(_, registration, _)| *registration == self.registration)
         {
             inboxes.remove(&self.address);
         }
@@ -99,6 +109,8 @@ impl MessagingRuntime {
             Arc::new(super::mailbox::SystemMailboxClock),
         )?;
         let runtime = Arc::new(Self {
+            turns: Default::default(),
+            caches: Default::default(),
             store,
             workspace: path.to_string_lossy().into_owned(),
             instance,
@@ -122,13 +134,15 @@ impl MessagingRuntime {
     pub fn register(self: &Arc<Self>, address: SessionAddr) -> MailboxResult<SessionInbox> {
         let scope = self.store.session_scope(&self.workspace, &address, true)?;
         let (sender, receiver) = mpsc::channel(1);
+        let registration = uuid::Uuid::new_v4();
         match self.inboxes.lock().entry(address.clone()) {
             std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert((scope.scope_id, sender));
+                entry.insert((scope.scope_id, registration, sender));
             }
             std::collections::hash_map::Entry::Occupied(_) => return Err(MailboxError::IdentityImmutable),
         }
         Ok(SessionInbox {
+            registration,
             runtime: Arc::clone(self),
             address,
             scope,
@@ -173,31 +187,63 @@ impl MessagingRuntime {
         self.store.session_scope(&self.workspace, target, registered)
     }
 
+    pub(crate) fn ready_capacity(&self, target: &SessionAddr) -> bool {
+        self.ready.lock().get(target).is_none_or(|queue| queue.len() < 64)
+    }
     pub(crate) fn adopted(&self, message: PrxMessage, receipt: MailboxReceipt) -> MailboxResult<()> {
         let text = crate::session_worker::mailbox::user_text(&message)?;
         let target = message.to.clone();
-        let mut ready = self.ready.lock();
-        let queue = ready.entry(target.clone()).or_default();
-        if queue.len() >= usize::try_from(super::mailbox::MAX_QUEUE).map_err(|_| MailboxError::CorruptState)? {
-            return Err(MailboxError::QueueFull);
-        }
-        let scope = self.store.session_scope(&self.workspace, &message.to, false)?;
-        let lease = self.store.hold_input(&scope, &message.to)?;
-        queue.push_back(MessageInput {
+        let scope = self.store.session_scope(&self.workspace, &target, false)?;
+        let lease = self.store.hold_input(&scope, &target)?;
+        let input = MessageInput {
             _lease: lease,
             scope: scope.scope_id,
             message,
             receipt,
             text,
-        });
-        drop(ready);
+        };
+        self.requeue_back(input)?;
         self.wake(&target);
         Ok(())
     }
+    fn requeue_back(&self, input: MessageInput) -> MailboxResult<()> {
+        self.queue_input(input, false)
+    }
+    fn queue_input(&self, input: MessageInput, front: bool) -> MailboxResult<()> {
+        let target = input.message.to.clone();
+        let event = input
+            .receipt
+            .adopted_message_event_id
+            .ok_or(MailboxError::CorruptState)?;
+        self.store.with_input(
+            &self.workspace,
+            &target,
+            event,
+            &input.text,
+            input.message.id,
+            &input.receipt,
+            || {
+                let mut ready = self.ready.lock();
+                let queue = ready.entry(target.clone()).or_default();
+                if queue.len() >= 64 {
+                    return Err(MailboxError::QueueFull);
+                }
+                if front {
+                    queue.push_front(input.clone());
+                } else {
+                    queue.push_back(input.clone());
+                }
+                Ok(())
+            },
+        )?
+    }
     pub fn wake(&self, target: &SessionAddr) {
-        if let Some((_, sender)) = self.inboxes.lock().get(target) {
+        if let Some((_, _, sender)) = self.inboxes.lock().get(target) {
             let _ = sender.try_send(());
         }
+    }
+    pub(crate) fn requeue(&self, input: MessageInput) -> MailboxResult<()> {
+        self.queue_input(input, true)
     }
 
     pub fn bind(self: &Arc<Self>, source: SessionAddr, event: Option<&str>) -> MailboxResult<RuntimeSender> {
@@ -343,14 +389,24 @@ impl SessionInbox {
             self.runtime
                 .store
                 .execution_guard(&self.scope, &self.address, uuid::Uuid::new_v4().to_string())?;
-        let mut inputs: Vec<_> = self
-            .runtime
-            .ready
-            .lock()
-            .remove(&self.address)
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
+        let queued = {
+            let mut ready = self.runtime.ready.lock();
+            let value = ready
+                .get_mut(&self.address)
+                .and_then(std::collections::VecDeque::pop_front);
+            if ready
+                .get(&self.address)
+                .is_some_and(std::collections::VecDeque::is_empty)
+            {
+                ready.remove(&self.address);
+            }
+            value
+        };
+        if let Some(input) = queued {
+            drop(execution);
+            return Ok(vec![input]);
+        }
+        let mut inputs = Vec::new();
         for _ in 0..1 {
             let Some(delivery) = self.runtime.store.deliver(&self.scope, &self.address)? else {
                 break;
@@ -373,11 +429,12 @@ impl SessionInbox {
 
 impl super::mailbox::MailboxCacheDrainer for MessagingRuntime {
     fn drain(&self, scope: uuid::Uuid) {
+        self.stop_scope(scope);
         self.ready.lock().retain(|_, inputs| {
             inputs.retain(|input| input.scope != scope);
             !inputs.is_empty()
         });
-        self.inboxes.lock().retain(|_, (registered, sender)| {
+        self.inboxes.lock().retain(|_, (registered, _, sender)| {
             if *registered == scope {
                 let _ = sender.try_send(());
                 false

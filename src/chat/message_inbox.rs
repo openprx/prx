@@ -91,6 +91,7 @@ pub(super) fn cause(message: &ChannelMessage) -> Option<&str> {
 
 pub(super) async fn send_command(
     config: &crate::config::Config,
+    memory:&Arc<dyn crate::memory::Memory>,
     parent: &str,
     focused: Option<&str>,
     message: &ChannelMessage,
@@ -119,6 +120,33 @@ pub(super) async fn send_command(
     {
         source.agent = agent;
     }
+    let level = if source_session == parent {
+        config.autonomy.level
+    } else {
+        let store = memory.child_session_store()
+            .ok_or_else(|| anyhow::anyhow!("child store unavailable"))?;
+        let record = store
+            .sessions(&runtime.workspace, &owner)?
+            .into_iter()
+            .find(|record| record.session_key == source_session && record.parent_session == parent)
+            .ok_or_else(|| anyhow::anyhow!("child_session_unknown"))?;
+        record.level.min(
+            crate::security::agent_level::named_child_level(config, Some(&record.agent), config.autonomy.level)
+                .unwrap_or(config.autonomy.level),
+        )
+    };
+    let policy = crate::security::SecurityPolicy {
+        autonomy: level,
+        ..crate::security::SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
+    };
+    crate::security::SideEffectGate::new(&policy)
+        .authorize_resource_operation(
+            "sessions_send",
+            "sessions_send:message",
+            crate::security::policy::ResourceRiskLevel::Low,
+            None,
+        )
+        .map_err(anyhow::Error::msg)?;
     let (target, text) = super::commands::msg::parse(&message.content, &source)?;
     let mut target = serde_json::Value::String(target.session);
     if let Some(seq) = target

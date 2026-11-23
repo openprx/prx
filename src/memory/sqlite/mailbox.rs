@@ -36,6 +36,9 @@ pub struct SqliteMailbox {
 }
 
 impl SqliteMailbox {
+    pub(crate) fn cache_drain_guard(&self, scope: uuid::Uuid) -> std::sync::Arc<dyn Send + Sync> {
+        std::sync::Arc::new(self.memory.mailbox_runtime.cache_lease(scope))
+    }
     pub(crate) fn register_drainer(&self, drainer: &Arc<dyn crate::messaging::mailbox::MailboxCacheDrainer>) {
         self.memory.mailbox_runtime.register_drainer(drainer);
     }

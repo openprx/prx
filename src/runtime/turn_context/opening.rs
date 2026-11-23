@@ -371,6 +371,7 @@ fn accounting_scope(
             deadline,
         )
         .with_root_agent(proof.memory_scope().agent_partition.as_ref())
+        .with_cost_root_agent(proof.cost_root_agent())
         .with_money(service.runtime.recursive_money(proof)),
     ))
 }

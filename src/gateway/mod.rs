@@ -25,6 +25,7 @@
 
 mod agent_lifecycle;
 mod api;
+mod child_mailbox;
 mod compat;
 mod h2_control;
 mod jobs;

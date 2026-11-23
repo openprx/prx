@@ -1980,6 +1980,15 @@ when attached. Incoming data appears as `[message from <session>/<agent>]`.
 Messages never approve tools, execute slash commands, or publish into an rf
 chat. Local adoption is journaled with session provenance; peer adoption carries
 its TLS SPIFFE identity. Erasing the local copy cannot erase a remote copy.
+
+An idle child can receive a message after its parent's turn ends. Its next
+turn uses the persisted child session and model, with its level capped by the
+current agent and owner configuration. It gets no inherited approval grant or
+local operator authority. Task approvals use the root session's live surface;
+without one, calls that need approval are denied with `no_approval_surface`.
+Process-child approvals remain denied with `no_resolver`. Message turns count
+toward the receiving agent's limits and daily cost, and run one at a time per
+child session.
 Process children continue in a new worker with public history seeded. Their
 tool approvals remain denied with `no_resolver`; task/delegate approvals use
 the owner's pending-approval surface.

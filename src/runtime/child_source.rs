@@ -438,7 +438,7 @@ impl std::fmt::Debug for ChildProviderBinding {
 impl ChildProviderBinding {
     /// Preserve the provider instance authenticated by the explicit operator
     /// ingress. This model binding alone does not grant child capabilities.
-    pub(crate) fn build_operator(source: &super::operator_spawn::OperatorSpawnSource) -> anyhow::Result<Self> {
+    pub(crate) fn build_independent(source: &super::operator_spawn::ChildLaunchSource) -> anyhow::Result<Self> {
         use super::turn_source::TurnSourceProof;
         source.verify_live()?;
         let binding = Self {
@@ -449,16 +449,16 @@ impl ChildProviderBinding {
             resolved: source.resolved().clone(),
             route: source.route().cloned(),
         };
-        binding.verify_operator_source(source)?;
+        binding.verify_independent_source(source)?;
         source.verify_live()?;
         Ok(binding)
     }
 
     /// Verify retained model provenance independently of the command lifetime.
     /// The task driver separately owns and checks its cancellation authority.
-    pub(crate) fn verify_operator_source(
+    pub(crate) fn verify_independent_source(
         &self,
-        source: &super::operator_spawn::OperatorSpawnSource,
+        source: &super::operator_spawn::ChildLaunchSource,
     ) -> anyhow::Result<()> {
         use super::turn_source::TurnSourceProof;
         anyhow::ensure!(

@@ -76,6 +76,8 @@ impl OperatorTaskSegments {
         envelope.task_id = Some(authority.run_id.clone());
         envelope.source_message_event_id = proof.source_event_id().map(str::to_owned);
         envelope.parent_run_id = scope.parent_run_id;
+        envelope.parent_session_key = scope.parent_session_key;
+        envelope.agent_partition = scope.agent_partition;
         envelope.agent_id = scope.agent_id;
         envelope.persona_id = scope.persona_id;
         envelope.channel = scope.channel;
@@ -85,8 +87,9 @@ impl OperatorTaskSegments {
         envelope.lease_epoch = scope.lease_epoch;
         envelope.config_generation_id = scope.config_generation_id;
         envelope.config_source_revision = scope.config_source_revision;
-        let execution = ToolExecutionContext::new(envelope, proof.policy_chat_type())
+        let mut execution = ToolExecutionContext::new(envelope, proof.policy_chat_type())
             .with_dispatch_origin(crate::tools::DispatchOrigin::ModelTurn);
+        execution.live_turn = authority.live_turn();
         self.next = following;
         self.previous_input = next_previous;
         Ok((proof, execution))

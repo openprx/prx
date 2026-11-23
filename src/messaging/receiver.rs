@@ -22,6 +22,14 @@ pub(crate) fn gate(address: &SessionAddr) -> Arc<tokio::sync::Mutex<()>> {
     gate
 }
 pub(crate) fn register(runtime: Arc<MessagingRuntime>, address: SessionAddr, callback: Callback) -> anyhow::Result<()> {
+    register_idle(runtime, address, callback, Arc::new(|| true))
+}
+pub(crate) fn register_idle(
+    runtime: Arc<MessagingRuntime>,
+    address: SessionAddr,
+    callback: Callback,
+    idle: Arc<dyn Fn() -> bool + Send + Sync>,
+) -> anyhow::Result<()> {
     // Registration is idempotent for the currently running backend owner.
     let Some(mut inbox) = runtime.register_backend(address)? else {
         return Ok(());
@@ -30,12 +38,23 @@ pub(crate) fn register(runtime: Arc<MessagingRuntime>, address: SessionAddr, cal
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
         loop {
             interval.tick().await;
+            if !inbox.live() {
+                break;
+            }
+            if !idle() {
+                continue;
+            }
             match inbox.poll() {
                 Ok(inputs) => {
                     for input in inputs {
+                        let retained = input.clone();
                         if input.auto_start()
                             && let Err(error) = callback(input).await
                         {
+                            if error.is::<crate::runtime::mailbox_child::ChildBusy>() {
+                                let _ = runtime.requeue(retained);
+                                continue;
+                            }
                             tracing::warn!(error=%crate::agent::diagnostics::error_class(&error),"session mailbox turn refused");
                         }
                     }

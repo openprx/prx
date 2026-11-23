@@ -15,6 +15,7 @@ pub(crate) struct WorkerMailboxes {
     owners: parking_lot::Mutex<HashMap<String, Arc<WorkerOwner>>>,
 }
 struct WorkerOwner {
+    turn: parking_lot::Mutex<Option<crate::messaging::runtime::MessageTurnGuard>>,
     cancel: CancellationToken,
     pending: parking_lot::Mutex<HashMap<uuid::Uuid, crate::memory::sqlite::mailbox::MailboxDelivery>>,
     execution: parking_lot::Mutex<Option<crate::memory::sqlite::mailbox::MailboxExecution>>,
@@ -71,7 +72,21 @@ impl WorkerMailboxFactory for WorkerMailboxes {
         let (controls, receiver) = mpsc::channel(64);
         let (outputs, mut output_rx) = mpsc::channel(64);
         let cancel = CancellationToken::new();
+        let run = manifest.run_id.clone();
+        let handle = tokio::runtime::Handle::try_current()?;
+        let turn = self.runtime.hold_scope(
+            &scope,
+            &address,
+            Arc::new(move || {
+                if let Some(id) = crate::runtime::registry::resolve_address(&run) {
+                    handle.spawn(async move {
+                        let _ = crate::runtime::registry::kill(id, true).await;
+                    });
+                }
+            }),
+        )?;
         let owner = Arc::new(WorkerOwner {
+            turn: parking_lot::Mutex::new(Some(turn)),
             cancel: cancel.clone(),
             pending: Default::default(),
             execution: parking_lot::Mutex::new(Some(execution)),
@@ -110,6 +125,7 @@ impl WorkerMailboxFactory for WorkerMailboxes {
                                 }.await
                             }
                             Some(WorkerOutputFrame::Ack { message_id, state: DeliveryState::Consumed }) => {
+                                if !runtime.ready_capacity(&target) {continue;}
                                 let delivery = pending.lock().remove(&message_id);
                                 delivery.map_or_else(||Ok(()),|delivery|runtime.store.adopt(&delivery).and_then(|receipt|runtime.adopted(delivery.message().clone(),receipt)).map_err(Into::into))
                             }
@@ -121,7 +137,7 @@ impl WorkerMailboxFactory for WorkerMailboxes {
                     _ = interval.tick() => {
                         async {
                             runtime.store.validate_scope(&scope, &target)?;
-                            if pending.lock().len() < 64 {
+                            if pending.lock().len() < 64 && runtime.ready_capacity(&target) {
                                 if let Some(delivery) = runtime.store.deliver(&scope, &target)? {
                                     let frame = WorkerControlFrame::Message { envelope: Box::new(delivery.message().clone()) };
                                     let id = delivery.message().id;
@@ -163,6 +179,7 @@ impl WorkerMailboxFactory for WorkerMailboxes {
                 }
                 owner.pending.lock().clear();
                 drop(owner.execution.lock().take());
+                drop(owner.turn.lock().take());
                 let _ = runtime.store.recover_delivery(&owner.scope, &owner.address);
                 runtime.wake(&owner.address);
             });

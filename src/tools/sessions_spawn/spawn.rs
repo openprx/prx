@@ -231,6 +231,14 @@ impl SessionsSpawnTool {
             },
             crate::runtime::child_source::publication::OrdinaryChildPublication::level,
         );
+        let child_level = if operator_source
+            .as_ref()
+            .is_some_and(|source| source.is_message_continuation())
+        {
+            launch_security.autonomy
+        } else {
+            child_level
+        };
         let provider_options = &providers::provider_runtime_options_from_config(child_model_config);
         let spawn_config = &child_model_config.sessions_spawn;
         let agents = &child_model_config.agents;
@@ -362,6 +370,21 @@ impl SessionsSpawnTool {
         // source keeps its authenticated session.
         let session_scope_key =
             super::continuation::current().map_or_else(|| spawn_session_key(&run_id), |seed| seed.record.session_key);
+        let _new_session_gate = if super::continuation::current().is_none() {
+            let owner = spawn_scope
+                .as_ref()
+                .and_then(|scope| scope.owner_id.as_deref())
+                .context("child owner missing")?;
+            let address = crate::messaging::SessionAddr::new(
+                child_model_config.workspace_dir.to_string_lossy(),
+                owner,
+                &session_scope_key,
+                None,
+            );
+            Some(crate::messaging::receiver::gate(&address).lock_owned().await)
+        } else {
+            None
+        };
 
         // The registry imposes no global fan-out or nesting limit. A child's
         // sealed delegation grant independently bounds its depth. An operator sees every
@@ -448,7 +471,10 @@ impl SessionsSpawnTool {
         // `None` (no trusted scope) falls back at announce time to the shared
         // active channel, preserving single-channel / legacy behaviour.
         let run_channel_name = spawn_scope.as_ref().map(|scope| scope.channel.clone());
-        let operator_channel = if operator_source.is_some() {
+        let operator_channel = if operator_source
+            .as_ref()
+            .is_some_and(|source| !source.is_message_continuation())
+        {
             let channel = self.resolve_announce_channel(run_channel_name.as_deref()).await;
             anyhow::ensure!(
                 Some(channel.name()) == run_channel_name.as_deref(),
@@ -487,6 +513,9 @@ impl SessionsSpawnTool {
         // with `announce: true` at the top level delivers one message per member
         // on top of the parent's summary.
         let announce_result = batch_id.is_none()
+            && !operator_source
+                .as_ref()
+                .is_some_and(|source| source.is_message_continuation())
             && args
                 .get("announce")
                 .and_then(serde_json::Value::as_bool)
@@ -803,6 +832,9 @@ impl SessionsSpawnTool {
         )
         .await?;
 
+        if let Some(publication) = ordinary_publication {
+            publication.watch_mailbox_children()?;
+        }
         if mode == "process" {
             let process_parent_frames = caller.as_ref().and_then(|caller| {
                 let context = caller.context();
@@ -858,6 +890,19 @@ impl SessionsSpawnTool {
             let history_arc: Arc<RwLock<Vec<HistoryEntry>>> =
                 Arc::new(RwLock::new(super::continuation::seed_history()));
             let process_control = ProcessRunControl::new();
+            let stop_control = Arc::clone(&process_control);
+            let runtime_handle = tokio::runtime::Handle::try_current()?;
+            let message_turn = super::message_lifetime::retain(
+                child_model_config,
+                message_input.as_ref(),
+                &self.active_runs,
+                Arc::new(move || {
+                    let control = Arc::clone(&stop_control);
+                    runtime_handle.spawn(async move {
+                        let _ = control.request_termination("history_erased").await;
+                    });
+                }),
+            )?;
             // Process-mode steering: the sender lives in the registry exactly as
             // it does for task mode, so `sessions_send` / `sessions_spawn:steer`
             // reach an OS-process sub-agent through the same code path. The
@@ -1066,6 +1111,7 @@ impl SessionsSpawnTool {
                     crate::agent::idle::scope_beat(Some(Arc::clone(&monitor_progress)), async move {
                         let _message_permit=message_permit;
                         let _message_input=message_input;
+                        let _message_turn=message_turn;
                         async {
                             tracing::info!(run_id = %rid, "Sub-agent process starting");
 
@@ -1420,7 +1466,7 @@ impl SessionsSpawnTool {
         let mut provider_name = resolved_provider_name;
         let mut model = resolved_model;
         let child_provider_binding = if let Some(source) = &operator_source {
-            let binding = Arc::new(crate::runtime::child_source::ChildProviderBinding::build_operator(
+            let binding = Arc::new(crate::runtime::child_source::ChildProviderBinding::build_independent(
                 source,
             )?);
             provider_name = binding.provider_name().to_owned();
@@ -1567,6 +1613,13 @@ impl SessionsSpawnTool {
         // owns cleanup; parenting this to the caller would cancel valid work
         // when that caller returns. Register before publishing the active row.
         let task_control = TaskRunControl::new();
+        let stop_token = task_control.cancellation().clone();
+        let message_turn = super::message_lifetime::retain(
+            child_model_config,
+            message_input.as_ref(),
+            &self.active_runs,
+            Arc::new(move || stop_token.cancel()),
+        )?;
         if let Some(source) = &operator_source {
             let (authority, lifetime) = source.issue_task(
                 Arc::clone(
@@ -1710,6 +1763,7 @@ impl SessionsSpawnTool {
             SPAWN_EXECUTION_CONTEXT.scope(task_execution_ctx, async move {
                 let _message_permit = message_permit;
                 let _message_input = message_input;
+                let _message_turn = message_turn;
                 tracing::info!(run_id = %rid, "Sub-agent task starting");
                 let provider_started_at = Utc::now();
                 let (run_on_delta, run_on_tool) = match run_event_streams {

@@ -56,7 +56,11 @@ pub fn validate(config: &A2aConfig) -> Result<()> {
         let url = reqwest::Url::parse(&format!("https://{}", peer.address))?;
         ensure!(
             url.host_str().is_some()
-                && url.port().is_some()
+                && url.port_or_known_default().is_some()
+                && peer
+                    .address
+                    .rsplit_once(':')
+                    .is_some_and(|(_, port)| port.parse::<u16>().is_ok_and(|port| port > 0))
                 && url.username().is_empty()
                 && url.password().is_none()
                 && url.path() == "/"

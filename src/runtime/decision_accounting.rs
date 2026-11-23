@@ -95,6 +95,12 @@ impl AccountingScope {
         self.root_agent = partition.map(crate::cost::types::RootAgent::from_partition);
         self
     }
+    pub(crate) fn with_cost_root_agent(mut self, receiver: Option<crate::cost::types::RootAgent>) -> Self {
+        if receiver.is_some() {
+            self.root_agent = receiver;
+        }
+        self
+    }
 
     pub(crate) fn money_owner(&self) -> Arc<AtomicU64> {
         Arc::clone(

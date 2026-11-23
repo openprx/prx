@@ -48,6 +48,9 @@ tokio::task_local! {
 pub(super) fn current_cancellation() -> Option<CancellationToken> {
     JOB_CANCELLATION.try_with(Clone::clone).ok()
 }
+pub(super) async fn scope_cancellation<F: std::future::Future>(cancellation: CancellationToken, work: F) -> F::Output {
+    JOB_CANCELLATION.scope(cancellation, work).await
+}
 
 /// Register before terminal work begins; the receiver survives abortion of
 /// the work task because the independent job monitor owns the collection.

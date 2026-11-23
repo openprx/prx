@@ -101,11 +101,16 @@ impl SqliteMailbox {
         let writer = self.memory.pool.write();
         let tx = Transaction::new_unchecked(&writer, TransactionBehavior::Immediate).map_err(storage_error)?;
         pin::check_scope(&tx, scope, source, None, true)?;
-        let (id,raw):(i64,String)=tx.query_row("SELECT id,envelope_meta FROM prx_mailbox_outbox WHERE message_id=?1 AND ma_scope_id=?2 AND state IN(0,1)",params![message.id.as_bytes().as_slice(),scope.scope_id.to_string()],|r|Ok((r.get(0)?,r.get(1)?))).map_err(storage_error)?;
+        let (id,raw,stream_id):(i64,String,i64)=tx.query_row("SELECT id,envelope_meta,stream_id FROM prx_mailbox_outbox WHERE message_id=?1 AND ma_scope_id=?2 AND state IN(0,1)",params![message.id.as_bytes().as_slice(),scope.scope_id.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(storage_error)?;
         let mut meta: OutboxMeta = decode(&raw)?;
         if !meta.to_pin.incarnation.is_nil()
             && (meta.to_pin.incarnation != pin.incarnation || meta.to_pin.generation != pin.generation)
         {
+            // Old payloads stay bound to their old incarnation. Future sends
+            // get a new wire stream instead of reusing the receiver's tombstone.
+            let mut stream = super::stream::load(&tx, stream_id)?;
+            super::stream::retire(&tx, &mut stream, self.clock.now())?;
+            tx.commit().map_err(storage_error)?;
             return Err(MailboxError::StaleIncarnation);
         }
         message.to_pin = pin;

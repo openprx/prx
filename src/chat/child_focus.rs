@@ -32,19 +32,10 @@ impl ChildFocusContext<'_> {
         record: ChildSessionRecord,
         input: crate::messaging::runtime::MessageInput,
     ) -> anyhow::Result<String> {
-        let provider = self.provider(&record)?;
-        let binding = ChatProviderBinding::capture(self.generation, &provider, &record.provider, &record.model)?
-            .context("child provider missing")?;
-        let command = ChatOperatorSpawn::capture_message(input, record, binding)?;
-        let (args, source) = command
-            .admit(
-                Arc::clone(self.memory),
-                self.parent,
-                Arc::clone(self.security),
-                Arc::clone(self.service),
-            )
-            .await?;
-        self.execute_source(source, args).await
+        crate::runtime::mailbox_child::MailboxChildSource::admit(self.service, record, input, None)
+            .await?
+            .continue_turn(self.tools)
+            .await
     }
     pub(super) async fn view(
         &self,
@@ -202,7 +193,7 @@ impl ChildFocusContext<'_> {
     }
     async fn execute_source(
         &self,
-        source: crate::runtime::operator_spawn::OperatorSpawnSource,
+        source: crate::runtime::operator_spawn::ChildLaunchSource,
         args: serde_json::Value,
     ) -> anyhow::Result<String> {
         let tool = self

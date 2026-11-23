@@ -6,6 +6,30 @@ use crate::messaging::{CausalChain, SessionAddr};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
 impl SqliteMailbox {
+    pub(crate) fn partition(
+        &self,
+        scope: &crate::messaging::mailbox::MailboxScope,
+    ) -> crate::messaging::mailbox::MailboxResult<crate::memory::AgentPartition> {
+        let writer = self.memory.pool.write();
+        let key:String=writer.query_row("SELECT agent_key FROM agent_scopes WHERE scope_id=?1 AND workspace_id=?2 AND owner_id=?3 AND incarnation=?4 AND generation=?5",params![scope.scope_id.to_string(),scope.workspace_id,scope.owner_id,scope.incarnation.to_string(),scope.generation],|row|row.get(0)).map_err(storage_error)?;
+        let key = if key == "m" {
+            crate::memory::PartitionKey::Main
+        } else {
+            crate::memory::PartitionKey::Named {
+                name: crate::config::agent_name::AgentName::parse(
+                    key.strip_prefix("n:")
+                        .ok_or(crate::messaging::mailbox::MailboxError::CorruptState)?,
+                )
+                .map_err(|_| crate::messaging::mailbox::MailboxError::CorruptState)?,
+                incarnation: scope.incarnation,
+            }
+        };
+        Ok(crate::memory::AgentPartition {
+            workspace_id: scope.workspace_id.clone(),
+            owner_id: scope.owner_id.clone(),
+            key,
+        })
+    }
     pub(crate) fn hold_input(
         &self,
         scope: &MailboxScope,
@@ -17,18 +41,51 @@ impl SqliteMailbox {
             self.memory.mailbox_runtime.cache_lease(scope.scope_id),
         ))
     }
+    pub(crate) fn with_live_scope<T>(
+        &self,
+        scope: &MailboxScope,
+        target: &SessionAddr,
+        action: impl FnOnce() -> T,
+    ) -> MailboxResult<T> {
+        let writer = self.memory.pool.write();
+        pin::check_scope(&writer, scope, target, None, true)?;
+        Ok(action())
+    }
     pub(crate) fn validate_input(
         &self,
         workspace: &str,
         target: &SessionAddr,
         event: uuid::Uuid,
         text: &str,
+        message: uuid::Uuid,
+        receipt: &crate::messaging::mailbox::MailboxReceipt,
     ) -> MailboxResult<()> {
+        self.with_input(workspace, target, event, text, message, receipt, || ())
+    }
+    pub(crate) fn with_input<T>(
+        &self,
+        workspace: &str,
+        target: &SessionAddr,
+        event: uuid::Uuid,
+        text: &str,
+        message: uuid::Uuid,
+        receipt: &crate::messaging::mailbox::MailboxReceipt,
+        action: impl FnOnce() -> T,
+    ) -> MailboxResult<T> {
         let scope = self.session_scope(workspace, target, false)?;
-        self.validate_scope(&scope, target)?;
         let writer = self.memory.pool.write();
-        let present:bool=writer.query_row("SELECT EXISTS(SELECT 1 FROM message_events WHERE event_id=?1 AND workspace_id=?2 AND owner_id=?3 AND session_key=?4 AND source='prx_mailbox' AND role='user' AND content=?5 AND ma_scope_id=?6)",params![event.to_string(),scope.workspace_id,target.owner,target.session,text,scope.scope_id.to_string()],|r|r.get(0)).map_err(storage_error)?;
-        if present { Ok(()) } else { Err(MailboxError::Fenced) }
+        pin::check_scope(&writer, &scope, target, None, true)?;
+        let raw:Option<String>=writer.query_row("SELECT source_ref_json FROM message_events WHERE event_id=?1 AND workspace_id=?2 AND owner_id=?3 AND session_key=?4 AND source='prx_mailbox' AND role='user' AND content=?5 AND ma_scope_id=?6",params![event.to_string(),scope.workspace_id,target.owner,target.session,text,scope.scope_id.to_string()],|r|r.get(0)).optional().map_err(storage_error)?;
+        let reference: super::model::EventRef = super::model::decode(&raw.ok_or(MailboxError::Fenced)?)?;
+        if reference.message_id != message
+            || receipt.message_id != message
+            || reference.common.chain(message) != receipt.chain
+            || reference.scope != scope
+            || reference.agent != target.agent
+        {
+            return Err(MailboxError::IdentityImmutable);
+        }
+        Ok(action())
     }
 
     pub fn has_pending(&self, scope: &MailboxScope, target: &SessionAddr) -> MailboxResult<bool> {

@@ -1,4 +1,5 @@
-//! Typed local-operator ingress, separate from model delegation authority.
+//! Independent child lifetimes issued by operator or adopted-message ingress.
+mod mailbox;
 pub(crate) mod process;
 pub(crate) mod task;
 
@@ -9,7 +10,8 @@ use std::sync::{
 };
 use tokio_util::sync::CancellationToken;
 
-pub(crate) struct OperatorSpawnSource {
+pub(crate) struct ChildLaunchSource {
+    live_turn: Option<crate::agent::live_frames::LiveTurnRef>,
     message_event: Option<String>,
     message_permit: Option<Arc<crate::runtime::agent_admission::AgentTurnPermit>>,
     message_input: Option<crate::messaging::runtime::MessageInput>,
@@ -22,7 +24,7 @@ pub(crate) struct OperatorSpawnSource {
     resolved: crate::providers::catalog::ResolvedModel,
     route: Option<crate::providers::catalog::RouteTarget>,
     security: Arc<crate::security::SecurityPolicy>,
-    publication: crate::runtime::child_source::publication::OperatorChildPublication,
+    publication: crate::runtime::child_source::publication::IndependentChildPublication,
     task: String,
     claimed: AtomicBool,
     child_issued: AtomicBool,
@@ -36,13 +38,13 @@ impl Drop for OperatorLifetime {
     }
 }
 
-tokio::task_local! { static OPERATOR_SPAWN: Arc<OperatorSpawnSource>; }
+tokio::task_local! { static OPERATOR_SPAWN: Arc<ChildLaunchSource>; }
 
-pub(crate) fn current() -> Option<Arc<OperatorSpawnSource>> {
+pub(crate) fn current() -> Option<Arc<ChildLaunchSource>> {
     OPERATOR_SPAWN.try_with(Arc::clone).ok()
 }
 
-impl OperatorSpawnSource {
+impl ChildLaunchSource {
     pub(crate) fn new(
         proof: &dyn TurnSourceProof,
         generation: Arc<crate::config::ConfigGeneration>,
@@ -65,7 +67,7 @@ impl OperatorSpawnSource {
                 && !task.is_empty(),
             "operator source identity differs"
         );
-        let publication = crate::runtime::child_source::publication::OperatorChildPublication::capture(
+        let publication = crate::runtime::child_source::publication::IndependentChildPublication::capture(
             publication,
             runtime,
             proof,
@@ -90,6 +92,7 @@ impl OperatorSpawnSource {
             "operator model source differs from pinned PMM selection"
         );
         Ok(Self {
+            live_turn: None,
             message_event: None,
             message_permit: None,
             message_input: None,
@@ -162,7 +165,13 @@ impl OperatorSpawnSource {
         let root = input.message.to.agent.clone();
         runtime.store.validate_scope(&scope, &input.message.to)?;
         self.message_permit =
-            crate::runtime::agent_admission::admit(&self.generation.effective, self.proof.owner_id(), &root)?
+            crate::runtime::agent_admission::admit(&self.generation.effective, self.proof.owner_id(), &root)
+                .map_err(|error| match error {
+                    crate::runtime::agent_admission::AdmissionError::Busy => {
+                        anyhow::Error::new(crate::runtime::mailbox_child::ChildBusy)
+                    }
+                    error => anyhow::Error::new(error),
+                })?
                 .map(Arc::new);
         self.message_event = Some(id);
         self.message_input = Some(input.clone());
@@ -177,6 +186,9 @@ impl OperatorSpawnSource {
     }
     pub(crate) fn message_permit(&self) -> Option<Arc<crate::runtime::agent_admission::AgentTurnPermit>> {
         self.message_permit.clone()
+    }
+    pub(crate) fn live_turn(&self) -> Option<crate::agent::live_frames::LiveTurnRef> {
+        self.live_turn.clone()
     }
 
     pub(crate) async fn scope<F: std::future::Future>(self, work: F) -> F::Output {
@@ -221,6 +233,8 @@ impl OperatorSpawnSource {
         scope.channel = Some(self.proof.policy_channel().to_owned());
         scope.sender = Some(self.proof.policy_sender().to_owned());
         scope.recipient = self.proof.memory_scope().chat_id.clone();
+        scope.agent_partition =
+            crate::runtime::child_source::inherited_partition(self.proof.memory_scope().agent_partition.as_ref());
         scope.causation_event_id = self
             .message_event
             .clone()
@@ -244,7 +258,7 @@ impl OperatorSpawnSource {
     }
 }
 
-pub(crate) fn claim(args: &serde_json::Value) -> anyhow::Result<Option<Arc<OperatorSpawnSource>>> {
+pub(crate) fn claim(args: &serde_json::Value) -> anyhow::Result<Option<Arc<ChildLaunchSource>>> {
     let Some(source) = OPERATOR_SPAWN.try_with(Arc::clone).ok() else {
         return Ok(None);
     };

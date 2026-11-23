@@ -83,6 +83,13 @@ impl StreamQueue {
     }
 }
 impl StreamHub {
+    pub(crate) fn connected(&self, owner: &str) -> bool {
+        self.state
+            .lock()
+            .connections
+            .get(owner)
+            .is_some_and(|queue| !queue.failed())
+    }
     pub(crate) fn connect(&self, owner: &str) -> Arc<StreamQueue> {
         let queue = Arc::new(StreamQueue::default());
         let mut state = self.state.lock();

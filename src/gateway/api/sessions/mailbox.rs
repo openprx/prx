@@ -16,6 +16,7 @@ pub(super) fn register(
         return Ok(());
     }
     let runtime = MessagingRuntime::for_config(&config)?;
+    crate::gateway::child_mailbox::register(state, &envelope)?;
     let address = runtime.address(
         &envelope.resolved_owner_id(),
         &envelope.session_key,
@@ -71,7 +72,9 @@ async fn run(
     )
     .await?;
     let cancellation = tokio_util::sync::CancellationToken::new();
-    let ticket = turn_runtime.publication_slot.cleanup.register(cancellation)?;
+    let stop = cancellation.clone();
+    let _message_turn = runtime.hold_turn(&input, Arc::new(move || stop.cancel()))?;
+    let ticket = turn_runtime.publication_slot.cleanup.register(cancellation.clone())?;
     let pending = ConsolePendingInput {
         state: state.clone(),
         runtime: turn_runtime.clone(),
@@ -90,9 +93,12 @@ async fn run(
         guard,
         owner_authenticated: false,
     };
-    run_console_message_job_work(turn_runtime, state, input.text.clone(), turns, source, target)
-        .await
-        .map_err(anyhow::Error::msg)?;
+    crate::gateway::jobs::scope_cancellation(
+        cancellation,
+        run_console_message_job_work(turn_runtime, state, input.text.clone(), turns, source, target),
+    )
+    .await
+    .map_err(anyhow::Error::msg)?;
     drop(input);
     Ok(())
 }

@@ -29,7 +29,7 @@ pub(crate) async fn recorded_local_operator_spawn(
     publication: crate::runtime::turn_publication::TurnPublication,
     provider: Arc<dyn crate::providers::Provider>,
     task: &str,
-) -> anyhow::Result<(serde_json::Value, crate::runtime::operator_spawn::OperatorSpawnSource)> {
+) -> anyhow::Result<(serde_json::Value, crate::runtime::operator_spawn::ChildLaunchSource)> {
     let generation = Arc::clone(&publication.generation);
     let memory = Arc::clone(&publication.memory);
     let security = Arc::clone(&publication.security);

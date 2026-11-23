@@ -34,6 +34,7 @@ pub(super) fn register(
         return Ok(());
     }
     let runtime = MessagingRuntime::for_config(&config)?;
+    super::child_mailbox::register(state, envelope)?;
     let address = runtime.address(
         &envelope.resolved_owner_id(),
         &envelope.session_key,
@@ -55,22 +56,29 @@ pub(super) fn register(
                     crate::runtime::agent_admission::wait(&config, &input.message.to.owner, &input.message.to.agent)
                         .await?;
                 let text = input.text.clone();
+                let runtime = MessagingRuntime::for_config(&config)?;
+                let cancellation = tokio_util::sync::CancellationToken::new();
+                let stop = cancellation.clone();
+                let _message_turn = runtime.hold_turn(&input, Arc::new(move || stop.cancel()))?;
                 INPUT
-                    .scope(input, async {
-                        let mut stage = TurnFailureClass::TurnNotReady;
-                        // Normal gateway admission owns history, policy, costs and
-                        // cleanup. Message data never enters the HTTP approval parser.
-                        run_gateway_chat_with_multimodal(
-                            &state,
-                            crate::providers::selection::default_provider(&config),
-                            &text,
-                            &context,
-                            None,
-                            &mut stage,
-                        )
-                        .await
-                        .map(|_| ())
-                    })
+                    .scope(
+                        input,
+                        super::jobs::scope_cancellation(cancellation, async {
+                            let mut stage = TurnFailureClass::TurnNotReady;
+                            // Normal gateway admission owns history, policy, costs and
+                            // cleanup. Message data never enters the HTTP approval parser.
+                            run_gateway_chat_with_multimodal(
+                                &state,
+                                crate::providers::selection::default_provider(&config),
+                                &text,
+                                &context,
+                                None,
+                                &mut stage,
+                            )
+                            .await
+                            .map(|_| ())
+                        }),
+                    )
                     .await
             })
         }),

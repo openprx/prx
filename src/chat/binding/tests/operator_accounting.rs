@@ -198,7 +198,7 @@ async fn run_operator_case(process: bool) -> anyhow::Result<()> {
             .scope(async {
                 let claimed =
                     crate::runtime::operator_spawn::claim(&args)?.context("actual operator source missing")?;
-                let binding = Arc::new(crate::runtime::child_source::ChildProviderBinding::build_operator(
+                let binding = Arc::new(crate::runtime::child_source::ChildProviderBinding::build_independent(
                     &claimed,
                 )?);
                 let mut scope = crate::runtime::envelope::RuntimeEnvelope::sessions_spawn(
@@ -331,7 +331,7 @@ async fn run_operator_case(process: bool) -> anyhow::Result<()> {
 
 // Test-only composition fragment. Not a frozen candidate or executed test.
 async fn restore_operator_process(
-    source: &std::sync::Arc<crate::runtime::operator_spawn::OperatorSpawnSource>,
+    source: &std::sync::Arc<crate::runtime::operator_spawn::ChildLaunchSource>,
     scope: &crate::memory::MessageEventScope,
     receipt: Option<std::sync::Arc<crate::runtime::child_source::ChildInputReceipt>>,
     task: &str,
@@ -425,7 +425,7 @@ async fn restore_operator_process(
 }
 
 async fn process_segment(
-    claimed: &std::sync::Arc<crate::runtime::operator_spawn::OperatorSpawnSource>,
+    claimed: &std::sync::Arc<crate::runtime::operator_spawn::ChildLaunchSource>,
     scope: &crate::memory::MessageEventScope,
     receipt: Option<std::sync::Arc<crate::runtime::child_source::ChildInputReceipt>>,
     task: &str,

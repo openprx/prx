@@ -410,6 +410,8 @@ pub(super) fn provider_construction_outside_the_provider_module_is_pinned() {
         "src/gateway/api/sessions/target.rs:target_provider:create_routed_provider_for",
         "src/gateway/mod.rs:build_gateway_provider_selection:create_routed_provider_for",
         "src/runtime/child_source.rs:from_selection:create_provider_for",
+        // Adopted child uses the persisted model and its current PMM-scoped credential.
+        "src/runtime/mailbox_child.rs:admit:create_routed_provider_for",
         // Proposal and judge calls share the resolved, credential-scoped factory.
         "src/runtime/evolution_model.rs:from_config:create_provider_for",
         "src/runtime/decision_accounting/auxiliary.rs:auxiliary_accounting:create_provider_for",

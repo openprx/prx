@@ -357,7 +357,6 @@ impl Default for RemoteTreeLimits {
     }
 }
 
-/// Inbound key-possession method a peer must use.
 /// Explicit pinned identity and local recipient grant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

@@ -363,6 +363,11 @@ pub(super) const ALLOWED_DIRECT_TOOL_INVOCATIONS: &[(&str, usize, &str)] = &[
         "operator input in child focus; admitted by the same captured local operator source",
     ),
     (
+        "src/runtime/mailbox_child.rs::continue_turn",
+        1,
+        "verified adopted-message continuation of an existing child; never a new spawn or operator grant",
+    ),
+    (
         "src/chat/run.rs::run_internal",
         3,
         "operator-typed `/spawn`, `/steer` and `!command`; the human at the keyboard is the \

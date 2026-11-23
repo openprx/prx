@@ -2,7 +2,7 @@
 //! operator children, the ordinary process launch and the execution-policy
 //! proof carried into an issued child grant.
 mod operator;
-pub(crate) use operator::OperatorChildPublication;
+pub(crate) use operator::IndependentChildPublication;
 mod ordinary_process;
 pub(crate) use ordinary_process::OrdinaryProcessLaunch;
 
@@ -132,6 +132,18 @@ impl PartialEq for OrdinaryChildPublication {
 impl Eq for OrdinaryChildPublication {}
 
 impl OrdinaryChildPublication {
+    pub(crate) fn watch_mailbox_children(&self) -> anyhow::Result<()> {
+        let agent = self.inner.source.memory_scope().agent_partition.as_ref().map_or_else(
+            || "main".to_owned(),
+            |partition| crate::cost::types::RootAgent::from_partition(partition).name,
+        );
+        crate::runtime::mailbox_child::watch(
+            Arc::clone(&self.inner.service),
+            self.inner.source.owner_id().to_owned(),
+            self.inner.source.session_key().to_owned(),
+            agent,
+        )
+    }
     pub(crate) fn parent_authority(&self) -> &crate::runtime::child_source::ParentAuthority {
         &self.inner.authority
     }

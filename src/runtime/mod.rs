@@ -119,6 +119,7 @@ mod tests {
     }
 }
 
+pub(crate) mod mailbox_child;
 pub(crate) mod operator_spawn;
 
 pub(crate) mod ingress_recovery;

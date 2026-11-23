@@ -112,14 +112,14 @@ impl VerifiedOperatorProcessPublication {
 }
 
 pub(crate) struct OperatorProcessLaunch {
-    source: std::sync::Arc<super::OperatorSpawnSource>,
+    source: std::sync::Arc<super::ChildLaunchSource>,
     scope: crate::memory::MessageEventScope,
     receipt: Option<std::sync::Arc<crate::runtime::child_source::ChildInputReceipt>>,
     config_generation: String,
     id: uuid::Uuid,
 }
 
-impl super::OperatorSpawnSource {
+impl super::ChildLaunchSource {
     pub(crate) fn capture_process(
         self: &std::sync::Arc<Self>,
         scope: &crate::memory::MessageEventScope,
@@ -231,7 +231,7 @@ impl OperatorProcessLaunch {
                 && worker.task == source.task.trim()
                 && Some(worker.run_id.as_str()) == self.scope.run_id.as_deref()
                 && worker.config_generation == self.config_generation
-                && worker.session_scope_key == source.proof.session_key()
+                && Some(worker.session_scope_key.as_str()) == self.scope.session_key.as_deref()
                 && worker.owner_id == self.scope.owner_id
                 && worker.parent_run_id == self.scope.parent_run_id
                 && worker.agent_id == self.scope.agent_id
@@ -281,12 +281,16 @@ impl OperatorProcessLaunch {
             },
             self.scope.attempt_id.clone(),
             self.scope.lease_epoch,
-            crate::security::agent_level::named_child_level(
-                &source.generation.effective,
-                self.scope.agent_id.as_deref(),
-                source.security.autonomy,
-            )
-            .unwrap_or(source.security.autonomy),
+            if source.is_message_continuation() {
+                source.security.autonomy
+            } else {
+                crate::security::agent_level::named_child_level(
+                    &source.generation.effective,
+                    self.scope.agent_id.as_deref(),
+                    source.security.autonomy,
+                )
+                .unwrap_or(source.security.autonomy)
+            },
         )?;
         source.publication.verify(
             &source.proof,

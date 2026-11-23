@@ -61,6 +61,41 @@ pub(crate) struct CleanupTicket {
     id: u64,
     finished: bool,
 }
+/// Release a child publication after its last segment, including early exits.
+pub(crate) struct ChildServiceRetirement {
+    service: Option<Arc<TurnRuntimeService>>,
+    owner: Arc<CleanupTracker>,
+    handle: tokio::runtime::Handle,
+}
+impl ChildServiceRetirement {
+    pub(crate) fn new(service: Arc<TurnRuntimeService>) -> anyhow::Result<Self> {
+        Ok(Self {
+            service: Some(service),
+            owner: current_tracker().ok_or_else(|| anyhow::anyhow!("child cleanup owner missing"))?,
+            handle: tokio::runtime::Handle::try_current()?,
+        })
+    }
+}
+impl Drop for ChildServiceRetirement {
+    fn drop(&mut self) {
+        let Some(service) = self.service.take() else {
+            return;
+        };
+        match self.owner.retire(&service) {
+            Ok(ticket) => {
+                self.handle.spawn(async move {
+                    let drained = service
+                        .drain_writes(std::time::Instant::now() + std::time::Duration::from_secs(2))
+                        .await;
+                    ticket.finish(drained);
+                });
+            }
+            Err(error) => {
+                tracing::warn!(error=%crate::agent::diagnostics::error_class(&error),"child publication retirement refused")
+            }
+        }
+    }
+}
 
 impl CleanupTracker {
     pub(crate) async fn scope<F: std::future::Future>(self: &Arc<Self>, work: F) -> F::Output {

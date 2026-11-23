@@ -1,7 +1,7 @@
 //! Detached task lifetime issued only by a live explicit operator command.
 mod segments;
 
-use super::{Arc, AtomicBool, CancellationToken, OperatorSpawnSource, Ordering, OwnedTurnSourceProof, TurnSourceProof};
+use super::{Arc, AtomicBool, CancellationToken, ChildLaunchSource, Ordering, OwnedTurnSourceProof, TurnSourceProof};
 use crate::runtime::child_source::{ChildInputReceipt, ChildProviderBinding};
 use anyhow::Context;
 
@@ -11,7 +11,7 @@ pub(crate) struct OperatorTaskAuthority {
     source_event_id: Option<String>,
     scope: crate::memory::MessageEventScope,
     sequence_claimed: AtomicBool,
-    source: Arc<OperatorSpawnSource>,
+    source: Arc<ChildLaunchSource>,
     binding: Arc<ChildProviderBinding>,
     run_id: String,
     input: String,
@@ -32,7 +32,7 @@ impl Drop for OperatorTaskLifetime {
     }
 }
 
-impl OperatorSpawnSource {
+impl ChildLaunchSource {
     pub(crate) fn issue_task(
         self: &Arc<Self>,
         binding: Arc<ChildProviderBinding>,
@@ -42,7 +42,7 @@ impl OperatorSpawnSource {
         cancellation: &CancellationToken,
     ) -> anyhow::Result<(Arc<OperatorTaskAuthority>, OperatorTaskLifetime)> {
         self.verify_live()?;
-        binding.verify_operator_source(self)?;
+        binding.verify_independent_source(self)?;
         anyhow::ensure!(
             self.claimed.load(Ordering::Acquire)
                 && input == self.task.trim()
@@ -140,6 +140,12 @@ impl OperatorSpawnSource {
 }
 
 impl OperatorTaskAuthority {
+    pub(crate) fn mailbox_turn(&self) -> bool {
+        self.source.is_message_continuation()
+    }
+    pub(crate) fn live_turn(&self) -> Option<crate::agent::live_frames::LiveTurnRef> {
+        self.source.live_turn()
+    }
     pub(crate) const fn allowance(
         &self,
     ) -> &Arc<crate::runtime::child_source::recursive_allowance::RecursiveAllowance> {
@@ -157,7 +163,7 @@ impl OperatorTaskAuthority {
         &self.source.fabric
     }
 
-    pub(crate) fn publication(&self) -> &crate::runtime::child_source::publication::OperatorChildPublication {
+    pub(crate) fn publication(&self) -> &crate::runtime::child_source::publication::IndependentChildPublication {
         &self.source.publication
     }
 
@@ -169,7 +175,7 @@ impl OperatorTaskAuthority {
         anyhow::ensure!(!self.cancellation.is_cancelled(), "operator task authority is closed");
         // The command may have returned. The independently owned task lifetime
         // remains subject to the original frozen publication and actual policy.
-        self.binding.verify_operator_source(&self.source)?;
+        self.binding.verify_independent_source(&self.source)?;
         self.source.publication.verify(
             &self.source.proof,
             &self.source.generation,
@@ -232,6 +238,9 @@ impl OperatorTaskAuthority {
 }
 
 impl TurnSourceProof for OperatorTaskAuthority {
+    fn cost_root_agent(&self) -> Option<crate::cost::types::RootAgent> {
+        self.source.proof.cost_root_agent()
+    }
     fn owner_isolated(&self) -> bool {
         self.source.proof.owner_isolated()
     }

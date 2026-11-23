@@ -398,7 +398,7 @@ async fn operator_task_cells(
     drift: &AtomicUsize,
 ) -> anyhow::Result<()> {
     let claimed = crate::runtime::operator_spawn::claim(&args)?.context("operator source not in scope")?;
-    let binding = Arc::new(super::ChildProviderBinding::build_operator(&claimed)?);
+    let binding = Arc::new(super::ChildProviderBinding::build_independent(&claimed)?);
     let mut scope = crate::runtime::envelope::RuntimeEnvelope::sessions_spawn(
         claimed.fabric().workspace_id(),
         "prx_operator_session",

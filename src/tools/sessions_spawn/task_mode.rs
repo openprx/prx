@@ -217,6 +217,10 @@ pub(super) async fn run_sub_agent_task(
     } else {
         None
     };
+    let _service_retirement = child_service
+        .as_ref()
+        .map(|service| crate::runtime::turn_cleanup::ChildServiceRetirement::new(Arc::clone(service)))
+        .transpose()?;
     let ordinary_runtime = ordinary_authority
         .as_ref()
         .map(|authority| authority.publication().loop_runtime().cloned())
