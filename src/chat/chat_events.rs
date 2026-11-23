@@ -92,7 +92,9 @@ pub(crate) fn chat_runtime_envelope(workspace_id: &str, chat_session_key: &str) 
         owner_id: envelope.resolved_owner_id(),
         key: crate::memory::PartitionKey::Main,
     };
-    envelope.with_agent_partition(partition)
+    envelope
+        .with_owner_id(partition.owner_id.clone())
+        .with_agent_partition(partition)
 }
 
 #[cfg(test)]
