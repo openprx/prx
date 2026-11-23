@@ -198,15 +198,25 @@ impl ChatSessionsHandle {
             .read()
             .await
             .iter()
-            .find(|run| run.id == target || run.session_scope_key == target)
+            .filter(|run| run.id == target || run.session_scope_key == target)
+            .max_by_key(|run| run.started_at)
             .cloned()
     }
 
     pub(crate) async fn restore_child(&self, run: SubAgentRun) {
         let mut runs = self.runs.write().await;
-        if !runs.iter().any(|old| old.session_scope_key == run.session_scope_key) {
-            runs.push(run);
+        if runs.iter().any(|old| {
+            old.session_scope_key == run.session_scope_key
+                && (old.started_at >= run.started_at
+                    || matches!(
+                        old.status,
+                        SubAgentStatus::Running | SubAgentStatus::AwaitingInput { .. }
+                    ))
+        }) {
+            return;
         }
+        runs.retain(|old| old.session_scope_key != run.session_scope_key);
+        runs.push(run);
     }
 
     /// Build a handle over the supplied single-source agent registry Arc, with a

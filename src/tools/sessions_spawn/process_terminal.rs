@@ -211,6 +211,26 @@ impl RecoveredProcessRun {
         };
         let mut runs = active_runs.write().await;
         let existing_index = runs.iter().position(|run| run.id == run_id);
+        // Recovery scans historical turns too. A logical child has one live
+        // projection; an older continuation cannot replace or duplicate it.
+        if existing_index.is_none()
+            && runs.iter().any(|run| {
+                run.session_scope_key == session
+                    && run.owner_id == source.owner_id
+                    && (run.started_at >= started_at
+                        || !run
+                            .process_control
+                            .as_ref()
+                            .is_some_and(|control| control.recovery_only))
+            })
+        {
+            return Ok(false);
+        }
+        let existing_index = existing_index.or_else(|| {
+            runs.iter().position(|run| {
+                run.session_scope_key == session && run.owner_id == source.owner_id && run.started_at < started_at
+            })
+        });
         if let Some(index) = existing_index {
             let existing = runs.get(index).context("recovered worker registry index disappeared")?;
             let recovery_only = existing
@@ -228,13 +248,14 @@ impl RecoveredProcessRun {
             anyhow::ensure!(
                 recovery_only
                     && existing.owner_id == source.owner_id
-                    && existing.source_message_event_id.as_deref() == Some(source.event_id.as_str()),
+                    && (existing.id != run_id
+                        || existing.source_message_event_id.as_deref() == Some(source.event_id.as_str())),
                 "recovered worker conflicts with registry ownership"
             );
             // A later sweep cannot discard or change an already authenticated
             // settlement, including while upgrading to a completed journal.
             anyhow::ensure!(
-                existing.token_usage_records.iter().all(|known| usage.contains(known)),
+                existing.id != run_id || existing.token_usage_records.iter().all(|known| usage.contains(known)),
                 "worker recovery would lose or change a confirmed settlement"
             );
         }
