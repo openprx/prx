@@ -98,12 +98,7 @@ impl OrdinaryWorkerCompletionEvidence {
 
     pub(crate) fn signing_bytes(&self, result: &WorkerResult) -> anyhow::Result<Vec<u8>> {
         anyhow::ensure!(
-            result.denials.len() <= 256
-                && result
-                    .denials
-                    .iter()
-                    .all(|denial| denial.tool.len() <= 64
-                        && denial.cause == crate::tools::ApprovalDenialCause::NoResolver),
+            result.denials.len() <= 256 && result.denials.iter().all(super::super::denials::WorkerDenial::valid),
             "invalid worker denial inventory"
         );
         Ok(serde_json::to_vec(&(

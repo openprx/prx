@@ -787,9 +787,7 @@ pub(super) async fn run_sub_agent_process(
                     verified.confirm_reaped(run_id)?;
                     if let Some(frames) = &parent_frames {
                         for denial in &verified.result.denials {
-                            if denial.cause == crate::tools::ApprovalDenialCause::NoResolver {
-                                frames.child_denial(&denial.tool, run_id);
-                            }
+                            frames.child_denial(&denial.tool, run_id, denial.rf_cause());
                         }
                     }
                     Ok(ProcessWorkerOutcome::OrdinaryVerifiedFinished(verified))
@@ -807,9 +805,7 @@ pub(super) async fn run_sub_agent_process(
                     verified.confirm_reaped(run_id)?;
                     if let Some(frames) = &parent_frames {
                         for denial in &verified.result.denials {
-                            if denial.cause == crate::tools::ApprovalDenialCause::NoResolver {
-                                frames.child_denial(&denial.tool, run_id);
-                            }
+                            frames.child_denial(&denial.tool, run_id, denial.rf_cause());
                         }
                     }
                     Ok(ProcessWorkerOutcome::OperatorVerifiedFinished(verified))

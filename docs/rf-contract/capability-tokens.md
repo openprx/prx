@@ -745,11 +745,15 @@ interception uses `plan_only`. Every denied/failed tool outcome commits a `tool.
 journal row before its live frame, including scheduler refusals before service
 entry. Rows retain the internal `reason` and the same mapped `cause` as the
 live frame. A refusal-storage failure ends the turn without an unrecorded frame.
-No refusal cause contains paths or arguments. Process workers have no approval relay in this unit. Their
-completion returns a bounded, content-free `denials:[{tool,cause}]` inventory
-under the existing completion signature. Only after authentication does the
-parent emit one frame per denial on the **parent run**:
-`{tool,phase:"denied",cause:"no_resolver",child_run_id}` plus its stable ids.
+No refusal cause contains paths or arguments. Process workers have no approval
+relay in this unit. Their completion returns a bounded, content-free
+`denials:[{tool,cause}]` inventory under the existing completion signature.
+This includes pre-approval refusal and failure causes; approval requests still
+end with `no_resolver`. Only after authentication does the parent emit one
+`tool_status` per outcome on the **parent run**, with `child_run_id` and its
+stable ids. Its phase is `failed` for `failed`/`indeterminate` causes, otherwise
+`denied`; its cause uses the same typed mapping as an in-process child.
+Worker refusal rows are committed before the signed observation is emitted.
 The inventory holds at most 256 denials with tool names at most 64 bytes;
 overflow fails completion explicitly. It carries no model text or arguments.
 

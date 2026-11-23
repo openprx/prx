@@ -120,7 +120,12 @@ impl ToolExecutionService {
         // rf records every denied/failed frame at the scheduler boundary,
         // including refusals that never enter this service. Keep one row per
         // outcome there; the operator notice above retains its original order.
-        if context.live_turn.is_some() {
+        // The worker's sealed refusal inventory uses that same scheduler
+        // boundary. Approval calls still stay denied with no_resolver.
+        if context.live_turn.is_some()
+            || (context.pending_approval_denied
+                && context.envelope.source == crate::runtime::envelope::RuntimeSource::SessionWorker)
+        {
             return;
         }
         let Some(memory) = self.idempotency_memory.as_ref() else {

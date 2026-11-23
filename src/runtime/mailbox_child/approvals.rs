@@ -7,7 +7,7 @@ impl LiveFrameSink for NoSurface {
     fn emit(&self, _: &ToolLoopEvent) {}
     fn thinking(&self) {}
     fn awaiting_approval(&self, _: &str) {}
-    fn child_denial(&self, _: &str, _: &str) {}
+    fn child_denial(&self, _: &str, _: &str, _: crate::security::approval_ledger::run_call::RfDenialCause) {}
 }
 #[async_trait::async_trait]
 impl LiveTurn for NoSurface {

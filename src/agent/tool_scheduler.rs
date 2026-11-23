@@ -392,7 +392,12 @@ async fn emit_tool_outcome(
     call: &ParsedToolCall,
     mut event: ToolLoopEvent,
 ) -> Result<()> {
-    if adapter.tool_execution_context.live_turn.is_some()
+    // A worker returns only sealed observations, never an approval relay.
+    // Commit the same refusal before its observation can reach the parent.
+    let context = &adapter.tool_execution_context;
+    let worker = context.pending_approval_denied
+        && context.envelope.source == crate::runtime::envelope::RuntimeSource::SessionWorker;
+    if (context.live_turn.is_some() || worker)
         && let ToolLoopEvent::ToolFinished {
             tool_call_id,
             name,

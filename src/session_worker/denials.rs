@@ -9,7 +9,30 @@ const MAX_DENIALS: usize = 256;
 #[serde(deny_unknown_fields)]
 pub struct WorkerDenial {
     pub tool: String,
-    pub cause: crate::tools::ApprovalDenialCause,
+    pub cause: WorkerDenialCause,
+}
+/// Content-free outcomes only; this never carries an approval request or grant.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum WorkerDenialCause {
+    Approval(crate::tools::ApprovalDenialCause),
+    Refusal(crate::tools::execution::ToolCallRefusalReason),
+}
+impl WorkerDenial {
+    pub(crate) const fn valid(&self) -> bool {
+        self.tool.len() <= 64
+            && matches!(
+                self.cause,
+                WorkerDenialCause::Approval(crate::tools::ApprovalDenialCause::NoResolver)
+                    | WorkerDenialCause::Refusal(_)
+            )
+    }
+    pub(crate) fn rf_cause(&self) -> crate::security::approval_ledger::run_call::RfDenialCause {
+        match self.cause {
+            WorkerDenialCause::Approval(cause) => cause.into(),
+            WorkerDenialCause::Refusal(cause) => cause.into(),
+        }
+    }
 }
 #[derive(Default)]
 pub(crate) struct DenialSink {
@@ -29,25 +52,43 @@ impl LiveFrameSink for DenialSink {
     fn thinking(&self) {}
     // Process workers have no approval relay; only typed denials enter completion.
     fn awaiting_approval(&self, _tool: &str) {}
-    fn child_denial(&self, tool: &str, _child_run_id: &str) {
-        self.record(tool);
+    fn child_denial(
+        &self,
+        tool: &str,
+        _child_run_id: &str,
+        cause: crate::security::approval_ledger::run_call::RfDenialCause,
+    ) {
+        self.record(tool, cause);
     }
     fn emit(&self, event: &ToolLoopEvent) {
+        use crate::agent::tool_evidence::ToolCallOutcome;
+        use crate::tools::execution::ToolCallRefusalReason;
         if let ToolLoopEvent::ToolFinished {
             name,
-            outcome:
-                crate::agent::tool_evidence::ToolCallOutcome::Denied {
-                    cause: Some(crate::tools::ApprovalDenialCause::NoResolver),
-                },
+            outcome,
+            refusal_cause,
             ..
         } = event
         {
-            self.record(name);
+            let cause = match outcome {
+                ToolCallOutcome::Denied {
+                    cause: Some(crate::tools::ApprovalDenialCause::NoResolver),
+                } => Some(crate::tools::ApprovalDenialCause::NoResolver.into()),
+                ToolCallOutcome::Refused => Some(refusal_cause.unwrap_or(ToolCallRefusalReason::PolicyDenied).into()),
+                ToolCallOutcome::PlanOnly => Some(ToolCallRefusalReason::PlanOnly.into()),
+                ToolCallOutcome::Error => Some(refusal_cause.unwrap_or(ToolCallRefusalReason::Failed).into()),
+                ToolCallOutcome::Unknown => Some(refusal_cause.unwrap_or(ToolCallRefusalReason::Indeterminate).into()),
+                _ => None,
+            };
+            if let Some(cause) = cause {
+                self.record(name, cause);
+            }
         }
     }
 }
+
 impl DenialSink {
-    fn record(&self, tool: &str) {
+    fn record(&self, tool: &str, cause: crate::security::approval_ledger::run_call::RfDenialCause) {
         let mut denials = self.denials.lock();
         if denials.len() == MAX_DENIALS || tool.len() > 64 {
             self.overflow.store(true, Ordering::Relaxed);
@@ -55,7 +96,14 @@ impl DenialSink {
         }
         denials.push(WorkerDenial {
             tool: tool.to_owned(),
-            cause: crate::tools::ApprovalDenialCause::NoResolver,
+            cause: match cause {
+                crate::security::approval_ledger::run_call::RfDenialCause::Approval(cause) => {
+                    WorkerDenialCause::Approval(cause)
+                }
+                crate::security::approval_ledger::run_call::RfDenialCause::Refusal(cause) => {
+                    WorkerDenialCause::Refusal(cause)
+                }
+            },
         });
     }
 }
