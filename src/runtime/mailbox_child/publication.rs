@@ -8,7 +8,7 @@ pub(super) fn fresh(
     agent: &str,
 ) -> anyhow::Result<Arc<TurnRuntimeService>> {
     use crate::decision_engine::prediction::factory::{DecisionBackendFactory, FactoryDeps};
-    let generation = crate::config::ConfigGeneration::for_child(config)?;
+    let generation = crate::config::ConfigGeneration::for_mailbox_child(config)?;
     let provider_catalog = crate::providers::selection::catalog_for(config);
     let security = Arc::new(crate::security::SecurityPolicy {
         autonomy: level,

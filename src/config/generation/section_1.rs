@@ -179,6 +179,15 @@ impl ProcessGenerationBinding {
 }
 
 impl ConfigGeneration {
+    /// Bind a freshly loaded mailbox-child configuration to the disk revision
+    /// that a relaunched process worker must verify. Its effective snapshot is
+    /// still sealed independently by `bind_process`.
+    pub(crate) fn for_mailbox_child(config: &Config) -> anyhow::Result<Arc<Self>> {
+        let mut generation = Self::for_child(config)?.as_ref().clone();
+        generation.source_revision = ConfigSourceRevision::from_config(config)?;
+        Ok(Arc::new(generation))
+    }
+
     /// Pin an ordinary child without startup globals or disk reloads.
     pub(crate) fn for_child(config: &Config) -> anyhow::Result<Arc<Self>> {
         let mut value = serde_json::to_value((&config.workspace_dir, &config.config_path, config))?;
