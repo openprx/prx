@@ -135,6 +135,7 @@ pub(super) fn lookup_write_scope(
     partition: &AgentPartition,
     session_key: Option<&str>,
 ) -> anyhow::Result<Option<String>> {
+    super::terminal_epoch::check(conn, &partition.workspace_id, Some(&partition.owner_id), session_key)?;
     let session = require_session(session_key)?;
     let workspace = partition.workspace_id.as_str();
     let owner = partition.owner_id.as_str();

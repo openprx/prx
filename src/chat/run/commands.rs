@@ -641,6 +641,8 @@ Retry with a compatible model: /provider {shown} <model>",
                             // The branch's own transcript rows (handoff chain and
                             // retained turns) commit in one transaction before the
                             // branch session exists; any failure aborts the branch.
+                            let branch_key = crate::runtime::envelope::RuntimeEnvelope::chat_canonical_session_key(&branch.id);
+                            super::message_inbox::pin_epoch(&config, &branch_key).await?;
                             if let Err(e) = super::branch_copy::copy_branch_transcript(
                                 mem.as_ref(),
                                 memory_fabric.workspace_id(),
