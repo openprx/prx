@@ -44,7 +44,11 @@ impl Common {
             in_reply_to: message.in_reply_to,
             hop_count: message.hop_count,
             ancestry: message.ancestry.clone(),
-            origin: message.origin.ok_or(MailboxError::Unauthorized)?,
+            origin: message.origin.ok_or_else(|| {
+                crate::messaging::mailbox::unauthorized(
+                    crate::messaging::mailbox::UnauthorizedReason::MessageOriginMissing,
+                )
+            })?,
             auth: message.auth.clone(),
             remote_peer,
         })

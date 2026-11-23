@@ -19,7 +19,9 @@ impl SqliteMailbox {
     pub fn accept(&self, authority: &MailboxAuthority, mut message: PrxMessage) -> MailboxResult<MailboxReceipt> {
         authority.authorize(&message)?;
         if message.to.instance != self.local_instance {
-            return Err(MailboxError::Unauthorized);
+            return Err(crate::messaging::mailbox::unauthorized(
+                crate::messaging::mailbox::UnauthorizedReason::LocalInstanceMismatch,
+            ));
         }
         // Identity/origin/auth are runtime-owned, never trusted from the wire.
         message.from = authority.source.clone();
@@ -127,7 +129,11 @@ impl SqliteMailbox {
         reserve_gaps(&tx, &stream, &message)?;
         receipt::derive_chain(&tx, &authority.workspace_id, &claims.scope.owner_id, &mut message)?;
         let remote = if authority.origin == MessageOrigin::RemotePeer {
-            let auth = authority.auth.as_ref().ok_or(MailboxError::Unauthorized)?;
+            let auth = authority.auth.as_ref().ok_or_else(|| {
+                crate::messaging::mailbox::unauthorized(
+                    crate::messaging::mailbox::UnauthorizedReason::PeerAuthenticationMissing,
+                )
+            })?;
             Some(RemotePeerAttr {
                 issuer: auth.issuer.clone(),
                 subject: auth.subject.clone(),

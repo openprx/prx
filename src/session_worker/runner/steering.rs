@@ -99,7 +99,11 @@ pub(super) fn spawn_stdin_control_reader(
                 WorkerControlFrame::Message { envelope } => {
                     let result = mailbox
                         .as_mut()
-                        .ok_or(crate::messaging::mailbox::MailboxError::Unauthorized)
+                        .ok_or_else(|| {
+                            crate::messaging::mailbox::unauthorized(
+                                crate::messaging::mailbox::UnauthorizedReason::WorkerSenderUnavailable,
+                            )
+                        })
                         .and_then(|inbox| inbox.enqueue(*envelope));
                     match result {
                         Ok(ack) => {

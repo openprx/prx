@@ -30,7 +30,9 @@ impl SqliteMailbox {
             return Err(MailboxError::ReceiptExpired);
         }
         if saved.scope != *scope {
-            return Err(MailboxError::Unauthorized);
+            return Err(crate::messaging::mailbox::unauthorized(
+                crate::messaging::mailbox::UnauthorizedReason::AdoptScopeMismatch,
+            ));
         }
         saved.matches(&tx, &scope.workspace_id, delivery.message())?;
         if saved.state == DeliveryState::Consumed {
@@ -108,7 +110,9 @@ impl SqliteMailbox {
             })
             .map_err(storage_error)?;
         if owner.as_deref() != Some(scope.owner_id.as_str()) {
-            return Err(MailboxError::Unauthorized);
+            return Err(crate::messaging::mailbox::unauthorized(
+                crate::messaging::mailbox::UnauthorizedReason::AdoptScopeMismatch,
+            ));
         }
         let event_id = Uuid::new_v4();
         let reference = EventRef {

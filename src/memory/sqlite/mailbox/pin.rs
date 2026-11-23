@@ -37,7 +37,9 @@ impl SqliteMailbox {
         canonical_session_key: &str,
     ) -> MailboxResult<RecipientPin> {
         if authority.destination.instance != self.local_instance || authority.workspace_id != scope.workspace_id {
-            return Err(MailboxError::Unauthorized);
+            return Err(crate::messaging::mailbox::unauthorized(
+                crate::messaging::mailbox::UnauthorizedReason::PinScopeMismatch,
+            ));
         }
         bounded(canonical_session_key, 512)?;
         let writer = self.memory.pool.write();

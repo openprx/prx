@@ -28,7 +28,9 @@ impl SqliteMailbox {
         let tx = Transaction::new_unchecked(&writer, TransactionBehavior::Immediate).map_err(storage_error)?;
         check_scope(&tx, scope, address, None, true)?;
         if address.instance != self.local_instance {
-            return Err(MailboxError::Unauthorized);
+            return Err(crate::messaging::mailbox::unauthorized(
+                crate::messaging::mailbox::UnauthorizedReason::OutboxScopeMismatch,
+            ));
         }
         let mut query=tx.prepare("SELECT o.id,o.stream_id,o.seq,o.idempotency_key,o.message_id,o.body_bytes,o.envelope_meta FROM prx_mailbox_outbox o WHERE o.stream_id IN(SELECT stream_id FROM prx_mailbox_seq WHERE sender_ma_scope_id=?1 AND from_addr=?2) AND o.state IN(0,1) AND o.ma_scope_id=?1 ORDER BY o.stream_id,o.seq").map_err(storage_error)?;
         let rows = query
@@ -148,7 +150,9 @@ impl SqliteMailbox {
         let found=tx.query_row("SELECT o.id,o.stream_id,o.state,o.envelope_meta FROM prx_mailbox_parents p JOIN prx_mailbox_outbox o ON o.id=p.id WHERE p.workspace_id=?1 AND p.owner_id=?2 AND p.message_id=?3 AND o.ma_scope_id=?4",params![scope.workspace_id,scope.owner_id,message_id.as_bytes().as_slice(),scope.scope_id.to_string()],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?))).optional().map_err(storage_error)?.ok_or(MailboxError::InvalidMetadata)?;
         let stream = stream::load(&tx, found.1)?;
         if stream.sender.as_ref() != Some(scope) || *peer != stream.to || stream.from.instance != self.local_instance {
-            return Err(MailboxError::Unauthorized);
+            return Err(crate::messaging::mailbox::unauthorized(
+                crate::messaging::mailbox::UnauthorizedReason::OutboxScopeMismatch,
+            ));
         }
         check_scope(&tx, scope, &stream.from, None, true)?;
         let mut meta: OutboxMeta = decode(&found.3)?;

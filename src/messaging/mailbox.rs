@@ -1,6 +1,9 @@
 //! Dormant mailbox contracts. Authority is runtime input, never deserialized
 //! from a model/tool request. SQLite owns all durable mutations.
 
+mod authorization;
+pub(crate) use authorization::{UnauthorizedReason, unauthorized};
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -129,8 +132,11 @@ impl MailboxAuthority {
         validate_address(&source)?;
         validate_address(&destination)?;
         bounded(&workspace_id, 4096)?;
-        if source.instance != destination.instance || source.owner != destination.owner {
-            return Err(MailboxError::Unauthorized);
+        if source.instance != destination.instance {
+            return Err(unauthorized(UnauthorizedReason::LocalInstanceMismatch));
+        }
+        if source.owner != destination.owner {
+            return Err(unauthorized(UnauthorizedReason::LocalOwnerMismatch));
         }
         Ok(Self {
             workspace_id,
@@ -154,7 +160,7 @@ impl MailboxAuthority {
         validate_address(&source)?;
         validate_address(&destination)?;
         if auth.method != "mtls" {
-            return Err(MailboxError::Unauthorized);
+            return Err(unauthorized(UnauthorizedReason::PeerAuthenticationMethod));
         }
         Ok(Self {
             workspace_id,
@@ -173,7 +179,7 @@ impl MailboxAuthority {
         validate_address(&source)?;
         validate_address(&destination)?;
         if source.instance == destination.instance && source.owner != destination.owner {
-            return Err(MailboxError::Unauthorized);
+            return Err(unauthorized(UnauthorizedReason::LocalOwnerMismatch));
         }
         Ok(Self {
             workspace_id,
@@ -196,7 +202,7 @@ impl MailboxAuthority {
 
     pub(crate) fn authorize(&self, message: &PrxMessage) -> MailboxResult<()> {
         if message.to != self.destination {
-            return Err(MailboxError::Unauthorized);
+            return Err(unauthorized(UnauthorizedReason::DestinationMismatch));
         }
         Ok(())
     }

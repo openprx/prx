@@ -31,8 +31,15 @@ impl SqliteMailboxSender {
         inherited: Option<InheritedProvenance>,
     ) -> MailboxResult<Self> {
         crate::messaging::mailbox::validate_address(&source)?;
-        if source.instance != store.local_instance || scope.owner_id != source.owner {
-            return Err(MailboxError::Unauthorized);
+        if source.instance != store.local_instance {
+            return Err(crate::messaging::mailbox::unauthorized(
+                crate::messaging::mailbox::UnauthorizedReason::LocalInstanceMismatch,
+            ));
+        }
+        if scope.owner_id != source.owner {
+            return Err(crate::messaging::mailbox::unauthorized(
+                crate::messaging::mailbox::UnauthorizedReason::SenderOwnerMismatch,
+            ));
         }
         store.validate_scope(&scope, &source)?;
         Ok(Self {
@@ -79,11 +86,20 @@ impl SqliteMailboxSender {
             PendingSend { text, _lease: lease }
         };
         let resolved = self.resolver.resolve(&target).await?;
-        if resolved.authority.source != self.source
-            || resolved.authority.workspace_id != self.scope.workspace_id
-            || resolved.authority.destination != target
-        {
-            return Err(MailboxError::Unauthorized);
+        if resolved.authority.source != self.source {
+            return Err(crate::messaging::mailbox::unauthorized(
+                crate::messaging::mailbox::UnauthorizedReason::SenderIdentityMismatch,
+            ));
+        }
+        if resolved.authority.workspace_id != self.scope.workspace_id {
+            return Err(crate::messaging::mailbox::unauthorized(
+                crate::messaging::mailbox::UnauthorizedReason::SenderWorkspaceMismatch,
+            ));
+        }
+        if resolved.authority.destination != target {
+            return Err(crate::messaging::mailbox::unauthorized(
+                crate::messaging::mailbox::UnauthorizedReason::DestinationMismatch,
+            ));
         }
         let mut message = PrxMessage {
             id,

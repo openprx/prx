@@ -102,7 +102,9 @@ impl SqliteMailbox {
     ) -> MailboxResult<MailboxScope> {
         crate::messaging::mailbox::validate_address(address)?;
         if address.instance != self.local_instance {
-            return Err(MailboxError::Unauthorized);
+            return Err(crate::messaging::mailbox::unauthorized(
+                crate::messaging::mailbox::UnauthorizedReason::LocalInstanceMismatch,
+            ));
         }
         let writer = self.memory.pool.write();
         let tx = Transaction::new_unchecked(&writer, TransactionBehavior::Immediate).map_err(storage_error)?;
@@ -116,18 +118,22 @@ impl SqliteMailbox {
         }
         let actual:Option<String>=tx.query_row("SELECT CASE WHEN s.agent_key='m' THEN 'main' ELSE substr(s.agent_key,3) END FROM message_events e JOIN agent_scopes s ON s.scope_id=e.ma_scope_id WHERE e.workspace_id=?1 AND e.owner_id=?2 AND e.session_key=?3 ORDER BY e.id DESC LIMIT 1",params![workspace,address.owner,address.session],|r|r.get(0)).optional().map_err(storage_error)?;
         if actual.as_deref().is_some_and(|agent| agent != address.agent) {
-            return Err(MailboxError::Unauthorized);
+            return Err(crate::messaging::mailbox::unauthorized(
+                crate::messaging::mailbox::UnauthorizedReason::ReceiverAgentMismatch,
+            ));
         }
         let known:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM message_events WHERE workspace_id=?1 AND owner_id=?2 AND session_key=?3) OR EXISTS(SELECT 1 FROM sessions WHERE owner_id=?2 AND session_key=?3) OR EXISTS(SELECT 1 FROM child_sessions WHERE workspace_id=?1 AND owner_id=?2 AND session_id=?3)",params![workspace,address.owner,address.session],|r|r.get(0)).map_err(storage_error)?;
         if !known && !registered {
-            return Err(MailboxError::Unauthorized);
+            return Err(crate::messaging::mailbox::unauthorized(
+                crate::messaging::mailbox::UnauthorizedReason::ReceiverUnknown,
+            ));
         }
         let key = if address.agent == "main" {
             PartitionKey::Main
         } else {
             let agent = crate::config::agent_name::AgentName::parse(&address.agent)
                 .map_err(|_| MailboxError::InvalidAddress)?;
-            let incarnation:String=tx.query_row("SELECT incarnation FROM agent_incarnations WHERE workspace_id=?1 AND owner_id=?2 AND agent_key=?3 AND state='active'",params![workspace,address.owner,format!("n:{}",address.agent)],|r|r.get(0)).optional().map_err(storage_error)?.ok_or(MailboxError::Unauthorized)?;
+            let incarnation:String=tx.query_row("SELECT incarnation FROM agent_incarnations WHERE workspace_id=?1 AND owner_id=?2 AND agent_key=?3 AND state='active'",params![workspace,address.owner,format!("n:{}",address.agent)],|r|r.get(0)).optional().map_err(storage_error)?.ok_or_else(|| crate::messaging::mailbox::unauthorized(crate::messaging::mailbox::UnauthorizedReason::ReceiverAgentInactive))?;
             PartitionKey::Named {
                 name: agent,
                 incarnation: uuid::Uuid::parse_str(&incarnation).map_err(|_| MailboxError::CorruptState)?,

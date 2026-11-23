@@ -3524,3 +3524,18 @@ roots receive child approval requests in their owner-scoped approval inbox and
 review them through the root session endpoint; the wait remains four minutes.
 An rf root uses its connected live surface and configured wait. Without a live
 approval surface the call is denied with `no_approval_surface`.
+
+Mailbox authorization refusals keep the public `mailbox_unauthorized` error and
+emit a typed, content-free `reason` at WARN. Reasons identify missing caller
+receipts, owner/instance/agent mismatches, unknown receivers, disabled inbound
+messaging, missing peers and scope-binding failures; no message, token or key
+is logged. Local targets default to the authenticated sender's owner. Remote
+targets use the full SPIFFE ID and the receiving instance's actual owner, as
+explicitly authorized by that instance's peer grant.
+
+Fresh `prx init` starts with no paired bearer. A serialized empty
+`gateway.paired_tokens = []` does not block pairing. `prx token issue --out ...`
+explicitly installs a bearer and records its hash in this list; the gateway
+then reports pairing ACTIVE and accepts that bearer instead of offering a new
+one-time pairing code. Keep and use the issued file; do not remove valid
+paired credentials just to request a second pairing.

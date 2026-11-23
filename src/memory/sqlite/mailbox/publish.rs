@@ -76,7 +76,9 @@ impl SqliteMailbox {
             || authority.workspace_id != sender.workspace_id
             || authority.origin == MessageOrigin::RemotePeer
         {
-            return Err(MailboxError::Unauthorized);
+            return Err(crate::messaging::mailbox::unauthorized(
+                crate::messaging::mailbox::UnauthorizedReason::PublishScopeMismatch,
+            ));
         }
         message.from = authority.source.clone();
         message.origin = Some(MessageOrigin::LocalModel);

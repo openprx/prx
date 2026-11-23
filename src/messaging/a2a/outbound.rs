@@ -27,7 +27,10 @@ impl RemoteTransport {
             .values()
             .find(|peer| peer.spiffe_id == target.instance)
             .cloned()
-            .ok_or_else(|| MailboxError::Unauthorized.into())
+            .ok_or_else(|| {
+                crate::messaging::mailbox::unauthorized(crate::messaging::mailbox::UnauthorizedReason::PeerAbsent)
+                    .into()
+            })
     }
     pub(crate) fn destination(
         &self,

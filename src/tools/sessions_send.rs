@@ -170,7 +170,11 @@ impl Tool for SessionsSendTool {
                 mailbox::MailboxError,
                 send::{parse_target, send_result},
             };
-            let sender = self.mailbox.as_ref().ok_or(MailboxError::Unauthorized)?;
+            let sender = self.mailbox.as_ref().ok_or_else(|| {
+                crate::messaging::mailbox::unauthorized(
+                    crate::messaging::mailbox::UnauthorizedReason::WorkerSenderUnavailable,
+                )
+            })?;
             let object = args.as_object().ok_or(MailboxError::InvalidMetadata)?;
             if object
                 .keys()
@@ -319,8 +323,9 @@ impl SessionsSendTool {
         args: &serde_json::Value,
     ) -> anyhow::Result<ToolResult> {
         use crate::messaging::send::MailboxSender;
-        let caller = crate::tools::execution::current_child_call_context()
-            .ok_or(crate::messaging::mailbox::MailboxError::Unauthorized)?;
+        let caller = crate::tools::execution::current_child_call_context().ok_or_else(|| {
+            crate::messaging::mailbox::unauthorized(crate::messaging::mailbox::UnauthorizedReason::CallerMissing)
+        })?;
         caller.verify_tool("sessions_send")?;
         anyhow::ensure!(args.get("run_id").is_none(), "exactly one of run_id and to is required");
         let context = caller.context();

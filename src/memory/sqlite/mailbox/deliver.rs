@@ -62,7 +62,9 @@ impl SqliteMailbox {
 
     pub fn deliver(&self, scope: &MailboxScope, address: &SessionAddr) -> MailboxResult<Option<MailboxDelivery>> {
         if address.instance != self.local_instance {
-            return Err(MailboxError::Unauthorized);
+            return Err(crate::messaging::mailbox::unauthorized(
+                crate::messaging::mailbox::UnauthorizedReason::DeliverScopeMismatch,
+            ));
         }
         let now = self.clock.now();
         if now < 0 {
@@ -278,7 +280,9 @@ impl SqliteMailbox {
         let tx = Transaction::new_unchecked(&writer, TransactionBehavior::Immediate).map_err(storage_error)?;
         check_scope(&tx, scope, address, None, true)?;
         if address.instance != self.local_instance {
-            return Err(MailboxError::Unauthorized);
+            return Err(crate::messaging::mailbox::unauthorized(
+                crate::messaging::mailbox::UnauthorizedReason::DeliverScopeMismatch,
+            ));
         }
         let runtime = std::sync::Arc::clone(&self.memory.mailbox_runtime);
         runtime.set_execution(address.clone(), scope.clone(), Some(run.clone()));

@@ -179,7 +179,9 @@ impl MessagingRuntime {
 
     pub fn resolve_scope(&self, target: &SessionAddr) -> MailboxResult<MailboxScope> {
         if !self.inbound(target) {
-            return Err(MailboxError::Unauthorized);
+            return Err(crate::messaging::mailbox::unauthorized(
+                crate::messaging::mailbox::UnauthorizedReason::InboundDisabledOrConfigInvalid,
+            ));
         }
         let registered = self.inboxes.lock().contains_key(target);
         self.store.session_scope(&self.workspace, target, registered)
@@ -285,7 +287,9 @@ impl MessagingRuntime {
             return Ok(address);
         }
         if address.owner != source.owner {
-            return Err(MailboxError::Unauthorized);
+            return Err(crate::messaging::mailbox::unauthorized(
+                crate::messaging::mailbox::UnauthorizedReason::LocalOwnerMismatch,
+            ));
         }
         if matches!(address.session.as_str(), "main" | "parent") {
             address.session = self

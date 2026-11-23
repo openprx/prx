@@ -32,7 +32,9 @@ impl WorkerMailboxParent {
         inherited: Option<InheritedProvenance>,
     ) -> MailboxResult<Self> {
         if worker_scope.workspace_id != parent_scope.workspace_id {
-            return Err(MailboxError::Unauthorized);
+            return Err(crate::messaging::mailbox::unauthorized(
+                crate::messaging::mailbox::UnauthorizedReason::WorkerScopeMismatch,
+            ));
         }
         store.validate_scope(&parent_scope, &parent)?;
         let mut incoming = MailboxAuthority::local(worker_scope.workspace_id.clone(), worker.clone(), parent.clone())?;
@@ -158,7 +160,9 @@ impl WorkerMailboxParent {
                 Ok(None)
             }
             WorkerOutputFrame::BrokerCall { .. } | WorkerOutputFrame::BrokerCancel { .. } => {
-                Err(MailboxError::Unauthorized)
+                Err(crate::messaging::mailbox::unauthorized(
+                    crate::messaging::mailbox::UnauthorizedReason::WorkerSenderMismatch,
+                ))
             }
         }
     }

@@ -767,7 +767,7 @@ fn src_and_tests_carry_no_cjk_characters() {
 #[test]
 fn tool_arguments_are_schema_validated_on_the_production_execution_path() {
     let root = repository_root();
-    let execution = fs::read_to_string(root.join("src/tools/execution.rs")).expect("read src/tools/execution.rs");
+    let execution = read_source(&root.join("src/tools/execution.rs"));
     let production = strip_cfg_test_items(&execution);
     let production = production.as_str();
 

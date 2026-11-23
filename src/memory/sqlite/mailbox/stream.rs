@@ -150,7 +150,9 @@ impl SqliteMailbox {
         }
         let address = if role == Role::Sender { &stream.from } else { &stream.to };
         if address.instance != self.local_instance || scope.owner_id != address.owner {
-            return Err(MailboxError::Unauthorized);
+            return Err(crate::messaging::mailbox::unauthorized(
+                crate::messaging::mailbox::UnauthorizedReason::StreamScopeMismatch,
+            ));
         }
         check_scope(conn, scope, address, None, true)?;
         let previous = if role == Role::Sender {

@@ -47,7 +47,9 @@ impl WorkerMailboxSender {
     /// Called only on the pipe owned by the authenticated spawning parent.
     pub fn enqueue(&mut self, message: PrxMessage) -> MailboxResult<WorkerOutputFrame> {
         if message.kind != MessageKind::Data || message.to != self.address {
-            return Err(MailboxError::Unauthorized);
+            return Err(crate::messaging::mailbox::unauthorized(
+                crate::messaging::mailbox::UnauthorizedReason::WorkerScopeMismatch,
+            ));
         }
         validate_address(&message.from)?;
         validate_body(&message.body.mime, &message.body.bytes)?;
