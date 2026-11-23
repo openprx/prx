@@ -36,47 +36,58 @@ impl MailboxChildSource {
         input: MessageInput,
         live: Option<crate::agent::live_frames::LiveTurnRef>,
     ) -> Result<Self> {
-        let runtime = MessagingRuntime::for_config(&parent.generation.effective)?;
-        input.verify(&runtime)?;
-        let mailbox_scope = runtime.resolve_scope(&input.message.to)?;
+        let parent_copy = Arc::clone(parent);
+        let record_copy = record;
+        let input_copy = input.clone();
+        let (runtime, mailbox_scope, record, root_agent) = crate::runtime::blocking::spawn_blocking(move || {
+            let parent = parent_copy;
+            let record = record_copy;
+            let input = input_copy;
+            let runtime = MessagingRuntime::for_config(&parent.generation.effective)?;
+            input.verify(&runtime)?;
+            let mailbox_scope = runtime.resolve_scope(&input.message.to)?;
+            let memory = Arc::clone(&parent.memory);
+            let stored = memory
+                .child_session_store()
+                .context("child storage unavailable")?
+                .sessions(&record.workspace, &record.owner)?
+                .into_iter()
+                .find(|candidate| candidate.session_key == record.session_key)
+                .context("child_session_unknown")?;
+            ensure!(
+                stored.parent_session == record.parent_session && stored.agent == record.agent,
+                "child receiver changed"
+            );
+            let record = stored;
+            ensure!(
+                input.auto_start()
+                    && input.message.to.owner == record.owner
+                    && input.message.to.session == record.session_key
+                    && input.message.to.agent == record.agent,
+                "mailbox receiver differs from persisted child"
+            );
+            let root_agent = runtime
+                .store
+                .logical_agent(&record.workspace, &record.owner, &record.parent_session)?
+                .unwrap_or_else(|| "main".to_owned());
+            Ok::<_, anyhow::Error>((runtime, mailbox_scope, record, root_agent))
+        })
+        .await??;
         let memory = Arc::clone(&parent.memory);
-        let stored = memory
-            .child_session_store()
-            .context("child storage unavailable")?
-            .sessions(&record.workspace, &record.owner)?
-            .into_iter()
-            .find(|candidate| candidate.session_key == record.session_key)
-            .context("child_session_unknown")?;
-        ensure!(
-            stored.parent_session == record.parent_session && stored.agent == record.agent,
-            "child receiver changed"
-        );
-        let record = stored;
-        ensure!(
-            input.auto_start()
-                && input.message.to.owner == record.owner
-                && input.message.to.session == record.session_key
-                && input.message.to.agent == record.agent,
-            "mailbox receiver differs from persisted child"
-        );
-        let pinned = &parent.generation.effective;
-        let mut current = if pinned.config_path.exists() {
-            let directory = pinned
-                .config_path
-                .parent()
-                .and_then(std::path::Path::to_str)
-                .context("receiver config directory unavailable")?;
-            crate::config::Config::load_existing_read_only_with_config_dir(Some(directory)).await?
-        } else {
-            pinned.as_ref().clone()
-        };
-        current.workspace_dir = pinned.workspace_dir.clone();
-        current.config_path = pinned.config_path.clone();
+        let pinned = Arc::clone(&parent.generation.effective);
+        let mut current = crate::runtime::blocking::spawn_blocking(move || {
+            if pinned.config_path.try_exists()? {
+                crate::config::Config::load_from_path(&pinned.config_path, pinned.workspace_dir.clone())
+            } else {
+                Ok(pinned.as_ref().clone())
+            }
+        })
+        .await??;
+        current
+            .workspace_dir
+            .clone_from(&parent.generation.effective.workspace_dir);
+        current.config_path.clone_from(&parent.generation.effective.config_path);
         let config = &current;
-        let root_agent = runtime
-            .store
-            .logical_agent(&record.workspace, &record.owner, &record.parent_session)?
-            .unwrap_or_else(|| "main".to_owned());
         let root_level = if root_agent == "main" {
             config.autonomy.level
         } else {
@@ -90,44 +101,60 @@ impl MailboxChildSource {
         let now = crate::security::agent_level::named_child_level(config, Some(&record.agent), root_level)
             .unwrap_or(root_level);
         let level = record.level.min(now);
-        let publication = publication::fresh(parent, level, &current)?;
-        let catalog = &publication.provider_catalog;
-        let named = config.agents.get(&record.agent).filter(|agent| {
-            crate::providers::ProviderId::of(&agent.provider) == crate::providers::ProviderId::of(&record.provider)
-        });
-        let credential = named.map_or_else(
-            || crate::providers::selection::credential_for(config, &record.provider),
-            |agent| {
-                agent.credential_ref.as_ref().map_or_else(
-                    || {
-                        if agent.api_key.as_ref().is_some_and(|key| !key.trim().is_empty()) {
-                            crate::providers::credentials::CredentialRef::LegacyInline(
-                                crate::providers::credentials::LegacySlot::Agent(record.agent.clone()),
-                            )
-                        } else {
-                            crate::providers::selection::credential_for(config, &record.provider)
-                        }
-                    },
-                    |id| crate::providers::credentials::CredentialRef::Profile { id: id.clone() },
-                )
-            },
-        );
-        let resolved = crate::providers::selection::check_with(
-            config,
-            catalog,
-            &record.provider,
-            &record.model,
-            credential,
-            &crate::providers::catalog::Requirement::chat(),
-            crate::providers::catalog::UnknownPolicy::Invocation,
-        )?;
-        let route = crate::providers::selection::route_target(catalog, &record.provider, &record.model)?.cloned();
-        let provider = Arc::from(crate::providers::create_routed_provider_for(
-            &resolved,
-            catalog,
-            config,
-            &crate::providers::provider_runtime_options_from_config(config),
-        )?);
+        let retained = Arc::clone(parent);
+        let configured = current.clone();
+        let agent = record.agent.clone();
+        let publication =
+            crate::runtime::blocking::spawn_blocking(move || publication::fresh(&retained, level, &configured, &agent))
+                .await??;
+        let configured = current;
+        let selected = record.clone();
+        let published = Arc::clone(&publication);
+        let (resolved, route, provider) = crate::runtime::blocking::spawn_blocking(move || {
+            let config = &configured;
+            let record = selected;
+            let publication = published;
+            let catalog = &publication.provider_catalog;
+            let named = config.agents.get(&record.agent).filter(|agent| {
+                crate::providers::ProviderId::of(&agent.provider) == crate::providers::ProviderId::of(&record.provider)
+            });
+            let credential = named.map_or_else(
+                || crate::providers::selection::credential_for(config, &record.provider),
+                |agent| {
+                    agent.credential_ref.as_ref().map_or_else(
+                        || {
+                            if agent.api_key.as_ref().is_some_and(|key| !key.trim().is_empty()) {
+                                crate::providers::credentials::CredentialRef::LegacyInline(
+                                    crate::providers::credentials::LegacySlot::Agent(record.agent.clone()),
+                                )
+                            } else {
+                                crate::providers::selection::credential_for(config, &record.provider)
+                            }
+                        },
+                        |id| crate::providers::credentials::CredentialRef::Profile { id: id.clone() },
+                    )
+                },
+            );
+            let resolved = crate::providers::selection::check_with(
+                config,
+                catalog,
+                &record.provider,
+                &record.model,
+                credential,
+                &crate::providers::catalog::Requirement::chat(),
+                crate::providers::catalog::UnknownPolicy::Invocation,
+            )?;
+            let route = crate::providers::selection::route_target(catalog, &record.provider, &record.model)?.cloned();
+            let provider: Arc<dyn crate::providers::Provider> =
+                Arc::from(crate::providers::create_routed_provider_for(
+                    &resolved,
+                    catalog,
+                    config,
+                    &crate::providers::provider_runtime_options_from_config(config),
+                )?);
+            Ok::<_, anyhow::Error>((resolved, route, provider))
+        })
+        .await??;
         let event_id = input
             .receipt
             .adopted_message_event_id

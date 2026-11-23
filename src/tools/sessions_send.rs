@@ -126,10 +126,10 @@ impl Tool for SessionsSendTool {
 
     fn parameters_schema(&self) -> serde_json::Value {
         if self.mailbox.is_some() || self.messaging.is_some() {
-            return json!({"oneOf":[
-                {"type":"object","additionalProperties":false,"properties":{"run_id":{"type":"string","minLength":1},"message":{"type":"string","minLength":1}},"required":["run_id","message"]},
-                {"type":"object","additionalProperties":false,"properties":{"to":{"oneOf":[crate::messaging::send::target_schema(),{"type":"string","minLength":1}]},"message":{"type":"string","minLength":1}},"required":["to","message"]}
-            ]});
+            return json!({"type":"object","additionalProperties":false,
+                "properties":{"run_id":{"type":"string","minLength":1},
+                "to":{"oneOf":[crate::messaging::send::target_schema(),{"type":"string","minLength":1}]},
+                "message":{"type":"string","minLength":1}},"required":["message"]});
         }
         json!({
             "type": "object",
@@ -149,7 +149,18 @@ impl Tool for SessionsSendTool {
         })
     }
 
+    fn execution_parameters_schema(&self) -> Option<Arc<serde_json::Value>> {
+        let mut schema = self.parameters_schema();
+        if let Some(object) = schema.as_object_mut() {
+            object.insert("oneOf".into(), json!([{"required":["run_id"]},{"required":["to"]}]));
+        }
+        Some(Arc::new(schema))
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        if args.get("to").is_some() == args.get("run_id").is_some() {
+            return Err(InvalidSendSelector.into());
+        }
         if args.get("to").is_some() {
             if let Some(config) = &self.messaging {
                 let runtime = crate::messaging::runtime::MessagingRuntime::for_config(config)?;
@@ -639,3 +650,7 @@ mod tests {
         assert!(result.error.unwrap().contains("already completed"));
     }
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("invalid_arguments: exactly one of run_id and to is required")]
+struct InvalidSendSelector;

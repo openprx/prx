@@ -1,6 +1,6 @@
 //! Pinned Ed25519 verification plus real TLS CertificateVerify signatures.
 use super::{identity, peers};
-use crate::config::{A2aConfig, A2aPeer, Config};
+use crate::config::{A2aPeer, Config};
 use anyhow::{Result, ensure};
 use rustls::{
     DigitallySignedStruct, DistinguishedName, Error, SignatureScheme,
@@ -10,30 +10,8 @@ use rustls::{
 };
 use std::sync::Arc;
 
-#[derive(Clone)]
-pub(crate) struct Trust {
-    pub config: Arc<Config>,
-}
-impl std::fmt::Debug for Trust {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("PinnedA2aTrust")
-    }
-}
+pub(crate) use super::trust::Trust;
 impl Trust {
-    pub(crate) fn effective(&self) -> Result<Config> {
-        // CLI edits revoke connections immediately, independently of runtime reload.
-        let merged = crate::config::files::read_merged_toml_with_gate(&self.config.config_path)?;
-        let mut config: Config = merged.try_into()?;
-        config.config_path.clone_from(&self.config.config_path);
-        config.workspace_dir.clone_from(&self.config.workspace_dir);
-        config.a2a.validate()?;
-        Ok(config)
-    }
-    pub(crate) fn current(&self) -> Result<A2aConfig> {
-        let config = self.effective()?.a2a;
-        ensure!(config.messaging_enabled, "A2A messaging disabled");
-        Ok(config)
-    }
     pub(crate) fn resolve(&self, cert: &CertificateDer<'_>, now: UnixTime) -> Result<A2aPeer> {
         let config = self.effective()?.a2a;
         let fingerprint = identity::fingerprint(cert.as_ref());
@@ -186,19 +164,19 @@ impl ServerCertVerifier for ServerPin {
     }
 }
 pub(crate) fn server(trust: Trust) -> Result<rustls::ServerConfig> {
-    let identity = identity::load(&trust.config)?;
+    let identity = trust.identity()?;
     check_certificate(&identity.cert, &identity.spiffe_id, UnixTime::now())?;
     let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_client_cert_verifier(Arc::new(trust))
-        .with_single_cert(vec![identity.cert], identity.key)?;
+        .with_single_cert(vec![identity.cert.clone()], identity.key.clone_key())?;
     config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
     config.send_tls13_tickets = 0;
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(config)
 }
 pub(crate) fn client(trust: Trust, peer: &A2aPeer) -> Result<reqwest::Client> {
-    let identity = identity::load(&trust.config)?;
+    let identity = trust.identity()?;
     let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .dangerous()
@@ -206,7 +184,7 @@ pub(crate) fn client(trust: Trust, peer: &A2aPeer) -> Result<reqwest::Client> {
             trust,
             spiffe: peer.spiffe_id.clone(),
         }))
-        .with_client_auth_cert(vec![identity.cert], identity.key)?;
+        .with_client_auth_cert(vec![identity.cert.clone()], identity.key.clone_key())?;
     config.resumption = rustls::client::Resumption::disabled();
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(reqwest::Client::builder()
@@ -222,13 +200,12 @@ pub(crate) fn client(trust: Trust, peer: &A2aPeer) -> Result<reqwest::Client> {
 }
 
 pub(crate) async fn peer_expiry(config: &Config, peer: &A2aPeer) -> Result<i64> {
-    let trust = Trust {
-        config: Arc::new(config.clone()),
-    };
-    let response = client(trust, peer)?
-        .head(format!("https://{}/a2a/v1/pins", peer.address))
-        .send()
-        .await?;
+    let trust = Trust::new(config);
+    trust.refresh_async().await?;
+    let address = peer.address.clone();
+    let peer = peer.clone();
+    let client = crate::runtime::blocking::spawn_blocking(move || client(trust, &peer)).await??;
+    let response = client.head(format!("https://{address}/a2a/v1/pins")).send().await?;
     let certificate = response
         .extensions()
         .get::<reqwest::tls::TlsInfo>()

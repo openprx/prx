@@ -30,21 +30,44 @@ pub(crate) fn register_idle(
     callback: Callback,
     idle: Arc<dyn Fn() -> bool + Send + Sync>,
 ) -> anyhow::Result<()> {
-    // Registration is idempotent for the currently running backend owner.
-    let Some(mut inbox) = runtime.register_backend(address)? else {
-        return Ok(());
-    };
+    // Registration and each poll own their SQLite work on the blocking pool.
     tokio::spawn(async move {
+        let backend = Arc::clone(&runtime);
+        let Ok(result) = crate::runtime::blocking::spawn_blocking(move || backend.register_backend(address)).await
+        else {
+            return;
+        };
+        let mut inbox = match result {
+            Ok(Some(inbox)) => inbox,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(error=%crate::agent::diagnostics::error_class(&error), "session mailbox registration refused");
+                return;
+            }
+        };
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
         loop {
             interval.tick().await;
-            if !inbox.live() {
+            let idle = Arc::clone(&idle);
+            let Ok((returned, result)) = crate::runtime::blocking::spawn_blocking(move || {
+                let result = if !inbox.live() {
+                    None
+                } else if !idle() {
+                    Some(Ok(Vec::new()))
+                } else {
+                    Some(inbox.poll())
+                };
+                (inbox, result)
+            })
+            .await
+            else {
                 break;
-            }
-            if !idle() {
-                continue;
-            }
-            match inbox.poll() {
+            };
+            inbox = returned;
+            let Some(result) = result else {
+                break;
+            };
+            match result {
                 Ok(inputs) => {
                     for input in inputs {
                         let retained = input.clone();
@@ -52,7 +75,9 @@ pub(crate) fn register_idle(
                             && let Err(error) = callback(input).await
                         {
                             if error.is::<crate::runtime::mailbox_child::ChildBusy>() {
-                                let _ = runtime.requeue(retained);
+                                let runtime = Arc::clone(&runtime);
+                                let _ =
+                                    crate::runtime::blocking::spawn_blocking(move || runtime.requeue(retained)).await;
                                 continue;
                             }
                             tracing::warn!(error=%crate::agent::diagnostics::error_class(&error),"session mailbox turn refused");

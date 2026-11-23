@@ -137,7 +137,7 @@ async fn sessions_send_remote_addr_is_not_steer() {
     let tool = crate::tools::sessions_send::SessionsSendTool::new(Arc::new(tokio::sync::RwLock::new(Vec::new())))
         .with_mailbox(f.sender_port(None));
     assert!(
-        tool.parameters_schema().get("oneOf").is_some(),
+        tool.parameters_schema().get("type").and_then(serde_json::Value::as_str) == Some("object"),
         "sessions send remote addr is not steer: expected messaging contract changed"
     );
     assert!(

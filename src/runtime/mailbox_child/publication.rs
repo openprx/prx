@@ -5,6 +5,7 @@ pub(super) fn fresh(
     parent: &Arc<TurnRuntimeService>,
     level: crate::security::AutonomyLevel,
     config: &crate::config::Config,
+    agent: &str,
 ) -> anyhow::Result<Arc<TurnRuntimeService>> {
     use crate::decision_engine::prediction::factory::{DecisionBackendFactory, FactoryDeps};
     let generation = crate::config::ConfigGeneration::for_child(config)?;
@@ -17,14 +18,19 @@ pub(super) fn fresh(
         parent.surface,
         &config.tool_tiering.at_level(level, security.evaluation_sandbox),
     );
-    policy
-        .direct_names
-        .extend(parent.publication_policy.direct_names.iter().cloned());
-    policy
-        .excluded_names
-        .extend(parent.publication_policy.excluded_names.iter().cloned());
-    if level != crate::security::AutonomyLevel::Full {
-        policy.allowed_tools = parent.publication_policy.allowed_tools.clone();
+    if level != crate::security::AutonomyLevel::Full
+        && let Some(named) = config.agents.get(agent)
+        && !named.allowed_tools.is_empty()
+        && !named.allowed_tools.iter().any(|name| name.trim() == "*")
+    {
+        let mut allowed: std::collections::BTreeSet<_> = named
+            .allowed_tools
+            .iter()
+            .map(|name| name.trim().to_owned())
+            .filter(|name| !name.is_empty())
+            .collect();
+        allowed.insert(crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME.to_owned());
+        policy.allowed_tools = Some(allowed);
     }
     let policy_version = crate::runtime::turn_publication::service::pinned_policy_version(
         config,

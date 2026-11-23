@@ -860,6 +860,9 @@ impl Config {
         self.memory.validate()?;
         self.sessions_spawn.validate()?;
         self.a2a.validate()?;
+        if let Some(local) = crate::messaging::a2a::identity::optional(self)? {
+            crate::messaging::a2a::peers::validate_local(&self.a2a, &local)?;
+        }
 
         // Smart group-reply pre-gate numeric ranges.
         self.smart_group.validate()?;

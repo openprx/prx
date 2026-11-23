@@ -45,11 +45,15 @@ pub async fn run(command: A2aCommand, mut config: crate::config::Config) -> Resu
     let original = config.clone();
     match command {
         A2aCommand::Init { rotate, prepare_rotate } => {
-            let identity = if prepare_rotate {
-                super::identity::prepare_rotation(&config)?
-            } else {
-                super::identity::init(&config, rotate)?
-            };
+            let selected = config.clone();
+            let identity = crate::runtime::blocking::spawn_blocking(move || {
+                if prepare_rotate {
+                    super::identity::prepare_rotation(&selected)
+                } else {
+                    super::identity::init(&selected, rotate)
+                }
+            })
+            .await??;
             Ok(format!(
                 "{}\nfingerprint {}\nexpires {}",
                 identity.spiffe_id, identity.fingerprint, identity.expires_at
@@ -58,7 +62,8 @@ pub async fn run(command: A2aCommand, mut config: crate::config::Config) -> Resu
         A2aCommand::Peer {
             command: PeerCommand::List,
         } => {
-            let local = super::identity::load(&config)?;
+            let selected = config.clone();
+            let local = crate::runtime::blocking::spawn_blocking(move || super::identity::load(&selected)).await??;
             let mut rows = vec![format!("local {} expires {}", local.spiffe_id, local.expires_at)];
             let mut peers: Vec<_> = config.a2a.peers.iter().collect();
             peers.sort_by_key(|(name, _)| *name);
@@ -93,10 +98,13 @@ pub async fn run(command: A2aCommand, mut config: crate::config::Config) -> Resu
                     agents,
                 },
         } => {
-            let local = super::identity::load(&config)?;
+            let selected = config.clone();
+            let local = crate::runtime::blocking::spawn_blocking(move || super::identity::load(&selected)).await??;
             super::peers::instance(&spiffe)?;
             ensure!(
-                spiffe != local.spiffe_id && fingerprint != local.fingerprint,
+                super::peers::instance(&spiffe)? != local.instance_id
+                    && spiffe != local.spiffe_id
+                    && fingerprint != local.fingerprint,
                 "local identity cannot be a peer"
             );
             ensure!(

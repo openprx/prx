@@ -1512,6 +1512,9 @@ pub(super) async fn get_decision_approval(
     Path((session_id, decision_id)): Path<(String, String)>,
     axum::Extension(principal): axum::Extension<super::ApiPrincipal>,
 ) -> Response {
+    if let Some(view) = state.rf_approvals.root_view(&principal.owner_id, &session_id, &decision_id) {
+        return Json(view).into_response();
+    }
     call_approval_action(state, session_id, decision_id, principal, None, false).await
 }
 
@@ -1606,8 +1609,9 @@ pub(super) async fn get_session_approvals(
                 rows.push((
                     event.id,
                     ApprovalInboxItem {
-                        session_id: item.subject().session_key.clone().unwrap_or_default(),
-                        view: item.view(),
+                        session_id: item.rf.as_ref().map(|root| root.root_session.clone())
+                            .or_else(|| item.subject().session_key.clone()).unwrap_or_default(),
+                        view: { let mut view = item.view(); if let Some(root) = &item.rf { view.tool = Some(root.tool.clone()); } view },
                     },
                 ));
             }
@@ -1677,6 +1681,14 @@ pub(super) async fn post_decision_approval(
     let Ok(request) = serde_json::from_value::<DecisionApprovalRequest>(request) else {
         return json_error(StatusCode::UNPROCESSABLE_ENTITY, "invalid approval body");
     };
+    if state.rf_approvals.root_view(&principal.owner_id, &session_id, &decision_id).is_some() {
+        if !owner_authenticated {
+            return json_error(StatusCode::FORBIDDEN, "Paired owner approval is required");
+        }
+        let decision = if request.approved { "approved" } else { "denied" };
+        return crate::gateway::run_approvals::decide(&state, &principal.owner_id, &session_id, &decision_id,
+            serde_json::json!({"decision":decision})).await;
+    }
     call_approval_action(
         state,
         session_id,

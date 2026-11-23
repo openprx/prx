@@ -58,14 +58,20 @@ pub(crate) fn watch(parent: Arc<TurnRuntimeService>, owner: String, root: String
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
         loop {
             interval.tick().await;
-            if runtime.store.validate_scope(&scope, &address).is_err() {
-                break;
-            }
+            let reader = Arc::clone(&runtime);
+            let captured_scope = scope.clone();
+            let target = address.clone();
             let parent = Arc::clone(&host.parent.read());
-            let Some(store) = parent.memory.child_session_store() else {
-                break;
-            };
-            let Ok(records) = store.sessions(&runtime.workspace, &owner) else {
+            let selected_owner = owner.clone();
+            let Ok(Ok(Some(records))) = crate::runtime::blocking::spawn_blocking(move || {
+                if reader.store.validate_scope(&captured_scope, &target).is_err() {
+                    return Ok(None);
+                }
+                let store = parent.memory.child_session_store().context("child store unavailable")?;
+                Ok::<_, anyhow::Error>(Some(store.sessions(&reader.workspace, &selected_owner)?))
+            })
+            .await
+            else {
                 break;
             };
             for mut record in records
@@ -115,11 +121,15 @@ pub(crate) fn watch(parent: Arc<TurnRuntimeService>, owner: String, root: String
                                     let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
                                     loop {
                                         interval.tick().await;
-                                        let records = parent
-                                            .memory
-                                            .child_session_store()
-                                            .context("child store unavailable")?
-                                            .sessions(&record.workspace, &record.owner)?;
+                                        let memory = Arc::clone(&parent.memory);
+                                        let receiver = record.clone();
+                                        let records = crate::runtime::blocking::spawn_blocking(move || {
+                                            memory
+                                                .child_session_store()
+                                                .context("child store unavailable")?
+                                                .sessions(&receiver.workspace, &receiver.owner)
+                                        })
+                                        .await??;
                                         let Some(current) =
                                             records.iter().find(|current| current.session_key == record.session_key)
                                         else {

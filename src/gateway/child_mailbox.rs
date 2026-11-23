@@ -1,4 +1,5 @@
 //! Backend-owned wake drivers for durable children, independent of parent turns.
+mod approvals;
 use super::AppState;
 use crate::memory::child_sessions::ChildSessionRecord;
 use crate::messaging::runtime::{MessageInput, MessagingRuntime};
@@ -51,6 +52,7 @@ pub(super) fn register(state: &AppState, envelope: &crate::runtime::envelope::Ru
         }
         roots.insert(root.clone(), Arc::downgrade(&lifetime));
     }
+    let console = envelope.source == crate::runtime::envelope::RuntimeSource::Console;
     let state = state.clone();
     tokio::spawn(async move {
         let _lifetime = Registration {
@@ -60,13 +62,19 @@ pub(super) fn register(state: &AppState, envelope: &crate::runtime::envelope::Ru
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
         loop {
             interval.tick().await;
-            if runtime.store.validate_scope(&root_scope, &root).is_err() {
-                break;
-            }
-            let Some(store) = state.mem.child_session_store() else {
-                break;
-            };
-            let Ok(records) = store.sessions(&runtime.workspace, &root.owner) else {
+            let reader = Arc::clone(&runtime);
+            let scope = root_scope.clone();
+            let address = root.clone();
+            let memory = Arc::clone(&state.mem);
+            let Ok(Ok(Some(records))) = crate::runtime::blocking::spawn_blocking(move || {
+                if reader.store.validate_scope(&scope, &address).is_err() {
+                    return Ok(None);
+                }
+                let store = memory.child_session_store().context("child store unavailable")?;
+                Ok::<_, anyhow::Error>(Some(store.sessions(&reader.workspace, &address.owner)?))
+            })
+            .await
+            else {
                 break;
             };
             for mut record in records
@@ -95,7 +103,7 @@ pub(super) fn register(state: &AppState, envelope: &crate::runtime::envelope::Ru
                     Arc::new(move |input| {
                         let state = state.clone();
                         let record = record.clone();
-                        Box::pin(run(state, record, input))
+                        Box::pin(run(state, record, input, console))
                     }),
                     idle,
                 );
@@ -107,41 +115,29 @@ pub(super) fn register(state: &AppState, envelope: &crate::runtime::envelope::Ru
     });
     Ok(())
 }
-async fn run(state: AppState, record: ChildSessionRecord, input: MessageInput) -> Result<()> {
+async fn run(state: AppState, record: ChildSessionRecord, input: MessageInput, console: bool) -> Result<()> {
     let turn = state.admit_turn_runtime()?;
     let cleanup = Arc::clone(&turn.publication_slot.cleanup);
     cleanup
         .scope(async {
             let publication = turn.publication_slot.publish(&turn, &state).await?;
-            let runtime = MessagingRuntime::for_config(&turn.config_generation.effective)?;
-            input.verify(&runtime)?;
-            let mut live = crate::runtime::mailbox_child::no_surface();
-            if state.rf_streams.connected(&record.owner)
-                && let Some(store) = state.mem.sync_store()
-            {
-                let event = input
-                    .receipt
-                    .adopted_message_event_id
-                    .context("adopted child event missing")?
-                    .to_string();
-                if let Some(scope) = store.live_scope(&record.owner, &event)? {
-                    live =
-                        crate::agent::live_frames::LiveTurnRef(Arc::new(super::run_approvals::RunApprovalResolver {
-                            scope,
-                            streams: Arc::clone(&state.rf_streams),
-                            approvals: Arc::clone(&state.rf_approvals),
-                            cancellation: tokio_util::sync::CancellationToken::new(),
-                            wait_secs: turn
-                                .config_generation
-                                .effective
-                                .agents
-                                .get(&record.agent)
-                                .map_or(turn.config_generation.effective.agent.approval_wait_secs, |agent| {
-                                    agent.approval_wait_secs
-                                }),
-                        }));
-                }
-            }
+            let configured = Arc::clone(&turn.config_generation.effective);
+            let incoming = input.clone();
+            let runtime = crate::runtime::blocking::spawn_blocking(move || {
+                let runtime = MessagingRuntime::for_config(&configured)?;
+                incoming.verify(&runtime)?;
+                Ok::<_, anyhow::Error>(runtime)
+            })
+            .await??;
+            let wait_secs = turn
+                .config_generation
+                .effective
+                .agents
+                .get(&record.agent)
+                .map_or(turn.config_generation.effective.agent.approval_wait_secs, |agent| {
+                    agent.approval_wait_secs
+                });
+            let live = approvals::live(&state, &record, &input, console, wait_secs).await?;
             crate::runtime::mailbox_child::MailboxChildSource::admit(
                 publication,
                 record.clone(),
@@ -156,12 +152,18 @@ async fn run(state: AppState, record: ChildSessionRecord, input: MessageInput) -
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
             loop {
                 interval.tick().await;
-                input.verify(&runtime)?;
-                let records = state
-                    .mem
-                    .child_session_store()
-                    .context("child store unavailable")?
-                    .sessions(&record.workspace, &record.owner)?;
+                let reader = Arc::clone(&runtime);
+                let incoming = input.clone();
+                let memory = Arc::clone(&state.mem);
+                let receiver = record.clone();
+                let records = crate::runtime::blocking::spawn_blocking(move || {
+                    incoming.verify(&reader)?;
+                    memory
+                        .child_session_store()
+                        .context("child store unavailable")?
+                        .sessions(&receiver.workspace, &receiver.owner)
+                })
+                .await??;
                 let Some(current) = records.iter().find(|current| current.session_key == record.session_key) else {
                     break;
                 };

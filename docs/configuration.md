@@ -3474,6 +3474,8 @@ minutes. See [the rf live-frame and approval contract](rf-contract/capability-to
 `[agent.messaging] inbound = true` controls Main. Each
 `[agents.<name>.messaging] inbound = true` controls that agent. Both default to
 true. Messages are user data; an approval-looking body grants no permission.
+Addresses use the full SPIFFE ID in `instance` when initialized; duplicate
+peer UUIDs across trust domains and the local UUID are refused.
 An idle receiver starts a turn at its own level and budget; a busy receiver
 queues it. After eight automatic hops, delivery continues without starting a
 turn. The chain bound stops loops between honest instances; peers can be revoked.
@@ -3500,14 +3502,25 @@ on the other instance using the existing peer name, then run `prx a2a init
 UUID and SPIFFE ID. Remove the old pin with `a2a peer remove <name>
 --fingerprint <old-fingerprint>`. A peer accepts at most two fingerprints during
 overlap. Removal and rotation close connections and cancel outstanding client
-requests; TLS sessions are never resumed. Certificates expire after five years.
+requests; interrupted deliveries retry. Activation deletes retired key/cert
+files and stale temporary files; the staged pair is kept until activation.
+TLS sessions are never resumed. Certificates expire after five years.
 `a2a init` displays the local expiry; `a2a peer list` obtains each remote expiry
 through authenticated TLS and reports when a peer is unreachable or refused.
 
 The outbox persists retries for up to 24 hours, below the seven-day replay
 window. Authentication, authorization, malformed-chain and oversized-message
-refusals are permanent. Network failures, 429 and server failures retry with
-jitter and `Retry-After`. A receiver pin is refreshed before each attempt;
+refusals are permanent. Network failures, client rotation/cancellation, 408, 429 and server failures retry with
+jitter and `Retry-After`, independently for each peer. Malformed messages
+return 400 `field_invalid`; 422 is reserved for chain cycles. Pin tokens are
+opaque authenticated ciphertext and disclose no workspace path or owner.
+A receiver pin is refreshed before each attempt;
 recipient incarnation changes fail rather than redirect old data. To roll back,
 disable messaging and restart the gateway; retain the outbox and identity files.
 There are no remote-tree permission caps. Queue/body storage bounds remain.
+
+Mailbox children derive their tool allowlist from current configuration. Console
+roots receive child approval requests in their owner-scoped approval inbox and
+review them through the root session endpoint; the wait remains four minutes.
+An rf root uses its connected live surface and configured wait. Without a live
+approval surface the call is denied with `no_approval_surface`.

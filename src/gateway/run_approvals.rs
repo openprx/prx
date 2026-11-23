@@ -43,6 +43,25 @@ impl Decision {
 pub struct ApprovalHub {
     entries: Mutex<HashMap<String, Arc<Entry>>>,
 }
+impl ApprovalHub {
+    pub(crate) fn root_view(
+        &self,
+        owner: &str,
+        session: &str,
+        id: &str,
+    ) -> Option<crate::security::approval_ledger::view::DecisionApprovalView> {
+        let entries = self.entries.lock();
+        let entry = entries.get(id)?;
+        let root = entry.pending.rf.as_ref()?;
+        if entry.pending.subject().owner_id != owner || root.root_session != session {
+            return None;
+        }
+        let mut view = entry.pending.view();
+        view.tool = Some(root.tool.clone());
+        Some(view)
+    }
+}
+
 struct Entry {
     ledger: ExecutionApprovalLedger,
     pending: PendingCall,

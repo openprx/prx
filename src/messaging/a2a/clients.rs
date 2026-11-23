@@ -1,8 +1,5 @@
 //! One revocable HTTP client per pinned peer and local key generation.
-use super::{
-    identity,
-    tls::{self, Trust},
-};
+use super::tls::{self, Trust};
 use crate::config::A2aPeer;
 use anyhow::Result;
 use parking_lot::Mutex;
@@ -29,7 +26,7 @@ impl Clients {
         }
     }
     pub(crate) fn get(&self, peer: &A2aPeer) -> Result<(reqwest::Client, CancellationToken)> {
-        let local = identity::load(&self.trust.config)?;
+        let local = self.trust.identity()?;
         let mut entries = self.entries.lock();
         if let Some(entry) = entries.get(&peer.spiffe_id) {
             if same(&entry.peer, peer) && entry.local_fingerprint == local.fingerprint {
@@ -43,7 +40,7 @@ impl Clients {
             peer.spiffe_id.clone(),
             Entry {
                 peer: peer.clone(),
-                local_fingerprint: local.fingerprint,
+                local_fingerprint: local.fingerprint.clone(),
                 client: client.clone(),
                 cancellation: cancellation.clone(),
             },
@@ -60,7 +57,8 @@ impl Clients {
                 tokio::select! {
                     ()=stop.cancelled()=>break,
                     _=interval.tick()=> {
-                        let config=cache.trust.current();let local=identity::load(&cache.trust.config);
+                        let _ = cache.trust.refresh_async().await;
+                        let config=cache.trust.current();let local=cache.trust.identity();
                         cache.states.lock().retain(|spiffe,_|config.as_ref().is_ok_and(|config|config.peers.values().any(|peer|&peer.spiffe_id==spiffe)));
                         cache.entries.lock().retain(|spiffe,entry| {
                             let current=config.as_ref().ok().and_then(|config|config.peers.values().find(|peer|&peer.spiffe_id==spiffe));

@@ -1,9 +1,11 @@
-//! Recipient pins are HMAC-bound to a scope snapshot, target and verified peer.
+//! Opaque AEAD pins bind the scope, target and verified peer without disclosure.
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use hmac::{Hmac, Mac};
+use chacha20poly1305::{
+    ChaCha20Poly1305, Nonce,
+    aead::{Aead, KeyInit, Payload},
+};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 use uuid::Uuid;
 
 use super::{
@@ -55,14 +57,25 @@ impl SqliteMailbox {
             expires_at: self.clock.now().checked_add(300).ok_or(MailboxError::InvalidMetadata)?,
         };
         let payload = encode(&claims)?;
-        let mut mac = Hmac::<Sha256>::new_from_slice(self.secret.as_ref()).map_err(|_| MailboxError::InvalidPin)?;
-        mac.update(b"prx-mailbox-recipient-v1\0");
-        mac.update(payload.as_bytes());
-        let token = format!(
-            "{}.{}",
-            URL_SAFE_NO_PAD.encode(payload.as_bytes()),
-            hex::encode(mac.finalize().into_bytes())
-        );
+        let cipher = ChaCha20Poly1305::new_from_slice(self.secret.as_ref()).map_err(|_| MailboxError::InvalidPin)?;
+        use ring::rand::SecureRandom as _;
+        let mut nonce_bytes = [0_u8; 12];
+        ring::rand::SystemRandom::new()
+            .fill(&mut nonce_bytes)
+            .map_err(|_| MailboxError::InvalidPin)?;
+        let nonce = Nonce::from(nonce_bytes);
+        let encrypted = cipher
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: payload.as_bytes(),
+                    aad: b"prx-mailbox-recipient-v2",
+                },
+            )
+            .map_err(|_| MailboxError::InvalidPin)?;
+        let mut opaque = nonce.to_vec();
+        opaque.extend_from_slice(&encrypted);
+        let token = URL_SAFE_NO_PAD.encode(opaque);
         Ok(RecipientPin {
             incarnation: scope.incarnation,
             generation: scope.generation,
@@ -74,13 +87,22 @@ impl SqliteMailbox {
         if message.to_pin.token.is_empty() {
             return Err(MailboxError::PinRequired);
         }
-        let (payload, signature) = message.to_pin.token.split_once('.').ok_or(MailboxError::InvalidPin)?;
-        let bytes = URL_SAFE_NO_PAD.decode(payload).map_err(|_| MailboxError::InvalidPin)?;
-        let signature = hex::decode(signature).map_err(|_| MailboxError::InvalidPin)?;
-        let mut mac = Hmac::<Sha256>::new_from_slice(self.secret.as_ref()).map_err(|_| MailboxError::InvalidPin)?;
-        mac.update(b"prx-mailbox-recipient-v1\0");
-        mac.update(&bytes);
-        mac.verify_slice(&signature).map_err(|_| MailboxError::InvalidPin)?;
+        let opaque = URL_SAFE_NO_PAD
+            .decode(&message.to_pin.token)
+            .map_err(|_| MailboxError::InvalidPin)?;
+        let (nonce, encrypted) = opaque.split_at_checked(12).ok_or(MailboxError::InvalidPin)?;
+        let cipher = ChaCha20Poly1305::new_from_slice(self.secret.as_ref()).map_err(|_| MailboxError::InvalidPin)?;
+        let nonce: [u8; 12] = nonce.try_into().map_err(|_| MailboxError::InvalidPin)?;
+        let nonce = Nonce::from(nonce);
+        let bytes = cipher
+            .decrypt(
+                &nonce,
+                Payload {
+                    msg: encrypted,
+                    aad: b"prx-mailbox-recipient-v2",
+                },
+            )
+            .map_err(|_| MailboxError::InvalidPin)?;
         let json = std::str::from_utf8(&bytes).map_err(|_| MailboxError::InvalidPin)?;
         let claims: PinClaims = decode(json).map_err(|_| MailboxError::InvalidPin)?;
         if claims.target != message.to

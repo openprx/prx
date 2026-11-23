@@ -1,12 +1,12 @@
 //! Durable remote publication and receiver-pin refresh before every attempt.
-use super::{peers, tls::Trust};
+use super::tls::Trust;
 use crate::messaging::{
     DeliveryState, RecipientPin, SessionAddr,
     mailbox::{MailboxAuthority, MailboxError, MailboxResult},
     runtime::MessagingRuntime,
     send::MailboxDestination,
 };
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 pub(crate) struct RemoteTransport {
     trust: Trust,
@@ -14,9 +14,7 @@ pub(crate) struct RemoteTransport {
 }
 impl RemoteTransport {
     pub(crate) fn new(config: &crate::config::Config) -> Self {
-        let trust = Trust {
-            config: Arc::new(config.clone()),
-        };
+        let trust = Trust::new(config);
         Self {
             clients: super::clients::Clients::new(trust.clone()),
             trust,
@@ -27,9 +25,9 @@ impl RemoteTransport {
         config
             .peers
             .values()
-            .find(|peer| peers::instance(&peer.spiffe_id).is_ok_and(|id| id.to_string() == target.instance))
+            .find(|peer| peer.spiffe_id == target.instance)
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("peer_not_allowed"))
+            .ok_or_else(|| MailboxError::Unauthorized.into())
     }
     pub(crate) fn destination(
         &self,
@@ -55,8 +53,11 @@ impl RemoteTransport {
         source: &SessionAddr,
         message: &mut crate::messaging::PrxMessage,
     ) -> anyhow::Result<(u16, Option<u64>)> {
-        let peer = self.peer(&message.to).map_err(|_| MailboxError::Unauthorized)?;
-        let (client, cancellation) = self.clients.get(&peer)?;
+        self.trust.refresh_async().await?;
+        let peer = self.peer(&message.to)?;
+        let clients = self.clients.clone();
+        let selected = peer.clone();
+        let (client, cancellation) = crate::runtime::blocking::spawn_blocking(move || clients.get(&selected)).await??;
         let request = async {
             let response = client
                 .post(format!("https://{}/a2a/v1/pins", peer.address))
@@ -74,9 +75,16 @@ impl RemoteTransport {
                 expires_at: i64,
             }
             let pin: Pin = serde_json::from_slice(&bounded_response(response).await?)?;
-            runtime
-                .store
-                .refresh_outbox_pin(scope, source, message, pin.pin, pin.expires_at)?;
+            let store = runtime.store.clone();
+            let scope = scope.clone();
+            let source = source.clone();
+            let mut refreshed = message.clone();
+            *message = crate::runtime::blocking::spawn_blocking(move || {
+                store.refresh_outbox_pin(&scope, &source, &mut refreshed, pin.pin, pin.expires_at)?;
+                Ok::<_, MailboxError>(refreshed)
+            })
+            .await??;
+            self.trust.refresh_async().await?;
             // Re-read grants between the two requests; no cached bearer authority.
             let current = self.peer(&message.to)?;
             anyhow::ensure!(
@@ -93,88 +101,79 @@ impl RemoteTransport {
             Ok((response.status().as_u16(), retry_after(&response)))
         };
         tokio::select! {
-            ()=cancellation.cancelled()=>Err(MailboxError::Unauthorized.into()),
+            ()=cancellation.cancelled()=>Err(anyhow::anyhow!("peer client changed; retry delivery")),
             result=request=>result,
         }
     }
     pub(crate) fn start(self, runtime: Arc<MessagingRuntime>) -> anyhow::Result<()> {
-        let lease = super::leader::open(&self.trust.config.workspace_dir)?;
-        let mut leader = super::leader::claim(&lease)?;
+        let lease = Arc::new(super::leader::open(&self.trust.config.workspace_dir)?);
+        let transport = Arc::new(self);
         tokio::spawn(async move {
-            let _monitor = self.clients.monitor();
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            let _monitor = transport.clients.monitor();
             loop {
-                interval.tick().await;
-                if !leader {
-                    match super::leader::claim(&lease) {
-                        Ok(true) => leader = true,
-                        Ok(false) => continue,
-                        Err(_) => break,
+                let (transport, runtime, lease) = (Arc::clone(&transport), Arc::clone(&runtime), Arc::clone(&lease));
+                let result = tokio::spawn(super::dispatch::run(transport, runtime, lease)).await;
+                match result {
+                    Ok(Err(error)) => {
+                        tracing::error!(error=%crate::agent::diagnostics::error_class(&error), "A2A outbox dispatcher exited; restarting")
                     }
+                    _ => tracing::error!("A2A outbox dispatcher exited; restarting"),
                 }
-                let Ok(sources) = runtime.store.outbox_sources() else {
-                    continue;
-                };
-                let mut peers = HashSet::new();
-                for (scope, source) in sources {
-                    let Ok(pending) = runtime.store.pending_outbox(&scope, &source) else {
-                        continue;
-                    };
-                    for outbound in pending {
-                        let mut message = outbound.message().clone();
-                        if message.to.instance == runtime.instance || !peers.insert(message.to.instance.clone()) {
-                            continue;
-                        }
-                        let Ok((attempts, created)) = runtime.store.outbox_retry(&scope, &message) else {
-                            continue;
-                        };
-                        let now = chrono::Utc::now().timestamp();
-                        if now.saturating_sub(created) >= 86400 {
-                            let _ = runtime.store.retry_outbox(&scope, &source, &message, None, "expired");
-                            continue;
-                        }
-                        let result = self.attempt(&runtime, &scope, &source, &mut message).await;
-                        let (status, retry) = match result {
-                            Ok(value) => value,
-                            Err(error)
-                                if error.downcast_ref::<MailboxError>() == Some(&MailboxError::StaleIncarnation)
-                                    || error.downcast_ref::<MailboxError>() == Some(&MailboxError::Unauthorized) =>
-                            {
-                                (403, None)
-                            }
-                            Err(_) => (0, None),
-                        };
-                        if let Ok(peer) = self.peer(&message.to) {
-                            self.clients
-                                .state(&peer, if status == 202 { "available" } else { "unavailable" });
-                        }
-                        if status == 202 {
-                            let _ = runtime
-                                .store
-                                .acknowledge(&scope, &message.to, message.id, DeliveryState::Accepted);
-                            continue;
-                        }
-                        let permanent =
-                            matches!(status, 401 | 403 | 413 | 422) || (400..500).contains(&status) && status != 429;
-                        let delay = backoff(attempts).max(retry.unwrap_or(0));
-                        let next = if permanent {
-                            None
-                        } else {
-                            Some(now.saturating_add(i64::try_from(delay).unwrap_or(300)))
-                        };
-                        let error = match status {
-                            401 => "peer_unauthenticated",
-                            403 => "peer_not_allowed",
-                            413 => "message_too_large",
-                            422 => "chain_limit_reached",
-                            429 => "inbox_full",
-                            _ => "peer_unavailable",
-                        };
-                        let _ = runtime.store.retry_outbox(&scope, &source, &message, next, error);
-                    }
-                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
+        Ok(())
+    }
+    pub(super) async fn deliver(
+        &self,
+        runtime: Arc<MessagingRuntime>,
+        pending: super::dispatch::Pending,
+    ) -> anyhow::Result<()> {
+        let super::dispatch::Pending {
+            scope,
+            source,
+            mut message,
+            attempts,
+        } = pending;
+        let (status, retry) = match self.attempt(&runtime, &scope, &source, &mut message).await {
+            Ok(value) => value,
+            Err(error) if super::dispatch::permanent(&error) => (403, None),
+            Err(_) => (0, None),
+        };
+        if let Ok(peer) = self.peer(&message.to) {
+            self.clients
+                .state(&peer, if status == 202 { "available" } else { "unavailable" });
+        }
+        let store = runtime.store.clone();
+        crate::runtime::blocking::spawn_blocking(move || {
+            if status == 202 {
+                store.acknowledge(&scope, &message.to, message.id, DeliveryState::Accepted)?;
+            } else {
+                let permanent = (400..500).contains(&status) && !matches!(status, 408 | 429);
+                let delay = backoff(attempts).max(retry.unwrap_or(0));
+                let next = if permanent {
+                    None
+                } else {
+                    Some(
+                        chrono::Utc::now()
+                            .timestamp()
+                            .saturating_add(i64::try_from(delay).unwrap_or(300)),
+                    )
+                };
+                let error = match status {
+                    400 => "field_invalid",
+                    401 => "peer_unauthenticated",
+                    403 => "peer_not_allowed",
+                    413 => "message_too_large",
+                    422 => "chain_limit_reached",
+                    429 => "inbox_full",
+                    _ => "peer_unavailable",
+                };
+                store.retry_outbox(&scope, &source, &message, next, error)?;
+            }
+            Ok::<_, MailboxError>(())
+        })
+        .await??;
         Ok(())
     }
 }

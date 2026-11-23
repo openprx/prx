@@ -10,7 +10,7 @@ pub const MAX_BODY_BYTES: usize = 256 * 1024;
 /// Logical session address. No execution-run field.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionAddr {
-    /// Persisted `a2a.agent_id`.
+    /// Full SPIFFE ID when A2A identity exists; local-only agent id otherwise.
     pub instance: String,
     /// Authenticated owner, never channel-derived.
     pub owner: String,

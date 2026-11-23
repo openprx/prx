@@ -1,4 +1,5 @@
 //! Atomic, private, persisted Ed25519 instance identities.
+mod rotation;
 use anyhow::{Context, Result, ensure};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::{Deserialize, Serialize};
@@ -122,7 +123,9 @@ fn load_named(config: &crate::config::Config, name: &str) -> Result<Identity> {
     Ok(identity)
 }
 pub fn init(config: &crate::config::Config, rotate: bool) -> Result<Identity> {
-    let dir = directory(config);
+    let dir = prepare_directory(config)?;
+    let _lease = rotation::lock(&dir)?;
+    rotation::cleanup(&dir)?;
     if dir.join("identity.toml").exists() && !rotate {
         return load(config);
     }
@@ -149,11 +152,17 @@ pub fn init(config: &crate::config::Config, rotate: bool) -> Result<Identity> {
         );
         fs::rename(dir.join("pending.toml"), dir.join("identity.toml"))?;
         fs::File::open(&dir)?.sync_all()?;
+        rotation::cleanup(&dir)?;
         return load(config);
     }
-    generate(config, "identity.toml", old)
+    let identity = generate(config, "identity.toml", old)?;
+    rotation::cleanup(&dir)?;
+    Ok(identity)
 }
 pub fn prepare_rotation(config: &crate::config::Config) -> Result<Identity> {
+    let dir = prepare_directory(config)?;
+    let _lease = rotation::lock(&dir)?;
+    rotation::cleanup(&dir)?;
     let current = load(config)?;
     if directory(config).join("pending.toml").exists() {
         return load_named(config, "pending.toml");
@@ -162,30 +171,6 @@ pub fn prepare_rotation(config: &crate::config::Config) -> Result<Identity> {
 }
 fn generate(config: &crate::config::Config, name: &str, old: Option<Identity>) -> Result<Identity> {
     let dir = directory(config);
-    fs::create_dir_all(&config.workspace_dir)?;
-    let mut builder = fs::DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    match builder.create(&dir) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error.into()),
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        ensure!(
-            fs::metadata(&dir)?.permissions().mode().trailing_zeros() >= 6,
-            "A2A directory permissions exceed 0700"
-        );
-    }
-    ensure!(
-        !fs::symlink_metadata(&dir)?.file_type().is_symlink(),
-        "A2A directory cannot be a symlink"
-    );
     let instance_id = old
         .as_ref()
         .map_or_else(uuid::Uuid::new_v4, |identity| identity.instance_id);
@@ -225,4 +210,33 @@ fn generate(config: &crate::config::Config, name: &str, old: Option<Identity>) -
 }
 pub(crate) fn fingerprint(der: &[u8]) -> String {
     hex::encode(Sha256::digest(der))
+}
+
+fn prepare_directory(config: &crate::config::Config) -> Result<PathBuf> {
+    let dir = directory(config);
+    fs::create_dir_all(&config.workspace_dir)?;
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(&dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        ensure!(
+            fs::metadata(&dir)?.permissions().mode().trailing_zeros() >= 6,
+            "A2A directory permissions exceed 0700"
+        );
+    }
+    ensure!(
+        !fs::symlink_metadata(&dir)?.file_type().is_symlink(),
+        "A2A directory cannot be a symlink"
+    );
+    Ok(dir)
 }

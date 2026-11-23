@@ -8,7 +8,7 @@ use crate::messaging::{
     mailbox::{MailboxAuthority, MailboxError},
     runtime::MessagingRuntime,
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use http_body_util::{BodyExt as _, Full, Limited};
 use hyper::{
     Request, Response, StatusCode,
@@ -47,7 +47,7 @@ fn target_authority(
     anyhow::ensure!(peers::allows(peer, target, &runtime.instance), "peer_not_allowed");
     runtime.resolve_scope(target)?;
     crate::messaging::mailbox::validate_address(&source)?;
-    source.instance = peers::instance(&peer.spiffe_id)?.to_string();
+    source.instance.clone_from(&peer.spiffe_id);
     source.owner = peer.owner.clone();
     Ok(MailboxAuthority::verified_peer(
         runtime.workspace.clone(),
@@ -67,6 +67,33 @@ async fn request(
     rate: Arc<super::resources::RequestRate>,
     request: Request<Incoming>,
 ) -> Response<Body> {
+    let route = if request.method() == hyper::Method::POST {
+        match request.uri().path() {
+            "/a2a/v1/pins" => Some(true),
+            "/a2a/v1/messages" => Some(false),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let bytes = match Limited::new(request.into_body(), 352 * 1024).collect().await {
+        Ok(body) => body.to_bytes(),
+        Err(_) => return refused(StatusCode::PAYLOAD_TOO_LARGE, "message_too_large"),
+    };
+    crate::runtime::blocking::spawn_blocking(move || process(trust, cert, rate, route, bytes))
+        .await
+        .unwrap_or_else(|_| refused(StatusCode::SERVICE_UNAVAILABLE, "mailbox_unavailable"))
+}
+fn process(
+    trust: Trust,
+    cert: rustls::pki_types::CertificateDer<'static>,
+    rate: Arc<super::resources::RequestRate>,
+    route: Option<bool>,
+    bytes: Bytes,
+) -> Response<Body> {
+    if trust.refresh().is_err() {
+        return refused(StatusCode::UNAUTHORIZED, "peer_unauthenticated");
+    }
     let Ok(effective) = trust.effective() else {
         return refused(StatusCode::UNAUTHORIZED, "peer_unauthenticated");
     };
@@ -86,13 +113,8 @@ async fn request(
             .insert(hyper::header::RETRY_AFTER, hyper::header::HeaderValue::from_static("1"));
         return response;
     }
-    if request.method() != hyper::Method::POST || !matches!(request.uri().path(), "/a2a/v1/pins" | "/a2a/v1/messages") {
+    let Some(pins) = route else {
         return refused(StatusCode::NOT_FOUND, "not_found");
-    }
-    let pins = request.uri().path() == "/a2a/v1/pins";
-    let bytes = match Limited::new(request.into_body(), 352 * 1024).collect().await {
-        Ok(body) => body.to_bytes(),
-        Err(_) => return refused(StatusCode::PAYLOAD_TOO_LARGE, "message_too_large"),
     };
     if pins {
         #[derive(serde::Deserialize)]
@@ -101,14 +123,9 @@ async fn request(
             to: SessionAddr,
         }
         let Ok(input) = serde_json::from_slice::<PinRequest>(&bytes) else {
-            return refused(StatusCode::FORBIDDEN, "peer_not_allowed");
+            return refused(StatusCode::BAD_REQUEST, "field_invalid");
         };
-        let source = SessionAddr::new(
-            peers::instance(&peer.spiffe_id).map_or_else(|_| String::new(), |id| id.to_string()),
-            &peer.owner,
-            "peer",
-            None,
-        );
+        let source = SessionAddr::new(peer.spiffe_id.clone(), &peer.owner, "peer", None);
         let Ok(authority) = target_authority(&runtime, &peer, &input.to, source) else {
             return refused(StatusCode::FORBIDDEN, "peer_not_allowed");
         };
@@ -127,7 +144,7 @@ async fn request(
     }
     let mut message: PrxMessage = match serde_json::from_slice(&bytes) {
         Ok(message) => message,
-        Err(_) => return refused(StatusCode::UNPROCESSABLE_ENTITY, "chain_limit_reached"),
+        Err(_) => return refused(StatusCode::BAD_REQUEST, "field_invalid"),
     };
     if message.body.bytes.len() > crate::messaging::MAX_BODY_BYTES {
         return refused(StatusCode::PAYLOAD_TOO_LARGE, "message_too_large");
@@ -154,13 +171,18 @@ async fn request(
                 .insert(hyper::header::RETRY_AFTER, hyper::header::HeaderValue::from_static("1"));
             result
         }
+        Err(MailboxError::ChainDepth) => refused(StatusCode::UNPROCESSABLE_ENTITY, "chain_limit_reached"),
         Err(
-            MailboxError::ChainDepth
-            | MailboxError::UnknownParent
+            MailboxError::UnknownParent
             | MailboxError::InvalidMetadata
             | MailboxError::IdempotencyConflict
-            | MailboxError::IdReuse,
-        ) => refused(StatusCode::UNPROCESSABLE_ENTITY, "chain_limit_reached"),
+            | MailboxError::IdReuse
+            | MailboxError::InvalidAddress
+            | MailboxError::InvalidMime
+            | MailboxError::StreamIdRequired
+            | MailboxError::SeqConflict
+            | MailboxError::NaturalKeyCollision,
+        ) => refused(StatusCode::BAD_REQUEST, "field_invalid"),
         Err(_) => refused(StatusCode::FORBIDDEN, "peer_not_allowed"),
     }
 }
@@ -168,21 +190,16 @@ pub async fn start(config: &crate::config::Config, shutdown: CancellationToken) 
     if !config.a2a.messaging_enabled {
         return Ok(None);
     }
-    config.a2a.validate()?;
-    let identity = identity::load(config).context("run prx a2a init before enabling messaging")?;
-    anyhow::ensure!(
-        !config
-            .a2a
-            .peers
-            .values()
-            .any(|peer| peer.spiffe_id == identity.spiffe_id || peer.fingerprints.contains(&identity.fingerprint)),
-        "local identity cannot be its own peer"
-    );
-    let trust = Trust {
-        config: Arc::new(config.clone()),
-    };
-    let _ = tls::server(trust.clone())?;
-    let runtime = MessagingRuntime::for_config(config)?;
+    let configured = config.clone();
+    let (trust, runtime) = crate::runtime::blocking::spawn_blocking(move || {
+        let trust = Trust::new(&configured);
+        trust.refresh()?;
+        let local = trust.identity()?;
+        peers::validate_local(&configured.a2a, &local)?;
+        let _ = tls::server(trust.clone())?;
+        Ok::<_, anyhow::Error>((trust, MessagingRuntime::for_config(&configured)?))
+    })
+    .await??;
     let listener = tokio::net::TcpListener::bind(&config.a2a.bind).await?;
     let total = Arc::new(tokio::sync::Semaphore::new(128));
     let registry = Arc::new(super::connections::Connections::default());
@@ -195,7 +212,8 @@ pub async fn start(config: &crate::config::Config, shutdown: CancellationToken) 
                 () = shutdown.cancelled() => break,
                 _ = connections.join_next(), if !connections.is_empty() => continue,
                 _=refresh.tick()=> {
-                    let config=trust.current();let local=identity::load(&trust.config);
+                    let _ = trust.refresh_async().await;
+                    let config=trust.current();let local=trust.identity();
                     registry.recheck(config.as_ref().ok(),local.as_ref().ok().map(|identity|identity.fingerprint.as_str()));
                     continue;
                 }
@@ -218,10 +236,13 @@ pub async fn start(config: &crate::config::Config, shutdown: CancellationToken) 
             let shutdown = shutdown.clone();
             connections.spawn(async move {
                 let _permit = permit;
-                let Ok(local) = identity::load(&trust.config) else {
-                    return;
-                };
-                let Ok(server) = tls::server(trust.clone()) else {
+                let builder = trust.clone();
+                let Ok(Ok((server, local))) = crate::runtime::blocking::spawn_blocking(move || {
+                    builder.refresh()?;
+                    Ok::<_, anyhow::Error>((tls::server(builder.clone())?, builder.identity()?))
+                })
+                .await
+                else {
                     return;
                 };
                 let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
@@ -241,7 +262,7 @@ pub async fn start(config: &crate::config::Config, shutdown: CancellationToken) 
                     return;
                 };
                 let fingerprint = identity::fingerprint(cert.as_ref());
-                let Some(permit) = registry.register(peer, fingerprint, local.fingerprint) else {
+                let Some(permit) = registry.register(peer, fingerprint, local.fingerprint.clone()) else {
                     return;
                 };
                 let cancellation = permit.cancellation();

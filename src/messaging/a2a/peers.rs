@@ -30,9 +30,13 @@ pub fn instance(spiffe: &str) -> Result<uuid::Uuid> {
 pub fn validate(config: &A2aConfig) -> Result<()> {
     let mut identities = HashSet::new();
     let mut fingerprints = HashSet::new();
+    let mut instances = HashSet::new();
     instance(&format!("spiffe://{}/prx/{}", config.trust_domain, uuid::Uuid::nil()))?;
     for peer in config.peers.values() {
-        instance(&peer.spiffe_id)?;
+        ensure!(
+            instances.insert(instance(&peer.spiffe_id)?),
+            "duplicate peer instance UUID"
+        );
         ensure!(identities.insert(&peer.spiffe_id), "duplicate peer SPIFFE ID");
         ensure!(!peer.owner.trim().is_empty(), "peer owner is required");
         ensure!(
@@ -79,4 +83,17 @@ pub(crate) fn allows(peer: &A2aPeer, target: &crate::messaging::SessionAddr, loc
             .iter()
             .any(|value| value == "*" || value == &target.session)
         && peer.agents.iter().any(|value| value == "*" || value == &target.agent)
+}
+
+pub(crate) fn validate_local(config: &A2aConfig, local: &super::identity::Identity) -> Result<()> {
+    validate(config)?;
+    for peer in config.peers.values() {
+        ensure!(
+            instance(&peer.spiffe_id)? != local.instance_id
+                && peer.spiffe_id != local.spiffe_id
+                && !peer.fingerprints.contains(&local.fingerprint),
+            "local identity cannot be a peer"
+        );
+    }
+    Ok(())
 }

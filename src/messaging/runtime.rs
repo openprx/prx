@@ -95,12 +95,10 @@ impl MessagingRuntime {
             &[b"prx-mailbox-pins-v1"],
         );
         let instance = if config.a2a.messaging_enabled {
-            super::a2a::identity::load(config)?.instance_id.to_string()
+            super::a2a::identity::load(config)?.spiffe_id
         } else {
-            super::a2a::identity::optional(config)?.map_or_else(
-                || config.a2a.agent_id.clone(),
-                |identity| identity.instance_id.to_string(),
-            )
+            super::a2a::identity::optional(config)?
+                .map_or_else(|| config.a2a.agent_id.clone(), |identity| identity.spiffe_id)
         };
         let store = SqliteMailbox::new(
             memory,
@@ -313,21 +311,25 @@ struct LocalResolver {
 #[async_trait]
 impl MailboxResolver for LocalResolver {
     async fn resolve(&self, target: &SessionAddr) -> MailboxResult<MailboxDestination> {
-        if target.instance != self.runtime.instance {
-            return super::a2a::RemoteTransport::new(&self.runtime.config.read()).destination(
-                &self.runtime,
-                &self.source,
-                target,
-            );
-        }
-        let authority = MailboxAuthority::local(self.runtime.workspace.clone(), self.source.clone(), target.clone())?;
-        let scope = self.runtime.resolve_scope(target)?;
-        let pin = self.runtime.store.recipient_pin(&authority, &scope, &target.session)?;
-        Ok(MailboxDestination {
-            authority,
-            pin,
-            pin_expires_at: chrono::Utc::now().timestamp() + 300,
+        let runtime = Arc::clone(&self.runtime);
+        let source = self.source.clone();
+        let target = target.clone();
+        crate::runtime::blocking::spawn_blocking(move || {
+            if target.instance != runtime.instance {
+                return super::a2a::RemoteTransport::new(&runtime.config.read())
+                    .destination(&runtime, &source, &target);
+            }
+            let authority = MailboxAuthority::local(runtime.workspace.clone(), source.clone(), target.clone())?;
+            let scope = runtime.resolve_scope(&target)?;
+            let pin = runtime.store.recipient_pin(&authority, &scope, &target.session)?;
+            Ok(MailboxDestination {
+                authority,
+                pin,
+                pin_expires_at: chrono::Utc::now().timestamp() + 300,
+            })
         })
+        .await
+        .map_err(|_| MailboxError::Storage)?
     }
 }
 
