@@ -240,8 +240,11 @@ pub(super) fn derive_chain(
         message.ancestry.clear();
         return Ok(());
     };
+    if parent == message.id {
+        return Err(MailboxError::ChainDepth);
+    }
     let (depth, mut ancestry) = parent_chain(conn, workspace, owner, parent)?;
-    if ancestry.contains(&message.id) || parent == message.id {
+    if ancestry.contains(&message.id) {
         return Err(MailboxError::ChainDepth);
     }
     ancestry.push(parent);
