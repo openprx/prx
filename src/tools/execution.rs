@@ -1582,7 +1582,7 @@ pub struct ToolExecutionOutcome {
 }
 
 impl ToolExecutionOutcome {
-    fn with_refusal_cause(mut self, cause: ToolCallRefusalReason) -> Self {
+    const fn with_refusal_cause(mut self, cause: ToolCallRefusalReason) -> Self {
         self.refusal_cause = Some(cause);
         self
     }
