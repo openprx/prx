@@ -89,7 +89,7 @@ pub(crate) async fn run(cli: &Cli) -> Result<()> {
             bail!("--channels-only does not accept --from-stdin or --from-env");
         }
         let provider_secret = if *from_stdin {
-            Some(super::host_bootstrap::provider_key(&mut std::io::stdin())?)
+            Some(crate::runtime::host_bootstrap::provider_key(&mut std::io::stdin())?)
         } else {
             None
         };
@@ -148,7 +148,7 @@ pub(crate) async fn run(cli: &Cli) -> Result<()> {
                 openprx::config::Config::load_or_init_with_config_dir(config_dir).await?
             };
             let config = if let Some(secret) = provider_secret {
-                super::host_bootstrap::store_provider_key(config, &secret).await?
+                crate::runtime::host_bootstrap::store_provider_key(config, &secret).await?
             } else {
                 config
             };

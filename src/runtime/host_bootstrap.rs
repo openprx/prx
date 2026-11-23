@@ -91,7 +91,7 @@ pub async fn issue_token(config: Config, out: &Path, force: bool) -> Result<Stri
 }
 
 /// Bounded provider-key input shared with `prx init --from-stdin`.
-pub(crate) fn provider_key(stdin: &mut dyn Read) -> Result<zeroize::Zeroizing<String>> {
+pub fn provider_key(stdin: &mut dyn Read) -> Result<zeroize::Zeroizing<String>> {
     const MAX_CREDENTIAL_BYTES: u64 = 64 * 1024;
     let mut secret = zeroize::Zeroizing::new(String::new());
     stdin.take(MAX_CREDENTIAL_BYTES + 1).read_to_string(&mut secret)?;
@@ -107,7 +107,7 @@ pub(crate) fn provider_key(stdin: &mut dyn Read) -> Result<zeroize::Zeroizing<St
 }
 
 /// Persist only through the approved encrypted provider-reference store.
-pub(crate) async fn store_provider_key(config: Config, secret: &str) -> Result<Config> {
+pub async fn store_provider_key(config: Config, secret: &str) -> Result<Config> {
     let provider = crate::providers::selection::default_provider(&config).to_owned();
     let name = crate::providers::ProviderId::of(&provider)
         .catalog_name()
