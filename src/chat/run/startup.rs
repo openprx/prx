@@ -299,7 +299,7 @@ pub(super) fn initial_conversation(
     // run_id. The session identity is carried by `chat_session_key`, never by
     // run_id, and turns deliberately set no parent_run_id (that field is reserved
     // for the spawn execution lineage, not for relating turns within a session).
-    let chat_session_key = format!("chat:{}", chat_session.id);
+    let chat_session_key = crate::runtime::envelope::RuntimeEnvelope::chat_canonical_session_key(&chat_session.id);
     let fabric_turn_seq: u64 = 0;
 
     // ── Build banner text ────────────────────────────────────────
@@ -315,7 +315,13 @@ pub(super) fn initial_conversation(
     // The previous multi-line "PRX Chat — ... \n Type /help for commands"
     // hint has moved to the persistent footer instead. `chat_session` is no
     // longer queried for the banner but stays in scope for downstream use.
-    let banner = startup_banner(provider_name, model_name);
+    let envelope = crate::chat::chat_runtime_envelope(&config.workspace_dir.to_string_lossy(), &chat_session_key);
+    let banner = format!(
+        "{}\nMailbox session={} owner={} agent=main",
+        startup_banner(provider_name, model_name),
+        chat_session_key,
+        envelope.resolved_owner_id()
+    );
 
     // ── Conversation history ─────────────────────────────────────
     let leading_system_prompt = leading_system_prompt_for_session(config, model_name, skills, native_tools);

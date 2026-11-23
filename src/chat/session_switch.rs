@@ -348,7 +348,7 @@ pub(super) async fn apply_chat_session_switch(
     *ctx.attached_follow = None;
     *ctx.attached_follow_seq = None;
 
-    *ctx.chat_session_key = format!("chat:{}", loaded.id);
+    *ctx.chat_session_key = crate::runtime::envelope::RuntimeEnvelope::chat_canonical_session_key(&loaded.id);
     *ctx.fabric_turn_seq = loaded
         .turns
         .iter()

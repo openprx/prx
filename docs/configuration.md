@@ -3539,3 +3539,11 @@ explicitly installs a bearer and records its hash in this list; the gateway
 then reports pairing ACTIVE and accepts that bearer instead of offering a new
 one-time pairing code. Keep and use the issued file; do not remove valid
 paired credentials just to request a second pairing.
+
+For mTLS messaging, run `prx a2a init`, then `prx a2a bind 127.0.0.1:16832`.
+Initialization prints the terminal-chat owner alongside the public SPIFFE identity
+and fingerprint. `prx a2a peer add` requires an explicit `--owner`: this is the
+**local receiving owner** whose sessions this peer may message. Use the local
+owner on each instance, even when the instances have different default owners.
+Restart running daemons and chats after A2A setup or listener/identity changes.
+Peer grants and revocations are also rechecked during live delivery.

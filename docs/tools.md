@@ -1995,3 +1995,10 @@ the owner's pending-approval surface.
 
 `session_status` includes the caller session's last 64 outbox states, including
 `expired` and permanent refusals, without message bodies or recipient tokens.
+
+Terminal chats use the durable mailbox session key `chat:terminal:local-user:<chat-id>`.
+The startup banner prints the complete session key and owner. Child focus accepts
+follow-up text after completion and starts another turn in the same child session.
+`/msg #1 <text>` addresses that child's logical session, including after completion.
+If a process child reports `configuration_changed`, restart its parent chat before
+retrying; a newer disk configuration cannot execute under the parent's old seal.

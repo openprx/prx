@@ -12,6 +12,8 @@ pub enum A2aCommand {
         #[arg(long, conflicts_with = "rotate")]
         prepare_rotate: bool,
     },
+    /// Enable mTLS messaging at this address; restart running daemons and chats.
+    Bind { address: std::net::SocketAddr },
     Peer {
         #[command(subcommand)]
         command: PeerCommand,
@@ -28,7 +30,7 @@ pub enum PeerCommand {
         #[arg(long)]
         address: String,
         #[arg(long)]
-        owner: Option<String>,
+        owner: String,
         #[arg(long = "session", default_value = "*")]
         sessions: Vec<String>,
         #[arg(long = "agent", default_value = "*")]
@@ -55,16 +57,32 @@ pub async fn run(command: A2aCommand, mut config: crate::config::Config) -> Resu
             })
             .await??;
             Ok(format!(
-                "{}\nfingerprint {}\nexpires {}",
-                identity.spiffe_id, identity.fingerprint, identity.expires_at
+                "{}\nfingerprint {}\nexpires {}\nowner {}\nRestart running daemons and chats after A2A configuration or identity changes.",
+                identity.spiffe_id,
+                identity.fingerprint,
+                identity.expires_at,
+                local_owner(&config)
             ))
+        }
+        A2aCommand::Bind { address } => {
+            ensure!(address.port() != 0, "A2A bind requires a nonzero port");
+            config.a2a.bind = address.to_string();
+            config.a2a.messaging_enabled = true;
+            config.a2a.validate()?;
+            persist(original, config).await?;
+            Ok("A2A messaging enabled; restart running daemons and chats to apply the listener configuration.".into())
         }
         A2aCommand::Peer {
             command: PeerCommand::List,
         } => {
             let selected = config.clone();
             let local = crate::runtime::blocking::spawn_blocking(move || super::identity::load(&selected)).await??;
-            let mut rows = vec![format!("local {} expires {}", local.spiffe_id, local.expires_at)];
+            let mut rows = vec![format!(
+                "local {} owner={} expires {}",
+                local.spiffe_id,
+                local_owner(&config),
+                local.expires_at
+            )];
             let mut peers: Vec<_> = config.a2a.peers.iter().collect();
             peers.sort_by_key(|(name, _)| *name);
             for (name, peer) in peers {
@@ -115,14 +133,6 @@ pub async fn run(command: A2aCommand, mut config: crate::config::Config) -> Resu
                         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
                 "invalid peer name"
             );
-            let owner = owner.unwrap_or_else(|| {
-                crate::runtime::envelope::RuntimeEnvelope::chat_canonical(
-                    config.workspace_dir.to_string_lossy().into_owned(),
-                    "peer-management",
-                    crate::memory::MemoryVisibility::Workspace,
-                )
-                .resolved_owner_id()
-            });
             let mut fingerprints = vec![fingerprint.clone()];
             if let Some(old) = config.a2a.peers.get(&name) {
                 ensure!(
@@ -134,6 +144,7 @@ pub async fn run(command: A2aCommand, mut config: crate::config::Config) -> Resu
                     fingerprints.push(fingerprint);
                 }
             }
+            let bound_owner = owner.clone();
             config.a2a.peers.insert(
                 name,
                 crate::config::A2aPeer {
@@ -147,7 +158,9 @@ pub async fn run(command: A2aCommand, mut config: crate::config::Config) -> Resu
             );
             config.a2a.validate()?;
             persist(original, config).await?;
-            Ok("Peer grant saved; both instances must pin each other.".into())
+            Ok(format!(
+                "Peer grant saved, bound owner={bound_owner}; both instances must pin each other. Restart running daemons and chats after setup."
+            ))
         }
         A2aCommand::Peer {
             command: PeerCommand::Remove { name, fingerprint },
@@ -167,7 +180,10 @@ pub async fn run(command: A2aCommand, mut config: crate::config::Config) -> Resu
             }
             config.a2a.validate()?;
             persist(original, config).await?;
-            Ok("Peer grant removed; live connections will close.".into())
+            Ok(
+                "Peer grant removed; live connections will close. Restart running daemons and chats after setup."
+                    .into(),
+            )
         }
     }
 }
@@ -179,4 +195,13 @@ async fn persist(before: crate::config::Config, after: crate::config::Config) ->
     let revision = plan.revision().map(str::to_owned);
     service.apply(plan, ConfigActor::Cli, revision.as_deref()).await?;
     Ok(())
+}
+
+fn local_owner(config: &crate::config::Config) -> String {
+    crate::runtime::envelope::RuntimeEnvelope::chat_canonical(
+        config.workspace_dir.to_string_lossy().into_owned(),
+        "peer-management",
+        crate::memory::MemoryVisibility::Workspace,
+    )
+    .resolved_owner_id()
 }

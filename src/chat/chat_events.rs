@@ -50,7 +50,10 @@ impl ReduxMode {
 /// if the key is not in `chat:{id}` form it is returned unchanged (the canonical
 /// derivation then keys on the whole string, still stable).
 pub(super) fn chat_session_id_from_key(chat_session_key: &str) -> &str {
-    chat_session_key.strip_prefix("chat:").unwrap_or(chat_session_key)
+    chat_session_key
+        .strip_prefix("chat:terminal:local-user:")
+        .or_else(|| chat_session_key.strip_prefix("chat:"))
+        .unwrap_or(chat_session_key)
 }
 
 /// Build a chat message-event write scope on the stable durable-canonical

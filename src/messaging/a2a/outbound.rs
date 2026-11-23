@@ -97,7 +97,7 @@ impl RemoteTransport {
                 current.spiffe_id == peer.spiffe_id
                     && current.fingerprints == peer.fingerprints
                     && current.address == peer.address,
-                "peer changed"
+                AttemptInterrupted
             );
             let response = client
                 .post(format!("https://{}/a2a/v1/messages", peer.address))
@@ -107,7 +107,7 @@ impl RemoteTransport {
             Ok((response.status().as_u16(), retry_after(&response)))
         };
         tokio::select! {
-            ()=cancellation.cancelled()=>Err(anyhow::anyhow!("peer client changed; retry delivery")),
+            ()=cancellation.cancelled()=>Err(AttemptInterrupted.into()),
             result=request=>result,
         }
     }
@@ -143,9 +143,27 @@ impl RemoteTransport {
         } = pending;
         let (status, retry) = match self.attempt(&runtime, &scope, &source, &mut message).await {
             Ok(value) => value,
-            Err(error) if super::dispatch::permanent(&error) => (403, None),
-            Err(_) => (0, None),
+            Err(error) => {
+                tracing::warn!(
+                    reason = attempt_reason(&error),
+                    attempt = attempts.saturating_add(1),
+                    "A2A outbound attempt failed"
+                );
+                if super::dispatch::permanent(&error) {
+                    (403, None)
+                } else {
+                    (0, None)
+                }
+            }
         };
+        if status != 202 && status != 0 {
+            tracing::warn!(
+                reason = status_reason(status),
+                status,
+                attempt = attempts.saturating_add(1),
+                "A2A outbound attempt refused"
+            );
+        }
         if let Ok(peer) = self.peer(&message.to) {
             self.clients
                 .state(&peer, if status == 202 { "available" } else { "unavailable" });
@@ -166,15 +184,7 @@ impl RemoteTransport {
                             .saturating_add(i64::try_from(delay).unwrap_or(300)),
                     )
                 };
-                let error = match status {
-                    400 => "field_invalid",
-                    401 => "peer_unauthenticated",
-                    403 => "peer_not_allowed",
-                    413 => "message_too_large",
-                    422 => "chain_limit_reached",
-                    429 => "inbox_full",
-                    _ => "peer_unavailable",
-                };
+                let error = status_reason(status);
                 store.retry_outbox(&scope, &source, &message, next, error)?;
             }
             Ok::<_, MailboxError>(())
@@ -205,4 +215,45 @@ async fn bounded_response(mut response: reqwest::Response) -> anyhow::Result<Vec
 fn backoff(attempts: u32) -> u64 {
     let ceiling = 1_u64.checked_shl(attempts.min(9)).unwrap_or(300).min(300);
     rand::random_range(0..=ceiling)
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("peer configuration changed during delivery")]
+struct AttemptInterrupted;
+fn attempt_reason(error: &anyhow::Error) -> &'static str {
+    if error.is::<AttemptInterrupted>() {
+        return "peer_configuration_changed";
+    }
+    if let Some(error) = error.downcast_ref::<reqwest::Error>() {
+        return if error.is_timeout() {
+            "peer_timeout"
+        } else if error.is_connect() {
+            "peer_connect_failed"
+        } else {
+            "peer_request_failed"
+        };
+    }
+    if let Some(error) = error.downcast_ref::<MailboxError>() {
+        return match error {
+            MailboxError::Unauthorized => "peer_not_allowed",
+            MailboxError::StaleIncarnation => "stale_incarnation",
+            _ => "mailbox_attempt_failed",
+        };
+    }
+    if error.is::<serde_json::Error>() {
+        return "peer_response_invalid";
+    }
+    "peer_attempt_failed"
+}
+fn status_reason(status: u16) -> &'static str {
+    match status {
+        400 => "field_invalid",
+        401 => "peer_unauthenticated",
+        403 => "peer_not_allowed",
+        408 => "peer_timeout",
+        413 => "message_too_large",
+        422 => "chain_limit_reached",
+        429 => "inbox_full",
+        _ => "peer_unavailable",
+    }
 }

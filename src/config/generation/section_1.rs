@@ -118,6 +118,11 @@ pub struct ConfigGeneration {
 #[error("worker working root differs from signed parent configuration")]
 pub(crate) struct ProcessWorkingRootMismatch;
 
+/// A worker must not execute a newer disk configuration under an older parent seal.
+#[derive(Debug, thiserror::Error)]
+#[error("configuration_changed: process configuration changed since this chat started; restart the parent chat and retry the process child")]
+pub(crate) struct ProcessConfigurationChanged;
+
 /// Metadata, a working root override and a keyed effective snapshot digest.
 /// Credential values and other configuration overrides are not transported.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -266,7 +271,7 @@ impl ConfigGeneration {
         }
         anyhow::ensure!(
             ConfigSourceRevision::from_config(&config)? == binding.source_revision,
-            "process configuration source differs from parent generation"
+            ProcessConfigurationChanged
         );
         anyhow::ensure!(
             key.verify_hmac(

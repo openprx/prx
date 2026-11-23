@@ -167,7 +167,7 @@ async fn session_switch_fail_closes_pending_approvals_and_resets_mirror() {
         "loaded-session",
         "the reader adopted the loaded session"
     );
-    assert_eq!(chat_session_key, "chat:loaded-session");
+    assert_eq!(chat_session_key, "chat:terminal:local-user:loaded-session");
     assert_eq!(fabric_turn_seq, 1);
     assert!(announced_started_sessions.is_empty());
     assert!(last_sessions_summary.is_empty(), "expected an empty value");
