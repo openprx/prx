@@ -22,6 +22,8 @@ pub const MAX_BYTES: i64 = 64 * 1024 * 1024;
 /// Stable refusals, shared by store, IPC and dormant send adapters.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MailboxError {
+    #[error("{0}")]
+    PublicationRefused(String),
     #[error("peer_unknown")]
     PeerUnknown,
     #[error("peer_not_allowed")]
@@ -232,7 +234,7 @@ pub struct MailboxReceipt {
 
 /// Publishing returns status only. Payloads leave the store exclusively
 /// through scoped pending-outbox leases, never through a status replay.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MailboxPublished {
     pub row_id: i64,
     pub message_id: Uuid,
@@ -242,7 +244,7 @@ pub struct MailboxPublished {
     pub ack_state: Option<DeliveryState>,
     pub error: Option<String>,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MailboxSendState {
     Pending,
     Sent,

@@ -120,12 +120,18 @@ impl WorkerMailboxFactory for WorkerMailboxes {
                             Some(WorkerOutputFrame::Message { envelope }) => {
                                 // Only the target and data are wire input. Sender, chain,
                                 // pin, sequence and authority are reconstructed here.
-                                async {
+                                let message_id = envelope.id;
+                                let result = async {
                                     let to = runtime.alias(sender.source(), &serde_json::to_value(&envelope.to)?)?;
                                     let text = String::from_utf8(envelope.body.bytes)?;
-                                    sender.send_with_id(to, text, envelope.body.mime, envelope.id).await?;
-                                    Ok(())
-                                }.await
+                                    Ok::<_, anyhow::Error>(sender.send_with_id(to, text, envelope.body.mime, message_id).await?)
+                                }.await.map_err(|error| {
+                                    // Resolver and store errors contain typed causes only.
+                                    error.downcast_ref::<super::mailbox::MailboxError>()
+                                        .map_or_else(|| "mailbox_storage_error".to_owned(), ToString::to_string)
+                                });
+                                controls.send(WorkerControlFrame::MessageResult { message_id, result })
+                                    .await.context("worker control closed")
                             }
                             Some(WorkerOutputFrame::Ack { message_id, state: DeliveryState::Consumed }) => {
                                 if !runtime.ready_capacity(&target) {continue;}
@@ -193,6 +199,24 @@ impl WorkerMailboxFactory for WorkerMailboxes {
 pub(crate) struct WorkerSender {
     pub(crate) address: super::SessionAddr,
 }
+type PublicationResult = Result<super::mailbox::MailboxPublished, String>;
+type Publications = parking_lot::Mutex<HashMap<uuid::Uuid, tokio::sync::oneshot::Sender<PublicationResult>>>;
+fn publications() -> &'static Publications {
+    static PENDING: std::sync::OnceLock<Publications> = std::sync::OnceLock::new();
+    PENDING.get_or_init(Default::default)
+}
+struct PendingPublication(uuid::Uuid);
+impl Drop for PendingPublication {
+    fn drop(&mut self) {
+        publications().lock().remove(&self.0);
+    }
+}
+pub(crate) fn resolve_publication(id: uuid::Uuid, result: PublicationResult) {
+    let sender = publications().lock().remove(&id);
+    if let Some(sender) = sender {
+        let _ = sender.send(result);
+    }
+}
 #[async_trait::async_trait]
 impl MailboxSender for WorkerSender {
     fn source(&self) -> &super::SessionAddr {
@@ -204,12 +228,18 @@ impl MailboxSender for WorkerSender {
         text: String,
         mime: String,
     ) -> super::mailbox::MailboxResult<super::mailbox::MailboxPublished> {
-        use super::{
-            IdempotencyKey, MessageBody, MessageKind, PrxMessage, RecipientPin,
-            mailbox::{MailboxError, MailboxPublished, MailboxSendState},
-        };
+        use super::{IdempotencyKey, MessageBody, MessageKind, PrxMessage, RecipientPin, mailbox::MailboxError};
         super::mailbox::validate_body(&mime, text.as_bytes())?;
         let id = uuid::Uuid::new_v4();
+        let (reply, received) = tokio::sync::oneshot::channel();
+        {
+            let mut pending = publications().lock();
+            if pending.len() >= 64 {
+                return Err(MailboxError::QueueFull);
+            }
+            pending.insert(id, reply);
+        }
+        let _pending = PendingPublication(id);
         let message = PrxMessage {
             id,
             idempotency: IdempotencyKey::parse(&id.to_string()).map_err(|_| MailboxError::InvalidMetadata)?,
@@ -240,14 +270,10 @@ impl MailboxSender for WorkerSender {
             envelope: Box::new(message),
         })
         .map_err(|_| MailboxError::Storage)?;
-        Ok(MailboxPublished {
-            row_id: 0,
-            message_id: id,
-            stream_id: uuid::Uuid::nil(),
-            seq: 0,
-            state: MailboxSendState::Pending,
-            ack_state: None,
-            error: None,
-        })
+        tokio::time::timeout(std::time::Duration::from_secs(30), received)
+            .await
+            .map_err(|_| MailboxError::Storage)?
+            .map_err(|_| MailboxError::Storage)?
+            .map_err(MailboxError::PublicationRefused)
     }
 }

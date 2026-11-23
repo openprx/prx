@@ -308,6 +308,11 @@ fn config_source_generation_once(config_dir: &Path) -> anyhow::Result<String> {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkerControlFrame {
+    /// Durable publication result from the parent-owned mailbox broker.
+    MessageResult {
+        message_id: uuid::Uuid,
+        result: Result<crate::messaging::mailbox::MailboxPublished, String>,
+    },
     /// Inject an operator message into the worker's running conversation.
     Steer { message: String },
     /// Parent-to-worker Data envelope (MSG-5). Types only in FOUNDATION.

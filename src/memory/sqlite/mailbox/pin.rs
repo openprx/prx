@@ -157,7 +157,10 @@ pub(in crate::memory::sqlite) fn check_scope(
         return Err(MailboxError::StaleIncarnation);
     }
     if live {
-        let latest:i64=conn.query_row("SELECT max(generation) FROM agent_scopes WHERE workspace_id=?1 AND owner_id=?2 AND agent_key=?3 AND incarnation=?4 AND session_key IS ?5",params![scope.workspace_id,scope.owner_id,key,scope.incarnation.to_string(),row.1],|r|r.get(0)).map_err(storage_error)?;
+        // A named child may inherit its parent's storage partition. The
+        // child identity was verified above; its generation belongs to the
+        // stored partition, not the presentation agent on its address.
+        let latest:i64=conn.query_row("SELECT max(generation) FROM agent_scopes WHERE workspace_id=?1 AND owner_id=?2 AND agent_key=?3 AND incarnation=?4 AND session_key IS ?5",params![scope.workspace_id,scope.owner_id,row.0,scope.incarnation.to_string(),row.1],|r|r.get(0)).map_err(storage_error)?;
         if row.2 != "active" || latest != scope.generation || row.3.as_deref() == Some("erased") {
             return Err(MailboxError::StaleIncarnation);
         }

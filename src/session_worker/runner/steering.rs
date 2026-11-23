@@ -79,7 +79,11 @@ pub(super) fn spawn_stdin_control_reader(
                                 auth.verify(value)
                                     .map_err(|e| serde_json::Error::io(std::io::Error::other(e)))
                             })
-                    } else if value.get("kind").and_then(|v| v.as_str()) == Some("message") && auth.is_some() {
+                    } else if matches!(
+                        value.get("kind").and_then(|v| v.as_str()),
+                        Some("message" | "message_result")
+                    ) && auth.is_some()
+                    {
                         Err(serde_json::Error::io(std::io::Error::other("unsigned mailbox frame")))
                     } else {
                         Ok(value)
@@ -91,6 +95,9 @@ pub(super) fn spawn_stdin_control_reader(
                 continue;
             };
             match frame {
+                WorkerControlFrame::MessageResult { message_id, result } => {
+                    crate::messaging::worker::resolve_publication(message_id, result);
+                }
                 WorkerControlFrame::Steer { message } => {
                     if steer_tx.blocking_send(message).is_err() {
                         break;
