@@ -145,7 +145,10 @@ impl LiveTurn for RunApprovalResolver {
                 tracing::warn!("rf approval ledger refused a call");
                 ToolApprovalDecision::Denied {
                     cause: crate::tools::ApprovalDenialCause::LedgerRefused,
-                    reason: crate::security::redaction::redacted_error_report(&error),
+                    reason: format!(
+                        "Approval policy refused this call (ledger_refused): {}. Do not retry this call",
+                        crate::security::redaction::redacted_error_report(&error)
+                    ),
                 }
             }
         }
