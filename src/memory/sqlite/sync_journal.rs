@@ -433,8 +433,12 @@ impl SyncStore for SqliteMemory {
             return Ok(None);
         };
         anyhow::ensure!(h.owner == owner, crate::memory::sync::SyncError::InvalidSource);
+        // Descendant headers retain the root's agent and incarnation. Its
+        // approval surface belongs to that root even after its turn ended.
+        let session = h.root_session.as_ref().unwrap_or(&h.session);
+        let run = h.root_run_id.as_ref().or(h.run_id.as_ref());
         Ok(Some(
-            serde_json::json!({"session":h.session,"agent":h.agent,"incarnation":h.incarnation,"run_id":h.run_id}),
+            serde_json::json!({"session":session,"agent":h.agent,"incarnation":h.incarnation,"run_id":run}),
         ))
     }
 
