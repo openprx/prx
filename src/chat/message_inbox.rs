@@ -91,7 +91,7 @@ pub(super) fn cause(message: &ChannelMessage) -> Option<&str> {
 
 pub(super) async fn send_command(
     config: &crate::config::Config,
-    memory:&Arc<dyn crate::memory::Memory>,
+    memory: &Arc<dyn crate::memory::Memory>,
     parent: &str,
     focused: Option<&str>,
     message: &ChannelMessage,
@@ -123,7 +123,8 @@ pub(super) async fn send_command(
     let level = if source_session == parent {
         config.autonomy.level
     } else {
-        let store = memory.child_session_store()
+        let store = memory
+            .child_session_store()
             .ok_or_else(|| anyhow::anyhow!("child store unavailable"))?;
         let record = store
             .sessions(&runtime.workspace, &owner)?

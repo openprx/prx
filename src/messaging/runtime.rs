@@ -121,7 +121,7 @@ impl MessagingRuntime {
         let drainer: Arc<dyn super::mailbox::MailboxCacheDrainer> = runtime.clone();
         runtime.store.register_drainer(&drainer);
         if config.a2a.messaging_enabled {
-            super::a2a::RemoteTransport::new(config).start(runtime.clone());
+            super::a2a::RemoteTransport::new(config).start(runtime.clone())?;
         }
         runtimes.insert(path, Arc::downgrade(&runtime));
         Ok(runtime)

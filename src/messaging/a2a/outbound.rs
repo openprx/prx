@@ -97,12 +97,21 @@ impl RemoteTransport {
             result=request=>result,
         }
     }
-    pub(crate) fn start(self, runtime: Arc<MessagingRuntime>) {
+    pub(crate) fn start(self, runtime: Arc<MessagingRuntime>) -> anyhow::Result<()> {
+        let lease = super::leader::open(&self.trust.config.workspace_dir)?;
+        let mut leader = super::leader::claim(&lease)?;
         tokio::spawn(async move {
             let _monitor = self.clients.monitor();
             let mut interval = tokio::time::interval(Duration::from_secs(1));
             loop {
                 interval.tick().await;
+                if !leader {
+                    match super::leader::claim(&lease) {
+                        Ok(true) => leader = true,
+                        Ok(false) => continue,
+                        Err(_) => break,
+                    }
+                }
                 let Ok(sources) = runtime.store.outbox_sources() else {
                     continue;
                 };
@@ -166,6 +175,7 @@ impl RemoteTransport {
                 }
             }
         });
+        Ok(())
     }
 }
 fn retry_after(response: &reqwest::Response) -> Option<u64> {

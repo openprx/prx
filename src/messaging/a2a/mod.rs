@@ -3,6 +3,7 @@ pub mod cli;
 mod clients;
 mod connections;
 pub mod identity;
+mod leader;
 mod listener;
 mod outbound;
 pub mod peers;
