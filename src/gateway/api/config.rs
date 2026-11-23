@@ -944,6 +944,7 @@ fn resolve_config_file_path(config_path: &std::path::Path, filename: &str) -> Re
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::declare_chat_model;
     use super::AppState;
     use crate::config::Config;
     use crate::config::secret_paths::{self, fixture};
@@ -1490,6 +1491,7 @@ mod tests {
             config.default_provider = Some("openai".to_string());
             config.default_model = Some("gpt-4o".to_string());
             config.api_key = Some("sentinel-root-owner-key".to_string());
+            declare_chat_model(config, "anthropic", "claude-sonnet-4-5");
         })
         .await;
         let before = disk(&state);
@@ -1516,6 +1518,7 @@ mod tests {
             config.default_provider = Some("openai".to_string());
             config.default_model = Some("gpt-4o".to_string());
             config.api_key = Some(PLAIN.to_string());
+            declare_chat_model(config, "anthropic", "claude-sonnet-4-5");
         })
         .await;
         let stored = disk(&state);
@@ -2672,7 +2675,11 @@ mod tests {
     /// onto the older desired configuration. After: 409, the edit survives.
     #[tokio::test]
     async fn post_config_never_overwrites_an_edit_it_has_not_seen() {
-        let (_dir, state, base, server) = on_disk(|_| {}).await;
+        let (_dir, state, base, server) = on_disk(|config| {
+            let provider = crate::providers::selection::default_provider(config).to_owned();
+            declare_chat_model(config, &provider, "posted-model");
+        })
+        .await;
         let path = state.config.desired().config.config_path.clone();
         let edited = disk(&state).replacen("default_temperature = 0.7", "default_temperature = 0.4", 1);
         assert_ne!(edited, disk(&state), "test precondition: the edit applies");

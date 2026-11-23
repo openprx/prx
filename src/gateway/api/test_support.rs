@@ -187,6 +187,17 @@ async fn saved_defaults(edit: impl FnOnce(&mut Config)) -> (tempfile::TempDir, C
     (dir, loaded)
 }
 
+/// Declare `model` on `provider` with chat and native tools, so the
+/// capability check admits the selection a test writes.
+pub(super) fn declare_chat_model(config: &mut Config, provider: &str, model: &str) {
+    config.providers.models.push(
+        toml::from_str(&format!(
+            "provider = \"{provider}\"\nmodel = \"{model}\"\noperations = [\"chat\"]\nnative_tools = true\n"
+        ))
+        .expect("test: a valid [[providers.models]] entry"),
+    );
+}
+
 /// Save `edit`ed defaults (default provider `openai`, model `gpt-4o`) to a
 /// temp dir, load them back, and serve them.
 pub(super) async fn serve_config(edit: impl FnOnce(&mut Config)) -> Served {

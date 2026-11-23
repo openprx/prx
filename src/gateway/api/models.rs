@@ -354,7 +354,7 @@ pub async fn delete_route(
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::{at, json, serve_config};
+    use super::super::test_support::{at, declare_chat_model, json, serve_config};
     use reqwest::Method;
     use serde_json::json;
 
@@ -563,7 +563,11 @@ mod tests {
     #[tokio::test]
     async fn switching_the_default_away_from_the_root_key_needs_the_choice_and_confirmation() {
         const KEY: &str = "pmmf-root-key-sentinel";
-        let served = serve_config(|config| config.api_key = Some(KEY.into())).await;
+        let served = serve_config(|config| {
+            config.api_key = Some(KEY.into());
+            declare_chat_model(config, "anthropic", "claude-sonnet-4-5");
+        })
+        .await;
         let before = served.disk();
         let switch = json!({"provider": "anthropic", "model": "claude-sonnet-4-5"});
 

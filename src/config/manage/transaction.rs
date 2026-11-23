@@ -2187,7 +2187,11 @@ mod tests {
         let first = apply_structured(&fixture, |config| config.default_temperature = 0.6, Some(&base));
         let second = apply_structured(
             &fixture,
-            |config| config.default_model = Some("second-writer".into()),
+            |config| {
+                config.default_model = Some("second-writer".into());
+                let provider = crate::providers::selection::default_provider(config).to_owned();
+                declare_chat(config, &provider, "second-writer");
+            },
             Some(&base),
         );
         let (first, second) = tokio::join!(first, second);
@@ -2836,6 +2840,17 @@ mod tests {
         format!("custom:http://alice:{USERINFO_PW}@127.0.0.1:1/v1")
     }
 
+    /// Declares chat and native tools for `model` on `provider`, so the
+    /// capability check admits the selection the test writes.
+    fn declare_chat(config: &mut crate::config::Config, provider: &str, model: &str) {
+        config.providers.models.push(
+            toml::from_str(&format!(
+                "provider = \"{provider}\"\nmodel = \"{model}\"\noperations = [\"chat\"]\nnative_tools = true\n"
+            ))
+            .expect("test: a valid [[providers.models]] entry"),
+        );
+    }
+
     /// RED before PMMD-g (N-2): a raw write that puts C2BU's `[redacted]@`
     /// placeholder where real URL userinfo is stored was accepted with the
     /// flag, and the real userinfo was gone.
@@ -2844,7 +2859,10 @@ mod tests {
         let fixture = fixture().await;
         apply_structured(
             &fixture,
-            |config| config.default_provider = Some(userinfo_provider()),
+            |config| {
+                config.default_provider = Some(userinfo_provider());
+                declare_chat(config, &userinfo_provider(), "anthropic/claude-sonnet-5");
+            },
             None,
         )
         .await
@@ -3335,12 +3353,29 @@ mod tests {
         let fixture = fixture().await;
         let old = "custom:http://alice:pmmd8-old-password@127.0.0.1:9/v1";
         let new = "custom:http://alice:pmmd8-new-password@127.0.0.1:9/v1";
-        apply_structured(&fixture, |config| config.default_provider = Some(old.into()), None)
-            .await
-            .expect("test: store the old userinfo");
-        let rotated = apply_structured(&fixture, |config| config.default_provider = Some(new.into()), None)
-            .await
-            .expect("test: rotate it");
+        apply_structured(
+            &fixture,
+            |config| {
+                config.default_provider = Some(old.into());
+                declare_chat(config, old, "anthropic/claude-sonnet-5");
+            },
+            None,
+        )
+        .await
+        .expect("test: store the old userinfo");
+        let rotated = apply_structured(
+            &fixture,
+            |config| {
+                // Drop the old declaration: it carries the old password, and a
+                // rollback must still find that password absent from the current config.
+                config.providers.models.clear();
+                config.default_provider = Some(new.into());
+                declare_chat(config, new, "anthropic/claude-sonnet-5");
+            },
+            None,
+        )
+        .await
+        .expect("test: rotate it");
         let on_disk = fixture.tree();
         let revision = current_revision(&fixture);
 
