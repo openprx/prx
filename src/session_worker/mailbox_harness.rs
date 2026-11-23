@@ -55,11 +55,6 @@ impl Factory {
             record.child_session = Some(crate::chat::sessions::child::ChildSessionMetadata {
                 addr: addr.clone(),
                 provider: None,
-                recipe: Some(crate::chat::sessions::child::RelaunchRecipe {
-                    addr: addr.clone(),
-                    last_run: Some(manifest.run_id.clone()),
-                    inherited_provenance: manifest.inherited_provenance.clone(),
-                }),
                 mailbox_projection: std::collections::BTreeMap::new(),
             });
             Ok(record.to_json()?)
@@ -188,7 +183,11 @@ impl WorkerMailboxFactory for Factory {
         Ok(WorkerMailboxBinding {
             address: worker,
             frames: WorkerFrameChannels {
-                controls: WorkerControlQueue { receiver, owner: actor },
+                controls: WorkerControlQueue {
+                    auth: Some(crate::session_worker::frame_auth::FrameAuth::parent(&manifest.run_id)?),
+                    receiver,
+                    owner: actor,
+                },
                 outputs,
             },
         })
@@ -266,7 +265,6 @@ pub async fn run(workspace: &Path, turns: usize) -> Result<()> {
         "prx-mailbox-harness".into(),
         [31; 32],
         Arc::new(SystemMailboxClock),
-        config.a2a.remote_tree.clone(),
     )?;
     let factory = Arc::new(Factory {
         memory: Arc::clone(&memory),

@@ -15,6 +15,7 @@ struct PendingSend {
 }
 
 pub struct SqliteMailboxSender {
+    chain: Option<crate::messaging::CausalChain>,
     store: SqliteMailbox,
     source: SessionAddr,
     scope: MailboxScope,
@@ -35,12 +36,17 @@ impl SqliteMailboxSender {
         }
         store.validate_scope(&scope, &source)?;
         Ok(Self {
+            chain: None,
             store,
             source,
             scope,
             resolver,
             inherited,
         })
+    }
+    pub fn with_chain(mut self, chain: Option<crate::messaging::CausalChain>) -> Self {
+        self.chain = chain;
+        self
     }
 }
 #[async_trait]
@@ -49,6 +55,17 @@ impl MailboxSender for SqliteMailboxSender {
         &self.source
     }
     async fn send(&self, target: SessionAddr, text: String, mime: String) -> MailboxResult<MailboxPublished> {
+        self.send_with_id(target, text, mime, Uuid::new_v4()).await
+    }
+}
+impl SqliteMailboxSender {
+    pub(crate) async fn send_with_id(
+        &self,
+        target: SessionAddr,
+        text: String,
+        mime: String,
+        id: Uuid,
+    ) -> MailboxResult<MailboxPublished> {
         crate::messaging::mailbox::validate_body(&mime, text.as_bytes())?;
         if text.is_empty() {
             return Err(MailboxError::InvalidMetadata);
@@ -68,8 +85,7 @@ impl MailboxSender for SqliteMailboxSender {
         {
             return Err(MailboxError::Unauthorized);
         }
-        let id = Uuid::new_v4();
-        let message = PrxMessage {
+        let mut message = PrxMessage {
             id,
             idempotency: IdempotencyKey::parse(&id.to_string()).map_err(|_| MailboxError::InvalidMetadata)?,
             stream_id: None,
@@ -91,6 +107,9 @@ impl MailboxSender for SqliteMailboxSender {
             exec: None,
             canonical_hash: None,
         };
+        if let Some(chain) = &self.chain {
+            crate::messaging::stamp_outbound(chain, &mut message);
+        }
         self.store.publish_current(
             &resolved.authority,
             message,

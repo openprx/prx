@@ -10,6 +10,9 @@ use std::sync::{
 use tokio_util::sync::CancellationToken;
 
 pub(crate) struct OperatorSpawnSource {
+    message_event: Option<String>,
+    message_permit: Option<Arc<crate::runtime::agent_admission::AgentTurnPermit>>,
+    message_input: Option<crate::messaging::runtime::MessageInput>,
     continuation: Option<crate::memory::child_sessions::ChildSessionRecord>,
     proof: OwnedTurnSourceProof,
     generation: Arc<crate::config::ConfigGeneration>,
@@ -87,6 +90,9 @@ impl OperatorSpawnSource {
             "operator model source differs from pinned PMM selection"
         );
         Ok(Self {
+            message_event: None,
+            message_permit: None,
+            message_input: None,
             continuation: None,
             catalog,
             resolved,
@@ -118,6 +124,59 @@ impl OperatorSpawnSource {
         );
         self.continuation = Some(record);
         Ok(self)
+    }
+
+    /// A mailbox wake authorizes exactly one existing receiver session. It
+    /// never authorizes a new spawn or an operator command in the message body.
+    pub(crate) async fn for_message(
+        mut self,
+        record: crate::memory::child_sessions::ChildSessionRecord,
+        input: &crate::messaging::runtime::MessageInput,
+    ) -> anyhow::Result<Self> {
+        let runtime = crate::messaging::runtime::MessagingRuntime::for_config(&self.generation.effective)?;
+        input.verify(&runtime)?;
+        let id = input
+            .receipt
+            .adopted_message_event_id
+            .ok_or_else(|| anyhow::anyhow!("mailbox adoption missing"))?
+            .to_string();
+        let event = self
+            .fabric
+            .memory()
+            .find_owned_message_event(&record.workspace, &record.owner, &id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("mailbox input is no longer live"))?;
+        anyhow::ensure!(
+            input.message.to.session == record.session_key
+                && input.message.to.owner == record.owner
+                && event.session_key.as_deref() == Some(record.session_key.as_str())
+                && event.role == "user"
+                && event.source.as_str() == "prx_mailbox"
+                && event.content == input.text
+                && input.auto_start(),
+            "mailbox wake identity differs"
+        );
+        self = self.for_continuation(record)?;
+        let runtime = crate::messaging::runtime::MessagingRuntime::for_config(&self.generation.effective)?;
+        let scope = runtime.resolve_scope(&input.message.to)?;
+        let root = input.message.to.agent.clone();
+        runtime.store.validate_scope(&scope, &input.message.to)?;
+        self.message_permit =
+            crate::runtime::agent_admission::admit(&self.generation.effective, self.proof.owner_id(), &root)?
+                .map(Arc::new);
+        self.message_event = Some(id);
+        self.message_input = Some(input.clone());
+        Ok(self)
+    }
+
+    pub(crate) const fn is_message_continuation(&self) -> bool {
+        self.message_event.is_some() && self.continuation.is_some()
+    }
+    pub(crate) fn message_input(&self) -> Option<crate::messaging::runtime::MessageInput> {
+        self.message_input.clone()
+    }
+    pub(crate) fn message_permit(&self) -> Option<Arc<crate::runtime::agent_admission::AgentTurnPermit>> {
+        self.message_permit.clone()
     }
 
     pub(crate) async fn scope<F: std::future::Future>(self, work: F) -> F::Output {
@@ -162,7 +221,10 @@ impl OperatorSpawnSource {
         scope.channel = Some(self.proof.policy_channel().to_owned());
         scope.sender = Some(self.proof.policy_sender().to_owned());
         scope.recipient = self.proof.memory_scope().chat_id.clone();
-        scope.causation_event_id = self.proof.source_event_id().map(str::to_owned);
+        scope.causation_event_id = self
+            .message_event
+            .clone()
+            .or_else(|| self.proof.source_event_id().map(str::to_owned));
         scope.config_generation_id = Some(self.generation.id.0);
         scope.config_source_revision = Some(self.generation.source_revision.fingerprint_sha256.clone());
         Ok(())
@@ -208,15 +270,15 @@ pub(crate) fn claim(args: &serde_json::Value) -> anyhow::Result<Option<Arc<Opera
                     } else {
                         "spawn"
                     })
-            && match &source.continuation {
-                Some(record) =>
-                    args.get("session_key").and_then(serde_json::Value::as_str) == Some(record.session_key.as_str())
-                        && args.get("mode").and_then(serde_json::Value::as_str) == Some(record.mode.as_str())
-                        && args.get("agent").and_then(serde_json::Value::as_str).unwrap_or("main") == record.agent,
-                None => !["session_key", "mode", "agent"]
+            && source.continuation.as_ref().map_or_else(
+                || !["session_key", "mode", "agent"]
                     .iter()
                     .any(|key| args.get(key).is_some()),
-            },
+                |record| args.get("session_key").and_then(serde_json::Value::as_str)
+                    == Some(record.session_key.as_str())
+                    && args.get("mode").and_then(serde_json::Value::as_str) == Some(record.mode.as_str())
+                    && args.get("agent").and_then(serde_json::Value::as_str).unwrap_or("main") == record.agent
+            ),
         "operator spawn differs from captured command"
     );
     anyhow::ensure!(

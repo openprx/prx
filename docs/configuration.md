@@ -136,7 +136,7 @@ and the module-gate family are absorbed on load; they are not live switches.
 | `[composio]` | `api_key` unset; `entity_id = "default"` |
 | `[mcp]` | `servers = {}`; `workspace_servers = "off"` (`http_only` or `stdio` to widen). A server: `transport = "stdio"`; `command`/`url` unset; `args = []`; `env = {}`; `startup_timeout_ms = 10000`; `request_timeout_ms = 30000`; `tool_name_prefix = "mcp"`; `allow_tools`/`deny_tools = []`; `working_dir` unset |
 | `[mcp_server]` | `bind = "127.0.0.1:16831"`; `require_auth = true`; `exposed_tools` the read-only set (`memory_search`, `memory_recall`, `memory_get`, `document_search`, `document_get_chunk`, `sessions_list`, `sessions_history`); `allowed_origins = ["claude.ai", "openai.com", "localhost"]`; `rate_limit_rps = 10`; JWT fields unset; `jwt_jwks_cache_ttl_secs = 300`; `jwt_algorithms = ["RS256"]` |
-| `[a2a]` | `bind = "127.0.0.1:16832"`; `agent_id = "prx-default"`; `spiffe_id = "spiffe://prx-local/agent/prx-default"`; `discovery_advertised = false`; `allowed_peer_issuers = []`; `handoff_nonce_ttl_seconds = 3600`; `card_signing_key_path` unset; `card_ttl_seconds = 3600`; `card_jwks_uri` unset; `trusted_trust_domains = []`; `spiffe_trust_bundle_pem` unset; `spiffe_strict_validation = false`; `tls_cert_path`/`tls_key_path`/`client_ca_path` unset; `messaging_enabled = false`; `[a2a.remote_tree]` `max_spawned = 16`, `max_scheduled = 4`, `max_connections = 4`, `max_sends = 4`; `peers = {}`; `credentials = {}`. When `messaging_enabled` is true, a non-loopback bind is refused at load unless `tls_cert_path` and `tls_key_path` are set. With messaging disabled, the existing advertised bind remains accepted. TLS files are read at use. Messaging routes stay unregistered while `messaging_enabled` is false |
+| `[a2a]` | Messaging is disabled by default (`messaging_enabled = false`). `bind = "127.0.0.1:16832"`, `trust_domain = "prx.local"`. Run `prx a2a init` before enabling messaging. The dedicated listener always requires pinned mutual TLS, including on loopback. `[a2a.peers.<name>]` has `spiffe_id`, `fingerprints` (one or two full SHA-256 certificate fingerprints), `address` (`host:port`), `owner`, `sessions` and `agents` (default `["*"]`). Legacy discovery/card fields retain their existing behavior. |
 | `[auth]` | `codex_auth_json_auto_import = false`; `codex_auth_json_path` the platform Codex `auth.json` |
 | `[secrets]` | `encrypt = true` |
 | `[browser]` | `allowed_domains = []` (`web_fetch`); `computer_use.api_key` unset (retained for secret handling; browser automation tools are gone) |
@@ -3468,3 +3468,46 @@ The rf gateway's approve-and-continue wait is `approval_wait_secs`: set it in
 seconds and accepts 1–86400. Waiting pauses that turn's idle detector; other
 turns retain their own idle windows. Console approval expiry remains four
 minutes. See [the rf live-frame and approval contract](rf-contract/capability-tokens.md#live-frames-and-run-approvals-b2).
+
+## Session messaging
+
+`[agent.messaging] inbound = true` controls Main. Each
+`[agents.<name>.messaging] inbound = true` controls that agent. Both default to
+true. Messages are user data; an approval-looking body grants no permission.
+An idle receiver starts a turn at its own level and budget; a busy receiver
+queues it. After eight automatic hops, delivery continues without starting a
+turn. The chain bound stops loops between honest instances; peers can be revoked.
+
+For cross-machine messaging, initialize each instance, exchange its printed
+SPIFFE ID and full certificate fingerprint, and add each side explicitly:
+
+```sh
+prx a2a init
+prx a2a peer add peer_a --spiffe spiffe://prx.local/prx/00000000-0000-4000-8000-000000000001 --fingerprint <64-lowercase-hex> --address example.com:16832 --owner <local-receiving-owner>
+prx a2a peer list
+prx a2a peer remove peer_a
+```
+
+Set `a2a.messaging_enabled = true` and the listener bind, then run the daemon or
+gateway. Identity files live under the workspace's `a2a/`: directory mode 0700,
+private files 0600. Wider permissions are refused. Unix mode enforcement does
+not apply on Windows. Keys are separate from memory exports and backups.
+
+Use `prx a2a init --prepare-rotate` to stage a new certificate/key and print
+its fingerprint while the current identity remains active. Add that fingerprint
+on the other instance using the existing peer name, then run `prx a2a init
+--rotate` to activate the staged identity atomically. It keeps the persisted
+UUID and SPIFFE ID. Remove the old pin with `a2a peer remove <name>
+--fingerprint <old-fingerprint>`. A peer accepts at most two fingerprints during
+overlap. Removal and rotation close connections and cancel outstanding client
+requests; TLS sessions are never resumed. Certificates expire after five years.
+`a2a init` displays the local expiry; `a2a peer list` obtains each remote expiry
+through authenticated TLS and reports when a peer is unreachable or refused.
+
+The outbox persists retries for up to 24 hours, below the seven-day replay
+window. Authentication, authorization, malformed-chain and oversized-message
+refusals are permanent. Network failures, 429 and server failures retry with
+jitter and `Retry-After`. A receiver pin is refreshed before each attempt;
+recipient incarnation changes fail rather than redirect old data. To roll back,
+disable messaging and restart the gateway; retain the outbox and identity files.
+There are no remote-tree permission caps. Queue/body storage bounds remain.

@@ -55,11 +55,11 @@ const ALLOWED_BRAIN_DB_OPENS_OUTSIDE_SQLITE_REPOSITORY: &[&str] = &[
     "src/memory/sqlite/ingress_recovery.rs::inspect_unsettled_ingress::let connection = Connection::open_with_flags(&canonical, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;",
     // D-107 amendment: the doctor reads the cron and Xin stores read-only.
     "src/doctor/mod.rs::read_only_unowned_rows::let connection = rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;",
-    "src/doctor/mod.rs::doctor_names_shell_jobs_without_a_recorded_creator::rusqlite::Connection::open(&db_path)",
+    "src/doctor/tests.rs::doctor_names_shell_jobs_without_a_recorded_creator::rusqlite::Connection::open(&db_path)",
     "src/doctor/mod.rs::read_only_sqlite_session_count::let conn = rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;",
     // Test-only legacy rows intentionally bypass the new public write guard so
     // the migration and doctor can prove they repair pre-guard data.
-    "src/doctor/mod.rs::doctor_reports_legacy_fitness_counts_and_repair_command::let connection = rusqlite::Connection::open(config.workspace_dir.join(\"memory/brain.db\")).unwrap();",
+    "src/doctor/tests.rs::doctor_reports_legacy_fitness_counts_and_repair_command::let connection = rusqlite::Connection::open(config.workspace_dir.join(\"memory/brain.db\")).unwrap();",
     "src/fitness_cli.rs::migration_exports_then_removes_legacy_rows_and_projections::let connection = rusqlite::Connection::open(db_path).unwrap();",
     // Test-only, read-only (V02-R9): the handler refusal test must prove that a
     // refused `memory_store` left the victim row's `owner_id` unchanged and wrote
@@ -260,7 +260,7 @@ fn brain_db_is_not_opened_outside_the_sqlite_repository() {
             }
         }
         let source = read_source(&path);
-        if !source.contains("brain.db") {
+        if !source.contains("brain.db") && relative != "src/doctor/mod.rs" {
             continue;
         }
         let lines = source.lines().collect::<Vec<_>>();

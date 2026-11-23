@@ -90,6 +90,7 @@ mod external_editor;
 mod file_mention;
 mod input_queue;
 mod line_approval;
+mod message_inbox;
 mod model_commands;
 mod output;
 mod plain_queue;
@@ -110,7 +111,8 @@ mod tests;
 
 #[cfg(test)]
 pub(crate) use self::bootstrap::chat_provider_chain;
-use self::chat_events::{chat_runtime_envelope, chat_session_id_from_key};
+pub(crate) use self::chat_events::chat_runtime_envelope;
+use self::chat_events::chat_session_id_from_key;
 #[cfg(test)]
 use self::chat_events::{
     finalize_chat_non_success_turn, finalize_chat_success_turn, record_chat_user_message_event_in_generation,

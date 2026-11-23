@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 /// Explicitly supplied by the dormant mailbox runtime; no factory installs it.
 pub struct WorkerControlQueue {
     pub receiver: mpsc::Receiver<WorkerControlFrame>,
+    pub auth: Option<super::frame_auth::FrameAuth>,
     /// Drops after the receiver and all queued payloads.
     pub owner: std::sync::Arc<dyn Send + Sync>,
 }
@@ -49,6 +50,16 @@ pub async fn read_worker_frames<R>(
 where
     R: AsyncRead + Unpin,
 {
+    read_worker_frames_authenticated(reader, frames, progress, limit, None).await
+}
+
+pub(crate) async fn read_worker_frames_authenticated<R: AsyncRead + Unpin>(
+    reader: R,
+    frames: Option<mpsc::Sender<WorkerOutputFrame>>,
+    progress: Option<std::sync::Arc<crate::agent::idle::ProgressBeat>>,
+    limit: u64,
+    auth: Option<super::frame_auth::FrameAuth>,
+) -> Result<Vec<u8>> {
     use tokio::io::AsyncReadExt;
     let reader = ProgressReader {
         inner: reader,
@@ -79,6 +90,10 @@ where
         }
         let value: serde_json::Value = serde_json::from_slice(&line).context("invalid worker stdout JSON line")?;
         if value.get("kind").is_some() {
+            let value = match &auth {
+                Some(auth) => auth.verify(value)?,
+                None => value,
+            };
             let frame: WorkerOutputFrame = serde_json::from_value(value).context("invalid worker output frame")?;
             if let Some(frames) = &frames {
                 frames.send(frame).await.context("worker frame receiver closed")?;

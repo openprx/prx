@@ -749,6 +749,7 @@ async fn run_internal(
             // seq, so the main loop restores `Main` (when None) or `Session { seq }`.
             let mut attached_follow_seq: Option<u64> = None;
             let mut child_focus = super::child_focus::ChildFocus::default();
+            let mut message_inbox = super::message_inbox::ChatInbox::open(&config, &chat_session_key)?;
             // Guards the event-drain select arm: once the event channel closes (only at
             // shutdown — the sender lives as long as the tool registry) we disable the
             // arm so a closed channel does not busy-spin returning `None`.
@@ -812,6 +813,7 @@ async fn run_internal(
             let assignment_enrolment = if one_shot.is_none() {
                 start_assignment_enrolment(
                     &config,
+                    &chat_session_key,
                     &chat_sessions,
                     &assignment_input_tx,
                     &chat_dispatcher,
@@ -853,7 +855,10 @@ async fn run_internal(
                     surface_session_message(&chat_dispatcher, sessions_redraw_handle.as_ref(), &error.to_string());
                     continue;
                 }
-                if let Some(target) = attached_follow.as_ref() {
+                if let Some(target) = attached_follow
+                    .as_ref()
+                    .filter(|_| super::is_local_operator_input(&msg) && !msg.sender_is_bot)
+                {
                     match child_focus
                         .submit(
                             target.as_str(),
@@ -886,6 +891,52 @@ async fn run_internal(
                         Ok(None) => {}
                     }
                 }
+                if msg.id == "mailbox-wake" && msg.sender == "session-message" && msg.sender_is_bot {
+                    if let Some(inbox) = message_inbox.as_mut() {
+                        inbox.wake();
+                    }
+                    continue;
+                }
+                if one_shot.is_none()
+                    && super::is_local_operator_input(&msg)
+                    && !msg.sender_is_bot
+                    && msg.content.starts_with("/msg ")
+                {
+                    let result = super::message_inbox::send_command(
+                        &config,
+                        &chat_session_key,
+                        attached_follow.as_ref().map(|id| id.as_str()),
+                        &msg,
+                        &mut chat_sessions,
+                    )
+                    .await;
+                    match result {
+                        Ok(output) => {
+                            surface_session_message(&chat_dispatcher, sessions_redraw_handle.as_ref(), &output)
+                        }
+                        Err(error) => surface_session_message(
+                            &chat_dispatcher,
+                            sessions_redraw_handle.as_ref(),
+                            &error.to_string(),
+                        ),
+                    }
+                    continue;
+                }
+                let mut mailbox_input = if let Some(inbox) = message_inbox.as_mut() {
+                    match inbox.take_input(&msg) {
+                        Ok(input) => input,
+                        Err(error) => {
+                            surface_session_message(
+                                &chat_dispatcher,
+                                sessions_redraw_handle.as_ref(),
+                                &error.to_string(),
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
                 let user_input = msg.content.clone();
                 let synthetic_ui_command = is_synthetic_ui_command(&msg);
                 // Armed here, at the top, because the turn body has many exits — a
@@ -970,7 +1021,7 @@ async fn run_internal(
                     print_fallback_chat_output(text);
                 };
 
-                include!("run/commands.rs");
+                let () = include!("run/commands.rs");
 
                 include!("run/provider_turn.rs");
             }

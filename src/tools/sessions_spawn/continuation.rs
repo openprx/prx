@@ -100,7 +100,16 @@ impl SessionsSpawnTool {
                     )),
             "child_session_busy"
         );
-        let history = store.history(&record)?;
+        let mut history = store.history(&record)?;
+        if let Some(input) = operator.as_ref().and_then(|source| source.message_input()) {
+            anyhow::ensure!(
+                history
+                    .last()
+                    .is_some_and(|turn| turn.role == "user" && turn.content == input.text),
+                "adopted input is not the pending child turn"
+            );
+            history.pop();
+        }
         let mut launch = args.clone();
         let object = launch
             .as_object_mut()

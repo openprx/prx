@@ -273,7 +273,7 @@ const CATCH_UNWIND_FILES: &[&str] = &[
     "src/providers/label_redaction_tests.rs",
     "src/runtime/decision_accounting/transport_tests.rs",
     "src/runtime/h2_entry/authority/tests.rs",
-    "src/tools/delegate.rs",
+    "src/tools/delegate/tests.rs",
     "src/tools/delegate_diagnostic.rs",
     "src/tools/sessions_spawn/tests/lineage.rs",
     "src/tools/sessions_spawn/tests/owned_child.rs",

@@ -811,7 +811,7 @@ fn mutation_proof_compaction_producer_guard() {
         ),
         ("src/chat/run/entry.rs", "        Some(producer),", "        None,"),
         (
-            "src/chat/run.rs",
+            "src/chat/run/provider_turn.rs",
             "compaction_config: Some(effective_compaction.config.clone())",
             "compaction_config: Some(config.agent.compaction.clone())",
         ),
@@ -841,12 +841,12 @@ fn mutation_proof_compaction_producer_guard() {
 fn mutation_proof_gateway_registration_guard() {
     for (path, old, new) in [
         (
-            "src/gateway/mod.rs",
+            "src/gateway/implementation/section_2.rs",
             "run_gateway_inner(host, port, config, shared_config, shutdown, None).await",
             "Ok(())",
         ),
         (
-            "src/gateway/mod.rs",
+            "src/gateway/implementation/section_2.rs",
             "let (channels_registry, spawn_tools_handle) = register_gateway_turn_tools(",
             "let (channels_registry, spawn_tools_handle) = unreviewed_gateway_turn_tools(",
         ),

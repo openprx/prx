@@ -41,6 +41,7 @@ fn test_remove_env(key: impl AsRef<std::ffi::OsStr>) {
 
 fn agentic_delegate_config(allowed_tools: Vec<String>) -> DelegateAgentConfig {
     DelegateAgentConfig {
+        messaging: crate::config::schema::AgentMessaging::default(),
         approval_wait_secs: 600,
         limits: crate::config::AgentLimits::default(),
         provider: "openrouter".into(),

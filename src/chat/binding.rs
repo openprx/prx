@@ -376,6 +376,7 @@ impl Drop for ChatAdmissionGuard {
 /// Private fields keep mailbox content and decoded tool arguments from minting
 /// an operator command or replacing the model after verification.
 pub(super) struct ChatOperatorSpawn {
+    mailbox: Option<crate::messaging::runtime::MessageInput>,
     child: Option<crate::memory::child_sessions::ChildSessionRecord>,
     command: String,
     binding: ChatProviderBinding,
@@ -405,6 +406,7 @@ impl ChatOperatorSpawn {
         );
         binding.verify(generation, provider, provider_name, model_name)?;
         Ok(Self {
+            mailbox: None,
             child: None,
             command: message.content.clone(),
             binding: ChatProviderBinding {
@@ -433,12 +435,34 @@ impl ChatOperatorSpawn {
         );
         binding.verify(&binding.generation, &binding.provider, &record.provider, &record.model)?;
         Ok(Self {
-            command: message.content.clone(),
+            mailbox: None,
+            command: format!("Continue child session {}", record.session_key),
             provider: record.provider.clone(),
             model: record.model.clone(),
             child: Some(record),
             binding,
             task: task.to_owned(),
+        })
+    }
+
+    pub(super) fn capture_message(
+        input: crate::messaging::runtime::MessageInput,
+        record: crate::memory::child_sessions::ChildSessionRecord,
+        binding: ChatProviderBinding,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            input.auto_start() && input.message.to.session == record.session_key,
+            "mailbox wake target differs"
+        );
+        binding.verify(&binding.generation, &binding.provider, &record.provider, &record.model)?;
+        Ok(Self {
+            command: format!("Continue child session {}", record.session_key),
+            task: input.text.clone(),
+            provider: record.provider.clone(),
+            model: record.model.clone(),
+            child: Some(record),
+            mailbox: Some(input),
+            binding,
         })
     }
 
@@ -502,9 +526,18 @@ impl ChatOperatorSpawn {
         )?;
         let mut args = serde_json::json!({ "task": self.task, "provider": self.provider, "model": self.model });
         if let Some(record) = self.child {
-            args["action"] = "continue".into();
-            args["session_key"] = record.session_key.clone().into();
-            source = source.for_continuation(record)?;
+            let object = args.as_object_mut().context("child arguments must be an object")?;
+            object.insert("action".into(), "continue".into());
+            object.insert("session_key".into(), record.session_key.clone().into());
+            object.insert("mode".into(), record.mode.clone().into());
+            if record.agent != "main" {
+                object.insert("agent".into(), record.agent.clone().into());
+            }
+            source = if let Some(input) = self.mailbox {
+                source.for_message(record, &input).await?
+            } else {
+                source.for_continuation(record)?
+            };
         }
         if let Some(guard) = admission_guard {
             guard.handoff();

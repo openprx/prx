@@ -167,6 +167,7 @@ pub(super) fn session_tools(
         ));
         base_tools_vec.push(Box::new(
             crate::tools::SessionsSendTool::with_security(Arc::clone(&active_runs), security.clone())
+                .with_messaging(config)
                 .with_shared_memory(Arc::clone(mem))
                 .with_event_recording(config.memory.event_recording_config()),
         ));

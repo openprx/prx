@@ -125,7 +125,11 @@ pub(in crate::memory::sqlite) fn check_scope(
         params![scope.scope_id.to_string(),scope.workspace_id,scope.owner_id,scope.incarnation.to_string(),scope.generation],
         |row|Ok((row.get::<_,String>(0)?,row.get::<_,Option<String>>(1)?,row.get::<_,String>(2)?,row.get::<_,Option<String>>(3)?))
     ).optional().map_err(storage_error)?.ok_or(MailboxError::StaleIncarnation)?;
-    if row.0 != key || canonical.is_some_and(|expected| row.1.as_deref().is_some_and(|actual| actual != expected)) {
+    let child:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM child_sessions WHERE ma_scope_id=?1 AND owner_id=?2 AND workspace_id=?3 AND session_id=?4 AND json_extract(record,'$.agent')=?5)",
+        params![scope.scope_id.to_string(),scope.owner_id,scope.workspace_id,address.session,address.agent],|r|r.get(0)).map_err(storage_error)?;
+    if (row.0 != key && !child)
+        || canonical.is_some_and(|expected| row.1.as_deref().is_some_and(|actual| actual != expected))
+    {
         return Err(MailboxError::StaleIncarnation);
     }
     if live {

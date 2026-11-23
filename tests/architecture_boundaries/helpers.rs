@@ -39,6 +39,50 @@ pub(super) fn rust_source_files() -> Vec<PathBuf> {
             }
         }
     });
+    files.retain(|path| {
+        ![
+            "src/config/secret_paths/tests/section_1.rs",
+            "src/config/secret_paths/tests/section_2.rs",
+            "src/config/generation/section_1.rs",
+            "src/config/generation/section_2.rs",
+            "src/chat/provider_turns/section_1.rs",
+            "src/chat/provider_turns/section_2.rs",
+            "src/gateway/api/sessions/section_1.rs",
+            "src/gateway/api/sessions/section_2.rs",
+            "src/gateway/api/sessions/section_3.rs",
+            "src/chat/tests/p3_directional_switch_tests/section_1.rs",
+            "src/chat/tests/p3_directional_switch_tests/section_2.rs",
+            "src/chat/tests/p3_directional_switch_tests/section_3.rs",
+            "src/main/section_1.rs",
+            "src/main/section_2.rs",
+            "src/main/section_3.rs",
+            "src/chat/run/event_pump.rs",
+            "src/chat/run/commands.rs",
+            "src/chat/run/provider_turn.rs",
+            "src/doctor/implementation/section_1.rs",
+            "src/doctor/implementation/section_2.rs",
+            "src/doctor/tests/section_1.rs",
+            "src/doctor/tests/section_2.rs",
+            "src/gateway/implementation/section_1.rs",
+            "src/gateway/implementation/section_2.rs",
+            "src/gateway/implementation/section_3.rs",
+            "src/gateway/api/sessions/tests/targeting/section_1.rs",
+            "src/gateway/api/sessions/tests/targeting/section_2.rs",
+            "src/chat/sessions/assignment/section_1.rs",
+            "src/chat/sessions/assignment/section_2.rs",
+            "src/memory/sqlite/events/section_1.rs",
+            "src/memory/sqlite/events/section_2.rs",
+            "src/memory/sqlite/events/section_3.rs",
+            "src/memory/sqlite/tests/mailbox/section_1.rs",
+            "src/memory/sqlite/tests/mailbox/section_2.rs",
+            "src/memory/sqlite/tests/mailbox/section_3.rs",
+            "src/tools/capability/catalog/section_1.rs",
+            "src/tools/capability/catalog/section_2.rs",
+            "src/tools/delegate/tests/section_1.rs",
+            "src/tools/delegate/tests/section_2.rs",
+        ]
+        .contains(&relative_path(path).as_str())
+    });
     files.sort();
     files
 }
@@ -53,7 +97,64 @@ pub(super) fn read_source(path: &Path) -> String {
             .find(|(planted_path, _)| *planted_path == relative)
             .map(|(_, text)| text.clone())
     });
-    planted.unwrap_or_else(|| fs::read_to_string(path).unwrap_or_else(|error| panic!("read {relative}: {error}")))
+    let mut source =
+        planted.unwrap_or_else(|| fs::read_to_string(path).unwrap_or_else(|error| panic!("read {relative}: {error}")));
+    for (owner, included) in [
+        ("src/config/secret_paths/tests.rs", "tests/section_1.rs"),
+        ("src/config/secret_paths/tests.rs", "tests/section_2.rs"),
+        ("src/config/generation.rs", "generation/section_1.rs"),
+        ("src/config/generation.rs", "generation/section_2.rs"),
+        ("src/chat/provider_turns.rs", "provider_turns/section_1.rs"),
+        ("src/chat/provider_turns.rs", "provider_turns/section_2.rs"),
+        ("src/gateway/api/sessions.rs", "sessions/section_1.rs"),
+        ("src/gateway/api/sessions.rs", "sessions/section_2.rs"),
+        ("src/gateway/api/sessions.rs", "sessions/section_3.rs"),
+        (
+            "src/chat/tests/p3_directional_switch_tests.rs",
+            "p3_directional_switch_tests/section_1.rs",
+        ),
+        (
+            "src/chat/tests/p3_directional_switch_tests.rs",
+            "p3_directional_switch_tests/section_2.rs",
+        ),
+        (
+            "src/chat/tests/p3_directional_switch_tests.rs",
+            "p3_directional_switch_tests/section_3.rs",
+        ),
+        ("src/main.rs", "main/section_1.rs"),
+        ("src/main.rs", "main/section_2.rs"),
+        ("src/main.rs", "main/section_3.rs"),
+        ("src/chat/run.rs", "run/event_pump.rs"),
+        ("src/chat/run.rs", "run/commands.rs"),
+        ("src/chat/run.rs", "run/provider_turn.rs"),
+        ("src/doctor/mod.rs", "implementation/section_1.rs"),
+        ("src/doctor/mod.rs", "implementation/section_2.rs"),
+        ("src/doctor/tests.rs", "tests/section_1.rs"),
+        ("src/doctor/tests.rs", "tests/section_2.rs"),
+        ("src/gateway/mod.rs", "implementation/section_1.rs"),
+        ("src/gateway/mod.rs", "implementation/section_2.rs"),
+        ("src/gateway/mod.rs", "implementation/section_3.rs"),
+        ("src/gateway/api/sessions/tests/targeting.rs", "targeting/section_1.rs"),
+        ("src/gateway/api/sessions/tests/targeting.rs", "targeting/section_2.rs"),
+        ("src/chat/sessions/assignment.rs", "assignment/section_1.rs"),
+        ("src/chat/sessions/assignment.rs", "assignment/section_2.rs"),
+        ("src/memory/sqlite/events.rs", "events/section_1.rs"),
+        ("src/memory/sqlite/events.rs", "events/section_2.rs"),
+        ("src/memory/sqlite/events.rs", "events/section_3.rs"),
+        ("src/memory/sqlite/tests/mailbox.rs", "mailbox/section_1.rs"),
+        ("src/memory/sqlite/tests/mailbox.rs", "mailbox/section_2.rs"),
+        ("src/memory/sqlite/tests/mailbox.rs", "mailbox/section_3.rs"),
+        ("src/tools/capability/catalog.rs", "catalog/section_1.rs"),
+        ("src/tools/capability/catalog.rs", "catalog/section_2.rs"),
+        ("src/tools/delegate/tests.rs", "tests/section_1.rs"),
+        ("src/tools/delegate/tests.rs", "tests/section_2.rs"),
+    ] {
+        if relative == owner {
+            let included_path = path.parent().expect("source directory").join(included);
+            source = source.replace(&format!("include!(\"{included}\")"), &read_source(&included_path));
+        }
+    }
+    source
 }
 
 /// Every Rust file the repository owns: the crate sources and the integration
@@ -62,6 +163,50 @@ pub(super) fn rust_source_and_test_files() -> Vec<PathBuf> {
     let mut files = Vec::new();
     collect_rust_files(&repository_root().join("src"), &mut files);
     collect_rust_files(&repository_root().join("tests"), &mut files);
+    files.retain(|path| {
+        ![
+            "src/config/secret_paths/tests/section_1.rs",
+            "src/config/secret_paths/tests/section_2.rs",
+            "src/config/generation/section_1.rs",
+            "src/config/generation/section_2.rs",
+            "src/chat/provider_turns/section_1.rs",
+            "src/chat/provider_turns/section_2.rs",
+            "src/gateway/api/sessions/section_1.rs",
+            "src/gateway/api/sessions/section_2.rs",
+            "src/gateway/api/sessions/section_3.rs",
+            "src/chat/tests/p3_directional_switch_tests/section_1.rs",
+            "src/chat/tests/p3_directional_switch_tests/section_2.rs",
+            "src/chat/tests/p3_directional_switch_tests/section_3.rs",
+            "src/main/section_1.rs",
+            "src/main/section_2.rs",
+            "src/main/section_3.rs",
+            "src/chat/run/event_pump.rs",
+            "src/chat/run/commands.rs",
+            "src/chat/run/provider_turn.rs",
+            "src/doctor/implementation/section_1.rs",
+            "src/doctor/implementation/section_2.rs",
+            "src/doctor/tests/section_1.rs",
+            "src/doctor/tests/section_2.rs",
+            "src/gateway/implementation/section_1.rs",
+            "src/gateway/implementation/section_2.rs",
+            "src/gateway/implementation/section_3.rs",
+            "src/gateway/api/sessions/tests/targeting/section_1.rs",
+            "src/gateway/api/sessions/tests/targeting/section_2.rs",
+            "src/chat/sessions/assignment/section_1.rs",
+            "src/chat/sessions/assignment/section_2.rs",
+            "src/memory/sqlite/events/section_1.rs",
+            "src/memory/sqlite/events/section_2.rs",
+            "src/memory/sqlite/events/section_3.rs",
+            "src/memory/sqlite/tests/mailbox/section_1.rs",
+            "src/memory/sqlite/tests/mailbox/section_2.rs",
+            "src/memory/sqlite/tests/mailbox/section_3.rs",
+            "src/tools/capability/catalog/section_1.rs",
+            "src/tools/capability/catalog/section_2.rs",
+            "src/tools/delegate/tests/section_1.rs",
+            "src/tools/delegate/tests/section_2.rs",
+        ]
+        .contains(&relative_path(path).as_str())
+    });
     files.sort();
     files
 }

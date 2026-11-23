@@ -601,6 +601,8 @@ const fn one() -> u32 {
 /// acknowledgements that rode along.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssignmentPull {
+    #[serde(default)]
+    pub messages: Vec<serde_json::Value>,
     pub assignments: Vec<PulledAssignment>,
     #[serde(default)]
     pub acked: usize,
@@ -663,11 +665,22 @@ pub async fn pull_chat_assignments(
     ack: &[String],
     max: Option<usize>,
 ) -> Result<AssignmentPull> {
+    pull_chat_inbox(endpoint, session_id, session_token, ack, max, None).await
+}
+
+pub async fn pull_chat_inbox(
+    endpoint: &TasksEndpoint,
+    session_id: &str,
+    session_token: &str,
+    ack: &[String],
+    max: Option<usize>,
+    message_target: Option<&crate::messaging::SessionAddr>,
+) -> Result<AssignmentPull> {
     let client = client()?;
     let path = format!("/api/chat-sessions/{}/inbox/pull", urlencoding::encode(session_id));
     let response = endpoint
         .session_request(&client, reqwest::Method::POST, &path, session_token)
-        .json(&serde_json::json!({ "ack": ack, "max": max }))
+        .json(&serde_json::json!({ "ack": ack, "max": max, "message_target": message_target }))
         .send()
         .await
         .map_err(|error| unreachable_hint(endpoint, &error))?;

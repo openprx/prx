@@ -155,6 +155,8 @@ impl SessionsSpawnTool {
         if let Some(source) = &operator_source {
             source.verify_live()?;
         }
+        let message_input = crate::runtime::operator_spawn::current().and_then(|source| source.message_input());
+        let message_permit = operator_source.as_ref().and_then(|source| source.message_permit());
         let caller = crate::tools::execution::current_child_call_context();
         if let Some(caller) = &caller {
             caller.verify_tool("sessions_spawn")?;
@@ -338,12 +340,19 @@ impl SessionsSpawnTool {
         // so it is a Medium-risk side effect (requires an approval grant under
         // supervised autonomy; denied outright under read-only) rather than Low.
         let approval_grant = ApprovalGrant::from_runtime_args(self.name(), args);
-        if let Err(error) = SideEffectGate::new(launch_security.as_ref()).authorize_resource_operation(
-            self.name(),
-            "sessions_spawn:spawn",
-            ResourceRiskLevel::Medium,
-            approval_grant.as_ref(),
-        ) {
+        if let Err(error) = if operator_source
+            .as_ref()
+            .is_some_and(|source| source.is_message_continuation())
+        {
+            Ok(ResourceRiskLevel::Medium)
+        } else {
+            SideEffectGate::new(launch_security.as_ref()).authorize_resource_operation(
+                self.name(),
+                "sessions_spawn:spawn",
+                ResourceRiskLevel::Medium,
+                approval_grant.as_ref(),
+            )
+        } {
             return Ok(SpawnOutcome::rejected(error));
         }
 
@@ -1029,7 +1038,18 @@ impl SessionsSpawnTool {
             } else {
                 None
             };
-            let process_worker_mailbox = self.worker_mailbox.clone();
+            let process_worker_mailbox = if let Some(factory) = &self.worker_mailbox {
+                Some(factory.clone())
+            } else if let Some(config) = self
+                .hint_config
+                .as_ref()
+                .filter(|config| config.memory.backend == "sqlite")
+            {
+                Some(crate::messaging::worker::WorkerMailboxes::for_config(config)?
+                    as Arc<dyn crate::session_worker::mailbox_binding::WorkerMailboxFactory>)
+            } else {
+                None
+            };
             let process_batch_id = batch_id.map(str::to_owned);
             #[cfg(test)]
             let test_worker_executable = self.test_worker_executable.clone();
@@ -1044,6 +1064,8 @@ impl SessionsSpawnTool {
                 SPAWN_EXECUTION_CONTEXT.scope(
                     process_execution_ctx,
                     crate::agent::idle::scope_beat(Some(Arc::clone(&monitor_progress)), async move {
+                        let _message_permit=message_permit;
+                        let _message_input=message_input;
                         async {
                             tracing::info!(run_id = %rid, "Sub-agent process starting");
 
@@ -1686,6 +1708,8 @@ impl SessionsSpawnTool {
         let jh = crate::agent::channel_approval::spawn(crate::runtime::registry::scope_current(
             sub_agent_work_id,
             SPAWN_EXECUTION_CONTEXT.scope(task_execution_ctx, async move {
+                let _message_permit = message_permit;
+                let _message_input = message_input;
                 tracing::info!(run_id = %rid, "Sub-agent task starting");
                 let provider_started_at = Utc::now();
                 let (run_on_delta, run_on_tool) = match run_event_streams {

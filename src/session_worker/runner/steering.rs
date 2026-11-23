@@ -46,6 +46,7 @@ use tokio_util::sync::CancellationToken;
 pub(super) fn spawn_stdin_control_reader(
     steer_tx: tokio::sync::mpsc::Sender<String>,
     mut mailbox: Option<super::super::mailbox::WorkerMailboxSender>,
+    auth: Option<crate::session_worker::frame_auth::FrameAuth>,
 ) {
     const MAX_CONTROL_LINE: u64 = 2 * 1024 * 1024;
     std::thread::spawn(move || {
@@ -67,7 +68,25 @@ pub(super) fn spawn_stdin_control_reader(
                 continue;
             }
             // A malformed frame must never end the run: skip it and keep reading.
-            let Ok(frame) = serde_json::from_str::<WorkerControlFrame>(line) else {
+            let decoded = serde_json::from_str::<serde_json::Value>(line)
+                .and_then(|value| {
+                    if value.get("kind").and_then(|v| v.as_str()) == Some("authenticated_mailbox") {
+                        auth.as_ref()
+                            .ok_or_else(|| {
+                                serde_json::Error::io(std::io::Error::other("unexpected authenticated frame"))
+                            })
+                            .and_then(|auth| {
+                                auth.verify(value)
+                                    .map_err(|e| serde_json::Error::io(std::io::Error::other(e)))
+                            })
+                    } else if value.get("kind").and_then(|v| v.as_str()) == Some("message") && auth.is_some() {
+                        Err(serde_json::Error::io(std::io::Error::other("unsigned mailbox frame")))
+                    } else {
+                        Ok(value)
+                    }
+                })
+                .and_then(serde_json::from_value::<WorkerControlFrame>);
+            let Ok(frame) = decoded else {
                 tracing::warn!("session-worker discarded an unparseable stdin control frame");
                 continue;
             };
@@ -161,16 +180,16 @@ where
                 segment.await
             }
         };
-        let (mut advanced, result) = finished;
+        let (advanced, result) = finished;
         if result.is_err() {
             return (advanced, result);
         }
         while let Some(message) = mailbox.as_mut().and_then(|inbox| inbox.try_next()) {
-            let text = match super::super::mailbox::user_text(&message) {
+            let _text = match super::super::mailbox::user_text(&message) {
                 Ok(text) => text,
                 Err(error) => return (advanced, Err(error.into())),
             };
-            advanced.push(crate::agent::turn_contracts::inbound_user_message_owned(text));
+
             let ack = mailbox
                 .as_ref()
                 .ok_or(crate::messaging::mailbox::MailboxError::CorruptState)

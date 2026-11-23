@@ -196,9 +196,9 @@ fn production_tool_loop_memory_is_wired_to_request_context_events() {
     for relative in [
         "src/agent/entry.rs",
         "src/channels/turn.rs",
-        "src/chat/run.rs",
-        "src/gateway/api/sessions.rs",
-        "src/gateway/mod.rs",
+        "src/chat/run/provider_turn.rs",
+        "src/gateway/api/sessions/section_1.rs",
+        "src/gateway/implementation/section_2.rs",
         "src/session_worker/runner/run.rs",
         "src/tools/delegate.rs",
         "src/tools/sessions_spawn/task_mode.rs",

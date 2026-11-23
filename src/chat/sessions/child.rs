@@ -10,14 +10,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::approval::PendingApprovals;
-use crate::messaging::{InheritedProvenance, SessionAddr};
+use crate::messaging::SessionAddr;
 use crate::tools::sessions_spawn::HistoryEntry;
-
-/// Inbound mailbox consume cursor. MSG-CORE fills reconstruction.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct MailboxCursor {
-    pub streams: std::collections::BTreeMap<i64, u64>,
-}
 
 /// Provider binding without credentials (no key wiring).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,26 +22,13 @@ pub struct ProviderBinding {
     pub model: String,
 }
 
-/// Process-mode relaunch recipe: same [`SessionAddr`], new run.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RelaunchRecipe {
-    /// Stable address across relaunch.
-    pub addr: SessionAddr,
-    /// Last completed run, if any.
-    pub last_run: Option<String>,
-    /// Sealed provenance restored on relaunch.
-    pub inherited_provenance: Option<InheritedProvenance>,
-}
-
 /// One child session owned by the parent chat for its lifetime.
 pub struct ChildSession {
     addr: SessionAddr,
     history: Vec<HistoryEntry>,
     provider: Option<ProviderBinding>,
-    mailbox_cursor: MailboxCursor,
     approvals: PendingApprovals,
     turn: Mutex<()>,
-    recipe: Option<RelaunchRecipe>,
     mailbox_projection: std::collections::BTreeMap<usize, Uuid>,
     tool_calls: std::collections::BTreeMap<usize, Vec<crate::chat::session::ToolCallSummary>>,
     mailbox_scope: Option<crate::messaging::mailbox::MailboxScope>,
@@ -57,23 +38,17 @@ pub struct ChildSession {
 impl ChildSession {
     /// Construct a live child session.
     #[must_use]
-    pub fn new(addr: SessionAddr, provider: Option<ProviderBinding>, recipe: Option<RelaunchRecipe>) -> Self {
+    pub fn new(addr: SessionAddr, provider: Option<ProviderBinding>) -> Self {
         Self {
-            addr: addr.clone(),
+            addr,
             history: Vec::new(),
             provider,
-            mailbox_cursor: MailboxCursor::default(),
             mailbox_projection: Default::default(),
             tool_calls: Default::default(),
             mailbox_scope: None,
             _history_lease: None,
             approvals: PendingApprovals::new(),
             turn: Mutex::new(()),
-            recipe: recipe.or(Some(RelaunchRecipe {
-                addr,
-                last_run: None,
-                inherited_provenance: None,
-            })),
         }
     }
 
@@ -107,28 +82,15 @@ impl ChildSession {
         self.provider.as_ref()
     }
 
-    /// Mailbox cursor (empty until MSG-CORE).
-    #[must_use]
-    pub const fn mailbox_cursor(&self) -> &MailboxCursor {
-        &self.mailbox_cursor
-    }
-
     /// Acquire the turn mutex.
     pub fn lock_turn(&self) -> parking_lot::MutexGuard<'_, ()> {
         self.turn.lock()
-    }
-
-    /// Process relaunch recipe, if this is a process child.
-    #[must_use]
-    pub const fn recipe(&self) -> Option<&RelaunchRecipe> {
-        self.recipe.as_ref()
     }
 
     fn metadata(&self) -> ChildSessionMetadata {
         ChildSessionMetadata {
             addr: self.addr.clone(),
             provider: self.provider.clone(),
-            recipe: self.recipe.clone(),
             mailbox_projection: self.mailbox_projection.clone(),
         }
     }
@@ -140,7 +102,6 @@ impl ChildSession {
 pub struct ChildSessionMetadata {
     pub addr: SessionAddr,
     pub provider: Option<ProviderBinding>,
-    pub recipe: Option<RelaunchRecipe>,
     /// Event identities of mailbox-projected turns; never a progress cursor.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub mailbox_projection: std::collections::BTreeMap<usize, Uuid>,
@@ -152,8 +113,6 @@ struct ScopedChatRecord {
     record: crate::chat::session::ChatSession,
     #[serde(skip)]
     scope: crate::messaging::mailbox::MailboxScope,
-    #[serde(skip)]
-    cursors: std::collections::BTreeMap<i64, u64>,
     #[serde(skip)]
     mailbox_turns: Vec<crate::memory::child_sessions::ChildMailboxTurn>,
     #[serde(skip)]
@@ -178,7 +137,6 @@ impl ScopedChatRecord {
         Ok(Self {
             record,
             scope: loaded.scope,
-            cursors: loaded.cursors,
             mailbox_turns: loaded.mailbox_turns,
             lease: loaded.lease,
         })
@@ -278,7 +236,7 @@ impl ChildSessionRegistry {
         let preserved_calls = child.tool_calls.clone();
         let key = Self::record_id(child.addr())?;
         self.update_record(child.addr(), move |old| {
-            let mut metadata = metadata.clone();
+            let metadata = metadata.clone();
             let mut record = old.unwrap_or_else(|| {
                 let mut record = crate::chat::session::ChatSession::new(
                     metadata
@@ -293,11 +251,6 @@ impl ChildSessionRegistry {
                 record.id = key.clone();
                 record
             });
-            if let Some(recipe) = metadata.recipe.as_mut()
-                && let Some(previous) = record.child_session.as_ref().and_then(|value| value.recipe.as_ref())
-            {
-                recipe.last_run.clone_from(&previous.last_run);
-            }
             record.child_session = Some(metadata);
             record.turns = history
                 .iter()
@@ -352,7 +305,6 @@ impl ChildSessionRegistry {
         let ScopedChatRecord {
             record,
             scope,
-            cursors,
             mailbox_turns,
             lease,
         } = self.load_record(addr).await?;
@@ -408,8 +360,6 @@ impl ChildSessionRegistry {
             addr: metadata.addr,
             history,
             provider: metadata.provider,
-            recipe: metadata.recipe,
-            mailbox_cursor: MailboxCursor { streams: cursors },
             approvals: PendingApprovals::new(),
             turn: Mutex::new(()),
             mailbox_projection: projection,
@@ -430,8 +380,8 @@ mod tests {
 
     #[test]
     fn two_child_sessions_hold_independent_approvals() {
-        let a = ChildSession::new(addr("child-a"), None, None);
-        let b = ChildSession::new(addr("child-b"), None, None);
+        let a = ChildSession::new(addr("child-a"), None);
+        let b = ChildSession::new(addr("child-b"), None);
         a.approvals().test_register("run-a");
         assert!(
             a.approvals().is_pending("run-a"),
@@ -469,7 +419,6 @@ mod tests {
                 provider: "openrouter".into(),
                 model: "m".into(),
             }),
-            None,
         );
         live.history.push(HistoryEntry {
             role: "user".into(),
@@ -501,11 +450,6 @@ mod tests {
             "child session reconstructs from registry: expected messaging contract changed"
         );
         assert!(!restored.approvals().is_pending("ask-1"), "in-memory Ask dies");
-        assert_eq!(
-            restored.mailbox_cursor(),
-            &MailboxCursor::default(),
-            "child session reconstructs from registry: expected messaging contract changed"
-        );
     }
 
     #[tokio::test]
@@ -514,7 +458,7 @@ mod tests {
         let memory: Arc<dyn crate::memory::Memory> =
             Arc::new(crate::memory::SqliteMemory::new(dir.path()).expect("test: sqlite"));
         let registry = ChildSessionRegistry::new(Arc::clone(&memory)).with_workspace("prx_workspace".to_owned());
-        let child = ChildSession::new(addr("child-a"), None, None);
+        let child = ChildSession::new(addr("child-a"), None);
         registry.insert(&child).await.expect("test: insert child");
         assert!(
             memory
@@ -597,7 +541,7 @@ mod tests {
     }
 
     async fn rich_child(registry: &ChildSessionRegistry) -> ChildSession {
-        let mut child = ChildSession::new(addr("child-a"), None, None);
+        let mut child = ChildSession::new(addr("child-a"), None);
         child.history.push(HistoryEntry {
             role: "assistant".into(),
             content: "prx result".into(),

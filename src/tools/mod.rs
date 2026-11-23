@@ -64,7 +64,6 @@ pub mod message_send;
 pub mod nodes;
 pub mod prompt;
 pub mod proxy_config;
-pub mod prx_message;
 pub mod pushover;
 pub mod schema;
 pub mod session_status;
@@ -1202,6 +1201,7 @@ mod tests {
         let agents = HashMap::from([(
             "schema-audit".to_string(),
             DelegateAgentConfig {
+                messaging: crate::config::schema::AgentMessaging::default(),
                 approval_wait_secs: 600,
                 limits: crate::config::AgentLimits::default(),
                 provider: "ollama".to_string(),
@@ -1325,6 +1325,7 @@ mod tests {
         agents.insert(
             "researcher".to_string(),
             DelegateAgentConfig {
+                messaging: crate::config::schema::AgentMessaging::default(),
                 approval_wait_secs: 600,
                 limits: crate::config::AgentLimits::default(),
                 provider: "ollama".to_string(),
@@ -1409,6 +1410,7 @@ mod tests {
         let agents = HashMap::from([(
             "a".to_string(),
             DelegateAgentConfig {
+                messaging: crate::config::schema::AgentMessaging::default(),
                 approval_wait_secs: 600,
                 limits: crate::config::AgentLimits::default(),
                 provider: "litellm".to_string(),

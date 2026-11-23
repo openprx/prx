@@ -26,6 +26,7 @@ pub(in crate::memory::sqlite) fn for_database(path: &std::path::Path) -> anyhow:
 
 #[derive(Default)]
 pub(in crate::memory::sqlite) struct Runtime {
+    drainers: Mutex<Vec<std::sync::Weak<dyn crate::messaging::mailbox::MailboxCacheDrainer>>>,
     state: Mutex<State>,
     changed: Condvar,
 }
@@ -108,7 +109,22 @@ impl Runtime {
     pub fn has_scope_leases(&self, scope: Uuid) -> bool {
         self.state.lock().leases.contains_key(&scope)
     }
+    pub fn register_drainer(&self, drainer: &Arc<dyn crate::messaging::mailbox::MailboxCacheDrainer>) {
+        let mut drainers = self.drainers.lock();
+        drainers.retain(|drainer| drainer.strong_count() > 0);
+        drainers.push(Arc::downgrade(drainer));
+    }
     pub fn drain_and_join(&self, scope: Uuid, deadline: std::time::Duration) -> bool {
+        let drainers: Vec<_> = self
+            .drainers
+            .lock()
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .collect();
+        for drainer in drainers {
+            drainer.drain(scope);
+        }
+
         let Some(until) = std::time::Instant::now().checked_add(deadline) else {
             return false;
         };

@@ -176,6 +176,9 @@ futures = "0.3"
 regex = "1.10"
 unicode-normalization = "0.1"
 hostname = "0.4.2"
+rcgen = { version = "0.14.8", default-features = false, features = ["ring", "pem"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
 rustls = "0.23.46"
 rustls-pki-types = "1.14.0"
 # X.509 SVID parsing for SPIFFE peer verification (PEM/DER decode, SAN URI,
@@ -282,7 +285,6 @@ criterion = { version = "0.7", features = ["html_reports"] }
 # PTY-driven end-to-end tests for `prx chat` (see tests/chat_pty_e2e.rs).
 expectrl = "0.7"
 proptest = "1.6"
-rcgen = "0.14"
 # Serialize PTY tests that share controlling-tty resources, without forcing
 # `--test-threads=1` on the whole test binary.
 serial_test = "3"

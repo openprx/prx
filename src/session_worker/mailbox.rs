@@ -66,7 +66,6 @@ impl WorkerMailboxSender {
             return Err(MailboxError::StaleRun);
         }
         if message.ancestry.len() != usize::from(message.hop_count)
-            || message.hop_count > 8
             || message.ancestry.last().copied() != message.in_reply_to
             || message.ancestry.contains(&message.id)
         {
@@ -147,7 +146,10 @@ pub fn user_text(message: &PrxMessage) -> MailboxResult<String> {
     if matches!(message.body.mime.as_str(), "text/plain" | "text/markdown")
         && let Ok(text) = std::str::from_utf8(&message.body.bytes)
     {
-        return Ok(text.to_owned());
+        return Ok(format!(
+            "[message from {}/{}]\n{text}",
+            message.from.session, message.from.agent
+        ));
     }
     use base64::Engine as _;
     Ok(format!(

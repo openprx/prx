@@ -360,7 +360,7 @@ pub enum Action {
         /// `None` means "no turn-root context" (e.g. tests, or callers that do
         /// not originate a chat turn) — sub-agents then fall back to user origin,
         /// which is correct for non-turn paths such as the `/bg` slash command.
-        turn_spawn_ctx: Option<crate::tools::sessions_spawn::SpawnExecutionContext>,
+        turn_spawn_ctx: Option<Box<crate::tools::sessions_spawn::SpawnExecutionContext>>,
         /// Per-turn default route for `message_send` tool calls. This mirrors
         /// `turn_spawn_ctx`: the real Redux driver runs in a spawned task, so
         /// the routing default must be carried through the reducer/effect

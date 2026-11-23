@@ -194,6 +194,24 @@ impl Tool for SessionStatusTool {
             output.push_str(&delegation.join("\n"));
         }
 
+        if self.memory.as_ref().is_some_and(|memory| memory.name() == "sqlite")
+            && !self.workspace_id.is_empty()
+            && let Some(caller) = crate::tools::execution::current_child_call_context()
+        {
+            caller.verify_tool("session_status")?;
+            let owner = caller.context().envelope.resolved_owner_id();
+            let session = caller.context().envelope.session_key.clone();
+            let workspace = self.workspace_id.clone();
+            let rows = crate::runtime::blocking::spawn_blocking(move || {
+                crate::memory::SqliteMemory::new(std::path::Path::new(&workspace))?
+                    .mailbox_send_status(&workspace, &owner, &session)
+            })
+            .await??;
+            if !rows.is_empty() {
+                output.push_str("\nMessage outbox: ");
+                output.push_str(&serde_json::to_string(&rows)?);
+            }
+        }
         Ok(ToolResult {
             success: true,
             output,

@@ -197,6 +197,13 @@ const DAEMON_SCOPE_CANDIDATES: &[CommandArgCandidate] = &[CommandArgCandidate {
 /// Single source of truth for user-visible chat slash commands.
 pub const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec {
+        name: "/msg",
+        aliases: &[],
+        args_hint: "<target> <text>",
+        description: "Message a session; /msg uses the same durable mailbox as sessions_send. Remote copies cannot be erased here.",
+        arg: NO_ARG,
+    },
+    CommandSpec {
         name: "/help",
         aliases: &[],
         args_hint: "",

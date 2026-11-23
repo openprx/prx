@@ -532,6 +532,7 @@ pub async fn start_channels_with_config(
         // sessions_send: cross-session message injection (OpenClaw alignment)
         tools_list.push(Box::new(
             tools::SessionsSendTool::with_security(active_runs.clone(), security.clone())
+                .with_messaging(&config)
                 .with_shared_memory(Arc::clone(&mem))
                 .with_event_recording(config.memory.event_recording_config()),
         ));

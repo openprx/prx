@@ -61,6 +61,7 @@ pub(super) async fn pump_worker_control_frames(
     history: Arc<RwLock<Vec<HistoryEntry>>>,
     run_id: String,
 ) {
+    use tokio::io::AsyncWriteExt as _;
     let mut steer_open = true;
     let mut controls_open = controls.is_some();
     while steer_open || controls_open {
@@ -76,7 +77,19 @@ pub(super) async fn pump_worker_control_frames(
         let Some(frame) = frame else {
             continue;
         };
-        if let Err(error) = crate::session_worker::frames::write_control_frame(&mut stdin, &frame).await {
+        let write = async {
+            if let Some(auth) = controls.as_ref().and_then(|q| q.auth.as_ref()) {
+                let value = auth.sign(&frame)?;
+                stdin.write_all(&serde_json::to_vec(&value)?).await?;
+                stdin.write_all(b"\n").await?;
+                stdin.flush().await?;
+                Ok::<(), anyhow::Error>(())
+            } else {
+                crate::session_worker::frames::write_control_frame(&mut stdin, &frame).await
+            }
+        }
+        .await;
+        if let Err(error) = write {
             tracing::debug!(%run_id,"sub-agent control pipe closed: {error}");
             return;
         }
@@ -151,6 +164,10 @@ pub(super) async fn run_spawned_child_lifecycle(
 ) -> anyhow::Result<OwnedProcessPhase> {
     use tokio::io::AsyncWriteExt;
 
+    let frame_auth = steer
+        .as_ref()
+        .and_then(|pipe| pipe.frames.as_ref())
+        .and_then(|frames| frames.controls.auth.clone());
     let frame_outputs = steer
         .as_ref()
         .and_then(|pipe| pipe.frames.as_ref().map(|frames| frames.outputs.clone()));
@@ -224,11 +241,12 @@ pub(super) async fn run_spawned_child_lifecycle(
         .take()
         .ok_or_else(|| anyhow::anyhow!("session-worker stderr pipe was not configured"))?;
 
-    let stdout_task = tokio::spawn(crate::session_worker::frames::read_worker_frames(
+    let stdout_task = tokio::spawn(crate::session_worker::frames::read_worker_frames_authenticated(
         stdout_stream,
         frame_outputs,
         progress.as_ref().map(Arc::clone),
         MAX_SUBPROCESS_OUTPUT,
+        frame_auth,
     ));
     let stderr_task = tokio::spawn(drain_worker_stream(
         stderr_stream,

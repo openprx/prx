@@ -59,7 +59,7 @@ impl Common {
             return Err(MailboxError::InvalidMetadata);
         }
         if self.ancestry.len() != usize::from(self.hop_count)
-            || self.ancestry.len() > 8
+            || self.ancestry.len() > usize::from(u8::MAX)
             || self.in_reply_to != self.ancestry.last().copied()
             || self.ancestry.contains(&id)
         {
@@ -70,7 +70,7 @@ impl Common {
             return Err(MailboxError::InvalidMetadata);
         }
         if let Some(auth) = &self.auth {
-            if !matches!(auth.method.as_str(), "jwt" | "mtls") || self.remote_peer.is_none() {
+            if auth.method != "mtls" || self.remote_peer.is_none() {
                 return Err(MailboxError::InvalidMetadata);
             }
         }
@@ -115,6 +115,8 @@ pub(super) struct TargetPin {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct OutboxMeta {
+    #[serde(default)]
+    pub attempts: u32,
     pub common: Common,
     pub to_pin: TargetPin,
     pub wire_ts: i64,

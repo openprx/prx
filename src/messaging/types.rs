@@ -140,7 +140,7 @@ pub struct MessageAuth {
     pub issuer: String,
     /// Verified subject.
     pub subject: String,
-    /// Key-possession method (`jwt` or `mtls`).
+    /// Key-possession method (`mtls`).
     pub method: String,
 }
 
@@ -152,6 +152,7 @@ pub struct MessageBody {
     pub mime: String,
     /// Raw body bytes.
     #[serde(default)]
+    #[serde(with = "body_base64")]
     pub bytes: Vec<u8>,
 }
 
@@ -324,5 +325,22 @@ mod tests {
         let a = data_message(Some(Uuid::from_u128(1)), b"body".to_vec());
         let b = data_message(Some(Uuid::from_u128(2)), b"body".to_vec());
         assert_ne!(request_digest(&a), request_digest(&b));
+    }
+}
+
+mod body_base64 {
+    use base64::Engine as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        if text.len() > 352 * 1024 {
+            return Err(serde::de::Error::custom("message_too_large"));
+        }
+        base64::engine::general_purpose::STANDARD
+            .decode(text)
+            .map_err(serde::de::Error::custom)
     }
 }

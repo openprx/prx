@@ -84,7 +84,7 @@ pub(super) async fn record_spawn_request_event(
         .ok_or_else(|| anyhow::anyhow!("child parent session missing"))?;
     let mut runs = super::continuation::current().map_or_else(Vec::new, |seed| seed.record.runs);
     runs.push(run.to_owned());
-    metadata["child_session_record"] = serde_json::to_value(crate::memory::child_sessions::ChildSessionRecord {
+    let record = serde_json::to_value(crate::memory::child_sessions::ChildSessionRecord {
         workspace: fabric.workspace_id().to_owned(),
         owner: scope
             .owner_id
@@ -108,6 +108,10 @@ pub(super) async fn record_spawn_request_event(
         context_after: 0,
         context: Vec::new(),
     })?;
+    metadata
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("child metadata must be an object"))?
+        .insert("child_session_record".into(), record);
     let receipt =
         crate::runtime::child_source::record_child_input(fabric, scope, task, None, Some(metadata.to_string())).await?;
     delegation::append_task(&mut metadata, task)?;

@@ -214,7 +214,7 @@ fn workspace_hooks_launch_through_the_shared_builder_behind_the_opt_in() {
 #[test]
 fn every_live_hook_manager_owner_drains_at_shutdown() {
     for path in [
-        "src/gateway/mod.rs",
+        "src/gateway/implementation/section_2.rs",
         "src/channels/startup.rs",
         "src/chat/run.rs",
         "src/agent/entry.rs",

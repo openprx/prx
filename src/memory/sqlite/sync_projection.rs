@@ -254,6 +254,18 @@ pub(super) fn payload(conn: &Connection, h: &Header) -> anyhow::Result<Value> {
             }
             let input:Option<(String,bool)>=conn.query_row("SELECT client_message_id,run_id IS NOT NULL FROM rf_message_attempts WHERE message_event_id=?1 AND owner_id=?2",params![id,h.owner],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
             let mut value = json!({"message_id":message_id,"role":role,"content":content,"final":role=="assistant","timestamp":timestamp});
+            if let Some(provenance) = raw.get("provenance") {
+                let object = value
+                    .as_object_mut()
+                    .ok_or(crate::memory::sync::SyncError::InvalidSource)?;
+                object.insert("provenance".into(), provenance.clone());
+                object.insert(
+                    "from".into(),
+                    raw.get("from")
+                        .cloned()
+                        .ok_or(crate::memory::sync::SyncError::InvalidSource)?,
+                );
+            }
             if let Some((client, turn)) = input {
                 let obj = value
                     .as_object_mut()

@@ -512,6 +512,10 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
             Ok(())
         }
 
+        Commands::A2a { command } => {
+            println!("{}", openprx::messaging::a2a::cli::run(command, config).await?);
+            Ok(())
+        }
         Commands::Memory { memory_command } => handle_memory_command(memory_command, &config).await,
 
         Commands::Evolution {

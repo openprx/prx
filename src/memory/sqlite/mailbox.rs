@@ -5,11 +5,13 @@ mod accept;
 mod adopt;
 pub(super) mod child_projection;
 mod deliver;
+mod local_runtime;
 mod model;
 mod outbox;
 pub(super) mod pin;
 mod publish;
 mod receipt;
+mod retry;
 mod stream;
 pub use outbox::MailboxOutbound;
 mod erase;
@@ -31,10 +33,13 @@ pub struct SqliteMailbox {
     local_instance: String,
     secret: Arc<[u8; 32]>,
     clock: Arc<dyn MailboxClock>,
-    limits: crate::config::schema::RemoteTreeLimits,
 }
 
 impl SqliteMailbox {
+    pub(crate) fn register_drainer(&self, drainer: &Arc<dyn crate::messaging::mailbox::MailboxCacheDrainer>) {
+        self.memory.mailbox_runtime.register_drainer(drainer);
+    }
+
     pub fn validate_scope(
         &self,
         scope: &crate::messaging::mailbox::MailboxScope,
@@ -52,7 +57,6 @@ impl SqliteMailbox {
         local_instance: String,
         secret: [u8; 32],
         clock: Arc<dyn MailboxClock>,
-        limits: crate::config::schema::RemoteTreeLimits,
     ) -> MailboxResult<Self> {
         crate::messaging::mailbox::bounded(&local_instance, 512)?;
         if clock.now() < 0 {
@@ -63,7 +67,6 @@ impl SqliteMailbox {
             local_instance,
             secret: Arc::new(secret),
             clock,
-            limits,
         })
     }
 }

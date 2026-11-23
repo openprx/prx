@@ -68,9 +68,16 @@ async fn run_manifest(
     } else {
         (None, None)
     };
+    let frame_auth = manifest
+        .session_addr
+        .as_ref()
+        .map(|_| super::frame_auth::FrameAuth::worker(transport.key.clone(), &manifest.run_id));
+    if let Some(auth) = &frame_auth {
+        super::stdout::authenticate(auth.clone())?;
+    }
     let steer_rx = read_stdin_control_frames.then(|| {
         let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<String>(STEER_CHANNEL_CAPACITY);
-        spawn_stdin_control_reader(steer_tx, mailbox_tx);
+        spawn_stdin_control_reader(steer_tx, mailbox_tx, frame_auth);
         steer_rx
     });
     run_authenticated_manifest(manifest, steer_rx, mailbox_rx, explicit_config_dir, Some(transport)).await

@@ -1,4 +1,4 @@
-//! Dormant /msg parser. Deliberately absent from command dispatch/help.
+//! Explicit local-operator messaging command: /msg <target> <text>.
 use crate::messaging::{
     SessionAddr,
     mailbox::{MailboxError, MailboxResult},
@@ -12,21 +12,13 @@ pub fn parse(input: &str, caller: &SessionAddr) -> MailboxResult<(SessionAddr, S
         .strip_prefix("/msg ")
         .ok_or(MailboxError::InvalidMetadata)?
         .trim_start();
-    let (peer, rest) = rest
-        .split_once(char::is_whitespace)
-        .ok_or(MailboxError::InvalidMetadata)?;
     let (session, text) = rest
-        .trim_start()
         .split_once(char::is_whitespace)
         .ok_or(MailboxError::InvalidMetadata)?;
     if text.trim().is_empty() {
         return Err(MailboxError::InvalidMetadata);
     }
-    let (session, agent) = session.split_once('/').unwrap_or((session, "main"));
-    let target = parse_target(
-        &json!({"instance":if peer=="local" {&caller.instance} else {peer},"session":session,"agent":agent}),
-        caller,
-    )?;
+    let target = parse_target(&json!({"session":session}), caller)?;
     Ok((target, text.trim_start().to_owned()))
 }
 pub async fn send(

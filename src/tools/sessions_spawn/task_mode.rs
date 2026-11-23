@@ -232,13 +232,10 @@ pub(super) async fn run_sub_agent_task(
         .read()
         .await
         .iter()
-        .map(|entry| ChatMessage {
-            role: entry.role.clone(),
-            content: entry.content.clone(),
-        })
+        .map(|entry| crate::agent::turn_contracts::stored_turn_message(entry.role.clone(), entry.content.clone()))
         .collect();
     if !history.is_empty() {
-        history.push(ChatMessage::user(task));
+        history.push(crate::agent::turn_contracts::inbound_user_message(task));
     }
 
     // NeedsInput: deterministically restore a suspended run to `Running` before

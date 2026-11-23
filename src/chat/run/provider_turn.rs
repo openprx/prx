@@ -74,6 +74,7 @@
         let mut input_scope = chat_message_event_scope(
             memory_fabric.workspace_id(), &chat_session_key, &turn_run_id, provider_name, model_name,
         );
+        input_scope.causation_event_id=super::message_inbox::cause(&msg).map(str::to_owned);
         input_scope.config_generation_id = Some(ctx.config_generation.id.0);
         input_scope.config_source_revision = Some(ctx.config_generation.source_revision.fingerprint_sha256.clone());
         // The TUI mirror is updated synchronously by /mode; its legacy session
@@ -602,7 +603,7 @@
                     compaction_guard_history: Some(persisted_history_for_turn.clone()),
                     compaction_config: Some(effective_compaction.config.clone()),
                     cancel: cancellation.clone(),
-                    turn_spawn_ctx: Some(redux_turn_spawn_ctx),
+                    turn_spawn_ctx: Some(Box::new(redux_turn_spawn_ctx)),
                     turn_message_send_ctx: Some(redux_turn_message_send_ctx),
                     // Route on what the user typed. `history_for_provider`
                     // already carries the memory preamble and the
@@ -664,6 +665,7 @@
                     .insert(
                         task_id,
                         PerTurnContext {
+                            _mailbox_input: mailbox_input.take(),
                             turn_binding: chat_turn_binding.clone(),
 
                             task_id,

@@ -1342,7 +1342,7 @@ impl ChatState {
                 compaction_guard_history,
                 compaction_config,
                 cancel,
-                turn_spawn_ctx,
+                turn_spawn_ctx.map(|context| *context),
                 turn_message_send_ctx,
                 routing_input,
                 turn_binding,

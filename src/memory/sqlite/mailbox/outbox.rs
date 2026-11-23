@@ -47,7 +47,11 @@ impl SqliteMailbox {
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(storage_error)?;
         let mut messages = Vec::new();
+        let mut first = std::collections::HashSet::new();
         for (_, stream_id, seq, idempotency, id, bytes, json) in rows {
+            if !first.insert(stream_id) {
+                continue;
+            }
             let stream = stream::load(&tx, stream_id)?;
             if stream.sender.as_ref() != Some(scope) {
                 return Err(MailboxError::StaleIncarnation);
@@ -58,7 +62,10 @@ impl SqliteMailbox {
             if meta.body_erased_at.is_some() {
                 return Err(MailboxError::Fenced);
             }
-            if meta.next_attempt_at.is_some_and(|when| when > self.clock.now()) {
+            // Retry-After cannot postpone the terminal 24-hour deadline.
+            if self.clock.now().saturating_sub(meta.created_at) < 86400
+                && meta.next_attempt_at.is_some_and(|when| when > self.clock.now())
+            {
                 continue;
             }
             let mime = meta.body_mime.ok_or(MailboxError::CorruptState)?;

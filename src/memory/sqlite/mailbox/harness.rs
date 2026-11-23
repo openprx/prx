@@ -34,13 +34,7 @@ pub fn accept_adopt(workspace: &Path) -> anyhow::Result<()> {
         tx.commit()?;
         scope
     };
-    let store = SqliteMailbox::new(
-        memory,
-        "prx_harness".into(),
-        [31; 32],
-        Arc::new(SystemMailboxClock),
-        crate::config::schema::RemoteTreeLimits::default(),
-    )?;
+    let store = SqliteMailbox::new(memory, "prx_harness".into(), [31; 32], Arc::new(SystemMailboxClock))?;
     let authority = MailboxAuthority::local(workspace_id, source.clone(), target.clone())?;
     let request_path = workspace.join("mailbox-harness-request.json");
     let message: PrxMessage = if request_path.exists() {

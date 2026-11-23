@@ -19,6 +19,8 @@ pub const MAX_BYTES: i64 = 64 * 1024 * 1024;
 /// Stable refusals, shared by store, IPC and dormant send adapters.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MailboxError {
+    #[error("remote_not_enabled")]
+    RemoteNotEnabled,
     #[error("invalid_address")]
     InvalidAddress,
     #[error("stream_id_required")]
@@ -151,7 +153,7 @@ impl MailboxAuthority {
         bounded(&workspace_id, 4096)?;
         validate_address(&source)?;
         validate_address(&destination)?;
-        if !matches!(auth.method.as_str(), "jwt" | "mtls") {
+        if auth.method != "mtls" {
             return Err(MailboxError::Unauthorized);
         }
         Ok(Self {
@@ -262,7 +264,7 @@ pub(crate) fn validate_body(mime: &str, bytes: &[u8]) -> MailboxResult<()> {
     if mime.is_empty() || mime.len() > 255 || !mime.bytes().all(|byte| (0x20..=0x7e).contains(&byte)) {
         return Err(MailboxError::InvalidMime);
     }
-    if mime.len().saturating_add(bytes.len()) > super::MAX_BODY_BYTES {
+    if bytes.len() > super::MAX_BODY_BYTES {
         return Err(MailboxError::BodyTooLarge);
     }
     Ok(())
@@ -305,4 +307,9 @@ pub(crate) fn outbox_key(workspace: &str, message: &PrxMessage) -> MailboxResult
             message.idempotency.as_str(),
         ],
     )
+}
+
+/// Runtime cache owners release erased payloads before the durable erase joins.
+pub trait MailboxCacheDrainer: Send + Sync {
+    fn drain(&self, scope: Uuid);
 }

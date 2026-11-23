@@ -17,6 +17,7 @@ use tokio::sync::RwLock;
 
 /// Tool that sends a message to a running sub-agent session to redirect it.
 pub struct SessionsSendTool {
+    messaging: Option<Arc<crate::config::Config>>,
     mailbox: Option<Arc<dyn crate::messaging::send::MailboxSender>>,
     active_runs: Arc<RwLock<Vec<SubAgentRun>>>,
     security: Arc<SecurityPolicy>,
@@ -32,6 +33,7 @@ impl SessionsSendTool {
 
     pub fn with_security(active_runs: Arc<RwLock<Vec<SubAgentRun>>>, security: Arc<SecurityPolicy>) -> Self {
         Self {
+            messaging: None,
             mailbox: None,
             active_runs,
             security,
@@ -39,6 +41,10 @@ impl SessionsSendTool {
             source_fabric: None,
             event_recording: MemoryEventRecording::default(),
         }
+    }
+    pub fn with_messaging(mut self, config: &crate::config::Config) -> Self {
+        self.messaging = Some(Arc::new(config.clone()));
+        self
     }
 
     /// Opt-in only; activation owns registration of the address-based schema.
@@ -119,10 +125,10 @@ impl Tool for SessionsSendTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        if self.mailbox.is_some() {
+        if self.mailbox.is_some() || self.messaging.is_some() {
             return json!({"oneOf":[
                 {"type":"object","additionalProperties":false,"properties":{"run_id":{"type":"string","minLength":1},"message":{"type":"string","minLength":1}},"required":["run_id","message"]},
-                {"type":"object","additionalProperties":false,"properties":{"to":crate::messaging::send::target_schema(),"message":{"type":"string","minLength":1}},"required":["to","message"]}
+                {"type":"object","additionalProperties":false,"properties":{"to":{"oneOf":[crate::messaging::send::target_schema(),{"type":"string","minLength":1}]},"message":{"type":"string","minLength":1}},"required":["to","message"]}
             ]});
         }
         json!({
@@ -145,16 +151,28 @@ impl Tool for SessionsSendTool {
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         if args.get("to").is_some() {
+            if let Some(config) = &self.messaging {
+                let runtime = crate::messaging::runtime::MessagingRuntime::for_config(config)?;
+                return self.send_message(&runtime, &args).await;
+            }
             use crate::messaging::{
                 mailbox::MailboxError,
                 send::{parse_target, send_result},
             };
             let sender = self.mailbox.as_ref().ok_or(MailboxError::Unauthorized)?;
             let object = args.as_object().ok_or(MailboxError::InvalidMetadata)?;
-            if object.keys().any(|key| !matches!(key.as_str(), "to" | "message")) {
+            if object
+                .keys()
+                .any(|key| !matches!(key.as_str(), "to" | "message") && !key.starts_with("_zc_"))
+            {
                 return Err(MailboxError::InvalidMetadata.into());
             }
-            let target = parse_target(args.get("to").ok_or(MailboxError::InvalidAddress)?, sender.source())?;
+            let value = args.get("to").ok_or(MailboxError::InvalidAddress)?;
+            let target = if let Some(alias) = value.as_str() {
+                crate::messaging::SessionAddr::new(&sender.source().instance, &sender.source().owner, alias, None)
+            } else {
+                parse_target(value, sender.source())?
+            };
             let message = args
                 .get("message")
                 .and_then(serde_json::Value::as_str)
@@ -280,6 +298,65 @@ impl Tool for SessionsSendTool {
 
     fn categories(&self) -> &'static [ToolCategory] {
         &[ToolCategory::Automation]
+    }
+}
+
+impl SessionsSendTool {
+    async fn send_message(
+        &self,
+        runtime: &Arc<crate::messaging::runtime::MessagingRuntime>,
+        args: &serde_json::Value,
+    ) -> anyhow::Result<ToolResult> {
+        use crate::messaging::send::MailboxSender;
+        let caller = crate::tools::execution::current_child_call_context()
+            .ok_or(crate::messaging::mailbox::MailboxError::Unauthorized)?;
+        caller.verify_tool("sessions_send")?;
+        anyhow::ensure!(args.get("run_id").is_none(), "exactly one of run_id and to is required");
+        let context = caller.context();
+        let source = runtime.address(
+            &context.envelope.resolved_owner_id(),
+            &context.envelope.session_key,
+            context.envelope.agent_id.as_deref().unwrap_or("main"),
+        );
+        let mut target = args
+            .get("to")
+            .cloned()
+            .ok_or(crate::messaging::mailbox::MailboxError::InvalidAddress)?;
+        if let Some(alias) = target.as_str() {
+            let runs = self.active_runs.read().await;
+            let run = alias
+                .strip_prefix('#')
+                .and_then(|index| index.parse::<usize>().ok())
+                .map_or_else(
+                    || {
+                        runs.iter().find(|run| {
+                            run.owner_id.as_deref() == Some(source.owner.as_str())
+                                && (run.id == alias || run.session_scope_key == alias)
+                        })
+                    },
+                    |index| {
+                        runs.iter()
+                            .filter(|run| run.owner_id.as_deref() == Some(source.owner.as_str()))
+                            .nth(index.checked_sub(1).unwrap_or(usize::MAX))
+                    },
+                );
+            if let Some(run) = run {
+                target = serde_json::json!({"session":run.session_scope_key,"agent":run.agent_partition.as_ref().map_or("main",|partition| match &partition.key {crate::memory::PartitionKey::Main=>"main",crate::memory::PartitionKey::Named{name,..}=>name.as_str()})});
+            }
+        }
+        let target = runtime.alias(&source, &target)?;
+        let text = args
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| !text.is_empty())
+            .ok_or(crate::messaging::mailbox::MailboxError::InvalidMetadata)?;
+        let sender = runtime.bind(source, context.envelope.source_message_event_id.as_deref())?;
+        let result = sender.send(target, text.into(), "text/plain".into()).await;
+        Ok(ToolResult {
+            success: result.is_ok(),
+            error: result.as_ref().err().map(ToString::to_string),
+            output: crate::messaging::send::send_result(result).to_string(),
+        })
     }
 }
 

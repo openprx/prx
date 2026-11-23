@@ -1,6 +1,6 @@
 //! Transcript and checkpoint have exactly one commit boundary.
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use rusqlite::{Transaction, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use uuid::Uuid;
 
 use super::{
@@ -91,7 +91,12 @@ impl SqliteMailbox {
         if pin.to_pin_token.is_empty() {
             return Err(MailboxError::CorruptState);
         }
-        let content = project_body(&mime, &bytes)?;
+        let content = format!(
+            "[message from {}/{}]\n{}",
+            stream.from.session,
+            stream.from.agent,
+            project_body(&mime, &bytes)?
+        );
         let timestamp = chrono::DateTime::from_timestamp(now, 0)
             .ok_or(MailboxError::InvalidMetadata)?
             .to_rfc3339();
@@ -122,7 +127,72 @@ impl SqliteMailbox {
             common: saved.meta.common.clone(),
         };
         let agent = (stream.to.agent != "main").then_some(stream.to.agent.as_str());
-        tx.execute("INSERT INTO message_events(event_id,idempotency_key,workspace_id,owner_id,source,session_key,role,event_type,source_ref_json,content,visibility,created_at,updated_at,agent_id,ma_scope_id) VALUES (?1,?2,?3,?4,'prx_mailbox',?5,'user','message.created',?6,?7,'private',?8,?8,?9,?10)",params![event_id.to_string(),format!("prx_mailbox/{}/{}",saved.message_id,saved.meta.acceptance_id),scope.workspace_id,scope.owner_id,key,encode(&reference)?,content,timestamp,agent,scope.scope_id.to_string()]).map_err(storage_error)?;
+        let source:Option<(Option<String>,Option<String>,Option<String>)>=tx.query_row(
+            "SELECT run_id,parent_session_key,parent_run_id FROM message_events WHERE workspace_id=?1 AND owner_id=?2 AND session_key=?3 AND source!='prx_mailbox' ORDER BY id DESC LIMIT 1",
+            params![scope.workspace_id,scope.owner_id,key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(storage_error)?;
+        let (run, parent_session, parent_run) = source.unwrap_or_default();
+        let scope_agent: String = tx
+            .query_row(
+                "SELECT agent_key FROM agent_scopes WHERE scope_id=?1",
+                [scope.scope_id.to_string()],
+                |r| r.get(0),
+            )
+            .map_err(storage_error)?;
+        let partition = crate::memory::AgentPartition {
+            workspace_id: scope.workspace_id.clone(),
+            owner_id: scope.owner_id.clone(),
+            key: if let Some(name) = scope_agent.strip_prefix("n:") {
+                crate::memory::PartitionKey::Named {
+                    name: crate::config::agent_name::AgentName::parse(name).map_err(|_| MailboxError::CorruptState)?,
+                    incarnation: scope.incarnation,
+                }
+            } else {
+                crate::memory::PartitionKey::Main
+            },
+        };
+        let remote = saved.meta.common.origin == crate::messaging::MessageOrigin::RemotePeer;
+        let from = if remote {
+            serde_json::json!({"session_key":stream.from.session,"session":stream.from.session,"agent":stream.from.agent,"instance":stream.from.instance,"spiffe_id":saved.meta.common.auth.as_ref().map(|auth|auth.subject.clone())})
+        } else {
+            serde_json::json!({"session_key":stream.from.session,"agent":stream.from.agent})
+        };
+        let metadata = serde_json::json!({"provenance":if remote {"peer"}else{"session"},"from":from,"message_id":saved.message_id,"chain":saved.meta.common.chain(saved.message_id)});
+        let input = crate::memory::MessageEventInput {
+            event_id: Some(event_id.to_string()),
+            idempotency_key: Some(format!("prx_mailbox/{}/{}", saved.message_id, saved.meta.acceptance_id)),
+            workspace_id: scope.workspace_id.clone(),
+            owner_id: Some(scope.owner_id.clone()),
+            source: crate::memory::MessageEventSource::Other("prx_mailbox".into()),
+            channel: Some("mailbox".into()),
+            session_key: Some(key.clone()),
+            parent_session_key: parent_session,
+            run_id: run,
+            parent_run_id: parent_run,
+            agent_id: agent.map(str::to_owned),
+            persona_id: None,
+            sender: Some(stream.from.session.clone()),
+            recipient: Some(key.clone()),
+            role: "user".into(),
+            event_type: "message.created".into(),
+            subject: None,
+            goal_id: None,
+            causation_event_id: None,
+            correlation_id: None,
+            attempt_id: None,
+            lease_epoch: None,
+            config_generation_id: None,
+            config_source_revision: None,
+            content: content.clone(),
+            raw_payload_json: Some(metadata.to_string()),
+            visibility: crate::memory::MemoryVisibility::Private,
+            agent_partition: Some(partition),
+        };
+        super::super::SqliteMemory::append_event_row(&tx, input, false).map_err(storage_error)?;
+        tx.execute(
+            "UPDATE message_events SET source_ref_json=?2 WHERE event_id=?1",
+            params![event_id.to_string(), encode(&reference)?],
+        )
+        .map_err(storage_error)?;
         tx.execute("INSERT INTO conversation_turns(session_key,owner_id,role,content,timestamp,message_id,message_event_id,agent_id,visibility,ma_scope_id) VALUES (?1,?2,'user',?3,?4,?5,?6,?7,'private',?8)",params![key,scope.owner_id,content,timestamp,saved.message_id.to_string(),event_id.to_string(),agent,scope.scope_id.to_string()]).map_err(storage_error)?;
         saved.adopted_turn_id = Some(tx.last_insert_rowid());
         tx.execute(

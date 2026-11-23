@@ -9,7 +9,10 @@ use std::{collections::VecDeque, sync::Arc};
 
 #[derive(Default)]
 pub(super) struct ChildFocus {
+    parent: Option<String>,
+    message_queue: VecDeque<(String, crate::messaging::runtime::MessageInput)>,
     queue: VecDeque<(String, ChannelMessage)>,
+    mailboxes: std::collections::HashMap<String, crate::messaging::runtime::SessionInbox>,
 }
 
 pub(super) struct ChildFocusContext<'a> {
@@ -24,6 +27,25 @@ pub(super) struct ChildFocusContext<'a> {
 }
 
 impl ChildFocusContext<'_> {
+    async fn start_message(
+        &self,
+        record: ChildSessionRecord,
+        input: crate::messaging::runtime::MessageInput,
+    ) -> anyhow::Result<String> {
+        let provider = self.provider(&record)?;
+        let binding = ChatProviderBinding::capture(self.generation, &provider, &record.provider, &record.model)?
+            .context("child provider missing")?;
+        let command = ChatOperatorSpawn::capture_message(input, record, binding)?;
+        let (args, source) = command
+            .admit(
+                Arc::clone(self.memory),
+                self.parent,
+                Arc::clone(self.security),
+                Arc::clone(self.service),
+            )
+            .await?;
+        self.execute_source(source, args).await
+    }
     pub(super) async fn view(
         &self,
         target: &str,
@@ -86,7 +108,7 @@ impl ChildFocusContext<'_> {
                     topic_id: None,
                     source_message_event_id: None,
                     started_at: record.created_at,
-                    finished_at: record.ended_at.or(Some(chrono::Utc::now())),
+                    finished_at: record.ended_at.or_else(|| Some(chrono::Utc::now())),
                     status: SubAgentStatus::Completed(output),
                     recipient: None,
                     channel_name: Some("terminal".into()),
@@ -167,13 +189,22 @@ impl ChildFocusContext<'_> {
                 Arc::clone(self.service),
             )
             .await?;
-        args[crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG] =
-            serde_json::to_value(crate::security::policy::ApprovalGrant::for_resource_operation(
-                "sessions_spawn",
-                "sessions_spawn:spawn",
-                "chat-operator",
-                None,
-            ))?;
+        let grant = serde_json::to_value(crate::security::policy::ApprovalGrant::for_resource_operation(
+            "sessions_spawn",
+            "sessions_spawn:spawn",
+            "chat-operator",
+            None,
+        ))?;
+        args.as_object_mut()
+            .context("child arguments must be an object")?
+            .insert(crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG.into(), grant);
+        self.execute_source(source, args).await
+    }
+    async fn execute_source(
+        &self,
+        source: crate::runtime::operator_spawn::OperatorSpawnSource,
+        args: serde_json::Value,
+    ) -> anyhow::Result<String> {
         let tool = self
             .tools
             .iter()
@@ -295,9 +326,8 @@ impl ChildFocus {
                     let provider = ctx.provider(&record)?;
                     let mut history: Vec<_> = turns
                         .iter()
-                        .map(|turn| crate::providers::ChatMessage {
-                            role: turn.role.clone(),
-                            content: turn.content.clone(),
+                        .map(|turn| {
+                            crate::agent::turn_contracts::stored_turn_message(turn.role.clone(), turn.content.clone())
                         })
                         .collect();
                     let source = crate::agent::turn_history::CanonicalHistory::from_acknowledged(
@@ -399,6 +429,78 @@ impl ChildFocus {
 
     pub(super) async fn pump(&mut self, ctx: &ChildFocusContext<'_>) -> Vec<String> {
         let mut outputs = Vec::new();
+        if self.parent.as_deref() != Some(ctx.parent) {
+            self.queue.clear();
+            self.message_queue.clear();
+            self.mailboxes.clear();
+            self.parent = Some(ctx.parent.into());
+        }
+        if ctx.generation.effective.memory.backend == "sqlite" {
+            let messages = async {
+                let runtime = crate::messaging::runtime::MessagingRuntime::for_config(&ctx.generation.effective)?;
+                self.message_queue.retain(|(_, input)| input.verify(&runtime).is_ok());
+                let workspace = ctx.generation.effective.workspace_dir.to_string_lossy();
+                let owner = super::chat_runtime_envelope(&workspace, ctx.parent).resolved_owner_id();
+                let store = ctx.memory.child_session_store().context("child storage unavailable")?;
+                for record in store
+                    .sessions(&workspace, &owner)?
+                    .into_iter()
+                    .filter(|record| record.parent_session == ctx.parent)
+                {
+                    if ctx.busy(&record).await {
+                        continue;
+                    }
+                    if !self.mailboxes.contains_key(&record.session_key) {
+                        let inbox = runtime.register(runtime.address(&owner, &record.session_key, &record.agent))?;
+                        self.mailboxes.insert(record.session_key.clone(), inbox);
+                    }
+                    let inputs = self
+                        .mailboxes
+                        .get_mut(&record.session_key)
+                        .context("child inbox disappeared")?
+                        .poll()?;
+                    for input in inputs {
+                        if input.auto_start() {
+                            self.message_queue.push_back((record.session_key.clone(), input));
+                        } else {
+                            outputs.push(format!(
+                                "Message recorded for {} (automatic reply chain stopped).",
+                                record.session_key
+                            ));
+                        }
+                    }
+                }
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            if let Err(error) = messages {
+                outputs.push(error.to_string());
+            }
+        }
+        let mut message_index = 0;
+        while message_index < self.message_queue.len() {
+            let Some((target, _)) = self.message_queue.get(message_index) else {
+                break;
+            };
+            let record = match ctx.record(target) {
+                Ok(record) => record,
+                Err(error) => {
+                    self.message_queue.remove(message_index);
+                    outputs.push(error.to_string());
+                    continue;
+                }
+            };
+            if ctx.busy(&record).await {
+                message_index += 1;
+                continue;
+            }
+            if let Some((_, input)) = self.message_queue.remove(message_index) {
+                outputs.push(match ctx.start_message(record, input).await {
+                    Ok(output) => output,
+                    Err(error) => error.to_string(),
+                });
+            }
+        }
         let mut index = 0;
         while index < self.queue.len() {
             let Some((target, _)) = self.queue.get(index) else {

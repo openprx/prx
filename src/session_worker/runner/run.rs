@@ -681,12 +681,16 @@ async fn run_owned_manifest(
         crate::tools::SessionsListTool::new(Arc::clone(&active_runs))
             .with_shared_memory(Arc::clone(&session_memory), workspace_id.clone()),
     ));
-    full_tools.push(Box::new(
-        crate::tools::SessionsSendTool::with_security(Arc::clone(&active_runs), Arc::clone(&security))
-            .with_shared_memory(Arc::clone(&session_memory))
-            .with_source_fabric(session_fabric.clone())
-            .with_event_recording(config.memory.event_recording_config()),
-    ));
+    let mut send_tool = crate::tools::SessionsSendTool::with_security(Arc::clone(&active_runs), Arc::clone(&security))
+        .with_shared_memory(Arc::clone(&session_memory))
+        .with_source_fabric(session_fabric.clone())
+        .with_event_recording(config.memory.event_recording_config());
+    if let Some(address) = &manifest.session_addr {
+        send_tool = send_tool.with_mailbox(Arc::new(crate::messaging::worker::WorkerSender {
+            address: address.clone(),
+        }));
+    }
+    full_tools.push(Box::new(send_tool));
     full_tools.push(Box::new(
         crate::tools::SubagentsTool::with_security(Arc::clone(&active_runs), Arc::clone(&security))
             .with_shared_memory(Arc::clone(&session_memory))
@@ -895,13 +899,10 @@ async fn run_owned_manifest(
         let mut initial_history: Vec<crate::providers::ChatMessage> = manifest
             .seed_history
             .iter()
-            .map(|turn| crate::providers::ChatMessage {
-                role: turn.role.clone(),
-                content: turn.content.clone(),
-            })
+            .map(|turn| crate::agent::turn_contracts::stored_turn_message(turn.role.clone(), turn.content.clone()))
             .collect();
         if !initial_history.is_empty() {
-            initial_history.push(crate::providers::ChatMessage::user(&manifest.task));
+            initial_history.push(crate::agent::turn_contracts::inbound_user_message(&manifest.task));
         }
 
         let observer = NoopObserver;

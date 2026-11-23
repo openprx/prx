@@ -3,6 +3,8 @@ use super::{Deserialize, JsonSchema, Serialize, default_true};
 /// Agent orchestration configuration (`[agent]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AgentConfig {
+    #[serde(default)]
+    pub messaging: super::AgentMessaging,
     /// rf approve-and-continue wait; Console approvals retain their own expiry.
     #[serde(
         default = "super::default_approval_wait_secs",
@@ -392,6 +394,7 @@ pub(super) const fn default_agent_compaction_max_context_tokens() -> usize {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
+            messaging: super::AgentMessaging::default(),
             approval_wait_secs: super::default_approval_wait_secs(),
             compact_context: false,
             read_only_tool_concurrency_window: default_read_only_tool_concurrency_window(),

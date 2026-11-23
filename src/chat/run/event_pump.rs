@@ -1,4 +1,37 @@
 loop {
+        if let Some(inbox) = message_inbox.as_mut().filter(|inbox|inbox.fenced()) {
+            input_backlog.retain(|queued| {
+                if super::message_inbox::cause(&queued.msg).is_some() {
+                    if let Some(task) = queued.turn_task_id {let _ = turn_scheduler.request_cancel(task);}
+                    false
+                } else {true}
+            });
+            inbox.drain();
+        }
+
+        if message_inbox.as_ref().is_some_and(|inbox|inbox.session()!=chat_session_key) {
+            drop(message_inbox.take());
+            message_inbox=super::message_inbox::ChatInbox::open(&config,&chat_session_key)?;
+        }
+        #[cfg(feature="terminal-tui")]
+        let message_idle = per_turn_contexts.is_empty();
+        #[cfg(not(feature="terminal-tui"))]
+        let message_idle = true;
+        if let Some(inbox)=message_inbox.as_mut().filter(|_| message_idle) {
+            match inbox.poll() {
+                Ok(inputs)=>for input in inputs {
+                    if input.auto_start() {
+                        let message=super::message_inbox::channel_input(&input)?;
+                        enqueue_input_message_with_scheduler(&mut input_backlog,&mut turn_scheduler,message,chat_session.session().turns.len());
+                    } else {
+                        history.push(crate::agent::turn_contracts::inbound_user_message(&input.text));
+                        surface_session_message(&chat_dispatcher,sessions_redraw_handle.as_ref(),&input.text);
+                    }
+                },
+                Err(error)=>surface_session_message(&chat_dispatcher,sessions_redraw_handle.as_ref(),&error.to_string()),
+            }
+        }
+
         #[cfg(feature="terminal-tui")]
         if let (Some(target),Some(seq))=(attached_follow.as_ref(),attached_follow_seq) {
             let lines=session_rings.get(target).map_or_else(Vec::new,|ring|ring.recent_lines(crate::chat::sessions::event::DEFAULT_RING_CAPACITY));
@@ -173,7 +206,14 @@ loop {
                     }
                     break None;
                 };
-                if let Some(target)=attached_follow.as_ref() {
+                if msg.message.id == "mailbox-wake" && msg.message.sender == "session-message" && msg.message.sender_is_bot {
+                    if let Some(inbox) = message_inbox.as_mut() { inbox.wake(); }
+                    continue;
+                }
+                if super::is_local_operator_input(&msg.message) && !msg.message.sender_is_bot {
+                    if let Some(inbox) = message_inbox.as_mut() { inbox.wake(); }
+                }
+                if let Some(target)=attached_follow.as_ref().filter(|_|super::is_local_operator_input(&msg.message) && !msg.message.sender_is_bot) {
                     match child_focus.submit(target.as_str(),msg.message.clone(),&super::child_focus::ChildFocusContext { memory:&mem,generation:&ctx.config_generation,parent:&chat_session_key,
                 security:&ctx.security,service:&turn_service,tools:&tools_registry,sessions:&chat_sessions,approvals:&pending_approvals }).await {
                         Ok(Some(output))=>{surface_session_message(&chat_dispatcher,sessions_redraw_handle.as_ref(),&output);continue;},

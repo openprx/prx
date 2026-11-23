@@ -358,8 +358,13 @@ pub(super) const ALLOWED_DIRECT_TOOL_INVOCATIONS: &[(&str, usize, &str)] = &[
         "operator-typed `/kill`; the human at the keyboard is the authority",
     ),
     (
+        "src/chat/child_focus.rs::execute_source",
+        1,
+        "operator input in child focus; admitted by the same captured local operator source",
+    ),
+    (
         "src/chat/run.rs::run_internal",
-        4,
+        3,
         "operator-typed `/spawn`, `/steer` and `!command`; the human at the keyboard is the \
          authority",
     ),

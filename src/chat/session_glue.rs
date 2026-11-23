@@ -726,6 +726,7 @@ fn assignment_notifier(
 /// down, or refusing credentials never delays the prompt.
 pub(super) fn start_assignment_enrolment(
     config: &Config,
+    message_session: &str,
     chat_sessions: &crate::chat::sessions::ChatSessionsHandle,
     input_tx: &crate::runtime::h2_entry::ChatInputSender,
     dispatcher: &dispatcher::ChatDispatcher,
@@ -742,6 +743,11 @@ pub(super) fn start_assignment_enrolment(
         Enrolable::Yes => {}
     }
     let client = assignment::AssignmentClient::new(config);
+    if let Ok(runtime) = crate::messaging::runtime::MessagingRuntime::for_config(config) {
+        let owner =
+            super::chat_runtime_envelope(&config.workspace_dir.to_string_lossy(), message_session).resolved_owner_id();
+        client.set_message_target(runtime.address(&owner, message_session, "main"));
+    }
     let cancel = CancellationToken::new();
     tokio::spawn(assignment::enrol_and_poll(
         std::sync::Arc::clone(&client),

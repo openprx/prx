@@ -79,7 +79,7 @@ pub(super) fn chat_message_event_scope(
 /// Build the chat read envelope on the same stable durable-canonical
 /// `session_key` as the write scope (D4 C6), carrying the legacy `chat:{id}` key
 /// for read-merge so the read principal unions canonical + legacy history.
-pub(super) fn chat_runtime_envelope(workspace_id: &str, chat_session_key: &str) -> RuntimeEnvelope {
+pub(crate) fn chat_runtime_envelope(workspace_id: &str, chat_session_key: &str) -> RuntimeEnvelope {
     let chat_session_id = chat_session_id_from_key(chat_session_key);
     RuntimeEnvelope::chat_canonical(workspace_id.to_string(), chat_session_id, MemoryVisibility::Workspace)
         .with_recipient("terminal:user")

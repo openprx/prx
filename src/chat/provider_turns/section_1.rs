@@ -1,0 +1,1701 @@
+use super::active_turn::rollback_cancelled_turn_history;
+#[cfg(feature = "terminal-tui")]
+use super::binding;
+#[cfg(feature = "terminal-tui")]
+use super::chat_events::{finalize_chat_non_success_turn, finalize_chat_success_turn};
+use super::dispatcher;
+#[cfg(feature = "terminal-tui")]
+use super::input_queue::publish_main_queue_status;
+#[cfg(feature = "terminal-tui")]
+use super::session_glue::{surface_session_message, surface_turn_elapsed_message};
+#[cfg(feature = "terminal-tui")]
+use crate::agent::turn_contracts::ToolCallNotification;
+#[cfg(feature = "terminal-tui")]
+use crate::channels::Channel;
+#[cfg(feature = "terminal-tui")]
+use crate::channels::TerminalChannel;
+#[cfg(feature = "terminal-tui")]
+use crate::channels::sanitize_channel_response;
+#[cfg(feature = "terminal-tui")]
+use crate::config::Config;
+#[cfg(feature = "terminal-tui")]
+use crate::llm::route_decision::ProviderExecutionOutcome;
+#[cfg(feature = "terminal-tui")]
+use crate::llm::route_decision::RouteDecision;
+#[cfg(feature = "terminal-tui")]
+use crate::memory::MemoryFabric;
+#[cfg(feature = "terminal-tui")]
+use crate::memory::MessageEventScope;
+#[cfg(feature = "terminal-tui")]
+use crate::providers::ChatMessage;
+#[cfg(feature = "terminal-tui")]
+use crate::tools::Tool;
+#[cfg(feature = "terminal-tui")]
+use std::sync::Arc;
+#[cfg(feature = "terminal-tui")]
+use std::time::Duration;
+use tokio::sync::mpsc;
+#[cfg(feature = "terminal-tui")]
+use tokio_util::sync::CancellationToken;
+
+/// Queue depth for provider-turn lifecycle events (`HandleAttached`, `Started`,
+/// `Exited`) travelling from the effect executor back to the chat loop.
+///
+/// Sized as a backpressure valve, not a concurrency limit. Each turn emits
+/// exactly three of these small, `Copy`-sized records, so this depth absorbs
+/// roughly 1300 turns' worth of lifecycle traffic — far more than the chat loop
+/// can fall behind by in practice, since it drains the queue at several points
+/// in every iteration. If it ever does fill, the emitting turn parks on
+/// `send().await` instead of the queue growing without bound; slowing turn
+/// startup is the correct outcome, because the worker registry driving aborts
+/// and completion routing must not fall arbitrarily far behind reality.
+pub(crate) const PROVIDER_TURN_LIFECYCLE_CHANNEL_CAPACITY: usize = 4096;
+
+#[derive(Debug, Clone)]
+pub(super) struct ProviderTurnCompletionEvent {
+    pub(super) task_id: crate::chat::turn_scheduler::TurnTaskId,
+    // Only the TUI completion waiter fills these and only the TUI finalizer
+    // reads them.
+    #[cfg(feature = "terminal-tui")]
+    pub(super) outcome: Option<dispatcher::TurnOutcomeKind>,
+    #[cfg(feature = "terminal-tui")]
+    pub(super) usage: crate::llm::route_decision::TokenUsage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ProviderTurnCompletionContext {
+    history_len_before_assistant: usize,
+}
+
+#[cfg(feature = "terminal-tui")]
+pub(super) struct PerTurnContext {
+    pub(super) _mailbox_input: Option<crate::messaging::runtime::MessageInput>,
+    pub(super) turn_binding: Option<Arc<binding::ChatTurnBinding>>,
+    pub(super) task_id: crate::chat::turn_scheduler::TurnTaskId,
+    pub(super) draft_id: String,
+    pub(super) delta_tx: Option<mpsc::Sender<String>>,
+    pub(super) tool_event_tx: Option<mpsc::Sender<ToolCallNotification>>,
+    pub(super) draft_updater: Option<tokio::task::JoinHandle<()>>,
+    pub(super) tool_event_forwarder: Option<tokio::task::JoinHandle<()>>,
+    pub(super) user_input: String,
+    pub(super) turn_run_id: String,
+    pub(super) route_scope: MessageEventScope,
+    pub(super) route_decision: RouteDecision,
+    pub(super) provider_started_at: chrono::DateTime<chrono::Utc>,
+    pub(super) provider_name: String,
+    pub(super) model_name: String,
+    pub(super) history_len_before_user_turn: usize,
+    /// The reducer's compaction epoch when the turn's provider view was
+    /// copied. A newer acknowledged epoch at commit means a worker compaction
+    /// ran during the turn, and the run loop's view is rebuilt from the
+    /// committed snapshot instead of being appended to.
+    pub(super) compaction_epoch_at_start: u64,
+    /// Set when this turn was started by daemon-assigned work, and carried all
+    /// the way to the commit because that is where the reply exists.
+    ///
+    /// A visible turn is *launched* by the main loop and finalized somewhere
+    /// else entirely, so a guard left behind in the loop body would report the
+    /// moment the turn started — an answer of "no reply" to work that was about
+    /// to produce one. Moving it into the context ties the report to the turn
+    /// rather than to the iteration that started it.
+    pub(super) assignment: Option<crate::chat::sessions::assignment::AssignmentTurnGuard>,
+}
+
+#[cfg(feature = "terminal-tui")]
+pub(super) struct PendingOrderedProviderTurnCommit {
+    pub(super) context: PerTurnContext,
+    pub(super) terminal_plan: ProviderTurnTerminalPlan,
+}
+
+#[derive(Debug)]
+#[cfg(feature = "terminal-tui")]
+pub(super) struct ResolvedProviderTurnCompletion {
+    pub(super) outcome: Option<dispatcher::TurnOutcomeKind>,
+    pub(super) usage: crate::llm::route_decision::TokenUsage,
+}
+
+#[derive(Debug, Clone)]
+#[cfg(feature = "terminal-tui")]
+pub(super) enum ProviderTurnTerminalPlan {
+    Completed {
+        final_text: String,
+        reasoning: String,
+        recorded_response: String,
+        empty_response: bool,
+        usage: crate::llm::route_decision::TokenUsage,
+        history_commit_len: usize,
+        final_text_chars: usize,
+        recorded_response_chars: usize,
+        summary: &'static str,
+    },
+    Failed {
+        err: String,
+        history_commit_len: usize,
+        summary: String,
+    },
+    Cancelled {
+        summary: &'static str,
+    },
+}
+
+#[cfg(feature = "terminal-tui")]
+#[derive(Debug, Clone)]
+pub(super) struct ProviderTurnFinalizerEvent {
+    pub(super) task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    pub(super) plan: ProviderTurnTerminalPlan,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "terminal-tui")]
+pub(super) struct ProviderTurnFinalizerResult {
+    pub(super) task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    pub(super) terminal_status: &'static str,
+    pub(super) finalized: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct ProviderTurnVisibleAdmission {
+    pub(super) active_workers: usize,
+    pub(super) foreground_active: usize,
+    pub(super) detached_active: usize,
+    pub(super) effective_max_visible_turns: usize,
+    pub(super) can_start_visible: bool,
+}
+
+#[cfg(feature = "terminal-tui")]
+pub(super) enum ProviderTurnTerminalGate<'a> {
+    Completed {
+        history_commit_len: usize,
+        final_text_chars: usize,
+        recorded_response_chars: usize,
+        usage: &'a crate::llm::route_decision::TokenUsage,
+        summary: &'static str,
+    },
+    Failed {
+        history_commit_len: usize,
+        summary: String,
+    },
+    Cancelled {
+        summary: &'static str,
+    },
+}
+
+pub(super) fn provider_worker_status(
+    workers: &crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+) -> crate::chat::action::ProviderWorkerStatus {
+    use crate::chat::action::{ProviderWorkerRowKind, ProviderWorkerRowState, ProviderWorkerStatusRow};
+
+    let mut status = crate::chat::action::ProviderWorkerStatus::default();
+    for worker in workers.snapshot() {
+        if worker.finalized_payload_ready {
+            status.finalized_payloads = status.finalized_payloads.saturating_add(1);
+            status.finalized_total_tokens = status
+                .finalized_total_tokens
+                .saturating_add(worker.finalized_total_tokens.unwrap_or_default());
+        }
+        let row_state = match worker.state {
+            crate::chat::turn_worker::ProviderTurnWorkerState::Running => ProviderWorkerRowState::Running,
+            crate::chat::turn_worker::ProviderTurnWorkerState::Cancelling => ProviderWorkerRowState::Cancelling,
+            crate::chat::turn_worker::ProviderTurnWorkerState::AwaitingCommit(_) => {
+                ProviderWorkerRowState::AwaitingCommit
+            }
+            crate::chat::turn_worker::ProviderTurnWorkerState::Committed => ProviderWorkerRowState::Committed,
+            crate::chat::turn_worker::ProviderTurnWorkerState::Cancelled => ProviderWorkerRowState::Cancelled,
+            crate::chat::turn_worker::ProviderTurnWorkerState::Failed => ProviderWorkerRowState::Failed,
+        };
+        if !worker.state.is_terminal() || worker.finalized_payload_ready {
+            let row_kind = match worker.kind {
+                crate::chat::turn_worker::ProviderTurnWorkerKind::ForegroundAwaited => {
+                    ProviderWorkerRowKind::ForegroundAwaited
+                }
+                crate::chat::turn_worker::ProviderTurnWorkerKind::Detached => ProviderWorkerRowKind::Detached,
+            };
+            status.rows.push(ProviderWorkerStatusRow {
+                task_id: worker.task_id.get(),
+                sequence: worker.sequence,
+                kind: row_kind,
+                state: row_state,
+                started_at_ms: worker.started_at_ms,
+                finalized_total_tokens: worker.finalized_total_tokens,
+                completion_ready: worker.completion_ready,
+                recent_tool_call: None,
+            });
+        }
+        match worker.state {
+            crate::chat::turn_worker::ProviderTurnWorkerState::Running => {
+                status.running = status.running.saturating_add(1);
+                status.oldest_started_at_ms = Some(
+                    status
+                        .oldest_started_at_ms
+                        .map_or(worker.started_at_ms, |current| current.min(worker.started_at_ms)),
+                );
+            }
+            crate::chat::turn_worker::ProviderTurnWorkerState::Cancelling => {
+                status.cancelling = status.cancelling.saturating_add(1);
+                status.oldest_started_at_ms = Some(
+                    status
+                        .oldest_started_at_ms
+                        .map_or(worker.started_at_ms, |current| current.min(worker.started_at_ms)),
+                );
+            }
+            crate::chat::turn_worker::ProviderTurnWorkerState::AwaitingCommit(_) => {
+                status.awaiting_commit = status.awaiting_commit.saturating_add(1);
+            }
+            crate::chat::turn_worker::ProviderTurnWorkerState::Committed
+            | crate::chat::turn_worker::ProviderTurnWorkerState::Cancelled
+            | crate::chat::turn_worker::ProviderTurnWorkerState::Failed => {}
+        }
+    }
+    status
+}
+
+pub(super) fn publish_provider_worker_status(
+    chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
+    workers: &crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+) {
+    let _ = chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::ProviderWorkerStatusUpdated {
+            status: provider_worker_status(workers),
+        },
+        "chat.provider_worker_status_updated",
+    );
+}
+
+pub(super) fn provider_turn_visible_admission(
+    workers: &crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    target_kind: crate::chat::turn_worker::ProviderTurnWorkerKind,
+    max_concurrent_visible_turns: usize,
+) -> ProviderTurnVisibleAdmission {
+    let effective_max_visible_turns = max_concurrent_visible_turns.max(1);
+    let active_rows: Vec<_> = workers
+        .snapshot()
+        .into_iter()
+        .filter(|worker| {
+            matches!(
+                worker.state,
+                crate::chat::turn_worker::ProviderTurnWorkerState::Running
+                    | crate::chat::turn_worker::ProviderTurnWorkerState::Cancelling
+                    | crate::chat::turn_worker::ProviderTurnWorkerState::AwaitingCommit(_)
+            )
+        })
+        .collect();
+    let active_workers = active_rows.len();
+    let foreground_active = active_rows
+        .iter()
+        .filter(|worker| worker.kind == crate::chat::turn_worker::ProviderTurnWorkerKind::ForegroundAwaited)
+        .count();
+    let detached_active = active_rows
+        .iter()
+        .filter(|worker| worker.kind == crate::chat::turn_worker::ProviderTurnWorkerKind::Detached)
+        .count();
+    let can_start_visible = match target_kind {
+        crate::chat::turn_worker::ProviderTurnWorkerKind::ForegroundAwaited => active_workers == 0,
+        crate::chat::turn_worker::ProviderTurnWorkerKind::Detached => {
+            foreground_active == 0 && detached_active < effective_max_visible_turns
+        }
+    };
+    ProviderTurnVisibleAdmission {
+        active_workers,
+        foreground_active,
+        detached_active,
+        effective_max_visible_turns,
+        can_start_visible,
+    }
+}
+
+fn drain_provider_turn_lifecycle_events(
+    rx: &mut mpsc::Receiver<dispatcher::ProviderTurnLifecycleEvent>,
+    events_open: &mut bool,
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+) -> bool {
+    if !*events_open {
+        return false;
+    }
+
+    let mut drained = false;
+    loop {
+        match rx.try_recv() {
+            Ok(event) => {
+                drained = true;
+                record_provider_turn_lifecycle_event(workers, event);
+            }
+            Err(mpsc::error::TryRecvError::Empty) => return drained,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                *events_open = false;
+                return drained;
+            }
+        }
+    }
+}
+
+pub(super) fn record_provider_turn_lifecycle_event(
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    event: dispatcher::ProviderTurnLifecycleEvent,
+) {
+    use crate::chat::turn_worker::ProviderTurnWorkerError;
+    let (task_id, lease_id, kind, result): (
+        crate::chat::turn_scheduler::TurnTaskId,
+        u64,
+        &'static str,
+        Result<(), ProviderTurnWorkerError>,
+    ) = match event {
+        dispatcher::ProviderTurnLifecycleEvent::HandleAttached {
+            task_id,
+            lease_id,
+            abort_handle,
+        } => {
+            let result = workers.attach_execution_handle(task_id, lease_id, abort_handle);
+            (task_id, lease_id, "handle_attached", result)
+        }
+        dispatcher::ProviderTurnLifecycleEvent::Started { task_id, lease_id } => {
+            let result = workers.record_execution_started(task_id, lease_id);
+            (task_id, lease_id, "started", result)
+        }
+        dispatcher::ProviderTurnLifecycleEvent::FailureRequested {
+            task_id,
+            lease_id,
+            accepted,
+        } => {
+            let result = workers.record_execution_failed(task_id, lease_id);
+            if accepted.send(result.is_ok()).is_err() {
+                tracing::debug!(
+                    task_id = crate::chat::turn_scheduler::TurnTaskId::get(task_id),
+                    lease_id,
+                    "provider worker supervisor left before the failure answer"
+                );
+            }
+            if let Err(error) = result {
+                // Expected when the turn already produced its terminal: the
+                // failure gate refuses and the turn keeps its outcome.
+                tracing::debug!(
+                    task_id = crate::chat::turn_scheduler::TurnTaskId::get(task_id),
+                    lease_id,
+                    error = %crate::agent::diagnostics::error_class(&error),
+                    "provider worker failure refused"
+                );
+            }
+            return;
+        }
+        dispatcher::ProviderTurnLifecycleEvent::Exited { task_id, lease_id } => {
+            let result = workers.record_execution_exited(task_id, lease_id);
+            if let Err(ProviderTurnWorkerError::UnknownWorker(_)) = result {
+                tracing::debug!(
+                    task_id = crate::chat::turn_scheduler::TurnTaskId::get(task_id),
+                    lease_id,
+                    "provider worker exit for a retired task"
+                );
+                return;
+            }
+            (task_id, lease_id, "exited", result)
+        }
+    };
+    if let Err(error) = result {
+        tracing::warn!(
+            task_id = crate::chat::turn_scheduler::TurnTaskId::get(task_id),
+            lease_id,
+            kind,
+            error = %crate::agent::diagnostics::error_class(&error),
+            "ProviderTurnWorkerRegistry provider execution lifecycle record failed"
+        );
+    }
+}
+
+fn record_provider_turn_completion_ready(
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    task_id: crate::chat::turn_scheduler::TurnTaskId,
+) {
+    if let Err(error) = workers.record_completion_ready(task_id) {
+        tracing::warn!(
+            task_id = crate::chat::turn_scheduler::TurnTaskId::get(task_id),
+            error = %crate::agent::diagnostics::error_class(&error),
+            "ProviderTurnWorkerRegistry provider completion-ready gate failed"
+        );
+    }
+}
+
+pub(super) fn route_provider_completion_event(
+    lifecycle_rx: &mut mpsc::Receiver<dispatcher::ProviderTurnLifecycleEvent>,
+    lifecycle_events_open: &mut bool,
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    pending: &mut std::collections::HashMap<crate::chat::turn_scheduler::TurnTaskId, ProviderTurnCompletionEvent>,
+    current_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    completion: ProviderTurnCompletionEvent,
+) -> Option<ProviderTurnCompletionEvent> {
+    if drain_provider_turn_lifecycle_events(lifecycle_rx, lifecycle_events_open, workers) {
+        tracing::trace!(
+            task_id = completion.task_id.get(),
+            "drained provider lifecycle events before routing completion"
+        );
+    }
+    let task_id = completion.task_id;
+    record_provider_turn_completion_ready(workers, task_id);
+    if Some(task_id) == current_task_id {
+        return Some(completion);
+    }
+    if pending.insert(task_id, completion).is_some() {
+        tracing::warn!(
+            task_id = crate::chat::turn_scheduler::TurnTaskId::get(task_id),
+            "replaced duplicate pending provider completion event"
+        );
+    }
+    None
+}
+
+pub(super) fn route_provider_completion_event_and_publish(
+    lifecycle_rx: &mut mpsc::Receiver<dispatcher::ProviderTurnLifecycleEvent>,
+    lifecycle_events_open: &mut bool,
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    pending: &mut std::collections::HashMap<crate::chat::turn_scheduler::TurnTaskId, ProviderTurnCompletionEvent>,
+    current_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    completion: ProviderTurnCompletionEvent,
+    chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
+) -> Option<ProviderTurnCompletionEvent> {
+    let route = route_provider_completion_event(
+        lifecycle_rx,
+        lifecycle_events_open,
+        workers,
+        pending,
+        current_task_id,
+        completion,
+    );
+    publish_provider_worker_status(chat_dispatcher, workers);
+    route
+}
+
+pub(super) fn record_provider_turn_completion_context(
+    contexts: &mut std::collections::HashMap<crate::chat::turn_scheduler::TurnTaskId, ProviderTurnCompletionContext>,
+    task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    history_len_before_assistant: usize,
+) {
+    if let Some(task_id) = task_id
+        && contexts
+            .insert(
+                task_id,
+                ProviderTurnCompletionContext {
+                    history_len_before_assistant,
+                },
+            )
+            .is_some()
+    {
+        tracing::warn!(
+            task_id = crate::chat::turn_scheduler::TurnTaskId::get(task_id),
+            "replaced duplicate provider turn completion context"
+        );
+    }
+}
+
+#[cfg(feature = "terminal-tui")]
+pub(super) fn take_provider_turn_completion_history_len(
+    contexts: &mut std::collections::HashMap<crate::chat::turn_scheduler::TurnTaskId, ProviderTurnCompletionContext>,
+    task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    fallback_history_len: usize,
+) -> usize {
+    task_id
+        .and_then(|task_id| contexts.remove(&task_id))
+        .map_or(fallback_history_len, |context| context.history_len_before_assistant)
+}
+
+#[cfg(feature = "terminal-tui")]
+fn provider_turn_finalized_payload_from_usage(
+    history_commit_len: usize,
+    final_text_chars: usize,
+    recorded_response_chars: usize,
+    usage: &crate::llm::route_decision::TokenUsage,
+) -> crate::chat::turn_worker::ProviderTurnFinalizedPayload {
+    let prompt_tokens = usage.prompt_tokens.map_or(0, u64::from);
+    let completion_tokens = usage.completion_tokens.map_or(0, u64::from);
+    let total_tokens = usage
+        .total_tokens
+        .map_or_else(|| prompt_tokens.saturating_add(completion_tokens), u64::from);
+    crate::chat::turn_worker::ProviderTurnFinalizedPayload {
+        history_commit_len,
+        final_text_chars,
+        recorded_response_chars,
+        total_tokens,
+        prompt_tokens,
+        completion_tokens,
+    }
+}
+
+#[cfg(feature = "terminal-tui")]
+fn record_provider_turn_finalized_payload(
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    payload: crate::chat::turn_worker::ProviderTurnFinalizedPayload,
+) -> bool {
+    let Some(id) = id else {
+        tracing::warn!("ProviderTurnWorkerRegistry missing provider task for finalized payload");
+        return false;
+    };
+    if let Err(error) = workers.record_finalized_payload(id, payload) {
+        tracing::warn!(
+            task_id = crate::chat::turn_scheduler::TurnTaskId::get(id),
+            error = %crate::agent::diagnostics::error_class(&error),
+            "ProviderTurnWorkerRegistry provider finalized payload record failed"
+        );
+        return false;
+    }
+    true
+}
+
+#[cfg(feature = "terminal-tui")]
+pub(super) fn gate_completed_provider_turn_finalization(
+    scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+    coordinator: &mut crate::chat::history_commit::HistoryCommitCoordinator,
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    history_commit_len: usize,
+    final_text_chars: usize,
+    recorded_response_chars: usize,
+    usage: &crate::llm::route_decision::TokenUsage,
+    summary: &'static str,
+) -> Vec<crate::chat::history_commit::HistoryCommitDecision> {
+    let finalized_payload = provider_turn_finalized_payload_from_usage(
+        history_commit_len,
+        final_text_chars,
+        recorded_response_chars,
+        usage,
+    );
+    if !record_provider_turn_finalized_payload(workers, id, finalized_payload) {
+        return Vec::new();
+    }
+    mark_provider_turn_completed(scheduler, coordinator, workers, id, history_commit_len, summary)
+}
+
+/// Finalized payload of a turn the non-TUI tool loop completed inline.
+pub(super) fn inline_provider_turn_payload(
+    history_commit_len: usize,
+    response_chars: usize,
+    usage: Option<&crate::chat::session::MainSessionTokenUsageRecord>,
+) -> crate::chat::turn_worker::ProviderTurnFinalizedPayload {
+    crate::chat::turn_worker::ProviderTurnFinalizedPayload {
+        history_commit_len,
+        final_text_chars: response_chars,
+        recorded_response_chars: response_chars,
+        total_tokens: usage.map_or(0, |usage| usage.total_tokens),
+        prompt_tokens: usage.map_or(0, |usage| usage.prompt_tokens),
+        completion_tokens: usage.map_or(0, |usage| usage.completion_tokens),
+    }
+}
+
+/// The non-TUI tool loop awaited provider turn `id` inline and reached its
+/// terminal. Records the inline execution as complete and, for a completed
+/// turn, its finalized payload, so the terminal mark that follows commits the
+/// worker and frees the visible-turn slot (without it the worker stays
+/// `Running` and every later input, `/exit` included, waits for a slot).
+pub(super) fn finish_inline_provider_turn(
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    payload: Option<crate::chat::turn_worker::ProviderTurnFinalizedPayload>,
+) {
+    let Some(id) = id else {
+        return;
+    };
+    if let Err(error) = workers.record_inline_completion_ready(id) {
+        tracing::warn!(
+            task_id = crate::chat::turn_scheduler::TurnTaskId::get(id),
+            error = %crate::agent::diagnostics::error_class(&error),
+            "ProviderTurnWorkerRegistry inline provider completion failed"
+        );
+        return;
+    }
+    if let Some(payload) = payload
+        && let Err(error) = workers.record_finalized_payload(id, payload)
+    {
+        tracing::warn!(
+            task_id = crate::chat::turn_scheduler::TurnTaskId::get(id),
+            error = %crate::agent::diagnostics::error_class(&error),
+            "ProviderTurnWorkerRegistry inline provider finalized payload record failed"
+        );
+    }
+}
+
+pub(super) fn gate_failed_provider_turn_finalization(
+    scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+    coordinator: &mut crate::chat::history_commit::HistoryCommitCoordinator,
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    history_commit_len: usize,
+    summary: impl Into<String>,
+) -> Vec<crate::chat::history_commit::HistoryCommitDecision> {
+    mark_provider_turn_failed(scheduler, coordinator, workers, id, history_commit_len, summary)
+}
+
+pub(super) fn gate_cancelled_provider_turn_finalization(
+    scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+    coordinator: &mut crate::chat::history_commit::HistoryCommitCoordinator,
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    summary: &'static str,
+) -> Vec<crate::chat::history_commit::HistoryCommitDecision> {
+    mark_provider_turn_cancelled(scheduler, coordinator, workers, id, summary)
+}
+
+#[allow(clippy::option_if_let_else)]
+#[cfg(feature = "terminal-tui")]
+pub(super) fn resolve_provider_turn_completion(
+    turn_signal: &dispatcher::TurnCompletionSignal,
+    task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    completion_event: Option<ProviderTurnCompletionEvent>,
+) -> ResolvedProviderTurnCompletion {
+    let outcome = if let Some(completion) = completion_event.as_ref() {
+        completion.outcome.clone().or_else(|| turn_signal.consume_outcome())
+    } else if let Some(id) = task_id {
+        turn_signal
+            .consume_turn_outcome(id)
+            .or_else(|| turn_signal.consume_outcome())
+    } else {
+        turn_signal.consume_outcome()
+    };
+    let usage = if let Some(completion) = completion_event {
+        if completion.usage.has_any_tokens() {
+            completion.usage
+        } else {
+            turn_signal.consume_usage()
+        }
+    } else if let Some(id) = task_id {
+        let keyed_usage = turn_signal.consume_turn_usage(id);
+        if keyed_usage.has_any_tokens() {
+            keyed_usage
+        } else {
+            turn_signal.consume_usage()
+        }
+    } else {
+        turn_signal.consume_usage()
+    };
+    if let Some(id) = task_id {
+        turn_signal.unregister_turn(id);
+    }
+    ResolvedProviderTurnCompletion { outcome, usage }
+}
+
+#[cfg(feature = "terminal-tui")]
+pub(super) fn provider_turn_terminal_plan_from_completion(
+    resolved: ResolvedProviderTurnCompletion,
+    history_len: usize,
+    tools_registry: &[Box<dyn Tool>],
+) -> ProviderTurnTerminalPlan {
+    match resolved.outcome {
+        Some(dispatcher::TurnOutcomeKind::Completed { final_text, reasoning }) => {
+            let mut usage = resolved.usage;
+            if !usage.has_any_tokens() {
+                let accumulator = crate::llm::route_decision::ProviderUsageAccumulator::new();
+                usage = accumulator.finish_or_estimate_completion_chars(final_text.chars().count());
+            }
+            if crate::agent::response_guard::is_empty_assistant_response(&final_text, false) {
+                ProviderTurnTerminalPlan::Completed {
+                    final_text,
+                    reasoning: String::new(),
+                    recorded_response: String::new(),
+                    empty_response: true,
+                    usage,
+                    history_commit_len: history_len,
+                    final_text_chars: 0,
+                    recorded_response_chars: 0,
+                    summary: "redux driver completed with empty response",
+                }
+            } else {
+                let recorded_response = sanitize_channel_response(&final_text, tools_registry);
+                let final_text_chars = final_text.chars().count();
+                let recorded_response_chars = recorded_response.chars().count();
+                ProviderTurnTerminalPlan::Completed {
+                    final_text,
+                    reasoning,
+                    final_text_chars,
+                    recorded_response_chars,
+                    recorded_response,
+                    empty_response: false,
+                    usage,
+                    history_commit_len: history_len.saturating_add(1),
+                    summary: "redux driver completed",
+                }
+            }
+        }
+        Some(dispatcher::TurnOutcomeKind::Failed { err, retryable: _ }) => ProviderTurnTerminalPlan::Failed {
+            summary: format!("redux driver failed: {err}"),
+            err,
+            history_commit_len: history_len,
+        },
+        Some(dispatcher::TurnOutcomeKind::Cancelled) | None => ProviderTurnTerminalPlan::Cancelled {
+            summary: "redux driver cancelled",
+        },
+    }
+}
+
+#[cfg(feature = "terminal-tui")]
+pub(super) fn gate_provider_turn_terminal_finalization(
+    scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+    coordinator: &mut crate::chat::history_commit::HistoryCommitCoordinator,
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    gate: ProviderTurnTerminalGate<'_>,
+) -> Vec<crate::chat::history_commit::HistoryCommitDecision> {
+    match gate {
+        ProviderTurnTerminalGate::Completed {
+            history_commit_len,
+            final_text_chars,
+            recorded_response_chars,
+            usage,
+            summary,
+        } => gate_completed_provider_turn_finalization(
+            scheduler,
+            coordinator,
+            workers,
+            id,
+            history_commit_len,
+            final_text_chars,
+            recorded_response_chars,
+            usage,
+            summary,
+        ),
+        ProviderTurnTerminalGate::Failed {
+            history_commit_len,
+            summary,
+        } => gate_failed_provider_turn_finalization(scheduler, coordinator, workers, id, history_commit_len, summary),
+        ProviderTurnTerminalGate::Cancelled { summary } => {
+            gate_cancelled_provider_turn_finalization(scheduler, coordinator, workers, id, summary)
+        }
+    }
+}
+
+#[cfg(feature = "terminal-tui")]
+pub(super) fn finalize_provider_turn_from_event(
+    scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+    coordinator: &mut crate::chat::history_commit::HistoryCommitCoordinator,
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    event: ProviderTurnFinalizerEvent,
+) -> Vec<ProviderTurnFinalizerResult> {
+    let task_id = event.task_id;
+    let decisions = match event.plan {
+        ProviderTurnTerminalPlan::Completed {
+            usage,
+            history_commit_len,
+            final_text_chars,
+            recorded_response_chars,
+            summary,
+            ..
+        } => gate_provider_turn_terminal_finalization(
+            scheduler,
+            coordinator,
+            workers,
+            task_id,
+            ProviderTurnTerminalGate::Completed {
+                history_commit_len,
+                final_text_chars,
+                recorded_response_chars,
+                usage: &usage,
+                summary,
+            },
+        ),
+        ProviderTurnTerminalPlan::Failed {
+            history_commit_len,
+            summary,
+            ..
+        } => gate_provider_turn_terminal_finalization(
+            scheduler,
+            coordinator,
+            workers,
+            task_id,
+            ProviderTurnTerminalGate::Failed {
+                history_commit_len,
+                summary,
+            },
+        ),
+        ProviderTurnTerminalPlan::Cancelled { summary } => gate_provider_turn_terminal_finalization(
+            scheduler,
+            coordinator,
+            workers,
+            task_id,
+            ProviderTurnTerminalGate::Cancelled { summary },
+        ),
+    };
+    if decisions.is_empty() {
+        return vec![ProviderTurnFinalizerResult {
+            task_id,
+            terminal_status: "unknown",
+            finalized: false,
+        }];
+    }
+    decisions
+        .iter()
+        .map(provider_turn_finalizer_result_from_commit_decision)
+        .collect()
+}
+
+#[cfg(feature = "terminal-tui")]
+const fn provider_turn_finalizer_result_from_commit_decision(
+    decision: &crate::chat::history_commit::HistoryCommitDecision,
+) -> ProviderTurnFinalizerResult {
+    match decision {
+        crate::chat::history_commit::HistoryCommitDecision::Commit { task_id, .. } => ProviderTurnFinalizerResult {
+            task_id: Some(*task_id),
+            terminal_status: "completed",
+            finalized: true,
+        },
+        crate::chat::history_commit::HistoryCommitDecision::Skip { task_id, status, .. } => {
+            ProviderTurnFinalizerResult {
+                task_id: Some(*task_id),
+                terminal_status: match status {
+                    crate::chat::history_commit::HistoryCommitStatus::Completed => "completed",
+                    crate::chat::history_commit::HistoryCommitStatus::Cancelled => "cancelled",
+                    crate::chat::history_commit::HistoryCommitStatus::Failed => "failed",
+                },
+                finalized: true,
+            }
+        }
+    }
+}
+
+#[cfg(feature = "terminal-tui")]
+pub(super) fn enqueue_provider_turn_finalizer_event(
+    queue: &mut std::collections::VecDeque<ProviderTurnFinalizerEvent>,
+    task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    plan: ProviderTurnTerminalPlan,
+) {
+    queue.push_back(ProviderTurnFinalizerEvent { task_id, plan });
+}
+
+/// The terminal action of an ordered provider-turn commit.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum OrderedCommitTerminal<'a> {
+    /// TUI: `StreamCompleted` for the visible draft, acknowledged through the
+    /// task-scoped turn signal.
+    #[cfg(feature = "terminal-tui")]
+    StreamCompleted { draft_id: &'a str, reasoning: &'a str },
+    /// Non-TUI: `TurnCommitRequested`, acknowledged through
+    /// `dispatch_awaited` (keyed by the task).
+    TurnCommitRequested { draft_id: Option<&'a str> },
+}
+
+/// Queue the turn's history records (user turn when `record_user`, then the
+/// assistant turn unless the reply is empty) ahead of its terminal action.
+fn dispatch_ordered_turn_records(
+    chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
+    task_id: crate::chat::turn_scheduler::TurnTaskId,
+    user_input: &str,
+    final_text: &str,
+    empty_response: bool,
+    record_user: bool,
+) -> std::result::Result<(), String> {
+    if record_user {
+        let result = chat_dispatcher.dispatch_or_log(
+            crate::chat::action::Action::RecordUserTurn(user_input.to_string()),
+            "chat.ordered_record_user_turn",
+        );
+        if !matches!(result, dispatcher::DispatchResult::Sent) {
+            return Err(format!("ordered history dispatch failed: {result:?}"));
+        }
+    }
+    if !empty_response {
+        let result = chat_dispatcher.dispatch_or_log(
+            crate::chat::action::Action::RecordAssistantTurn {
+                task_id: Some(task_id),
+                content: final_text.to_string(),
+            },
+            "chat.ordered_record_assistant_turn",
+        );
+        if !matches!(result, dispatcher::DispatchResult::Sent) {
+            return Err(format!("ordered history dispatch failed: {result:?}"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "terminal-tui")]
+pub(super) fn dispatch_ordered_provider_turn_commit(
+    chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
+    task_id: crate::chat::turn_scheduler::TurnTaskId,
+    draft_id: &str,
+    user_input: &str,
+    final_text: &str,
+    reasoning: &str,
+    empty_response: bool,
+    record_user: bool,
+) -> std::result::Result<(), String> {
+    dispatch_ordered_turn_records(
+        chat_dispatcher,
+        task_id,
+        user_input,
+        final_text,
+        empty_response,
+        record_user,
+    )?;
+    let result = chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::StreamCompleted {
+            draft_id: draft_id.to_string(),
+            final_text: final_text.to_string(),
+            reasoning: reasoning.to_string(),
+        },
+        "chat.ordered_stream_completed",
+    );
+    if !matches!(result, dispatcher::DispatchResult::Sent) {
+        return Err(format!("ordered history dispatch failed: {result:?}"));
+    }
+    Ok(())
+}
+
+pub(super) async fn dispatch_ordered_provider_turn_commit_and_wait(
+    chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
+    turn_signal: &dispatcher::TurnCompletionSignal,
+    task_id: crate::chat::turn_scheduler::TurnTaskId,
+    terminal: OrderedCommitTerminal<'_>,
+    user_input: &str,
+    final_text: &str,
+    empty_response: bool,
+    record_user: bool,
+) -> std::result::Result<(), String> {
+    let result = match terminal {
+        #[cfg(feature = "terminal-tui")]
+        OrderedCommitTerminal::StreamCompleted { draft_id, reasoning } => {
+            dispatch_stream_completed_commit_and_wait(
+                chat_dispatcher,
+                turn_signal,
+                task_id,
+                draft_id,
+                user_input,
+                final_text,
+                reasoning,
+                empty_response,
+                record_user,
+            )
+            .await
+        }
+        OrderedCommitTerminal::TurnCommitRequested { draft_id } => {
+            dispatch_turn_commit_requested_and_wait(
+                chat_dispatcher,
+                turn_signal,
+                task_id,
+                draft_id,
+                user_input,
+                final_text,
+                empty_response,
+                record_user,
+            )
+            .await
+        }
+    };
+    if result.is_ok() {
+        turn_signal.record_history_commit(task_id);
+    }
+    result
+}
+
+/// TUI ordered commit: the records, then `StreamCompleted`, acknowledged by
+/// the dispatcher's second task-scoped turn-signal notification.
+#[cfg(feature = "terminal-tui")]
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_stream_completed_commit_and_wait(
+    chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
+    turn_signal: &dispatcher::TurnCompletionSignal,
+    task_id: crate::chat::turn_scheduler::TurnTaskId,
+    draft_id: &str,
+    user_input: &str,
+    final_text: &str,
+    reasoning: &str,
+    empty_response: bool,
+    record_user: bool,
+) -> std::result::Result<(), String> {
+    // The first task-scoped notification means the provider produced its
+    // terminal payload. The ordered StreamCompleted below is a distinct phase:
+    // the dispatcher only emits its second notification after every reducer
+    // effect, including SaveSession, has completed. Arm the waiter before
+    // dispatch so the latch-less Notify cannot be missed.
+    // Provider completion consumption unregisters the first-phase slot. Open
+    // a fresh slot for the same task/draft so the ordered reducer commit has
+    // its own acknowledgement lifecycle.
+    turn_signal.register_turn(task_id, draft_id.to_string());
+    let Some(persistence_committed) = turn_signal.notified_for(task_id) else {
+        tracing::error!(
+            task_id = crate::chat::turn_scheduler::TurnTaskId::get(task_id),
+            "missing task-scoped persistence waiter"
+        );
+        turn_signal.fail_history_commit("missing task-scoped persistence waiter");
+        return Err("missing task-scoped persistence waiter".to_string());
+    };
+    if let Err(error) = dispatch_ordered_provider_turn_commit(
+        chat_dispatcher,
+        task_id,
+        draft_id,
+        user_input,
+        final_text,
+        reasoning,
+        empty_response,
+        record_user,
+    ) {
+        turn_signal.unregister_turn(task_id);
+        turn_signal.fail_history_commit(error.clone());
+        return Err(error);
+    }
+    let result = match tokio::time::timeout(Duration::from_secs(30), persistence_committed).await {
+        Ok(()) => {
+            // Consume the second terminal outcome so a later waiter cannot
+            // mistake this persistence acknowledgement for a provider result.
+            let outcome = turn_signal.consume_turn_outcome(task_id);
+            turn_signal.unregister_turn(task_id);
+            match outcome {
+                Some(dispatcher::TurnOutcomeKind::Completed { .. }) => Ok(()),
+                Some(dispatcher::TurnOutcomeKind::Failed { err, .. }) => Err(err),
+                Some(dispatcher::TurnOutcomeKind::Cancelled) => {
+                    Err("ordered session persistence was cancelled".to_string())
+                }
+                None => Err("ordered session persistence acknowledged without an outcome".to_string()),
+            }
+        }
+        Err(_) => {
+            tracing::error!(
+                task_id = crate::chat::turn_scheduler::TurnTaskId::get(task_id),
+                "timed out waiting for ordered session persistence"
+            );
+            turn_signal.unregister_turn(task_id);
+            Err("timed out waiting for ordered session persistence".to_string())
+        }
+    };
+    if let Err(error) = &result {
+        turn_signal.fail_history_commit(error.clone());
+    }
+    result
+}
+
+/// Non-TUI ordered commit: the records, then `TurnCommitRequested` awaited
+/// through the acknowledged-session barrier. Any failure latches the
+/// unconfirmed-commit stop.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_turn_commit_requested_and_wait(
+    chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
+    turn_signal: &dispatcher::TurnCompletionSignal,
+    task_id: crate::chat::turn_scheduler::TurnTaskId,
+    draft_id: Option<&str>,
+    user_input: &str,
+    final_text: &str,
+    empty_response: bool,
+    record_user: bool,
+) -> std::result::Result<(), String> {
+    if let Err(error) = dispatch_ordered_turn_records(
+        chat_dispatcher,
+        task_id,
+        user_input,
+        final_text,
+        empty_response,
+        record_user,
+    ) {
+        turn_signal.fail_history_commit(error.clone());
+        return Err(error);
+    }
+    let ack = chat_dispatcher
+        .dispatch_awaited(
+            crate::chat::action::Action::TurnCommitRequested {
+                task_id,
+                draft_id: draft_id.map(str::to_owned),
+            },
+            turn_signal,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    match ack {
+        crate::chat::acked_session::Ack::Published(_) => Ok(()),
+        crate::chat::acked_session::Ack::Unchanged(_) => {
+            let error = "turn commit was acknowledged without a saved revision".to_owned();
+            turn_signal.fail_history_commit(error.clone());
+            Err(error)
+        }
+        crate::chat::acked_session::Ack::Rejected(reason) => {
+            turn_signal.fail_history_commit(reason.clone());
+            Err(reason)
+        }
+    }
+}
+
+#[cfg(feature = "terminal-tui")]
+#[allow(clippy::too_many_arguments)]
+async fn commit_completed_provider_turn(
+    pending_commit: PendingOrderedProviderTurnCommit,
+    history: &mut Vec<ChatMessage>,
+    turn_scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+    provider_turn_workers: &crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
+    terminal: &Arc<TerminalChannel>,
+    memory_fabric: &MemoryFabric,
+    chat_session_key: &str,
+    config: &Config,
+    sessions_redraw_handle: Option<&mpsc::Sender<()>>,
+    redraw_tx_for_main: Option<&mpsc::Sender<()>>,
+    turn_signal: &dispatcher::TurnCompletionSignal,
+) -> bool {
+    let mut pending = pending_commit.context;
+    let ProviderTurnTerminalPlan::Completed {
+        final_text,
+        reasoning,
+        recorded_response,
+        empty_response,
+        usage: redux_tokens_used,
+        history_commit_len,
+        ..
+    } = pending_commit.terminal_plan
+    else {
+        tracing::warn!(
+            task_id = pending.task_id.get(),
+            "ordered provider turn commit received non-completed terminal plan"
+        );
+        return false;
+    };
+
+    let provider_turn_task_id = Some(pending.task_id);
+    // Provider trace capture seals execution authority before this ordered
+    // finalizer runs. Re-reading the live disposition here would therefore
+    // reject every successful provider-backed turn. Use the immutable
+    // pre-execution classification carried with the turn instead.
+    let (provider_outcome, terminal_usage) = {
+        let provider_outcome = if let Some(binding) = pending.turn_binding.as_ref() {
+            match binding.provider_outcome(&pending.route_decision, pending.provider_started_at) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    tracing::error!(error = %crate::agent::diagnostics::error_class(&error), "Chat completion has no authenticated provider trace");
+                    return false;
+                }
+            }
+        } else {
+            ProviderExecutionOutcome::success_for_decision_with_usage(
+                &pending.route_decision,
+                pending.provider_started_at,
+                redux_tokens_used.clone(),
+            )
+        };
+        let terminal_usage = match finalize_chat_success_turn(
+            pending.turn_binding.as_deref(),
+            memory_fabric,
+            chat_session_key,
+            &pending.turn_run_id,
+            &pending.provider_name,
+            &pending.model_name,
+            pending.route_scope.clone(),
+            provider_outcome.clone(),
+            (!empty_response).then(|| recorded_response.clone()),
+            history_commit_len,
+            if empty_response {
+                "redux driver completed with empty response"
+            } else {
+                "redux driver completed"
+            },
+            &config.cost,
+            &config.workspace_dir,
+        )
+        .await
+        {
+            Ok(receipt) => receipt.into_session_usage(),
+            Err(error) => {
+                tracing::error!(error = %crate::agent::diagnostics::error_class(&error), "Chat terminal persistence is unconfirmed");
+                return false;
+            }
+        };
+        (Some(provider_outcome), terminal_usage)
+    };
+    let finished_at = provider_outcome
+        .as_ref()
+        .map_or_else(chrono::Utc::now, |outcome| outcome.finished_at);
+    if empty_response {
+        if let Err(e) = terminal.cancel_draft("user", &pending.draft_id).await {
+            tracing::debug!(error = %crate::agent::diagnostics::error_class(&e), "Redux driver: cancel empty-response draft failed");
+        }
+        // Metered usage goes in before the commit: same-channel FIFO puts it
+        // in the commit's acknowledged revision, and it is recorded even if
+        // the commit then fails, because the provider charged it.
+        if let Err(error) = dispatch_final_usage(
+            chat_dispatcher,
+            turn_signal,
+            turn_scheduler,
+            provider_turn_task_id,
+            terminal_usage,
+            "chat.provider_usage_recorded_empty_response",
+        )
+        .await
+        {
+            surface_session_message(
+                chat_dispatcher,
+                sessions_redraw_handle,
+                &format!("Session persistence failed; dependent commands remain blocked: {error}"),
+            );
+            return false;
+        }
+        if let Some(tx) = redraw_tx_for_main {
+            let _ = tx.try_send(());
+        }
+        let persistence_result = dispatch_ordered_provider_turn_commit_and_wait(
+            chat_dispatcher,
+            turn_signal,
+            pending.task_id,
+            OrderedCommitTerminal::StreamCompleted {
+                draft_id: &pending.draft_id,
+                reasoning: &reasoning,
+            },
+            &pending.user_input,
+            &final_text,
+            empty_response,
+            true,
+        )
+        .await;
+        if let Err(error) = persistence_result {
+            surface_session_message(
+                chat_dispatcher,
+                sessions_redraw_handle,
+                &format!("Session persistence failed; dependent commands remain blocked: {error}"),
+            );
+            return false;
+        }
+        if let Some(guard) = pending.assignment.as_mut() {
+            guard.failed("The turn finished without reply text.");
+        }
+        adopt_committed_turn(history, chat_dispatcher, &pending, None);
+        surface_turn_elapsed_message(
+            chat_dispatcher,
+            sessions_redraw_handle,
+            "completed",
+            pending.provider_started_at,
+            finished_at,
+        );
+        publish_main_queue_status(chat_dispatcher, turn_scheduler);
+        publish_provider_worker_status(chat_dispatcher, provider_turn_workers);
+        return true;
+    }
+
+    if let Err(error) = dispatch_final_usage(
+        chat_dispatcher,
+        turn_signal,
+        turn_scheduler,
+        provider_turn_task_id,
+        terminal_usage,
+        "chat.provider_usage_recorded",
+    )
+    .await
+    {
+        surface_session_message(
+            chat_dispatcher,
+            sessions_redraw_handle,
+            &format!("Session persistence failed; dependent commands remain blocked: {error}"),
+        );
+        return false;
+    }
+    if let Some(tx) = redraw_tx_for_main {
+        let _ = tx.try_send(());
+    }
+    let persistence_result = dispatch_ordered_provider_turn_commit_and_wait(
+        chat_dispatcher,
+        turn_signal,
+        pending.task_id,
+        OrderedCommitTerminal::StreamCompleted {
+            draft_id: &pending.draft_id,
+            reasoning: &reasoning,
+        },
+        &pending.user_input,
+        &final_text,
+        empty_response,
+        true,
+    )
+    .await;
+    if let Err(error) = persistence_result {
+        surface_session_message(
+            chat_dispatcher,
+            sessions_redraw_handle,
+            &format!("Session persistence failed; dependent commands remain blocked: {error}"),
+        );
+        return false;
+    }
+    adopt_committed_turn(history, chat_dispatcher, &pending, Some(&final_text));
+    if let Err(e) = terminal.finalize_draft("user", &pending.draft_id, &final_text).await {
+        tracing::warn!(error = %crate::agent::diagnostics::error_class(&e), "Redux driver: finalize_draft failed");
+    }
+    if let Some(provider_outcome) = provider_outcome.as_ref() {
+        let attempts_count = u8::try_from(provider_outcome.attempts.len()).unwrap_or(u8::MAX);
+        crate::runtime::control_ladder::append_provider_outcome_trace(
+            std::path::Path::new(&config.workspace_dir),
+            &provider_outcome.decision_id,
+            &provider_outcome.final_provider,
+            &provider_outcome.final_model,
+            attempts_count,
+            "success",
+        );
+    }
+    if let Some(guard) = pending.assignment.as_mut() {
+        guard.completed(&recorded_response);
+    }
+    surface_turn_elapsed_message(
+        chat_dispatcher,
+        sessions_redraw_handle,
+        "completed",
+        pending.provider_started_at,
+        finished_at,
+    );
+    publish_main_queue_status(chat_dispatcher, turn_scheduler);
+    publish_provider_worker_status(chat_dispatcher, provider_turn_workers);
+    true
+}
+
+/// Bring the run loop's provider view up to an acknowledged turn commit, so
+/// it equals the view rebuilt from the committed snapshot
+/// ([`super::compaction::provider_view_from_acked`]). Without a compaction
+/// since the turn copied its view, the committed request and reply are
+/// appended; the request is the plain stored text, never the enriched form
+/// the turn sent (only a request still being sent carries its recalled
+/// context and attached files). After a worker compaction the view is rebuilt
+/// from the committed snapshot instead: appending to the pre-compaction view
+/// would resend the replaced cold prefix and force another rollover or a lossy
+/// fallback on the next turn.
+#[cfg(feature = "terminal-tui")]
+fn adopt_committed_turn(
+    history: &mut Vec<ChatMessage>,
+    chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
+    pending: &PerTurnContext,
+    reply: Option<&str>,
+) {
+    let acked = chat_dispatcher.session_reader().acked();
+    if acked.compaction_epoch != pending.compaction_epoch_at_start {
+        let view = super::compaction::provider_view_from_acked(history, &acked);
+        tracing::info!(
+            task_id = pending.task_id.get(),
+            messages_before = history.len(),
+            messages_after = view.len(),
+            "provider view rebuilt from the committed snapshot after a worker compaction"
+        );
+        *history = view;
+        return;
+    }
+    history.push(crate::agent::turn_contracts::inbound_user_message(&pending.user_input));
+    if let Some(reply) = reply {
+        history.push(committed_reply_message(&acked, reply));
+    }
+}
+
+/// The provider-view message of a committed reply: `reply` rendered with the
+/// tool evidence of the snapshot's newest turn when that turn is this reply
+/// (an `assistant` turn holding exactly `reply`); otherwise the bare reply,
+/// since evidence that cannot be tied to the reply is never attached to it.
+/// A reply that is a context handoff passes through the handoff renderer
+/// first, as on every other provider-view path.
+#[cfg(feature = "terminal-tui")]
+pub(super) fn committed_reply_message(acked: &crate::chat::acked_session::AckedSession, reply: &str) -> ChatMessage {
+    let evidence = acked
+        .session
+        .turns
+        .last()
+        .filter(|turn| turn.role == "assistant" && turn.content == reply)
+        .map(|turn| turn.tool_evidence.as_ref());
+    if evidence.is_none() {
+        tracing::debug!("committed reply is not the snapshot's newest assistant turn; replayed without tool evidence");
+    }
+    let reply = crate::agent::compaction::render_context_handoff_for_provider("assistant", reply);
+    ChatMessage::assistant(
+        crate::agent::tool_evidence::render_assistant_content(&reply, evidence.flatten()).into_owned(),
+    )
+}
+
+/// A worker turn that failed or was cancelled: settled in order after the
+/// worker's compactions and terminal action (the reducer never recorded a
+/// worker turn's request, so none is removed), then the provider view follows
+/// the settled revision. The epoch the turn's view was copied at is from
+/// before the worker's detached switch and every in-turn compaction. A failed
+/// settlement is already latched; the run loop's health check stops the chat.
+#[cfg(feature = "terminal-tui")]
+async fn settle_aborted_worker_turn(
+    history: &mut Vec<ChatMessage>,
+    chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
+    commits: &dispatcher::TurnCompletionSignal,
+    pending: &PerTurnContext,
+    len_before_user_turn: Option<usize>,
+) {
+    match settle_aborted_turn(chat_dispatcher, commits, None).await {
+        Ok(settled) => {
+            provider_view_after_settled_abort(
+                history,
+                &settled,
+                pending.compaction_epoch_at_start,
+                false,
+                len_before_user_turn,
+            );
+        }
+        Err(_) => tracing::error!(
+            task_id = pending.task_id.get(),
+            "failed or cancelled worker turn was not settled; the history commit is latched as failed"
+        ),
+    }
+}
+
+#[cfg(feature = "terminal-tui")]
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn apply_ready_ordered_provider_turn_commits(
+    results: Vec<ProviderTurnFinalizerResult>,
+    pending_ordered_provider_turn_commits: &mut std::collections::HashMap<
+        crate::chat::turn_scheduler::TurnTaskId,
+        PendingOrderedProviderTurnCommit,
+    >,
+    history: &mut Vec<ChatMessage>,
+    turn_scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+    provider_turn_workers: &crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
+    terminal: &Arc<TerminalChannel>,
+    memory_fabric: &MemoryFabric,
+    chat_session_key: &str,
+    config: &Config,
+    sessions_redraw_handle: Option<&mpsc::Sender<()>>,
+    redraw_tx_for_main: Option<&mpsc::Sender<()>>,
+    turn_signal: &dispatcher::TurnCompletionSignal,
+    plain_mode: bool,
+    plain_mode_turn_failed: &mut bool,
+) -> bool {
+    let mut applied = false;
+    for result in results {
+        if turn_signal.ensure_history_commits_healthy().is_err() {
+            break;
+        }
+        if !result.finalized || result.terminal_status != "completed" {
+            continue;
+        }
+        let Some(task_id) = result.task_id else {
+            continue;
+        };
+        let Some(pending_commit) = pending_ordered_provider_turn_commits.remove(&task_id) else {
+            tracing::debug!(
+                task_id = crate::chat::turn_scheduler::TurnTaskId::get(task_id),
+                "ordered provider turn commit ready before local payload was registered"
+            );
+            continue;
+        };
+        let committed = commit_completed_provider_turn(
+            pending_commit,
+            history,
+            turn_scheduler,
+            provider_turn_workers,
+            chat_dispatcher,
+            terminal,
+            memory_fabric,
+            chat_session_key,
+            config,
+            sessions_redraw_handle,
+            redraw_tx_for_main,
+            turn_signal,
+        )
+        .await;
+        if !committed {
+            turn_signal.fail_history_commit(format!("ordered turn {} was not committed", task_id.get()));
+            if plain_mode {
+                *plain_mode_turn_failed = true;
+            }
+            break;
+        }
+        applied = true;
+    }
+    applied
+}
+
+/// The failed provider attempt a decided turn's terminal records, as every
+/// other entry records it; a policy refusal sent nothing, so it records none.
+#[cfg(feature = "terminal-tui")]
+fn failed_provider_outcome(pending: &PerTurnContext, err: &str) -> Option<ProviderExecutionOutcome> {
+    let binding = pending.turn_binding.as_ref()?;
+    let refused = matches!(
+        binding.failure_note(),
+        Some(crate::chat::binding::TurnFailureNote::Refused { .. })
+    );
+    (binding.is_decided() && !refused).then(|| {
+        ProviderExecutionOutcome::failed_for_decision(
+            &pending.route_decision,
+            pending.provider_started_at,
+            &anyhow::anyhow!("{err}"),
+        )
+    })
+}
+
+#[cfg(feature = "terminal-tui")]
+#[allow(clippy::too_many_arguments)]
+async fn finalize_per_turn_context(
+    mut pending: PerTurnContext,
+    completion_event: Option<ProviderTurnCompletionEvent>,
+    pending_ordered_provider_turn_commits: &mut std::collections::HashMap<
+        crate::chat::turn_scheduler::TurnTaskId,
+        PendingOrderedProviderTurnCommit,
+    >,
+    turn_signal: &dispatcher::TurnCompletionSignal,
+    provider_turn_completion_contexts: &mut std::collections::HashMap<
+        crate::chat::turn_scheduler::TurnTaskId,
+        ProviderTurnCompletionContext,
+    >,
+    history: &mut Vec<ChatMessage>,
+    tools_registry: &[Box<dyn Tool>],
+    provider_turn_finalizer_events: &mut std::collections::VecDeque<ProviderTurnFinalizerEvent>,
+    turn_scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+    history_commit_coordinator: &mut crate::chat::history_commit::HistoryCommitCoordinator,
+    provider_turn_workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
+    terminal: &Arc<TerminalChannel>,
+    memory_fabric: &MemoryFabric,
+    chat_session_key: &str,
+    config: &Config,
+    sessions_redraw_handle: Option<&mpsc::Sender<()>>,
+    redraw_tx_for_main: Option<&mpsc::Sender<()>>,
+    plain_mode: bool,
+    plain_mode_turn_failed: &mut bool,
+) {
+    let provider_turn_task_id = Some(pending.task_id);
+    let resolved_completion = resolve_provider_turn_completion(turn_signal, provider_turn_task_id, completion_event);
+    let completion_history_len = take_provider_turn_completion_history_len(
+        provider_turn_completion_contexts,
+        provider_turn_task_id,
+        history.len(),
+    );
+    let terminal_plan =
+        provider_turn_terminal_plan_from_completion(resolved_completion, completion_history_len, tools_registry);
+    let history_len_before_user_turn: usize = pending.history_len_before_user_turn;
+    tracing::debug!(
+        task_id = pending.task_id.get(),
+        draft_id = %crate::agent::diagnostics::text_class(&pending.draft_id),
+        turn_run_id = %crate::agent::diagnostics::text_class(&pending.turn_run_id),
+        provider_name = %crate::security::redaction::redact_provider_text(&pending.provider_name),
+        model_name = %crate::security::redaction::redact_provider_text(&pending.model_name),
+        history_len_before_user_turn,
+        "finalizing provider turn context"
+    );
+    enqueue_provider_turn_finalizer_event(
+        provider_turn_finalizer_events,
+        provider_turn_task_id,
+        terminal_plan.clone(),
+    );
+    let finalizer_results = drain_provider_turn_finalizer_events_and_publish(
+        turn_scheduler,
+        history_commit_coordinator,
+        provider_turn_workers,
+        provider_turn_finalizer_events,
+        chat_dispatcher,
+    );
+
+    drop(pending.delta_tx.take());
+    drop(pending.tool_event_tx.take());
+    if let Some(handle) = pending.draft_updater.take() {
+        let _ = handle.await;
+    }
+    if let Some(handle) = pending.tool_event_forwarder.take() {
+        let _ = handle.await;
+    }
+
+    match terminal_plan {
+        plan @ ProviderTurnTerminalPlan::Completed { .. } => {
+            let task_id = pending.task_id;
+            if pending_ordered_provider_turn_commits
+                .insert(
+                    task_id,
+                    PendingOrderedProviderTurnCommit {
+                        context: pending,
+                        terminal_plan: plan,
+                    },
+                )
+                .is_some()
+            {
+                tracing::warn!(
+                    task_id = crate::chat::turn_scheduler::TurnTaskId::get(task_id),
+                    "replaced pending ordered provider turn commit payload"
+                );
+            }
+        }
+        ProviderTurnTerminalPlan::Failed { err, .. } => {
+            if let Some(guard) = pending.assignment.as_mut() {
+                guard.failed(&format!("The turn this chat ran for the assignment failed: {err}"));
+            }
+            let provider_outcome = failed_provider_outcome(&pending, &err);
+            if let Err(error) = finalize_chat_non_success_turn(
+                pending.turn_binding.as_deref(),
+                memory_fabric,
+                &pending.turn_run_id,
+                pending.route_scope.clone(),
+                crate::agent::terminal::TurnTerminalStatus::Failed,
+                provider_outcome,
+                pending.provider_started_at,
+                &format!("redux driver failed: {err}"),
+                &config.cost,
+                &config.workspace_dir,
+            )
+            .await
+            {
+                if pending
+                    .turn_binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.is_decided())
+                {
+                    *plain_mode_turn_failed = true;
+                }
+                tracing::warn!(error = %crate::agent::diagnostics::error_class(&error), "Failed to commit ordered failed Chat terminal event");
+            }
+            settle_aborted_worker_turn(history, chat_dispatcher, turn_signal, &pending, None).await;
+            let interactive_tui_active = redraw_tx_for_main.is_some();
+            if !interactive_tui_active {
+                let _ = terminal.cancel_draft("user", &pending.draft_id).await;
+                super::output::print_turn_failure(plain_mode, &err);
+            }
+            if plain_mode {
+                *plain_mode_turn_failed = true;
+            }
+            surface_turn_elapsed_message(
+                chat_dispatcher,
+                sessions_redraw_handle,
+                "failed",
+                pending.provider_started_at,
+                chrono::Utc::now(),
+            );
+            publish_main_queue_status(chat_dispatcher, turn_scheduler);
+            publish_provider_worker_status(chat_dispatcher, provider_turn_workers);
+        }
+        ProviderTurnTerminalPlan::Cancelled { .. } => {
+            // Deliberately not marked: the guard's own default already says the
+            // turn ended before it answered, which is exactly what happened —
+            // and `cancelled` is the daemon's verdict, not a client's to claim.
+            if let Err(error) = finalize_chat_non_success_turn(
+                pending.turn_binding.as_deref(),
+                memory_fabric,
+                &pending.turn_run_id,
+                pending.route_scope.clone(),
+                crate::agent::terminal::TurnTerminalStatus::Cancelled,
+                None,
+                pending.provider_started_at,
+                "redux driver cancelled",
+                &config.cost,
+                &config.workspace_dir,
+            )
+            .await
+            {
+                if pending
+                    .turn_binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.is_decided())
+                {
+                    *plain_mode_turn_failed = true;
+                }
+                tracing::warn!(error = %crate::agent::diagnostics::error_class(&error), "Failed to commit ordered cancelled Chat terminal event");
+            }
+            let _ = terminal.cancel_draft("user", &pending.draft_id).await;
+            settle_aborted_worker_turn(
+                history,
+                chat_dispatcher,
+                turn_signal,
+                &pending,
+                Some(pending.history_len_before_user_turn),
+            )
+            .await;
+            publish_main_queue_status(chat_dispatcher, turn_scheduler);
+            publish_provider_worker_status(chat_dispatcher, provider_turn_workers);
+        }
+    }
+    let _ = apply_ready_ordered_provider_turn_commits(
+        finalizer_results,
+        pending_ordered_provider_turn_commits,
+        history,
+        turn_scheduler,
+        provider_turn_workers,
+        chat_dispatcher,
+        terminal,
+        memory_fabric,
+        chat_session_key,
+        config,
+        sessions_redraw_handle,
+        redraw_tx_for_main,
+        turn_signal,
+        plain_mode,
+        plain_mode_turn_failed,
+    )
+    .await;
+}

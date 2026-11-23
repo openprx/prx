@@ -1964,3 +1964,25 @@ current turn. `/now` puts input first; `/steer` explicitly interrupts the
 current turn. Session commands operate on the focused child's context,
 model, history, usage, and task-mode approvals. `/level` displays the inherited
 level. Process-child approval calls remain denied with `no_resolver`.
+
+## Messages between sessions
+
+`sessions_send {"to":"parent","message":"public update"}` delivers ordinary
+user input, while `{"run_id":"<running-run>","message":"new direction"}` keeps
+the existing explicit steering behavior. Targets include `main`, `parent`,
+`#N`, a child run ID, a stable `spawn:` session key, or another session key of
+the same owner. Structured `to` accepts `instance`, `owner`, `session`, `agent`;
+absent instance/owner default to the admitted caller. For a paired remote
+instance, specify its persisted UUID and receiving owner explicitly.
+
+In interactive chat, `/msg <target> <text>` uses the focused child's identity
+when attached. Incoming data appears as `[message from <session>/<agent>]`.
+Messages never approve tools, execute slash commands, or publish into an rf
+chat. Local adoption is journaled with session provenance; peer adoption carries
+its TLS SPIFFE identity. Erasing the local copy cannot erase a remote copy.
+Process children continue in a new worker with public history seeded. Their
+tool approvals remain denied with `no_resolver`; task/delegate approvals use
+the owner's pending-approval surface.
+
+`session_status` includes the caller session's last 64 outbox states, including
+`expired` and permanent refusals, without message bodies or recipient tokens.

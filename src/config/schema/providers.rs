@@ -1,5 +1,17 @@
 use super::{Deserialize, JsonSchema, Serialize};
 
+/// Owner-controlled inbound session messaging (enabled unless explicitly off).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+pub struct AgentMessaging {
+    #[serde(default = "super::default_true")]
+    pub inbound: bool,
+}
+impl Default for AgentMessaging {
+    fn default() -> Self {
+        Self { inbound: true }
+    }
+}
+
 // ── Delegate Agents ──────────────────────────────────────────────
 
 /// Optional admission limits for rf-started turns of a named agent.
@@ -30,6 +42,8 @@ impl AgentLimits {
 /// Configuration for a delegate sub-agent used by the `delegate` tool.
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DelegateAgentConfig {
+    #[serde(default)]
+    pub messaging: AgentMessaging,
     /// rf approve-and-continue wait; Console approvals retain their own expiry.
     #[serde(
         default = "super::default_approval_wait_secs",
@@ -92,6 +106,7 @@ impl DelegateAgentConfig {
     #[must_use]
     pub const fn on(provider: String, model: String) -> Self {
         Self {
+            messaging: AgentMessaging { inbound: true },
             approval_wait_secs: super::default_approval_wait_secs(),
             provider,
             model,

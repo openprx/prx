@@ -203,7 +203,6 @@ pub(super) fn parent_chain(
             || meta.created_at < 0
             || unique.len() != meta.ancestry.len()
             || meta.ancestry.len() != usize::from(meta.hop_count)
-            || meta.hop_count > 8
             || meta.ancestry.contains(&id)
         {
             return Err(MailboxError::CorruptState);
@@ -242,7 +241,7 @@ pub(super) fn derive_chain(
         return Ok(());
     };
     let (depth, mut ancestry) = parent_chain(conn, workspace, owner, parent)?;
-    if depth >= 8 || ancestry.contains(&message.id) || parent == message.id {
+    if ancestry.contains(&message.id) || parent == message.id {
         return Err(MailboxError::ChainDepth);
     }
     ancestry.push(parent);

@@ -826,7 +826,8 @@ fn tool_arguments_are_schema_validated_on_the_production_execution_path() {
 #[test]
 fn the_gateway_webhook_turn_seeds_its_spawn_boundary() {
     let root = repository_root();
-    let gateway = fs::read_to_string(root.join("src/gateway/mod.rs")).expect("read src/gateway/mod.rs");
+    let gateway =
+        fs::read_to_string(root.join("src/gateway/implementation/section_2.rs")).expect("read src/gateway/mod.rs");
     let production = strip_cfg_test_items(&gateway);
     let production = production.as_str();
 

@@ -571,6 +571,7 @@ async fn default_causal_embedded_turn_runs_delegate_child_and_confirms_cleanup()
     let agents = HashMap::from([(
         "worker".to_owned(),
         crate::config::DelegateAgentConfig {
+            messaging: crate::config::schema::AgentMessaging::default(),
             approval_wait_secs: 600,
             limits: crate::config::AgentLimits::default(),
             provider: child_provider,

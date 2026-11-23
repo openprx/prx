@@ -283,7 +283,10 @@ pub(super) fn event_written(conn: &Connection, event: &crate::memory::MessageEve
             append(conn, &h)?;
         }
     }
-    if event.role == "user" && h.parent_run_id.is_some() {
+    if event.role == "user"
+        && (h.parent_run_id.is_some() || event.source.as_str() == "prx_mailbox")
+        && !mailbox_continuation(conn, event)?
+    {
         h.kind = "turn.appended".into();
         h.event_id = format!("turn.appended:{}", h.source_ref);
         append(conn, &h)?;
@@ -359,6 +362,9 @@ pub(super) fn admission(
     h.timestamp = event.created_at.clone();
     if h.run_id.is_some() {
         append(conn, &h)?;
+    }
+    if mailbox_continuation(conn, event)? {
+        return Ok(());
     }
     h.kind = "turn.appended".into();
     h.source_ref = format!("event:{}", event.event_id);
@@ -524,4 +530,8 @@ impl SyncStore for SqliteMemory {
     fn shutdown_signal(&self) -> CancellationToken {
         self.sync_runtime.shutdown.lock().clone()
     }
+}
+
+fn mailbox_continuation(conn: &Connection, event: &crate::memory::MessageEvent) -> anyhow::Result<bool> {
+    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM message_events WHERE event_id=?1 AND workspace_id=?2 AND owner_id=?3 AND session_key=?4 AND source='prx_mailbox' AND role='user')",params![event.causation_event_id,event.workspace_id,event.owner_id,event.session_key],|row|row.get(0))?)
 }

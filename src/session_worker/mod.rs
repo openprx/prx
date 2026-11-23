@@ -18,3 +18,5 @@ pub mod mailbox_binding;
 
 #[cfg(feature = "test-mock")]
 pub mod mailbox_harness;
+
+pub mod frame_auth;

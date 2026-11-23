@@ -87,7 +87,8 @@ fn daemon_owned_components_do_not_reload_process_config_from_disk() {
 
 #[test]
 fn gateway_and_channels_have_one_shared_config_owner() {
-    let gateway = fs::read_to_string(repository_root().join("src/gateway/mod.rs")).expect("read src/gateway/mod.rs");
+    let gateway = fs::read_to_string(repository_root().join("src/gateway/implementation/section_1.rs"))
+        .expect("read src/gateway/mod.rs");
     let app_state_start = gateway.find("pub struct AppState").expect("AppState");
     let app_state = &gateway[app_state_start
         ..gateway[app_state_start..]
@@ -142,7 +143,7 @@ fn every_config_reload_entrypoint_routes_through_generation_manager() {
         ),
         ("src/config/manage/transaction.rs", "manager.reload_from_disk(trigger)"),
         (
-            "src/gateway/mod.rs",
+            "src/gateway/implementation/section_2.rs",
             "reload_from_disk(crate::config::ConfigReloadTrigger::PairingPersistence)",
         ),
     ] {

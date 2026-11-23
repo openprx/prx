@@ -328,6 +328,8 @@ pub async fn post_assign(
 
 #[derive(Deserialize, Default)]
 pub(super) struct PullRequest {
+    #[serde(default)]
+    message_target: Option<crate::messaging::SessionAddr>,
     /// Assignment ids from the previous response that the caller now holds.
     #[serde(default)]
     ack: Vec<String>,
@@ -353,6 +355,7 @@ pub(super) struct PulledAssignment {
 
 #[derive(Serialize)]
 pub(super) struct PullResponse {
+    messages: Vec<serde_json::Value>,
     assignments: Vec<PulledAssignment>,
     acked: usize,
     requeued: usize,
@@ -372,12 +375,38 @@ pub async fn post_pull(
     authorize_resource_mutation(&state, "chat_session_pull", ResourceRiskLevel::Low)?;
     let request = body.map(|Json(request)| request).unwrap_or_default();
     let token = session_token(&headers);
+    let target = request.message_target.clone();
     let pulled = offload("chat_session_pull", move || {
         chat_sessions::pull(&id, &token, &request.ack, request.max)
     })
     .await?
     .map_err(|error| into_refusal(&error))?;
+    let messages = if let Some(target) = target {
+        let config = state.config.load_full();
+        let runtime = crate::messaging::runtime::MessagingRuntime::for_config(&config)
+            .map_err(|_| refusal(StatusCode::SERVICE_UNAVAILABLE, "mailbox unavailable"))?;
+        let owner = crate::chat::chat_runtime_envelope(&config.workspace_dir.to_string_lossy(), &target.session)
+            .resolved_owner_id();
+        if target.owner != owner {
+            return Err(refusal(StatusCode::FORBIDDEN, "peer_not_allowed"));
+        }
+        let scope = runtime
+            .resolve_scope(&target)
+            .map_err(|_| refusal(StatusCode::FORBIDDEN, "peer_not_allowed"))?;
+        if runtime
+            .store
+            .has_pending(&scope, &target)
+            .map_err(|_| refusal(StatusCode::SERVICE_UNAVAILABLE, "mailbox unavailable"))?
+        {
+            vec![serde_json::json!({"kind":"message"})]
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
     Ok(Json(PullResponse {
+        messages,
         assignments: pulled
             .assignments
             .into_iter()

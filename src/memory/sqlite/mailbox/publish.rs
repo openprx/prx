@@ -8,7 +8,6 @@ use super::{
     receipt, storage_error,
     stream::{self, Role},
 };
-use crate::memory::sqlite::remote_tree::{self, RemoteTreeCaps, RemoteTreeError, RemoteTreeId, RemoteTreeResource};
 use crate::messaging::mailbox::{
     MAX_BYTES, MAX_ROWS, MailboxAuthority, MailboxError, MailboxPublished, MailboxResult, MailboxScope,
     MailboxSendState, outbox_key, validate_address, validate_body,
@@ -203,32 +202,7 @@ impl SqliteMailbox {
         receipt::derive_chain(&tx, &sender.workspace_id, &sender.owner_id, &mut message)?;
         let common = Common::from_message(&message, inherited.map(|p| p.remote.clone()))?;
         common.validate(message.id)?;
-        if let Some(inherited) = inherited {
-            let tree = RemoteTreeId {
-                workspace_id: sender.workspace_id.clone(),
-                owner_id: sender.owner_id.clone(),
-                trigger_message_id: inherited.chain.trigger.to_string(),
-            };
-            let caps = RemoteTreeCaps {
-                max_spawned: self.limits.max_spawned,
-                max_scheduled: self.limits.max_scheduled,
-                max_connections: self.limits.max_connections,
-                max_sends: self.limits.max_sends,
-            };
-            remote_tree::charge_in_transaction(
-                &tx,
-                &tree,
-                RemoteTreeResource::Send,
-                "",
-                Some(&sender.scope_id.to_string()),
-                caps,
-            )
-            .map_err(|error| match error {
-                RemoteTreeError::Closed => MailboxError::RemoteTreeClosed,
-                RemoteTreeError::Exhausted { .. } => MailboxError::RemoteSendExhausted,
-                RemoteTreeError::Storage => MailboxError::Storage,
-            })?;
-        }
+
         let parent = ParentMeta {
             request_digest: common.request_digest.clone(),
             hop_count: common.hop_count,
@@ -243,6 +217,7 @@ impl SqliteMailbox {
         tx.execute("INSERT INTO prx_mailbox_parents(stream_id,seq,workspace_id,owner_id,ma_scope_id,incarnation,generation,message_id,expires_at,parent_meta) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![stream.id,message.seq.to_be_bytes().as_slice(),sender.workspace_id,sender.owner_id,sender.scope_id.to_string(),sender.incarnation.to_string(),sender.generation,message.id.as_bytes().as_slice(),expiry,encode(&parent)?]).map_err(storage_error)?;
         let id = tx.last_insert_rowid();
         let meta = OutboxMeta {
+            attempts: 0,
             common,
             to_pin: TargetPin {
                 incarnation: message.to_pin.incarnation,
