@@ -374,7 +374,7 @@ impl ChildFocus {
                         {
                             break;
                         }
-                        compaction.keep_recent_messages = compaction.keep_recent_messages.saturating_add(2);
+                        compaction.keep_recent_messages = compaction.keep_recent_messages.saturating_add(1);
                     }
                     if let Some(patch) = built {
                         crate::agent::compaction::apply_compaction_patch_exact(&mut history, &patch)?;
