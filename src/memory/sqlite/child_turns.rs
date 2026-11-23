@@ -28,7 +28,12 @@ pub(super) fn source_written(conn: &rusqlite::Transaction<'_>, event: &MessageEv
         }
         Err(_) => return Ok(()),
     };
-    if let Some(value) = value.get("child_session_record") {
+    // task.spawned mirrors this metadata for observation; only the admitted
+    // user input creates/advances the durable logical child.
+    if event.role == "user"
+        && event.event_type == "message.created"
+        && let Some(value) = value.get("child_session_record")
+    {
         let mut record: ChildSessionRecord = serde_json::from_value(value.clone())?;
         let run = event.run_id.as_deref().ok_or(ChildSessionError::InvalidRecord)?;
         anyhow::ensure!(
