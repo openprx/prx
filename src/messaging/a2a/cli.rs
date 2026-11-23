@@ -29,6 +29,7 @@ pub enum PeerCommand {
         fingerprint: String,
         #[arg(long)]
         address: String,
+        /// Local owner allowed to send to this peer and receive from it; destination owner is learned from its pins route.
         #[arg(long)]
         owner: String,
         #[arg(long = "session", default_value = "*")]

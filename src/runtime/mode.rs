@@ -672,6 +672,7 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
                 Ok(())
             }
             management @ (ConfigCommands::Plan { .. }
+            | ConfigCommands::Autonomy { .. }
             | ConfigCommands::BraveKey { .. }
             | ConfigCommands::Apply { .. }
             | ConfigCommands::History { .. }

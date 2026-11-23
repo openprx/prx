@@ -287,9 +287,8 @@ impl MessagingRuntime {
             return Ok(address);
         }
         if address.owner != source.owner {
-            return Err(crate::messaging::mailbox::unauthorized(
-                crate::messaging::mailbox::UnauthorizedReason::LocalOwnerMismatch,
-            ));
+            crate::messaging::mailbox::unauthorized(crate::messaging::mailbox::UnauthorizedReason::LocalOwnerMismatch);
+            return Err(MailboxError::OwnerMismatch);
         }
         if matches!(address.session.as_str(), "main" | "parent") {
             address.session = self
@@ -318,11 +317,13 @@ impl MailboxResolver for LocalResolver {
         let runtime = Arc::clone(&self.runtime);
         let source = self.source.clone();
         let target = target.clone();
+        if target.instance != runtime.instance {
+            let config = runtime.config.read().clone();
+            return super::a2a::RemoteTransport::new(&config)
+                .destination(&runtime, &source, &target)
+                .await;
+        }
         crate::runtime::blocking::spawn_blocking(move || {
-            if target.instance != runtime.instance {
-                return super::a2a::RemoteTransport::new(&runtime.config.read())
-                    .destination(&runtime, &source, &target);
-            }
             let authority = MailboxAuthority::local(runtime.workspace.clone(), source.clone(), target.clone())?;
             let scope = runtime.resolve_scope(&target)?;
             let pin = runtime.store.recipient_pin(&authority, &scope, &target.session)?;

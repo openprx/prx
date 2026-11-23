@@ -22,6 +22,14 @@ pub const MAX_BYTES: i64 = 64 * 1024 * 1024;
 /// Stable refusals, shared by store, IPC and dormant send adapters.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MailboxError {
+    #[error("peer_unknown")]
+    PeerUnknown,
+    #[error("peer_not_allowed")]
+    PeerNotAllowed,
+    #[error("owner_mismatch")]
+    OwnerMismatch,
+    #[error("peer_unavailable")]
+    PeerUnavailable,
     #[error("remote_not_enabled")]
     RemoteNotEnabled,
     #[error("invalid_address")]

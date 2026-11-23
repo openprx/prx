@@ -96,7 +96,13 @@ impl SqliteMailboxSender {
                 crate::messaging::mailbox::UnauthorizedReason::SenderWorkspaceMismatch,
             ));
         }
-        if resolved.authority.destination != target {
+        let destination = &resolved.authority.destination;
+        // Only a verified remote pin response may supply the receiving owner.
+        let remote_owner = target.instance != self.source.instance
+            && destination.instance == target.instance
+            && destination.session == target.session
+            && destination.agent == target.agent;
+        if destination != &target && !remote_owner {
             return Err(crate::messaging::mailbox::unauthorized(
                 crate::messaging::mailbox::UnauthorizedReason::DestinationMismatch,
             ));
@@ -108,7 +114,7 @@ impl SqliteMailboxSender {
             seq: 0,
             ts: self.store.clock.now(),
             from: self.source.clone(),
-            to: target,
+            to: resolved.authority.destination.clone(),
             to_pin: resolved.pin,
             in_reply_to: None,
             hop_count: 0,

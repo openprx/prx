@@ -92,6 +92,12 @@ pub(super) async fn run(
 pub(super) fn permanent(error: &anyhow::Error) -> bool {
     matches!(
         error.downcast_ref::<MailboxError>(),
-        Some(MailboxError::Unauthorized | MailboxError::StaleIncarnation)
+        Some(
+            MailboxError::Unauthorized
+                | MailboxError::StaleIncarnation
+                | MailboxError::PeerNotAllowed
+                | MailboxError::PeerUnknown
+                | MailboxError::OwnerMismatch
+        )
     )
 }

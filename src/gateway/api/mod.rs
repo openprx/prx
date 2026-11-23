@@ -310,6 +310,12 @@ pub fn router(state: AppState) -> Router<AppState> {
                 .fallback(|| async { capabilities::method_not_allowed_allowing("DELETE") }),
         )
         .route(
+            "/terminal/sessions/{id}/agents/{name}/history",
+            get(agent_erasure::get_terminal_history)
+                .delete(agent_erasure::delete_terminal_history)
+                .fallback(|| async { capabilities::method_not_allowed_allowing("GET, DELETE") }),
+        )
+        .route(
             "/sessions/{id}/runs/{run_id}/cancel",
             post(sessions::post_run_cancel).fallback(capabilities::method_not_allowed),
         )

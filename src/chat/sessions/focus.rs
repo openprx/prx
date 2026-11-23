@@ -376,7 +376,8 @@ pub enum EscAction {
 /// prompts before falling through to this resolver.
 /// 1. Switcher open → close the switcher.
 /// 2. Approval focus → deny the pending tool.
-/// 3. Generating → interrupt the active turn.
+/// 3. Child focus → detach or clear its input, preserving the parent turn.
+/// 4. Main generating → interrupt the active turn.
 /// 4. Input non-empty → clear input (muscle memory preserved).
 /// 5. Input empty + session focused → detach.
 /// 6. Input empty + transcript focused → close transcript.
@@ -392,6 +393,14 @@ pub const fn resolve_esc(input_empty: bool, focus: FocusTarget, switcher_open: b
     }
     if matches!(focus, FocusTarget::Worker { .. }) && input_empty {
         return EscAction::CloseWorker;
+    }
+    // Leaving a child must not cancel an unrelated parent mailbox turn.
+    if matches!(focus, FocusTarget::Session { .. }) {
+        return if input_empty {
+            EscAction::RequestDetach
+        } else {
+            EscAction::ClearInput
+        };
     }
     if generating {
         return EscAction::CancelGenerating;
@@ -764,7 +773,7 @@ mod tests {
     fn resolve_esc_generating_interrupts_before_input_or_focus_cleanup() {
         assert_eq!(
             resolve_esc(false, FocusTarget::Session { seq: 1 }, false, true),
-            EscAction::CancelGenerating
+            EscAction::ClearInput
         );
         assert_eq!(
             resolve_esc(true, FocusTarget::Diff, false, true),

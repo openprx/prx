@@ -23,6 +23,21 @@ impl MailboxOutbound {
 }
 
 impl SqliteMailbox {
+    /// Reuse only an owner-bound, non-erased route previously pinned online.
+    pub(crate) fn known_remote_target(
+        &self,
+        workspace: &str,
+        source: &SessionAddr,
+        target: &SessionAddr,
+    ) -> MailboxResult<Option<SessionAddr>> {
+        let scope = self.session_scope(workspace, source, false)?;
+        let writer = self.memory.pool.write();
+        check_scope(&writer, &scope, source, None, true)?;
+        let raw: Option<String> = writer.query_row(
+            "SELECT s.to_addr FROM prx_mailbox_seq s JOIN prx_mailbox_outbox o ON o.stream_id=s.stream_id WHERE s.sender_ma_scope_id=?1 AND s.from_addr=?2 AND json_extract(s.to_addr,'$.instance')=?3 AND json_extract(s.to_addr,'$.session')=?4 AND json_extract(s.to_addr,'$.agent')=?5 AND o.state IN(0,1,2) AND json_extract(o.envelope_meta,'$.body_erased_at') IS NULL ORDER BY o.id DESC LIMIT 1",
+            params![scope.scope_id.to_string(), encode(source)?,target.instance,target.session,target.agent], |r| r.get(0)).optional().map_err(storage_error)?;
+        raw.map(|raw| decode(&raw)).transpose()
+    }
     pub fn pending_outbox(&self, scope: &MailboxScope, address: &SessionAddr) -> MailboxResult<Vec<MailboxOutbound>> {
         let writer = self.memory.pool.write();
         let tx = Transaction::new_unchecked(&writer, TransactionBehavior::Immediate).map_err(storage_error)?;

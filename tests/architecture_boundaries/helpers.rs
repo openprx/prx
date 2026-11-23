@@ -147,6 +147,8 @@ pub(super) fn read_source(path: &Path) -> String {
         ("src/memory/sqlite/tests/mailbox.rs", "mailbox/section_1.rs"),
         ("src/memory/sqlite/tests/mailbox.rs", "mailbox/section_2.rs"),
         ("src/memory/sqlite/tests/mailbox.rs", "mailbox/section_3.rs"),
+        ("src/runtime/manage_cli.rs", "manage_cli/section_1.rs"),
+        ("src/runtime/manage_cli.rs", "manage_cli/section_2.rs"),
         ("src/tools/execution.rs", "execution/section_1.rs"),
         ("src/tools/execution.rs", "execution/section_2.rs"),
         ("src/tools/execution.rs", "execution/section_3.rs"),

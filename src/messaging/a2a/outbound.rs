@@ -1,11 +1,7 @@
 //! Durable remote publication and receiver-pin refresh before every attempt.
+mod recipient;
 use super::tls::Trust;
-use crate::messaging::{
-    DeliveryState, RecipientPin, SessionAddr,
-    mailbox::{MailboxAuthority, MailboxError, MailboxResult},
-    runtime::MessagingRuntime,
-    send::MailboxDestination,
-};
+use crate::messaging::{DeliveryState, RecipientPin, SessionAddr, mailbox::MailboxError, runtime::MessagingRuntime};
 use std::{sync::Arc, time::Duration};
 
 pub(crate) struct RemoteTransport {
@@ -32,26 +28,6 @@ impl RemoteTransport {
                     .into()
             })
     }
-    pub(crate) fn destination(
-        &self,
-        runtime: &MessagingRuntime,
-        source: &SessionAddr,
-        target: &SessionAddr,
-    ) -> MailboxResult<MailboxDestination> {
-        // The sender may retain its turn's config while CLI peer grants change.
-        // LocalResolver runs this admission on the blocking pool.
-        self.trust.refresh().map_err(|_| MailboxError::RemoteNotEnabled)?;
-        self.peer(target).map_err(|_| MailboxError::RemoteNotEnabled)?;
-        Ok(MailboxDestination {
-            authority: MailboxAuthority::outbound(runtime.workspace.clone(), source.clone(), target.clone())?,
-            pin: RecipientPin {
-                incarnation: uuid::Uuid::nil(),
-                generation: 1,
-                token: "pending-peer-pin".into(),
-            },
-            pin_expires_at: chrono::Utc::now().timestamp() + 86400,
-        })
-    }
     async fn attempt(
         &self,
         runtime: &MessagingRuntime,
@@ -61,6 +37,7 @@ impl RemoteTransport {
     ) -> anyhow::Result<(u16, Option<u64>)> {
         self.trust.refresh_async().await?;
         let peer = self.peer(&message.to)?;
+        anyhow::ensure!(peer.owner == source.owner, MailboxError::PeerNotAllowed);
         let clients = self.clients.clone();
         let selected = peer.clone();
         let (client, cancellation) = crate::runtime::blocking::spawn_blocking(move || clients.get(&selected)).await??;
@@ -77,10 +54,12 @@ impl RemoteTransport {
             }
             #[derive(serde::Deserialize)]
             struct Pin {
+                to: SessionAddr,
                 pin: RecipientPin,
                 expires_at: i64,
             }
             let pin: Pin = serde_json::from_slice(&bounded_response(response).await?)?;
+            anyhow::ensure!(pin.to == message.to, MailboxError::OwnerMismatch);
             let store = runtime.store.clone();
             let scope = scope.clone();
             let source = source.clone();

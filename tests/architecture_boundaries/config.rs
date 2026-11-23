@@ -385,8 +385,12 @@ pub(super) fn config_writes_route_through_the_transaction_layer() {
 /// renders no plan of its own.
 #[test]
 fn the_management_cli_goes_through_the_management_service() {
-    let source = fs::read_to_string(repository_root().join("src/runtime/manage_cli.rs"))
-        .unwrap_or_else(|error| panic!("read src/runtime/manage_cli.rs: {error}"));
+    let source = [
+        "src/runtime/manage_cli/section_1.rs",
+        "src/runtime/manage_cli/section_2.rs",
+    ]
+    .map(|path| fs::read_to_string(repository_root().join(path)).unwrap_or_else(|error| panic!("read {path}: {error}")))
+    .join("\n");
     let production = production_part(&source);
     // The CLI does not run the configuration's runtime, so it records what
     // it applies as deferred to the daemon (D-085 F-4).

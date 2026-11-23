@@ -3530,8 +3530,9 @@ emit a typed, content-free `reason` at WARN. Reasons identify missing caller
 receipts, owner/instance/agent mismatches, unknown receivers, disabled inbound
 messaging, missing peers and scope-binding failures; no message, token or key
 is logged. Local targets default to the authenticated sender's owner. Remote
-targets use the full SPIFFE ID and the receiving instance's actual owner, as
-explicitly authorized by that instance's peer grant.
+targets use the full SPIFFE ID and session; the receiving owner is learned
+from its authenticated pins response. Typed routing refusals include
+`peer_unknown`, `peer_not_allowed`, `owner_mismatch`, and `remote_not_enabled`.
 
 Fresh `prx init` starts with no paired bearer. A serialized empty
 `gateway.paired_tokens = []` does not block pairing. `prx token issue --out ...`
@@ -3547,3 +3548,11 @@ and fingerprint. `prx a2a peer add` requires an explicit `--owner`: this is the
 owner on each instance, even when the instances have different default owners.
 Restart running daemons and chats after A2A setup or listener/identity changes.
 Peer grants and revocations are also rechecked during live delivery.
+
+`prx config autonomy supervised --yes` selects Supervised through the shared
+configuration transaction; `readonly` and `full` are also accepted. An increase
+prints the revision required by `--confirm-high-risk`. Restart running sessions
+to apply it. `prx config agents new NAME --provider kimi-code --model k3 --yes`
+creates a named role; apply the printed high-risk revision if required.
+For a peer, `--owner` is the LOCAL owner allowed to send to and receive from that
+peer; the remote destination owner is learned from the receiver's pins response.

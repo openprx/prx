@@ -333,7 +333,7 @@ impl ChildFocus {
                             &record.model,
                             &ctx.generation.effective.agent.compaction,
                             None,
-                            "manual",
+                            crate::agent::compaction::MANUAL_COMPACT_TRIGGER,
                         )
                         .await?
                     {
@@ -346,12 +346,25 @@ impl ChildFocus {
                                 timestamp: chrono::Utc::now(),
                             })
                             .collect();
+                    } else {
+                        return Ok(Some("Child context has no older complete turn to compact.".into()));
                     }
                 }
                 _ => {}
             }
+            let count = turns.len();
             store.replace_context(&record, &turns)?;
-            return Ok(Some("Child session updated.".into()));
+            if let Some(run) = ctx.sessions.child_run(&record.session_key).await {
+                *run.history.write().await = turns
+                    .iter()
+                    .map(|turn| crate::tools::sessions_spawn::HistoryEntry {
+                        role: turn.role.clone(),
+                        content: turn.content.clone(),
+                        timestamp: turn.timestamp,
+                    })
+                    .collect();
+            }
+            return Ok(Some(format!("Child session updated: {count} context messages.")));
         }
         let mut session = super::session::ChatSession::new(&record.provider, &record.model);
         session.id = record.session_key.clone();

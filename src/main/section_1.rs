@@ -954,6 +954,13 @@ enum TasksCommands {
 
 #[derive(Subcommand, Debug)]
 enum ConfigCommands {
+    /// Set the runtime autonomy level through a configuration transaction; restart running chats.
+    Autonomy {
+        #[arg(value_parser = ["readonly", "supervised", "full"])]
+        level: String,
+        #[command(flatten)]
+        apply: ApplyArgs,
+    },
     /// Set the Brave Search credential from stdin without an argument or echo
     BraveKey {
         #[arg(long, required = true)]

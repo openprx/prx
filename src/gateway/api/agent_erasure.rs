@@ -89,6 +89,65 @@ pub(super) async fn delete_history(
     uri: Uri,
     body: Bytes,
 ) -> Response {
+    history(state, (session, agent), principal, headers, uri, body, false).await
+}
+
+/// Read the exact incarnation needed by the paired terminal erase operation.
+pub(super) async fn get_terminal_history(
+    State(state): State<AppState>,
+    Path((session, agent)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if !super::owner_authenticated(&state, &headers) {
+        return coded_error(
+            StatusCode::UNAUTHORIZED,
+            "auth_failed",
+            "a paired owner bearer is required",
+        );
+    }
+    let config = state.config.load_full();
+    match crate::runtime::blocking::spawn_blocking(move || {
+        let owner =
+            crate::chat::chat_runtime_envelope(&config.workspace_dir.to_string_lossy(), &session).resolved_owner_id();
+        let runtime = crate::messaging::runtime::MessagingRuntime::for_config(&config)?;
+        let target = runtime.address(&owner, &session, &agent);
+        runtime.resolve_scope(&target).map_err(anyhow::Error::from)
+    })
+    .await
+    {
+        Ok(Ok(scope)) => {
+            Json(serde_json::json!({"incarnation":scope.incarnation,"generation":scope.generation})).into_response()
+        }
+        _ => coded_error(
+            StatusCode::NOT_FOUND,
+            "session_unknown",
+            "no terminal session of this installation has this key",
+        ),
+    }
+}
+
+/// Paired local operators may erase their terminal sessions without rebinding
+/// them to the Console owner or trusting an owner supplied in request JSON.
+pub(super) async fn delete_terminal_history(
+    State(state): State<AppState>,
+    Path(path): Path<(String, String)>,
+    Extension(principal): Extension<ApiPrincipal>,
+    headers: HeaderMap,
+    uri: Uri,
+    body: Bytes,
+) -> Response {
+    history(state, path, principal, headers, uri, body, true).await
+}
+
+async fn history(
+    state: AppState,
+    (session, agent): (String, String),
+    mut principal: ApiPrincipal,
+    headers: HeaderMap,
+    uri: Uri,
+    body: Bytes,
+    terminal: bool,
+) -> Response {
     if !super::owner_authenticated(&state, &headers) {
         return coded_error(
             StatusCode::UNAUTHORIZED,
@@ -107,19 +166,43 @@ pub(super) async fn delete_history(
         Ok(name) if name.is_main() || !name.is_reserved() => name,
         _ => return coded_error(StatusCode::BAD_REQUEST, "agent_invalid", "invalid agent name"),
     };
-    // Ownership is checked before idempotency or incarnation disclosure.
-    match state.mem.conversation_session_owner(&session).await {
-        Ok(Some(row))
-            if row.channel == crate::memory::CALLER_KEYED_SESSION_CHANNEL
-                && row.owner_id.as_deref() == Some(principal.owner_id.as_str()) => {}
-        Ok(_) => {
+    // The terminal owner is derived exclusively from this installation's workspace.
+    if terminal {
+        let config = state.config.load_full();
+        let owner =
+            crate::chat::chat_runtime_envelope(&config.workspace_dir.to_string_lossy(), &session).resolved_owner_id();
+        let target_session = session.clone();
+        let target_agent = agent.clone();
+        let selected_owner = owner.clone();
+        let known = crate::runtime::blocking::spawn_blocking(move || {
+            let runtime = crate::messaging::runtime::MessagingRuntime::for_config(&config)?;
+            let target = runtime.address(&selected_owner, &target_session, &target_agent);
+            runtime.resolve_scope(&target).map_err(anyhow::Error::from)
+        })
+        .await;
+        if !matches!(known, Ok(Ok(_))) {
             return coded_error(
                 StatusCode::NOT_FOUND,
                 "session_unknown",
-                "no caller-keyed session of this owner has this id",
+                "no terminal session of this installation has this key",
             );
         }
-        Err(error) => return failure(&error, false),
+        principal.owner_id = owner;
+    } else {
+        // Ownership is checked before idempotency or incarnation disclosure.
+        match state.mem.conversation_session_owner(&session).await {
+            Ok(Some(row))
+                if row.channel == crate::memory::CALLER_KEYED_SESSION_CHANNEL
+                    && row.owner_id.as_deref() == Some(principal.owner_id.as_str()) => {}
+            Ok(_) => {
+                return coded_error(
+                    StatusCode::NOT_FOUND,
+                    "session_unknown",
+                    "no caller-keyed session of this owner has this id",
+                );
+            }
+            Err(error) => return failure(&error, false),
+        }
     }
     let key = match idempotency_key(&headers) {
         Ok(key) => key,

@@ -126,24 +126,43 @@ fn process(
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
         struct PinRequest {
-            to: SessionAddr,
+            to: PinTarget,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct PinTarget {
+            instance: String,
+            session: String,
+            #[serde(default)]
+            owner: Option<String>,
+            #[serde(default = "main_agent")]
+            agent: String,
+        }
+        fn main_agent() -> String {
+            "main".into()
         }
         let Ok(input) = serde_json::from_slice::<PinRequest>(&bytes) else {
             return refused(StatusCode::BAD_REQUEST, "field_invalid");
         };
+        let target = SessionAddr::new(
+            input.to.instance,
+            input.to.owner.unwrap_or_else(|| peer.owner.clone()),
+            input.to.session,
+            Some(&input.to.agent),
+        );
         let source = SessionAddr::new(peer.spiffe_id.clone(), &peer.owner, "peer", None);
-        let Ok(authority) = target_authority(&runtime, &peer, &input.to, source) else {
+        let Ok(authority) = target_authority(&runtime, &peer, &target, source) else {
             return refused(StatusCode::FORBIDDEN, "peer_not_allowed");
         };
         let result = runtime
-            .resolve_scope(&input.to)
-            .and_then(|scope| runtime.store.recipient_pin(&authority, &scope, &input.to.session));
+            .resolve_scope(&target)
+            .and_then(|scope| runtime.store.recipient_pin(&authority, &scope, &target.session));
         return result.map_or_else(
             |_| refused(StatusCode::FORBIDDEN, "peer_not_allowed"),
             |pin| {
                 response(
                     StatusCode::OK,
-                    serde_json::json!({"pin":pin,"expires_at":chrono::Utc::now().timestamp()+300}),
+                    serde_json::json!({"to":target,"pin":pin,"expires_at":chrono::Utc::now().timestamp()+300}),
                 )
             },
         );

@@ -1973,7 +1973,8 @@ the existing explicit steering behavior. Targets include `main`, `parent`,
 `#N`, a child run ID, a stable `spawn:` session key, or another session key of
 the same owner. Structured `to` accepts `instance`, `owner`, `session`, `agent`;
 absent instance/owner default to the admitted caller. For a paired remote
-instance, specify its persisted UUID and receiving owner explicitly.
+instance, specify its full pinned SPIFFE ID and session; omit owner, which
+the receiver supplies through its authenticated pins response.
 
 In interactive chat, `/msg <target> <text>` uses the focused child's identity
 when attached. Incoming data appears as `[message from <session>/<agent>]`.
@@ -2002,3 +2003,16 @@ follow-up text after completion and starts another turn in the same child sessio
 `/msg #1 <text>` addresses that child's logical session, including after completion.
 If a process child reports `configuration_changed`, restart its parent chat before
 retrying; a newer disk configuration cannot execute under the parent's old seal.
+
+Remote `sessions_send` targets supply `instance`, `session`, and optionally `agent`.
+Omit `owner`: the authenticated receiver's `/a2a/v1/pins` response supplies it.
+A queued result always contains a durable message UUID; an assistant's text alone
+is not a delivery receipt. Unknown peers, absent owner grants, foreign owners, and
+disabled remote messaging return typed refusals before a write.
+
+A paired local operator erases a terminal chat or child through
+`DELETE /api/terminal/sessions/{url-encoded-session-key}/agents/{agent}/history`.
+First GET the same URL for its incarnation, then send that UUID in `If-Match`
+and a fresh `Idempotency-Key`. The receiver derives the terminal owner from its
+workspace; callers cannot supply a different owner. The Console erase route
+remains `DELETE /api/sessions/{id}/agents/{agent}/history`.

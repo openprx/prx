@@ -67,7 +67,11 @@ impl ChatState {
             };
         }
 
-        if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE && self.control.generating {
+        if key.code == KeyCode::Esc
+            && key.modifiers == KeyModifiers::NONE
+            && self.control.generating
+            && !matches!(self.ui.focus, crate::chat::sessions::FocusTarget::Session { .. })
+        {
             return self.reduce_cancel_requested();
         }
 
