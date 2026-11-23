@@ -120,6 +120,7 @@ pub(crate) struct PendingCallPage {
 }
 
 /// Typed input to the single rf refusal/approval cause mapper.
+#[derive(Clone, Copy)]
 pub(crate) enum RfDenialCause {
     Approval(crate::tools::ApprovalDenialCause),
     Refusal(crate::tools::execution::ToolCallRefusalReason),

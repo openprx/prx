@@ -11,6 +11,7 @@ mod approval_route;
 mod refusal_record;
 pub use refusal_record::ToolCallRefusalReason;
 pub(crate) use refusal_record::ToolRefusalNotice;
+pub(crate) use refusal_record::record_rf_call_refusal;
 
 use super::schema::ToolSchemaDialect;
 use super::traits::{Tool, ToolCategory, ToolResult, ToolSpec, ToolTier, is_tool_cancelled_result};

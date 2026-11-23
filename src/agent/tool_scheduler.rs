@@ -185,8 +185,9 @@ async fn execute_one_unrecorded(
 
     if let Some(result) = native_tool_calls.get(index).and_then(unparseable_native_arguments) {
         tracing::warn!(tool = %crate::agent::diagnostics::text_class(&call.name), "native tool call refused: arguments are not a complete JSON object");
-        emit_tool_loop_event(
+        emit_tool_outcome(
             adapter,
+            call,
             ToolLoopEvent::ToolFinished {
                 tool_call_id,
                 name: call.name.clone(),
@@ -209,8 +210,9 @@ async fn execute_one_unrecorded(
         .with_idempotency_key(tool_call_id.clone());
     let Some(service) = adapter.tool_execution_service.as_ref() else {
         let result = "Error: ToolExecutionService is unavailable; tool rejected for safety".to_string();
-        emit_tool_loop_event(
+        emit_tool_outcome(
             adapter,
+            call,
             ToolLoopEvent::ToolFinished {
                 tool_call_id,
                 name: call.name.clone(),
@@ -250,8 +252,9 @@ async fn execute_one_unrecorded(
                 },
                 |denial| format!("Error: {denial}"),
             );
-        emit_tool_loop_event(
+        emit_tool_outcome(
             adapter,
+            call,
             ToolLoopEvent::ToolFinished {
                 tool_call_id,
                 name: call.name.clone(),
@@ -259,7 +262,7 @@ async fn execute_one_unrecorded(
                 duration_ms: 0,
                 result: result.clone(),
                 outcome: ToolCallOutcome::Refused,
-                refusal_cause: Some(crate::tools::execution::ToolCallRefusalReason::PolicyDenied),
+                refusal_cause: Some(crate::tools::execution::ToolCallRefusalReason::ToolNotExposed),
             },
         )
         .await?;
@@ -268,8 +271,9 @@ async fn execute_one_unrecorded(
 
     if chat_mode.intercepts_writes() && is_write_tool(&call.name) {
         let preview = preview_tool_arguments(&call.arguments);
-        emit_tool_loop_event(
+        emit_tool_outcome(
             adapter,
+            call,
             ToolLoopEvent::ToolStarted {
                 tool_call_id: tool_call_id.clone(),
                 name: call.name.clone(),
@@ -278,8 +282,9 @@ async fn execute_one_unrecorded(
         )
         .await?;
         let result = format!("[plan mode] would call {} with {preview}", call.name);
-        emit_tool_loop_event(
+        emit_tool_outcome(
             adapter,
+            call,
             ToolLoopEvent::ToolFinished {
                 tool_call_id,
                 name: call.name.clone(),
@@ -299,8 +304,9 @@ async fn execute_one_unrecorded(
             Ok(guard) => Some(guard),
             Err(error) => {
                 let result = format!("Error: {error}");
-                emit_tool_loop_event(
+                emit_tool_outcome(
                     adapter,
+                    call,
                     ToolLoopEvent::ToolFinished {
                         tool_call_id,
                         name: call.name.clone(),
@@ -343,10 +349,21 @@ async fn execute_one_unrecorded(
     let executed = outcome.result.is_some() && outcome.process.as_ref().map_or(success, |process| process.started);
     let status = outcome.status;
     let approval_denial_cause = outcome.approval_denial_cause;
-    let refusal_cause = outcome.refusal_cause;
+    let refusal_cause = outcome.refusal_cause.or(match status {
+        ToolExecutionStatus::Failed => Some(crate::tools::execution::ToolCallRefusalReason::Failed),
+        ToolExecutionStatus::Indeterminate => Some(crate::tools::execution::ToolCallRefusalReason::Indeterminate),
+        ToolExecutionStatus::PreparationDenied => {
+            Some(crate::tools::execution::ToolCallRefusalReason::PreparationDenied)
+        }
+        ToolExecutionStatus::IdempotencyConflict => {
+            Some(crate::tools::execution::ToolCallRefusalReason::IdempotencyConflict)
+        }
+        _ => None,
+    });
     let result = outcome.model_content;
-    emit_tool_loop_event(
+    emit_tool_outcome(
         adapter,
+        call,
         ToolLoopEvent::ToolFinished {
             tool_call_id,
             name: call.name.clone(),
@@ -366,6 +383,54 @@ async fn execute_one_unrecorded(
         status,
         executed,
     })
+}
+
+/// The rf wire's durability boundary also covers scheduler-only refusals.
+/// The ordinary event and its model/UI text are forwarded unchanged.
+async fn emit_tool_outcome(
+    adapter: &ToolLoopRuntimeAdapter,
+    call: &ParsedToolCall,
+    mut event: ToolLoopEvent,
+) -> Result<()> {
+    if adapter.tool_execution_context.live_turn.is_some()
+        && let ToolLoopEvent::ToolFinished {
+            tool_call_id,
+            name,
+            outcome,
+            refusal_cause,
+            ..
+        } = &mut event
+    {
+        use crate::security::approval_ledger::run_call::RfDenialCause;
+        let cause = match outcome {
+            ToolCallOutcome::Denied { cause: Some(cause) } => Some(RfDenialCause::Approval(*cause)),
+            ToolCallOutcome::Denied { cause: None } | ToolCallOutcome::Refused => Some(RfDenialCause::Refusal(
+                refusal_cause.unwrap_or(crate::tools::execution::ToolCallRefusalReason::PolicyDenied),
+            )),
+            ToolCallOutcome::Error | ToolCallOutcome::Unknown => Some(RfDenialCause::Refusal(
+                refusal_cause.unwrap_or(crate::tools::execution::ToolCallRefusalReason::Failed),
+            )),
+            ToolCallOutcome::PlanOnly => Some(RfDenialCause::Refusal(
+                crate::tools::execution::ToolCallRefusalReason::PlanOnly,
+            )),
+            _ => None,
+        };
+        if let Some(cause) = cause {
+            if let RfDenialCause::Refusal(reason) = cause {
+                *refusal_cause = Some(reason);
+            }
+            let command = crate::tools::ToolExecutionCommand::new(name.as_str(), call.arguments.clone())
+                .with_operation_id(tool_call_id.clone());
+            crate::tools::execution::record_rf_call_refusal(
+                adapter.tool_execution_service.as_deref(),
+                &command,
+                &adapter.tool_execution_context,
+                cause,
+            )
+            .await?;
+        }
+    }
+    emit_tool_loop_event(adapter, event).await
 }
 
 type ToolExecutionFuture =

@@ -720,9 +720,13 @@ approval, pre-approval refusal, or termination causes: `owner_denied`, `expired`
 `path_invalid`, `path_forbidden`, `path_outside_workspace`,
 `path_symlink_outside`, `path_dynamic_shell_argument`,
 `path_active_shell_substitution`, `invalid_arguments`, `unknown_tool`,
-`stale_capability`, `service_unavailable`, or `barrier_timeout`. Plan-mode
-interception uses `plan_only`. Existing `tool.call.refused` journal rows retain
-their internal `reason` and include the same mapped `cause` as the live frame.
+`stale_capability`, `service_unavailable`, `barrier_timeout`, or
+`tool_not_exposed`. Other tool failures use `failed`, `indeterminate`,
+`preparation_denied`, or `idempotency_conflict`. Plan-mode
+interception uses `plan_only`. Every denied/failed tool outcome commits a `tool.call.refused`
+journal row before its live frame, including scheduler refusals before service
+entry. Rows retain the internal `reason` and the same mapped `cause` as the
+live frame. A refusal-storage failure ends the turn without an unrecorded frame.
 No refusal cause contains paths or arguments. Process workers have no approval relay in this unit. Their
 completion returns a bounded, content-free `denials:[{tool,cause}]` inventory
 under the existing completion signature. Only after authentication does the
