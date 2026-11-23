@@ -845,12 +845,18 @@ impl Memory for SqliteMemory {
         .await?
     }
 
-    async fn interrupt_rf_run(&self, workspace_id: &str, owner_id: &str, run_id: &str) -> anyhow::Result<bool> {
+    async fn interrupt_rf_run(
+        &self,
+        workspace_id: &str,
+        owner_id: &str,
+        run_id: &str,
+        restartable: bool,
+    ) -> anyhow::Result<bool> {
         let pool = self.pool.clone();
         let (workspace_id, owner_id, run_id) = (workspace_id.to_owned(), owner_id.to_owned(), run_id.to_owned());
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<bool> {
             let conn = pool.write();
-            super::rf_messages::interrupt_run(&conn, &workspace_id, &owner_id, &run_id)
+            super::rf_messages::interrupt_run(&conn, &workspace_id, &owner_id, &run_id, restartable)
         })
         .await?
     }

@@ -10,6 +10,11 @@ use crate::memory::MessageEvent;
 use crate::memory::rf_messages::{RfAdmission, RfAdmissionRefused, RfAttempt, RfAttemptLookup, RfRun, run_terminal};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
+const INTERRUPTED: i64 = 1;
+// Startup publishes the interrupted outcome without spending the key's
+// restart opportunity. Admission changes this to INTERRUPTED atomically.
+const RESTART_INTERRUPTED: i64 = 2;
+
 /// Idempotent DDL. Called from schema init.
 pub(super) fn init_schema(conn: &Connection) -> anyhow::Result<()> {
     conn.execute_batch(
@@ -26,7 +31,7 @@ pub(super) fn init_schema(conn: &Connection) -> anyhow::Result<()> {
             job_id TEXT,
             message_event_id TEXT NOT NULL,
             lifetime TEXT,
-            interrupted INTEGER NOT NULL DEFAULT 0 CHECK (interrupted IN (0, 1)),
+            interrupted INTEGER NOT NULL DEFAULT 0 CHECK (interrupted IN (0, 1, 2)),
             ma_scope_id TEXT REFERENCES agent_scopes(scope_id),
             created_at TEXT NOT NULL,
             PRIMARY KEY (workspace_id, owner_id, session_key, agent_key, incarnation, client_message_id, attempt),
@@ -63,22 +68,35 @@ pub(super) fn has_terminal(
 
 /// Mark the run `interrupted` while it has no terminal row; `false` when it
 /// has one (or no attempt holds the run).
-fn interrupt(conn: &Connection, workspace_id: &str, owner_id: &str, run_id: &str) -> anyhow::Result<bool> {
+fn interrupt(
+    conn: &Connection,
+    workspace_id: &str,
+    owner_id: &str,
+    run_id: &str,
+    restartable: bool,
+) -> anyhow::Result<bool> {
     if has_terminal(conn, workspace_id, owner_id, run_id)? {
         return Ok(false);
     }
     let changed = conn.execute(
-        "UPDATE rf_message_attempts SET interrupted = 1
-         WHERE workspace_id = ?1 AND owner_id = ?2 AND run_id = ?3 AND interrupted=0",
-        params![workspace_id, owner_id, run_id],
+        "UPDATE rf_message_attempts SET interrupted = ?4
+         WHERE workspace_id = ?1 AND owner_id = ?2 AND run_id = ?3
+           AND (interrupted=0 OR (interrupted=?5 AND ?4=?6))",
+        params![
+            workspace_id,
+            owner_id,
+            run_id,
+            if restartable { RESTART_INTERRUPTED } else { INTERRUPTED },
+            RESTART_INTERRUPTED,
+            INTERRUPTED
+        ],
     )?;
     if changed == 1 {
         super::sync_journal::interrupted(conn, workspace_id, owner_id, run_id)?;
     }
-    if changed == 1 {
-        return Ok(true);
-    }
-    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM rf_message_attempts WHERE workspace_id=?1 AND owner_id=?2 AND run_id=?3 AND interrupted=1)",params![workspace_id,owner_id,run_id],|r|r.get(0))?)
+    // A settled interruption is terminal too: a stale resend must not
+    // admit another attempt after a cancel or another admission won.
+    Ok(changed == 1)
 }
 
 /// Write the attempt row inside the input's append transaction, after the
@@ -97,7 +115,7 @@ pub(super) fn admit(
         "an admitted rf input must be a new event of the key's workspace and owner"
     );
     if let Some(previous) = admission.interrupts.as_deref()
-        && !interrupt(tx, &key.workspace_id, &key.owner_id, previous)?
+        && !interrupt(tx, &key.workspace_id, &key.owner_id, previous, false)?
     {
         return Err(RfAdmissionRefused::Stale.into());
     }
@@ -179,7 +197,7 @@ type AttemptRow = (
     Option<String>,
     Option<String>,
     Option<String>,
-    bool,
+    i64,
 );
 
 fn attempt_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttemptRow> {
@@ -194,6 +212,7 @@ fn attempt_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttemptRow> {
             message_event_id: row.get(7)?,
             lifetime: row.get(8)?,
             terminal: None,
+            restartable: false,
             deleted: row.get(10)?,
             reply_deleted: row.get(11)?,
         },
@@ -257,7 +276,9 @@ pub(super) fn read(
         _ => anyhow::bail!("an rf attempt row holds a run without its job"),
     };
     if attempt.run.is_some() {
-        attempt.terminal = run_terminal(final_payload.as_deref(), admission_failure.as_deref(), interrupted)?;
+        attempt.terminal = run_terminal(final_payload.as_deref(), admission_failure.as_deref(), interrupted != 0)?;
+        attempt.restartable =
+            interrupted == RESTART_INTERRUPTED && final_payload.is_none() && admission_failure.is_none();
     }
     Ok(Some(attempt))
 }
@@ -268,9 +289,10 @@ pub(super) fn interrupt_run(
     workspace_id: &str,
     owner_id: &str,
     run_id: &str,
+    restartable: bool,
 ) -> anyhow::Result<bool> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    let marked = interrupt(&tx, workspace_id, owner_id, run_id)?;
+    let marked = interrupt(&tx, workspace_id, owner_id, run_id, restartable)?;
     tx.commit()?;
     Ok(marked)
 }

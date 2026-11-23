@@ -58,7 +58,7 @@ async fn startup_inner(state: &AppState, shutdown: &CancellationToken) -> anyhow
             if gone {
                 state
                     .mem
-                    .interrupt_rf_run(&candidate.workspace, &candidate.owner, &candidate.run_id)
+                    .interrupt_rf_run(&candidate.workspace, &candidate.owner, &candidate.run_id, true)
                     .await?;
             }
         }

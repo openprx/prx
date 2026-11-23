@@ -2225,8 +2225,16 @@ pub trait Memory: Send + Sync {
 
     /// Give an rf run its terminal `interrupted` in one transaction, only
     /// while it has no terminal row; `false` when it has one.
-    async fn interrupt_rf_run(&self, workspace_id: &str, owner_id: &str, run_id: &str) -> anyhow::Result<bool> {
-        let _ = (workspace_id, owner_id, run_id);
+    /// Startup uses `restartable` to preserve the key's restart rule; a
+    /// cancel of an unfinished run or a new admission settles it permanently.
+    async fn interrupt_rf_run(
+        &self,
+        workspace_id: &str,
+        owner_id: &str,
+        run_id: &str,
+        restartable: bool,
+    ) -> anyhow::Result<bool> {
+        let _ = (workspace_id, owner_id, run_id, restartable);
         Err(crate::memory::fabric::fail_fast(self.name(), "interrupt_rf_run"))
     }
 

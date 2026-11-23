@@ -191,7 +191,11 @@ async fn turn_status(
     attempt: &RfAttempt,
     run_id: &str,
 ) -> Result<Option<RunOutcome>, Box<Response>> {
-    if let Some(terminal) = attempt.terminal {
+    // Startup publishes a durable failed outcome for run readers while
+    // leaving the key eligible for the same lifetime-proven restart rule.
+    if let Some(terminal) = attempt.terminal
+        && !attempt.restartable
+    {
         return Ok(Some(RunOutcome::of(terminal)));
     }
     if !matches!(
@@ -299,7 +303,7 @@ async fn cancel_run(state: &AppState, workspace: &str, attempt: RfAttempt) -> Re
     }
     match state
         .mem
-        .interrupt_rf_run(workspace, &attempt.owner_id, &run.run_id)
+        .interrupt_rf_run(workspace, &attempt.owner_id, &run.run_id, false)
         .await
     {
         // The mark was just committed: the attempt row now reads interrupted.

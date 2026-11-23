@@ -89,6 +89,9 @@ pub struct RfAttempt {
     /// that process recorded ingress.
     pub lifetime: Option<String>,
     pub terminal: Option<RfRunTerminal>,
+    /// Startup proved the admitting process ended, but no resend has yet
+    /// settled this interruption and admitted the next attempt.
+    pub restartable: bool,
     /// The message was deleted (AC-1b2b): a replay of the key is refused.
     pub deleted: bool,
     /// The assistant side of the attempt's run was deleted.
