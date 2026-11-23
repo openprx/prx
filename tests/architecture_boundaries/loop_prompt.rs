@@ -194,7 +194,7 @@ pub(super) fn outbound_middleware_has_one_production_owner() {
 #[test]
 fn production_tool_loop_memory_is_wired_to_request_context_events() {
     for relative in [
-        "src/agent/entry/section_2.rs",
+        "src/agent/entry/section_1.rs",
         "src/channels/turn.rs",
         "src/chat/run/provider_turn.rs",
         "src/gateway/api/sessions/section_1.rs",
@@ -242,7 +242,7 @@ pub(super) const REVIEWED_DECISION_HANDOFFS: &[(&str, usize, &str)] = &[
         "crate::agent::turn_request::TurnDecision{service:&service,context:&decision,runtime:decision.runtime(),proof:source,}",
     ),
     (
-        "src/agent/entry/section_2.rs",
+        "src/agent/entry.rs",
         1,
         "crate::agent::turn_request::TurnDecision{service:decision_service,context:decision_context,runtime:decision_context.runtime(),proof:decision_proof,}",
     ),
