@@ -49,7 +49,9 @@ impl SqliteMailbox {
         address: &crate::messaging::SessionAddr,
     ) -> MailboxResult<()> {
         if address.instance != self.local_instance {
-            return Err(MailboxError::Unauthorized);
+            return Err(crate::messaging::mailbox::unauthorized(
+                crate::messaging::mailbox::UnauthorizedReason::LocalInstanceMismatch,
+            ));
         }
         let writer = self.memory.pool.write();
         pin::check_scope(&writer, scope, address, None, true)

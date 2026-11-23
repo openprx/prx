@@ -113,20 +113,21 @@ impl EncryptedScope {
             crate::memory::MessageEventSource::SessionsSpawn | crate::memory::MessageEventSource::SessionWorker
         );
         input.raw_payload_json = Some(if child {
-            let mut wrapper = serde_json::json!({"encrypted_child_payload": sealed});
+            let mut wrapper = serde_json::Map::new();
+            wrapper.insert("encrypted_child_payload".into(), sealed.into());
             if let Some(record) = value.as_ref().and_then(|value| value.get("child_session_record")) {
                 let record: crate::memory::child_sessions::ChildSessionRecord = serde_json::from_value(record.clone())?;
                 anyhow::ensure!(record.context.is_empty(), "launch metadata cannot expose child history");
-                wrapper["child_session_record"] = serde_json::to_value(record)?;
+                wrapper.insert("child_session_record".into(), serde_json::to_value(record)?);
             }
             if let Some(status) = value
                 .as_ref()
                 .and_then(|value| value.get("status"))
                 .and_then(serde_json::Value::as_str)
             {
-                wrapper["status"] = status.into();
+                wrapper.insert("status".into(), status.into());
             }
-            wrapper.to_string()
+            serde_json::Value::Object(wrapper).to_string()
         } else {
             sealed
         });

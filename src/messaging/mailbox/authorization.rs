@@ -3,6 +3,8 @@ use super::MailboxError;
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum UnauthorizedReason {
     CallerMissing,
+    RequestIdentityRejected,
+    PeerGrantMismatch,
     WorkerSenderUnavailable,
     LocalInstanceMismatch,
     LocalOwnerMismatch,
@@ -31,6 +33,8 @@ impl UnauthorizedReason {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::CallerMissing => "caller_missing",
+            Self::RequestIdentityRejected => "request_identity_rejected",
+            Self::PeerGrantMismatch => "peer_grant_mismatch",
             Self::WorkerSenderUnavailable => "worker_sender_unavailable",
             Self::LocalInstanceMismatch => "local_instance_mismatch",
             Self::LocalOwnerMismatch => "local_owner_mismatch",

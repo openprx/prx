@@ -36,6 +36,12 @@ fn response(status: StatusCode, value: serde_json::Value) -> Response<Body> {
     response
 }
 fn refused(status: StatusCode, code: &str) -> Response<Body> {
+    use crate::messaging::mailbox::{UnauthorizedReason, unauthorized};
+    if status == StatusCode::UNAUTHORIZED {
+        unauthorized(UnauthorizedReason::RequestIdentityRejected);
+    } else if status == StatusCode::FORBIDDEN {
+        unauthorized(UnauthorizedReason::PeerGrantMismatch);
+    }
     response(status, serde_json::json!({"error":code}))
 }
 fn target_authority(
