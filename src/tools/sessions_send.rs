@@ -183,10 +183,12 @@ impl Tool for SessionsSendTool {
                 )
             })?;
             let object = args.as_object().ok_or(MailboxError::InvalidMetadata)?;
-            if object
-                .keys()
-                .any(|key| !matches!(key.as_str(), "to" | "message") && !key.starts_with("_zc_"))
-            {
+            if object.keys().any(|key| {
+                !matches!(key.as_str(), "to" | "message")
+                    && !crate::tools::execution::RUNTIME_ONLY_ARG_PREFIXES
+                        .into_iter()
+                        .any(|prefix| key.starts_with(prefix))
+            }) {
                 return Err(MailboxError::InvalidMetadata.into());
             }
             let value = args.get("to").ok_or(MailboxError::InvalidAddress)?;
