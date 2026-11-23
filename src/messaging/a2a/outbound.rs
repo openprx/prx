@@ -38,6 +38,9 @@ impl RemoteTransport {
         source: &SessionAddr,
         target: &SessionAddr,
     ) -> MailboxResult<MailboxDestination> {
+        // The sender may retain its turn's config while CLI peer grants change.
+        // LocalResolver runs this admission on the blocking pool.
+        self.trust.refresh().map_err(|_| MailboxError::RemoteNotEnabled)?;
         self.peer(target).map_err(|_| MailboxError::RemoteNotEnabled)?;
         Ok(MailboxDestination {
             authority: MailboxAuthority::outbound(runtime.workspace.clone(), source.clone(), target.clone())?,
