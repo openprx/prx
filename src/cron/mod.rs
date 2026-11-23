@@ -18,7 +18,6 @@ pub use schedule::normalize_expression;
 pub use schedule::{next_run_for_schedule, schedule_cron_expression, validate_schedule};
 #[cfg(test)]
 pub use store::add_job;
-pub(crate) use store::finish_claimed_run_preserving_schedule;
 pub use store::{
     abandon_job_claim, add_agent_job, add_agent_job_with_lineage, add_shell_job, add_shell_job_with_approval_grant,
     add_shell_job_with_lineage_and_approval_grant, add_shell_job_with_lineage_approval_and_delete,
@@ -27,6 +26,7 @@ pub use store::{
     list_jobs, list_runs, mark_job_operator, record_claim_lost, record_delivery_withheld, record_terminal_manual_run,
     remove_job, renew_job_claim, unmarked_shell_jobs, update_job,
 };
+pub(crate) use store::{finish_claimed_run_preserving_schedule, mark_run_finalizing};
 pub use types::{
     CronClaim, CronJob, CronJobEvent, CronJobLineage, CronJobPatch, CronJobTerminalState, CronRun, DeliveryConfig,
     DeliveryPrincipal, JobCreator, JobOrigin, JobType, Schedule, SessionTarget,

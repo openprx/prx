@@ -99,3 +99,45 @@ impl NamedJob {
         Ok(())
     }
 }
+
+/// Ordered status publication for claimed named-agent cron runs only.
+pub(crate) async fn finalize_status(
+    config: &Config,
+    scope: &crate::memory::MessageEventScope,
+    status: crate::agent::terminal::TurnTerminalStatus,
+) -> Result<()> {
+    if scope.source != crate::memory::MessageEventSource::Cron
+        || scope.parent_run_id.is_some()
+        || !scope
+            .agent_partition
+            .as_ref()
+            .is_some_and(|partition| matches!(partition.key, PartitionKey::Named { .. }))
+    {
+        return Ok(());
+    }
+    let Some(attempt) = scope
+        .attempt_id
+        .as_deref()
+        .filter(|attempt| !attempt.starts_with("immediate-"))
+    else {
+        return Ok(());
+    };
+    let Some(crate::memory::MessageEventSubject::Task(job_id)) = &scope.subject else {
+        anyhow::bail!("scheduled terminal has no job identity");
+    };
+    let status = match status {
+        crate::agent::terminal::TurnTerminalStatus::Completed | crate::agent::terminal::TurnTerminalStatus::Silent => {
+            "ok"
+        }
+        crate::agent::terminal::TurnTerminalStatus::Failed => "error",
+        crate::agent::terminal::TurnTerminalStatus::Cancelled => "cancelled",
+    };
+    let config = config.clone();
+    let job_id = job_id.clone();
+    let attempt = attempt.to_owned();
+    crate::runtime::blocking::spawn_blocking(move || {
+        crate::cron::mark_run_finalizing(&config, &job_id, &attempt, status)
+    })
+    .await??;
+    Ok(())
+}

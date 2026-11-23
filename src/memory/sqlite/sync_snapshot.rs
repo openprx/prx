@@ -35,7 +35,7 @@ fn inventory(conn: &Connection, id: &str, owner: &str, head: i64, water: i64) ->
     // Sessions are independent of whether a message has been admitted yet.
     let incarnation:String=conn.query_row("SELECT a.incarnation FROM agent_incarnations a JOIN sync_meta m ON m.workspace=a.workspace_id WHERE a.owner_id=?1 AND a.agent_key='m' AND a.state='active'",[owner],|r|r.get(0))?;
     let mut q =
-        conn.prepare("SELECT session_key FROM sessions WHERE owner_id=?1 AND channel='rf' ORDER BY session_key")?;
+        conn.prepare("SELECT session_key FROM sessions s WHERE owner_id=?1 AND channel='rf' AND NOT EXISTS(SELECT 1 FROM sync_journal j WHERE j.owner_id=s.owner_id AND j.session=s.session_key AND j.kind='session.upsert' AND j.agent!='main' AND j.parent_run_id IS NULL AND (j.session LIKE 'cron:%' OR j.session LIKE 'xin:%')) ORDER BY session_key")?;
     for session in q.query_map([owner], |r| r.get::<_, String>(0))? {
         let session = session?;
         save(

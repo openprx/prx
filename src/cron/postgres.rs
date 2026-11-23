@@ -621,6 +621,17 @@ impl PostgresCronStore {
         })
     }
 
+    pub(super) fn mark_run_finalizing(&self, job_id: &str, attempt: &str, status: &str) -> Result<()> {
+        self.with_client(|client| {
+            let changed = client.execute(
+                "UPDATE cron_jobs SET last_status=$3 WHERE id=$1 AND attempt_id=$2 AND claim_expires_at>$4",
+                &[&job_id, &attempt, &status, &format_claim_time(Utc::now())],
+            )?;
+            anyhow::ensure!(changed == 1, "cron finalization claim lost");
+            Ok(())
+        })
+    }
+
     pub fn job_claim_is_current(&self, job_id: &str, claim: &CronClaim, now: DateTime<Utc>) -> Result<bool> {
         self.with_client(|client| {
             let row = client.query_one(

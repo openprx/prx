@@ -760,6 +760,22 @@ pub fn renew_job_claim(
     })
 }
 
+/// Publish the model outcome before its session terminal becomes visible.
+/// Keep the lease: the scheduler still owns fenced history/schedule settlement.
+pub(crate) fn mark_run_finalizing(config: &Config, job_id: &str, attempt: &str, status: &str) -> Result<()> {
+    if let Some(store) = pg_store(config)? {
+        return store.mark_run_finalizing(job_id, attempt, status);
+    }
+    let changed = with_connection(config, |conn| {
+        Ok(conn.execute(
+            "UPDATE cron_jobs SET last_status=?3 WHERE id=?1 AND attempt_id=?2 AND claim_expires_at>?4",
+            params![job_id, attempt, status, format_claim_time(Utc::now())],
+        )?)
+    })?;
+    anyhow::ensure!(changed == 1, "cron finalization claim lost");
+    Ok(())
+}
+
 pub fn job_claim_is_current(config: &Config, job_id: &str, claim: &CronClaim, now: DateTime<Utc>) -> Result<bool> {
     if let Some(store) = pg_store(config)? {
         return store.job_claim_is_current(job_id, claim, now);

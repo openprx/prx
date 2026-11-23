@@ -969,6 +969,7 @@ pub(crate) async fn commit_terminal(
     proposal: crate::agent::terminal::TurnTerminalDraft,
     config: &crate::config::Config,
 ) -> anyhow::Result<crate::agent::terminal::TurnTerminalReceipt> {
+    crate::agent::automation::finalize_status(config, &proposal.scope, proposal.status).await?;
     if let Some(guard) = guard {
         guard.commit(proposal).await
     } else {

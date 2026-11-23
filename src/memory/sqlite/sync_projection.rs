@@ -63,11 +63,7 @@ pub(super) fn payload(conn: &Connection, h: &Header) -> anyhow::Result<Value> {
         let Some((created_at, raw)) = row else {
             return Ok(json!({"deleted":true}));
         };
-        let metadata: Value = raw
-            .as_deref()
-            .map(serde_json::from_str)
-            .transpose()?
-            .unwrap_or_default();
+        let metadata = scheduled_metadata(raw.as_deref())?;
         return Ok(
             json!({"session_key":h.session,"channel":if h.session.starts_with("cron:") {"cron"} else {"xin"},"created_at":created_at,"metadata":{"job_id":metadata.get("job_id"),"job_version":metadata.get("job_version")}}),
         );
@@ -85,11 +81,9 @@ pub(super) fn payload(conn: &Connection, h: &Header) -> anyhow::Result<Value> {
             )
             .optional()?
             .flatten();
-        return Ok(raw
+        return raw
             .as_deref()
-            .map(serde_json::from_str::<Value>)
-            .transpose()?
-            .unwrap_or_else(|| json!({"deleted":true})));
+            .map_or_else(|| Ok(json!({"deleted":true})), |raw| scheduled_metadata(Some(raw)));
     }
     if h.kind == "turn.failed" && (h.session.starts_with("cron:") || h.session.starts_with("xin:")) {
         if let Some(id) = h.source_ref.strip_prefix("event:") {
@@ -391,4 +385,13 @@ pub(super) fn refresh_config(
     }
     tx.commit()?;
     Ok(())
+}
+
+/// Ingress recovery wraps the source payload; project only the job identity.
+pub(super) fn scheduled_metadata(raw: Option<&str>) -> anyhow::Result<Value> {
+    let mut value: Value = raw.map(serde_json::from_str).transpose()?.unwrap_or_default();
+    if let Some(original) = value.get("original_payload_json").and_then(Value::as_str) {
+        value = serde_json::from_str(original)?;
+    }
+    Ok(json!({"job_id":value.get("job_id"),"job_version":value.get("job_version")}))
 }

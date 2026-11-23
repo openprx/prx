@@ -334,7 +334,7 @@ pub(super) fn event_written(conn: &Connection, event: &crate::memory::MessageEve
 
 /// Transcript projection shares the source/journal transaction and its erase stamp.
 fn project_scheduled(conn: &Connection, event: &str) -> anyhow::Result<()> {
-    conn.execute("INSERT INTO sessions(session_key,channel,sender,owner_id,created_at,updated_at) SELECT session_key,channel,(SELECT substr(agent_key,3) FROM agent_scopes WHERE scope_id=ma_scope_id),owner_id,created_at,created_at FROM message_events WHERE event_id=?1 ON CONFLICT(session_key) DO UPDATE SET updated_at=excluded.updated_at WHERE sessions.owner_id=excluded.owner_id AND sessions.channel=excluded.channel",[event])?;
+    conn.execute("INSERT INTO sessions(session_key,channel,sender,owner_id,created_at,updated_at) SELECT session_key,source,(SELECT substr(agent_key,3) FROM agent_scopes WHERE scope_id=ma_scope_id),owner_id,created_at,created_at FROM message_events WHERE event_id=?1 ON CONFLICT(session_key) DO UPDATE SET updated_at=excluded.updated_at WHERE sessions.owner_id=excluded.owner_id AND sessions.channel=excluded.channel",[event])?;
     conn.execute("INSERT INTO conversation_turns(session_key,owner_id,role,content,timestamp,message_id,message_event_id,agent_id,persona_id,visibility,ma_scope_id) SELECT session_key,owner_id,role,content,created_at,event_id,event_id,agent_id,persona_id,visibility,ma_scope_id FROM message_events WHERE event_id=?1 AND NOT EXISTS(SELECT 1 FROM conversation_turns WHERE message_event_id=?1)",[event])?;
     conn.execute("UPDATE sessions SET message_count=(SELECT COUNT(*) FROM conversation_turns t WHERE t.session_key=sessions.session_key AND t.owner_id=sessions.owner_id),last_message_preview=(SELECT substr(content,1,120) FROM message_events WHERE event_id=?1) WHERE session_key=(SELECT session_key FROM message_events WHERE event_id=?1) AND owner_id=(SELECT owner_id FROM message_events WHERE event_id=?1)",[event])?;
     Ok(())
@@ -415,7 +415,9 @@ impl SyncStore for SqliteMemory {
         let reader = self.pool.read()?;
         let conn = reader.connection()?;
         let raw:Option<String>=conn.query_row("SELECT raw_payload_json FROM message_events WHERE owner_id=?1 AND session_key=?2 AND source IN ('cron','xin') AND parent_run_id IS NULL AND (role='user' OR event_type='scheduled.skipped') ORDER BY id DESC LIMIT 1",params![owner,session],|r|r.get(0)).optional()?.flatten();
-        raw.as_deref().map(serde_json::from_str).transpose().map_err(Into::into)
+        raw.as_deref()
+            .map(|raw| super::sync_projection::scheduled_metadata(Some(raw)))
+            .transpose()
     }
 
     fn live_scope(&self, owner: &str, event: &str) -> anyhow::Result<Option<serde_json::Value>> {
