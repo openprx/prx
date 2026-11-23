@@ -3576,6 +3576,11 @@ impl ToolExecutionService {
         let public_name = command.name.as_str();
         let execution_parameters = descriptor.execution_parameters.clone();
         let schema_dialect = context.schema_dialect;
+        let live_frames = context
+            .live_turn
+            .as_ref()
+            .map(|live| live.0.frames(&context.envelope, &std::collections::HashSet::new()));
+        let operation_id = &command.operation_id;
         let tool_future = crate::runtime::registry::scope_current(
             work.id(),
             CHILD_CALL_CONTEXT.scope(
@@ -3593,6 +3598,15 @@ impl ToolExecutionService {
                             None
                         },
                         async move {
+                            // Emit only at backend entry, after approval and all
+                            // admission gates, without changing legacy event sinks.
+                            if let Some(live) = live_frames {
+                                live.emit(&crate::agent::turn_contracts::ToolLoopEvent::ToolStarted {
+                                    tool_call_id: operation_id.clone(),
+                                    name: public_name.to_owned(),
+                                    args: String::new(),
+                                });
+                            }
                             if let Some(observation) = exact_call_ref {
                                 observation.backend_started();
                             }

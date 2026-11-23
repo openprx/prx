@@ -315,15 +315,6 @@ async fn execute_one_unrecorded(
         },
         None => None,
     };
-    // Ordinary dispatch never emitted a legacy ToolStarted event. Keep the
-    // rf phase on its infallible sink so terminal approval ordering is unchanged.
-    if let Some(live) = &adapter.live_frames {
-        live.emit(&ToolLoopEvent::ToolStarted {
-            tool_call_id: tool_call_id.clone(),
-            name: call.name.clone(),
-            args: call.arguments.to_string(),
-        });
-    }
     let execution_context = adapter.tool_execution_context.clone();
     let cancellation = cancellation.cloned();
     // Every memory or document write of this call is attributed to the
