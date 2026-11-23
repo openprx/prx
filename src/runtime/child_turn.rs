@@ -245,7 +245,7 @@ impl ChildSegmentTurn {
         let live = self.execution.live_turn.clone();
         let mut context = self.execution.clone();
         if live.is_some() {
-            context.approval_ledger = self.service.execution_approval_ledger();
+            context.approval_ledger = self.service.live_approval_ledger();
         }
         ToolLoopRuntimeAdapter {
             live_frames: live.map(|live| {

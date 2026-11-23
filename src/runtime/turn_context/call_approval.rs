@@ -10,6 +10,14 @@ impl TurnRuntimeService {
         if !self.recordable {
             return None;
         }
+        self.live_approval_ledger()
+    }
+
+    /// A live child approval adapter journals against that child's durable
+    /// source, independently of whether its recovery scope is recordable.
+    pub(crate) fn live_approval_ledger(
+        &self,
+    ) -> Option<crate::security::approval_ledger::strategy::ExecutionApprovalLedger> {
         let workspace = self.generation.effective.workspace_dir.to_str()?.to_owned();
         Some(crate::security::approval_ledger::strategy::ExecutionApprovalLedger {
             memory: std::sync::Arc::clone(&self.memory),
