@@ -214,7 +214,12 @@ impl LiveFrameSink for Producer {
             ToolLoopEvent::ToolStarted { name, .. } => {
                 self.send(json!({"kind":"tool_status","tool":name,"phase":"started"}))
             }
-            ToolLoopEvent::ToolFinished { name, outcome, .. } => {
+            ToolLoopEvent::ToolFinished {
+                name,
+                outcome,
+                refusal_cause,
+                ..
+            } => {
                 let (phase, cause) = match outcome {
                     ToolCallOutcome::Ok => ("succeeded", None),
                     ToolCallOutcome::Denied { cause } => (
@@ -226,6 +231,9 @@ impl LiveFrameSink for Producer {
                     ToolCallOutcome::AwaitingApproval => ("awaiting_approval", None),
                     ToolCallOutcome::Error | ToolCallOutcome::Unknown => ("failed", None),
                 };
+                let cause = refusal_cause
+                    .map(crate::security::approval_ledger::run_call::rf_denial_cause)
+                    .or(cause);
                 let mut frame = json!({"kind":"tool_status","tool":name,"phase":phase});
                 if let (Some(cause), Some(object)) = (cause, frame.as_object_mut()) {
                     object.insert("cause".into(), json!(cause));

@@ -2861,6 +2861,7 @@ impl crate::agent::turn_contracts::ToolLoopEventSink for ReduxToolLoopEventSink 
                 duration_ms,
                 result,
                 outcome,
+                ..
             } => {
                 // The outcome reaches the reducer before the card update: one
                 // sender awaits each send, so the order holds.

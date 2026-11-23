@@ -713,10 +713,17 @@ or replayed; the final durable `turn.appended` remains authoritative.
 `tool_status` contains `{tool,phase}` without arguments or results. Phases are
 `started`, `succeeded`, `failed`, `denied`, `cancelled`, and `awaiting_approval`.
 Optional `cause` appears only on denied/failed/cancelled phases and uses typed
-approval or termination causes: `owner_denied`, `expired`,
+approval, pre-approval refusal, or termination causes: `owner_denied`, `expired`,
 `no_approval_surface`, `no_terminal`, `prompt_unavailable`, `concurrent_pending`,
 `session_switched`, `no_resolver`, `channel_denied`, `ledger_refused`, or
-`cancelled`. Process workers have no approval relay in this unit. Their
+`cancelled`. Pre-approval refusals use `owner_isolation`, `policy_denied`,
+`path_invalid`, `path_forbidden`, `path_outside_workspace`,
+`path_symlink_outside`, `path_dynamic_shell_argument`,
+`path_active_shell_substitution`, `invalid_arguments`, `unknown_tool`,
+`stale_capability`, `service_unavailable`, or `barrier_timeout`. Plan-mode
+interception uses `plan_only`. Existing `tool.call.refused` journal rows retain
+their internal `reason` and include the same mapped `cause` as the live frame.
+No refusal cause contains paths or arguments. Process workers have no approval relay in this unit. Their
 completion returns a bounded, content-free `denials:[{tool,cause}]` inventory
 under the existing completion signature. Only after authentication does the
 parent emit one frame per denial on the **parent run**:

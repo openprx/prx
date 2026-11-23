@@ -12,16 +12,23 @@ use super::{
     tool_execution_scope_digest,
 };
 use crate::security::PathRefusalReason;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Event type of a pre-approval refusal row.
 pub(crate) const TOOL_CALL_REFUSED_EVENT: &str = "tool.call.refused";
 
 /// Closed reason a call was refused before approval.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ToolCallRefusalReason {
+pub enum ToolCallRefusalReason {
+    OwnerIsolation,
+    InvalidArguments,
+    UnknownTool,
+    StaleCapability,
+    ServiceUnavailable,
+    BarrierTimeout,
+    PlanOnly,
     PolicyDenied,
     PathInvalid,
     PathForbidden,
@@ -34,8 +41,15 @@ pub(crate) enum ToolCallRefusalReason {
 impl ToolCallRefusalReason {
     /// The stable snake_case code recorded in the row.
     #[must_use]
-    pub(crate) const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
+            Self::OwnerIsolation => "owner_isolation",
+            Self::InvalidArguments => "invalid_arguments",
+            Self::UnknownTool => "unknown_tool",
+            Self::StaleCapability => "stale_capability",
+            Self::ServiceUnavailable => "service_unavailable",
+            Self::BarrierTimeout => "barrier_timeout",
+            Self::PlanOnly => "plan_only",
             Self::PolicyDenied => "policy_denied",
             Self::PathInvalid => "path_invalid",
             Self::PathForbidden => "path_forbidden",
@@ -75,6 +89,7 @@ struct ToolCallRefusedRecord<'a> {
     capability: &'a str,
     input_sha256: &'a str,
     reason: ToolCallRefusalReason,
+    cause: &'static str,
 }
 
 impl ToolExecutionService {
@@ -114,6 +129,7 @@ impl ToolExecutionService {
             capability: &command.name,
             input_sha256,
             reason,
+            cause: crate::security::approval_ledger::run_call::rf_denial_cause(reason),
         };
         let payload = match serde_json::to_string(&record) {
             Ok(payload) => payload,

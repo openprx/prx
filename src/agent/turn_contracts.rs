@@ -448,6 +448,8 @@ pub(crate) enum ToolLoopEvent {
         result: String,
         /// How the call ended, recorded as the reply's tool evidence.
         outcome: crate::agent::tool_evidence::ToolCallOutcome,
+        /// Payload-free refusal metadata for the rf wire; UI sinks ignore it.
+        refusal_cause: Option<crate::tools::execution::ToolCallRefusalReason>,
     },
 }
 

@@ -194,6 +194,7 @@ async fn execute_one_unrecorded(
                 duration_ms: 0,
                 result: result.clone(),
                 outcome: ToolCallOutcome::Refused,
+                refusal_cause: Some(crate::tools::execution::ToolCallRefusalReason::InvalidArguments),
             },
         )
         .await?;
@@ -217,6 +218,7 @@ async fn execute_one_unrecorded(
                 duration_ms: 0,
                 result: result.clone(),
                 outcome: ToolCallOutcome::Refused,
+                refusal_cause: Some(crate::tools::execution::ToolCallRefusalReason::ServiceUnavailable),
             },
         )
         .await?;
@@ -257,6 +259,7 @@ async fn execute_one_unrecorded(
                 duration_ms: 0,
                 result: result.clone(),
                 outcome: ToolCallOutcome::Refused,
+                refusal_cause: Some(crate::tools::execution::ToolCallRefusalReason::PolicyDenied),
             },
         )
         .await?;
@@ -284,6 +287,7 @@ async fn execute_one_unrecorded(
                 duration_ms: 0,
                 result: result.clone(),
                 outcome: ToolCallOutcome::PlanOnly,
+                refusal_cause: Some(crate::tools::execution::ToolCallRefusalReason::PlanOnly),
             },
         )
         .await?;
@@ -304,6 +308,7 @@ async fn execute_one_unrecorded(
                         duration_ms: 0,
                         result: result.clone(),
                         outcome: ToolCallOutcome::Refused,
+                        refusal_cause: Some(crate::tools::execution::ToolCallRefusalReason::BarrierTimeout),
                     },
                 )
                 .await?;
@@ -338,6 +343,7 @@ async fn execute_one_unrecorded(
     let executed = outcome.result.is_some() && outcome.process.as_ref().map_or(success, |process| process.started);
     let status = outcome.status;
     let approval_denial_cause = outcome.approval_denial_cause;
+    let refusal_cause = outcome.refusal_cause;
     let result = outcome.model_content;
     emit_tool_loop_event(
         adapter,
@@ -348,6 +354,7 @@ async fn execute_one_unrecorded(
             duration_ms: outcome.duration_ms,
             result: result.clone(),
             outcome: ToolCallOutcome::from_status(status, approval_denial_cause),
+            refusal_cause,
         },
     )
     .await?;

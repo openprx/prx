@@ -9,6 +9,7 @@ pub(crate) mod admission;
 mod approval_record;
 mod approval_route;
 mod refusal_record;
+pub use refusal_record::ToolCallRefusalReason;
 pub(crate) use refusal_record::ToolRefusalNotice;
 
 use super::schema::ToolSchemaDialect;
@@ -1575,9 +1576,17 @@ pub struct ToolExecutionOutcome {
     /// other status.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_denial_cause: Option<ApprovalDenialCause>,
+    /// Typed pre-approval refusal, projected only by rf live frames.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal_cause: Option<ToolCallRefusalReason>,
 }
 
 impl ToolExecutionOutcome {
+    fn with_refusal_cause(mut self, cause: ToolCallRefusalReason) -> Self {
+        self.refusal_cause = Some(cause);
+        self
+    }
+
     #[must_use]
     pub fn succeeded(&self) -> bool {
         self.status == ToolExecutionStatus::Succeeded
@@ -2824,19 +2833,25 @@ impl ToolExecutionService {
         crate::agent::idle::beat(crate::agent::idle::ProgressKind::ToolStart);
         let input_sha256 = format!("{:x}", Sha256::digest(command.arguments.to_string().as_bytes()));
         if let Err((status, error)) = admission::admit(self, &context, &command.name) {
-            return self.finish(
-                &command,
-                &context,
-                input_sha256,
-                None,
-                None,
-                status,
-                format!("Error: {error}"),
-                None,
-                Some(error),
-                None,
-                started,
-            );
+            return self
+                .finish(
+                    &command,
+                    &context,
+                    input_sha256,
+                    None,
+                    None,
+                    status,
+                    format!("Error: {error}"),
+                    None,
+                    Some(error),
+                    None,
+                    started,
+                )
+                .with_refusal_cause(if status == ToolExecutionStatus::StaleCapability {
+                    ToolCallRefusalReason::StaleCapability
+                } else {
+                    ToolCallRefusalReason::PolicyDenied
+                });
         }
         let Some(resolved) = self.resolve(&command.name) else {
             let available = self
@@ -2849,52 +2864,58 @@ impl ToolExecutionService {
                 command.name,
                 available.join(", ")
             );
-            return self.finish(
-                &command,
-                &context,
-                input_sha256,
-                None,
-                None,
-                ToolExecutionStatus::UnknownTool,
-                format!("Error: {error}"),
-                None,
-                Some(error),
-                None,
-                started,
-            );
-        };
-        if let Err((status, error)) = admission::recheck_resolved(&context, &command.name) {
-            return self.finish(
-                &command,
-                &context,
-                input_sha256,
-                None,
-                None,
-                status,
-                format!("Error: {error}"),
-                None,
-                Some(error),
-                None,
-                started,
-            );
-        }
-        let descriptor = resolved.descriptor;
-        if let Some(stage) = crate::runtime::experiment_stage::current() {
-            if let Err(error) = stage.claim_tool(&descriptor.backend_name) {
-                let error = error.to_string();
-                return self.finish(
+            return self
+                .finish(
                     &command,
                     &context,
                     input_sha256,
                     None,
                     None,
-                    ToolExecutionStatus::Failed,
-                    error.clone(),
+                    ToolExecutionStatus::UnknownTool,
+                    format!("Error: {error}"),
                     None,
                     Some(error),
                     None,
                     started,
-                );
+                )
+                .with_refusal_cause(ToolCallRefusalReason::UnknownTool);
+        };
+        if let Err((status, error)) = admission::recheck_resolved(&context, &command.name) {
+            return self
+                .finish(
+                    &command,
+                    &context,
+                    input_sha256,
+                    None,
+                    None,
+                    status,
+                    format!("Error: {error}"),
+                    None,
+                    Some(error),
+                    None,
+                    started,
+                )
+                .with_refusal_cause(ToolCallRefusalReason::PolicyDenied);
+        }
+        let descriptor = resolved.descriptor;
+        if let Some(stage) = crate::runtime::experiment_stage::current() {
+            if let Err(error) = stage.claim_tool(&descriptor.backend_name) {
+                let error = error.to_string();
+                return self
+                    .finish(
+                        &command,
+                        &context,
+                        input_sha256,
+                        None,
+                        None,
+                        ToolExecutionStatus::Failed,
+                        error.clone(),
+                        None,
+                        Some(error),
+                        None,
+                        started,
+                    )
+                    .with_refusal_cause(ToolCallRefusalReason::PolicyDenied);
             }
         }
 
@@ -2905,19 +2926,21 @@ impl ToolExecutionService {
                 .and_then(|binding| binding.verify_admitted_descriptor(self, &context.envelope, &descriptor));
             if let Err(error) = verified {
                 let error = error.to_string();
-                return self.finish(
-                    &command,
-                    &context,
-                    input_sha256,
-                    Some(descriptor),
-                    None,
-                    ToolExecutionStatus::StaleCapability,
-                    format!("Error: {error}"),
-                    None,
-                    Some(error),
-                    None,
-                    started,
-                );
+                return self
+                    .finish(
+                        &command,
+                        &context,
+                        input_sha256,
+                        Some(descriptor),
+                        None,
+                        ToolExecutionStatus::StaleCapability,
+                        format!("Error: {error}"),
+                        None,
+                        Some(error),
+                        None,
+                        started,
+                    )
+                    .with_refusal_cause(ToolCallRefusalReason::StaleCapability);
             }
         }
         // V02-R9 / OQ-21: an owner-isolated origin runs only tools that enforce
@@ -2952,19 +2975,21 @@ impl ToolExecutionService {
         if context.envelope.owner_isolated && !admits_owner_isolated_origin(&descriptor) && private_filesystem.is_none()
         {
             let error = owner_isolation_refusal(&descriptor.public_name);
-            return self.finish(
-                &command,
-                &context,
-                input_sha256,
-                Some(descriptor),
-                None,
-                ToolExecutionStatus::Denied,
-                format!("Error: {error}"),
-                None,
-                Some(error),
-                None,
-                started,
-            );
+            return self
+                .finish(
+                    &command,
+                    &context,
+                    input_sha256,
+                    Some(descriptor),
+                    None,
+                    ToolExecutionStatus::Denied,
+                    format!("Error: {error}"),
+                    None,
+                    Some(error),
+                    None,
+                    started,
+                )
+                .with_refusal_cause(ToolCallRefusalReason::OwnerIsolation);
         }
         // Structural validation runs before approval on purpose: a call that
         // cannot legally execute must never reach an approval prompt, a
@@ -2975,19 +3000,21 @@ impl ToolExecutionService {
         // `ToolExecutionContext::schema_dialect`.
         let contract = enforce_command_contract(&mut command.arguments, &descriptor, context.schema_dialect);
         if let Err(error) = contract {
-            return self.finish(
-                &command,
-                &context,
-                input_sha256,
-                Some(descriptor),
-                None,
-                ToolExecutionStatus::InvalidArguments,
-                format!("Error: {error}"),
-                None,
-                Some(error),
-                None,
-                started,
-            );
+            return self
+                .finish(
+                    &command,
+                    &context,
+                    input_sha256,
+                    Some(descriptor),
+                    None,
+                    ToolExecutionStatus::InvalidArguments,
+                    format!("Error: {error}"),
+                    None,
+                    Some(error),
+                    None,
+                    started,
+                )
+                .with_refusal_cause(ToolCallRefusalReason::InvalidArguments);
         }
 
         let h2_invocation = match async {
@@ -3046,19 +3073,21 @@ impl ToolExecutionService {
             Ok(invocation) => invocation,
             Err(error) => {
                 let error = error.to_string();
-                return self.finish(
-                    &command,
-                    &context,
-                    input_sha256,
-                    Some(descriptor),
-                    None,
-                    ToolExecutionStatus::Denied,
-                    format!("Error: {error}"),
-                    None,
-                    Some(error),
-                    None,
-                    started,
-                );
+                return self
+                    .finish(
+                        &command,
+                        &context,
+                        input_sha256,
+                        Some(descriptor),
+                        None,
+                        ToolExecutionStatus::Denied,
+                        format!("Error: {error}"),
+                        None,
+                        Some(error),
+                        None,
+                        started,
+                    )
+                    .with_refusal_cause(ToolCallRefusalReason::PolicyDenied);
             }
         };
 
@@ -3102,19 +3131,21 @@ impl ToolExecutionService {
                 &error,
             )
             .await;
-            return self.finish(
-                &command,
-                &context,
-                input_sha256,
-                Some(descriptor),
-                Some(decision),
-                ToolExecutionStatus::Denied,
-                format!("Error: {error}"),
-                None,
-                Some(error),
-                None,
-                started,
-            );
+            return self
+                .finish(
+                    &command,
+                    &context,
+                    input_sha256,
+                    Some(descriptor),
+                    Some(decision),
+                    ToolExecutionStatus::Denied,
+                    format!("Error: {error}"),
+                    None,
+                    Some(error),
+                    None,
+                    started,
+                )
+                .with_refusal_cause(ToolCallRefusalReason::PolicyDenied);
         }
         // Below Full, a path the tool's own policy refuses never reaches an
         // approval prompt or a reservation (the structural-validation intent
@@ -3137,19 +3168,21 @@ impl ToolExecutionService {
                     refusal.message(),
                     descriptor.public_name
                 );
-                return self.finish(
-                    &command,
-                    &context,
-                    input_sha256,
-                    Some(descriptor),
-                    Some(decision),
-                    ToolExecutionStatus::Denied,
-                    model_content,
-                    None,
-                    Some(error),
-                    None,
-                    started,
-                );
+                return self
+                    .finish(
+                        &command,
+                        &context,
+                        input_sha256,
+                        Some(descriptor),
+                        Some(decision),
+                        ToolExecutionStatus::Denied,
+                        model_content,
+                        None,
+                        Some(error),
+                        None,
+                        started,
+                    )
+                    .with_refusal_cause(reason);
             }
         }
 
@@ -3889,6 +3922,7 @@ impl ToolExecutionService {
             duration_ms,
             replayed: false,
             approval_denial_cause: None,
+            refusal_cause: None,
         }
     }
 }

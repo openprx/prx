@@ -55,6 +55,7 @@ async fn delegation_task_retains_the_source_subscriber_after_its_scope_ends() ->
                 duration_ms: 0,
                 replayed: false,
                 approval_denial_cause: None,
+                refusal_cause: None,
             }
         }))
     });

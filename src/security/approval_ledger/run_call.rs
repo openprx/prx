@@ -119,12 +119,31 @@ pub(crate) struct PendingCallPage {
     pub(crate) next_cursor: Option<i64>,
 }
 
-/// The rf wire names for internal approval denial causes. Console uses `as_str`.
-pub(crate) const fn rf_denial_cause(cause: crate::tools::ApprovalDenialCause) -> &'static str {
-    match cause {
-        crate::tools::ApprovalDenialCause::UserRejected => "owner_denied",
-        crate::tools::ApprovalDenialCause::NoAnswer => "expired",
-        other => other.as_str(),
+/// Typed input to the single rf refusal/approval cause mapper.
+pub(crate) enum RfDenialCause {
+    Approval(crate::tools::ApprovalDenialCause),
+    Refusal(crate::tools::execution::ToolCallRefusalReason),
+}
+
+impl From<crate::tools::ApprovalDenialCause> for RfDenialCause {
+    fn from(cause: crate::tools::ApprovalDenialCause) -> Self {
+        Self::Approval(cause)
+    }
+}
+
+impl From<crate::tools::execution::ToolCallRefusalReason> for RfDenialCause {
+    fn from(cause: crate::tools::execution::ToolCallRefusalReason) -> Self {
+        Self::Refusal(cause)
+    }
+}
+
+/// The rf wire names for typed causes. Console uses the internal `as_str`.
+pub(crate) fn rf_denial_cause(cause: impl Into<RfDenialCause>) -> &'static str {
+    match cause.into() {
+        RfDenialCause::Approval(crate::tools::ApprovalDenialCause::UserRejected) => "owner_denied",
+        RfDenialCause::Approval(crate::tools::ApprovalDenialCause::NoAnswer) => "expired",
+        RfDenialCause::Approval(other) => other.as_str(),
+        RfDenialCause::Refusal(reason) => reason.as_str(),
     }
 }
 
