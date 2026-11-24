@@ -1,7 +1,7 @@
 //! Mailbox turns use the registered receiver's Console policy and provider.
 use super::{
     AgentField, AppState, ConsolePendingInput, ConsoleTurnSource, MAX_PAGE_LIMIT, RuntimeEnvelope, TurnTarget,
-    prepare_target, resolve_target, run_console_message_job_work,
+    console_owner_isolated, prepare_target, resolve_target, run_console_message_job_work,
 };
 use crate::messaging::runtime::{MessageInput, MessagingRuntime};
 use std::sync::Arc;
@@ -72,8 +72,14 @@ pub(in crate::gateway) async fn recover_startup(state: &AppState) {
             &summary.channel,
             &summary.sender,
         )
-        .with_owner_id(owner.clone())
-        .with_owner_isolation()
+        .with_owner_id(owner.clone());
+        let isolated = startup_owner_isolated(state, &owner, &partition);
+        tracing::debug!(isolated, "session mailbox startup wake isolation decided");
+        let envelope = if isolated {
+            envelope.with_owner_isolation()
+        } else {
+            envelope
+        }
         .with_agent_partition(partition);
         let principal = super::super::ApiPrincipal { owner_id: owner };
         match register(state, envelope, principal) {
@@ -83,6 +89,41 @@ pub(in crate::gateway) async fn recover_startup(state: &AppState) {
             }
         }
     }
+}
+
+/// The isolation the owner's next submission to this session would get,
+/// from the current pairing and config. It evaluates the submission's own
+/// rule ([`console_owner_isolated`]) with an owner-authenticated flag that is
+/// true only when pairing is required, a paired token remains and the owner is
+/// the install owner. Any failure (target unresolved, runtime not admitted)
+/// yields isolation.
+fn startup_owner_isolated(state: &AppState, owner: &str, partition: &crate::memory::AgentPartition) -> bool {
+    let owner_authenticated = state.pairing.require_pairing()
+        && state.pairing.is_paired()
+        && state
+            .pairing
+            .install_owner()
+            .is_some_and(|install| install.as_str() == owner);
+    if !owner_authenticated {
+        return true;
+    }
+    let Ok(runtime) = state.admit_turn_runtime() else {
+        return true;
+    };
+    let target_level = match &partition.key {
+        crate::memory::PartitionKey::Main => None,
+        crate::memory::PartitionKey::Named { name, .. } => {
+            match resolve_target(&runtime.config_generation.effective, &TurnTarget::Named(name.clone())) {
+                Ok(Some(plan)) => Some(plan.autonomy),
+                Ok(None) | Err(_) => return true,
+            }
+        }
+    };
+    console_owner_isolated(
+        owner_authenticated,
+        target_level,
+        runtime.publication_slot.controlled.is_some(),
+    )
 }
 
 /// Owner (`api:` ids only: the Console ingress) root sessions to register.

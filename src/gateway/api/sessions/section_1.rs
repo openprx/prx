@@ -36,8 +36,8 @@ pub(super) use rf_replay::{post_run_cancel, rf_job_cancel};
 
 pub(super) use target::TARGET_EXCLUDED_TOOLS;
 use target::{
-    AgentField, SelectedTurn, TargetError, TargetUnavailable, TargetedTurn, TurnTarget, prepare_target,
-    resolve_incarnation, resolve_target,
+    AgentField, SelectedTurn, TargetError, TargetUnavailable, TargetedTurn, TurnTarget, console_owner_isolated,
+    prepare_target, resolve_incarnation, resolve_target,
 };
 
 #[derive(Serialize)]

@@ -421,10 +421,11 @@ async fn submit_console_message(
     // turn's own level; any other caller (pairing off) stays owner-isolated.
     // A controlled H2 launch binds only isolated Gateway sources, so it keeps
     // isolation.
-    let full_target = target
-        .as_ref()
-        .is_some_and(|target| target.autonomy == crate::security::AutonomyLevel::Full);
-    let owner_isolated = (!owner_authenticated && !full_target) || turn_runtime.publication_slot.controlled.is_some();
+    let owner_isolated = console_owner_isolated(
+        owner_authenticated,
+        target.as_ref().map(|target| target.autonomy),
+        turn_runtime.publication_slot.controlled.is_some(),
+    );
     let run_id = rf
         .as_ref()
         .map_or_else(|| uuid::Uuid::new_v4().to_string(), |rf| rf.run_id.clone());

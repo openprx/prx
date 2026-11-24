@@ -167,6 +167,20 @@ fn allowlist_for(agent: &DelegateAgentConfig) -> Result<ToolAllowlist, TargetErr
     }
 }
 
+/// The one rule that decides whether a Console turn runs owner-isolated. The
+/// submission handler and the startup wake recovery both call it, so a
+/// recovered wake can never get more authority than the owner's next
+/// submission. A named target at `Full` is not isolated by an owner that is
+/// not authenticated either; a controlled H2 launch always keeps isolation.
+pub(super) fn console_owner_isolated(
+    owner_authenticated: bool,
+    target_level: Option<AutonomyLevel>,
+    controlled: bool,
+) -> bool {
+    let full_target = target_level == Some(AutonomyLevel::Full);
+    (!owner_authenticated && !full_target) || controlled
+}
+
 /// A named target that passed resolution against one pinned config.
 #[derive(Clone)]
 pub(super) struct TargetPlan {
