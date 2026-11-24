@@ -141,7 +141,7 @@ and the module-gate family are absorbed on load; they are not live switches.
 | `[secrets]` | `encrypt = true` |
 | `[browser]` | `allowed_domains = []` (`web_fetch`); `computer_use.api_key` unset (retained for secret handling; browser automation tools are gone) |
 | `[http_request]` | `max_response_size = 1000000`; `timeout_secs = 30` |
-| `[multimodal]` | `max_images = 4`; `max_image_size_mb = 5`; `allow_remote_fetch = false` |
+| `[multimodal]` | `max_images = 4`; `max_image_size_mb = 5`; `allow_remote_fetch = true` |
 | `[web_search]` | `provider = "duckduckgo"`; `brave_api_key` unset; `max_results = 15`; `timeout_secs = 15`; `fetch_max_chars = 50000` |
 | `[proxy]` | `http_proxy`/`https_proxy`/`all_proxy` unset; `no_proxy = []`; `scope = "prx"`; `services = []` |
 | `[identity]` | `format = "openclaw"`; `aieos_path` unset; `aieos_inline` unset |

@@ -470,8 +470,8 @@ pub struct MultimodalConfig {
     /// Maximum image payload size in MiB before base64 encoding.
     #[serde(default = "default_multimodal_max_image_size_mb")]
     pub max_image_size_mb: usize,
-    /// Allow fetching remote image URLs (http/https). Disabled by default.
-    #[serde(default)]
+    /// Allow fetching remote image URLs (http/https). Enabled by default.
+    #[serde(default = "default_multimodal_allow_remote_fetch")]
     pub allow_remote_fetch: bool,
 }
 
@@ -481,6 +481,10 @@ pub(super) const fn default_multimodal_max_images() -> usize {
 
 pub(super) const fn default_multimodal_max_image_size_mb() -> usize {
     5
+}
+
+pub(super) const fn default_multimodal_allow_remote_fetch() -> bool {
+    true
 }
 
 impl MultimodalConfig {
@@ -497,7 +501,7 @@ impl Default for MultimodalConfig {
         Self {
             max_images: default_multimodal_max_images(),
             max_image_size_mb: default_multimodal_max_image_size_mb(),
-            allow_remote_fetch: false,
+            allow_remote_fetch: default_multimodal_allow_remote_fetch(),
         }
     }
 }
