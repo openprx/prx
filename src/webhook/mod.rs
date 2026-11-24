@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use axum::{
     Json, Router,
     extract::State,
-    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
-    response::IntoResponse,
+    http::{HeaderMap, StatusCode, header::{AUTHORIZATION, RETRY_AFTER}},
+    response::{IntoResponse, Response},
     routing::post,
 };
 use chrono::Utc;
@@ -1150,20 +1150,35 @@ fn router(state: WebhookState) -> Router {
         .with_state(state)
 }
 
+/// The coded `429 rate_limited` of the webhook limit, in the gateway's
+/// `{"error":{"code","message","retry_after_ms"}}` shape, with `Retry-After`
+/// in whole seconds. The sliding window does not compute the exact wait, so
+/// both carry the window length: an upper bound.
+fn rate_limited_reply() -> Response {
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(serde_json::json!({
+            "error": {
+                "code": "rate_limited",
+                "message": "Too many webhook requests. Please retry later.",
+                "retry_after_ms": WEBHOOK_RATE_LIMIT_WINDOW_SECS.saturating_mul(1000),
+            }
+        })),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(RETRY_AFTER, axum::http::HeaderValue::from(WEBHOOK_RATE_LIMIT_WINDOW_SECS));
+    response
+}
+
 async fn handle_webhook_event(
     State(state): State<WebhookState>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
     if !state.rate_limiter.allow().await {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(serde_json::json!({
-                "error": "Too many webhook requests. Please retry later.",
-                "retry_after": WEBHOOK_RATE_LIMIT_WINDOW_SECS
-            })),
-        )
-            .into_response();
+        return rate_limited_reply();
     }
 
     if !is_authorized(&headers, &state.token) {

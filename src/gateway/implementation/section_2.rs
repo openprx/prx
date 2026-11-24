@@ -756,15 +756,11 @@ async fn handle_pair(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     let rate_key = client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
     if !state.rate_limiter.allow_pair(&rate_key) {
         tracing::warn!("/pair rate limit exceeded");
-        let err = serde_json::json!({
-            "error": "Too many pairing requests. Please retry later.",
-            "retry_after": RATE_LIMIT_WINDOW_SECS,
-        });
-        return (StatusCode::TOO_MANY_REQUESTS, Json(err));
+        return rate_limited_reply("Too many pairing requests. Please retry later.", RATE_LIMIT_WINDOW_SECS);
     }
 
     let code = headers
@@ -773,7 +769,7 @@ async fn handle_pair(
         .unwrap_or("");
 
     if let Err(error) = authorize_gateway_resource_mutation(&state, "gateway:pair", ResourceRiskLevel::Low) {
-        return error;
+        return error.into_response();
     }
 
     match state.pairing.try_pair(code, &rate_key).await {
@@ -787,7 +783,7 @@ async fn handle_pair(
                     "token": token,
                     "message": "Paired for this process, but failed to persist token to config.toml. Check config path and write permissions.",
                 });
-                return (StatusCode::OK, Json(body));
+                return (StatusCode::OK, Json(body)).into_response();
             }
 
             let body = serde_json::json!({
@@ -796,20 +792,19 @@ async fn handle_pair(
                 "token": token,
                 "message": "Save this token — use it as Authorization: Bearer <token>"
             });
-            (StatusCode::OK, Json(body))
+            (StatusCode::OK, Json(body)).into_response()
         }
         Ok(None) => {
             tracing::warn!("🔐 Pairing attempt with invalid code");
             let err = serde_json::json!({"error": "Invalid pairing code"});
-            (StatusCode::FORBIDDEN, Json(err))
+            (StatusCode::FORBIDDEN, Json(err)).into_response()
         }
         Err(lockout_secs) => {
             tracing::warn!("🔐 Pairing locked out — too many failed attempts ({lockout_secs}s remaining)");
-            let err = serde_json::json!({
-                "error": format!("Too many failed attempts. Try again in {lockout_secs}s."),
-                "retry_after": lockout_secs
-            });
-            (StatusCode::TOO_MANY_REQUESTS, Json(err))
+            rate_limited_reply(
+                &format!("Too many failed attempts. Try again in {lockout_secs}s."),
+                lockout_secs,
+            )
         }
     }
 }

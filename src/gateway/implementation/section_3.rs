@@ -5,7 +5,7 @@ async fn handle_webhook(
     uri: axum::http::Uri,
     headers: HeaderMap,
     body: Bytes,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     let async_mode = jobs::wants_async(uri.query(), &headers);
     let bearer_token = headers
         .get(header::AUTHORIZATION)
@@ -27,11 +27,7 @@ async fn handle_webhook(
     let rate_key = client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
     if !state.rate_limiter.allow_webhook(&rate_key) {
         tracing::warn!("/webhook rate limit exceeded");
-        let err = serde_json::json!({
-            "error": "Too many webhook requests. Please retry later.",
-            "retry_after": RATE_LIMIT_WINDOW_SECS,
-        });
-        return (StatusCode::TOO_MANY_REQUESTS, Json(err));
+        return rate_limited_reply("Too many webhook requests. Please retry later.", RATE_LIMIT_WINDOW_SECS);
     }
 
     // ── Bearer token auth (pairing) ──
@@ -41,7 +37,7 @@ async fn handle_webhook(
             let err = serde_json::json!({
                 "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
             });
-            return (StatusCode::UNAUTHORIZED, Json(err));
+            return (StatusCode::UNAUTHORIZED, Json(err)).into_response();
         }
     }
 
@@ -53,7 +49,7 @@ async fn handle_webhook(
             _ => {
                 tracing::warn!("Webhook: rejected request — invalid or missing X-Webhook-Token");
                 let err = serde_json::json!({"error": "Unauthorized — invalid or missing X-Webhook-Token header"});
-                return (StatusCode::UNAUTHORIZED, Json(err));
+                return (StatusCode::UNAUTHORIZED, Json(err)).into_response();
             }
         }
     }
@@ -65,7 +61,7 @@ async fn handle_webhook(
             _ => {
                 tracing::warn!("Webhook: rejected request — invalid or missing X-Webhook-Signature");
                 let err = serde_json::json!({"error": "Unauthorized — invalid or missing X-Webhook-Signature header"});
-                return (StatusCode::UNAUTHORIZED, Json(err));
+                return (StatusCode::UNAUTHORIZED, Json(err)).into_response();
             }
         }
     }
@@ -106,15 +102,11 @@ async fn handle_webhook(
     };
     if !state.rate_limiter.allow_webhook_credential(&credential_rate_key) {
         tracing::warn!("/webhook credential rate limit exceeded");
-        let err = serde_json::json!({
-            "error": "Too many webhook requests. Please retry later.",
-            "retry_after": RATE_LIMIT_WINDOW_SECS,
-        });
-        return (StatusCode::TOO_MANY_REQUESTS, Json(err));
+        return rate_limited_reply("Too many webhook requests. Please retry later.", RATE_LIMIT_WINDOW_SECS);
     }
     // Admission, before any idempotency claim is taken.
     if let Err(refusal) = state.admit_turn_runtime() {
-        return turn_not_ready_plain(refusal);
+        return turn_not_ready_plain(refusal).into_response();
     }
 
     // ── Parse body ──
@@ -125,7 +117,7 @@ async fn handle_webhook(
             let err = serde_json::json!({
                 "error": "Invalid JSON body. Expected: {\"message\": \"...\"}"
             });
-            return (StatusCode::BAD_REQUEST, Json(err));
+            return (StatusCode::BAD_REQUEST, Json(err)).into_response();
         }
     };
 
@@ -134,7 +126,7 @@ async fn handle_webhook(
         Ok(key) => key,
         Err(message) => {
             let err = serde_json::json!({ "error": message });
-            return (StatusCode::BAD_REQUEST, Json(err));
+            return (StatusCode::BAD_REQUEST, Json(err)).into_response();
         }
     };
     let mut idempotency_digest = None;
@@ -143,7 +135,7 @@ async fn handle_webhook(
         if let Err(error) =
             authorize_gateway_resource_mutation(&state, "gateway:webhook:idempotency", ResourceRiskLevel::Low)
         {
-            return error;
+            return error.into_response();
         }
         let digest = webhook_idempotency_digest(&idempotency_scope, raw_key);
         let fingerprint = webhook_request_fingerprint(&body);
@@ -158,17 +150,17 @@ async fn handle_webhook(
                     "idempotent": true,
                     "message": "A request with this idempotency key is still processing"
                 });
-                return (StatusCode::CONFLICT, Json(body));
+                return (StatusCode::CONFLICT, Json(body)).into_response();
             }
             IdempotencyClaimOutcome::Replay(replay) => {
-                return (StatusCode::OK, Json(replay.json_body()));
+                return (StatusCode::OK, Json(replay.json_body())).into_response();
             }
             IdempotencyClaimOutcome::ReplayUnavailable {
                 response_id,
                 result_hash,
             } => {
                 let body = replay_unavailable_body(response_id, &result_hash);
-                return (StatusCode::CONFLICT, Json(body));
+                return (StatusCode::CONFLICT, Json(body)).into_response();
             }
             IdempotencyClaimOutcome::RequestConflict => {
                 let body = serde_json::json!({
@@ -176,7 +168,7 @@ async fn handle_webhook(
                     "idempotent": true,
                     "message": "This idempotency key was used with a different request body"
                 });
-                return (StatusCode::CONFLICT, Json(body));
+                return (StatusCode::CONFLICT, Json(body)).into_response();
             }
             IdempotencyClaimOutcome::RetryUnavailable => {
                 let body = serde_json::json!({
@@ -184,14 +176,14 @@ async fn handle_webhook(
                     "idempotent": true,
                     "message": "This failed request is not eligible for retry"
                 });
-                return (StatusCode::CONFLICT, Json(body));
+                return (StatusCode::CONFLICT, Json(body)).into_response();
             }
             IdempotencyClaimOutcome::AtCapacity => {
                 let body = serde_json::json!({
                     "error": "Idempotency capacity is temporarily exhausted",
                     "retryable": true
                 });
-                return (StatusCode::SERVICE_UNAVAILABLE, Json(body));
+                return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
             }
         }
     }
@@ -217,9 +209,9 @@ async fn handle_webhook(
     );
 
     if async_mode {
-        return (StatusCode::ACCEPTED, Json(job.accepted_body()));
+        return (StatusCode::ACCEPTED, Json(job.accepted_body())).into_response();
     }
-    job.wait().await.into_parts()
+    job.wait().await.into_parts().into_response()
 }
 
 /// Label for the registry row of a webhook job, so `prx tasks list` shows which

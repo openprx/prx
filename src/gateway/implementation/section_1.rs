@@ -117,6 +117,27 @@ pub const MAX_BODY_SIZE: usize = 65_536;
 pub const MAX_API_BODY_SIZE: usize = (10 * 20 * 1024 * 1024) + (1024 * 1024);
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
+
+/// The coded `429 rate_limited` of the `/pair` and `/webhook` limits: the shared
+/// `{"error":{"code","message","retry_after_ms"}}` body plus a `Retry-After`
+/// header in whole seconds.
+fn rate_limited_reply(message: &str, retry_after_secs: u64) -> axum::response::Response {
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(serde_json::json!({
+            "error": {
+                "code": "rate_limited",
+                "message": message,
+                "retry_after_ms": retry_after_secs.saturating_mul(1000),
+            }
+        })),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, header::HeaderValue::from(retry_after_secs));
+    response
+}
 /// Fallback max distinct client keys tracked in gateway rate limiter.
 pub const RATE_LIMIT_MAX_KEYS_DEFAULT: usize = 10_000;
 /// Fallback max distinct idempotency keys retained in gateway memory.
