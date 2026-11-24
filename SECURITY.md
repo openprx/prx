@@ -79,9 +79,9 @@ split above.
 
 ### Sandboxing Layers
 
-1. **Workspace isolation** — file operations confined to the workspace when `workspace_only = true` (default)
+1. **Workspace isolation** — file operations confined to the workspace below level `full` when `workspace_only = true` (not set by default)
 2. **Path traversal blocking** — `..` sequences and absolute paths rejected
-3. **Forbidden path list** — critical system paths (`/etc`, `/root`, `~/.ssh`, …) always blocked unless the operator replaces the list
+3. **Forbidden path list** — critical system paths (`/etc`, `/root`, `~/.ssh`, …) blocked below level `full` when the operator lists them (empty by default)
 4. **Daily cost cap** — `autonomy.max_cost_per_day_cents` (optional; no cap unless configured)
 5. **Identity-scope ACLs** — `[autonomy.scopes]` can deny a tool for a sender, channel, or chat type at every autonomy level
 

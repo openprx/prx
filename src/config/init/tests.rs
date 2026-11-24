@@ -1187,8 +1187,8 @@ fn full_security_template_configures_always_on_audit() {
 fn full_security_template_is_open_by_default() {
     let content = security_template(Spec::Full);
     assert!(content.contains("level = \"full\""));
-    assert!(content.contains("workspace_only = false"));
-    assert!(content.contains("forbidden_paths = []"));
+    assert!(!content.contains("workspace_only ="));
+    assert!(!content.contains("forbidden_paths ="));
     assert!(!content.contains("[autonomy.sandbox]"));
 }
 

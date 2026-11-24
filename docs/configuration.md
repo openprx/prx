@@ -49,9 +49,9 @@ entry without its parent section's `cli` setting can load. Integration entries s
 credentials, endpoints, identities, and explicit allowlists where no safe default
 exists. An empty `config.toml` parses with `default_temperature = 0.7`;
 omitted `default_provider` and `default_model` remain unset so saving does not
-pin a release catalog default. Security-posture defaults stay closed:
-`workspace_only = true`, `acknowledge_unrestricted_profile = false`, and
-`forbidden_paths` retains the built-in denylist. A `[causal_tree]` table is
+pin a release catalog default. Autonomy defaults are open: `workspace_only = false`
+and `forbidden_paths` is empty; a limit exists only when the operator writes it.
+A `[causal_tree]` table is
 refused at load as an unknown configuration path; delete it and set the turn
 limits under `[decision_engine]` (see
 [the decision engine](decision-engine.md#configuration)).
@@ -79,7 +79,7 @@ and the module-gate family are absorbed on load; they are not live switches.
 | Section | Keys and defaults |
 | --- | --- |
 | `[observability]` | `backend = "none"`; `otel_endpoint` unset; `otel_service_name` unset (collector name `"prx"` when backend is `otel`) |
-| `[autonomy]` | `level = "full"`; `workspace_only = true`; built-in `forbidden_paths`; `max_cost_per_day_cents` unset (no ceiling); `acknowledge_unrestricted_profile = false`; `[autonomy.scopes] default = "allow"`, `rules = []`, `assign_owners = []`. A rule may set `user`/`channel`/`chat_type` and `tools_allow`/`tools_deny`/`send_allow`/`send_deny`/`assign_allow`/`assign_deny` (all empty when omitted) |
+| `[autonomy]` | `level = "full"`; `workspace_only = false`; `forbidden_paths = []` (both apply below `full` only); `max_cost_per_day_cents` unset (no ceiling); `acknowledge_unrestricted_profile` accepted and ignored; `[autonomy.scopes] default = "allow"`, `rules = []`, `assign_owners = []`. A rule may set `user`/`channel`/`chat_type` and `tools_allow`/`tools_deny`/`send_allow`/`send_deny`/`assign_allow`/`assign_deny` (all empty when omitted) |
 | `[runtime]` | `kind = "native"`; `shell_env_allowlist = []`; `managed_cgroup_root` unset; `reasoning_enabled` unset; `codex_stream_idle_timeout_secs` unset; `codex_reasoning_effort` unset; `max_blocking_threads` unset (derived, floor 2048); `long_task_warn_secs` unset (900); `idle_hang_secs` unset (1800) |
 | `[runtime.docker]` | `image = "alpine:3.20"`; `network = "none"`; `memory_limit_mb = 512`; `cpu_limit = 1.0`; `read_only_rootfs = true`; `mount_workspace = true`; `allowed_workspace_roots = []` |
 | `[reliability]` | `provider_retries = 2`; `provider_backoff_ms = 500`; `fallback_providers = []`; `acknowledge_single_provider_risk = false`; `api_keys = []`; `model_fallbacks = {}`; `channel_initial_backoff_secs = 2`; `channel_max_backoff_secs = 60`; `scheduler_poll_secs = 15`; `scheduler_retries = 2` |
@@ -822,8 +822,9 @@ allow_executable_proposals = false
 # "Path policy by autonomy level" below).
 [autonomy]
 level = "full"
-workspace_only = true
-forbidden_paths = ["/etc", "/root", "/home", "/opt", "/tmp", "~/.ssh"]
+# For `supervised` or `readonly`, confine file and shell paths explicitly:
+# workspace_only = true
+# forbidden_paths = ["/etc", "/root", "/home", "/opt", "/tmp", "~/.ssh"]
 # max_cost_per_day_cents = 500   # unset means no ceiling
 
 # Multi-agent setup
@@ -890,8 +891,9 @@ agents, and process-isolated session workers.
   `workspace_only` and `forbidden_paths`; the native file tools still refuse
   parent traversal (`..`).
 - `supervised` and `readonly`: a path is allowed exactly when it resolves
-  inside the workspace (with `workspace_only = true`) and outside every
-  `forbidden_paths` entry, however it is written: relative, absolute, or `~/`.
+  inside the workspace (with `workspace_only = true`, default `false`) and outside
+  every `forbidden_paths` entry (default empty), however it is written: relative,
+  absolute, or `~/`. Set both keys when you lower the level.
   An absolute path inside the workspace is allowed; a path outside it, a
   forbidden path, and a symlink inside the workspace that resolves outside it
   are refused. Parent traversal (`..`), URL-encoded traversal and NUL bytes are
@@ -912,9 +914,9 @@ out of the file for no limit; set a key and exactly that limit applies (`0`
 refuses every priced turn). The signed child manifest carries "no ceiling" as
 `u32::MAX` cents (4294967295, the same value the key accepts). Spend is still
 recorded in the cost journal. With no limit set, no budget warning or
-"budget exhausted" notice is produced. A host-wide profile is explicit: set
-`workspace_only = false` and clear `forbidden_paths`; at level `full` the file
-tools and shell ignore both keys anyway. `prx doctor` prints one neutral line
+"budget exhausted" notice is produced. Neither `workspace_only` nor
+`forbidden_paths` is set by default, and at level `full` the file tools and
+shell ignore both anyway. `prx doctor` prints one neutral line
 with the active autonomy level and never warns about absent limits.
 `acknowledge_unrestricted_profile` is kept so existing configs still load and
 no longer changes any output. There is no hourly action cap.
@@ -3476,9 +3478,9 @@ resolve relative native file requests and shell path arguments against the selec
 working root. All forbidden-path and workspace-only limits are evaluated on that
 resolved path; ReadOnly still refuses mutations. Configured roots are canonicalized
 at load, just like CLI roots, so a symlink alias is checked against its real directory.
-With `workspace_only = true` (the default), a root outside the security workspace
+With `workspace_only = true`, a root outside the security workspace
 refuses every relative native file request and every shell path argument containing
-`/`. With `workspace_only = false`, a root outside the workspace under a default
+`/`. With `workspace_only = false`, a root outside the workspace under a configured
 forbidden prefix such as `/home`, `/tmp` or `/var` still refuses those paths; the
 workspace ancestor exemption applies only inside the security workspace.
 A child's effective level cannot exceed its manifest or the current service level.

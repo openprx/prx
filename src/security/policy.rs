@@ -902,7 +902,9 @@ pub struct SecurityPolicy {
 
 impl Default for SecurityPolicy {
     fn default() -> Self {
-        Self::from_config(&crate::config::AutonomyConfig::default(), Path::new("."))
+        // The programmatic fallback stays confined (fail closed). A running
+        // install builds its policy with `from_config`, whose default is open.
+        Self::from_config(&crate::config::AutonomyConfig::confined(), Path::new("."))
     }
 }
 
@@ -4141,7 +4143,7 @@ mod tests {
     #[test]
     fn default_policy_has_sane_values() {
         let p = SecurityPolicy::default();
-        let autonomy = crate::config::AutonomyConfig::default();
+        let autonomy = crate::config::AutonomyConfig::confined();
         assert_eq!(p.autonomy, AutonomyLevel::Full);
         assert!(p.workspace_only);
         assert!(!p.forbidden_paths.is_empty(), "expected a non-empty value");

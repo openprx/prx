@@ -106,7 +106,12 @@ async fn apply_file_operation_inner(
         .get("path")
         .and_then(serde_json::Value::as_str)
         .context("missing file path")?;
-    ensure!(security.is_path_allowed(path), "file path is denied by security policy");
+    // Owner-private files stay confined to the workspace at every level; this
+    // is part of the origin's isolation and does not follow `workspace_only`.
+    ensure!(
+        security.is_path_confined_to_workspace(path),
+        "file path is denied by security policy"
+    );
     let tool = operation.tool_name();
     let target = if operation == NativeFileOperation::Write {
         filesystem.resolve(path)?

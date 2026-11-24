@@ -7,8 +7,8 @@ use tokio::test;
 async fn autonomy_config_default() {
     let a = AutonomyConfig::default();
     assert_eq!(a.level, AutonomyLevel::Full);
-    assert!(a.workspace_only);
-    assert!(a.forbidden_paths.contains(&"/etc".to_string()));
+    assert!(!a.workspace_only);
+    assert!(a.forbidden_paths.is_empty());
     assert_eq!(a.max_cost_per_day_cents, None);
 }
 
@@ -87,8 +87,8 @@ bind = "127.0.0.1:16899"
 }
 
 #[test]
-async fn checklist_autonomy_default_is_workspace_scoped() {
-    let a = AutonomyConfig::default();
+async fn checklist_autonomy_confined_is_workspace_scoped() {
+    let a = AutonomyConfig::confined();
     assert!(a.workspace_only, "Default autonomy must be workspace_only");
     assert!(a.forbidden_paths.contains(&"/etc".to_string()), "Must block /etc");
     assert!(a.forbidden_paths.contains(&"/proc".to_string()), "Must block /proc");

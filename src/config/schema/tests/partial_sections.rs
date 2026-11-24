@@ -54,20 +54,17 @@ fn every_touched_section_defaults_to_its_default_impl() {
     assert_empty_section_matches_default::<ChannelsConfig>("channels_config");
 }
 
-/// Item 1, the security half: a partial `[autonomy]` fails closed.
-///
-/// The three keys whose absence could widen the posture keep the safe value
-/// rather than an empty one, so an operator who writes only `level` never
-/// silently loses the workspace restriction or the path denylist.
+/// Item 1, the security half: a partial `[autonomy]` keeps the unrestricted
+/// built-in values; an operator who wants confinement writes the keys.
 #[test]
 fn a_partial_autonomy_section_fails_closed() {
     let parsed: AutonomyConfig = toml::from_str("level = \"full\"").expect("test: partial autonomy parses");
 
-    assert!(parsed.workspace_only, "workspace_only must stay true when omitted");
+    assert!(!parsed.workspace_only, "workspace_only must stay false when omitted");
     assert_eq!(
         parsed.forbidden_paths,
         AutonomyConfig::default().forbidden_paths,
-        "forbidden_paths must keep the built-in list when omitted"
+        "forbidden_paths must keep the built-in (empty) list when omitted"
     );
     assert!(
         !parsed.acknowledge_unrestricted_profile,
@@ -215,7 +212,7 @@ fn the_reported_partial_sections_load_together() {
     let loaded = loaded.expect("test: the three reported partial sections load");
 
     assert_eq!(loaded.autonomy.level, AutonomyLevel::Full);
-    assert!(loaded.autonomy.workspace_only, "autonomy stays closed");
+    assert!(!loaded.autonomy.workspace_only, "autonomy stays open");
     assert_eq!(
         loaded.autonomy.forbidden_paths,
         AutonomyConfig::default().forbidden_paths

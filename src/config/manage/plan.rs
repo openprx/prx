@@ -3151,7 +3151,7 @@ mod tests {
             ),
             (
                 "a forbidden path removed",
-                |_| {},
+                |c| c.autonomy.forbidden_paths = vec!["/etc".into()],
                 |c| {
                     c.autonomy.forbidden_paths.pop();
                 },

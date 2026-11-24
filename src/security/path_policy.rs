@@ -196,6 +196,17 @@ impl SecurityPolicy {
     /// forbidden paths, however it is written: relative, absolute or `~`.
     /// Symlinks are the caller's canonical check (`is_resolved_path_allowed`).
     pub(crate) fn check_path_at(&self, root: &Path, path: &str) -> Result<(), PathRefusalReason> {
+        self.check_path_at_with(root, path, self.workspace_only)
+    }
+
+    /// Whether `path` stays inside the workspace and outside `forbidden_paths`,
+    /// whatever `workspace_only` says. For origins whose confinement is part of
+    /// their isolation, not an operator setting.
+    pub(crate) fn is_path_confined_to_workspace(&self, path: &str) -> bool {
+        self.check_path_at_with(&self.workspace_dir, path, true).is_ok()
+    }
+
+    fn check_path_at_with(&self, root: &Path, path: &str, workspace_only: bool) -> Result<(), PathRefusalReason> {
         let target = resolve_request_path(root, path).map_err(|_| PathRefusalReason::InvalidPath)?;
         let lower = path.to_lowercase();
         if lower.contains("..%2f") || lower.contains("%2f..") {
@@ -218,7 +229,7 @@ impl SecurityPolicy {
                 return Err(PathRefusalReason::ForbiddenPath);
             }
         }
-        if self.workspace_only && !inside_workspace {
+        if workspace_only && !inside_workspace {
             return Err(PathRefusalReason::OutsideWorkspace);
         }
         Ok(())

@@ -257,8 +257,8 @@ pub(super) fn security_template(spec: Spec) -> String {
 
 [autonomy]
 level = "full"
-# No limit is set unless you add one: max_cost_per_day_cents, workspace_only,
-# forbidden_paths (the last two take effect below level "full").
+# No limit is set unless you add one. workspace_only and forbidden_paths apply
+# below level "full" only; max_cost_per_day_cents applies at every level.
 
 [secrets]
 encrypt = true
@@ -281,8 +281,6 @@ status = "unclassified"               # unclassified | high_risk | not_high_risk
 
 [autonomy]
 level = "full"                         # read_only | supervised | full
-workspace_only = false
-forbidden_paths = []                   # no extra path denylist
 
 [secrets]
 encrypt = true

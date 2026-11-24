@@ -345,19 +345,15 @@ pub struct AutonomyConfig {
     /// Autonomy level: `readonly` (alias `read_only`), `supervised`, or `full` (default).
     #[serde(default)]
     pub level: AutonomyLevel,
-    /// Restrict file writes and command paths to the workspace directory. Default: `true`.
+    /// Restrict file writes and command paths to the workspace directory. Default: `false`.
     ///
-    /// Fails closed: a `[autonomy]` section that omits this key keeps the
-    /// workspace restriction on, so a partial section can never widen the
-    /// filesystem reach by accident.
-    #[serde(default = "default_workspace_only")]
+    /// Applies below level `full` only; set it when running `supervised` or `readonly`.
+    #[serde(default, skip_serializing_if = "is_false")]
     pub workspace_only: bool,
-    /// Explicit path denylist. Default includes system-critical paths.
+    /// Explicit path denylist. Default: empty.
     ///
-    /// Fails closed: omitting the key keeps the built-in list rather than
-    /// emptying it, so a partial `[autonomy]` section never removes the
-    /// denylist.
-    #[serde(default = "default_forbidden_paths")]
+    /// Applies below level `full` only; list paths when running `supervised` or `readonly`.
+    #[serde(default)]
     pub forbidden_paths: Vec<String>,
     /// Maximum cost per day in cents per policy. Default: unset (no ceiling).
     #[serde(default)]
@@ -365,7 +361,7 @@ pub struct AutonomyConfig {
 
     /// Operator acknowledgement for an intentionally unrestricted profile.
     /// Retained for existing configs; it no longer changes any output or policy behavior.
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub acknowledge_unrestricted_profile: bool,
 
     /// Scope-based tool access control: per-user/channel/chat-type allow/deny rules.
@@ -378,8 +374,8 @@ impl Default for AutonomyConfig {
         Self {
             evaluation_sandbox: false,
             level: AutonomyLevel::Full,
-            workspace_only: default_workspace_only(),
-            forbidden_paths: default_forbidden_paths(),
+            workspace_only: false,
+            forbidden_paths: Vec::new(),
             max_cost_per_day_cents: None,
             acknowledge_unrestricted_profile: false,
             scopes: ScopeConfig::default(),
@@ -387,19 +383,9 @@ impl Default for AutonomyConfig {
     }
 }
 
-/// Whether file writes and command paths stay inside the workspace.
-///
-/// `true` is the closed value: a `[autonomy]` section that omits the key keeps
-/// the restriction, so a partial section cannot widen the filesystem reach.
-pub(super) const fn default_workspace_only() -> bool {
-    true
-}
-
-/// The built-in path denylist.
-///
-/// Shared by `#[serde(default)]` and `impl Default` so a partial `[autonomy]`
-/// section keeps the same list a default section has, instead of an empty one.
-pub(super) fn default_forbidden_paths() -> Vec<String> {
+/// The system-critical paths an operator may copy into `forbidden_paths`.
+/// Not applied by default.
+fn recommended_forbidden_paths() -> Vec<String> {
     vec![
         "/etc".into(),
         "/root".into(),
@@ -422,7 +408,23 @@ pub(super) fn default_forbidden_paths() -> Vec<String> {
     ]
 }
 
+/// `skip_serializing_if` predicate: an unset confinement is not written out.
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 impl AutonomyConfig {
+    /// Workspace confinement plus the recommended denylist: the shape an operator
+    /// writes for a `supervised` or `readonly` install. Never the default.
+    #[must_use]
+    pub fn confined() -> Self {
+        Self {
+            workspace_only: true,
+            forbidden_paths: recommended_forbidden_paths(),
+            ..Self::default()
+        }
+    }
+
     /// The per-policy daily ceiling in cents, or
     /// [`UNLIMITED_AUTONOMY_MAX_COST_PER_DAY_CENTS`] when none is configured.
     #[must_use]
