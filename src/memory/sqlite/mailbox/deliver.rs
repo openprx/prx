@@ -164,32 +164,7 @@ impl SqliteMailbox {
                 if pin.to_pin_token.is_empty() || pin.pin_expires_at < 0 {
                     return Err(MailboxError::CorruptState);
                 }
-                let message = PrxMessage {
-                    id: saved.message_id,
-                    idempotency: saved.idempotency.clone(),
-                    stream_id: Some(stream.wire_id),
-                    seq: saved.seq,
-                    ts: saved.meta.wire_ts,
-                    from: stream.from.clone(),
-                    to: stream.to.clone(),
-                    to_pin: RecipientPin {
-                        incarnation: scope.incarnation,
-                        generation: scope.generation,
-                        token: pin.to_pin_token,
-                    },
-                    in_reply_to: saved.meta.common.in_reply_to,
-                    hop_count: saved.meta.common.hop_count,
-                    ancestry: saved.meta.common.ancestry.clone(),
-                    kind: MessageKind::Data,
-                    body: MessageBody {
-                        mime: body.0,
-                        bytes: body.1,
-                    },
-                    origin: Some(saved.meta.common.origin),
-                    auth: saved.meta.common.auth.clone(),
-                    exec: saved.meta.common.exec_run.clone().map(|run| ExecRef { run: Some(run) }),
-                    canonical_hash: None,
-                };
+                let message = wire_message(&saved, &stream, scope, body.0, body.1, pin.to_pin_token);
                 if crate::messaging::request_digest(&message) != saved.meta.common.request_digest {
                     return Err(MailboxError::IdentityImmutable);
                 }
@@ -250,6 +225,41 @@ impl SqliteMailbox {
             }
         }
         tx.commit().map_err(storage_error)
+    }
+}
+
+/// Rebuild the wire message of a stored slot; delivery and restart recovery
+/// share it so both verify the same request digest.
+pub(super) fn wire_message(
+    saved: &receipt::Receipt,
+    stream: &stream::Stream,
+    scope: &MailboxScope,
+    mime: String,
+    bytes: Vec<u8>,
+    token: String,
+) -> PrxMessage {
+    PrxMessage {
+        id: saved.message_id,
+        idempotency: saved.idempotency.clone(),
+        stream_id: Some(stream.wire_id),
+        seq: saved.seq,
+        ts: saved.meta.wire_ts,
+        from: stream.from.clone(),
+        to: stream.to.clone(),
+        to_pin: RecipientPin {
+            incarnation: scope.incarnation,
+            generation: scope.generation,
+            token,
+        },
+        in_reply_to: saved.meta.common.in_reply_to,
+        hop_count: saved.meta.common.hop_count,
+        ancestry: saved.meta.common.ancestry.clone(),
+        kind: MessageKind::Data,
+        body: MessageBody { mime, bytes },
+        origin: Some(saved.meta.common.origin),
+        auth: saved.meta.common.auth.clone(),
+        exec: saved.meta.common.exec_run.clone().map(|run| ExecRef { run: Some(run) }),
+        canonical_hash: None,
     }
 }
 

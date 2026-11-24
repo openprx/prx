@@ -11,6 +11,7 @@ mod outbox;
 pub(super) mod pin;
 mod publish;
 mod receipt;
+mod recover;
 mod retry;
 mod stream;
 pub use outbox::MailboxOutbound;

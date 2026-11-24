@@ -397,6 +397,38 @@ impl SessionInbox {
     pub async fn notified(&mut self) {
         let _ = self.receiver.recv().await;
     }
+    /// Queue adopted messages whose waking turn never started, e.g. the
+    /// process stopped between the adoption commit and the wake. Run once,
+    /// right after registration and before the first poll. A message whose
+    /// continuation input exists is not returned by the store, so a turn that
+    /// started is never repeated.
+    pub(crate) fn recover(&self) -> MailboxResult<usize> {
+        let mut queued = 0;
+        for (message, receipt) in self.runtime.store.unwoken_adopted(&self.scope, &self.address)? {
+            let input = MessageInput {
+                _lease: self.runtime.store.hold_input(&self.scope, &self.address)?,
+                scope: self.scope.scope_id,
+                text: crate::session_worker::mailbox::user_text(&message)?,
+                message,
+                receipt,
+            };
+            let pending = self
+                .runtime
+                .ready
+                .lock()
+                .get(&self.address)
+                .is_some_and(|queue| queue.iter().any(|held| held.message.id == input.message.id));
+            if !input.auto_start() || pending {
+                continue;
+            }
+            match self.runtime.requeue_back(input) {
+                Ok(()) => queued += 1,
+                Err(MailboxError::QueueFull) => break,
+                Err(_) => {}
+            }
+        }
+        Ok(queued)
+    }
     pub fn poll(&mut self) -> MailboxResult<Vec<MessageInput>> {
         self.runtime.store.validate_scope(&self.scope, &self.address)?;
         let execution =

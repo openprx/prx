@@ -45,6 +45,23 @@ pub(crate) fn register_idle(
                 return;
             }
         };
+        // Adopted but not yet woken before a restart: queue them for the first poll.
+        let Ok((returned, recovered)) = crate::runtime::blocking::spawn_blocking(move || {
+            let recovered = inbox.recover();
+            (inbox, recovered)
+        })
+        .await
+        else {
+            return;
+        };
+        inbox = returned;
+        match recovered {
+            Ok(0) => {}
+            Ok(count) => tracing::info!(count, "session mailbox recovered adopted messages awaiting a wake"),
+            Err(error) => {
+                tracing::warn!(error=%crate::agent::diagnostics::error_class(&error), "session mailbox wake recovery failed");
+            }
+        }
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
         loop {
             interval.tick().await;
