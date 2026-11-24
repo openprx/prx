@@ -236,10 +236,8 @@ fn every_live_hook_manager_owner_drains_at_shutdown() {
 /// catalogue, the doctor's `git --version` probe, a protocol name).
 const ALLOWED_GIT_PROGRAM_LITERALS: &[&str] = &[
     "src/doctor/mod.rs::check_environment::git",
-    "src/doctor/mod.rs::check_unowned_shell_jobs::git",
     "src/security/git_launch.rs::command_fallback::git",
     "src/security/git_launch.rs::git_command_with_parent::git",
-    "src/security/git_launch.rs::program_is_git::git",
     "src/security/git_launch.rs::read_git::git",
     "src/security/policy.rs::command_risk_level::git",
     "src/security/policy.rs::is_args_safe::git",
@@ -467,56 +465,10 @@ pub(super) fn process_command_types_are_never_aliased() {
     assert_inventory("aliased process command types", actual, &[]);
 }
 
-/// GIT-ENV (D-106, D-107 and its amendment): git in a shell command string
-/// is ordinary only at an effective Full level. Below it, restricted shells,
-/// workspace skill scripts, cron jobs and Xin tasks an agent tool created
-/// refuse it; git is hardened
-/// through the environment on the operator's (`prx cron`/`prx xin` jobs,
-/// system Xin tasks, node allowlists).
+/// The shell and native file tools read the per-call effective level, never
+/// the global autonomy setting.
 #[test]
-fn shell_sites_refuse_or_harden_git() {
-    let body = |relative: &str, function: &str| {
-        let source = fs::read_to_string(repository_root().join(relative))
-            .unwrap_or_else(|error| panic!("read {relative}: {error}"));
-        function_body(&production_part(&source), function)
-    };
-    // `execute` and `execute_joined` both run `execute_with`, the one body.
-    let adapter = body("src/runtime/shell_process.rs", "execute_with");
-    for required in [
-        "git_launch::shell_command_runs_git(request.command)",
-        "ShellProcessError::GitRefused",
-        "git_launch::operator_git_environment()",
-    ] {
-        assert!(
-            adapter.contains(required),
-            "ShellProcessAdapter::execute_with must use {required}"
-        );
-    }
-    assert!(
-        body("src/tools/skills.rs", "execute_resolved")
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect::<String>()
-            .contains("git:super::shell::shell_git_policy(super::effective_autonomy::current().unwrap_or(crate::security::AutonomyLevel::Supervised),)"),
-        "workspace skill execution must still refuse git below an effective Full level"
-    );
-    let policy = body("src/tools/shell.rs", "shell_git_policy");
-    let policy = policy
-        .split_once('{')
-        .expect("test: policy body")
-        .1
-        .strip_suffix('}')
-        .expect("test: policy end");
-    let compact: String = policy.chars().filter(|c| !c.is_whitespace()).collect();
-    assert_eq!(
-        compact,
-        "usecrate::runtime::shell_process::ShellGitPolicy::{PlainGit,RefuseGit};usecrate::security::AutonomyLevel::Full;matchlevel{Full=>PlainGit,_=>RefuseGit,}",
-        "shell git policy must widen only effective Full"
-    );
-    assert!(
-        body("src/tools/shell.rs", "execute_inner").contains("git: shell_git_policy("),
-        "shell must select git policy at invocation"
-    );
+fn native_tools_read_the_per_call_level() {
     for relative in [
         "src/tools/shell.rs",
         "src/tools/file_read.rs",
@@ -535,18 +487,6 @@ fn shell_sites_refuse_or_harden_git() {
             "test: {relative} must not widen from global autonomy"
         );
     }
-    let shell = body("src/tools/shell.rs", "execute_inner");
-    let compact: String = shell.chars().filter(|c| !c.is_whitespace()).collect();
-    assert!(compact.contains("git:shell_git_policy(super::effective_autonomy::current().unwrap_or(crate::security::AutonomyLevel::Supervised),)"), "test: shell selector must use the fail-closed per-call level");
-    // D-107 amendment: cron and Xin decide by the recorded creator.
-    assert!(
-        body("src/cron/scheduler.rs", "run_job_command_with_adapter").contains("git: shell_git_policy(config, job)")
-    );
-    assert!(body("src/cron/scheduler.rs", "shell_git_policy").contains("job_created_via("));
-    assert!(body("src/xin/runner.rs", "run_shell_with_adapter").contains("git: shell_git_policy(config, task)"));
-    let xin = body("src/xin/runner.rs", "shell_git_policy");
-    assert!(xin.contains("TaskKind::System") && xin.contains("task_created_via("));
-    assert!(body("src/nodes/server.rs", "execute_shell_command").contains("git_launch::operator_git_environment()"));
 }
 
 /// Every production `git` process is built by the one hardened launch
@@ -627,38 +567,6 @@ fn stdio_mcp_launches_start_from_a_cleared_environment() {
             "{launch}"
         );
     }
-}
-
-/// Plain git is an explicit Full-shell exception. Every production spelling is reviewed.
-#[test]
-pub(super) fn plain_git_policy_has_only_the_reviewed_production_sites() {
-    let mut actual = Vec::new();
-    for path in rust_source_files() {
-        let relative = relative_path(&path);
-        let production = production_part(&read_source(&path));
-        let lines: Vec<_> = production.lines().collect();
-        for (index, line) in lines.iter().enumerate() {
-            if line.trim_start().starts_with("//") {
-                continue;
-            }
-            if line.contains("PlainGit") {
-                actual.push(format!(
-                    "{relative}::{}::{}",
-                    enclosing_function(&lines, index),
-                    normalize_line(line)
-                ));
-            }
-        }
-    }
-    assert_inventory(
-        "production PlainGit policy uses",
-        actual,
-        &[
-            "src/runtime/shell_process.rs::shell_secret_environment::PlainGit,",
-            "src/tools/shell.rs::shell_git_policy::Full => PlainGit,",
-            "src/tools/shell.rs::shell_git_policy::use crate::runtime::shell_process::ShellGitPolicy::{PlainGit, RefuseGit};",
-        ],
-    );
 }
 
 /// Root inputs and selection belong to one helper and its reviewed consumers.

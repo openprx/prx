@@ -3434,8 +3434,7 @@ the effective snapshot; a worker cannot replace or discard that signed root.
 The security workspace, memory ACL and audit/experiment roots do not move.
 Docker also requires the directory to satisfy `runtime.docker.allowed_workspace_roots`.
 
-At effective Full autonomy the shell runs ordinary git (including repository hooks)
-and inherits the parent environment except known provider credentials, worker secrets,
+At effective Full autonomy the shell inherits the parent environment except known provider credentials, worker secrets,
 `MINIMAX_OAUTH_*` and `OPENPRX_*`. This environment hygiene is not a security boundary:
 a Full shell can read local configuration. Native file tools may access paths outside
 the workspace and forbidden paths; parent traversal (`..`) remains refused. Private
@@ -3448,13 +3447,11 @@ With `workspace_only = true` (the default), a root outside the security workspac
 refuses every relative native file request and every shell path argument containing
 `/`. With `workspace_only = false`, a root outside the workspace under a default
 forbidden prefix such as `/home`, `/tmp` or `/var` still refuses those paths; the
-workspace ancestor exemption applies only inside the security workspace. An approval does not enable git
-in a Supervised shell.
+workspace ancestor exemption applies only inside the security workspace.
 A child's effective level cannot exceed its manifest or the current service level.
 Direct tool calls without runtime authority keep the Supervised behavior.
 Docker continues to use the shell environment allowlist at every level. Native Full
 ignores that allowlist for admission, but invalid entries are still rejected.
-Skill scripts and scheduled shell jobs retain their existing git policy.
 
 ### Named-agent rf admission limits
 

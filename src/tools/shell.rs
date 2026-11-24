@@ -9,26 +9,11 @@ use serde_json::json;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
-/// The git policy of a shell command at an effective autonomy `level`:
-/// plain git at Full, refused below. Skill scripts, cron jobs and Xin tasks
-/// at an effective Full level reuse it, so Full git behaves the same on
-/// every shell path.
-pub(crate) const fn shell_git_policy(
-    level: crate::security::AutonomyLevel,
-) -> crate::runtime::shell_process::ShellGitPolicy {
-    use crate::runtime::shell_process::ShellGitPolicy::{PlainGit, RefuseGit};
-    use crate::security::AutonomyLevel::Full;
-    match level {
-        Full => PlainGit,
-        _ => RefuseGit,
-    }
-}
-
 /// Direct host shell command execution tool.
 ///
 /// Authorization belongs to the orchestration boundary. This executor passes
 /// command text unchanged to the configured runtime after checking path arguments
-/// against its execution root. Runtime authority selects git and environment policy.
+/// against its execution root.
 pub struct ShellTool {
     process: ShellProcessAdapter,
     workspace_dir: std::path::PathBuf,
@@ -69,7 +54,6 @@ impl ShellTool {
             ShellProcessError::Cancelled => TOOL_EXECUTION_CANCELLED.to_string(),
             ShellProcessError::Timeout(timeout) => format!("Command timed out after {timeout:?} and was killed"),
             ShellProcessError::Runtime(error) => format!("Failed to build runtime command: {error}"),
-            ShellProcessError::GitRefused => ShellProcessError::GitRefused.to_string(),
             ShellProcessError::Spawn(error) | ShellProcessError::Wait(error) | ShellProcessError::Output(error) => {
                 format!("Failed to execute command: {error}")
             }
@@ -113,9 +97,6 @@ impl ShellTool {
                 workspace_dir: &self.workspace_dir,
                 timeout: None,
                 cancellation,
-                git: shell_git_policy(
-                    super::effective_autonomy::current().unwrap_or(crate::security::AutonomyLevel::Supervised),
-                ),
             })
             .await
         {

@@ -379,18 +379,6 @@ impl PostgresCronStore {
         })
     }
 
-    pub fn job_created_via(&self, job_id: &str) -> Result<JobCreator> {
-        self.with_client(|client| {
-            let row = client
-                .query_opt("SELECT created_via FROM cron_jobs WHERE id = $1", &[&job_id])
-                .context("Failed to query cron job creator")?;
-            match row {
-                Some(row) => Ok(JobCreator::from_stored(row.try_get::<_, Option<String>>(0)?.as_deref())),
-                None => anyhow::bail!("Cron job '{job_id}' not found"),
-            }
-        })
-    }
-
     pub fn job_revision(&self, job_id: &str) -> Result<u64> {
         self.with_client(|client| {
             let row = client

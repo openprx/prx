@@ -9,9 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- BREAKING (operators): the git-specific rules of the shell path are removed.
+  A command that runs git is an ordinary shell command at every autonomy
+  level: below Full it is no longer refused, and operator cron and Xin jobs,
+  xin system tasks and node `exec_shell` commands no longer get the hardened
+  git environment (no forced `core.hooksPath`, `GIT_CONFIG_*` or
+  `GIT_NO_LAZY_FETCH`). `prx doctor` no longer lists shell jobs stored without
+  a recorded creator. PRX's own git invocations (skill installs, the chat diff
+  view) keep their hardened launch.
 - BREAKING (agents): the structured `git_operations` tool is removed. Agents
-  run git through the `shell` tool, whose git policy is unchanged: effective
-  Full runs plain git; Supervised and ReadOnly shells refuse git. A
+  run git through the `shell` tool. A
   configuration that still names `git_operations` (`tool_tiering`,
   `agents.<name>.allowed_tools`, scope-rule `tools_allow` / `tools_deny`)
   loads normally; the name matches nothing and is ignored.

@@ -641,7 +641,6 @@ async fn int_tr_05_direct_shell_process_has_no_sandbox_selection() {
             workspace_dir: workspace.path(),
             timeout: Some(Duration::from_secs(5)),
             cancellation: None,
-            git: openprx::runtime::shell_process::ShellGitPolicy::RefuseGit,
         })
         .await
         .unwrap();

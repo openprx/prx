@@ -406,11 +406,6 @@ async fn handle_exec_shell(state: &AppState, params: ExecShellParams, source_ip:
         &state.config.allowed_commands,
         &state.config.blocked_commands,
     )?;
-    // An operator allowlist entry is operator-configured (D-107): git runs,
-    // with the environment hardening `execute_shell_command` applies.
-    if crate::security::git_launch::shell_command_runs_git(command_text) {
-        crate::security::git_launch::warn_operator_git_once("node", &parsed_command.program);
-    }
 
     let cwd = if let Some(cwd) = params.cwd.as_deref() {
         Some(resolve_existing_sandbox_path(&state.sandbox_root.path, cwd)?)
@@ -517,23 +512,6 @@ async fn execute_shell_command(
     if let Some(env) = env {
         cmd.envs(env);
     }
-    // After the caller's variables, so they cannot undo it (D-107).
-    cmd.env_remove("GIT_CONFIG_PARAMETERS");
-    let git_environment = match crate::security::git_launch::operator_git_environment().await {
-        Ok(environment) => environment,
-        Err(error) => {
-            return ExecShellResult {
-                task_id: task_id.to_string(),
-                exit_code: None,
-                stdout: String::new(),
-                stderr: format!("cannot harden git for this operator command: {error}"),
-                duration_ms: elapsed_ms_u64(started.elapsed()),
-                timed_out: false,
-                cancelled: false,
-            };
-        }
-    };
-    cmd.envs(git_environment);
 
     let mut child = match crate::runtime::shell_process::spawn_managed_shell_child(cmd) {
         Ok(child) => child,

@@ -110,36 +110,6 @@ async fn full_shell_runs_git_and_repository_hook() {
 }
 
 #[tokio::test]
-async fn restricted_shell_refuses_git_before_spawn() {
-    let root = tempfile::tempdir().expect("test: root");
-    for level in [AutonomyLevel::Supervised, AutonomyLevel::ReadOnly] {
-        let result = tokio::time::timeout(
-            Duration::from_secs(5),
-            effective_autonomy::scope(
-                level,
-                shell(root.path()).execute_named_observed(
-                    "shell",
-                    json!({"command":"git -c user.name=t -c user.email=t@t commit --allow-empty -m x"}),
-                    None,
-                ),
-            ),
-        )
-        .await
-        .expect("test: deadline")
-        .expect("test: result");
-        assert!(!result.result.success, "test: restricted git denied");
-        assert!(result.process.as_ref().is_some_and(|p| !p.started), "test: zero spawn");
-        assert!(
-            result
-                .process
-                .and_then(|p| p.diagnostic)
-                .is_some_and(|e| e.contains("git")),
-            "test: git refusal diagnostic"
-        );
-    }
-}
-
-#[tokio::test]
 async fn full_shell_environment_keeps_proxy_and_strips_credentials() {
     const PROBE: &str = "PRX_FULL_ENV_TEST";
     if std::env::var_os(PROBE).is_none() {
@@ -245,31 +215,6 @@ async fn dispatch(
     )
     .await
     .expect("test: dispatch deadline")
-}
-
-#[tokio::test]
-async fn supervised_approval_does_not_enable_git() {
-    let root = tempfile::tempdir().expect("test: workspace");
-    let outcome = dispatch(
-        &service(root.path(), AutonomyLevel::Supervised),
-        context(),
-        "shell",
-        json!({"command":"git status"}),
-    )
-    .await;
-    assert_eq!(
-        outcome.status,
-        ToolExecutionStatus::Failed,
-        "test: approved shell reaches refusal"
-    );
-    assert!(
-        outcome.process.as_ref().is_some_and(|process| !process.started
-            && process
-                .diagnostic
-                .as_deref()
-                .is_some_and(|error| error.contains("refusing to run git through the shell"))),
-        "test: GitRefused before spawn: {outcome:?}"
-    );
 }
 
 #[tokio::test]

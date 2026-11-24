@@ -22,7 +22,7 @@ pub use store::{
     abandon_job_claim, add_agent_job, add_agent_job_with_lineage, add_shell_job, add_shell_job_with_approval_grant,
     add_shell_job_with_lineage_and_approval_grant, add_shell_job_with_lineage_approval_and_delete,
     claim_job_if_current, claim_job_if_current_for_manual_run, claim_terminal_job_for_manual_rerun, due_jobs,
-    finish_claimed_run, get_job, job_claim_is_current, job_created_via, job_creator, job_revision, list_job_events,
+    finish_claimed_run, get_job, job_claim_is_current, job_creator, job_revision, list_job_events,
     list_jobs, list_runs, mark_job_operator, record_claim_lost, record_delivery_withheld, record_terminal_manual_run,
     remove_job, renew_job_claim, unmarked_shell_jobs, update_job,
 };
@@ -194,8 +194,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
 fn cli_lineage() -> CronJobLineage {
     CronJobLineage {
         origin: JobOrigin::LocalOperator,
-        // D-107 amendment: the operator's own command, so its git may run
-        // (hardened).
+        // The operator's own command.
         created_via: JobCreator::OperatorCli,
         ..CronJobLineage::default()
     }

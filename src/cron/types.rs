@@ -260,8 +260,8 @@ pub struct CronJob {
     pub origin: JobOrigin,
 }
 
-/// Which surface created a job (D-107 amendment): decides whether its shell
-/// command may run git (hardened) or not.
+/// Which surface created a job: decides whether its runs use the operator
+/// level.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum JobCreator {
     /// The operator's own command: `prx cron`/`prx xin`, an authenticated

@@ -160,8 +160,7 @@ the runner stops that execution. For HEARTBEAT.md tasks, pause is undone by
 the next reconciliation while the bullet remains; cancel keeps status
 cancelled, so scheduling still skips it, until `prx xin resume`.
 `prx cron mark-operator` and `prx xin mark-operator` record that a pre-existing
-shell command is the operator's own; agent-created shell jobs stay refused for
-git.
+shell command is the operator's own, so it runs at the operator level.
 
 Field defaults live in the [configuration reference](configuration.md):
 

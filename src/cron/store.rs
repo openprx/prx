@@ -361,23 +361,6 @@ pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
     })
 }
 
-/// Which surface created the job (D-107 amendment); NULL is `agent_tool`.
-pub fn job_created_via(config: &Config, job_id: &str) -> Result<JobCreator> {
-    if let Some(store) = pg_store(config)? {
-        return store.job_created_via(job_id);
-    }
-    with_connection(config, |conn| {
-        let value = conn
-            .query_row(
-                "SELECT created_via FROM cron_jobs WHERE id = ?1",
-                params![job_id],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .with_context(|| format!("Cron job '{job_id}' not found"))?;
-        Ok(JobCreator::from_stored(value.as_deref()))
-    })
-}
-
 /// Which surface created the job and the stored creator stamp; NULL
 /// `created_via` is `agent_tool`, and an unreadable stamp reads as empty.
 pub fn job_creator(config: &Config, job_id: &str) -> Result<(JobCreator, CreatorStamp)> {
@@ -411,7 +394,7 @@ pub fn job_creator(config: &Config, job_id: &str) -> Result<(JobCreator, Creator
 }
 
 /// Record that the operator vouches for a job as their own (`prx cron
-/// mark-operator`): its shell command may then run git, hardened.
+/// mark-operator`): its runs then use the operator level.
 pub fn mark_job_operator(config: &Config, job_id: &str) -> Result<()> {
     if let Some(store) = pg_store(config)? {
         return store.mark_job_operator(job_id);
@@ -2295,7 +2278,7 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&mut Connection) -> Result
     add_column_if_missing(&conn, "cron_jobs", "origin", "TEXT")?;
     // D-107 amendment: which surface created the job. Nullable with no
     // backfill: a row stored before the column existed reads as
-    // `agent_tool` (its git is refused) until the operator marks it.
+    // `agent_tool` until the operator marks it.
     add_column_if_missing(&conn, "cron_jobs", "created_via", "TEXT")?;
     // The creating call's level and agent. Nullable with no backfill: a row
     // without them runs at Main's level.
@@ -3851,7 +3834,7 @@ mod tests {
         )
         .unwrap();
         mark_job_operator(&config, &job.id).unwrap();
-        assert_eq!(job_created_via(&config, &job.id).unwrap(), JobCreator::OperatorCli);
+        assert_eq!(job_creator(&config, &job.id).unwrap().0, JobCreator::OperatorCli);
 
         let updated = update_job(
             &config,
@@ -3863,7 +3846,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(updated.command, "git status");
-        assert_eq!(job_created_via(&config, &job.id).unwrap(), JobCreator::AgentTool);
+        assert_eq!(job_creator(&config, &job.id).unwrap().0, JobCreator::AgentTool);
     }
 }
 

@@ -89,7 +89,7 @@ fn scope_args(owner_id: &str) -> Value {
 }
 
 /// Who a write through this route records as the creator: the operator
-/// (`operator_cli`, so its runs keep Main's live level and hardened git) when
+/// (`operator_cli`, so its runs keep Main's live level) when
 /// a paired bearer authenticated the request; otherwise `agent_tool`, so a
 /// request accepted with pairing off gains nothing.
 fn route_creator(state: &AppState, headers: &axum::http::HeaderMap) -> crate::cron::JobCreator {

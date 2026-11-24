@@ -189,7 +189,6 @@ pub fn diagnose(config: &Config) -> DoctorReport {
     check_legacy_fitness_telemetry(config, &mut items);
     check_workspace_mcp_servers(config, &mut items);
     check_workspace_hooks(config, &mut items);
-    check_unowned_shell_jobs(config, &mut items);
     check_unfinished_config_changes(config, &mut items);
     check_daemon_state(config, &mut items);
     prompt_cache::check_prompt_cache(config, &mut items);
@@ -240,103 +239,6 @@ fn check_workspace_hooks(config: &Config, items: &mut Vec<DiagItem>) {
             format!("the workspace hooks.json is not valid: {error:#}"),
         )),
     }
-}
-
-/// Shell jobs stored before PRX recorded who creates them (D-107
-/// amendment): they count as agent-created, so a command that runs git is
-/// refused. Each is named with the one command that vouches for it. Opens
-/// the stores read-only and runs no migration: a store whose table predates
-/// the `created_via` column has only such rows.
-fn check_unowned_shell_jobs(config: &Config, items: &mut Vec<DiagItem>) {
-    let category = "git";
-    let cron_in_postgres = config
-        .storage
-        .provider
-        .config
-        .provider
-        .trim()
-        .eq_ignore_ascii_case("postgres");
-    let mut sources = vec![(
-        "xin shell task",
-        "prx xin mark-operator",
-        config.workspace_dir.join("xin").join("tasks.db"),
-        "xin_tasks",
-        "SELECT id, payload FROM xin_tasks
-         WHERE execution_mode = 'shell' AND kind <> 'system' AND created_via IS NULL ORDER BY id",
-        "SELECT id, payload FROM xin_tasks WHERE execution_mode = 'shell' AND kind <> 'system' ORDER BY id",
-    )];
-    if cron_in_postgres {
-        items.push(DiagItem::ok(
-            category,
-            "cron jobs are stored in Postgres and not inspected here; a shell job created before PRX recorded its \
-             creator runs no git until `prx cron mark-operator <id>`",
-        ));
-    } else {
-        sources.push((
-            "cron shell job",
-            "prx cron mark-operator",
-            config.workspace_dir.join("cron").join("jobs.db"),
-            "cron_jobs",
-            "SELECT id, command FROM cron_jobs WHERE job_type = 'shell' AND created_via IS NULL ORDER BY id",
-            "SELECT id, command FROM cron_jobs WHERE job_type = 'shell' ORDER BY id",
-        ));
-    }
-    let mut found = 0_usize;
-    for (what, mark, db_path, table, unowned_sql, legacy_sql) in sources {
-        match read_only_unowned_rows(&db_path, table, unowned_sql, legacy_sql) {
-            Ok(rows) => {
-                for (id, _) in rows {
-                    found += 1;
-                    items.push(DiagItem::warn(
-                        category,
-                        format!(
-                            "{what} {id} predates creator tracking and counts as agent-created, so git in it is \
-                             refused; if you created it: `{mark} {id}`"
-                        ),
-                    ));
-                }
-            }
-            Err(error) => items.push(DiagItem::warn(
-                category,
-                format!("the {what}s could not be read: {error:#}"),
-            )),
-        }
-    }
-    if found == 0 {
-        items.push(DiagItem::healthy(category, "every shell job records who created it"));
-    }
-}
-
-/// `(id, command)` of the shell rows of `table` whose `created_via` is NULL
-/// (`unowned_sql`), or all of them (`legacy_sql`) when the column does not
-/// exist yet; read-only, and empty when the database or the table is
-/// missing.
-fn read_only_unowned_rows(
-    db_path: &Path,
-    table: &str,
-    unowned_sql: &str,
-    legacy_sql: &str,
-) -> Result<Vec<(String, String)>> {
-    if !db_path.is_file() {
-        return Ok(Vec::new());
-    }
-    let connection = rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let table_exists: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
-        [table],
-        |row| row.get(0),
-    )?;
-    if !table_exists {
-        return Ok(Vec::new());
-    }
-    let has_creator: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = 'created_via')",
-        [table],
-        |row| row.get(0),
-    )?;
-    let mut statement = connection.prepare(if has_creator { unowned_sql } else { legacy_sql })?;
-    let rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
-    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
 /// Unfinished configuration changes (SP-PMM §2.6, D-095 L-3): a `pending`

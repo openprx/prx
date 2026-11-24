@@ -1116,29 +1116,6 @@ async fn run_job_command(config: &Config, job: &CronJob) -> (bool, String) {
     run_job_command_with_adapter(config, job, None, &process).await
 }
 
-/// How a cron shell job's git is treated. At the run's Full level (the
-/// level [`job_run_level`] computed and the caller scoped around the run;
-/// unset is never Full) git runs plainly, as in the Full shell, whoever
-/// created the job (owner D1). Below Full (D-107 amendment): a job the operator created
-/// with `prx cron` (or marked with `prx cron mark-operator`) runs git
-/// hardened, warned once; a job an agent tool created, a job stored before
-/// the creator was recorded, and a failed lookup refuse it.
-fn shell_git_policy(config: &Config, job: &CronJob) -> crate::runtime::shell_process::ShellGitPolicy {
-    if crate::tools::effective_autonomy::current() == Some(crate::security::AutonomyLevel::Full) {
-        return crate::tools::shell::shell_git_policy(crate::security::AutonomyLevel::Full);
-    }
-    let operator = crate::cron::job_created_via(config, &job.id)
-        .is_ok_and(|creator| creator == crate::cron::JobCreator::OperatorCli);
-    if operator {
-        if crate::security::git_launch::shell_command_runs_git(&job.command) {
-            crate::security::git_launch::warn_operator_git_once("cron", &job.id);
-        }
-        crate::runtime::shell_process::ShellGitPolicy::HardenGit
-    } else {
-        crate::runtime::shell_process::ShellGitPolicy::RefuseGit
-    }
-}
-
 async fn run_job_command_with_adapter(
     config: &Config,
     job: &CronJob,
@@ -1151,7 +1128,6 @@ async fn run_job_command_with_adapter(
             workspace_dir: &config.workspace_dir,
             timeout,
             cancellation: None,
-            git: shell_git_policy(config, job),
         })
         .await
     {
@@ -1607,78 +1583,6 @@ mod tests {
         cron::claim_job_if_current_for_manual_run(config, job, "scheduler-test", now, ChronoDuration::seconds(90))
             .unwrap()
             .unwrap()
-    }
-
-    /// D-107: a cron shell job an agent tool created (or one stored before
-    /// the creator was recorded) is model-driven, so a command that runs git
-    /// is refused.
-    #[tokio::test]
-    async fn a_cron_shell_job_that_runs_git_is_refused() {
-        let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp).await;
-        let job = test_job("cd . && git status");
-
-        let (success, output) = run_job_command(&config, &job).await;
-        assert!(!success);
-        assert!(output.contains("refusing to run git through the shell"), "{output}");
-    }
-
-    /// D-107 amendment: a job the operator added with `prx cron` runs git
-    /// (hardened); the same command added through an agent tool is refused;
-    /// an agent tool rewriting the operator job's command makes it an agent
-    /// job; `mark-operator` vouches for one again.
-    #[tokio::test]
-    async fn only_operator_cron_jobs_run_git() {
-        crate::security::git_launch::hermetic_git_for_tests();
-        let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp).await;
-        crate::cron::handle_command(
-            crate::CronCommands::Add {
-                expression: "*/5 * * * *".into(),
-                tz: None,
-                command: "git --version".into(),
-            },
-            &config,
-        )
-        .unwrap();
-        let operator = crate::cron::list_jobs(&config)
-            .unwrap()
-            .into_iter()
-            .find(|job| job.command == "git --version")
-            .expect("test: the CLI job");
-        let (success, output) = run_job_command(&config, &operator).await;
-        assert!(success, "{output}");
-        assert!(output.contains("git version"), "{output}");
-
-        let agent = cron::add_shell_job(
-            &config,
-            None,
-            crate::cron::Schedule::Cron {
-                expr: "*/5 * * * *".into(),
-                tz: None,
-            },
-            "git --version",
-        )
-        .unwrap();
-        let (success, output) = run_job_command(&config, &agent).await;
-        assert!(!success);
-        assert!(output.contains("refusing to run git"), "{output}");
-
-        let rewritten = cron::update_job(
-            &config,
-            &operator.id,
-            crate::cron::CronJobPatch {
-                command: Some("git status".into()),
-                ..crate::cron::CronJobPatch::default()
-            },
-        )
-        .unwrap();
-        let (success, output) = run_job_command(&config, &rewritten).await;
-        assert!(!success, "an agent rewrite kept the operator's permission: {output}");
-
-        crate::cron::mark_job_operator(&config, &agent.id).unwrap();
-        let (success, output) = run_job_command(&config, &agent).await;
-        assert!(success, "{output}");
     }
 
     #[tokio::test]

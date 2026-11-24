@@ -1044,31 +1044,6 @@ fn task_run_level(config: &Config, task: &XinTask) -> Result<crate::security::Au
     .map_err(|error| format!("blocked by security policy: {error}"))
 }
 
-/// How a Xin shell task's git is treated. At the run's Full level (the
-/// level [`task_run_level`] computed and [`run_shell_with_cancellation`]
-/// scoped around the run; unset is never Full) git runs plainly, as in the Full shell, for every task and
-/// goal step (owner D1). Below Full (D-107 and its amendment): a system task
-/// (built-in or the operator's `HEARTBEAT.md`) and a task the operator
-/// created with `prx xin` (or marked with `prx xin mark-operator`) run git
-/// hardened, warned once; every other task, and every goal step (steps can
-/// be added to a goal through tools), refuses it. A failed lookup refuses.
-fn shell_git_policy(config: &Config, task: &XinTask) -> crate::runtime::shell_process::ShellGitPolicy {
-    if crate::tools::effective_autonomy::current() == Some(crate::security::AutonomyLevel::Full) {
-        return crate::tools::shell::shell_git_policy(crate::security::AutonomyLevel::Full);
-    }
-    let operator = task.kind == crate::xin::types::TaskKind::System
-        || store::task_created_via(config, &task.id)
-            .is_ok_and(|creator| creator == crate::cron::JobCreator::OperatorCli);
-    if operator {
-        if crate::security::git_launch::shell_command_runs_git(&task.payload) {
-            crate::security::git_launch::warn_operator_git_once("xin", &task.id);
-        }
-        crate::runtime::shell_process::ShellGitPolicy::HardenGit
-    } else {
-        crate::runtime::shell_process::ShellGitPolicy::RefuseGit
-    }
-}
-
 async fn run_shell_with_adapter(
     config: &Config,
     task: &XinTask,
@@ -1081,7 +1056,6 @@ async fn run_shell_with_adapter(
             workspace_dir: &config.workspace_dir,
             timeout: None,
             cancellation,
-            git: shell_git_policy(config, task),
         })
         .await
     {
@@ -1176,96 +1150,6 @@ mod tests {
 
         let tasks = store::list_tasks(&config).unwrap();
         assert_eq!(tasks.len(), 3); // No duplicates
-    }
-
-    /// D-107: only a system task (built-in or the operator's `HEARTBEAT.md`)
-    /// is operator-configured; any other Xin shell task may come from a
-    /// tool, so its git is refused.
-    #[test]
-    fn only_system_xin_tasks_run_git_hardened() {
-        let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp);
-        let task = |name: &str, kind: TaskKind| {
-            store::add_task(
-                &config,
-                &NewXinTask {
-                    owner_id: None,
-                    topic_id: None,
-                    parent_task_id: None,
-                    source_message_event_id: None,
-                    name: name.to_string(),
-                    description: None,
-                    kind,
-                    priority: TaskPriority::Low,
-                    execution_mode: ExecutionMode::Shell,
-                    payload: "git pull".to_string(),
-                    recurring: false,
-                    interval_secs: 60,
-                    max_failures: 1,
-                    approval_grant_json: None,
-                },
-            )
-            .unwrap()
-        };
-        assert_eq!(
-            shell_git_policy(&config, &task("system", TaskKind::System)),
-            crate::runtime::shell_process::ShellGitPolicy::HardenGit
-        );
-        for (name, kind) in [("user", TaskKind::User), ("agent", TaskKind::Agent)] {
-            assert_eq!(
-                shell_git_policy(&config, &task(name, kind)),
-                crate::runtime::shell_process::ShellGitPolicy::RefuseGit,
-                "{name}"
-            );
-        }
-        // D-107 amendment: `prx xin add` records the operator; a task stored
-        // before that is refused until marked, and an agent tool rewriting an
-        // operator task's command makes it an agent task again.
-        let operator = store::add_task_with_origin_and_creator(
-            &config,
-            &NewXinTask {
-                owner_id: None,
-                topic_id: None,
-                parent_task_id: None,
-                source_message_event_id: None,
-                name: "operator".to_string(),
-                description: None,
-                kind: TaskKind::User,
-                priority: TaskPriority::Low,
-                execution_mode: ExecutionMode::Shell,
-                payload: "git pull".to_string(),
-                recurring: false,
-                interval_secs: 60,
-                max_failures: 1,
-                approval_grant_json: None,
-            },
-            &crate::tools::execution::JobOrigin::LocalOperator,
-            crate::cron::JobCreator::OperatorCli,
-        )
-        .unwrap();
-        assert_eq!(
-            shell_git_policy(&config, &operator),
-            crate::runtime::shell_process::ShellGitPolicy::HardenGit
-        );
-        let rewritten = store::update_task(
-            &config,
-            &operator.id,
-            &crate::xin::types::XinTaskPatch {
-                payload: Some("git push".to_string()),
-                ..crate::xin::types::XinTaskPatch::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            shell_git_policy(&config, &rewritten),
-            crate::runtime::shell_process::ShellGitPolicy::RefuseGit
-        );
-        let legacy = task("legacy", TaskKind::User);
-        store::mark_task_operator(&config, &legacy.id).unwrap();
-        assert_eq!(
-            shell_git_policy(&config, &legacy),
-            crate::runtime::shell_process::ShellGitPolicy::HardenGit
-        );
     }
 
     #[test]

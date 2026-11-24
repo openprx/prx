@@ -76,16 +76,10 @@
 //!     same per submodule named in the configuration or in `.gitmodules` of
 //!     the working tree, the index or `HEAD`).
 //!
-//! At an effective Full autonomy level (owner D1) a caller passes
-//! [`GitScope::PlainRepository`]: the same cleared environment, but no
-//! inspection, override, refusal or hooks path, as in the Full shell.
-//!
 //! Callers pass [`DIFF_SAFETY_ARGS`] to every command printing a patch,
-//! [`PUSH_SAFETY_ARGS`] to `push` and [`FETCH_SAFETY_ARGS`] to `fetch`,
-//! `pull` and `ls-remote`: `remote.<name>.receivepack`/`uploadpack` are read
-//! first-wins, so a `-c` cannot replace the repository's value, while the
-//! explicit option does. A trusted value of these two keys is not used for
-//! PRX's git.
+//! and [`FETCH_SAFETY_ARGS`] to `fetch`, `pull` and `ls-remote`:
+//! `remote.<name>.uploadpack` is read first-wins, so a `-c` cannot replace
+//! the repository's value, while the explicit option does.
 //!
 //! **Residuals (time of check to time of use).** The configuration is read
 //! just before the command runs. A repository-controlled driver, protocol,
@@ -107,10 +101,6 @@ use std::process::Stdio;
 /// patch PRX parses.
 pub const DIFF_SAFETY_ARGS: [&str; 2] = ["--no-ext-diff", "--no-textconv"];
 
-/// Flags every `git push` passes: the receiving program is git's own, not a
-/// repository's first-wins `remote.<name>.receivepack`.
-pub const PUSH_SAFETY_ARGS: [&str; 1] = ["--receive-pack=git-receive-pack"];
-
 /// Flags every `git fetch`, `pull` and `ls-remote` passes: the serving
 /// program is git's own, not a repository's first-wins
 /// `remote.<name>.uploadpack`.
@@ -122,13 +112,6 @@ pub enum GitScope<'a> {
     /// An existing repository (or a directory inside one): git starts in
     /// that directory, and its configuration is read first.
     Repository(&'a Path),
-    /// An existing repository used at an effective Full autonomy level:
-    /// git runs plainly there, as in the Full shell (owner D1). Its
-    /// configuration is not inspected, nothing is overridden and no hooks
-    /// path is set, so the repository's hooks and programs run; the cleared
-    /// environment ([`git_environment`]) is kept, so no secret of PRX's
-    /// environment reaches git.
-    PlainRepository(&'a Path),
     /// A command that creates a repository (`git clone <url> <dest>`): no
     /// repository configuration exists yet; the working directory is left
     /// to the caller.
@@ -714,110 +697,6 @@ fn submodule_names(raw: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// Settings an operator-configured shell job's git gets through the
-/// environment (D-107), where PRX cannot inspect the repository the job
-/// works in: the fixed program settings ([`COMMAND_SETTINGS`], the
-/// operator's system/global value or the fallback), no hook script, no bare
-/// repository discovery, no `ext::` transport.
-#[must_use]
-pub fn operator_git_config_pairs(entries: &[ConfigEntry]) -> Vec<(String, String)> {
-    let mut pairs = COMMAND_SETTINGS
-        .iter()
-        .map(|(key, fallback)| {
-            let trusted = entries
-                .iter()
-                .rev()
-                .find(|entry| {
-                    matches!(entry.scope.as_str(), "system" | "global") && entry.key.eq_ignore_ascii_case(key)
-                })
-                .map(|entry| entry.value.clone().unwrap_or_else(|| "true".to_string()));
-            ((*key).to_string(), trusted.unwrap_or_else(|| (*fallback).to_string()))
-        })
-        .collect::<Vec<_>>();
-    pairs.extend(
-        [("safe.bareRepository", "explicit"), ("protocol.ext.allow", "never")]
-            .map(|(key, value)| (key.to_string(), value.to_string())),
-    );
-    pairs
-}
-
-/// `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>` for
-/// `pairs` (command-line scope: they win over every configuration file and
-/// reach every git process started below), plus `GIT_NO_LAZY_FETCH=1` (a
-/// partial clone's lazy fetch would run the repository's first-wins
-/// `remote.<name>.uploadpack`).
-#[must_use]
-pub fn git_config_environment(pairs: &[(String, String)]) -> Vec<(OsString, OsString)> {
-    let mut environment = vec![
-        (
-            OsString::from("GIT_CONFIG_COUNT"),
-            OsString::from(pairs.len().to_string()),
-        ),
-        (OsString::from("GIT_NO_LAZY_FETCH"), OsString::from("1")),
-    ];
-    for (index, (key, value)) in pairs.iter().enumerate() {
-        environment.push((OsString::from(format!("GIT_CONFIG_KEY_{index}")), OsString::from(key)));
-        environment.push((
-            OsString::from(format!("GIT_CONFIG_VALUE_{index}")),
-            OsString::from(value),
-        ));
-    }
-    environment
-}
-
-/// The environment additions that harden the git of an operator-configured
-/// shell job (a node allowlist entry, a system Xin task): the operator's
-/// system and global configuration is read (from `/`, so no repository's
-/// configuration is), and [`operator_git_config_pairs`] plus the hooks path
-/// are passed through [`git_config_environment`]. A failed read falls back
-/// to the fallbacks alone.
-pub async fn operator_git_environment() -> anyhow::Result<Vec<(OsString, OsString)>> {
-    let parent = std::env::vars_os().collect::<Vec<_>>();
-    let environment = git_environment(parent);
-    let neutral = if cfg!(unix) {
-        PathBuf::from("/")
-    } else {
-        std::env::temp_dir()
-    };
-    let entries = match read_git(
-        &neutral,
-        &environment,
-        ReadKind::Listing,
-        &["config", "--list", "--show-scope", "--show-origin", "-z"],
-    )
-    .await
-    {
-        Ok(raw) => parse_config_listing(&raw),
-        Err(error) => {
-            tracing::warn!(error = %error, "could not read the operator's git configuration; using the fallbacks");
-            Vec::new()
-        }
-    };
-    let mut pairs = operator_git_config_pairs(&entries);
-    let hooks = hooks_path()?;
-    pairs.push(("core.hooksPath".to_string(), hooks.to_string_lossy().into_owned()));
-    Ok(git_config_environment(&pairs))
-}
-
-/// Warn once per operator-configured job (a `surface` and a job key) that
-/// its shell command runs git with only the environment hardening (D-107):
-/// the repository's own drivers, credential helpers and transport settings
-/// are not inspected there.
-pub fn warn_operator_git_once(surface: &str, job: &str) {
-    static WARNED: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
-        std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
-    let key = format!("{surface}\u{1f}{job}");
-    if WARNED.lock().insert(key) {
-        tracing::warn!(
-            surface,
-            job,
-            "an operator-configured shell job runs git: fsmonitor, hook scripts, bare discovery, ext:: and lazy \
-             fetch are disabled for it, but the repository's own drivers, credential helpers and transport \
-             settings are not inspected"
-        );
-    }
-}
-
 /// Whether `<toplevel>/.git` exists and is the repository git uses: the
 /// directory itself, or a `gitdir:` link file (a linked worktree, a
 /// submodule) pointing at it. A `core.worktree` that makes a parent (or any
@@ -843,142 +722,6 @@ fn working_tree_owns_repository(toplevel: &Path, git_dir: &Path) -> bool {
         (Ok(linked), Ok(git_dir)) => linked == git_dir,
         _ => false,
     }
-}
-
-/// Whether `program` (a path or a name) is git or one of its helper
-/// programs (`git-upload-pack`, ...), in any letter case, with or without
-/// `.exe`.
-#[must_use]
-pub fn program_is_git(program: &str) -> bool {
-    let name = program
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(program)
-        .to_ascii_lowercase();
-    let name = name.strip_suffix(".exe").unwrap_or(&name);
-    name == "git" || name.starts_with("git-")
-}
-
-/// Words that precede the program of a simple shell command without being
-/// it: wrappers, keywords and `!`.
-const SHELL_PREFIX_WORDS: &[&str] = &[
-    "sudo", "doas", "env", "command", "builtin", "exec", "nohup", "time", "nice", "ionice", "stdbuf", "timeout",
-    "xargs", "eval", "then", "do", "else", "elif", "if", "while", "until", "!", "{", "(",
-];
-
-/// Wrapper options whose next word is data, not the command to execute.
-const SHELL_PREFIX_VALUE_OPTIONS: &[&str] = &[
-    "-u",
-    "--user",
-    "-g",
-    "--group",
-    "-h",
-    "--host",
-    "-p",
-    "--prompt",
-    "-C",
-    "--close-from",
-    "-T",
-    "--command-timeout",
-    "--unset",
-    "--chdir",
-    "--chroot",
-];
-
-/// Shells whose `-c` argument is itself a command string.
-const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish"];
-
-/// Whether the shell command string `command` runs git (or a git helper)
-/// as the program of one of its simple commands: after `;`, `&&`, `||`,
-/// `|`, `&`, a newline, `$(`, a backtick or a subshell, past environment
-/// assignments and wrappers (`env`, `sudo`, `xargs`, `eval`, ...), and
-/// inside `sh -c`/`bash -c` strings. Quotes are removed while quoted path
-/// spaces stay in their program word, so `g'i't` is `git`. This is a
-/// best-effort guard: a script file or name built at run time (`$(printf git)`)
-/// is not recognised.
-#[must_use]
-pub fn shell_command_runs_git(command: &str) -> bool {
-    // A Windows drive path may contain spaces before its final `git.exe`;
-    // splitting it into shell words would otherwise hide the program name.
-    let start = command.trim_start_matches(|character: char| character.is_whitespace() || character == '"');
-    if start.as_bytes().get(1) == Some(&b':')
-        && matches!(start.as_bytes().get(2), Some(b'\\' | b'/'))
-        && start
-            .rsplit(['\\', '/'])
-            .next()
-            .and_then(|tail| tail.split_whitespace().next())
-            .is_some_and(|program| program_is_git(program.trim_matches('"')))
-    {
-        return true;
-    }
-    // Keep spaces inside literal quoted program paths in one word. A sentinel
-    // avoids adding a shell parser to this deliberately bounded detector.
-    const QUOTED_SPACE: char = '\u{1f}';
-    let mut quote = None;
-    let mut flattened = String::with_capacity(command.len());
-    for character in command.chars() {
-        if matches!(character, ';' | '&' | '|' | '\n' | '`' | '(' | ')' | '{' | '}') {
-            quote = None;
-            flattened.push('\n');
-            continue;
-        }
-        if matches!(character, '\'' | '"') {
-            if quote == Some(character) {
-                quote = None;
-            } else if quote.is_none() {
-                quote = Some(character);
-            }
-            continue;
-        }
-        flattened.push(match character {
-            ' ' | '\t' if quote.is_some() => QUOTED_SPACE,
-            '\\' if quote.is_some() => '/',
-            '\\' => continue,
-            other => other,
-        });
-    }
-    flattened.lines().any(|segment| {
-        let words = segment.split_whitespace().collect::<Vec<_>>();
-        let mut index = 0;
-        while let Some(word) = words.get(index) {
-            if SHELL_PREFIX_VALUE_OPTIONS.contains(word) {
-                index += 2;
-                continue;
-            }
-            let is_assignment = word.split_once('=').is_some_and(|(name, _)| {
-                !name.is_empty()
-                    && name
-                        .chars()
-                        .all(|character| character.is_ascii_alphanumeric() || character == '_')
-            });
-            let is_option_or_number = word.starts_with('-') || word.chars().all(|character| character.is_ascii_digit());
-            if is_assignment || is_option_or_number || word.starts_with('$') || SHELL_PREFIX_WORDS.contains(word) {
-                index += 1;
-                continue;
-            }
-            break;
-        }
-        let Some(program) = words.get(index) else {
-            return false;
-        };
-        if program_is_git(&program.replace(QUOTED_SPACE, " ")) {
-            return true;
-        }
-        let base = program.rsplit('/').next().unwrap_or(program);
-        SHELLS.contains(&base)
-            && words
-                .iter()
-                .position(|word| word.starts_with('-') && !word.starts_with("--") && word.contains('c'))
-                .is_some_and(|position| {
-                    shell_command_runs_git(
-                        &words
-                            .get(position + 1..)
-                            .unwrap_or_default()
-                            .join(" ")
-                            .replace(QUOTED_SPACE, " "),
-                    )
-                })
-    })
 }
 
 /// Read the repository at `dir`: its effective configuration with scopes
@@ -1070,7 +813,7 @@ async fn inspect_repository(
 /// neutralised, no hook script, `ext::` refused, no bare-repository
 /// discovery, no git process inside a submodule, and stdin closed. The
 /// caller adds the subcommand and its arguments (with
-/// [`DIFF_SAFETY_ARGS`], [`PUSH_SAFETY_ARGS`] or [`FETCH_SAFETY_ARGS`] where
+/// [`DIFF_SAFETY_ARGS`] or [`FETCH_SAFETY_ARGS`] where
 /// they apply).
 ///
 /// # Errors
@@ -1089,12 +832,7 @@ async fn git_command_with_parent(
     scope: GitScope<'_>,
     parent: Vec<(OsString, OsString)>,
 ) -> anyhow::Result<tokio::process::Command> {
-    // Only an effective Full launch skips the hardening (and its refusals).
-    let hooks = if matches!(scope, GitScope::PlainRepository(_)) {
-        None
-    } else {
-        Some(hooks_path()?)
-    };
+    let hooks = hooks_path()?;
     let mut environment = git_environment(parent);
     let mut overrides = if let GitScope::Repository(dir) = scope {
         let (entries, paths, submodules) = inspect_repository(dir, &environment).await?;
@@ -1106,22 +844,19 @@ async fn git_command_with_parent(
         overrides.extend(repository.overrides);
         overrides
     } else {
-        // `clone`: no repository configuration exists yet. A plain launch
-        // reads none.
+        // `clone`: no repository configuration exists yet.
         Vec::new()
     };
-    if let Some(hooks) = hooks {
-        overrides.extend(
-            ALWAYS_OVERRIDES
-                .iter()
-                .map(|(key, value)| ((*key).to_string(), (*value).to_string())),
-        );
-        overrides.push(("core.hooksPath".to_string(), hooks.to_string_lossy().into_owned()));
-    }
+    overrides.extend(
+        ALWAYS_OVERRIDES
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string())),
+    );
+    overrides.push(("core.hooksPath".to_string(), hooks.to_string_lossy().into_owned()));
 
     let mut command = tokio::process::Command::new("git");
     command.env_clear().envs(environment).stdin(Stdio::null());
-    if let GitScope::Repository(dir) | GitScope::PlainRepository(dir) = scope {
+    if let GitScope::Repository(dir) = scope {
         command.current_dir(dir);
     }
     command.arg("--no-pager");
@@ -1427,61 +1162,6 @@ mod tests {
         ] {
             assert!(result.contains(&expected), "{expected:?}: {result:?}");
         }
-    }
-
-    #[test]
-    fn shell_command_strings_that_run_git_are_recognised() {
-        for command in [
-            "git status",
-            "  git push origin main",
-            "cd repo && git status",
-            "ls; git log",
-            "echo x | xargs git add",
-            "GIT_DIR=x git log",
-            "env -i PATH=/usr/bin git status",
-            "sudo -u prx git pull",
-            "sudo --user prx git pull",
-            "doas -u prx git status",
-            "env -u GIT_CONFIG_PARAMETERS git status",
-            "/usr/bin/git status",
-            "C:\\Program Files\\Git\\bin\\git.exe status",
-            "echo ready; \"C:\\Program Files\\Git\\bin\\git.exe\" status",
-            "sudo -u prx \"C:\\Program Files\\Git\\bin\\git.exe\" status",
-            "echo ready; \"/tmp/Program Files/git\" status",
-            "GIT status",
-            "g'i't status",
-            "\"git\" status",
-            "sh -c 'git status'",
-            "bash -lc \"cd x && git fetch\"",
-            "echo $(git rev-parse HEAD)",
-            "echo `git rev-parse HEAD`",
-            "(git status)",
-            "if true; then git status; fi",
-            "git-upload-pack /repo",
-            "eval git status",
-            "nice -n 5 git gc",
-        ] {
-            assert!(shell_command_runs_git(command), "{command}");
-        }
-        for command in [
-            "echo git",
-            "ls -la",
-            "gitleaks detect",
-            "cat .gitignore",
-            "grep -r git src",
-            "npm run build",
-            "gh pr list",
-            "echo 'use git later'",
-            "sh -c 'ls'",
-            "sudo -u git echo ready",
-            "echo C:\\Program Files\\Git\\bin\\git.exe",
-            "echo ready; echo \"/tmp/Program Files/git\"",
-        ] {
-            assert!(!shell_command_runs_git(command), "{command}");
-        }
-        assert!(program_is_git("/usr/local/bin/git"));
-        assert!(program_is_git("GIT.EXE"));
-        assert!(!program_is_git("gitk"));
     }
 
     #[test]
@@ -1841,9 +1521,7 @@ mod tests {
         let mut push = git_command_with_parent(GitScope::Repository(&repo), parent_with_home(&home))
             .await
             .expect("test: safe launch");
-        push.arg("push")
-            .args(PUSH_SAFETY_ARGS)
-            .args(["origin", "HEAD:refs/heads/main"]);
+        push.arg("push").args(["origin", "HEAD:refs/heads/main"]);
         let output = run(push).await;
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         let mut fetch = git_command_with_parent(GitScope::Repository(&repo), parent_with_home(&home))
@@ -2023,7 +1701,7 @@ mod tests {
         let mut command = git_command_with_parent(GitScope::Repository(&repo), parent_with_home(&home))
             .await
             .expect("test: launch");
-        command.arg("push").args(PUSH_SAFETY_ARGS).args(["origin", "HEAD"]);
+        command.arg("push").args(["origin", "HEAD"]);
         let output = tokio::time::timeout(
             std::time::Duration::from_mins(1),
             crate::runtime::shell_process::run_managed_output(command),
@@ -2219,34 +1897,4 @@ mod tests {
         assert!(error.to_string().contains("does not hold the repository"), "{error}");
     }
 
-    /// D-107: an operator shell job's git gets the fixed program settings
-    /// (the operator's values or the fallbacks) and the forced settings
-    /// through `GIT_CONFIG_*`, plus `GIT_NO_LAZY_FETCH`.
-    #[test]
-    fn operator_shell_jobs_get_the_fixed_settings_through_the_environment() {
-        let pairs = operator_git_config_pairs(&[
-            global("core.sshcommand", "ssh -i key"),
-            local("core.fsmonitor", "./evil"),
-        ]);
-        for expected in [
-            pair("core.sshcommand", "ssh -i key"),
-            pair("core.fsmonitor", "false"),
-            pair("safe.bareRepository", "explicit"),
-            pair("protocol.ext.allow", "never"),
-        ] {
-            assert!(pairs.contains(&expected), "{expected:?}: {pairs:?}");
-        }
-        let environment =
-            git_config_environment(&[pair("core.fsmonitor", "false"), pair("core.hooksPath", "/dev/null")]);
-        let value = |name: &str| {
-            environment
-                .iter()
-                .find(|(key, _)| key == name)
-                .map(|(_, value)| value.to_string_lossy().into_owned())
-        };
-        assert_eq!(value("GIT_CONFIG_COUNT").as_deref(), Some("2"));
-        assert_eq!(value("GIT_CONFIG_KEY_1").as_deref(), Some("core.hooksPath"));
-        assert_eq!(value("GIT_CONFIG_VALUE_1").as_deref(), Some("/dev/null"));
-        assert_eq!(value("GIT_NO_LAZY_FETCH").as_deref(), Some("1"));
-    }
 }

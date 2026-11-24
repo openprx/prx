@@ -95,11 +95,12 @@ stricter environment, and operator cron/Xin jobs keep their existing policy.
 Environment filtering does not restrict which host files native shell commands
 can read, and does not change command authorization or process lifetime.
 
-## Shell git policy and file working root
+## Shell git and file working root
 
-Effective Full shells run ordinary git, including repository hooks. Supervised
-and ReadOnly shells refuse git before spawning; approval does not change that
-policy. Skill scripts and cron/Xin shell jobs keep their existing git policy.
+Git is an ordinary shell command at every autonomy level: PRX applies no git-specific
+rule, so repository hooks and configuration run as they would in a terminal. What a
+level does with shell commands (approval at Supervised, refusal at ReadOnly) applies
+to git unchanged.
 
 `runtime.workdir` or `prx chat --workdir /absolute/task` selects the working root
 for shell and native file tools; otherwise they use the workspace.
@@ -1574,22 +1575,11 @@ creating surface does not; and a **shell** job (`job_type = "shell"`, or a xin
 policy at all, whoever created it — deny the `cron` and `xin` tools to a scope
 that must not run shell commands.
 
-Git has a separate execution boundary. Effective Full autonomy runs git
-through the `shell` tool; PRX refuses recognized Git command strings in the
-`shell` tool below Full, in skill shell/script tools, and in
-cron or xin shell jobs created or rewritten by an agent tool. Operator-created
-cron and xin shell jobs, xin system tasks, and node `exec_shell` allowlists may
-run Git with fixed program settings and hooks disabled. PRX records who last
-wrote each shell command separately from the job's owner; rewriting a command
-through an agent tool removes its operator-Git eligibility. Jobs stored before
-this creator field existed are treated as agent-written. For SQLite stores,
-`prx doctor` lists their IDs without printing their commands. PostgreSQL cron
-jobs are not enumerated by doctor. An operator may vouch for a job they
-created with `prx cron mark-operator <id>` or `prx xin mark-operator <id>`.
-Detection of Git inside a script is best effort, and these operator surfaces
-do not inspect repository-specific Git drivers, helpers or transport settings.
-The Docker runtime forwards the fixed settings into the container without
-placing their values in Docker command arguments.
+Git has no execution boundary of its own: a shell job, skill script or node
+`exec_shell` command that runs git is treated like any other command. PRX
+records who last wrote each shell command separately from the job's owner;
+an operator may vouch for a job they created with `prx cron mark-operator <id>`
+or `prx xin mark-operator <id>`, which decides the level the job runs at.
 
 Claim timestamps currently use each scheduler caller's UTC clock. Multi-node deployments must maintain NTP synchronization and bounded clock skew well below the configured lease interval. A schedule change is rejected while any claim is still active; once that claim has expired, an explicit update may clear the stale tuple. Manual runs of nonterminal jobs use the same renewable lease, delivery, and fenced commit path as background runs.
 

@@ -213,21 +213,6 @@ pub fn due_tasks(config: &Config, now: DateTime<Utc>) -> Result<Vec<XinTask>> {
     })
 }
 
-/// Apply a partial update to an existing task.
-/// Which surface created the task (D-107 amendment); NULL is `agent_tool`.
-pub fn task_created_via(config: &Config, task_id: &str) -> Result<JobCreator> {
-    with_connection(config, |conn| {
-        let value = conn
-            .query_row(
-                "SELECT created_via FROM xin_tasks WHERE id = ?1",
-                params![task_id],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .with_context(|| format!("xin task '{task_id}' not found"))?;
-        Ok(JobCreator::from_stored(value.as_deref()))
-    })
-}
-
 /// The stored creator of a task, or of the goal a step belongs to: which
 /// surface created it (NULL is `agent_tool`) and the creating call's level
 /// and agent (an unreadable stamp reads as empty).
@@ -267,7 +252,7 @@ fn stored_creator(conn: &Connection, task_or_step_id: &str) -> Result<(JobCreato
 }
 
 /// Record that the operator vouches for a task as their own (`prx xin
-/// mark-operator`): its shell command may then run git, hardened.
+/// mark-operator`): its runs then use the operator level.
 pub fn mark_task_operator(config: &Config, task_id: &str) -> Result<()> {
     let changed = with_connection(config, |conn| {
         conn.execute(
@@ -2993,7 +2978,7 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
     add_column_if_missing(&conn, "xin_tasks", "origin", "TEXT")?;
     // D-107 amendment: which surface created the task. Nullable with no
     // backfill: a row stored before the column existed reads as
-    // `agent_tool` (its git is refused) until the operator marks it.
+    // `agent_tool` until the operator marks it.
     add_column_if_missing(&conn, "xin_tasks", "created_via", "TEXT")?;
     add_column_if_missing(&conn, "xin_goals", "origin", "TEXT")?;
     // The creating call's level and agent. Nullable with no backfill: a row
@@ -4706,7 +4691,7 @@ mod tests {
         new.payload = "echo initial".into();
         let task = add_task(&config, &new).unwrap();
         mark_task_operator(&config, &task.id).unwrap();
-        assert_eq!(task_created_via(&config, &task.id).unwrap(), JobCreator::OperatorCli);
+        assert_eq!(task_creator(&config, &task.id).unwrap().0, JobCreator::OperatorCli);
 
         let updated = update_task(
             &config,
@@ -4718,7 +4703,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(updated.payload, "git status");
-        assert_eq!(task_created_via(&config, &task.id).unwrap(), JobCreator::AgentTool);
+        assert_eq!(task_creator(&config, &task.id).unwrap().0, JobCreator::AgentTool);
     }
 }
 
