@@ -624,7 +624,7 @@ async fn run_owned_manifest(
 
     let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::from(runtime::create_runtime(&config.runtime)?);
     let shared_config = crate::config::new_shared(config.clone());
-    let hooks = Arc::new(HookManager::new(manifest.workspace_dir.clone()).with_config(Arc::clone(&shared_config)));
+    let hooks = Arc::new(HookManager::new(parent_workspace.clone()).with_config(Arc::clone(&shared_config)));
     #[cfg(feature = "wasm-plugins")]
     if let Some(plugin_runtime) = &wasm_plugin_runtime {
         hooks.set_plugin_runtime(Arc::clone(plugin_runtime)).await;
@@ -969,6 +969,7 @@ async fn run_owned_manifest(
         let memory_ref = &memory;
         let provider_name_ref: &str = &manifest.provider_name;
         let model_ref: &str = &manifest.model;
+        // The tool-execution ledger is worker state, not a tool root.
         let workspace_dir_ref: &Path = &manifest.workspace_dir;
         let compaction_config_ref = manifest.compaction_config.as_ref();
         let multimodal_ref = &config.multimodal;
@@ -984,6 +985,7 @@ async fn run_owned_manifest(
         let raw_task = manifest.task.as_str();
         let manifest_ref = &manifest;
         let config_ref = &config;
+        let prompt_config_ref = &tool_config;
         // The relay needs all three: the parent sealed it, the pipe is
         // authenticated, and the stdin reader that carries decisions is running.
         let approval_relay =
@@ -1035,14 +1037,14 @@ async fn run_owned_manifest(
                         match turn.prompt_skills() {
                             Ok(skills) => Some(build_worker_system_prompt_with_skills(
                                 manifest_ref,
-                                config_ref,
+                                prompt_config_ref,
                                 native_tools,
                                 &skills,
                             )),
                             Err(error) => return (segment_history, Err(error)),
                         }
                     } else if segment_history.first().is_none_or(|message| message.role != "system") {
-                        Some(build_worker_system_prompt(manifest_ref, config_ref, native_tools))
+                        Some(build_worker_system_prompt(manifest_ref, prompt_config_ref, native_tools))
                     } else {
                         None
                     };

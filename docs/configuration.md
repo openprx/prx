@@ -1293,6 +1293,8 @@ PRX treats `chat`, `agent`, `gateway`, `channel`, `delegate`, and `sessions_spaw
 
 For `sessions_spawn`, `task` runs an in-process sub-agent and `process` launches a worker process. Process mode uses a manifest with `memory_strategy`, `shared_memory_db_path`, and `worker_memory_db_path`; the default `shared_fabric` strategy writes worker events into the parent workspace fabric while still keeping the execution boundary explicit. Set `[sessions_spawn].process_memory_strategy = "isolated_private"` for a private worker DB. `hybrid` is fail-closed because no production merge consumer or merge/reject/ack/cleanup protocol exists; use `shared_fabric` or `isolated_private` instead.
 
+A process worker keeps a private per-run directory (`<workspace>/workers/<run_id>` unless `worker_workspace_root` is set) for its own state only: the sealed manifest snapshot, the isolated memory database, the identity copy and the cleanup target. Its tools, security policy root, hooks and prompt skills use the parent workspace, and its shell and file working directory is the sealed `runtime.workdir` or, when that is unset, the parent workspace. Files a process child writes by relative path therefore persist in the parent workspace after `cleanup_on_complete` removes the private directory, and the child sees the workspace skills, `mcp.json` and `.env` like a task child.
+
 Recursive child delegation is the default: a child session equals the main
 session, so a spawn without `allow_delegation` (or with `true`) lets the child
 spawn its own children, and an explicit `allow_delegation: false` makes a

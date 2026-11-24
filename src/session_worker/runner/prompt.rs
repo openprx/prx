@@ -22,14 +22,11 @@ fn resolve_system_prompt(manifest: &WorkerManifest) -> String {
 /// prompt as the final, task-specific section, but make the common execution
 /// contract identical to the other agentic entrypoints.
 pub(super) fn build_worker_system_prompt(manifest: &WorkerManifest, config: &Config, native_tools: bool) -> String {
-    // The worker may use an isolated workspace. Prompt rendering must describe
-    // that workspace (and load its skills), rather than the parent process's
-    // configured workspace path.
-    let mut worker_config = config.clone();
-    worker_config.workspace_dir = manifest.workspace_dir.clone();
-
-    let skills = crate::skills::load_skills_with_config(&manifest.workspace_dir, &worker_config);
-    build_worker_system_prompt_with_skills(manifest, &worker_config, native_tools, &skills)
+    // `config` is the worker's tool view: its workspace is the parent workspace,
+    // which the prompt describes and loads skills from. The worker's private
+    // directory only holds its own state (and the identity copy, read below).
+    let skills = crate::skills::load_skills_with_config(&config.workspace_dir, config);
+    build_worker_system_prompt_with_skills(manifest, config, native_tools, &skills)
 }
 
 pub(super) fn build_worker_system_prompt_with_skills(
@@ -38,10 +35,8 @@ pub(super) fn build_worker_system_prompt_with_skills(
     native_tools: bool,
     skills: &[crate::skills::Skill],
 ) -> String {
-    let mut worker_config = config.clone();
-    worker_config.workspace_dir = manifest.workspace_dir.clone();
     crate::agent::runtime_prompt::build_delegated_system_prompt(
-        &worker_config,
+        config,
         &manifest.model,
         skills,
         native_tools,
