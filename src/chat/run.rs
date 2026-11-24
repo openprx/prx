@@ -1026,6 +1026,7 @@ async fn run_internal(
 
                 let () = include!("run/commands.rs");
 
+                let model_name = current_model_owned.as_str();
                 include!("run/provider_turn.rs");
             }
 
