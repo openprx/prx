@@ -178,6 +178,10 @@ impl RecoveredProcessRun {
             RecoveredProcessOutcome::StoredResult(stored, recovered) => {
                 let status = if stored.success {
                     SubAgentStatus::Completed(stored.content.clone())
+                } else if stored.cancelled {
+                    // `SubAgentStatus` has no cancelled value: a stopped run
+                    // reads as the operator kill it was, as before the restart.
+                    SubAgentStatus::Failed(super::KILLED_BY_USER_REASON.to_owned())
                 } else {
                     SubAgentStatus::Failed(super::sub_agent_reported_failure(&stored.content))
                 };

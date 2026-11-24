@@ -6,6 +6,9 @@ use anyhow::Context;
 /// What a finished process child recorded under its single result key.
 pub(in crate::tools::sessions_spawn) struct StoredWorkerResult {
     pub(in crate::tools::sessions_spawn) success: bool,
+    /// The run ended because its work was cancelled (a requested stop or the
+    /// worker's own cancelled result), not because it failed.
+    pub(in crate::tools::sessions_spawn) cancelled: bool,
     /// The reply on success, the failure text otherwise (already redacted).
     pub(in crate::tools::sessions_spawn) content: String,
     pub(in crate::tools::sessions_spawn) finished_at: chrono::DateTime<chrono::Utc>,
@@ -45,6 +48,7 @@ pub(super) async fn read(fabric: &MemoryFabric, owner: &str, run: &str) -> anyho
         .get("success")
         .and_then(serde_json::Value::as_bool)
         .context("stored worker result success flag missing")?;
+    let cancelled = payload.get("cancelled").and_then(serde_json::Value::as_bool) == Some(true);
     let content = if success {
         event.content
     } else {
@@ -56,6 +60,7 @@ pub(super) async fn read(fabric: &MemoryFabric, owner: &str, run: &str) -> anyho
     let finished_at = chrono::DateTime::parse_from_rfc3339(&event.created_at)?.with_timezone(&chrono::Utc);
     Ok(Some(StoredWorkerResult {
         success,
+        cancelled,
         content,
         finished_at,
     }))

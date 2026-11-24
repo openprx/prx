@@ -237,17 +237,22 @@ pub(super) async fn record_spawn_result_event_keyed(
     // The result and task records carry the sub-agent's reply or error text:
     // redacted like the terminal commit (D-053).
     let content = crate::agent::terminal::redact_persisted_text(result_text);
-    let payload = Some(
-        crate::agent::terminal::redact_persisted_json(json!({
-            "success": success,
-            "error": error,
-            "owner_id": lineage.owner_id,
-            "topic_id": lineage.topic_id,
-            "parent_task_id": lineage.parent_task_id,
-            "source_message_event_id": lineage.source_message_event_id
-        }))
-        .to_string(),
-    );
+    let mut result_payload = json!({
+        "success": success,
+        "error": error,
+        "owner_id": lineage.owner_id,
+        "topic_id": lineage.topic_id,
+        "parent_task_id": lineage.parent_task_id,
+        "source_message_event_id": lineage.source_message_event_id
+    });
+    // The same flag the worker's own result row carries, so a restart reads
+    // either writer's row as cancelled.
+    if terminal_event_type == Some("task.cancelled") {
+        if let Some(object) = result_payload.as_object_mut() {
+            object.insert("cancelled".to_owned(), json!(true));
+        }
+    }
+    let payload = Some(crate::agent::terminal::redact_persisted_json(result_payload).to_string());
     let recorded = match result_key {
         Some(key) => {
             fabric
