@@ -144,6 +144,15 @@ deleted. A later rollover can reference the prior handoff event exactly, so
 repeated switches form an auditable generation chain within the same durable
 session.
 
+The provider view renders each note as one line: `[context_handoff]
+handoff_event_id=<id> -- <n> earlier user and assistant messages were moved out
+of this window. They are recoverable with
+transcript_history_lookup(handoff_event_id="<id>"). The tool calls and tool
+results of the replaced turns are not recoverable.` (the separator is an em
+dash), followed by the folded round-trip count when it is not zero. The
+system-prompt rule says the same: user and assistant messages can be read back,
+tool calls and tool results of those turns cannot.
+
 Each handoff references only the rows it replaced, its parent handoff row
 among them, so a fact older than the newest handoff is reached by following
 the chain: one lookup per generation. Once a handoff exists, the

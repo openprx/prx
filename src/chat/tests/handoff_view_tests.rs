@@ -115,8 +115,9 @@ fn stored_handoff(session: &session::ChatSession) -> String {
 /// `folded` tool round-trips, as the design spells it.
 fn expected_rendering(id: &str, events: usize, folded: usize) -> String {
     let mut text = format!(
-        "[context_handoff] handoff_event_id={id} — {events} earlier messages were moved out of this window. \
-         They are recoverable with transcript_history_lookup(handoff_event_id=\"{id}\")."
+        "[context_handoff] handoff_event_id={id} — {events} earlier user and assistant messages were moved out of this window. \
+         They are recoverable with transcript_history_lookup(handoff_event_id=\"{id}\"). \
+         The tool calls and tool results of the replaced turns are not recoverable."
     );
     if folded > 0 {
         text = format!("{text} {folded} tool round-trips were folded.");

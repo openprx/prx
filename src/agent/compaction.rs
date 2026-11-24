@@ -593,7 +593,7 @@ fn validate_context_handoff(content: &str) -> Option<(ValidatedContextHandoff, &
 /// The system-prompt paragraph of a chat session that states what a handoff
 /// in its window means and how earlier turns are reached. Its bytes never
 /// change between turns, so the cacheable prompt prefix stays stable.
-pub(crate) const CONTEXT_HANDOFF_PROMPT_RULE: &str = "A message that starts with [context_handoff] means earlier turns of this session were moved out of this window; they still exist. Never treat the oldest visible message as the start of the session. Before answering a question about anything that may have happened earlier than the visible window, call transcript_history_lookup with that handoff's handoff_event_id and read the result; if the result contains another [context_handoff], look that one up too.";
+pub(crate) const CONTEXT_HANDOFF_PROMPT_RULE: &str = "A message that starts with [context_handoff] means earlier turns of this session were moved out of this window; their user and assistant messages still exist and can be read back, but the tool calls and tool results of those turns cannot be recovered. Never treat the oldest visible message as the start of the session. Before answering a question about anything that may have happened earlier than the visible window, call transcript_history_lookup with that handoff's handoff_event_id and read the result; if the result contains another [context_handoff], look that one up too.";
 
 /// Whether `messages` hold a context handoff, in its stored or its rendered
 /// form: both start with the handoff marker.
@@ -619,9 +619,10 @@ pub(crate) fn render_context_handoff_for_provider<'a>(role: &str, content: &'a s
     std::borrow::Cow::Owned(format_compact_context_handoff(&handoff))
 }
 
-/// `[context_handoff] handoff_event_id=<id> — <n> earlier messages were moved
+/// `[context_handoff] handoff_event_id=<id> — <n> earlier user and assistant messages were moved
 /// out of this window. They are recoverable with
-/// transcript_history_lookup(handoff_event_id="<id>").`, followed by
+/// transcript_history_lookup(handoff_event_id="<id>"). The tool calls and
+/// tool results of the replaced turns are not recoverable.`, followed by
 /// ` <k> tool round-trips were folded.` only when `k` is not zero.
 fn format_compact_context_handoff(handoff: &ValidatedContextHandoff) -> String {
     format_compact_context_handoff_parts(
@@ -635,7 +636,7 @@ fn format_compact_context_handoff(handoff: &ValidatedContextHandoff) -> String {
 /// referenced events and `folded` folded tool round-trips.
 fn format_compact_context_handoff_parts(id: &str, messages: usize, folded: usize) -> String {
     let mut rendered = format!(
-        "{CONTEXT_HANDOFF_START}{COMPACT_HANDOFF_ID_FIELD}{id} — {messages} earlier messages were moved out of this window. They are recoverable with {}(handoff_event_id=\"{id}\").",
+        "{CONTEXT_HANDOFF_START}{COMPACT_HANDOFF_ID_FIELD}{id} — {messages} earlier user and assistant messages were moved out of this window. They are recoverable with {}(handoff_event_id=\"{id}\"). The tool calls and tool results of the replaced turns are not recoverable.",
         crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME,
     );
     if folded > 0 {

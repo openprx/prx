@@ -1712,7 +1712,7 @@ fn a_committed_json_answer_in_the_cold_window_is_referenced_by_the_handoff() {
 }
 
 /// The system-prompt paragraph a chat session states about handoffs (M1).
-const HANDOFF_RULE: &str = "A message that starts with [context_handoff] means earlier turns of this session were moved out of this window; they still exist. Never treat the oldest visible message as the start of the session. Before answering a question about anything that may have happened earlier than the visible window, call transcript_history_lookup with that handoff's handoff_event_id and read the result; if the result contains another [context_handoff], look that one up too.";
+const HANDOFF_RULE: &str = "A message that starts with [context_handoff] means earlier turns of this session were moved out of this window; their user and assistant messages still exist and can be read back, but the tool calls and tool results of those turns cannot be recovered. Never treat the oldest visible message as the start of the session. Before answering a question about anything that may have happened earlier than the visible window, call transcript_history_lookup with that handoff's handoff_event_id and read the result; if the result contains another [context_handoff], look that one up too.";
 
 /// The compact rendering of the stored `note`, as the provider must see it.
 fn expected_compact_handoff(note: &serde_json::Value) -> String {
@@ -1720,8 +1720,9 @@ fn expected_compact_handoff(note: &serde_json::Value) -> String {
     let events = note["lookup"]["arguments"]["event_ids"].as_array().map_or(0, Vec::len);
     let folded = note["folded_tool_roundtrips"]["count"].as_u64().unwrap_or(0);
     let mut text = format!(
-        "[context_handoff] handoff_event_id={id} — {events} earlier messages were moved out of this window. \
-         They are recoverable with transcript_history_lookup(handoff_event_id=\"{id}\")."
+        "[context_handoff] handoff_event_id={id} — {events} earlier user and assistant messages were moved out of this window. \
+         They are recoverable with transcript_history_lookup(handoff_event_id=\"{id}\"). \
+         The tool calls and tool results of the replaced turns are not recoverable."
     );
     if folded > 0 {
         text = format!("{text} {folded} tool round-trips were folded.");
