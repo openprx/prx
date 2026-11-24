@@ -1660,6 +1660,7 @@ pub(super) async fn post_decision_approval(
     Json(request): Json<serde_json::Value>,
 ) -> Response {
     let owner_authenticated = super::owner_authenticated(&state, &headers);
+    let mut request = request;
     match rf_message::keyed_session(&state, &session_id).await {
         Some(true) => {
             if !owner_authenticated {
@@ -1669,14 +1670,32 @@ pub(super) async fn post_decision_approval(
                     "paired bearer required",
                 );
             }
-            return crate::gateway::run_approvals::decide(
-                &state,
-                &principal.owner_id,
-                &session_id,
-                &decision_id,
-                request,
-            )
-            .await;
+            // A message-woken turn raises an ordinary call approval with no rf
+            // root; decide it through the ordinary call approval path.
+            let plain = crate::gateway::run_approvals::is_plain_call(&state, &decision_id).await;
+            if plain {
+                let approved = match request.get("decision").and_then(serde_json::Value::as_str) {
+                    Some("approved") => true,
+                    Some("denied") => false,
+                    _ => {
+                        return super::capabilities::coded_error(
+                            StatusCode::BAD_REQUEST,
+                            "field_invalid",
+                            "decision must be approved or denied",
+                        );
+                    }
+                };
+                request = serde_json::json!({ "approved": approved });
+            } else {
+                return crate::gateway::run_approvals::decide(
+                    &state,
+                    &principal.owner_id,
+                    &session_id,
+                    &decision_id,
+                    request,
+                )
+                .await;
+            }
         }
         None => {
             return super::capabilities::coded_error(

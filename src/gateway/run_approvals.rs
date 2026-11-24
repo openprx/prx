@@ -426,6 +426,34 @@ pub(crate) async fn decide(
         ),
     }
 }
+/// True when `id` names a durable pending call that carries no rf run scope.
+///
+/// A turn woken by a session-to-session message has no rf root, so its approval
+/// is an ordinary call approval. The rf decide path cannot resolve it (it is
+/// bound to an rf root session), the ordinary call approval path can. Any
+/// lookup failure answers `false`, which keeps the rf path and its refusals.
+pub(crate) async fn is_plain_call(state: &super::AppState, id: &str) -> bool {
+    if state.rf_approvals.entries.lock().contains_key(id) {
+        return false;
+    }
+    let Ok(authority) = RunCallAuthority::parse_call_id(id) else {
+        return false;
+    };
+    let workspace = state.config.load_full().workspace_dir.to_string_lossy().into_owned();
+    let Ok(Some(pending)) = state
+        .mem
+        .find_message_event_by_idempotency_key(&workspace, &authority.pending_key())
+        .await
+    else {
+        return false;
+    };
+    let raw: Value = pending
+        .raw_payload_json
+        .as_deref()
+        .and_then(|v| serde_json::from_str(v).ok())
+        .unwrap_or_default();
+    raw.get("record").is_some_and(Value::is_object) && raw.pointer("/record/rf").is_none_or(Value::is_null)
+}
 async fn recorded(
     state: &super::AppState,
     owner: &str,
