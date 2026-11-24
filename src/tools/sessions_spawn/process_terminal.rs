@@ -3,6 +3,7 @@ pub(super) mod operator;
 pub(super) mod ordinary;
 mod process_identity;
 pub(super) mod retained;
+mod stored_result;
 use crate::agent::terminal::TurnTerminalStatus;
 use crate::memory::{MemoryFabric, MessageEvent, MessageEventSource, MessageEventSubject};
 use crate::session_worker::protocol::WorkerResult;
@@ -118,6 +119,9 @@ pub(super) enum RecoveredProcessOutcome {
     OperatorUnconfirmed(RecoveredWorkerUsage),
     OrdinaryComplete(ordinary::VerifiedOrdinaryWorkerCompletion),
     OrdinaryUnconfirmed(RecoveredWorkerUsage),
+    /// No signed journal, but the run's own result row exists: its outcome is
+    /// shown; cleanup and provider usage stay unconfirmed.
+    StoredResult(stored_result::StoredWorkerResult, RecoveredWorkerUsage),
 }
 
 impl RecoveredProcessRun {
@@ -171,6 +175,29 @@ impl RecoveredProcessRun {
                 Vec::new(),
                 Some(ProcessRunControl::recovered_unconfirmed()),
             ),
+            RecoveredProcessOutcome::StoredResult(stored, recovered) => {
+                let status = if stored.success {
+                    SubAgentStatus::Completed(stored.content.clone())
+                } else {
+                    SubAgentStatus::Failed(super::sub_agent_reported_failure(&stored.content))
+                };
+                let history = if stored.success {
+                    vec![HistoryEntry {
+                        role: "assistant".to_owned(),
+                        content: stored.content,
+                        timestamp: stored.finished_at,
+                    }]
+                } else {
+                    Vec::new()
+                };
+                (
+                    status,
+                    Some(stored.finished_at),
+                    recovered.records,
+                    history,
+                    Some(ProcessRunControl::recovered_unconfirmed()),
+                )
+            }
             RecoveredProcessOutcome::OperatorComplete(completion) => {
                 let finished_at = completion
                     .finished_at

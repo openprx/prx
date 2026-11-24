@@ -508,7 +508,13 @@ pub(super) async fn recover_restart_event(
     }
     let outcome = match launch.completion(fabric).await? {
         Some(completion) => RecoveredProcessOutcome::OrdinaryComplete(completion),
-        None => RecoveredProcessOutcome::OrdinaryUnconfirmed(launch.partial_usage(fabric).await?),
+        None => {
+            let usage = launch.partial_usage(fabric).await?;
+            match super::stored_result::read(fabric, owner, run).await? {
+                Some(stored) => RecoveredProcessOutcome::StoredResult(stored, usage),
+                None => RecoveredProcessOutcome::OrdinaryUnconfirmed(usage),
+            }
+        }
     };
     let batch_id = launch.batch_id().map(str::to_owned);
     let agent_partition = launch.agent_partition().cloned();

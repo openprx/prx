@@ -527,7 +527,13 @@ pub(super) async fn recover_restart_event(
     }
     let outcome = match launch.completion(fabric).await? {
         Some(completion) => RecoveredProcessOutcome::OperatorComplete(completion),
-        None => RecoveredProcessOutcome::OperatorUnconfirmed(launch.partial_usage(fabric).await?),
+        None => {
+            let usage = launch.partial_usage(fabric).await?;
+            match super::stored_result::read(fabric, owner, run).await? {
+                Some(stored) => RecoveredProcessOutcome::StoredResult(stored, usage),
+                None => RecoveredProcessOutcome::OperatorUnconfirmed(usage),
+            }
+        }
     };
     let batch_id = None;
     Ok(Some(RecoveredProcessRun {
