@@ -422,6 +422,20 @@ async fn run_owned_manifest(
         })
         .context("session-worker signed configuration binding missing")?;
     config.runtime.workdir = binding.working_root.clone();
+    // Tool and policy root: the authenticated parent workspace. The worker's
+    // private `manifest.workspace_dir` only holds the worker's own state (sealed
+    // snapshot, isolated database, identity copy, cleanup target).
+    let parent_workspace = PathBuf::from(source_workspace);
+    let tool_working_root = binding
+        .working_root
+        .clone()
+        .unwrap_or_else(|| parent_workspace.clone());
+    let working_root_sealed: bool = binding.working_root.is_some();
+    tracing::info!(
+        tool_root = "parent_workspace",
+        working_root_sealed,
+        "session worker roots tools at the parent workspace"
+    );
 
     let operator_snapshots = if manifest.operator_source.is_some() {
         Some(super::operator_source::restore(
@@ -471,9 +485,15 @@ async fn run_owned_manifest(
     // FIX-P1-31: honour the configured `security.audit` block on the gate audit path.
     let security = Arc::new(SecurityPolicy {
         autonomy: level,
-        ..SecurityPolicy::from_config(&config.autonomy, &manifest.workspace_dir)
+        ..SecurityPolicy::from_config(&config.autonomy, &parent_workspace)
             .with_audit_config(config.security.audit.clone())
     });
+
+    // Config view for workspace-rooted tools. `config.runtime.workdir` itself
+    // stays as sealed (the seal check compares it); only this copy changes.
+    let mut tool_config = config.clone();
+    tool_config.workspace_dir = parent_workspace.clone();
+    tool_config.runtime.workdir = Some(tool_working_root);
 
     let provider_runtime_options = crate::providers::provider_runtime_options_from_config(&config);
 
@@ -629,7 +649,7 @@ async fn run_owned_manifest(
         extensions
     };
     let mut full_tools = tools::all_tools_with_runtime_ext_and_extensions(
-        Arc::new(config.clone()),
+        Arc::new(tool_config.clone()),
         shared_config.clone(),
         &security,
         runtime,
@@ -638,10 +658,10 @@ async fn run_owned_manifest(
         composio_entity_id,
         &config.browser,
         &config.http_request,
-        &manifest.workspace_dir,
+        &parent_workspace,
         &config.agents_with_references(),
         credentials.root_api_key,
-        &config,
+        &tool_config,
         extensions,
         Some(Arc::clone(&hooks)),
     )
