@@ -23,6 +23,17 @@ refresh. Unchanged servers reuse that discovery state. A later configuration or
 forced-discovery change still invalidates the old catalog; parity, policy, and
 approval checks remain enforced.
 
+A server's `allow_tools`/`deny_tools` (and the lists of a workspace `mcp.json`
+entry that narrows it) apply to callers below Full and are not applied at Full.
+When the main agent is below Full but an enabled named agent runs at Full, the
+tools those lists remove stay in the catalog for Full callers only: a turn
+below Full neither sees nor can call them, a Full turn does both. A workspace
+`mcp.json` server may also set loader, interpreter, search-path,
+configuration-lookup and certificate or proxy variables in its `env` when the
+main agent or a named agent runs at Full; below Full they are dropped as
+before. Servers that the opt-in, launcher allowlist or private-address checks
+block for the main agent still start only by the main agent's level.
+
 Native tool turns start with the file/shell core (`file_read`, `file_write`,
 `file_edit`, `shell`). When eligible deferred capabilities exist, the request
 also declares `capability_search`, including for brief inputs and with the
