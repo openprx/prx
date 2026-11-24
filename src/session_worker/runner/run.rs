@@ -53,6 +53,12 @@ pub(super) async fn run_validated_manifest(
     run_authenticated_manifest(manifest, steer_rx, None, explicit_config_dir, Some(transport)).await
 }
 
+/// A segment ends as cancelled when its token fired or its loop was cancelled,
+/// for example by a cancelled relayed approval.
+fn loop_cancelled(error: &anyhow::Error, cancel: &CancellationToken) -> bool {
+    cancel.is_cancelled() || crate::agent::turn_contracts::is_tool_loop_cancelled(error)
+}
+
 pub(super) async fn run_authenticated_manifest(
     manifest: WorkerManifest,
     steer_rx: Option<tokio::sync::mpsc::Receiver<String>>,
@@ -1159,7 +1165,10 @@ async fn run_owned_manifest(
                     if let (Some(turn), Some(segments)) = (child_turn.as_ref(), child_segments.as_ref()) {
                         let settlement = match &loop_result {
                             Ok((outcome, trace)) => segments.completion.complete(turn, outcome, trace).await,
-                            Err(error) => segments.completion.fail(turn, error, cancel.is_cancelled()).await,
+                            Err(error) => segments
+                                .completion
+                                .fail(turn, error, loop_cancelled(error, &cancel))
+                                .await,
                         };
                         if let Err(error) = settlement {
                             return (segment_history, Err(error));
@@ -1222,7 +1231,11 @@ async fn run_owned_manifest(
                 )),
                 tokens_used: None,
             },
-            crate::agent::terminal::TurnTerminalStatus::Failed,
+            if crate::agent::turn_contracts::is_tool_loop_cancelled(&error) {
+                crate::agent::terminal::TurnTerminalStatus::Cancelled
+            } else {
+                crate::agent::terminal::TurnTerminalStatus::Failed
+            },
         ),
     };
 

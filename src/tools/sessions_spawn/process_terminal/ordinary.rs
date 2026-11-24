@@ -243,19 +243,22 @@ async fn verify_completion(
         .await?;
         verify_lineage(&event, lineage)?;
         let payload = terminal_payload(&event)?;
-        let expected_status = if result.success {
-            TurnTerminalStatus::Completed
-        } else {
-            TurnTerminalStatus::Failed
-        };
         let status: TurnTerminalStatus = serde_json::from_value(
             payload
                 .get("status")
                 .cloned()
                 .context("ordinary terminal status missing")?,
         )?;
+        // Success needs a Completed terminal. A Cancelled terminal is accepted
+        // only together with `!success`, and then every check below applies
+        // unchanged: no history, and the failure text as the telemetry summary.
+        let status_matches = if result.success {
+            status == TurnTerminalStatus::Completed
+        } else {
+            matches!(status, TurnTerminalStatus::Failed | TurnTerminalStatus::Cancelled)
+        };
         anyhow::ensure!(
-            status == expected_status
+            status_matches
                 && payload.get("terminal_id").and_then(serde_json::Value::as_str) == Some(lineage.run_id.as_str())
                 && ["decision_id", "provider_outcome", "usage_settlement", "cost_settlement"]
                     .iter()
