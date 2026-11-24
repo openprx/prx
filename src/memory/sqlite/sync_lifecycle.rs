@@ -55,6 +55,17 @@ pub(super) fn child_payload(conn: &Connection, h: &Header) -> anyhow::Result<Val
         conn.query_row("SELECT created_at,json_extract(raw_payload_json,'$.mode') FROM message_events WHERE owner_id=?1 AND run_id=?2 ORDER BY id LIMIT 1",params![h.owner,h.run_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?
     };
     let (started, mode) = start.unwrap_or_else(|| (h.timestamp.clone(), None));
+    // The child session's own record states its mode; a header whose run is a
+    // turn-level segment run has no `task.spawned` of its own to read it from.
+    let recorded_mode: Option<String> = conn
+        .query_row(
+            "SELECT json_extract(record,'$.mode') FROM child_sessions WHERE key=?1 AND owner_id=?2",
+            params![h.session, h.owner],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    let mode = recorded_mode.or(mode);
     let (status, ended) = if let Some(id) = h.source_ref.strip_prefix("memory:") {
         let kind: Option<String> = conn
             .query_row(

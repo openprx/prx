@@ -80,7 +80,7 @@ fn inventory(conn: &Connection, id: &str, owner: &str, head: i64, water: i64) ->
             ),
         )?;
     }
-    let mut q=conn.prepare("SELECT e.event_id FROM message_events e WHERE e.owner_id=?1 AND e.parent_run_id IS NOT NULL AND e.id<=?2 AND e.id=(SELECT x.id FROM message_events x WHERE x.owner_id=e.owner_id AND x.session_key=e.session_key AND x.parent_run_id IS NOT NULL AND x.id<=?2 ORDER BY (x.event_type IN('turn.finalized','turn.admission.failed')) DESC,x.id DESC LIMIT 1) ORDER BY e.session_key")?;
+    let mut q=conn.prepare("SELECT e.event_id FROM message_events e WHERE e.owner_id=?1 AND e.parent_run_id IS NOT NULL AND e.id<=?2 AND COALESCE(e.run_id,'') NOT LIKE 'child-segment:%' AND COALESCE(e.run_id,'') NOT LIKE 'operator-worker-segment:%' AND e.id=(SELECT x.id FROM message_events x WHERE x.owner_id=e.owner_id AND x.session_key=e.session_key AND x.parent_run_id IS NOT NULL AND x.id<=?2 AND COALESCE(x.run_id,'') NOT LIKE 'child-segment:%' AND COALESCE(x.run_id,'') NOT LIKE 'operator-worker-segment:%' ORDER BY (x.event_type IN('turn.finalized','turn.admission.failed')) DESC,x.id DESC LIMIT 1) ORDER BY e.session_key")?;
     for source in q.query_map(params![owner, water], |r| r.get::<_, String>(0))? {
         let source = source?;
         if let Some(mut h) = super::sync_journal::event_header(conn, &source, "child_session.upsert")? {
