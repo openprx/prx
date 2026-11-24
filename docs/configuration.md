@@ -291,6 +291,11 @@ the run's workspace is `<DIR>/workspace`, even when that environment variable
 names a different directory. Omit `--config-dir` (and `OPENPRX_CONFIG_DIR`) when
 you intend to select the workspace through `OPENPRX_WORKSPACE`.
 
+`OPENPRX_CONFIG_DIR` combines with `OPENPRX_WORKSPACE`: the configuration tree
+comes from `OPENPRX_CONFIG_DIR` and the workspace from `OPENPRX_WORKSPACE`.
+When `OPENPRX_WORKSPACE` is unset or empty, the workspace is
+`$OPENPRX_CONFIG_DIR/workspace`.
+
 On Unix, new workspace `state` directories are created with mode `0700` even
 under umask `0002`; workspace parents retain their normal umask permissions.
 Cost storage refuses an existing group- or world-writable state directory:

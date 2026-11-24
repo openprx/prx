@@ -369,6 +369,17 @@ pub fn bootstrap_max_blocking_threads(explicit_config_dir: Option<&str>) -> Opti
     bootstrap.runtime.max_blocking_threads.filter(|value| *value > 0)
 }
 
+/// The workspace for a config directory chosen by `OPENPRX_CONFIG_DIR`: a non-empty
+/// `OPENPRX_WORKSPACE` is honoured, otherwise `<config dir>/workspace`.
+fn workspace_dir_for_config_dir(openprx_dir: &Path) -> Result<PathBuf> {
+    match env_openprx("WORKSPACE") {
+        Ok(workspace) if !workspace.trim().is_empty() => {
+            std::path::absolute(workspace.trim()).context("resolve OPENPRX_WORKSPACE")
+        }
+        _ => Ok(openprx_dir.join("workspace")),
+    }
+}
+
 pub(super) async fn resolve_runtime_config_dirs(
     default_openprx_dir: &Path,
     default_workspace_dir: &Path,
@@ -391,9 +402,10 @@ pub(super) async fn resolve_runtime_config_dirs(
         let custom_config_dir = custom_config_dir.trim();
         if !custom_config_dir.is_empty() {
             let openprx_dir = std::path::absolute(custom_config_dir).context("resolve OPENPRX_CONFIG_DIR")?;
+            let workspace_dir = workspace_dir_for_config_dir(&openprx_dir)?;
             return Ok((
-                openprx_dir.clone(),
-                openprx_dir.join("workspace"),
+                openprx_dir,
+                workspace_dir,
                 ConfigResolutionSource::EnvConfigDir,
             ));
         }
