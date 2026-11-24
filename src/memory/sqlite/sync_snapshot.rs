@@ -131,8 +131,13 @@ fn inventory(conn: &Connection, id: &str, owner: &str, head: i64, water: i64) ->
     // Admission/terminal commits precede their transcript projections. The
     // cut must inventory the primary events, or it could advance past an
     // event that is absent from both snapshot and subsequent replay.
-    let mut q=conn.prepare("WITH candidates AS (
+    let continuation_flag = format!(
+        "CASE WHEN {} THEN 1 ELSE 0 END",
+        super::mailbox_continuation::CONTINUATION_PREDICATE_E
+    );
+    let mut q=conn.prepare(&format!("WITH candidates AS (
         SELECT e.id,e.event_id,e.workspace_id,e.owner_id,e.run_id,e.role,e.event_type,e.idempotency_key,
+            {continuation_flag} AS continuation,
             CASE WHEN e.role='assistant' OR e.idempotency_key LIKE 'turn:%:assistant'
             THEN (SELECT f.event_id FROM message_events f WHERE f.owner_id=e.owner_id AND f.workspace_id=e.workspace_id
                 AND f.run_id=e.run_id AND f.id<=?2 AND (
@@ -141,13 +146,13 @@ fn inventory(conn: &Connection, id: &str, owner: &str, head: i64, water: i64) ->
                 ORDER BY f.id LIMIT 1) END AS final_marker
         FROM message_events e WHERE e.owner_id=?1 AND e.id<=?2)
         SELECT e.event_id,e.final_marker FROM candidates e WHERE
-            e.role='user'
+            (e.role='user' AND e.continuation=0)
             OR (e.event_type='message.deleted' AND (
                 EXISTS(SELECT 1 FROM rf_message_attempts a WHERE a.owner_id=e.owner_id AND a.message_event_id=e.event_id)
                 OR EXISTS(SELECT 1 FROM conversation_turns c WHERE c.message_event_id=e.event_id AND c.role='user')
                 OR EXISTS(SELECT 1 FROM sync_journal j WHERE j.owner_id=e.owner_id AND j.kind='turn.appended' AND j.source_ref='event:'||e.event_id AND j.seq<=?3)))
             OR e.final_marker IS NOT NULL
-        ORDER BY e.id")?;
+        ORDER BY e.id"))?;
     for row in q.query_map(params![owner, water, head], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
     })? {

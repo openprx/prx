@@ -80,6 +80,22 @@ async fn run(
         &input.message.to.agent,
     )
     .await?;
+    // The adoption row is the message's only history row. The woken turn's own
+    // input is not projected, and the request below carries the text once, so
+    // the adoption turn leaves the loaded history. A missing adoption row
+    // refuses the turn, as the child continuation does.
+    let adopted = envelope
+        .source_message_event_id
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("mailbox adoption row is missing"))?;
+    let principal_memory = envelope.memory_principal();
+    let mut turns = state
+        .mem
+        .list_console_conversation_turns(&principal_memory, &input.message.to.session, MAX_PAGE_LIMIT, 0)
+        .await?;
+    let before = turns.len();
+    turns.retain(|turn| turn.message_event_id.as_deref() != Some(adopted.as_str()));
+    anyhow::ensure!(turns.len() < before, "mailbox adoption row is missing from history");
     let cancellation = tokio_util::sync::CancellationToken::new();
     let stop = cancellation.clone();
     let _message_turn = runtime.hold_turn(&input, Arc::new(move || stop.cancel()))?;
@@ -90,13 +106,9 @@ async fn run(
         principal,
         envelope,
         ticket,
+        continuation: true,
     };
     let (proof, guard) = pending.record(input.text.clone(), None).await?;
-    let principal = proof.envelope().memory_principal();
-    let turns = state
-        .mem
-        .list_console_conversation_turns(&principal, &input.message.to.session, MAX_PAGE_LIMIT, 0)
-        .await?;
     let source = ConsoleTurnSource::Admitted {
         proof,
         guard,

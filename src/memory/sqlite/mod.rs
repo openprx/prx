@@ -14,6 +14,7 @@ mod events;
 mod evolution;
 mod ingress_recovery;
 pub mod mailbox;
+mod mailbox_continuation;
 mod mailbox_schema;
 mod memory_impl;
 mod mirror;

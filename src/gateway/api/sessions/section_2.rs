@@ -167,6 +167,8 @@ struct ConsolePendingInput {
     principal: super::ApiPrincipal,
     envelope: RuntimeEnvelope,
     ticket: crate::runtime::turn_cleanup::CleanupTicket,
+    /// Set only by the mailbox wake: the input anchors the run and is never a history row.
+    continuation: bool,
 }
 
 impl ConsolePendingInput {
@@ -249,7 +251,7 @@ impl ConsolePendingInput {
                 if recording.enabled && recording.record_user_messages {
                     if console_recordable(&self.runtime.config_generation.effective, self.state.mem.as_ref()) {
                         self.state.mem.project_console_message(&event).await?;
-                    } else {
+                    } else if !self.continuation {
                         self.state
                             .mem
                             .append_conversation_turn(
@@ -505,6 +507,7 @@ async fn submit_console_message(
         principal: api_principal,
         envelope: runtime_envelope,
         ticket,
+        continuation: false,
     };
     let admission = rf.as_ref().map(|rf| rf.admission.clone());
     let (proof, mut guard) = match pending.record(message.clone(), admission).await {

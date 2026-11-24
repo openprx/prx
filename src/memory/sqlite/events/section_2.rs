@@ -124,6 +124,10 @@ impl SqliteMemory {
             )?;
             anyhow::ensure!(serde_json::to_value(&durable)? == serde_json::to_value(&event)?,
                 "console projection differs from its durable event");
+            // A continuation input anchors the woken run; its adoption row is the history row.
+            if super::mailbox_continuation::is_continuation(&tx, &event)? {
+                return Ok(());
+            }
             let existing: Vec<(String, Option<String>, String, String, bool)> = {
                 let mut stmt = tx.prepare("SELECT session_key, owner_id, role, content, deleted_at IS NOT NULL
                     FROM conversation_turns WHERE message_event_id = ?1 OR message_id = ?1 LIMIT 2")?;
