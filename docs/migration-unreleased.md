@@ -116,9 +116,13 @@ latency_budget_ms = 800
 
 ## Remaining lifecycle and runtime interfaces
 
-Ordinary child monetary budgets now carve from their parent instead of each
-receiving the full allowance. Small balances narrow a child to a zero monetary ceiling, so it can run
-zero-price work while paid requests remain refused. No fresh money is created. Hook managers are explicitly inherited
+Ordinary children and operator tasks now share their parent's budget counter
+instead of each receiving half of the remaining balance, and a worker process
+is sealed with the parent's whole remaining balance at launch. Every tool is
+published to a child; a spend is refused only at spend time, when it would
+exceed the real total kept in the workspace cost journal. A balance below one
+cent gives a child a zero monetary ceiling, so it can run zero-price work while
+paid requests remain refused. No fresh money is created. Hook managers are explicitly inherited
 independently of child tool exposure. Isolated `skills_manage` callers can read
 and cancel only their own lifecycle proposals; shared-workspace writes stay
 local-operator-only. `POST /api/sessions` creates an authenticated empty Console

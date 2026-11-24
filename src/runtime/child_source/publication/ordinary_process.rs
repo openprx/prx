@@ -193,6 +193,9 @@ impl OrdinaryProcessLaunch {
             &worker.run_id,
             &worker.config_generation,
         )?;
+        // The sealed ceiling is the parent's whole remaining balance (capped by its
+        // own ceiling). The worker's spends reserve in the parent workspace's cost
+        // journal, which stays the authority for the total.
         let (cents, _) = publication.allocate_child_budget()?;
         let (issued, original_parent) = publication.scope().gate_inputs();
         // Seal only backends a worker can reconstruct. Interactive event-loop

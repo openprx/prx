@@ -159,7 +159,7 @@ A child session equals the main session. Every child is issued through one
 ordinary (or operator) path from its authenticated parent. Recursive
 delegation is on by default: omitting `allow_delegation` on `sessions_spawn`
 gives a child that can spawn its own children, bounded only by the sealed
-spawn depth, the funding carve from the parent's allowance and the integrity
+spawn depth, the parent's shared funding allowance and the integrity
 checks. Where the bound leaves no room, an omitted flag gives a child that
 cannot spawn; an explicit `true` is then refused, and an explicit `false`
 always gives a non-delegating child. There are no recursive-delegation

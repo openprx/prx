@@ -263,9 +263,9 @@ real CLI model listing through the management service and proves release rows
 carry catalog provenance.
 
 Finding 98 rollback: reverting the fix commits restores the C2 adapter
-serialization and pending-allowance lifecycle. Ordinary-child allowance
-carving is deferred to the next phase;
-ordinary children retain independent per-child allowances during closeout.
+serialization and pending-allowance lifecycle. Ordinary children now
+share their parent's allowance counter; the workspace cost journal remains the
+single authority for the total.
 
 ## Saving a model level
 
