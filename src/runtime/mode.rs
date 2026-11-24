@@ -499,10 +499,26 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
             println!();
             println!("Security:");
             println!("  Autonomy level:    {:?}", config.autonomy.level);
-            println!("  Workspace only:    {}", config.autonomy.workspace_only);
-            match config.autonomy.max_cost_per_day_cents {
-                Some(cents) => println!("  Max cost/day:      ${:.2}", f64::from(cents) / 100.0),
-                None => println!("  Max cost/day:      no limit set"),
+            if config.autonomy.workspace_only {
+                println!("  Workspace only:    true (below full autonomy)");
+            }
+            if !config.autonomy.forbidden_paths.is_empty() {
+                println!("  Forbidden paths:   {} (below full autonomy)", config.autonomy.forbidden_paths.len());
+            }
+            let mut limits = Vec::new();
+            if let Some(cents) = config.autonomy.max_cost_per_day_cents {
+                limits.push(format!("policy ${:.2}/day", f64::from(cents) / 100.0));
+            }
+            if let Some(usd) = config.cost.daily_limit_usd {
+                limits.push(format!("cost ${usd:.2}/day"));
+            }
+            if let Some(usd) = config.cost.monthly_limit_usd {
+                limits.push(format!("cost ${usd:.2}/month"));
+            }
+            if limits.is_empty() {
+                println!("  Cost limits:       no limit set");
+            } else {
+                println!("  Cost limits:       {}", limits.join(", "));
             }
             println!("  Audit logging:     enabled");
             println!("  Audit log path:    {}", config.security.audit.log_path);
