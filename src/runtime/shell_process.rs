@@ -157,7 +157,7 @@ impl ShellProcessAdapter {
     }
 
     pub async fn execute(&self, request: ShellProcessRequest<'_>) -> Result<ShellProcessOutcome, ShellProcessError> {
-        self.execute_with(request, false, None)
+        self.execute_with(request, false, None, false)
             .await
             .map_err(ShellProcessError::without_output)
     }
@@ -167,7 +167,7 @@ impl ShellProcessAdapter {
         &self,
         request: ShellProcessRequest<'_>,
     ) -> Result<ShellProcessOutcome, ShellProcessError> {
-        self.execute_with(request, false, None).await
+        self.execute_with(request, false, None, false).await
     }
 
     /// Like [`Self::execute`], with joined process-group cleanup:
@@ -182,11 +182,31 @@ impl ShellProcessAdapter {
     ///   `HOME` set to the request's working directory and `TMPDIR` to a
     ///   directory inside it. No provider key, token or other credential
     ///   reaches it. A container runtime isolates the environment itself.
+    ///   (`execute_joined_full` replaces this with the Full shell environment.)
     ///
     /// Used where a lifecycle-managed skill script runs.
     pub async fn execute_joined(
         &self,
         request: ShellProcessRequest<'_>,
+    ) -> Result<ShellProcessOutcome, ShellProcessError> {
+        self.execute_joined_with(request, false).await
+    }
+
+    /// Like [`Self::execute_joined`] for a call at an effective Full level:
+    /// on the native runtime the command gets the environment of the Full
+    /// shell tool (every variable except the stripped secrets, the real
+    /// `HOME`) instead of the contained one.
+    pub async fn execute_joined_full(
+        &self,
+        request: ShellProcessRequest<'_>,
+    ) -> Result<ShellProcessOutcome, ShellProcessError> {
+        self.execute_joined_with(request, true).await
+    }
+
+    async fn execute_joined_with(
+        &self,
+        request: ShellProcessRequest<'_>,
+        full_environment: bool,
     ) -> Result<ShellProcessOutcome, ShellProcessError> {
         let group = self
             .cgroup_root
@@ -202,7 +222,7 @@ impl ShellProcessAdapter {
             })
             .transpose()
             .map_err(ShellProcessError::Spawn)?;
-        let result = self.execute_with(request, true, group.clone()).await;
+        let result = self.execute_with(request, true, group.clone(), full_environment).await;
         if let Some(group) = group {
             group.finish().await.map_err(ShellProcessError::Wait)?;
         }
@@ -214,6 +234,7 @@ impl ShellProcessAdapter {
         request: ShellProcessRequest<'_>,
         end_group_on_exit: bool,
         cgroup: Option<Arc<super::shell_cgroup::ShellCgroup>>,
+        full_environment: bool,
     ) -> Result<ShellProcessOutcome, ShellProcessError> {
         if request
             .cancellation
@@ -258,7 +279,11 @@ impl ShellProcessAdapter {
         }
         if end_group_on_exit && self.runtime.name() == "native" {
             command.env_clear();
-            command.envs(contained_environment(request.workspace_dir).map_err(ShellProcessError::Runtime)?);
+            if full_environment {
+                command.envs(full_shell_environment());
+            } else {
+                command.envs(contained_environment(request.workspace_dir).map_err(ShellProcessError::Runtime)?);
+            }
         }
         let mut container = if self.runtime.name() == "docker" && command.as_std().get_program() == "docker" {
             Some(
@@ -429,6 +454,18 @@ fn filtered_shell_environment(
         environment.push(("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into()));
     }
     Ok(environment)
+}
+
+/// The environment of the Full shell tool: everything except the stripped
+/// secret variables, with the real `HOME`.
+fn full_shell_environment() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    let mut environment: Vec<_> = std::env::vars_os()
+        .filter(|(key, _)| !shell_secret_environment(key))
+        .collect();
+    if !environment.iter().any(|(key, _)| key == "PATH") {
+        environment.push(("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into()));
+    }
+    environment
 }
 
 /// The only environment a contained run gets (see

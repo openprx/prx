@@ -376,7 +376,10 @@ SL11 adds reviewed executable revisions: a bundle with scripts or declared
   native runtime the process starts with an empty environment plus `PATH`, `LANG`,
   `LC_*` and `TZ` from the parent, `HOME` set to its run directory, `TMPDIR`
   inside it, and the `PRX_SKILL_ARG_*` values of the call, so no provider key,
-  token or credential reaches it. Unmanaged shell callers are unchanged.
+  token or credential reaches it. At an effective Full level (outside the
+  evaluation sandbox) the script instead gets the environment of the Full shell
+  tool: every variable except the stripped secrets, with the real `HOME`.
+  Unmanaged shell callers are unchanged.
 - **Process containment.** The call uses the existing shell/HTTP adapters.
   Managed shell/script runs have a five-minute deadline and joined cleanup:
   the process group is ended when the leader exits, times out or is cancelled;

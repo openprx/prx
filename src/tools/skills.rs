@@ -1477,7 +1477,14 @@ impl SkillExecuteTool {
         // A deadline marks a managed run, which is also joined: the process
         // group ends with its leader.
         let outcome = if timeout.is_some() {
-            self.shell.execute_joined(request).await
+            let full = !self.security.evaluation_sandbox
+                && crate::tools::effective_autonomy::call_policy(&self.security).autonomy
+                    == crate::security::AutonomyLevel::Full;
+            if full {
+                self.shell.execute_joined_full(request).await
+            } else {
+                self.shell.execute_joined(request).await
+            }
         } else {
             self.shell.execute(request).await
         };
