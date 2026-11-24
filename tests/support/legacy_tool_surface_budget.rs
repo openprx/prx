@@ -14,7 +14,7 @@
 
 #![allow(clippy::unwrap_used, clippy::print_stdout, clippy::expect_used)]
 
-use crate::config::{Config, DEFAULT_CHANNEL_EXCLUDED_TOOLS, MemoryConfig, ToolTieringConfig};
+use crate::config::{Config, MemoryConfig, ToolTieringConfig};
 use crate::memory::Memory;
 use crate::security::SecurityPolicy;
 use crate::tools::{Tool, ToolCatalog, ToolSpec, all_tools, legacy_intent_tests as intent};
@@ -106,7 +106,7 @@ fn channel_sessions_do_not_advertise_the_operations_surface() {
     let tmp = TempDir::new().unwrap();
     let tools = registry(&tmp);
 
-    let operator = ToolTieringConfig::default();
+    let operator = ToolTieringConfig::with_recommended_channel_exclusions();
     let channel = operator.for_channel_surface();
 
     let operator_specs = specs_for(&tools, NEUTRAL_MESSAGE, &operator);
@@ -122,9 +122,9 @@ fn channel_sessions_do_not_advertise_the_operations_surface() {
     );
 
     let channel_names = names(&channel_specs);
-    for excluded in DEFAULT_CHANNEL_EXCLUDED_TOOLS {
+    for excluded in &operator.channel_exclude {
         assert!(
-            !channel_names.contains(excluded),
+            !channel_names.contains(&excluded.as_str()),
             "`{excluded}` must not be advertised to an IM channel session: {channel_names:?}"
         );
     }
@@ -141,9 +141,10 @@ fn channel_sessions_do_not_advertise_the_operations_surface() {
     let channel_broad = specs_for(&tools, broad, &channel);
     let operator_broad_names = names(&operator_broad);
     let channel_broad_names = names(&channel_broad);
-    let reachable: Vec<&str> = DEFAULT_CHANNEL_EXCLUDED_TOOLS
+    let reachable: Vec<&str> = operator
+        .channel_exclude
         .iter()
-        .copied()
+        .map(String::as_str)
         .filter(|name| operator_broad_names.contains(name))
         .collect();
     assert!(
@@ -176,7 +177,7 @@ fn always_include_restores_a_channel_excluded_tool() {
     let tmp = TempDir::new().unwrap();
     let tools = registry(&tmp);
 
-    let mut operator = ToolTieringConfig::default();
+    let mut operator = ToolTieringConfig::with_recommended_channel_exclusions();
     operator.always_include.push("nodes".to_string());
     let channel = operator.for_channel_surface();
 
@@ -199,7 +200,7 @@ fn an_empty_channel_exclude_list_restores_the_full_surface() {
 
     let operator = ToolTieringConfig {
         channel_exclude: Vec::new(),
-        ..ToolTieringConfig::default()
+        ..ToolTieringConfig::with_recommended_channel_exclusions()
     };
     let channel = operator.for_channel_surface();
     assert!(channel.always_exclude.is_empty(), "nothing may be folded in");
@@ -221,7 +222,7 @@ fn an_empty_channel_exclude_list_restores_the_full_surface() {
 fn channel_exclusion_survives_a_capability_matching_message() {
     let tmp = TempDir::new().unwrap();
     let tools = registry(&tmp);
-    let channel = ToolTieringConfig::default().for_channel_surface();
+    let channel = ToolTieringConfig::with_recommended_channel_exclusions().for_channel_surface();
 
     let message = "reload the wasm plugins and check the proxy config on the remote node";
     let operator_specs = specs_for(&tools, message, &ToolTieringConfig::default());
@@ -516,7 +517,7 @@ fn a_chat_session_opening_on_an_unrouted_turn_keeps_the_whole_registry() {
 fn a_stateless_entry_point_still_publishes_everything_on_an_unrouted_turn() {
     let tmp = TempDir::new().unwrap();
     let tools = registry(&tmp);
-    let channel = ToolTieringConfig::default().for_channel_surface();
+    let channel = ToolTieringConfig::with_recommended_channel_exclusions().for_channel_surface();
 
     let allowed_specs = specs_for(&tools, "", &channel);
     let allowed = names(&allowed_specs);

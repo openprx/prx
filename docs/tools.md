@@ -284,16 +284,16 @@ every model-running entrypoint:
 still *runs*: skills are usable, MCP and WASM plugin tools are callable, and
 hooks fire on the turn exactly as they do in terminal chat. What
 `channel_exclude` removes is the operations surface — the tools that manage or
-inspect those subsystems — because a channel turn is driven by a conversation
-partner rather than by the operator. The default excluded set is
-`DEFAULT_CHANNEL_EXCLUDED_TOOLS` (`src/config/schema/security.rs`):
+inspect those subsystems. The default excluded set is empty. The list an
+operator may copy into `channel_exclude` to hide them is
+`RECOMMENDED_CHANNEL_EXCLUDED_TOOLS` (`src/config/schema/security.rs`):
 
 `wasm_plugins_manage`, `wasm_plugin_reload`, `wasm_plugins_status`,
 `hooks_manage`, `hooks_status`, `proxy_config`, `config_reload`, `gateway`,
 `mcp_status`, `nodes`, `skills_manage`, `memory_reindex`,
 `document_sync`, `document_ingest`.
 
-Nothing else is hidden by the channel surface. See
+Nothing is hidden by the channel surface unless `channel_exclude` lists it. See
 [Per-turn capability routing](#per-turn-capability-routing) for how to override
 it.
 

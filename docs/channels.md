@@ -167,21 +167,21 @@ reply such as "yes" does not manufacture a grant, and lack of an approval UI
 does not authorize automatic execution. Review and revoke behavior is
 specified in [Approvals](decision-engine.md#approvals).
 
-A channel message is written by a conversation partner, not by the operator at
-the host, so a channel turn runs under a narrower tool policy than terminal chat
-or the gateway. On top of ordinary per-turn capability routing, the
-`[tool_tiering] channel_exclude` list is folded into that turn's `always_exclude`
-and defaults to the operations/development surface:
+A channel turn runs under the same tool policy as terminal chat or the
+gateway: nothing is hidden by default. On top of ordinary per-turn capability
+routing, the `[tool_tiering] channel_exclude` list (empty by default) is folded
+into that turn's `always_exclude`. An operator who wants a narrower channel
+surface can list the operations/development tools, for example:
 
 `wasm_plugins_manage`, `wasm_plugin_reload`, `wasm_plugins_status`,
 `hooks_manage`, `hooks_status`, `proxy_config`, `config_reload`, `gateway`,
 `mcp_status`, `nodes`, `skills_manage`, `memory_reindex`,
 `document_sync`, `document_ingest`.
 
-These are not advertised to the model on a channel turn even when the message
-names their capability, which both removes their schemas from every request and
-puts runtime reconfiguration out of reach of a misread sentence. Naming one in
-`always_include` restores it; `channel_exclude = []` drops the default entirely.
+Names listed in `channel_exclude` are not advertised to the model on a channel
+turn even when the message names their capability. Naming one in
+`always_include` restores it; an empty `channel_exclude` (the default) hides
+nothing.
 See [Tools](tools.md#per-turn-capability-routing).
 
 ## Sub-Agents On A Gateway Without Signal

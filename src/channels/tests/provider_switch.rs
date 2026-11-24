@@ -353,6 +353,7 @@ fn channel_message_runtime_hides_the_operations_tools_by_default() {
     let manager = crate::config::new_shared({
         let mut config = Config::default();
         config.autonomy.level = crate::security::AutonomyLevel::Supervised;
+        config.tool_tiering = crate::config::ToolTieringConfig::with_recommended_channel_exclusions();
         config
     });
     let generation = manager.pin();
@@ -366,7 +367,7 @@ fn channel_message_runtime_hides_the_operations_tools_by_default() {
         generation.effective.tool_tiering.always_exclude.is_empty(),
         "fixture must start from an operator config that excludes nothing"
     );
-    for hidden in crate::config::DEFAULT_CHANNEL_EXCLUDED_TOOLS {
+    for hidden in &generation.effective.tool_tiering.channel_exclude {
         assert!(
             snapshot
                 .tool_tiering

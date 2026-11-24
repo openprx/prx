@@ -264,7 +264,7 @@ fn sessions_spawn_process_manifest_carries_the_channel_exclusions_under_the_seal
         parent_task_id: None,
         source_message_event_id: None,
     };
-    let hidden = crate::config::ToolTieringConfig::default()
+    let hidden = crate::config::ToolTieringConfig::with_recommended_channel_exclusions()
         .for_channel_surface()
         .always_exclude;
     assert!(

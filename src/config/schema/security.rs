@@ -185,20 +185,16 @@ impl WorkspaceHooks {
     }
 }
 
-/// Operations/development tools hidden from IM channel sessions by default.
+/// Operations/development tools an operator may hide from IM channel sessions.
 ///
-/// A chat message arriving over Signal / Telegram / Discord / WhatsApp is written
-/// by a conversation partner, not by the operator sitting at the host. Advertising
-/// the plugin, hook, proxy, node, repository and index-maintenance surfaces on that
-/// path costs tokens on every turn and puts a misfire one sentence away from
-/// changing how the runtime itself is configured. None of these is reachable by
-/// accident from a conversation that actually needs them: listing a name in
-/// `[tool_tiering] always_include` restores it, and `channel_exclude = []` turns
-/// the whole default off.
+/// Not applied by default: a fresh install hides nothing, and a limit exists
+/// only when the operator configures one. Copy the names into
+/// `[tool_tiering] channel_exclude` to hide them on Signal / Telegram / Discord /
+/// WhatsApp turns; listing a name in `[tool_tiering] always_include` restores it.
 ///
-/// Terminal chat, the gateway/webhook surface and the web console are unaffected —
-/// those callers are the operator.
-pub const DEFAULT_CHANNEL_EXCLUDED_TOOLS: &[&str] = &[
+/// Terminal chat, the gateway/webhook surface and the web console are unaffected
+/// by `channel_exclude`: those callers are the operator.
+pub const RECOMMENDED_CHANNEL_EXCLUDED_TOOLS: &[&str] = &[
     "wasm_plugins_manage",
     "wasm_plugin_reload",
     "wasm_plugins_status",
@@ -227,8 +223,7 @@ pub struct ToolTieringConfig {
     /// Tool names excluded from capability publication.
     pub always_exclude: Vec<String>,
     /// Tool names hidden from IM channel sessions only, on top of `always_exclude`.
-    /// Defaults to [`DEFAULT_CHANNEL_EXCLUDED_TOOLS`]; set to `[]` to expose the
-    /// full operator surface on channels again.
+    /// Default: empty (nothing is hidden); list tool names to hide them on channels.
     pub channel_exclude: Vec<String>,
 }
 
@@ -237,15 +232,25 @@ impl Default for ToolTieringConfig {
         Self {
             always_include: Vec::new(),
             always_exclude: Vec::new(),
-            channel_exclude: DEFAULT_CHANNEL_EXCLUDED_TOOLS
-                .iter()
-                .map(|name| (*name).to_string())
-                .collect(),
+            channel_exclude: Vec::new(),
         }
     }
 }
 
 impl ToolTieringConfig {
+    /// A policy that hides [`RECOMMENDED_CHANNEL_EXCLUDED_TOOLS`] from channel
+    /// sessions: what an operator gets by copying that list into the config.
+    #[must_use]
+    pub fn with_recommended_channel_exclusions() -> Self {
+        Self {
+            channel_exclude: RECOMMENDED_CHANNEL_EXCLUDED_TOOLS
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+            ..Self::default()
+        }
+    }
+
     /// The tiering policy an IM channel session runs under.
     ///
     /// `channel_exclude` is folded into `always_exclude` rather than applied as a

@@ -3252,7 +3252,7 @@ mod tests {
             ),
             (
                 "operator tools exposed to channel sessions (R-SECRETSfg P27)",
-                |_| {},
+                |c| c.tool_tiering = crate::config::ToolTieringConfig::with_recommended_channel_exclusions(),
                 |c| c.tool_tiering.channel_exclude.clear(),
                 Some("tool_tiering"),
             ),

@@ -8,10 +8,10 @@ use tokio::test;
 /// exclusion the higher priority — silently un-doing the operator override.
 #[test]
 async fn channel_tiering_folds_defaults_in_without_overriding_the_operator() {
-    let mut config = ToolTieringConfig::default();
+    let mut config = ToolTieringConfig::with_recommended_channel_exclusions();
     assert!(
         config.channel_exclude.contains(&"wasm_plugins_manage".to_string()),
-        "the operations surface must be excluded from channels by default"
+        "the recommended operations surface is excluded from channels"
     );
     assert!(
         config.always_exclude.is_empty(),
@@ -55,7 +55,7 @@ async fn channel_tiering_is_identity_when_the_default_is_emptied() {
 async fn channel_tiering_does_not_duplicate_an_already_excluded_tool() {
     let config = ToolTieringConfig {
         always_exclude: vec!["nodes".to_string()],
-        ..ToolTieringConfig::default()
+        ..ToolTieringConfig::with_recommended_channel_exclusions()
     };
     let channel = config.for_channel_surface();
     assert_eq!(

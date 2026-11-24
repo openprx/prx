@@ -77,7 +77,7 @@ async fn a_process_worker_cannot_regain_the_operations_surface_its_channel_hides
     // Fixture validity first: the exclusions come from the real default
     // channel surface, not from a list written for this test, so the test
     // fails if `channel_exclude` ever stops hiding the operations tools.
-    let surface = crate::config::ToolTieringConfig::default().for_channel_surface();
+    let surface = crate::config::ToolTieringConfig::with_recommended_channel_exclusions().for_channel_surface();
     let hidden = surface.always_exclude.clone();
     for name in ["gateway", "proxy_config", "config_reload", "nodes"] {
         assert!(
@@ -117,7 +117,7 @@ async fn a_process_worker_cannot_regain_the_operations_surface_its_channel_hides
 
     // An operator who re-enables one keeps it: `for_channel_surface` never
     // folds an `always_include` name into the hidden set.
-    let mut reopened = crate::config::ToolTieringConfig::default();
+    let mut reopened = crate::config::ToolTieringConfig::with_recommended_channel_exclusions();
     reopened.always_include.push("gateway".to_string());
     let reopened = reopened.for_channel_surface().always_exclude;
     let names = worker_tool_names(&[], &reopened).await;
@@ -153,7 +153,7 @@ async fn manifest_tool_names(manifest: &WorkerManifest) -> Vec<String> {
 async fn a_worker_manifest_binds_its_channel_exclusions_to_the_tool_filter() {
     // Fixture validity first: the hidden set is the real default channel
     // surface, so the test dies if `channel_exclude` stops hiding these.
-    let hidden = crate::config::ToolTieringConfig::default()
+    let hidden = crate::config::ToolTieringConfig::with_recommended_channel_exclusions()
         .for_channel_surface()
         .always_exclude;
     for name in ["gateway", "proxy_config", "config_reload", "nodes"] {
