@@ -101,7 +101,9 @@ impl CronTool {
     /// changed by any update. Any other trusted caller may manage only jobs
     /// whose stored owner is its own owner (the same owner
     /// [`cron::lineage_from_trusted_scope`] records at creation); a job with no
-    /// stored owner belongs to no such caller. A call without a
+    /// stored owner belongs to no such caller, except that the authenticated
+    /// Console Main also manages the ownerless jobs the local operator created
+    /// through the CLI. A call without a
     /// runtime-authored scope bypassed the execution service entirely (an
     /// in-process call) and keeps the unrestricted behavior it always had,
     /// as `RunOwnerScope::from_args` does.
@@ -408,6 +410,10 @@ struct RunView {
 enum CallerScope {
     Unrestricted,
     Owner(Option<String>),
+    /// The authenticated, non-isolated Console Main: its owner's jobs, and
+    /// the jobs the local operator created through the CLI, which carry no
+    /// owner (the Console holder is the operator of this instance).
+    Console(Option<String>),
     Named { owner: Option<String>, creator: String },
 }
 
@@ -429,7 +435,19 @@ impl CallerScope {
                 owner,
                 creator: crate::security::agent_level::creator_agent_named(name.as_str(), &incarnation),
             },
-            Ok(_) => Self::Owner(owner),
+            Ok(_) => {
+                let console = args
+                    .get("_zc_scope")
+                    .and_then(serde_json::Value::as_object)
+                    .and_then(|scope| scope.get("runtime_source"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(crate::runtime::envelope::RuntimeSource::Console.as_str());
+                if console && owner.is_some() && !crate::tools::execution::scope_requires_owner_match(args) {
+                    Self::Console(owner)
+                } else {
+                    Self::Owner(owner)
+                }
+            }
             Err(_) => Self::Owner(None),
         }
     }
@@ -438,7 +456,11 @@ impl CallerScope {
         match self {
             Self::Unrestricted => true,
             Self::Owner(Some(owner)) => job.owner_id.as_deref() == Some(owner.as_str()),
-            Self::Owner(None) => false,
+            Self::Owner(None) | Self::Console(None) => false,
+            Self::Console(Some(owner)) => {
+                job.owner_id.as_deref() == Some(owner.as_str())
+                    || (job.owner_id.is_none() && job.origin.is_local_operator())
+            }
             Self::Named { owner, creator } => {
                 owner
                     .as_deref()

@@ -462,7 +462,7 @@ pub(super) async fn verify_ordinary_member(
         fabric,
         std::path::Path::new(fabric.workspace_id()),
         batch,
-        &crate::tools::sessions_read_model::RunOwnerScope::Owner(Some(owner.to_owned())),
+        &crate::tools::sessions_read_model::RunOwnerScope::Isolated(Some(owner.to_owned())),
     )
     .await?
     .context("ordinary batch roster missing")?;

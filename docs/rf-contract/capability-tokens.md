@@ -511,8 +511,10 @@ turn's agent, so a named agent's children are its own rows; Main's children
 are unchanged. `sessions_list`, `sessions_history`, `session_status`,
 `subagents` and `sessions_send` show a named agent only the runs it started.
 `spawn_batch` and `join` retain the parent's agent partition, including the
-batch journal and cached roster. `chat_sessions` and `chat_assign` answer a
-named agent with `spawn_action_unpartitioned`; a child whose root partition cannot be
+batch journal and cached roster. `chat_sessions` and `chat_assign` are available to a
+named agent (the assignment grants still decide which sessions it may hand work to). An owner's
+Main sees and can kill every run of that owner, including its named agents' runs; an
+owner-isolated origin still sees only unstamped runs. A child whose root partition cannot be
 determined is refused with `child_partition_unresolved`.
 
 **History labels.** `GET /api/sessions/{session_id}/messages` on a

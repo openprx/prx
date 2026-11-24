@@ -770,7 +770,9 @@ impl SessionsSpawnTool {
         owner_scope: &sessions_read_model::RunOwnerScope,
     ) -> anyhow::Result<Option<String>> {
         let owner = row_owner.or_else(|| match owner_scope {
-            sessions_read_model::RunOwnerScope::Owner(Some(owner)) => Some(owner.clone()),
+            sessions_read_model::RunOwnerScope::Owner(Some(owner)) | sessions_read_model::RunOwnerScope::Isolated(Some(owner)) => {
+                Some(owner.clone())
+            }
             _ => None,
         });
         match (fabric, owner) {

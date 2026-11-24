@@ -8,29 +8,6 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 
-/// Named agents cannot control the operator's live chat sessions.
-/// Batch journals and children retain the parent agent's partition.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SpawnActionUnpartitioned;
-
-impl SpawnActionUnpartitioned {
-    pub(crate) const fn code(self) -> &'static str {
-        "spawn_action_unpartitioned"
-    }
-}
-
-impl std::fmt::Display for SpawnActionUnpartitioned {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "{}: chat_sessions and chat_assign are unavailable to a named agent",
-            self.code()
-        )
-    }
-}
-
-impl std::error::Error for SpawnActionUnpartitioned {}
-
 impl SessionsSpawnTool {
     pub(super) fn execution_schema(&self) -> &std::sync::Arc<serde_json::Value> {
         self.execution_schema.get_or_init(|| {
@@ -236,13 +213,6 @@ impl Tool for SessionsSpawnTool {
         // caller's owner started; the local-process operator sees them all. A
         // run outside the scope answers exactly like a missing one.
         let owner_scope = sessions_read_model::RunOwnerScope::from_args(&args);
-        if owner_scope.is_agent() && matches!(action, "chat_sessions" | "chat_assign") {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(SpawnActionUnpartitioned.to_string()),
-            });
-        }
 
         match action {
             "continue" => return self.execute_continue(&args).await,

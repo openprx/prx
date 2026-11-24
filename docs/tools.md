@@ -1532,7 +1532,9 @@ A non-operator run keeps its `cron` / `xin` runtime source and a `cron:{id}` /
 local-operator CLI tuple, whatever channel and sender its creator had. The origin is
 fixed at creation. Only the job's creator (the same owner) or the local
 operator can `update`, `remove`, `pause`, `resume` or `run` a cron job; the
-operator doing so does not adopt it. Reads follow the same rule: `list` and
+operator doing so does not adopt it. The authenticated, non-isolated Console
+Main also manages the ownerless jobs the local operator created through the CLI.
+Reads follow the same rule: `list` and
 `status` show a caller only its own owner's jobs, and `get`, `runs`/`history`
 and `events` answer another principal's job exactly as a missing one: an id
 that names no job, or a removed job, reads as `not found` too, so a read

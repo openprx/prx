@@ -166,9 +166,14 @@ pub(crate) enum RunOwnerScope {
     /// local-operator CLI tuple), and in-process calls that bypass the execution service and so
     /// carry no trusted scope at all.
     Unrestricted,
-    /// Only runs registered under exactly this owner. `None` means the caller
-    /// has no resolvable owner, so nothing is admitted.
+    /// Every run registered under exactly this owner, whichever agent
+    /// partition stamped it: the owner's own agent sees and manages all of that
+    /// owner's runs, including those of its named agents. `None` means the
+    /// caller has no resolvable owner, so nothing is admitted.
     Owner(Option<String>),
+    /// An owner-isolated origin (external MCP): only the unstamped runs
+    /// registered under exactly this owner. It never sees a named agent's run.
+    Isolated(Option<String>),
     /// A named agent (MA-01b5): only the runs stamped with exactly its
     /// partition, under the partition's owner. Main and every other owner
     /// scope never admit a stamped run.
@@ -273,7 +278,12 @@ impl RunOwnerScope {
             if !context.envelope.owner_isolated && context.is_local_operator() {
                 return Self::Unrestricted;
             }
-            return Self::Owner(effective_run_owner_from_context(context));
+            let owner = effective_run_owner_from_context(context);
+            return if context.envelope.owner_isolated {
+                Self::Isolated(owner)
+            } else {
+                Self::Owner(owner)
+            };
         }
         // MA-01b5: a named agent sees the runs stamped with its partition; a
         // call whose partition cannot be read sees no run at all.
@@ -286,7 +296,7 @@ impl RunOwnerScope {
             Err(_) => return Self::Owner(None),
         }
         if crate::tools::execution::scope_requires_owner_match(args) {
-            return Self::Owner(
+            return Self::Isolated(
                 args.get("_zc_scope")
                     .and_then(Value::as_object)
                     .and_then(|scope| scope.get("owner_id"))
@@ -319,7 +329,8 @@ impl RunOwnerScope {
     ) -> bool {
         match self {
             Self::Unrestricted => true,
-            Self::Owner(_) => run_partition.is_none() && self.admits_owner(run_owner_id),
+            Self::Owner(_) => self.admits_owner(run_owner_id),
+            Self::Isolated(_) => run_partition.is_none() && self.admits_owner(run_owner_id),
             Self::Agent(caller) => run_partition == Some(caller) && self.admits_owner(run_owner_id),
         }
     }
@@ -329,15 +340,12 @@ impl RunOwnerScope {
     fn admits_owner(&self, run_owner_id: Option<&str>) -> bool {
         match self {
             Self::Unrestricted => true,
-            Self::Owner(Some(caller)) => run_owner_id.is_some_and(|owner| owner == caller),
-            Self::Owner(None) => false,
+            Self::Owner(Some(caller)) | Self::Isolated(Some(caller)) => {
+                run_owner_id.is_some_and(|owner| owner == caller)
+            }
+            Self::Owner(None) | Self::Isolated(None) => false,
             Self::Agent(caller) => run_owner_id == Some(caller.owner_id.as_str()),
         }
-    }
-
-    /// Whether this caller is a named agent (MA-01b5).
-    pub(crate) const fn is_agent(&self) -> bool {
-        matches!(self, Self::Agent(_))
     }
 
     /// Owner-qualify already-fetched projection rows.
@@ -356,7 +364,7 @@ impl RunOwnerScope {
     fn retain_admitted<T>(&self, rows: Vec<T>, owner_of: impl Fn(&T) -> Option<&str>) -> Vec<T> {
         match self {
             Self::Unrestricted => rows,
-            Self::Owner(_) | Self::Agent(_) => rows
+            Self::Owner(_) | Self::Isolated(_) | Self::Agent(_) => rows
                 .into_iter()
                 .filter(|row| self.admits_owner(owner_of(row)))
                 .collect(),
