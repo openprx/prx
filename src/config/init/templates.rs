@@ -60,7 +60,7 @@ auto_save = true
 [memory.events]
 record_user_messages = true
 record_assistant_messages = true
-record_tool_events = false
+record_tool_events = true
 
 [memory.semantic]
 auto_promote_user_messages = true
@@ -80,7 +80,7 @@ auto_save = true
 [memory.events]
 record_user_messages = true
 record_assistant_messages = true
-record_tool_events = false
+record_tool_events = true
 
 [memory.semantic]
 auto_promote_user_messages = true
@@ -111,7 +111,7 @@ auto_save = true
 [memory.events]
 record_user_messages = true
 record_assistant_messages = true
-record_tool_events = false
+record_tool_events = true
 
 # Semantic memory promotion controls long-term durable memory extraction.
 [memory.semantic]

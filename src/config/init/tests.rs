@@ -105,7 +105,7 @@ async fn force_regeneration_preserves_unrelated_explicit_settings() {
     .expect("test: write operator main config");
     fs::write(
             dir.join("config.d/memory.toml"),
-            "[memory]\nbackend = \"sqlite\"\nauto_save = false\nconversation_retention_days = 99\n[memory.events]\nrecord_tool_events = true\n",
+            "[memory]\nbackend = \"sqlite\"\nauto_save = false\nconversation_retention_days = 99\n[memory.events]\nrecord_tool_events = false\n",
         )
         .expect("test: write operator memory fragment");
     fs::write(
@@ -121,7 +121,7 @@ async fn force_regeneration_preserves_unrelated_explicit_settings() {
     assert_eq!(config.default_model.as_deref(), Some("operator-model"));
     assert!(!config.memory.auto_save, "an explicit false must survive regeneration");
     assert_eq!(config.memory.conversation_retention_days, 99);
-    assert!(config.memory.events.record_tool_events);
+    assert!(!config.memory.events.record_tool_events);
     assert!(!config.channels_config.cli);
     let telegram = config
         .channels_config
@@ -769,16 +769,16 @@ async fn force_refresh_separates_preserved_added_and_reset_defaults() {
     // templates. Only one of them was ever typed by the operator.
     fs::write(
         dir.join("config.d/memory.toml"),
-        "[memory]\nbackend = \"sqlite\"\nauto_save = false\n\n[memory.events]\nrecord_tool_events = true\n",
+        "[memory]\nbackend = \"sqlite\"\nauto_save = false\n\n[memory.events]\nrecord_tool_events = false\n",
     )
     .expect("test: write operator memory fragment");
     // The sidecar says `auto_save = false` is what the *previous* templates
     // shipped, so it is a stale default; `record_tool_events` is recorded at
-    // its shipped value, so the operator's `true` is their own choice.
+    // its shipped value, so the operator's `false` is their own choice.
     fs::write(
         dir.join(MANAGED_DEFAULTS_FILE),
         "[[entry]]\npath = [\"memory\", \"auto_save\"]\nvalue = false\n\n\
-             [[entry]]\npath = [\"memory\", \"events\", \"record_tool_events\"]\nvalue = false\n",
+             [[entry]]\npath = [\"memory\", \"events\", \"record_tool_events\"]\nvalue = true\n",
     )
     .expect("test: write the previous defaults record");
 

@@ -177,3 +177,17 @@ macOS keeps the documented process-group limitation. Model-backed memory and
 document retrieval reserve a versioned 100 ms decision-overhead estimate; local
 catalog discovery keeps zero model overhead. Actual paid requests still use the
 physical accounting ledger. No database schema migration is introduced.
+
+## Tool calls and tool results are stored
+
+`[memory.events] record_tool_events` now defaults to `true`. With it on, every
+tool call and every tool result of a turn is appended to `message_events` as a
+`tool.call.recorded` / `tool.result.recorded` row (role `tool`) carrying the run,
+the round and the call id in its payload. A result keeps the inline text up to
+the inline limit; above it the row holds the preview and the document
+reference of the stored tool output. Stored text and arguments are redacted.
+These rows are log-only: they are not `message.created`, so history loaders and
+the handoff match ignore them, and the gateway sync stream carries nothing for
+them. A config file that sets `record_tool_events` explicitly (including the
+`false` that older generated templates wrote) keeps its value; set it to `true`
+to start recording. No database schema migration is introduced.

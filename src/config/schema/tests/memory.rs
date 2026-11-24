@@ -77,7 +77,7 @@ async fn memory_config_default_hygiene_settings() {
     assert!(m.auto_save);
     assert!(m.events.record_user_messages);
     assert!(m.events.record_assistant_messages);
-    assert!(!m.events.record_tool_events);
+    assert!(m.events.record_tool_events);
     assert!(m.semantic.auto_promote_user_messages);
     assert!(!m.semantic.auto_promote_assistant_messages);
     assert_eq!(m.semantic.min_chars, 30);

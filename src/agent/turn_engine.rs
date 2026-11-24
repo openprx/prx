@@ -63,6 +63,7 @@ use crate::agent::stream_buffer::StreamBoundaryBuffer;
 use crate::agent::tool_call_parser::{
     looks_like_unparsed_tool_call_syntax, parse_structured_tool_calls, parse_tool_calls,
 };
+use crate::agent::tool_event_recording::{RoundLog, call_id_for};
 use crate::agent::tool_evidence::{claims_tool_evidence, strip_model_written_tool_evidence};
 #[cfg(test)]
 use crate::agent::tool_result_recording::INTERRUPTED_TOOL_RESULT;
@@ -2129,6 +2130,13 @@ async fn run_turn_unguarded(
         // run — and already had side effects — with nothing in history to attach
         // to, so a replay repeated every one of them.
         history.push(ChatMessage::assistant(assistant_history_content));
+        let tool_event_scope = request_event_scope
+            .clone()
+            .unwrap_or_else(|| execution_adapter.tool_execution_context.envelope.message_scope());
+        let round_log = RoundLog::new(event_fabric.as_ref(), &tool_event_scope, iteration);
+        if let Some(log) = round_log.as_ref() {
+            log.calls(&tool_calls, &native_tool_calls).await;
+        }
         let executed = ExecutedToolRecords::new(history, &recorder, &tool_calls, &native_tool_calls);
 
         let individual_results = match execute_tools_with_service(
@@ -2263,6 +2271,11 @@ async fn run_turn_unguarded(
             document_statuses.push(document_status);
             let truncated_result =
                 compact_tool_result_for_history_with_status(&call.name, result, max_inline_chars, document_status);
+            if let Some(log) = round_log.as_ref() {
+                let call_id = call_id_for(&call.name, index, &native_tool_calls);
+                log.result(&call_id, &call.name, outcome, &truncated_result, document_status)
+                    .await;
+            }
             let _ = writeln!(
                 tool_results,
                 "<tool_result name=\"{}\">\n{}{}\n</tool_result>",

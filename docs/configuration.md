@@ -126,7 +126,7 @@ and the module-gate family are absorbed on load; they are not live switches.
 | `[channels_config.qq]` | `app_id` and `app_secret` required; `allowed_users = []`; `mention_only = false` |
 | `[channels_config.ramflux]` | `socket_path` unset; `authorization_mode = "follow_rf"`; `max_in_flight_per_conversation = 1`; `on_new_message = "queue"`; `turn_wall_clock_secs = 120`; `encrypt_at_rest = true`; `surface_limits.max_blocks = 32`, `max_actions = 16`, `max_bytes = 65536`; `attachment_fetch.max_bytes = 5242880`, `max_per_turn = 4`; `allowed_block_types` the built-in surface set (Text, Markdown, Heading, KeyValue, Metric, List, TableFallback, Form, Input, Select, Progress, LogStream, Warning, Error, Success, Approval, ActionGroup, FilePreview, Fallback); `accounts = {}`. An account may set `system_prompt_file`, `model`, `provider`, `scope_profile`, `cross_conversation_retrieval` |
 | `[memory]` | `backend = "sqlite"`; `auto_save = true`; `acl_enabled = false`; `legacy_conversation_turns_visible = true`; `archive_after_days = 7`; `purge_after_days = 30`; `conversation_retention_days = 3`; `daily_retention_days = 7`; `embedding_provider = "local"`; `embedding_model = "prx-local-hash-v1"`; `embedding_dimensions = 384`; `vector_weight = 0.7`; `keyword_weight = 0.3`; `min_relevance_score = 0.4`; `embedding_cache_size = 10000`; `vector_candidate_cap = 2000`; `auto_hydrate = true`; `sqlite_open_timeout_secs` unset; `sqlite_read_pool_size` unset; `lucid_cmd` unset (`lucid`); `lucid_budget` unset (200); `lucid_recall_timeout_ms = 5000`; `lucid_store_timeout_ms = 3000`; `lucid_local_hit_threshold = 3`; `lucid_failure_cooldown_ms = 60000` |
-| `[memory.events]` | `record_user_messages = true`; `record_assistant_messages = true`; `record_tool_events = false` |
+| `[memory.events]` | `record_user_messages = true`; `record_assistant_messages = true`; `record_tool_events = true` |
 | `[memory.semantic]` | `auto_promote_user_messages = true`; `auto_promote_assistant_messages = false`; `min_chars = 30` |
 | `[[identity_bindings]]` | `user_id`, `channel`, `channel_account` required; `display_name` unset |
 | `[[user_policies]]` | `user_id` required; `role = "guest"`; `projects = []`; `visibility_ceiling = "private"`; `blocked_patterns = []` |
@@ -638,7 +638,7 @@ auto_save = true
 [memory.events]
 record_user_messages = true
 record_assistant_messages = true
-record_tool_events = false
+record_tool_events = true
 
 [memory.semantic]
 auto_promote_user_messages = true
@@ -1300,7 +1300,7 @@ PRX treats `chat`, `agent`, `gateway`, `channel`, `delegate`, and `sessions_spaw
 - `auto_save` no longer controls the base message log; it gates semantic promotion for backward compatibility.
 - The embedded `Agent` API additionally honors `semantic.auto_promote_user_messages` and `semantic.min_chars`. It promotes only original user input, using an owner-scoped `user_msg:<run-id>` key and source session/event metadata. It leaves legacy `user_msg` entries intact. Unsupported owner-aware writes are skipped with a content-free warning; model execution continues. See [embedded API admission](unified-turn-context.md#embedded-agent-api-admission).
 
-`[memory.events]` controls raw/quasi-raw event recording. Turning it off stops new fabric event rows for entrypoints wired through `MemoryFabric`.
+`[memory.events]` controls raw/quasi-raw event recording. Turning it off stops new fabric event rows for entrypoints wired through `MemoryFabric`. `record_tool_events` (default `true`) controls the `tool.call.recorded` and `tool.result.recorded` rows: one per tool call and one per result, with the run, round and call id in the payload, the redacted inline result text, and the document reference when an oversized output was stored. They are not chat messages and are not sent on the gateway sync stream.
 
 `[memory.semantic]` controls promotion from event/message content into durable semantic memory. Assistant promotion is disabled by default to reduce noisy self-generated memory.
 

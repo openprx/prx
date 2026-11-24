@@ -78,7 +78,7 @@ impl Default for MemoryEventRecording {
             enabled: true,
             record_user_messages: true,
             record_assistant_messages: true,
-            record_tool_events: false,
+            record_tool_events: true,
         }
     }
 }
@@ -460,6 +460,20 @@ impl MemoryFabric {
         raw_payload_json: Option<String>,
     ) -> anyhow::Result<MessageEvent> {
         self.record_message_event(scope, "tool", "message.created", content, None, raw_payload_json)
+            .await
+    }
+
+    /// Record a tool call or tool result row of a provider round. The event
+    /// type is not `message.created`, so history loaders and the sync
+    /// projection do not pick the row up as a chat message.
+    pub async fn record_tool_round_event(
+        &self,
+        scope: MessageEventScope,
+        event_type: &str,
+        content: impl Into<String>,
+        raw_payload_json: Option<String>,
+    ) -> anyhow::Result<MessageEvent> {
+        self.record_message_event(scope, "tool", event_type, content, None, raw_payload_json)
             .await
     }
 

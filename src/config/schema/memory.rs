@@ -230,8 +230,8 @@ pub struct MemoryEventsConfig {
     /// Record assistant replies.
     #[serde(default = "default_true")]
     pub record_assistant_messages: bool,
-    /// Record tool/event payloads by default.
-    #[serde(default)]
+    /// Record tool calls and tool results in the durable message log.
+    #[serde(default = "default_true")]
     pub record_tool_events: bool,
 }
 
@@ -357,7 +357,7 @@ impl Default for MemoryEventsConfig {
         Self {
             record_user_messages: true,
             record_assistant_messages: true,
-            record_tool_events: false,
+            record_tool_events: true,
         }
     }
 }

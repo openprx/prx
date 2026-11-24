@@ -209,6 +209,10 @@ pub(super) fn event_header(conn: &Connection, id: &str, kind: &str) -> anyhow::R
 }
 
 pub(super) fn event_written(conn: &Connection, event: &crate::memory::MessageEvent) -> anyhow::Result<()> {
+    // Tool call and tool result rows are log-only: the stream never carries them.
+    if event.role == "tool" {
+        return Ok(());
+    }
     let Some(mut h) = event_header(conn, &event.event_id, "turn.appended")? else {
         return Ok(());
     };
