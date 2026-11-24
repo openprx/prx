@@ -34,13 +34,38 @@ pub(super) fn memory_written(conn: &Connection, event: &MemoryEvent) -> anyhow::
     h.source_ref = format!("memory:{}", event.event_id);
     h.event_id = format!("child:{}", event.event_id);
     h.timestamp = event.created_at.clone();
-    append(conn, &h)?;
+    // A child run ends once for clients: a terminal already projected from the
+    // run's own turn terminal keeps the slot.
+    if event.event_type == "task.spawned" || !terminal_upsert_exists(conn, &h.owner, run)? {
+        append(conn, &h)?;
+    }
     if event.event_type == "task.spawned" {
         h.kind = "turn.started".into();
         h.event_id = format!("child-turn:{}", event.event_id);
         append(conn, &h)?;
     }
     Ok(())
+}
+
+/// Turn-level segment runs of a child (`child-segment:` for ordinary children,
+/// `operator-worker-segment:` for operator ones). Their terminal is a fact about
+/// one turn, never the end of the child session.
+pub(super) fn is_segment_run(run: &str) -> bool {
+    run.starts_with("child-segment:") || run.starts_with("operator-worker-segment:")
+}
+
+/// Whether the child run already has a terminal `child_session.upsert` in the
+/// journal: one projected from its turn terminal (`child-end:`), or one from
+/// its terminal `task.*` event (`child:`). The first one written is the
+/// authoritative end of the run; later writers add nothing.
+pub(super) fn terminal_upsert_exists(conn: &Connection, owner: &str, run: &str) -> anyhow::Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sync_journal j WHERE j.owner_id=?1 AND j.run_id=?2 AND j.kind='child_session.upsert'
+            AND (j.event_id LIKE 'child-end:%' OR j.source_ref IN (SELECT 'memory:'||m.event_id FROM memory_events m
+                WHERE m.owner_id=?1 AND m.run_id=?2 AND m.event_type IN ('task.completed','task.failed','task.cancelled'))))",
+        params![owner, run],
+        |r| r.get(0),
+    )?)
 }
 
 pub(super) fn child_payload(conn: &Connection, h: &Header) -> anyhow::Result<Value> {

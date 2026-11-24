@@ -327,10 +327,17 @@ pub(super) fn event_written(conn: &Connection, event: &crate::memory::MessageEve
         if let Some(run) = &event.run_id {
             super::sync_lifecycle::cancel_approvals(conn, &h, &event.workspace_id, run, status == "cancelled")?;
         }
-        if h.parent_run_id.is_some() {
-            h.kind = "child_session.upsert".into();
-            h.event_id = format!("child-end:{}", event.event_id);
-            append(conn, &h)?;
+        // The end of the child session is its run's terminal. A segment's own
+        // terminal ends one turn only, and a run that already has a terminal
+        // upsert (from its `task.*` event) keeps that one.
+        if let Some(run) = h.run_id.clone().filter(|_| h.parent_run_id.is_some()) {
+            if !super::sync_lifecycle::is_segment_run(&run)
+                && !super::sync_lifecycle::terminal_upsert_exists(conn, &h.owner, &run)?
+            {
+                h.kind = "child_session.upsert".into();
+                h.event_id = format!("child-end:{}", event.event_id);
+                append(conn, &h)?;
+            }
         }
     }
     Ok(())
