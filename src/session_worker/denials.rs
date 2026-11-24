@@ -17,6 +17,14 @@ pub struct WorkerDenial {
 pub enum WorkerDenialCause {
     Approval(crate::tools::ApprovalDenialCause),
     Refusal(crate::tools::execution::ToolCallRefusalReason),
+    /// Serializes as the string `cancelled`, which no other cause uses.
+    Cancelled(CancelledCause),
+}
+/// The single value of [`WorkerDenialCause::Cancelled`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancelledCause {
+    Cancelled,
 }
 impl WorkerDenial {
     pub(crate) const fn valid(&self) -> bool {
@@ -26,6 +34,7 @@ impl WorkerDenial {
         match self.cause {
             WorkerDenialCause::Approval(cause) => cause.into(),
             WorkerDenialCause::Refusal(cause) => cause.into(),
+            WorkerDenialCause::Cancelled(CancelledCause::Cancelled) => crate::security::approval_ledger::run_call::RfDenialCause::Cancelled,
         }
     }
 }
@@ -68,6 +77,7 @@ impl LiveFrameSink for DenialSink {
         {
             let cause = match outcome {
                 ToolCallOutcome::Denied { cause: Some(cause) } => Some((*cause).into()),
+                ToolCallOutcome::Cancelled => Some(crate::security::approval_ledger::run_call::RfDenialCause::Cancelled),
                 ToolCallOutcome::Refused => Some(refusal_cause.unwrap_or(ToolCallRefusalReason::PolicyDenied).into()),
                 ToolCallOutcome::PlanOnly => Some(ToolCallRefusalReason::PlanOnly.into()),
                 ToolCallOutcome::Error => Some(refusal_cause.unwrap_or(ToolCallRefusalReason::Failed).into()),
@@ -96,6 +106,9 @@ impl DenialSink {
                 }
                 crate::security::approval_ledger::run_call::RfDenialCause::Refusal(cause) => {
                     WorkerDenialCause::Refusal(cause)
+                }
+                crate::security::approval_ledger::run_call::RfDenialCause::Cancelled => {
+                    WorkerDenialCause::Cancelled(CancelledCause::Cancelled)
                 }
             },
         });

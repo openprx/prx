@@ -172,6 +172,7 @@ pub(crate) async fn record_rf_call_refusal(
     let reason = match cause {
         crate::security::approval_ledger::run_call::RfDenialCause::Approval(cause) => cause.as_str(),
         crate::security::approval_ledger::run_call::RfDenialCause::Refusal(reason) => reason.as_str(),
+        crate::security::approval_ledger::run_call::RfDenialCause::Cancelled => "cancelled",
     };
     append_refusal(
         memory,

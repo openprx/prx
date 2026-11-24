@@ -213,13 +213,10 @@ impl LiveFrameSink for Producer {
     ) {
         use crate::security::approval_ledger::run_call::RfDenialCause;
         use crate::tools::execution::ToolCallRefusalReason;
-        let phase = if matches!(
-            cause,
-            RfDenialCause::Refusal(ToolCallRefusalReason::Failed | ToolCallRefusalReason::Indeterminate)
-        ) {
-            "failed"
-        } else {
-            "denied"
+        let phase = match cause {
+            RfDenialCause::Refusal(ToolCallRefusalReason::Failed | ToolCallRefusalReason::Indeterminate) => "failed",
+            RfDenialCause::Cancelled => "cancelled",
+            RfDenialCause::Approval(_) | RfDenialCause::Refusal(_) => "denied",
         };
         let cause = crate::security::approval_ledger::run_call::rf_denial_cause(cause);
         self.send(json!({"kind":"tool_status","tool":tool,"phase":phase,"cause":cause,"child_run_id":child_run_id}));

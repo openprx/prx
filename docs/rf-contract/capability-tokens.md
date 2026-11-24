@@ -779,14 +779,19 @@ end with `no_resolver`; a process turn woken by a message ends with
 `no_approval_surface`, as a task child's does. While a relayed approval waits,
 the child shows `tool_status{phase:"awaiting_approval"}` on the child run and
 `approval.pending` carries the child `run_id`. The worker does not stream live
-`started` or `succeeded` frames after an approval. The completion returns a
+`started` or `succeeded` frames after an approval. A root that is not recordable
+has no relay ledger, so the approvals of its process children end with
+`ledger_refused`. The completion returns a
 bounded, content-free `denials:[{tool,cause}]` inventory under the existing
 completion signature. It carries pre-approval refusal and failure causes and
-every approval denial cause, such as `owner_denied` and `expired`. Only after
+every approval denial cause, such as `owner_denied` and `expired`, and
+`cancelled` for a cancelled approval. Only after
 authentication does the parent emit one `tool_status` per outcome on the
 **parent run**, with `child_run_id` and its stable ids. Its phase is `failed`
 for `failed`/`indeterminate` causes, otherwise `denied`; its cause uses the same
-typed mapping as an in-process child. Worker refusal rows are committed before
+typed mapping as an in-process child, except that a cancelled call has phase
+`cancelled` and cause `cancelled`, as an in-process child's cancelled call does.
+Worker refusal rows are committed before
 the signed observation is emitted. The inventory holds at most 256 denials with
 tool names at most 64 bytes; overflow fails completion explicitly. It carries no
 model text or arguments.

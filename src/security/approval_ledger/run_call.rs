@@ -124,6 +124,8 @@ pub(crate) struct PendingCallPage {
 pub(crate) enum RfDenialCause {
     Approval(crate::tools::ApprovalDenialCause),
     Refusal(crate::tools::execution::ToolCallRefusalReason),
+    /// The call ended because its approval or run was cancelled.
+    Cancelled,
 }
 
 impl From<crate::tools::ApprovalDenialCause> for RfDenialCause {
@@ -145,6 +147,7 @@ pub(crate) fn rf_denial_cause(cause: impl Into<RfDenialCause>) -> &'static str {
         RfDenialCause::Approval(crate::tools::ApprovalDenialCause::NoAnswer) => "expired",
         RfDenialCause::Approval(other) => other.as_str(),
         RfDenialCause::Refusal(reason) => reason.as_str(),
+        RfDenialCause::Cancelled => "cancelled",
     }
 }
 
