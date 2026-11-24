@@ -954,6 +954,9 @@ impl Config {
             .context("Config path must have a parent directory")?;
         let store = crate::security::SecretStore::new(openprx_dir, self.secrets.encrypt);
         let mut value = toml::Value::try_from(self).context("Failed to convert config into TOML value")?;
+        let defaults =
+            toml::Value::try_from(Self::default()).context("Failed to convert default config into TOML value")?;
+        omit_default_empty_arrays(&mut value, &defaults);
         crate::config::secret_paths::encrypt_at_rest(&mut value, &store)?;
         Ok(value)
     }
@@ -975,6 +978,32 @@ impl Config {
         }
         Ok((main, fragments))
     }
+}
+
+/// Remove every empty array that the default configuration also holds empty at
+/// the same table path.
+///
+/// An inline `model_routes = []` would make a later `[[model_routes]]` append
+/// (a duplicate definition of the key) fail to parse. Omitting it loses
+/// nothing, because the default of that key is the empty array. An empty array
+/// whose default is non-empty is an explicit choice and is kept.
+fn omit_default_empty_arrays(value: &mut toml::Value, defaults: &toml::Value) {
+    let (Some(table), Some(default_table)) = (value.as_table_mut(), defaults.as_table()) else {
+        return;
+    };
+    table.retain(|key, entry| {
+        let default_entry = default_table.get(key);
+        let empty_by_default = default_entry
+            .and_then(toml::Value::as_array)
+            .is_some_and(Vec::is_empty);
+        if empty_by_default && entry.as_array().is_some_and(Vec::is_empty) {
+            return false;
+        }
+        if let Some(default_entry) = default_entry {
+            omit_default_empty_arrays(entry, default_entry);
+        }
+        true
+    });
 }
 
 /// Whether the stored configuration writes `memory.embedding_provider` (or its
