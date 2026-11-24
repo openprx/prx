@@ -3,6 +3,7 @@ use crate::agent::response_guard::strip_quoted_fabricated_tool_markers;
 use crate::memory;
 use crate::memory::branch_copy::{CONTEXT_SWITCH_EVENT_TYPE, is_branch_copy};
 use crate::memory::principal::{MemoryWriteContext, OwnerPrincipal, Role};
+use crate::memory::MemoryEntry;
 use crate::memory::traits::MemoryEntryOrigin;
 use crate::memory::{
     ConversationTurn, DocumentSearchResult, Memory, MemoryPrincipal, MessageEvent, MessageEventSource,
@@ -255,6 +256,37 @@ pub(crate) async fn build_context_with_scope(
     build_semantic_context(mem, user_msg, min_relevance_score, scope_ctx, false, None, None, None).await
 }
 
+/// Rows recalled into the prompt per turn.
+const RECALL_LIMIT: usize = 5;
+
+/// Candidates read from the store before recency re-ranking: three times the
+/// limit, the same depth the store already scans per requested row.
+const RECALL_CANDIDATES: usize = RECALL_LIMIT * 3;
+
+/// Largest relative boost recency gives a row's relevance score.
+const RECENCY_MAX_BOOST: f64 = 0.1;
+
+/// Age in days over which the recency boost halves.
+const RECENCY_HALF_LIFE_DAYS: f64 = 30.0;
+
+/// Orders candidates by `score * (1 + RECENCY_MAX_BOOST * 0.5^(age_days /
+/// RECENCY_HALF_LIFE_DAYS))`: a row stored now gets up to a 10% boost, one
+/// 30 days old 5%, a year old about 0%. The boost is relative, so it works on
+/// both the hybrid score (0..1) and the raw keyword score. Nothing is excluded
+/// by age, a row with an unreadable timestamp gets no boost, and equal
+/// adjusted scores keep the store's order (the sort is stable).
+fn rank_with_recency(entries: &mut [MemoryEntry]) {
+    let now = chrono::Utc::now();
+    let adjusted = |entry: &MemoryEntry| -> f64 {
+        let age_days = chrono::DateTime::parse_from_rfc3339(&entry.timestamp)
+            .map(|created| now.signed_duration_since(created).num_seconds().max(0) as f64 / 86_400.0)
+            .ok();
+        let boost = age_days.map_or(0.0, |age| RECENCY_MAX_BOOST * 0.5_f64.powf(age / RECENCY_HALF_LIFE_DAYS));
+        entry.score.unwrap_or(0.0) * (1.0 + boost)
+    };
+    entries.sort_by(|a, b| adjusted(b).total_cmp(&adjusted(a)));
+}
+
 /// Whether `timestamp` is within the recent-events window. Applies only to the
 /// session and shared-event blocks; stored memories and documents have no age
 /// cut-off.
@@ -294,8 +326,8 @@ async fn build_semantic_context(
 
     // The current turn is already in the live input; its semantic promotion
     // must not count as historical recall or trigger a presentation callback.
-    let scored_entries = mem
-        .recall_with_context(user_msg, 5, None, scope_ctx)
+    let mut candidates = mem
+        .recall_with_context(user_msg, RECALL_CANDIDATES, None, scope_ctx)
         .await
         .unwrap_or_default()
         .into_iter()
@@ -303,6 +335,11 @@ async fn build_semantic_context(
         .filter(|entry| excluded_key != Some(entry.key.as_str()))
         .filter(|entry| excluded_event.is_none() || entry.source_event_id.as_deref() != excluded_event)
         .filter(|entry| !unscoped_remote_hit(entry.origin, entry.source_event_id.as_deref()))
+        .collect::<Vec<_>>();
+    rank_with_recency(&mut candidates);
+    candidates.truncate(RECALL_LIMIT);
+    let scored_entries = candidates
+        .into_iter()
         .map(|entry| (entry.id, entry.key, entry.content, entry.source_event_id))
         .collect::<Vec<_>>();
     let entries = if scoped_prompt && scored_entries.is_empty() {
