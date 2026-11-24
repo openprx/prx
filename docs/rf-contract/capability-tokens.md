@@ -677,6 +677,14 @@ continuation has a fresh run ID; `turn.started`, `turn.appended`, and
 `child_session.upsert` keep that turn's run and the four ancestry links.
 Consumers must accept repeated running-to-succeeded cycles for one child
 session key. Terminal-chat child sessions remain outside this journal.
+A child run ends with exactly one terminal `child_session.upsert` (`succeeded`,
+`failed` or `cancelled`) whose `mode` is the child's own mode (`task` or
+`process`); the first of the run's turn terminal and terminal task event holds
+that slot, and a segment turn's terminal never produces one. Every upsert and
+the snapshot row of a child carry the same mode. A child that was killed, died,
+or lost its owner (gateway exit or restart) ends `cancelled` for a requested
+stop and `failed` otherwise, and its unfinished turns get one `turn.cancelled`
+or `turn.failed` each. A root session never appears as a `child_session` row.
 A focused child's approval resolves only that child's pending call; a process
 child's approval is relayed to the root surface (see the approvals section).
 
