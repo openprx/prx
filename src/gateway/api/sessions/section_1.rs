@@ -769,7 +769,9 @@ async fn run_console_runtime_turn(
             scope,
             streams: std::sync::Arc::clone(&state.rf_streams),
             approvals: std::sync::Arc::clone(&state.rf_approvals),
-            cancellation: decision.cancellation.clone(),
+            // The resolver owns a child of the run token: run cancellation reaches its
+            // approval waits, while dropping it never cancels the run or the job.
+            cancellation: decision.cancellation.child_token(),
             wait_secs,
         }) as std::sync::Arc<dyn crate::agent::live_frames::LiveTurn>
     });

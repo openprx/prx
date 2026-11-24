@@ -131,6 +131,8 @@ pub(crate) struct RunApprovalResolver {
     pub(crate) scope: Value,
     pub(crate) streams: Arc<super::live_frames::StreamHub>,
     pub(crate) approvals: Arc<ApprovalHub>,
+    /// Owned by the resolver and cancelled on drop; it must never be a token
+    /// the run or job also holds (pass a child token of the run's token).
     pub(crate) cancellation: CancellationToken,
     pub(crate) wait_secs: u64,
 }
