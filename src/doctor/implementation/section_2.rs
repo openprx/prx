@@ -65,20 +65,31 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
                 AuthProfileCredentialStatus::Missing => {
                     // A credential stored through `PUT /api/providers/{id}/credential`
                     // or `prx providers credential set` is a `cred-<name>` reference in
-                    // the same encrypted store. Presence only; no value is read out.
-                    let references = crate::config::manage::service::provider_credentials(config, provider)
-                        .map(|credentials| credentials.references)
-                        .unwrap_or_else(|error| {
-                            tracing::warn!(%error, "doctor could not read the stored credential references");
-                            Vec::new()
-                        });
-                    if let Some(reference) = references.first() {
-                        items.push(DiagItem::configured(
-                            cat,
-                            format!("stored credential present for \"{provider}\" ({})", reference.id),
-                        ));
-                    } else {
-                        items.push(DiagItem::warn(cat, "no api_key or active auth profile credential set"));
+                    // the same encrypted store. It is used only when the configuration
+                    // references it (`credential_ref`), the same test `prx providers
+                    // credential status` applies. Presence only; no value is read out.
+                    match stored_credential_status(config, provider) {
+                        StoredCredentialStatus::Referenced { id, users } => {
+                            items.push(DiagItem::configured(
+                                cat,
+                                format!(
+                                    "stored credential {id} for \"{provider}\" is referenced by {}",
+                                    users.join(", ")
+                                ),
+                            ));
+                        }
+                        StoredCredentialStatus::Unreferenced { id } => {
+                            items.push(DiagItem::warn(
+                                cat,
+                                format!(
+                                    "stored credential {id} exists for \"{provider}\" but is not referenced by any \
+                                     model route, embedding route or agent (`credential_ref`), so it is not used"
+                                ),
+                            ));
+                        }
+                        StoredCredentialStatus::None => {
+                            items.push(DiagItem::warn(cat, "no api_key or active auth profile credential set"));
+                        }
                     }
                 }
             }
@@ -229,18 +240,24 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
             ),
         ));
     }
-    if !availability.unavailable.is_empty() {
+    // A provider whose stored credential the configuration references is not
+    // missing one, whatever the availability summary (which looks at the root
+    // key and the environment) says; the credential line above names it.
+    let unavailable: Vec<String> = availability
+        .unavailable
+        .iter()
+        .filter(|(name, _)| {
+            !matches!(
+                stored_credential_status(config, name),
+                StoredCredentialStatus::Referenced { .. }
+            )
+        })
+        .map(|(name, reason)| format!("{name}: {reason}"))
+        .collect();
+    if !unavailable.is_empty() {
         items.push(DiagItem::warn(
             cat,
-            format!(
-                "unavailable providers: {}",
-                availability
-                    .unavailable
-                    .iter()
-                    .map(|(name, reason)| format!("{name}: {reason}"))
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            ),
+            format!("unavailable providers: {}", unavailable.join("; ")),
         ));
     }
 
@@ -388,6 +405,42 @@ enum AuthProfileCredentialStatus {
     Present { profile_id: String },
     Missing,
     Unreadable(String),
+}
+
+/// What the credential store holds for a provider, by reference id only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StoredCredentialStatus {
+    /// A stored credential some part of the configuration references.
+    Referenced { id: String, users: Vec<String> },
+    /// A stored credential nothing references: it is never sent.
+    Unreferenced { id: String },
+    /// No stored credential for the provider, or the store is unreadable.
+    None,
+}
+
+fn stored_credential_status(config: &Config, provider: &str) -> StoredCredentialStatus {
+    let credentials = match crate::config::manage::service::provider_credentials(config, provider) {
+        Ok(credentials) => credentials,
+        Err(error) => {
+            tracing::warn!(%error, "doctor could not read the stored credential references");
+            return StoredCredentialStatus::None;
+        }
+    };
+    let mut unreferenced = None;
+    for reference in &credentials.references {
+        match credentials.reference_uses.get(&reference.id) {
+            Some(users) if !users.is_empty() => {
+                return StoredCredentialStatus::Referenced {
+                    id: reference.id.clone(),
+                    users: users.clone(),
+                };
+            }
+            _ => {
+                unreferenced.get_or_insert_with(|| reference.id.clone());
+            }
+        }
+    }
+    unreferenced.map_or(StoredCredentialStatus::None, |id| StoredCredentialStatus::Unreferenced { id })
 }
 
 fn active_auth_profile_credential_status(config: &Config, provider: &str) -> AuthProfileCredentialStatus {
