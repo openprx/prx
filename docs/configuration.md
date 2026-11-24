@@ -11,9 +11,9 @@ engine as owning everything:
   `always_exclude` / channel exclusions ∩ catalog eligibility.
   The surface is built even when the advisory engine is off. Authorized search
   stays available when deferred tools exist, including for brief inputs.
-- **Targeted gateway turns** (`[gateway] targeted_agents`, default `false`) use
-  a named memory partition (`name` + incarnation), not Main's history. The
-  switch is pre-release.
+- **Targeted gateway turns** (`[gateway] targeted_agents`, default `true`) use
+  a named memory partition (`name` + incarnation), not Main's history. Set
+  it to `false` to refuse named targets.
 - **Advisory decision engine** (`[decision_engine]`, default `enabled = false`)
   only advises; there is no `[causal_tree]` table any more.
 - **Recovery** needs the workspace database together with its `.recovery_keys`
@@ -131,7 +131,7 @@ and the module-gate family are absorbed on load; they are not live switches.
 | `[[user_policies]]` | `user_id` required; `role = "guest"`; `projects = []`; `visibility_ceiling = "private"`; `blocked_patterns = []` |
 | `[storage.provider.config]` | `provider = ""`; `db_url` unset (aliases `dbURL`, `database_url`, `databaseUrl`); `schema = "public"`; `table = "memories"`; `connect_timeout_secs` unset (15s handshake); `pool_max_size = 32` |
 | `[tunnel]` | `provider = "none"`; `cloudflare`/`tailscale`/`ngrok`/`custom` unset. Cloudflare needs `token`; Tailscale `funnel = false`, `hostname` unset; ngrok `auth_token` required, `domain` unset; custom `start_command` required, `health_url`/`url_pattern` unset |
-| `[gateway]` | `port = 16830`; `host = "127.0.0.1"`; `require_pairing = true`; `allow_public_bind = false`; `paired_tokens = []`; `pair_rate_limit_per_minute = 10`; `webhook_rate_limit_per_minute = 60`; `api_rate_limit_per_minute = 60`; `trust_forwarded_headers = false`; `rate_limit_max_keys = 10000`; `idempotency_ttl_secs = 300`; `idempotency_max_keys = 10000`; `channel_webhook_dedup_ttl_secs = 86400`; `targeted_agents = false` |
+| `[gateway]` | `port = 16830`; `host = "127.0.0.1"`; `require_pairing = true`; `allow_public_bind = false`; `paired_tokens = []`; `pair_rate_limit_per_minute = 10`; `webhook_rate_limit_per_minute = 60`; `api_rate_limit_per_minute = 60`; `trust_forwarded_headers = false`; `rate_limit_max_keys = 10000`; `idempotency_ttl_secs = 300`; `idempotency_max_keys = 10000`; `channel_webhook_dedup_ttl_secs = 86400`; `targeted_agents = true` |
 | `[webhook]` | `bind = "0.0.0.0:16899"`; `token` unset (required when enabled); `signing_secret` unset |
 | `[composio]` | `api_key` unset; `entity_id = "default"` |
 | `[mcp]` | `servers = {}`; `workspace_servers = "off"` (`http_only` or `stdio` to widen). A server: `transport = "stdio"`; `command`/`url` unset; `args = []`; `env = {}`; `startup_timeout_ms = 10000`; `request_timeout_ms = 30000`; `tool_name_prefix = "mcp"`; `allow_tools`/`deny_tools = []`; `working_dir` unset |
@@ -540,16 +540,16 @@ default_temperature = 0.3
 # again. Must be greater than 0. Default: 86400 (24 hours).
 # channel_webhook_dedup_ttl_secs = 86400
 
-# Rollout switch for targeted agent turns (`agent` on
-# POST /api/sessions/{id}/message). While false, any otherwise-valid named
+# Switch for targeted agent turns (`agent` on
+# POST /api/sessions/{id}/message). Default true. While false, any otherwise-valid named
 # target answers 409 `agent_disabled` and never runs as the main agent.
 # A named target on a memory backend that does not keep agent scope answers
 # 409 `agent_backend_unsupported` after the disabled and unknown checks.
-# `targeted_agents` is pre-release (default false). While true, a named target
+# While true (the default), a named target
 # uses its own memory partition (agent name + incarnation), not Main's history.
 # A memory backend that does not keep agent scope answers 409
 # `agent_backend_unsupported`.
-# targeted_agents = false
+# targeted_agents = true
 
 [runtime]
 # `kind` accepts "native" (default) or "docker". `kind = "cloudflare"` is
@@ -832,7 +832,7 @@ model = "claude-sonnet-4-6"
 agentic = true
 allowed_tools = ["web_search", "file_read"]
 # Targeted turns (`agent` on POST /api/sessions/{id}/message, needs
-# [gateway] targeted_agents = true): `enabled = false` answers 409
+# [gateway] targeted_agents, default true): `enabled = false` answers 409
 # `agent_disabled`; `autonomy` is capped at the main agent's level.
 # History is a named partition, not Main's. Names must match
 # ^[a-z][a-z0-9_-]{0,63}$ and cannot be `main`.

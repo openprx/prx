@@ -67,10 +67,11 @@ pub struct GatewayConfig {
     #[serde(default = "default_channel_webhook_dedup_ttl_secs")]
     pub channel_webhook_dedup_ttl_secs: u64,
 
-    /// Rollout switch for targeted agent turns (`agent` on
-    /// `POST /api/sessions/{id}/message`). While false, any otherwise-valid
-    /// named target answers 409 `agent_disabled` and never runs as Main.
-    #[serde(default)]
+    /// Switch for targeted agent turns (`agent` on
+    /// `POST /api/sessions/{id}/message`). Default true. While false, any
+    /// otherwise-valid named target answers 409 `agent_disabled` and never
+    /// runs as Main.
+    #[serde(default = "default_true")]
     pub targeted_agents: bool,
 }
 
@@ -130,7 +131,7 @@ impl Default for GatewayConfig {
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
             channel_webhook_dedup_ttl_secs: default_channel_webhook_dedup_ttl_secs(),
-            targeted_agents: false,
+            targeted_agents: true,
         }
     }
 }
