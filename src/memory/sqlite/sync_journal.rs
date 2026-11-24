@@ -267,8 +267,12 @@ pub(super) fn event_written(conn: &Connection, event: &crate::memory::MessageEve
             append(conn, &h)?;
         }
     }
+    // An event of a session written on behalf of that same session (the batch
+    // membership journal of a root run) carries the run's parent link but is
+    // not a child session.
+    let own_session = event.parent_session_key.is_some() && event.parent_session_key == event.session_key;
     // Root user rows are appended by admit, after their attempt is inserted.
-    if h.parent_run_id.is_some() {
+    if h.parent_run_id.is_some() && !own_session {
         let first: bool = conn.query_row(
             "SELECT NOT EXISTS(SELECT 1 FROM sync_journal WHERE owner_id=?1 AND session=?2 AND kind='session.upsert')",
             params![h.owner, h.session],
@@ -340,7 +344,7 @@ pub(super) fn event_written(conn: &Connection, event: &crate::memory::MessageEve
         // The end of the child session is its run's terminal. A segment's own
         // terminal ends one turn only, and a run that already has a terminal
         // upsert (from its `task.*` event) keeps that one.
-        if let Some(run) = h.run_id.clone().filter(|_| h.parent_run_id.is_some()) {
+        if let Some(run) = h.run_id.clone().filter(|_| h.parent_run_id.is_some() && !own_session) {
             if !super::sync_lifecycle::is_segment_run(&run)
                 && !super::sync_lifecycle::terminal_upsert_exists(conn, &h.owner, &run)?
             {
