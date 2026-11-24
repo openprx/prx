@@ -312,8 +312,15 @@ fn event_view(event: &CronJobEvent) -> Value {
     })
 }
 
+/// Whether `owner` may see and manage `job`. A job stored under the owner id
+/// is the owner's. A job the local operator created from the command line
+/// carries no owner id and belongs to the install owner, so a paired bearer
+/// sees it; a request with pairing off (`api:local`) does not.
 fn owns(job: &CronJob, owner: &str) -> bool {
-    job.owner_id.as_deref() == Some(owner)
+    match job.owner_id.as_deref() {
+        Some(job_owner) => job_owner == owner,
+        None => owner != super::LOCAL_OWNER_ID && job.origin == crate::cron::JobOrigin::LocalOperator,
+    }
 }
 
 fn visible_job(config: &crate::config::Config, owner: &str, id: &str) -> Result<CronJob, ApiResponse> {
