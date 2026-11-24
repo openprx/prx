@@ -97,7 +97,7 @@ async fn file_mention_success_uses_file_read_tool_and_preserves_original_text() 
     std::fs::write(temp.path().join("note.txt"), "hello from mention").expect("write note");
     let registry = file_read_registry(temp.path(), false);
 
-    let enriched = enrich_file_mentions_for_prompt("please inspect @note.txt", &registry).await;
+    let enriched = enrich_file_mentions_for_prompt("please inspect @note.txt", &registry, crate::security::AutonomyLevel::Supervised).await;
 
     assert!(enriched.prompt.starts_with("please inspect @note.txt"));
     assert!(enriched.prompt.contains("hello from mention"));
@@ -121,6 +121,7 @@ async fn file_mention_security_negatives_are_soft_visible_and_generic() {
         let enriched = enrich_file_mentions_for_prompt(
             "check @../../etc/passwd @/etc/passwd @escape.txt @MEMORY.md @missing.txt",
             &registry,
+            crate::security::AutonomyLevel::Supervised,
         )
         .await;
 
@@ -142,7 +143,7 @@ async fn file_mention_directory_is_rejected_softly() {
     std::fs::create_dir_all(temp.path().join("dir")).expect("create dir");
     let registry = file_read_registry(temp.path(), false);
 
-    let enriched = enrich_file_mentions_for_prompt("inspect @dir", &registry).await;
+    let enriched = enrich_file_mentions_for_prompt("inspect @dir", &registry, crate::security::AutonomyLevel::Supervised).await;
 
     let note = enriched.visible_note.expect("visible directory note");
     assert!(note.contains("@dir: unavailable"));
@@ -203,7 +204,7 @@ async fn file_mention_caps_file_count_and_bytes() {
         max_bytes_seen: Arc::clone(&max_bytes_seen),
     })];
 
-    let enriched = enrich_file_mentions_for_prompt("x @a @b @c @d @e @f", &registry).await;
+    let enriched = enrich_file_mentions_for_prompt("x @a @b @c @d @e @f", &registry, crate::security::AutonomyLevel::Supervised).await;
 
     assert_eq!(calls.load(Ordering::SeqCst), FILE_MENTION_MAX_FILES);
     assert_eq!(
@@ -229,7 +230,7 @@ async fn file_mention_truncates_utf8_on_char_boundary() {
     std::fs::write(temp.path().join("big.txt"), "\u{20ac}".repeat(30_000)).expect("write big");
     let registry = file_read_registry(temp.path(), false);
 
-    let enriched = enrich_file_mentions_for_prompt("read @big.txt", &registry).await;
+    let enriched = enrich_file_mentions_for_prompt("read @big.txt", &registry, crate::security::AutonomyLevel::Supervised).await;
 
     assert!(enriched.prompt.contains("[content truncated: 64 KiB limit]"));
     let attached_content = enriched

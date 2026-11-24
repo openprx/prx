@@ -106,7 +106,7 @@
             one_shot_binding = Some(Arc::clone(&admitted_binding));
         }
 
-        let file_mention_enrichment = enrich_file_mentions_for_prompt(&user_input, tools_registry.as_ref()).await;
+        let file_mention_enrichment = enrich_file_mentions_for_prompt(&user_input, tools_registry.as_ref(), security.autonomy).await;
         if let Some(note) = file_mention_enrichment.visible_note.as_deref() {
             emit_chat_output(note);
         }

@@ -79,9 +79,13 @@ const fn is_file_mention_trailing_punctuation(ch: char) -> bool {
     matches!(ch, ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}')
 }
 
+/// Attach the files `user_input` mentions. The reads run at the turn's
+/// effective `autonomy`: at Full the file tool resolves any path the OS lets
+/// the process read, below Full the workspace confinement is unchanged.
 pub(super) async fn enrich_file_mentions_for_prompt(
     user_input: &str,
     tools_registry: &[Box<dyn Tool>],
+    autonomy: crate::security::AutonomyLevel,
 ) -> FileMentionEnrichment {
     let mentions = extract_file_mentions(user_input);
     if mentions.is_empty() {
@@ -102,7 +106,7 @@ pub(super) async fn enrich_file_mentions_for_prompt(
                     "path": mention.path.as_str(),
                     "max_bytes": FILE_MENTION_MAX_BYTES,
                 });
-                match tool.execute_named("file_read", args).await {
+                match crate::tools::effective_autonomy::scope(autonomy, tool.execute_named("file_read", args)).await {
                     Ok(result) if result.success => {
                         let (content, truncated) = truncate_utf8_to_byte_cap(&result.output, FILE_MENTION_MAX_BYTES);
                         let mut section = format!("### {}\nPath: {}\n\n{}", mention.token, mention.path, content);
