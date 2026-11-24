@@ -262,6 +262,7 @@ async fn hybrid_worker_result_creates_private_draft_and_parent_merge_request() {
         output: "worker draft content".to_string(),
         error: None,
         tokens_used: None,
+        cancelled: false,
     };
     let result_event = worker_fabric
         .record_worker_result(scope.clone(), result.output.clone(), None)
@@ -418,6 +419,7 @@ async fn hybrid_worker_draft_obeys_readonly_resource_gate() {
         output: "worker draft content".to_string(),
         error: None,
         tokens_used: None,
+        cancelled: false,
     };
     let manifest = WorkerManifest {
         seed_history: Vec::new(),

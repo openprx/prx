@@ -1173,10 +1173,14 @@ impl SessionsSpawnTool {
                             )
                             .await;
 
+                            // The worker's own account that its work was cancelled; the run's
+                            // status stays `Failed`, only the recorded task event differs.
+                            let mut worker_cancelled = false;
                             let (status, result_text, token_usage_records, finalization) = match worker_result {
                                 Ok(ProcessWorkerOutcome::OrdinaryVerifiedFinished(completion)) => {
                                     *monitor_ordinary_terminal.lock() = Some(completion.clone());
                                     let result = completion.result;
+                                    worker_cancelled = result.cancelled;
                                     let (status, text) = if result.success {
                                         (SubAgentStatus::Completed(result.output.clone()), result.output)
                                     } else {
@@ -1188,6 +1192,7 @@ impl SessionsSpawnTool {
                                 Ok(ProcessWorkerOutcome::OperatorVerifiedFinished(completion)) => {
                                     *monitor_operator_terminal.lock() = Some(completion.clone());
                                     let result = completion.result;
+                                    worker_cancelled = result.cancelled;
                                     let (status, text) = if result.success {
                                         (SubAgentStatus::Completed(result.output.clone()), result.output)
                                     } else {
@@ -1238,6 +1243,7 @@ impl SessionsSpawnTool {
                                     )
                                 }
                                 Ok(ProcessWorkerOutcome::Finished(result)) => {
+                                    worker_cancelled = result.cancelled;
                                     let error = result.error.unwrap_or_else(|| "worker failed".to_string());
                                     let msg = format!("Sub-agent error: {error}");
                                     // `result.error` is a field of the JSON the
@@ -1353,7 +1359,7 @@ impl SessionsSpawnTool {
                                         &result_text,
                                         &status,
                                         &process_lineage,
-                                        None,
+                                        worker_cancelled.then_some("task.cancelled"),
                                         Some(crate::session_worker::protocol::worker_result_key(&rid)),
                                     )
                                     .await;
@@ -1385,7 +1391,11 @@ impl SessionsSpawnTool {
                                 &result_text,
                                 &status,
                                 &process_lineage,
-                                (finalization == ProcessFinalization::Terminated).then_some("task.killed"),
+                                if finalization == ProcessFinalization::Terminated {
+                                    Some("task.killed")
+                                } else {
+                                    worker_cancelled.then_some("task.cancelled")
+                                },
                                 Some(crate::session_worker::protocol::worker_result_key(&rid)),
                             )
                             .await;

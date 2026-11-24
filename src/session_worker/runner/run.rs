@@ -1213,30 +1213,35 @@ async fn run_owned_manifest(
                     },
                     error: None,
                     tokens_used: tokens_used.has_any_tokens().then_some(tokens_used),
+                    cancelled: false,
                 },
                 crate::agent::terminal::TurnTerminalStatus::Completed,
             )
         }
-        Err(error) => (
-            WorkerResult {
-                denials: Vec::new(),
-                ordinary_completion: None,
-                operator_completion: None,
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "worker execution in {} (memory {}): {error:#}",
-                    manifest.workspace_dir.display(),
-                    manifest.memory_db_path.display()
-                )),
-                tokens_used: None,
-            },
-            if crate::agent::turn_contracts::is_tool_loop_cancelled(&error) {
-                crate::agent::terminal::TurnTerminalStatus::Cancelled
-            } else {
-                crate::agent::terminal::TurnTerminalStatus::Failed
-            },
-        ),
+        Err(error) => {
+            let cancelled = crate::agent::turn_contracts::is_tool_loop_cancelled(&error);
+            (
+                WorkerResult {
+                    denials: Vec::new(),
+                    ordinary_completion: None,
+                    operator_completion: None,
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "worker execution in {} (memory {}): {error:#}",
+                        manifest.workspace_dir.display(),
+                        manifest.memory_db_path.display()
+                    )),
+                    tokens_used: None,
+                    cancelled,
+                },
+                if cancelled {
+                    crate::agent::terminal::TurnTerminalStatus::Cancelled
+                } else {
+                    crate::agent::terminal::TurnTerminalStatus::Failed
+                },
+            )
+        }
     };
 
     worker_result.denials = process_denials.take()?;
@@ -1405,6 +1410,7 @@ async fn run_owned_manifest(
                 crate::agent::terminal::redact_persisted_json(serde_json::json!({
                     "success": worker_result.success,
                     "error": worker_result.error,
+                    "cancelled": worker_result.cancelled,
                     "owner_id": manifest.owner_id.as_deref(),
                     "topic_id": manifest.topic_id.as_deref(),
                     "parent_task_id": manifest.parent_task_id.as_deref(),

@@ -62,6 +62,7 @@ impl WorkerUnverifiedFailure {
             output: String::new(),
             error: Some(format!("{}: {detail}", self.code())),
             tokens_used: None,
+            cancelled: false,
         })
     }
 }

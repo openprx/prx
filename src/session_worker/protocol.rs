@@ -420,6 +420,10 @@ pub struct WorkerResult {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens_used: Option<crate::llm::route_decision::TokenUsage>,
+    /// The run ended because its work was cancelled, not because it failed.
+    /// `success` is still false; only the terminal classification differs.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cancelled: bool,
 }
 
 #[cfg(test)]
@@ -700,6 +704,7 @@ mod tests {
             output: String::new(),
             error: Some("timeout".into()),
             tokens_used: None,
+            cancelled: false,
         };
 
         let json = serde_json::to_string(&result).expect("serialize result");

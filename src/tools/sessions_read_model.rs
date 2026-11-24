@@ -566,6 +566,7 @@ fn is_task_lifecycle_event(event_type: &str) -> bool {
         || event_type == "task.completed"
         || event_type == "task.failed"
         || event_type == "task.killed"
+        || event_type == "task.cancelled"
         || event_type.ends_with(".task.started")
         || event_type.ends_with(".task.completed")
         || event_type.ends_with(".task.failed")
@@ -578,6 +579,7 @@ fn status_from_event_type(event_type: &str) -> RecoveredTaskStatus {
         RecoveredTaskStatus::Completed
     } else if event_type == "task.failed"
         || event_type == "task.killed"
+        || event_type == "task.cancelled"
         || event_type.ends_with(".task.failed")
         || event_type.ends_with(".task.timeout")
     {

@@ -94,6 +94,7 @@ impl AuthenticatedStartupFailure {
             output: String::new(),
             error: Some(error),
             tokens_used: None,
+            cancelled: false,
         };
         validate_failure(&result)?;
         let mut proof = StartupFailureProof {
