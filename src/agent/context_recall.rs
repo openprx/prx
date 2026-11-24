@@ -255,6 +255,9 @@ pub(crate) async fn build_context_with_scope(
     build_semantic_context(mem, user_msg, min_relevance_score, scope_ctx, false, None, None, None).await
 }
 
+/// Whether `timestamp` is within the recent-events window. Applies only to the
+/// session and shared-event blocks; stored memories and documents have no age
+/// cut-off.
 fn fresh_timestamp(timestamp: &str) -> bool {
     chrono::DateTime::parse_from_rfc3339(timestamp)
         .ok()
@@ -280,7 +283,7 @@ async fn build_semantic_context(
     user_msg: &str,
     min_relevance_score: f64,
     scope_ctx: Option<&MemoryWriteContext>,
-    fresh_only: bool,
+    scoped_prompt: bool,
     excluded_key: Option<&str>,
     excluded_event: Option<&str>,
     child: Option<&ChildRecallGate<'_>>,
@@ -297,13 +300,12 @@ async fn build_semantic_context(
         .unwrap_or_default()
         .into_iter()
         .filter(|entry| entry.score.map_or(true, |score| score >= min_relevance_score))
-        .filter(|entry| !fresh_only || fresh_timestamp(&entry.timestamp))
         .filter(|entry| excluded_key != Some(entry.key.as_str()))
         .filter(|entry| excluded_event.is_none() || entry.source_event_id.as_deref() != excluded_event)
         .filter(|entry| !unscoped_remote_hit(entry.origin, entry.source_event_id.as_deref()))
         .map(|entry| (entry.id, entry.key, entry.content, entry.source_event_id))
         .collect::<Vec<_>>();
-    let entries = if fresh_only && scored_entries.is_empty() {
+    let entries = if scoped_prompt && scored_entries.is_empty() {
         // When scored recall has no matches, scoped prompt reads also use the
         // repository's bounded keyword contract, independent of decision selection.
         // Its hits have no semantic score: raw BM25 ranks are not comparable
@@ -358,7 +360,6 @@ async fn build_semantic_context(
         })
         .unwrap_or_default()
         .into_iter()
-        .filter(|hit| fresh_timestamp(&hit.created_at))
         .filter(|hit| excluded_key != Some(hit.key.as_str()))
         .filter(|hit| excluded_event.is_none() || hit.source_event_id.as_deref() != excluded_event)
         .map(|hit| {
@@ -888,7 +889,6 @@ async fn build_agent_context(
         current_session_turns.retain(|turn| fresh_timestamp(&turn.timestamp) && (record || turn.role != "user"));
         current_session_events.retain(|event| fresh_timestamp(&event.created_at) && (record || event.role != "user"));
         shared_events.retain(|event| fresh_timestamp(&event.created_at) && (record || event.role != "user"));
-        document_results.retain(|result| fresh_timestamp(&result.chunk.created_at));
     }
     // FIX-P2-02: hard-filter untrusted external content copies (web_fetch /
     // http_request / file_read ingests) out of the trusted recall context before
