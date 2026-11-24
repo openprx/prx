@@ -624,6 +624,21 @@ impl SessionsSpawnTool {
         batch_id: &str,
         owner_scope: &sessions_read_model::RunOwnerScope,
     ) -> anyhow::Result<ToolResult> {
+        // A run id names exactly one batch; accept it where a batch id is expected.
+        let run_lookup = self.run_batch_lookup(batch_id, owner_scope).await;
+        let batch_id = match &run_lookup {
+            RunBatchLookup::InBatch(batch) => batch.as_str(),
+            RunBatchLookup::NoBatch => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "'{batch_id}' is a run id, and that run belongs to no batch: join takes the batch_id returned by spawn_batch."
+                    )),
+                });
+            }
+            RunBatchLookup::NotARun => batch_id,
+        };
         let caller = crate::tools::execution::current_child_call_context();
         if let Some(caller) = &caller {
             caller.verify_tool("sessions_spawn")?;
@@ -670,7 +685,8 @@ impl SessionsSpawnTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Unknown batch '{batch_id}': no sub-agent run in this session carries that batch id."
+                    "Unknown batch '{batch_id}': no sub-agent run in this session carries that batch id. \
+                     join takes the batch_id returned by spawn_batch (a run id is accepted only while its run is still on file)."
                 )),
             });
         }
@@ -681,6 +697,19 @@ impl SessionsSpawnTool {
             output: serde_json::to_string_pretty(&join_summary(batch_id, &settled))?,
             error: None,
         })
+    }
+
+    /// Whether `id` is the id of a run on file that this caller may see, and
+    /// the batch that run belongs to.
+    async fn run_batch_lookup(&self, id: &str, owner_scope: &sessions_read_model::RunOwnerScope) -> RunBatchLookup {
+        let runs = self.active_runs.read().await;
+        runs.iter()
+            .find(|run| run.id == id && owner_scope.admits(run.owner_id.as_deref(), run.agent_partition.as_ref()))
+            .map_or(RunBatchLookup::NotARun, |run| {
+                run.batch_id
+                    .clone()
+                    .map_or(RunBatchLookup::NoBatch, RunBatchLookup::InBatch)
+            })
     }
 
     /// Who this batch launched.
@@ -724,4 +753,14 @@ impl SessionsSpawnTool {
             })
             .collect()
     }
+}
+
+/// How the id given to `join` relates to the runs on file.
+enum RunBatchLookup {
+    /// The id is a run id; this is the batch that run belongs to.
+    InBatch(String),
+    /// The id is a run id whose run is in no batch.
+    NoBatch,
+    /// The id is not a run id on file: treat it as a batch id.
+    NotARun,
 }
