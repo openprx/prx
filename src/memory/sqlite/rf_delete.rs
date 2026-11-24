@@ -492,7 +492,14 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
         .filter(|row| row.conversational && !row.content.is_empty())
         .map(|row| row.content.as_str())
         .collect::<Vec<_>>();
-    rf_forget::erase_context_pages(tx, target.session_key, attempt.partition(), &direct, &contents)?;
+    rf_forget::erase_context_pages(
+        tx,
+        target.session_key,
+        attempt.partition(),
+        &direct,
+        &attempt.input_event_id,
+        &contents,
+    )?;
     let mut ids = rows.into_iter().map(|row| row.event_id).collect::<Vec<_>>();
     let mut forgotten = tx.execute(
         "DELETE FROM memories WHERE source_event_id IN (SELECT value FROM json_each(?1))",

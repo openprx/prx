@@ -1,6 +1,7 @@
 use crate::agent::compaction::COMPACTION_MAX_SUMMARY_CHARS;
 use crate::agent::context_budget::{estimate_history_tokens, plan_context_budget};
 use crate::agent::document_ingest::DocumentIngestRuntime;
+use crate::agent::page_sources::{MessageSources, PageEventIds};
 #[cfg(test)]
 use crate::agent::history::drop_orphan_tool_results_at;
 use crate::agent::response_guard::strip_quoted_fabricated_tool_markers;
@@ -67,7 +68,7 @@ pub(super) async fn apply_os_paging(
     config: &crate::config::AgentCompactionConfig,
     runtime: Option<&DocumentIngestRuntime>,
 ) -> Result<bool> {
-    let Some(eviction) = plan_os_paging(history, config, runtime).await? else {
+    let Some(eviction) = plan_os_paging(history, &[], config, runtime).await? else {
         return Ok(false);
     };
     eviction.apply_to(history);
@@ -101,8 +102,13 @@ impl OsPagingEviction {
 /// Plan an OS-paging eviction of `history` and write its page to the document
 /// store; the caller applies the returned eviction. `Ok(None)` when nothing is
 /// evicted (all failures are soft, as for [`apply_os_paging`]).
+///
+/// `sources` is index-aligned with `history`; the evicted messages' event ids
+/// are recorded in the page's metadata. A shorter slice records no ids for the
+/// messages it does not cover.
 pub(super) async fn plan_os_paging(
     history: &[ChatMessage],
+    sources: &[MessageSources],
     config: &crate::config::AgentCompactionConfig,
     runtime: Option<&DocumentIngestRuntime>,
 ) -> Result<Option<OsPagingEviction>> {
@@ -157,6 +163,10 @@ pub(super) async fn plan_os_paging(
     }
 
     let transcript = build_page_transcript(to_evict);
+    let page_ids = PageEventIds::from_sources(
+        sources.get(start..evict_end).unwrap_or_default(),
+        runtime.source_message_event_id.as_deref(),
+    );
     let token_count = estimate_history_tokens(to_evict);
     let evicted_message_count: usize = to_evict.len();
     let timestamp = chrono::Utc::now().to_rfc3339();
@@ -170,6 +180,8 @@ pub(super) async fn plan_os_paging(
     hasher.update(session_key.as_bytes());
     hasher.update(b"\0");
     hasher.update(transcript.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(page_ids.hash_bytes());
     let digest = hex::encode(hasher.finalize());
     let short = digest.get(..16).unwrap_or(&digest);
     let document_id = format!("context-page:{session_key}:{short}");
@@ -180,6 +192,8 @@ pub(super) async fn plan_os_paging(
         "evicted_at": timestamp,
         "message_count": to_evict.len(),
         "token_count": token_count,
+        "message_event_ids": page_ids.message_event_ids,
+        "turn_event_ids": page_ids.turn_event_ids,
     })
     .to_string();
     let input = DocumentIngestInput {

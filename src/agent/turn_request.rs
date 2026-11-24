@@ -156,6 +156,11 @@ pub(crate) struct ToolLoopMemory {
     /// Whether the caller compacted or trimmed the view before the turn, so
     /// the view already is a fitting projection of `canonical_history`.
     pub(super) caller_rollover: bool,
+    /// The stored event of each message of the turn's initial view, index for
+    /// index (`None` for a message with no stored event), for a caller whose
+    /// history carries no canonical history of its own (the console). Empty
+    /// when the caller knows none.
+    pub(super) history_event_ids: Vec<Option<String>>,
 }
 
 impl ToolLoopMemory {
@@ -169,6 +174,7 @@ impl ToolLoopMemory {
             tool_surface_reserve: None,
             canonical_history: None,
             caller_rollover: false,
+            history_event_ids: Vec::new(),
         }
     }
 
@@ -202,6 +208,13 @@ impl ToolLoopMemory {
     ) -> Self {
         self.canonical_history = Some(canonical);
         self.caller_rollover = caller_rollover;
+        self
+    }
+
+    /// Record the stored event of each message of the turn's initial view,
+    /// index for index, so an evicted context page names the events it holds.
+    pub(crate) fn with_history_event_ids(mut self, event_ids: Vec<Option<String>>) -> Self {
+        self.history_event_ids = event_ids;
         self
     }
 

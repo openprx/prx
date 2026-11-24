@@ -96,6 +96,7 @@ impl PostgresMemory {
                     content: row.get(3),
                     timestamp: row.get(4),
                     message_id: row.get(5),
+                    message_event_id: None,
                 })
                 .collect();
             turns.reverse();

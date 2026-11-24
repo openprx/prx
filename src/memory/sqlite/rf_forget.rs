@@ -383,14 +383,20 @@ fn page_probe(content: &str) -> Option<String> {
 }
 
 /// Delete the agent's OS-paging context pages of `session_key` that hold a
-/// deleted row: a page ingested during a deleted turn (its source event is a
-/// deleted event) or a page whose text holds a deleted row's text. Pages of
-/// other agents stay. Not counted as forgotten.
+/// deleted row. A page records the event ids it was built from in its
+/// metadata: `message_event_ids` (stored events) and `turn_event_ids` (the
+/// input event of the turn whose own output the page holds). It is deleted
+/// whole when one of its `message_event_ids` is a deleted event (`event_ids`,
+/// a JSON array) or `input_event_id` is among its `turn_event_ids`. A page
+/// without a `message_event_ids` array (written before pages recorded ids) is
+/// matched by its source event or by the text of a deleted row. Pages of other
+/// agents stay. Not counted as forgotten.
 pub(super) fn erase_context_pages(
     tx: &Connection,
     session_key: &str,
     partition: Partition<'_>,
     event_ids: &str,
+    input_event_id: &str,
     contents: &[&str],
 ) -> anyhow::Result<()> {
     let probes = serde_json::to_string(&contents.iter().filter_map(|text| page_probe(text)).collect::<Vec<_>>())?;
@@ -403,10 +409,18 @@ pub(super) fn erase_context_pages(
                               ON o.workspace_id = n.workspace_id AND o.owner_id = n.owner_id
                              AND o.agent_key = n.agent_key AND o.incarnation = n.incarnation
                               WHERE o.scope_id = d.ma_scope_id AND n.scope_id = ?2))
-               AND (d.source_message_event_id IN (SELECT value FROM json_each(?4))
-                    OR (d.source_uri = ?1 AND EXISTS(
-                        SELECT 1 FROM document_chunks c, json_each(?5) p
-                        WHERE c.document_id = d.document_id AND instr(c.content, p.value) > 0)))",
+               AND d.source_uri = ?1
+               AND (EXISTS(SELECT 1 FROM json_each(CASE WHEN json_valid(d.metadata_json) THEN d.metadata_json END,
+                                                       '$.message_event_ids') m
+                           WHERE m.value IN (SELECT value FROM json_each(?4)))
+                    OR EXISTS(SELECT 1 FROM json_each(CASE WHEN json_valid(d.metadata_json) THEN d.metadata_json END,
+                                                       '$.turn_event_ids') t
+                              WHERE t.value = ?7)
+                    OR ((CASE WHEN json_valid(d.metadata_json)
+                              THEN json_type(d.metadata_json, '$.message_event_ids') END) IS NULL
+                        AND (d.source_message_event_id IN (SELECT value FROM json_each(?4))
+                             OR EXISTS(SELECT 1 FROM document_chunks c, json_each(?5) p
+                                       WHERE c.document_id = d.document_id AND instr(c.content, p.value) > 0))))",
         )?;
         statement
             .query_map(
@@ -416,7 +430,8 @@ pub(super) fn erase_context_pages(
                     partition.main,
                     event_ids,
                     probes,
-                    CONTEXT_PAGE_KIND
+                    CONTEXT_PAGE_KIND,
+                    input_event_id
                 ],
                 |row| row.get::<_, String>(0),
             )?

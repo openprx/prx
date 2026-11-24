@@ -302,6 +302,10 @@ pub struct ConversationTurn {
     pub content: String,
     pub timestamp: String,
     pub message_id: Option<String>,
+    /// The `message_events.event_id` this turn was projected from, when the
+    /// turn was written through the event fabric.
+    #[serde(default)]
+    pub message_event_id: Option<String>,
 }
 
 /// Visibility scope for message and memory fabric events.

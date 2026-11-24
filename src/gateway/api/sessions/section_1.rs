@@ -820,6 +820,12 @@ async fn run_console_runtime_turn(
         format!("{}{}", mem_context.preamble, visible_message)
     };
 
+    // The stored event of each history message, index for index: none for the
+    // system prompt, each stored turn's event, then the request's own event.
+    let history_event_ids: Vec<Option<String>> = std::iter::once(None)
+        .chain(previous_turns.iter().map(|turn| turn.message_event_id.clone()))
+        .chain(std::iter::once(turn_envelope.source_message_event_id.clone()))
+        .collect();
     let mut history = Vec::with_capacity(previous_turns.len() + 2);
     history.push(ChatMessage::system(system_prompt));
     // stored console turns are neutralised like fresh input
@@ -942,7 +948,8 @@ async fn run_console_runtime_turn(
                 MemoryFabric::new(state.mem.clone(), turn_envelope.workspace_id.clone())
                     .with_event_recording(config_snapshot.memory.event_recording_config()),
             )
-            .with_request_event_scope(turn_envelope.message_scope()),
+            .with_request_event_scope(turn_envelope.message_scope())
+            .with_history_event_ids(history_event_ids),
         },
         crate::agent::turn_request::TurnDelivery {
             cancellation: Some(decision.cancellation.clone()),

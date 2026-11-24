@@ -258,15 +258,6 @@ fn middleware_messages(history: &[ChatMessage], transformed: &serde_json::Value)
 /// durable compaction changed it: the turn's projection (recalled page,
 /// skill-metadata suppression, inbound middleware) over the canonical
 /// history. The per-provider preflight trims it again before the next request.
-/// Whether this turn's history holds a context handoff: its canonical history
-/// does (a per-request trim may have left the handoff out of the view), or the
-/// provider view does (stored or rendered, both start with the marker). The
-/// one test both the recovery-tool check and its publication use.
-fn turn_holds_context_handoff(turn_history: &TurnHistory, view: &[ChatMessage]) -> bool {
-    crate::agent::compaction::holds_context_handoff(turn_history.canonical(view))
-        || crate::agent::compaction::holds_context_handoff(view)
-}
-
 async fn rederive_provider_view(
     turn_history: &mut TurnHistory,
     history: &mut Vec<ChatMessage>,
@@ -451,6 +442,7 @@ async fn run_turn_unguarded(
         tool_surface_reserve,
         canonical_history,
         caller_rollover,
+        history_event_ids,
     } = memory_runtime;
     // A session authority adopts this turn's durable compactions as patches
     // over its acknowledged history, so the turn must build them from that
@@ -461,7 +453,8 @@ async fn run_turn_unguarded(
     );
     // The canonical history every durable compaction of this turn is built
     // from; `history` is the provider view projected from it.
-    let mut turn_history = TurnHistory::new(history, canonical_history, caller_rollover);
+    let mut turn_history =
+        TurnHistory::new(history, canonical_history, caller_rollover).with_history_event_ids(history_event_ids);
     anyhow::ensure!(
         Arc::ptr_eq(turn_runtime, context.runtime()),
         "turn runtime context differs from the opened decision context"
@@ -521,7 +514,7 @@ async fn run_turn_unguarded(
     // mode above the 0.85 threshold.
     if let Some(config) = compaction_config {
         let switch_needs_lookup = matches!(config.mode, crate::config::AgentCompactionMode::Switch)
-            && (turn_holds_context_handoff(&turn_history, history)
+            && (turn_history.holds_context_handoff(history)
                 || plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD).over_warning);
         if switch_needs_lookup
             && !tools_registry
@@ -549,7 +542,7 @@ async fn run_turn_unguarded(
         if plan_context_budget(history, config, config.os_paging.eviction_threshold).over_warning {
             let canonical = turn_history.canonical_mut(history);
             let before = history_before_change(&runtime_adapter, canonical);
-            match plan_os_paging(canonical.messages(), config, document_ingest.as_ref()).await {
+            match plan_os_paging(canonical.messages(), canonical.sources(), config, document_ingest.as_ref()).await {
                 Ok(Some(eviction)) if canonical.apply_page_eviction(&eviction) => {
                     crate::agent::idle::beat(crate::agent::idle::ProgressKind::Compaction);
                     tracing::debug!("os-paging: pre-turn eviction applied");
@@ -905,7 +898,7 @@ async fn run_turn_unguarded(
         // handoff tells the model to call.
         let context_lookup_required = compaction_config
             .is_some_and(|config| matches!(config.mode, crate::config::AgentCompactionMode::Switch))
-            && turn_holds_context_handoff(&turn_history, history);
+            && turn_history.holds_context_handoff(history);
         if context_lookup_required
             && !selected_tools
                 .iter()

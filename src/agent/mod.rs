@@ -18,6 +18,7 @@ pub(crate) mod history;
 pub mod idle;
 pub(crate) mod live_frames;
 pub mod memory_loader;
+pub(crate) mod page_sources;
 pub mod prompt;
 pub(crate) mod prompt_cache_metrics;
 pub(crate) mod provider_round;

@@ -94,7 +94,7 @@ pub(crate) fn conversation_turns_select_sql(
         "\n                   AND deleted_at IS NULL"
     };
     format!(
-        "SELECT id, session_key, role, content, timestamp, message_id, deleted_at IS NOT NULL
+        "SELECT id, session_key, role, content, timestamp, message_id, deleted_at IS NOT NULL, message_event_id
                  FROM conversation_turns
                  WHERE {session_fragment}
                    AND (

@@ -466,17 +466,25 @@ code). Only memories and documents are forgotten: other tool side effects
 
 **Context pages.** From the commit that advertises `message_forget_writes_v1`,
 every delete (with or without `forget_writes`) also deletes the agent's
-OS-paging context-page documents of the session that hold a deleted row (a
-page written during the deleted turn, or a page whose text holds the deleted
-text). They are not counted in `forgotten`.
+OS-paging context-page documents of the session that hold a deleted row. They
+are not counted in `forgotten`.
 
-How a page is matched today: by the input event of the turn in which the page
-was written, or by the page text containing the first non-blank line of the
-deleted message (at most 64 characters). The match is by text, not by message
-id, so a very short message (for example `ok`) can remove other context pages
-of the same agent and session. Context pages are recall copies; transcripts
-and other sessions are never touched by this match. A client should tell the
-user that deleting a short message may also drop older recall context.
+How a page is matched: a context page records the event ids it was built from
+(`message_event_ids`: the stored events of the paged messages;
+`turn_event_ids`: the input event of the turn, when the page holds that turn's
+own output). A delete removes a page when one of its `message_event_ids` is a
+deleted event, or when the deleted message's input event is in its
+`turn_event_ids`. The match is by message id, so deleting a short message (for
+example `ok`) removes only the pages that hold that message. A page that holds
+the deleted message is removed whole; the page's other messages stay in the
+transcript and are paged again by a later eviction, and are not recallable in
+the meantime. A reply delete does not remove a page that holds only the user
+input. Context pages written before pages recorded ids carry no id arrays and
+are still matched by their source event or by the text of the deleted message
+(its first non-blank line, at most 64 characters); only those older pages can
+be over-matched by a short message. Pages written by the terminal chat carry no
+ids. Context pages are recall copies; transcripts and other sessions are never
+touched by this match.
 
 **Replay.** A resend of a deleted message's key (`POST …/message` with that
 `client_message_id` for that agent) is `409 message_deleted`. The deleted mark

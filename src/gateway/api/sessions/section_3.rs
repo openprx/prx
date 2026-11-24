@@ -538,6 +538,7 @@ mod tests {
                             content: "previous answer".to_string(),
                             timestamp: "2026-05-27T00:00:00Z".to_string(),
                             message_id: Some("previous-event".to_string()),
+                            message_event_id: Some("previous-event".to_string()),
                         }];
 
                         let (runtime, _, _, proof) =

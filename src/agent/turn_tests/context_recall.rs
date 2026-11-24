@@ -974,6 +974,7 @@ fn quoted_turns_and_document_chunks_drop_fabricated_markers_too() {
         content: content.to_string(),
         timestamp: "2026-03-05T00:00:00Z".to_string(),
         message_id: None,
+        message_event_id: None,
     };
     let turns = vec![
         turn("assistant", "Cleaned up. [Used tools: shell, file_write]"),

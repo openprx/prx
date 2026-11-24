@@ -75,6 +75,7 @@ impl SqliteMemory {
                         content: row.get(3)?,
                         timestamp: row.get(4)?,
                         message_id: row.get(5)?,
+                        message_event_id: row.get(7)?,
                     },
                     deleted: row.get(6)?,
                 })
@@ -463,7 +464,7 @@ impl SqliteMemory {
                 let reader = pool.read()?;
                 let conn = reader.connection()?;
                 let mut stmt = conn.prepare(
-                    "SELECT id, session_key, role, content, timestamp, message_id
+                    "SELECT id, session_key, role, content, timestamp, message_id, message_event_id
                      FROM (
                          SELECT
                              ct.id,
@@ -472,6 +473,7 @@ impl SqliteMemory {
                              ct.content,
                              ct.timestamp,
                              ct.message_id,
+                             ct.message_event_id,
                              ROW_NUMBER() OVER (PARTITION BY ct.session_key ORDER BY ct.id DESC) AS row_num
                          FROM conversation_turns ct
                          INNER JOIN (
@@ -501,6 +503,7 @@ impl SqliteMemory {
                             content: row.get(3)?,
                             timestamp: row.get(4)?,
                             message_id: row.get(5)?,
+                            message_event_id: row.get(6)?,
                         })
                     },
                 )?;

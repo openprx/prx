@@ -717,6 +717,7 @@ impl Memory for EncryptedScope {
                     .get("message_id")
                     .and_then(|item| item.as_str())
                     .map(str::to_string),
+                message_event_id: None,
             });
         }
         for turns in out.values_mut() {

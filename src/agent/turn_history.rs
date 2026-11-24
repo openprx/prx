@@ -28,6 +28,7 @@
 
 use crate::agent::compaction::render_context_handoff_for_provider;
 use crate::agent::context_paging::inject_recalled_context;
+use crate::agent::page_sources::MessageSources;
 use crate::agent::tool_evidence::{TurnToolEvidence, render_assistant_content};
 use crate::agent::turn_contracts::{inbound_user_message, stored_turn_message};
 use crate::providers::ChatMessage;
@@ -96,6 +97,9 @@ pub(crate) struct CanonicalHistory {
     /// One evidence slot per message, index for index; only an acknowledged
     /// assistant message's slot can be filled.
     evidence: Vec<Option<Arc<TurnToolEvidence>>>,
+    /// One set of source event ids per message, index for index; an evicted
+    /// context page records the union over its messages.
+    sources: Vec<MessageSources>,
 }
 
 impl PartialEq for CanonicalHistory {
@@ -108,10 +112,12 @@ impl CanonicalHistory {
     fn with_origin(messages: Vec<ChatMessage>, origin: MessageOrigin) -> Self {
         let origins = vec![origin; messages.len()];
         let evidence = vec![None; messages.len()];
+        let sources = vec![MessageSources::default(); messages.len()];
         Self {
             messages,
             origins,
             evidence,
+            sources,
         }
     }
 
@@ -191,6 +197,7 @@ impl CanonicalHistory {
             .collect();
         let mut origins = vec![MessageOrigin::Acknowledged; messages.len()];
         let mut evidence = vec![None; messages.len()];
+        let mut sources = vec![MessageSources::default(); messages.len()];
         for (index, (role, content, turn_evidence)) in turns.into_iter().enumerate() {
             if !matches!(role, "user" | "assistant") {
                 continue;
@@ -203,11 +210,17 @@ impl CanonicalHistory {
             messages.push(stored_turn_message(role.to_owned(), content.to_owned()));
             origins.push(origin);
             evidence.push(turn_evidence.filter(|_| role == "assistant"));
+            sources.push(if origin == MessageOrigin::Request {
+                MessageSources::turn_round()
+            } else {
+                MessageSources::default()
+            });
         }
         Self {
             messages,
             origins,
             evidence,
+            sources,
         }
     }
 
@@ -217,6 +230,7 @@ impl CanonicalHistory {
         self.messages.push(inbound_user_message(request));
         self.origins.push(MessageOrigin::Request);
         self.evidence.push(None);
+        self.sources.push(MessageSources::turn_round());
         self
     }
 
@@ -228,6 +242,34 @@ impl CanonicalHistory {
     /// always supplies one).
     pub(crate) fn of_caller_without_session(messages: &[ChatMessage]) -> Self {
         Self::with_origin(messages.to_vec(), MessageOrigin::CallerSupplied)
+    }
+
+    /// As [`Self::of_caller_without_session`], for a view the running turn
+    /// started with `started_len` messages and then appended to. `event_ids`
+    /// gives the stored event of each started message, index for index
+    /// (`None` for a message with no stored event); it is used only when it
+    /// covers exactly the started messages. The messages after them were
+    /// appended by the running turn.
+    pub(crate) fn of_caller_with_event_ids(
+        messages: &[ChatMessage],
+        started_len: usize,
+        event_ids: &[Option<String>],
+    ) -> Self {
+        let mut canonical = Self::of_caller_without_session(messages);
+        let known = event_ids.len() == started_len;
+        for (index, slot) in canonical.sources.iter_mut().enumerate() {
+            if index >= started_len {
+                *slot = MessageSources::turn_round();
+            } else if known {
+                *slot = MessageSources::stored(event_ids.get(index).and_then(Option::as_deref));
+            }
+        }
+        canonical
+    }
+
+    /// Per message, index for index, the event ids it derives from.
+    pub(crate) fn sources(&self) -> &[MessageSources] {
+        &self.sources
     }
 
     pub(crate) fn messages(&self) -> &[ChatMessage] {
@@ -254,17 +296,27 @@ impl CanonicalHistory {
         self.origins
             .extend(std::iter::repeat_n(MessageOrigin::TurnRound, appended.len()));
         self.evidence.extend(std::iter::repeat_n(None, appended.len()));
+        self.sources
+            .extend(std::iter::repeat_n(MessageSources::turn_round(), appended.len()));
     }
 
     /// Replace `self[start..end]` with `replacement`, every new message of
-    /// `origin` and without evidence. `false` (and `self` unchanged) when the
-    /// range is not inside the history or the per-message lists disagree in
-    /// length.
-    fn splice(&mut self, start: usize, end: usize, replacement: &[ChatMessage], origin: MessageOrigin) -> bool {
+    /// `origin`, without evidence and with `sources`. `false` (and `self`
+    /// unchanged) when the range is not inside the history or the per-message
+    /// lists disagree in length.
+    fn splice(
+        &mut self,
+        start: usize,
+        end: usize,
+        replacement: &[ChatMessage],
+        origin: MessageOrigin,
+        sources: &MessageSources,
+    ) -> bool {
         if start > end
             || end > self.messages.len()
             || self.origins.len() != self.messages.len()
             || self.evidence.len() != self.messages.len()
+            || self.sources.len() != self.messages.len()
         {
             return false;
         }
@@ -273,7 +325,15 @@ impl CanonicalHistory {
             .splice(start..end, std::iter::repeat_n(origin, replacement.len()));
         self.evidence
             .splice(start..end, std::iter::repeat_n(None, replacement.len()));
+        self.sources
+            .splice(start..end, std::iter::repeat_n(sources.clone(), replacement.len()));
         true
+    }
+
+    /// The union of the sources of `self[start..end]`, which a replacement of
+    /// that range derives from.
+    fn range_sources(&self, start: usize, end: usize) -> MessageSources {
+        MessageSources::union(self.sources.get(start..end).unwrap_or_default())
     }
 
     /// The guard of a patch that replaces `self[range_start..]`.
@@ -317,7 +377,8 @@ impl CanonicalHistory {
     ) -> Result<RefreshNotes, crate::agent::turn_contracts::CompactionPatchError> {
         self.check_patch(patch)?;
         let (start, end) = (patch.range_start(), patch.range_end());
-        if !self.splice(start, end, &patch.replacement, MessageOrigin::Acknowledged) {
+        let derived = self.range_sources(start, end);
+        if !self.splice(start, end, &patch.replacement, MessageOrigin::Acknowledged, &derived) {
             return Err(crate::agent::turn_contracts::CompactionPatchError::RangeOutOfBounds {
                 start,
                 end,
@@ -339,7 +400,13 @@ impl CanonicalHistory {
         patch: &crate::agent::turn_contracts::CompactionPatch,
     ) -> Result<(), crate::agent::turn_contracts::CompactionPatchError> {
         let notes = self.apply_patch(patch)?;
-        if !self.splice(notes.at, notes.at, &notes.notes, MessageOrigin::RefreshAside) {
+        if !self.splice(
+            notes.at,
+            notes.at,
+            &notes.notes,
+            MessageOrigin::RefreshAside,
+            &MessageSources::default(),
+        ) {
             return Err(crate::agent::turn_contracts::CompactionPatchError::RangeOutOfBounds {
                 start: notes.at,
                 end: notes.at,
@@ -369,6 +436,7 @@ impl CanonicalHistory {
         if restored {
             self.origins.push(MessageOrigin::Request);
             self.evidence.push(None);
+            self.sources.push(MessageSources::turn_round());
         }
         restored
     }
@@ -382,6 +450,7 @@ impl CanonicalHistory {
             eviction.end,
             std::slice::from_ref(&eviction.breadcrumb),
             MessageOrigin::Acknowledged,
+            &MessageSources::default(),
         ) {
             return false;
         }
@@ -394,6 +463,9 @@ impl CanonicalHistory {
             if behind < self.evidence.len() {
                 self.evidence.remove(behind);
             }
+            if behind < self.sources.len() {
+                self.sources.remove(behind);
+            }
         }
         true
     }
@@ -405,11 +477,13 @@ impl CanonicalHistory {
         let mut kept = Vec::with_capacity(self.messages.len());
         let mut kept_origins = Vec::with_capacity(self.origins.len());
         let mut kept_evidence = Vec::with_capacity(self.evidence.len());
-        for ((message, origin), evidence) in self
+        let mut kept_sources = Vec::with_capacity(self.sources.len());
+        for (((message, origin), evidence), sources) in self
             .messages
             .drain(..)
             .zip(self.origins.drain(..))
             .zip(self.evidence.drain(..))
+            .zip(self.sources.drain(..))
         {
             if origin == MessageOrigin::RefreshAside {
                 lifted.push((kept.len(), message));
@@ -417,11 +491,13 @@ impl CanonicalHistory {
                 kept.push(message);
                 kept_origins.push(origin);
                 kept_evidence.push(evidence);
+                kept_sources.push(sources);
             }
         }
         self.messages = kept;
         self.origins = kept_origins;
         self.evidence = kept_evidence;
+        self.sources = kept_sources;
         lifted
     }
 
@@ -643,6 +719,9 @@ pub(crate) struct TurnHistory {
     absorbed_view_len: usize,
     /// See [`Self::caller_rollover_current`].
     caller_rollover_current: bool,
+    /// The stored event of each message of the view the turn started on, when
+    /// the caller knows them (see [`Self::with_history_event_ids`]).
+    history_event_ids: Vec<Option<String>>,
     projection: ProjectionInputs,
     #[cfg(feature = "wasm-plugins")]
     inbound_middleware_applied: bool,
@@ -671,10 +750,31 @@ impl TurnHistory {
             caller_rollover_current: caller_rollover && canonical.is_some(),
             canonical,
             absorbed_view_len: view.len(),
+            history_event_ids: Vec::new(),
             projection,
             #[cfg(feature = "wasm-plugins")]
             inbound_middleware_applied: false,
         }
+    }
+
+    /// Tell the turn the stored event of each message of the view it starts
+    /// on, index for index (`None` for a message with no stored event). They
+    /// apply only while the view still has that length when the canonical
+    /// history is first taken from it.
+    #[must_use]
+    pub(crate) fn with_history_event_ids(mut self, event_ids: Vec<Option<String>>) -> Self {
+        self.history_event_ids = event_ids;
+        self
+    }
+
+    /// Whether this turn's history holds a context handoff: its canonical
+    /// history does (a per-request trim may have left the handoff out of the
+    /// view), or the provider view does (stored or rendered, both start with
+    /// the marker). The one test both the recovery-tool check and its
+    /// publication use.
+    pub(crate) fn holds_context_handoff(&self, view: &[ChatMessage]) -> bool {
+        crate::agent::compaction::holds_context_handoff(self.canonical(view))
+            || crate::agent::compaction::holds_context_handoff(view)
     }
 
     /// Whether the caller's pre-turn rollover over the canonical history it
@@ -692,8 +792,9 @@ impl TurnHistory {
     fn catch_up(&mut self, view: &[ChatMessage]) -> &mut CanonicalHistory {
         let appended = view.get(self.absorbed_view_len..).unwrap_or_default();
         let absorbed_any = !appended.is_empty();
+        let (started_len, event_ids) = (self.absorbed_view_len, self.history_event_ids.as_slice());
         let canonical = self.canonical.take().map_or_else(
-            || CanonicalHistory::of_caller_without_session(view),
+            || CanonicalHistory::of_caller_with_event_ids(view, started_len, event_ids),
             |mut canonical| {
                 canonical.append_turn_messages(appended);
                 canonical
