@@ -119,7 +119,8 @@ pub struct MemoryConfig {
     /// Purge archived files older than this many days
     #[serde(default = "default_purge_after_days")]
     pub purge_after_days: u32,
-    /// For sqlite backend: prune conversation rows older than this many days
+    /// For sqlite backend: prune conversation rows older than this many days.
+    /// Saved chat sessions (`chat_session:*` keys) are never pruned by this pass.
     #[serde(default = "default_conversation_retention_days")]
     pub conversation_retention_days: u32,
     /// For sqlite backend: prune daily rows older than this many days

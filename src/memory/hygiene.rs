@@ -308,6 +308,7 @@ fn prune_conversation_rows(workspace_dir: &Path, retention_days: u32) -> Result<
     let affected = conn.execute(
         "DELETE FROM memories
          WHERE category = 'conversation'
+           AND substr(key, 1, 13) <> 'chat_session:'
            AND updated_at < ?1
            AND COALESCE(useful_count, 0) < ?2",
         params![cutoff, USEFUL_COUNT_RETENTION_THRESHOLD],
