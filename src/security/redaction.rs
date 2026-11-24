@@ -217,11 +217,11 @@ fn looks_like_a_secret(value: &str) -> bool {
         && value.chars().any(|c| c.is_ascii_alphabetic())
 }
 
-/// A key's segments, lower-cased: split on `_`, `-`, `.` and camelCase
+/// A key's segments, lower-cased: split on `_`, `-`, `.`, `:` and camelCase
 /// (`authToken` -> `auth`, `token`; `APIKey` -> `api`, `key`).
 fn key_segments(key: &str) -> Vec<String> {
     let mut segments = Vec::new();
-    for part in key.split(['_', '-', '.']).filter(|part| !part.is_empty()) {
+    for part in key.split(['_', '-', '.', ':']).filter(|part| !part.is_empty()) {
         let chars: Vec<char> = part.chars().collect();
         let mut current = String::new();
         for (index, c) in chars.iter().enumerate() {
