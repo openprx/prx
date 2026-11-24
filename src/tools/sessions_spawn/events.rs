@@ -148,6 +148,7 @@ pub(super) async fn record_owner_loss_terminal(
 ) -> anyhow::Result<bool> {
     let key = crate::session_worker::protocol::worker_result_key(run_id);
     let code = reason.code();
+    let task_scope = scope.clone();
     let payload = json!({
         "success": false,
         "error": code,
@@ -169,7 +170,31 @@ pub(super) async fn record_owner_loss_terminal(
             || (event.idempotency_key.as_deref() == Some(key.as_str()) && event.run_id.as_deref() == Some(run_id)),
         "process worker result row differs from its run"
     );
-    Ok(event.id > 0 && event.raw_payload_json.as_deref() == Some(payload.as_str()))
+    let created = event.id > 0 && event.raw_payload_json.as_deref() == Some(payload.as_str());
+    if created {
+        // Nobody requested this stop and no writer is left: the child ended
+        // failed, and clients read that from the task event. Only the writer
+        // of the run's single result row records it, so a result the worker
+        // wrote first (and the turn terminal it came with) stays the outcome.
+        let message = format!(
+            "Sub-agent process ended without a result: its owner went away ({code}); cleanup and provider usage remain unconfirmed"
+        );
+        let task_payload = json!({
+            "success": false,
+            "error": message,
+            "result_preview": message,
+            "owner_id": task_scope.owner_id,
+            "reason": code,
+        })
+        .to_string();
+        if let Err(error) = fabric
+            .record_task_event(task_scope, run_id.to_owned(), "task.failed", Some(task_payload))
+            .await
+        {
+            tracing::warn!("failed to record owner-loss task.failed event: {error}");
+        }
+    }
+    Ok(created)
 }
 
 pub(super) async fn record_spawn_result_event(
