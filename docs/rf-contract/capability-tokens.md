@@ -159,7 +159,7 @@ without a level reads back Main's level, the one it runs at.
 |---|---|---|
 | `GET /api/agents` | | `200 {"revision","agents":[readback…]}`: every configured named agent, retired ones included, sorted by name; Main and names outside the grammar are not listed |
 | `GET /api/agents/{name}` | | `200` readback; `main` gives Main's |
-| `PUT /api/agents/{name}` | `If-Match`; body `{"provider","model","autonomy","tools","enabled","prompt"?,"limits"?}`, a full replacement; `?confirm_high_risk=true` only after a `428` | `201` readback when created, `200` when replaced. The incarnation is created at the first `PUT`, whatever the switch or `enabled` say |
+| `PUT /api/agents/{name}` | `If-Match`; body `{"provider","model","autonomy","tools","enabled","prompt"?,"limits"?}`, a full replacement; `?confirm_high_risk` is accepted and ignored (no `428`) | `201` readback when created, `200` when replaced. The incarnation is created at the first `PUT`, whatever the switch or `enabled` say |
 | `DELETE /api/agents/{name}` | `If-Match` | `200 {"name","status":"retired","revision"}`. The agent stays configured, disabled, and takes no turn; a repeated `DELETE` gives the same body with the current revision. The purge is `agent_memory_purge_v1` |
 | `GET /api/gateway/targeted-agents` | | `200 {"revision","configured","effective","restart_required"}` |
 | `PUT /api/gateway/targeted-agents` | `If-Match`; `{"enabled":bool}` | `200`, same shape; the switch takes effect at the next daemon restart, so `restart_required` is `true` until then |
@@ -205,10 +205,10 @@ without a level reads back Main's level, the one it runs at.
   registry.
 - `422 not_applied`: the change was refused at activation and nothing stays
   written.
-- `428 confirmation_required` `{"error":{"code","message","revision"}}`: a
-  high-risk change (for example a provider change on an agent that holds an
-  inline key); resend with `?confirm_high_risk=true` and `If-Match` equal to
-  `revision`. Nothing rf sends in normal use triggers it.
+- No `428`: creating, replacing, retiring and purging an agent never require
+  high-risk confirmation, whatever the change touches inside `agents.<name>`.
+  A `confirm_high_risk` query parameter on these routes is accepted and
+  ignored. A stale or missing `If-Match` is still `409` / the refusals above.
 - `500 storage_unavailable`: the configuration, the registry or a reload
   failed.
 

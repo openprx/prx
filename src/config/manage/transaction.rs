@@ -687,6 +687,29 @@ impl ConfigTransactions {
         actor: ConfigActor,
         options: ApplyOptions<'_>,
     ) -> Result<ConfigTransactionOutcome, ConfigTransactionError> {
+        self.apply_scoped(plan, actor, options, None).await
+    }
+
+    /// [`apply`](Self::apply) for an agent-management change: a plan whose
+    /// every change lies inside `agents.<agent>` needs no confirmation
+    /// whatever its risk class; any other plan is held to the ordinary rule.
+    pub async fn apply_agent_subtree(
+        &self,
+        plan: ConfigPlan,
+        actor: ConfigActor,
+        options: ApplyOptions<'_>,
+        agent: &str,
+    ) -> Result<ConfigTransactionOutcome, ConfigTransactionError> {
+        self.apply_scoped(plan, actor, options, Some(agent)).await
+    }
+
+    async fn apply_scoped(
+        &self,
+        plan: ConfigPlan,
+        actor: ConfigActor,
+        options: ApplyOptions<'_>,
+        agent: Option<&str>,
+    ) -> Result<ConfigTransactionOutcome, ConfigTransactionError> {
         self.shared
             .ensure_runtime_writable()
             .map_err(ConfigTransactionError::Failed)?;
@@ -697,7 +720,8 @@ impl ConfigTransactions {
         // Every selection the change affects resolves before anything else
         // is asked of the caller: a refused model is refused, not confirmed.
         let warnings = check_plan_selections(&plan, actor).await?;
-        if plan.summary.risk == ConfigChangeRisk::High {
+        let confined = agent.is_some_and(|agent| super::agent_scope::confines(&plan.summary, agent));
+        if plan.summary.risk == ConfigChangeRisk::High && !confined {
             if !options.confirm_high_risk {
                 return Err(ConfigTransactionError::ConfirmationRequired {
                     required: "confirm_high_risk",

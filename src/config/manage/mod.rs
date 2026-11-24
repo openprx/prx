@@ -17,6 +17,7 @@
 //! - [`render`]: the one text rendering of a plan;
 //! - [`migrate`]: the legacy-configuration report and migration (PMM-H).
 
+mod agent_scope;
 mod autonomy;
 pub(crate) mod boundary;
 pub mod credentials;

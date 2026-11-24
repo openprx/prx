@@ -193,6 +193,9 @@ pub struct ManagedPlan {
     /// One sentence per selection the change makes that the evidence does
     /// not verify (accepted for the operator, D-034).
     warnings: Vec<String>,
+    /// The agent whose own configuration is the whole change (agent
+    /// management); its plan needs no high-risk confirmation.
+    agent_subtree: Option<String>,
 }
 
 impl std::fmt::Debug for ManagedPlan {
@@ -300,7 +303,14 @@ impl ManagementService {
         let desired = self.shared.desired();
         let candidate = candidate(&desired.config, change)?;
         let revision = ConfigTransactions::base_revision(&desired);
-        self.plan_candidate(candidate, revision, actor).await
+        let mut planned = self.plan_candidate(candidate, revision, actor).await?;
+        planned.agent_subtree = match change {
+            ManagedChange::PutAgent { agent, .. }
+            | ManagedChange::RetireAgent { agent }
+            | ManagedChange::PurgeAgent { agent } => Some(agent.clone()),
+            _ => None,
+        };
+        Ok(planned)
     }
 
     /// Write-only Brave credential planning through the same slot validation,
@@ -354,6 +364,7 @@ impl ManagementService {
             plan,
             revision,
             warnings,
+            agent_subtree: None,
         })
     }
 
@@ -373,6 +384,7 @@ impl ManagementService {
             plan,
             revision,
             warnings,
+            agent_subtree: None,
         })
     }
 
@@ -389,19 +401,25 @@ impl ManagementService {
         actor: ConfigActor,
         confirmed_revision: Option<&str>,
     ) -> Result<ConfigTransactionOutcome, ManageError> {
-        let ManagedPlan { plan, revision, .. } = plan;
-        Ok(self
-            .transactions
-            .apply(
-                plan,
-                actor,
-                ApplyOptions {
-                    expected_revision: revision.as_deref(),
-                    confirm_high_risk: confirmed_revision.is_some(),
-                    confirmed_revision,
-                },
-            )
-            .await?)
+        let ManagedPlan {
+            plan,
+            revision,
+            agent_subtree,
+            ..
+        } = plan;
+        let options = ApplyOptions {
+            expected_revision: revision.as_deref(),
+            confirm_high_risk: confirmed_revision.is_some(),
+            confirmed_revision,
+        };
+        Ok(match agent_subtree.as_deref() {
+            Some(agent) => {
+                self.transactions
+                    .apply_agent_subtree(plan, actor, options, agent)
+                    .await?
+            }
+            None => self.transactions.apply(plan, actor, options).await?,
+        })
     }
 
     /// Plan decision-plane `mutations` (CDP-14, `prx causal config`) over
@@ -504,6 +522,7 @@ impl ManagementService {
                 plan,
                 revision,
                 warnings: Vec::new(),
+                agent_subtree: None,
             },
         )))
     }
