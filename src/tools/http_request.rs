@@ -1268,7 +1268,7 @@ mod tests {
         let (target_listener, target_address) = loopback_listener().await;
         let (proxy_listener, proxy_address) = loopback_listener().await;
         let server = tokio::spawn(async move { serve_one_request(&target_listener, OK_RESPONSE).await });
-        let general = proxy_config(crate::config::ProxyScope::Zeroclaw, &[], proxy_address);
+        let general = proxy_config(crate::config::ProxyScope::Prx, &[], proxy_address);
         assert!(
             general.should_apply_to_service(PROXY_SERVICE_KEY),
             "test setup: ordinary clients would use this proxy"

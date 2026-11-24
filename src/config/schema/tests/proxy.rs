@@ -116,7 +116,7 @@ fn proxy_with_scope(scope: ProxyScope, services: &[&str]) -> ProxyConfig {
 /// an explicit selection; a general or environment proxy is not.
 #[test]
 async fn only_a_services_selector_explicitly_selects_a_service() {
-    let general = proxy_with_scope(ProxyScope::Zeroclaw, &[]);
+    let general = proxy_with_scope(ProxyScope::Prx, &[]);
     assert!(
         general.should_apply_to_service("tool.http_request"),
         "a general proxy still applies to ordinary clients"
@@ -185,13 +185,13 @@ async fn a_saved_environment_scope_loads_with_a_migration_notice() {
         ProxyConfig::ENVIRONMENT_SCOPE_INACTIVE,
         "the notice is the published migration text"
     );
-    for needed in ["inactive", "zeroclaw", "services", "HTTP_PROXY"] {
+    for needed in ["inactive", "prx", "services", "HTTP_PROXY"] {
         assert!(
             notice.contains(needed),
             "the migration notice must mention `{needed}`: {notice}"
         );
     }
-    for scope in [ProxyScope::Zeroclaw, ProxyScope::Services] {
+    for scope in [ProxyScope::Prx, ProxyScope::Services] {
         assert!(
             proxy_with_scope(scope, &["tool.*"])
                 .environment_scope_notice()

@@ -66,7 +66,7 @@ pub enum ProxyScope {
     Environment,
     /// Apply proxy to all OpenPRX-managed HTTP traffic (default).
     #[default]
-    Zeroclaw,
+    Prx,
     /// Apply proxy only to explicitly listed service selectors.
     Services,
 }
@@ -101,7 +101,7 @@ impl Default for ProxyConfig {
             https_proxy: None,
             all_proxy: None,
             no_proxy: Vec::new(),
-            scope: ProxyScope::Zeroclaw,
+            scope: ProxyScope::Prx,
             services: Vec::new(),
         }
     }
@@ -175,7 +175,7 @@ impl ProxyConfig {
     /// `proxy.scope = "environment"`, and what the `proxy_config` tool
     /// answers when asked to set it.
     pub const ENVIRONMENT_SCOPE_INACTIVE: &str = "proxy.scope = \"environment\" is inactive: PRX never writes the \
-         process environment, so the configured proxy URLs route no traffic. Migrate to proxy.scope = \"zeroclaw\" \
+         process environment, so the configured proxy URLs route no traffic. Migrate to proxy.scope = \"prx\" \
          (all PRX traffic; tool `proxy_config` scope 'prx') or to proxy.scope = \"services\" with a proxy.services \
          list; to keep using inherited variables, start PRX with HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY already set";
 
@@ -185,7 +185,7 @@ impl ProxyConfig {
     pub const fn environment_scope_notice(&self) -> Option<&'static str> {
         match self.scope {
             ProxyScope::Environment => Some(Self::ENVIRONMENT_SCOPE_INACTIVE),
-            ProxyScope::Zeroclaw | ProxyScope::Services => None,
+            ProxyScope::Prx | ProxyScope::Services => None,
         }
     }
 
@@ -193,7 +193,7 @@ impl ProxyConfig {
     /// the scope is `services` and `proxy.services` lists the key itself
     /// (trimmed and case-folded like every selector). A wildcard selector
     /// such as `tool.*`, a proxy that merely applies to everything (scope
-    /// `zeroclaw`) and one inherited from the environment are not an
+    /// `prx`) and one inherited from the environment are not an
     /// explicit selection.
     pub fn explicitly_selects_service(&self, service_key: &str) -> bool {
         if self.scope != ProxyScope::Services || !self.has_any_proxy_url() {
@@ -236,7 +236,7 @@ impl ProxyConfig {
 
         match self.scope {
             ProxyScope::Environment => false,
-            ProxyScope::Zeroclaw => true,
+            ProxyScope::Prx => true,
             ProxyScope::Services => {
                 let service_key = service_key.trim().to_ascii_lowercase();
                 if service_key.is_empty() {

@@ -96,7 +96,7 @@ impl ProxyConfigTool {
     fn parse_scope(raw: &str) -> Option<ProxyScope> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "environment" | "env" => Some(ProxyScope::Environment),
-            "prx" | "internal" | "core" => Some(ProxyScope::Zeroclaw),
+            "prx" | "internal" | "core" => Some(ProxyScope::Prx),
             "services" | "service" => Some(ProxyScope::Services),
             _ => None,
         }
@@ -448,7 +448,7 @@ impl Tool for ProxyConfigTool {
     }
 
     fn description(&self) -> &str {
-        "Manage ZeroClaw proxy settings (scope: prx | services): 'get' reads the effective settings, 'set' writes them, 'list_services' lists the routable service selectors; 'apply_env', 'clear_env' and scope 'environment' are refused (PRX never modifies the process environment)"
+        "Manage PRX proxy settings (scope: prx | services): 'get' reads the effective settings, 'set' writes them, 'list_services' lists the routable service selectors; 'apply_env', 'clear_env' and scope 'environment' are refused (PRX never modifies the process environment)"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -849,7 +849,7 @@ mod tests {
                 "scope '{scope}': the refusal is the typed error"
             );
             assert!(
-                error.contains("nothing was changed") && error.contains("zeroclaw") && error.contains("services"),
+                error.contains("nothing was changed") && error.contains("prx") && error.contains("services"),
                 "the refusal must carry the migration text, got {error}"
             );
         }
