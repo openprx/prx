@@ -485,6 +485,11 @@ impl SessionsSpawnTool {
         if let Some(caller) = &batch_caller {
             caller.verify_tool("sessions_spawn")?;
         }
+        // The child partition (Named or None), as every run row stores it.
+        let batch_partition = match &batch_caller {
+            Some(caller) => crate::runtime::child_source::caller_root_partition(caller.context())?,
+            None => None,
+        };
         let batch_owner = batch_caller
             .as_ref()
             .map(|caller| caller.context().envelope.resolved_owner_id())
@@ -577,9 +582,7 @@ impl SessionsSpawnTool {
             rosters.push(BatchRoster {
                 batch_id: batch_id.clone(),
                 owner_id: batch_owner,
-                agent_partition: batch_caller
-                    .as_ref()
-                    .and_then(|caller| caller.context().envelope.agent_partition.clone()),
+                agent_partition: batch_partition,
                 members: roster,
             });
         }

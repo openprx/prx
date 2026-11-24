@@ -129,7 +129,8 @@ impl PreparedBatch {
         }
         let fabric = publication.source_fabric();
         let source = OrdinarySource {
-            partition: caller.envelope.agent_partition.clone(),
+            // The child partition (Named or None), as every run row stores it.
+            partition: crate::runtime::child_source::caller_root_partition(caller)?,
             // The batch parent is the run its members name (a child segment
             // spawns as its task run, CR-CI-3).
             parent_run: publication.spawn_run_id().to_owned(),

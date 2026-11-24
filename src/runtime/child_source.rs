@@ -54,7 +54,7 @@ impl std::error::Error for ChildPartitionUnresolved {}
 
 /// The root partition of a child issued by `caller`. The envelope's partition
 /// must agree with the partition sealed in the caller's parent publication.
-fn caller_root_partition(
+pub(crate) fn caller_root_partition(
     caller: &crate::tools::ToolExecutionContext,
 ) -> Result<Option<crate::memory::AgentPartition>, ChildPartitionUnresolved> {
     let carried = inherited_partition(caller.envelope.agent_partition.as_ref());
