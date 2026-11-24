@@ -1224,28 +1224,15 @@ impl DelegateLoopResources {
         let full = child_source
             .as_ref()
             .is_some_and(|source| source.authority.publication.level() == crate::security::AutonomyLevel::Full);
-        if !answer_only && !full && agent_config.allowed_tools.is_empty() {
-            return Ok(DelegateAgenticExecution {
-                child_terminal_committed: false,
-                result: ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!(
-                        "Agent '{agent_name}' has agentic=true but allowed_tools is empty"
-                    )),
-                },
-                trace: None,
-            });
-        }
-
         let requested = agent_config
             .allowed_tools
             .iter()
             .map(|name| name.trim())
             .filter(|name| !name.is_empty())
             .collect::<std::collections::HashSet<_>>();
-        let inherit_all = answer_only || full || requested.contains("*");
-        if !answer_only && !full && inherit_all && requested.len() != 1 {
+        // An empty `allowed_tools` means all tools, the same as `["*"]`.
+        let inherit_all = answer_only || full || requested.is_empty() || requested.contains("*");
+        if !answer_only && !full && requested.contains("*") && requested.len() != 1 {
             return Ok(DelegateAgenticExecution {
                 child_terminal_committed: false,
                 result: ToolResult {

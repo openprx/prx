@@ -75,10 +75,12 @@ pub struct DelegateAgentConfig {
     /// Max recursion depth for nested delegation
     #[serde(default = "default_max_depth")]
     pub max_depth: u32,
-    /// Enable agentic sub-agent mode (multi-turn tool-call loop).
-    #[serde(default)]
+    /// Agentic sub-agent mode (multi-turn tool-call loop). Default true; an
+    /// explicit `false` makes the agent answer-only with no tools.
+    #[serde(default = "default_agentic")]
     pub agentic: bool,
     /// Allowlist of tool names available to the sub-agent in agentic mode.
+    /// Empty or omitted means all tools, the same as `["*"]`.
     #[serde(default)]
     pub allowed_tools: Vec<String>,
     /// Optional identity files directory relative to workspace root.
@@ -119,7 +121,7 @@ impl DelegateAgentConfig {
             credential_ref: None,
             temperature: None,
             max_depth: default_max_depth(),
-            agentic: false,
+            agentic: default_agentic(),
             allowed_tools: Vec::new(),
             identity_dir: None,
             memory_scope: None,
@@ -128,6 +130,10 @@ impl DelegateAgentConfig {
             autonomy: None,
         }
     }
+}
+
+pub(super) const fn default_agentic() -> bool {
+    true
 }
 
 pub(super) const fn default_agent_enabled() -> bool {

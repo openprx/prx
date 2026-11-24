@@ -4,14 +4,13 @@ use super::*;
 use tokio::test;
 
 #[test]
-async fn config_rejects_empty_agentic_delegate_allowlist() {
+async fn config_accepts_empty_agentic_delegate_allowlist_as_all_tools() {
     let mut config = Config::default();
     config
         .agents
         .insert("worker".into(), agentic_delegate_config(Vec::new()));
 
-    let error = config.validate().unwrap_err().to_string();
-    assert!(error.contains("agents.worker.allowed_tools must not be empty"));
+    config.validate().expect("test: an empty allowlist means all tools");
 }
 
 #[test]

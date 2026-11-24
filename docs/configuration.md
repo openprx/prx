@@ -148,7 +148,7 @@ and the module-gate family are absorbed on load; they are not live switches.
 | `[cost]` | `daily_limit_usd = 10.0`; `monthly_limit_usd = 100.0`; `warn_at_percent = 80`; `allow_override = false`; `prices = {}` (each price: `input`/`output`/`cache_write`/`cache_read = 0`) |
 | `[nodes]` | `request_timeout_ms = 15000`; `retry_max = 2`; `nodes = []`. A node: `id`, `endpoint`, `bearer_token` required; `hmac_secret` unset; `timeout_ms`/`retry_max` unset |
 | `[nodes.server]` | `listen_addr = "127.0.0.1:8787"`; `bearer_token = ""`; `hmac_secret` unset; `sandbox_root = "."`; `exec_timeout_ms = 15000`; `max_output_bytes = 1048576`; `max_concurrent_tasks = 8`; `task_result_ttl_ms = 3600000`; `allowed_commands = ["echo"]`; `blocked_commands = []`; `tls_required = true`; `tls_cert`/`tls_key` unset |
-| `[agents.<name>]` | `provider`/`model` required; `system_prompt`/`api_key`/`credential_ref`/`temperature`/`identity_dir`/`memory_scope`/`spawn_enabled`/`autonomy` unset; `max_depth = 8`; `agentic = false`; `allowed_tools = []`; `enabled = true` |
+| `[agents.<name>]` | `provider`/`model` required; `system_prompt`/`api_key`/`credential_ref`/`temperature`/`identity_dir`/`memory_scope`/`spawn_enabled`/`autonomy` unset; `max_depth = 8`; `agentic = true`; `allowed_tools = []` (empty means all tools, the same as `["*"]`); `enabled = true` |
 | `[media]` | `audio_provider = "none"`; `audio_model = "whisper"`; `audio_ollama_url = "http://localhost:11434"`; `video_provider = "none"`; `video_max_frames = 4`; `max_audio_size_mb = 20`; `max_video_size_mb = 50` |
 | `[decision_engine]` | `enabled = false`; `mode = "pre"`; `prompt_budget_tokens = 300`; `candidates = 5`; `timeout_ms = 1500`; `telemetry_cap = 1000`; `observe_queue = 64`; `latency_budget_ms = 500`; `token_ratio_limit = 0.35`; `max_candidates = 12`; `backend` unset |
 | `[decision_engine.backend]` | optional; absent = `kind = "auto"`, `remote_enabled = false`, `endpoint = ""`, `model = ""`, `pinned_snapshot = ""`, `credential_ref` unset, `timeout_ms = 250`, `max_request_bytes = 65536`, `max_response_bytes = 262144`, `circuit_breaker = { failure_threshold = 5, cooldown_secs = 60 }` |
@@ -829,6 +829,8 @@ max_cost_per_day_cents = 500
 [agents.researcher]
 provider = "anthropic"
 model = "claude-sonnet-4-6"
+# agentic defaults to true; `agentic = false` makes the agent answer-only
+# with no tools. An empty or omitted allowed_tools means all tools.
 agentic = true
 allowed_tools = ["web_search", "file_read"]
 # Targeted turns (`agent` on POST /api/sessions/{id}/message, needs

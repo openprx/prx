@@ -308,7 +308,12 @@ fn named_readback(
     (incarnation, retired): (String, bool),
 ) -> Readback {
     let tools = if agent.agentic {
-        agent.allowed_tools.clone()
+        if agent.allowed_tools.iter().all(|tool| tool.trim().is_empty()) {
+            // Empty means all tools: report it as the wildcard.
+            vec!["*".to_owned()]
+        } else {
+            agent.allowed_tools.clone()
+        }
     } else {
         Vec::new()
     };

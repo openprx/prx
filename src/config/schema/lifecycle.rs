@@ -844,9 +844,7 @@ impl Config {
                 .map(|tool| tool.trim())
                 .filter(|tool| !tool.is_empty())
                 .collect::<Vec<_>>();
-            if allowed_tools.is_empty() {
-                anyhow::bail!("agents.{name}.allowed_tools must not be empty when agentic=true");
-            }
+            // An empty list means all tools, the same as `["*"]`.
             if allowed_tools.contains(&"*") && allowed_tools.len() != 1 {
                 anyhow::bail!("agents.{name}.allowed_tools must use '*' exclusively");
             }

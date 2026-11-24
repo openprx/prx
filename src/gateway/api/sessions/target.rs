@@ -157,10 +157,11 @@ fn allowlist_for(agent: &DelegateAgentConfig) -> Result<ToolAllowlist, TargetErr
         .filter(|name| !name.is_empty())
         .map(str::to_owned)
         .collect();
-    if names.is_empty() || (names.contains("*") && names.len() != 1) {
+    if names.contains("*") && names.len() != 1 {
         return Err(TargetError::ToolsInvalid);
     }
-    if names.contains("*") {
+    // An empty list means all tools, the same as `["*"]`.
+    if names.is_empty() || names.contains("*") {
         Ok(ToolAllowlist::Inherit)
     } else {
         Ok(ToolAllowlist::Only(names))
