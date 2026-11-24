@@ -31,7 +31,7 @@ pub(super) async fn persist_workspace_selection_at(config_path: &Path, default_c
 
 // ── Step 1: Workspace ────────────────────────────────────────────
 
-pub(super) fn setup_workspace(config_dir: Option<&str>) -> Result<(PathBuf, PathBuf)> {
+pub(super) async fn setup_workspace(config_dir: Option<&str>) -> Result<(PathBuf, PathBuf)> {
     let openprx_dir = if let Some(dir) = config_dir {
         PathBuf::from(dir)
     } else {
@@ -53,7 +53,7 @@ pub(super) fn setup_workspace(config_dir: Option<&str>) -> Result<(PathBuf, Path
         }
     };
 
-    let workspace_dir = openprx_dir.join("workspace");
+    let workspace_dir = crate::config::init_workspace_dir(&openprx_dir).await?;
     let config_path = openprx_dir.join("config.toml");
 
     println!(

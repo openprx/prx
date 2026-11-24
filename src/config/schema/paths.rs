@@ -550,6 +550,35 @@ pub async fn resolve_init_target_dir(
     Ok(openprx_dir)
 }
 
+/// The workspace `prx init` scaffolds for `target_dir`.
+///
+/// It is the workspace a later run of the same process environment resolves
+/// for that directory, so the scaffold and the runtime never disagree:
+/// - the global `--config-dir` flag (published by the CLI before init runs)
+///   names `target_dir`: `<target_dir>/workspace`, whatever
+///   `OPENPRX_WORKSPACE` says;
+/// - otherwise, when the environment (`OPENPRX_CONFIG_DIR`, `OPENPRX_WORKSPACE`
+///   or the active-workspace marker) resolves to `target_dir`: the workspace
+///   that resolution names;
+/// - any other directory (for example `init --dir`): `<target_dir>/workspace`.
+///
+/// # Errors
+///
+/// When the default directories or the environment cannot be resolved.
+pub async fn init_workspace_dir(target_dir: &Path) -> Result<PathBuf> {
+    let flag_names_target =
+        process_config_dir().is_some_and(|published| init_targets_are_same_dir(&published, target_dir));
+    if !flag_names_target {
+        let (default_openprx_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
+        let (openprx_dir, workspace_dir, _source) =
+            resolve_runtime_config_dirs(&default_openprx_dir, &default_workspace_dir, None).await?;
+        if init_targets_are_same_dir(&openprx_dir, target_dir) {
+            return Ok(workspace_dir);
+        }
+    }
+    Ok(target_dir.join("workspace"))
+}
+
 pub(super) fn config_dir_creation_error(path: &Path) -> String {
     format!(
         "Failed to create config directory: {}. If running as an OpenRC service, \

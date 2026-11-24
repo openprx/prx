@@ -40,7 +40,7 @@ pub use schema::{
     StreamMode, TaskRoutingConfig, TaskRoutingIntentConfig, TaskRoutingRule, TelegramConfig, ToolTieringConfig,
     TunnelConfig, UserPolicyConfig, WacliConfig, WebSearchConfig, WebhookConfig, WhatsAppConfig, WorkdirError,
     WorkspaceHooks, WorkspaceMcpServers, apply_runtime_proxy_to_builder, bootstrap_max_blocking_threads,
-    build_runtime_proxy_client, build_runtime_proxy_client_with_timeouts, default_openprx_dir, expand_home,
+    build_runtime_proxy_client, build_runtime_proxy_client_with_timeouts, default_openprx_dir, expand_home, init_workspace_dir,
     platform_config_dir, process_config_dir, resolve_init_target_dir, runtime_proxy_config, runtime_proxy_generation,
     set_process_config_dir, user_home_dir,
 };

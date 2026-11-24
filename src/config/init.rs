@@ -65,7 +65,8 @@ impl Spec {
         }
         self.generate(target_dir, force).await?;
         if let Some(decision) = decision {
-            let config = super::Config::load_from_path(&target_dir.join("config.toml"), target_dir.join("workspace"))?;
+            let workspace_dir = super::init_workspace_dir(target_dir).await?;
+            let config = super::Config::load_from_path(&target_dir.join("config.toml"), workspace_dir)?;
             let plan = decision.apply(config).await?;
             print!("{plan}");
             println!("Decision backend configured ({}).", decision.kind.as_str());
@@ -117,7 +118,7 @@ impl Spec {
         // defaults only: every value an operator wrote explicitly is carried over.
         // `--force` is a repair operation, not a reset.
         let main_toml = main_config_template(self);
-        let workspace_dir = target_dir.join("workspace");
+        let workspace_dir = super::init_workspace_dir(target_dir).await?;
         let mut report = InitReport::default();
         let mut preservation = None;
         let mut reset_reason = None;

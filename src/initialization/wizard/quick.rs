@@ -150,7 +150,8 @@ pub async fn run_quick_setup(
         println!("  prx auth login --provider xai --device-code");
         println!("An xAI API key still works via --from-stdin or `api_key` in config.toml.");
     }
-    Config::load_from_path(&target.join("config.toml"), target.join("workspace"))
+    let workspace_dir = crate::config::init_workspace_dir(&target).await?;
+    Config::load_from_path(&target.join("config.toml"), workspace_dir)
 }
 
 #[cfg(test)]

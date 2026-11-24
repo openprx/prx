@@ -156,7 +156,10 @@ pub(crate) async fn run(cli: &Cli) -> Result<()> {
                 .await?
             } else {
                 spec.generate(&target, *force).await?;
-                openprx::config::Config::load_or_init_with_config_dir(config_dir).await?
+                // Same resolution the runtime uses: the global flag, else the
+                // environment. Only `init --dir` names the directory itself.
+                let load_dir = if dir.is_some() { config_dir } else { cli.config_dir.as_deref() };
+                openprx::config::Config::load_or_init_with_config_dir(load_dir).await?
             };
             let config = if let Some(secret) = provider_secret {
                 crate::runtime::host_bootstrap::store_provider_key(config, &secret).await?

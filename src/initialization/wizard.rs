@@ -102,7 +102,7 @@ pub async fn run_wizard(config_dir: Option<&str>, spec: Spec, force: bool) -> Re
     println!();
 
     print_step(1, 9, "Workspace Setup");
-    let (workspace_dir, config_path) = setup_workspace(config_dir)?;
+    let (workspace_dir, config_path) = setup_workspace(config_dir).await?;
     let state_dir = config_path.parent().context("Config path has no parent")?;
 
     print_step(2, 9, "AI Provider & API Key");
@@ -236,7 +236,8 @@ pub async fn run_channels_repair_wizard(config_dir: Option<&str>) -> Result<(Con
         target.join("config.toml").is_file(),
         "Channel repair requires an existing configuration; run prx init first"
     );
-    let mut config = Config::load_from_path(&target.join("config.toml"), target.join("workspace"))?;
+    let workspace_dir = crate::config::init_workspace_dir(&target).await?;
+    let mut config = Config::load_from_path(&target.join("config.toml"), workspace_dir)?;
 
     print_step(1, 1, "Channels (How You Talk to OpenPRX)");
     config.channels_config = setup_channels()?;
