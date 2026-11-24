@@ -19,6 +19,8 @@ pub(crate) mod lesson_delivery;
 pub(crate) mod logical_clock;
 pub mod native;
 pub(crate) mod operator_notice;
+#[cfg(unix)]
+pub(crate) mod descendant_groups;
 pub mod registry;
 pub mod remote_tree;
 mod shell_cgroup;

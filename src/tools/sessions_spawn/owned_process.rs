@@ -282,9 +282,13 @@ impl OwnedProcessGroup {
         }
         #[cfg(unix)]
         {
+            // The worker's shell commands run in groups of their own; snapshot
+            // them before the kill, which orphans them.
+            let foreign = crate::runtime::descendant_groups::foreign_groups_of(self.pgid, self.pgid);
             // SAFETY: `pgid` is captured from a child spawned with
             // `process_group(0)` and is never exposed outside its owner.
             let rc = unsafe { libc::killpg(self.pgid, libc::SIGKILL) };
+            crate::runtime::descendant_groups::kill_groups(&foreign);
             if rc != 0 {
                 let error = std::io::Error::last_os_error();
                 if error.raw_os_error() != Some(libc::ESRCH) {

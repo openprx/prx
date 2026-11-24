@@ -417,8 +417,11 @@ pub(super) async fn run_sub_agent_process(
         .filter(|pid| *pid > 0);
     #[cfg(not(unix))]
     let worker_pgid: Option<i32> = None;
-    let mut worker_registration =
-        crate::runtime::registry::register_process(&format!("session-worker {run_id}"), child.id(), worker_pgid);
+    let mut worker_registration = crate::runtime::registry::register_process(
+        &format!("{}{run_id}", crate::runtime::registry::WORKER_PROCESS_LABEL_PREFIX),
+        child.id(),
+        worker_pgid,
+    );
     #[cfg(test)]
     if let Some(control) = protocol {
         control.diagnostic.lock().registry_id = Some(worker_registration.id().raw());

@@ -62,6 +62,10 @@ use tokio_util::sync::CancellationToken;
 /// unrelated tool calls almost never contend on the same lock.
 const SHARD_COUNT: usize = 16;
 
+/// Label prefix of the process row of a `sessions_spawn` session worker; the
+/// killer also ends the process groups of that worker's descendants.
+pub const WORKER_PROCESS_LABEL_PREFIX: &str = "session-worker ";
+
 /// How long [`kill`] waits for a target to actually disappear before reporting
 /// the request as merely *sent*.
 ///
@@ -967,10 +971,19 @@ fn request_termination(slot: &Slot) -> bool {
 #[allow(unsafe_code)]
 fn kill_process_group(slot: &Slot) -> bool {
     if let Some(pgid) = slot.pgid.filter(|pgid| *pgid > 0) {
+        // A session worker's shell commands run in groups of their own that
+        // `killpg(pgid)` cannot reach, so snapshot them before the worker dies.
+        let foreign = match slot.pid.and_then(|pid| i32::try_from(pid).ok()) {
+            Some(pid) if slot.name.starts_with(WORKER_PROCESS_LABEL_PREFIX) => {
+                crate::runtime::descendant_groups::foreign_groups_of(pid, pgid)
+            }
+            _ => Vec::new(),
+        };
         // SAFETY: `pgid` is the positive group id of a child spawned with
         // `process_group(0)`. `killpg` only delivers a signal; it dereferences
         // no pointer and the call cannot invalidate any Rust invariant.
         unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        crate::runtime::descendant_groups::kill_groups(&foreign);
         return true;
     }
     if let Some(pid) = slot.pid.and_then(|pid| i32::try_from(pid).ok()).filter(|pid| *pid > 0) {
