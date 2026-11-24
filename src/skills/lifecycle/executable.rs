@@ -277,8 +277,15 @@ fn check_tool(bundle: &Bundle, tool: &SkillTool) -> Result<(), ExecutableError> 
 /// was built, and the result of this review is bound to the complete bundle
 /// hash, which covers every script, reference and mode.
 pub fn review_executable_bundle(bundle: &Bundle) -> Result<ExecutableReview, ExecutableError> {
+    review_bundle(bundle, false)
+}
+
+/// The structural review of [`review_executable_bundle`]. `allow_untrusted`
+/// skips only the untrusted-origin marker refusal (an operator-review
+/// concern); every structural check still applies.
+fn review_bundle(bundle: &Bundle, allow_untrusted: bool) -> Result<ExecutableReview, ExecutableError> {
     validate_manifest_strict(bundle).map_err(LifecycleError::from)?;
-    if bundle.file(UNTRUSTED_ORIGIN_MARKER).is_some() {
+    if !allow_untrusted && bundle.file(UNTRUSTED_ORIGIN_MARKER).is_some() {
         return Err(ExecutableError::UntrustedOrigin);
     }
     let tools = declared_tools(bundle)?;
@@ -560,6 +567,11 @@ pub struct PrepareRequest<'a> {
     pub task_id: Option<&'a str>,
     pub arguments: Option<&'a serde_json::Value>,
     pub grant: &'a dyn ToolGrant,
+    /// True for a call at an effective Full level outside the evaluation
+    /// sandbox: the operator-review requirements (untrusted-origin marker,
+    /// review lineage, change since review) are skipped. The pin, bundle
+    /// digest and staging integrity checks always apply.
+    pub skip_review: bool,
 }
 
 /// Resolves a declared tool of a lifecycle-managed skill and stages it.
@@ -587,8 +599,10 @@ pub fn prepare_execution(request: &PrepareRequest<'_>) -> Result<Option<Prepared
     else {
         return Ok(None);
     };
-    review_executable_bundle(&verified.bundle)?;
-    require_review_lineage(&store, &verified)?;
+    review_bundle(&verified.bundle, request.skip_review)?;
+    if !request.skip_review {
+        require_review_lineage(&store, &verified)?;
+    }
     let tools = declared_tools(&verified.bundle)?;
     let tool = tools
         .into_iter()
