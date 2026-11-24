@@ -37,7 +37,6 @@ pub mod file_edit;
 pub mod file_read;
 pub mod file_write;
 pub mod gateway;
-pub mod git_operations;
 pub mod http_request;
 pub mod image;
 pub mod image_info;
@@ -107,7 +106,6 @@ pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
 pub use gateway::GatewayTool;
-pub use git_operations::GitOperationsTool;
 pub use http_request::HttpRequestTool;
 pub use image::ImageTool;
 pub use image_info::ImageInfoTool;
@@ -148,7 +146,6 @@ pub const STATIC_PUBLIC_TOOL_NAMES: &[&str] = &[
     "file_read",
     "file_write",
     "file_edit",
-    "git_operations",
     "web_search_tool",
     "web_fetch",
     "http_request",
@@ -537,7 +534,6 @@ pub fn all_tools_with_runtime_ext_and_extensions(
         Arc::new(FileWriteTool::new(security.clone()).with_workdir(Some(working_root.to_path_buf()))),
         Arc::new(FileEditTool::new(security.clone()).with_workdir(Some(working_root.to_path_buf()))),
         Arc::new(ProxyConfigTool::new(shared_config.clone(), security.clone())),
-        Arc::new(GitOperationsTool::new(security.clone(), working_root.to_path_buf())),
         Arc::new(PushoverTool::new(security.clone(), workspace_dir.to_path_buf())),
         Arc::new(SkillsListTool::new(workspace_dir.to_path_buf(), root_config.clone())),
         Arc::new(SkillReadTool::new(workspace_dir.to_path_buf(), root_config.clone())),
@@ -752,7 +748,7 @@ mod tests {
 
     #[test]
     fn static_public_tool_inventory_is_complete_unique_and_documented() {
-        assert_eq!(STATIC_PUBLIC_TOOL_NAMES.len(), 55);
+        assert_eq!(STATIC_PUBLIC_TOOL_NAMES.len(), 54);
         let unique = STATIC_PUBLIC_TOOL_NAMES.iter().copied().collect::<HashSet<_>>();
         assert_eq!(unique.len(), STATIC_PUBLIC_TOOL_NAMES.len());
 

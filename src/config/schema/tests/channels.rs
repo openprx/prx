@@ -18,7 +18,7 @@ async fn channel_tiering_folds_defaults_in_without_overriding_the_operator() {
         "the default must not touch the operator surface"
     );
 
-    config.always_include.push("git_operations".to_string());
+    config.always_include.push("gateway".to_string());
     config.always_exclude.push("shell".to_string());
     let channel = config.for_channel_surface();
 
@@ -31,7 +31,7 @@ async fn channel_tiering_folds_defaults_in_without_overriding_the_operator() {
         "channel_exclude entries are folded in"
     );
     assert!(
-        !channel.always_exclude.contains(&"git_operations".to_string()),
+        !channel.always_exclude.contains(&"gateway".to_string()),
         "a tool the operator re-enabled must not be folded into the exclusion"
     );
     assert_eq!(

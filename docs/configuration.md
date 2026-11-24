@@ -721,7 +721,7 @@ low_priority_tools = ["sessions_spawn", "delegate"]
 # channel sessions only (Signal / Telegram / Discord / WhatsApp / …) and defaults
 # to the operations/development surface: wasm_plugins_manage, wasm_plugin_reload,
 # wasm_plugins_status, hooks_manage, hooks_status, proxy_config, config_reload,
-# gateway, mcp_status, nodes, git_operations, skills_manage, memory_reindex,
+# gateway, mcp_status, nodes, skills_manage, memory_reindex,
 # document_sync, document_ingest. Terminal chat, the gateway and the console are
 # unaffected. Name a tool in `always_include` to put it back on channels, or set
 # `channel_exclude = []` to drop the default entirely. `always_include` does not
@@ -2216,8 +2216,7 @@ A command hook that runs:
 Writing or editing `hooks.json` or `mcp.json` at the workspace root, or any
 file under `<workspace>/plugins/` (WASM plugin code and manifests), with the
 file tools is a high-risk operation of its own (`write-launch-definition`,
-`edit-launch-definition`); git operations that change those paths are treated
-the same way. Every other surface classifies a `hooks.json`
+`edit-launch-definition`). Every other surface classifies a `hooks.json`
 change the same way: a change that installs, changes or runs a hook command
 (its program, arguments or event) is high risk (`hooks_manage` `replace` and
 `test`, Gateway `POST /api/hooks` and a `PUT /api/hooks/{id}` that sets
@@ -3424,7 +3423,7 @@ three turn limits above replace its former limits. Roll back by setting
 ### Native tool working directory and Full autonomy
 
 `runtime.workdir` optionally selects an absolute, existing directory for the shell,
-native file tools and `git_operations`. `prx chat --workdir /absolute/task` overrides
+and native file tools. `prx chat --workdir /absolute/task` overrides
 it before chat startup (every chat mode, including `--message`); invalid CLI paths fail with exit 2, invalid configuration
 paths with exit 1. The CLI canonicalizes the directory. The default remains the
 workspace directory. Changes require restart and setting or changing the directory
@@ -3455,7 +3454,7 @@ A child's effective level cannot exceed its manifest or the current service leve
 Direct tool calls without runtime authority keep the Supervised behavior.
 Docker continues to use the shell environment allowlist at every level. Native Full
 ignores that allowlist for admission, but invalid entries are still rejected.
-`git_operations`, skill scripts and scheduled shell jobs retain their existing git policy.
+Skill scripts and scheduled shell jobs retain their existing git policy.
 
 ### Named-agent rf admission limits
 

@@ -209,7 +209,6 @@ pub const DEFAULT_CHANNEL_EXCLUDED_TOOLS: &[&str] = &[
     "gateway",
     "mcp_status",
     "nodes",
-    "git_operations",
     "skills_manage",
     "memory_reindex",
     "document_sync",

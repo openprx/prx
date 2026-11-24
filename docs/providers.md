@@ -669,11 +669,11 @@ Fail-closed is **per request**: a turn whose offered tool slice contains even
 one refused tool is not sent at all. The first unrouted turn of the
 fullscreen chat offers the whole registry by design, so on a
 `no_root_combinators` endpoint it is refused unless the tools are excluded.
-On a current build these fourteen published tools carry a root conditional or
+On a current build these thirteen published tools carry a root conditional or
 alternative and are refused:
 
 `chat_profile_update`, `composio`, `cron`, `document_get_chunk`,
-`document_ingest`, `gateway`, `git_operations`, `mcp_call`, `memory_get`,
+`document_ingest`, `gateway`, `mcp_call`, `memory_get`,
 `nodes`, `proxy_config`, `skills_manage`, `subagents`, `xin`
 
 (`tests/tool_schema_contract.rs` pins this list; a change is a finding either

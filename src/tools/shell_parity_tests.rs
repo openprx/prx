@@ -326,15 +326,10 @@ async fn configured_workdir_is_shared_by_shell_files_and_git() {
         write.success && workdir.path().join("relative.txt").exists(),
         "test: native root: {write:?}"
     );
-    let status = direct(
-        find("git_operations"),
-        AutonomyLevel::Full,
-        json!({"operation":"status"}),
-    )
-    .await;
+    let status = direct(find("shell"), AutonomyLevel::Full, json!({"command":"git status --short"})).await;
     assert!(
         status.success && status.output.contains("relative.txt"),
-        "test: hardened git root: {status:?}"
+        "test: shell git root: {status:?}"
     );
     assert!(
         !workspace.path().join("relative.txt").exists(),

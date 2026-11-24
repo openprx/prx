@@ -175,7 +175,7 @@ and defaults to the operations/development surface:
 
 `wasm_plugins_manage`, `wasm_plugin_reload`, `wasm_plugins_status`,
 `hooks_manage`, `hooks_status`, `proxy_config`, `config_reload`, `gateway`,
-`mcp_status`, `nodes`, `git_operations`, `skills_manage`, `memory_reindex`,
+`mcp_status`, `nodes`, `skills_manage`, `memory_reindex`,
 `document_sync`, `document_ingest`.
 
 These are not advertised to the model on a channel turn even when the message

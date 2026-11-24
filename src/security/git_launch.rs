@@ -813,7 +813,7 @@ pub fn warn_operator_git_once(surface: &str, job: &str) {
             job,
             "an operator-configured shell job runs git: fsmonitor, hook scripts, bare discovery, ext:: and lazy \
              fetch are disabled for it, but the repository's own drivers, credential helpers and transport \
-             settings are not inspected; prefer the git_operations tool"
+             settings are not inspected"
         );
     }
 }
@@ -1219,12 +1219,6 @@ fn has_other_hard_links(target: &Path) -> bool {
 const fn has_other_hard_links(_target: &Path) -> bool {
     false
 }
-
-/// The workspace launch definitions (`hooks.json`, `mcp.json` at the
-/// workspace root, and everything under `plugins/`, which holds WASM plugin
-/// code and manifests) as git pathspecs relative to the workspace, matched in
-/// any letter case.
-pub const LAUNCH_DEFINITION_PATHSPECS: [&str; 3] = [":(icase)hooks.json", ":(icase)mcp.json", ":(icase)plugins"];
 
 /// Test support: every git process of the lib tests reads a scratch global
 /// file and no system file, never the host's configuration (D-103). The

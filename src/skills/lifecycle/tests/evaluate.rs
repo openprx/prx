@@ -1732,7 +1732,6 @@ fn only_declared_read_tools_and_declared_writes_can_be_required() {
         "proxy_config",
         "document_ingest",
         "composio",
-        "git_operations",
     ] {
         assert!(ok(&[tool], SideEffects::WorkspaceWrite).is_err(), "{tool}");
     }

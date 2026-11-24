@@ -56,7 +56,6 @@ fn worker_surface_fixture() -> Vec<Box<dyn Tool>> {
         "proxy_config",
         "config_reload",
         "nodes",
-        "git_operations",
         "shell",
     ]
     .into_iter()
@@ -80,7 +79,7 @@ async fn a_process_worker_cannot_regain_the_operations_surface_its_channel_hides
     // fails if `channel_exclude` ever stops hiding the operations tools.
     let surface = crate::config::ToolTieringConfig::default().for_channel_surface();
     let hidden = surface.always_exclude.clone();
-    for name in ["gateway", "proxy_config", "config_reload", "nodes", "git_operations"] {
+    for name in ["gateway", "proxy_config", "config_reload", "nodes"] {
         assert!(
             hidden.iter().any(|entry| entry == name),
             "the default channel surface must hide '{name}' for this fixture to mean anything"
@@ -88,7 +87,7 @@ async fn a_process_worker_cannot_regain_the_operations_surface_its_channel_hides
     }
 
     let filtered = worker_tool_names(&[], &hidden).await;
-    for name in ["gateway", "proxy_config", "config_reload", "nodes", "git_operations"] {
+    for name in ["gateway", "proxy_config", "config_reload", "nodes"] {
         assert!(
             !filtered.iter().any(|entry| entry == name),
             "a worker started from an IM turn must not publish '{name}': {filtered:?}"
@@ -157,7 +156,7 @@ async fn a_worker_manifest_binds_its_channel_exclusions_to_the_tool_filter() {
     let hidden = crate::config::ToolTieringConfig::default()
         .for_channel_surface()
         .always_exclude;
-    for name in ["gateway", "proxy_config", "config_reload", "nodes", "git_operations"] {
+    for name in ["gateway", "proxy_config", "config_reload", "nodes"] {
         assert!(
             hidden.iter().any(|entry| entry == name),
             "the default channel surface must hide '{name}' for this fixture to mean anything"
@@ -169,7 +168,7 @@ async fn a_worker_manifest_binds_its_channel_exclusions_to_the_tool_filter() {
     manifest.channel_excluded_tools = hidden;
 
     let filtered = manifest_tool_names(&manifest).await;
-    for name in ["gateway", "proxy_config", "config_reload", "nodes", "git_operations"] {
+    for name in ["gateway", "proxy_config", "config_reload", "nodes"] {
         assert!(
             !filtered.iter().any(|entry| entry == name),
             "a worker resumed from this manifest must not publish '{name}': {filtered:?}"

@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- BREAKING (agents): the structured `git_operations` tool is removed. Agents
+  run git through the `shell` tool, whose git policy is unchanged: effective
+  Full runs plain git; Supervised and ReadOnly shells refuse git. A
+  configuration that still names `git_operations` (`tool_tiering`,
+  `agents.<name>.allowed_tools`, scope-rule `tools_allow` / `tools_deny`)
+  loads normally; the name matches nothing and is ignored.
 - BREAKING (operators): the legacy decision plane is gone and no decision
   data is carried over. `decisions.db`, `self/causal_tree/.decision_key` and
   `self/child_authority/journal.db` are never opened; if any exists, one

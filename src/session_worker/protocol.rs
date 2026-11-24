@@ -198,7 +198,7 @@ pub struct WorkerManifest {
     /// IM channel and the operations surface, and until 0.8.131 it stopped at
     /// the OS process boundary — a `mode: "process"` spawn, or a worker resumed
     /// from this manifest, got `gateway`, `config_reload`, `proxy_config`,
-    /// `nodes` and `git_operations` back. The list is covered by the manifest
+    /// and `nodes` back. The list is covered by the manifest
     /// capability seal, so a worker cannot be started with it stripped.
     #[serde(default)]
     pub channel_excluded_tools: Vec<String>,

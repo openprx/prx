@@ -1019,7 +1019,7 @@ fn effect_for(descriptor: &ToolDescriptor) -> SideEffectClass {
     match descriptor.effect {
         ToolEffect::Read => SideEffectClass::ReadOnly,
         ToolEffect::Act => match descriptor.public_name.as_str() {
-            "shell" | "git_operations" => SideEffectClass::ProcessExec,
+            "shell" => SideEffectClass::ProcessExec,
             "message_send" | "http_request" => SideEffectClass::ExternalSend,
             "sessions_send" if descriptor.parameters.get("oneOf").is_some() => SideEffectClass::ExternalSend,
             "config_reload" | "proxy_config" => SideEffectClass::CredentialOrConfig,

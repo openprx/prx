@@ -171,7 +171,6 @@ Initial migration covers every multi-action native surface:
 - `mcp`
 - `composio`
 - `message_send`
-- `git_operations`
 - TUI `managed_session`
 - TUI `chat_schedule`
 
@@ -272,7 +271,6 @@ wired in 0.8.133 keep their original test names):
 | `sessions_spawn` | `src/tools/sessions_spawn/tool.rs` |
 | `wasm_plugins_manage` | `src/plugins/runtime.rs` |
 | `mcp_call` | `src/tools/mcp.rs` |
-| `git_operations` (the `stash` sub-action enum) | `src/tools/git_operations.rs` |
 | `gateway` | `src/tools/gateway.rs` |
 | `skills_manage` | `src/tools/skills.rs` |
 | `composio` | `src/tools/composio.rs` |
@@ -282,10 +280,6 @@ wired in 0.8.133 keep their original test names):
 | `chat_schedule` | `src/chat/scheduled_input.rs` |
 | `managed_session` | `src/chat/managed_session.rs` |
 | `hooks_manage` | `src/hooks/mod.rs` |
-
-`git_operations` dispatches on `operation` and carries a second `action` enum
-for the `stash` sub-command; the contract test covers that inner enum, and the
-tool description names both sets.
 
 A new action-dispatched tool is expected to add its own `action_tool_contract`
 test in the same change that introduces the executor branches.

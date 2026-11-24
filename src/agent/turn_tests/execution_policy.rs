@@ -239,7 +239,6 @@ fn is_write_tool_classifies_mutating_tools_as_writes() {
     for name in [
         "file_write",
         "shell",
-        "git_operations",
         "memory_store",
         "memory_forget",
         "memory_reindex",

@@ -10,7 +10,7 @@ and the active WASM generation feed the registry. The resulting immutable
 iteration; see [Unified turn context](unified-turn-context.md) and
 [Runtime security — tool surface owner](security.md#tool-surface-owner).
 
-The complete static public inventory contains 55 tool names. Runtime discovery
+The complete static public inventory contains 54 tool names. Runtime discovery
 can add Skill, MCP, and WASM aliases. MCP aliases remain in the discovery
 catalog and are resolved by exact name; the default MCP tool surface contains
 only `mcp_call`. Its schema does not enumerate configured servers or tools.
@@ -43,7 +43,7 @@ session controls remain available independently.
 | Category | Tools |
 |----------|-------|
 | **Capability discovery** | `capability_search` (tool-capable turns with eligible deferred features) |
-| **Shell & Files** | `shell`, `file_read`, `file_write`, `file_edit`, `git_operations` |
+| **Shell & Files** | `shell`, `file_read`, `file_write`, `file_edit` |
 | **Web** | `web_search_tool`, `web_fetch`, `http_request` |
 | **Memory & Documents** | `memory_store`, `memory_recall`, `memory_search`, `memory_get`, `transcript_history_lookup`, `memory_forget`, `memory_reindex`, `chat_profile_update`, `document_search`, `document_get_chunk`, `document_ingest`, `document_sync` |
 | **Skills** | `skills_list`, `skill_read`, `skills_manage`, `skill_execute`, plus up to 32 declared skill-tool aliases |
@@ -99,11 +99,10 @@ can read, and does not change command authorization or process lifetime.
 
 Effective Full shells run ordinary git, including repository hooks. Supervised
 and ReadOnly shells refuse git before spawning; approval does not change that
-policy. `git_operations` keeps its hardened launch at every level. Skill scripts
-and cron/Xin shell jobs keep their existing git policy.
+policy. Skill scripts and cron/Xin shell jobs keep their existing git policy.
 
 `runtime.workdir` or `prx chat --workdir /absolute/task` selects the working root
-for shell, native file tools and `git_operations`; otherwise they use the workspace.
+for shell and native file tools; otherwise they use the workspace.
 Restricted native file and shell path checks resolve relative requests against
 that root before evaluating forbidden paths and workspace confinement. ReadOnly
 still refuses mutations. Configured roots follow symlinks to their canonical directory.
@@ -279,7 +278,7 @@ partner rather than by the operator. The default excluded set is
 
 `wasm_plugins_manage`, `wasm_plugin_reload`, `wasm_plugins_status`,
 `hooks_manage`, `hooks_status`, `proxy_config`, `config_reload`, `gateway`,
-`mcp_status`, `nodes`, `git_operations`, `skills_manage`, `memory_reindex`,
+`mcp_status`, `nodes`, `skills_manage`, `memory_reindex`,
 `document_sync`, `document_ingest`.
 
 Nothing else is hidden by the channel surface. See
@@ -354,7 +353,7 @@ hides the operations/development surface from a conversation partner:
 
 `wasm_plugins_manage`, `wasm_plugin_reload`, `wasm_plugins_status`,
 `hooks_manage`, `hooks_status`, `proxy_config`, `config_reload`, `gateway`,
-`mcp_status`, `nodes`, `git_operations`, `skills_manage`, `memory_reindex`,
+`mcp_status`, `nodes`, `skills_manage`, `memory_reindex`,
 `document_sync`, `document_ingest`.
 
 These names are folded into that turn's `always_exclude`, so they stay hidden
@@ -365,8 +364,8 @@ the whole default off, set `channel_exclude = []`:
 
 ```toml
 [tool_tiering]
-# Re-enable repository access for channel conversations.
-always_include = ["git_operations"]
+# Re-enable a channel-excluded tool for channel conversations.
+always_include = ["nodes"]
 # Or drop the channel default entirely.
 # channel_exclude = []
 ```
@@ -1575,9 +1574,9 @@ creating surface does not; and a **shell** job (`job_type = "shell"`, or a xin
 policy at all, whoever created it — deny the `cron` and `xin` tools to a scope
 that must not run shell commands.
 
-Git has a separate execution boundary. Use `git_operations` for model-driven
-Git actions; PRX refuses recognized Git command strings in the `shell` tool,
-skill shell/script tools, and
+Git has a separate execution boundary. Effective Full autonomy runs git
+through the `shell` tool; PRX refuses recognized Git command strings in the
+`shell` tool below Full, in skill shell/script tools, and in
 cron or xin shell jobs created or rewritten by an agent tool. Operator-created
 cron and xin shell jobs, xin system tasks, and node `exec_shell` allowlists may
 run Git with fixed program settings and hooks disabled. PRX records who last

@@ -127,8 +127,8 @@ pub enum ShellProcessError {
     /// Effective Full shell, skill, cron and Xin invocations select PlainGit
     /// instead.
     #[error(
-        "refusing to run git through the shell: use the git_operations tool, which disables the programs a \
-         repository's configuration names"
+        "refusing to run git through the shell: a restricted command may not run git, because a repository's \
+         configuration can name programs git would execute"
     )]
     GitRefused,
 }

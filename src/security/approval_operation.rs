@@ -78,28 +78,6 @@ pub(crate) fn grant_op_for_call(tool_name: &str, args: &serde_json::Value) -> Op
             };
             Some(GrantOp::ResourceExact(operation, risk))
         }
-        "git_operations" => {
-            let operation = string_arg("operation").unwrap_or_default();
-            let (resource_operation, risk) = match operation {
-                "push" => (
-                    format!("git_operations:push:{}", string_arg("remote").unwrap_or("origin")),
-                    RiskLevel::High,
-                ),
-                "reset_hard" => ("git_operations:reset_hard".to_string(), RiskLevel::High),
-                "commit" => ("git_operations:commit".to_string(), RiskLevel::Medium),
-                "add" => ("git_operations:add".to_string(), RiskLevel::Medium),
-                "checkout" => {
-                    let branch = string_arg("branch").unwrap_or("unknown");
-                    (format!("git_operations:checkout:{branch}"), RiskLevel::Medium)
-                }
-                "stash" => {
-                    let action = string_arg("stash_action").unwrap_or("push");
-                    (format!("git_operations:stash:{action}"), RiskLevel::Medium)
-                }
-                other => (format!("git_operations:{other}"), RiskLevel::Medium),
-            };
-            Some(GrantOp::ResourceExact(resource_operation, risk))
-        }
         "sessions_send" => {
             let run_id = string_arg("run_id").unwrap_or_default();
             Some(GrantOp::ResourceExact(

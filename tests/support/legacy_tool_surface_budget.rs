@@ -177,15 +177,15 @@ fn always_include_restores_a_channel_excluded_tool() {
     let tools = registry(&tmp);
 
     let mut operator = ToolTieringConfig::default();
-    operator.always_include.push("git_operations".to_string());
+    operator.always_include.push("nodes".to_string());
     let channel = operator.for_channel_surface();
 
-    // `git_operations` is DevOps-tiered, so name the capability too: the point
+    // `nodes` is DevOps-tiered, so name the capability too: the point
     // of this test is the override, not the classifier.
     let channel_specs = specs_for(&tools, "commit this to git", &channel);
     let channel_names = names(&channel_specs);
     assert!(
-        channel_names.contains(&"git_operations"),
+        channel_names.contains(&"nodes"),
         "always_include must survive the channel default: {channel_names:?}"
     );
 }
@@ -268,7 +268,7 @@ fn common_requests_reach_the_tools_they_obviously_need() {
     let tiering = ToolTieringConfig::default();
 
     let cases: [(&str, &[&str]); 8] = [
-        ("commit this change and push the branch", &["git_operations", "shell"]),
+        ("commit this change and push the branch", &["nodes", "shell"]),
         ("search the web for the rustls release notes", &["web_search_tool"]),
         (
             "fetch https://example.com/report and summarise it",
@@ -310,7 +310,7 @@ fn a_request_the_keyword_table_cannot_read_keeps_the_whole_registry() {
     let baseline = specs_for(&tools, "", &tiering);
     let everything = names(&baseline);
     assert!(
-        everything.contains(&"cron") && everything.contains(&"git_operations"),
+        everything.contains(&"cron") && everything.contains(&"nodes"),
         "the fixture's baseline must really be the whole catalog: {everything:?}"
     );
 
@@ -364,7 +364,7 @@ fn a_routed_english_request_is_still_narrowed() {
         routed.len(),
         everything.len()
     );
-    assert!(routed.contains(&"git_operations"), "{routed:?}");
+    assert!(routed.contains(&"nodes"), "{routed:?}");
     assert!(
         !routed.contains(&"cron"),
         "an unnamed Extended capability must stay out: {routed:?}"
@@ -420,7 +420,7 @@ fn a_closing_pleasantry_does_not_widen_an_established_chat_session() {
         "turn 1 must reach web search: {turn1_names:?}"
     );
     assert!(
-        turn2_names.contains(&"git_operations") && turn2_names.contains(&"web_search_tool"),
+        turn2_names.contains(&"nodes") && turn2_names.contains(&"web_search_tool"),
         "turn 2 must add git and keep web search: {turn2_names:?}"
     );
     assert!(

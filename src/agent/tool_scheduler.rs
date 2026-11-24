@@ -21,7 +21,7 @@ static TOOL_BARRIERS: LazyLock<parking_lot::Mutex<HashMap<&'static str, Arc<toki
 fn tool_barrier_key(name: &str) -> Option<&'static str> {
     match name {
         // Workspace mutations / command execution.
-        "file_write" | "shell" | "git_operations" => Some("workspace_write"),
+        "file_write" | "shell" => Some("workspace_write"),
         // Shared runtime configuration / scheduler state.
         "config_reload" | "cron" | "proxy_config" => Some("runtime_config"),
         // Shared long-term memory writes.

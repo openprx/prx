@@ -1611,7 +1611,7 @@ mod tests {
 
     /// D-107: a cron shell job an agent tool created (or one stored before
     /// the creator was recorded) is model-driven, so a command that runs git
-    /// is refused and names the tool to use instead.
+    /// is refused.
     #[tokio::test]
     async fn a_cron_shell_job_that_runs_git_is_refused() {
         let tmp = TempDir::new().unwrap();
@@ -1621,7 +1621,6 @@ mod tests {
         let (success, output) = run_job_command(&config, &job).await;
         assert!(!success);
         assert!(output.contains("refusing to run git through the shell"), "{output}");
-        assert!(output.contains("git_operations"), "{output}");
     }
 
     /// D-107 amendment: a job the operator added with `prx cron` runs git
