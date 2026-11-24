@@ -943,7 +943,13 @@ impl McpTool {
             }
 
             // ── Security gate: strip variables a workspace may not set ──
-            let removed = Self::sanitize_env_vars(&mut converted.env);
+            // At an effective Full level of the install the variables are kept:
+            // they are not secrets, and PRX's own secrets never reach the child.
+            let removed = if full || self.keeps_full_only() {
+                Vec::new()
+            } else {
+                Self::sanitize_env_vars(&mut converted.env)
+            };
             if !removed.is_empty() {
                 tracing::warn!(
                     server = %shown,
