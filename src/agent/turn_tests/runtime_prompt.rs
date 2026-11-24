@@ -37,14 +37,9 @@ fn chat_prompt_states_the_handoff_rule_once() {
     let chat = build_chat_system_prompt(&config, "model", &[], true);
     let runtime = build_runtime_system_prompt(&config, "model", &[], true);
 
-    let expected = usize::from(cfg!(feature = "terminal-tui"));
-    assert_eq!(
-        chat.matches(rule).count(),
-        expected,
-        "the chat prompt states the rule once"
-    );
-    assert!(!runtime.contains(rule), "a prompt outside chat does not state it");
-    if expected == 1 {
+    assert_eq!(chat.matches(rule).count(), 1, "the chat prompt states the rule once");
+    assert_eq!(runtime.matches(rule).count(), 1, "every runtime prompt states it once");
+    if cfg!(feature = "terminal-tui") {
         let evidence = chat
             .find(crate::agent::tool_evidence::TOOL_EVIDENCE_PROMPT_RULE)
             .expect("the evidence rule");

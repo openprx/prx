@@ -71,10 +71,10 @@ pub(crate) fn build_chat_system_prompt(
     skills: &[crate::skills::Skill],
     native_tools: bool,
 ) -> String {
+    // The handoff rule is part of the shared defaults; only the tool-evidence
+    // rule is specific to the reducer-driven terminal chat.
     #[cfg(feature = "terminal-tui")]
-    let builder = crate::agent::prompt::SystemPromptBuilder::with_defaults()
-        .with_tool_evidence_rule()
-        .with_context_handoff_rule();
+    let builder = crate::agent::prompt::SystemPromptBuilder::with_defaults().with_tool_evidence_rule();
     #[cfg(not(feature = "terminal-tui"))]
     let builder = crate::agent::prompt::SystemPromptBuilder::with_defaults();
     build_runtime_system_prompt_with(builder, config, model_name, skills, native_tools)

@@ -57,10 +57,15 @@ pub struct SystemPromptBuilder {
 }
 
 impl SystemPromptBuilder {
+    /// The default sections of every runtime entry surface (chat, gateway,
+    /// channels, workers, children). They include the context-handoff rule, so a
+    /// session whose earlier turns were moved out of its window can always
+    /// look them up again, whichever surface a turn enters through.
     pub fn with_defaults() -> Self {
         Self {
             sections: vec![
                 Box::new(TaskSection),
+                Box::new(ContextHandoffSection),
                 Box::new(SafetySection),
                 Box::new(OrchestrationSection),
                 Box::new(SkillsSection),
@@ -91,6 +96,9 @@ impl SystemPromptBuilder {
     /// tool-evidence rule (or the task section, or ends the prompt).
     #[must_use]
     pub fn with_context_handoff_rule(mut self) -> Self {
+        if self.sections.iter().any(|section| section.name() == "context_handoff") {
+            return self;
+        }
         let at = self
             .sections
             .iter()
@@ -568,6 +576,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 "task",
+                "context_handoff",
                 "safety",
                 "orchestration",
                 "skills",
