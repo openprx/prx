@@ -677,10 +677,13 @@ fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
     let state_file = crate::daemon::state_file_path(config);
 
     if !state_file.exists() {
-        items.push(DiagItem::error(
+        // No state file means no daemon ever ran here (a fresh state
+        // directory): report it as not running, not as a failure. A file that
+        // exists but is unreadable, corrupt or stale stays an error below.
+        items.push(DiagItem::warn(
             cat,
             format!(
-                "state file not found: {} — is the daemon running?",
+                "daemon not running (no state file at {}); start it with `prx daemon`",
                 state_file.display()
             ),
         ));
