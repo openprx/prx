@@ -275,6 +275,7 @@ async fn discovered_mcp_trace_preserves_the_published_server_namespace() {
             server: "prx_service".to_owned(),
             tool: "read".to_owned(),
             state_digest: [7; 32],
+            full_only: false,
             spec: crate::tools::ToolSpec {
                 name: descriptor.public_name,
                 description: descriptor.description,

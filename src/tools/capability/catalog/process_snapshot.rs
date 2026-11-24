@@ -50,6 +50,8 @@ struct Entry {
     availability: CapabilityAvailability,
     #[serde(default = "process_worker_compatible_by_default")]
     process_worker_compatible: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    full_only: bool,
 }
 
 const fn process_worker_compatible_by_default() -> bool {
@@ -90,6 +92,7 @@ impl CapabilityCatalog {
                     exposure: entry.exposure.clone(),
                     availability: entry.availability.clone(),
                     process_worker_compatible: entry.process_worker_compatible,
+                    full_only: entry.full_only,
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -192,6 +195,7 @@ impl CapabilityCatalog {
                     exposure: entry.exposure,
                     availability: entry.availability,
                     process_worker_compatible: entry.process_worker_compatible,
+                    full_only: entry.full_only,
                 },
                 &mut entries,
                 &mut names,

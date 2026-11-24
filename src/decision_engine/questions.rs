@@ -571,6 +571,7 @@ mod tests {
                     server: "prx_server".into(),
                     tool: tool.clone(),
                     state_digest: [1; 32],
+                    full_only: false,
                     spec: ToolSpec {
                         name: format!("mcp__prx_server__{tool}"),
                         description: if index == 0 { "Fixed compact summary".into() } else { "Extra inventory entry".into() },

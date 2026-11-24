@@ -335,6 +335,7 @@ mod tests {
             server: "notes".into(),
             tool: "search".into(),
             state_digest: [0; 32],
+            full_only: false,
             spec: ToolSpec {
                 name: "mcp__notes__search".into(),
                 description: "search notes".into(),
@@ -404,6 +405,7 @@ mod tests {
                 server: server.into(),
                 tool: "search".into(),
                 state_digest: [0; 32],
+                full_only: false,
                 spec: ToolSpec {
                     name: format!("mcp__{server}__search"),
                     description: "search".into(),
@@ -513,6 +515,7 @@ mod tests {
             server: "prx_server".into(),
             tool: "read".into(),
             state_digest: [3; 32],
+            full_only: false,
             spec: ToolSpec {
                 name: "mcp__prx_server__read".into(),
                 description: "MCP".into(),
@@ -569,6 +572,7 @@ mod tests {
             server: "prx_server".into(),
             tool: "read".into(),
             state_digest: [1; 32],
+            full_only: false,
             spec: ToolSpec {
                 name: "mcp__prx_server__read".into(),
                 description: "Read remote data".into(),
@@ -953,6 +957,7 @@ mod tests {
             server: "prx_server".into(),
             tool: "read".into(),
             state_digest: [1; 32],
+            full_only: false,
             spec: ToolSpec {
                 name: "mcp__prx_server__read".into(),
                 description: "Read remote data".into(),
@@ -988,6 +993,7 @@ mod tests {
             server: "prx_server".into(),
             tool: "read".into(),
             state_digest: [1; 32],
+            full_only: false,
             spec: ToolSpec {
                 name: "mcp__prx_server__read".into(),
                 description: "Read remote data".into(),
@@ -1107,6 +1113,7 @@ mod tests {
                         server: "prx_server".into(),
                         tool: format!("read_{index}"),
                         state_digest: [0; 32],
+                        full_only: false,
                         spec: ToolSpec {
                             name: format!("mcp__prx_server__read_{index}"),
                             description: "PRX inventory fixture".into(),
@@ -1142,6 +1149,7 @@ mod tests {
                 server: "prx_server".into(),
                 tool: "read".into(),
                 state_digest: [0; 32],
+                full_only: false,
                 spec: ToolSpec {
                     name: "mcp__prx_server__read".into(),
                     description: "Search local evidence".into(),
@@ -1250,6 +1258,7 @@ mod tests {
                 server: "prx_server".to_string(),
                 tool: format!("tool_{index}"),
                 state_digest: [0; 32],
+                full_only: false,
                 spec: ToolSpec {
                     name: format!("mcp__prx_server__tool_{index}"),
                     description: if index == 4095 {

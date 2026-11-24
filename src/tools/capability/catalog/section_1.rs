@@ -67,6 +67,8 @@ pub(crate) struct CapabilityEntry {
     pub exposure: Exposure,
     pub availability: CapabilityAvailability,
     pub process_worker_compatible: bool,
+    /// An MCP tool the allow/deny lists hide from callers below Full.
+    pub full_only: bool,
 }
 
 impl CapabilityEntry {
@@ -390,6 +392,7 @@ impl CapabilityCatalog {
             )?;
             entry.aliases.push(discovered.tool.clone());
             entry.binding_digest = Some(discovered.state_digest);
+            entry.full_only = discovered.full_only;
             let op = OpId::new(&crate::security::op_id::op_id(
                 "mcp_call",
                 "call",
@@ -951,6 +954,7 @@ fn entry_from_spec(
         exposure,
         availability,
         process_worker_compatible,
+        full_only: false,
     })
 }
 

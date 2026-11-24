@@ -66,6 +66,15 @@ impl PublicationRules<'_, '_> {
         self.facts.policy.autonomy == AutonomyLevel::Full
     }
 
+    /// The level this turn runs at: a child's sealed level, else the
+    /// policy's. A tool tagged `full_only` is published only at Full.
+    fn turn_full(&self) -> bool {
+        self.facts
+            .child_scope()
+            .map_or(self.facts.policy.autonomy, |(manifest, _)| manifest.authority.level)
+            == AutonomyLevel::Full
+    }
+
     fn has_constraint(&self, code: &str) -> bool {
         self.trusted.constraints.iter().any(|item| item.as_str() == code)
     }
@@ -199,6 +208,7 @@ impl PublicationRules<'_, '_> {
             || !self.catalog.contains(&entry.id)
             || matches!(entry.exposure, Exposure::Unavailable { .. })
             || entry.availability.level < CapabilityAvailabilityLevel::Configured
+            || (entry.full_only && !self.turn_full())
         {
             return blocked(3, "unavailable_or_stale");
         }

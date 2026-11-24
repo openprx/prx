@@ -153,6 +153,14 @@ struct RuntimeState {
     /// The registry's held level is Full: per-server allow/deny lists are
     /// not applied to the published catalog.
     full_level: bool,
+    /// A caller that can run at Full exists although the registry's level is
+    /// below Full: tools its allow/deny lists remove stay in the catalog,
+    /// tagged `full_only`.
+    keep_full_only: bool,
+    /// Servers the workspace `mcp.json` narrows, as a caller below Full sees
+    /// them (filled only with `keep_full_only`; `effective_config` then holds
+    /// the unnarrowed definition for Full callers).
+    below_full: HashMap<String, McpServerConfig>,
 }
 
 struct StdioSession {
@@ -279,6 +287,8 @@ pub(crate) struct McpCapabilitySpec {
     /// Digest of the effective launch/routing config. Raw env values never
     /// leave the MCP tool or appear in catalog diagnostics.
     pub state_digest: [u8; 32],
+    /// Hidden from and refused to callers below Full (see `level_view`).
+    pub full_only: bool,
 }
 
 impl McpStatusTool {
@@ -324,6 +334,8 @@ impl McpTool {
             catalog_snapshot: super::SharedToolCatalogSnapshot::default(),
             capability_specs: Vec::new(),
             full_level: security.autonomy == crate::security::AutonomyLevel::Full,
+            keep_full_only: false,
+            below_full: HashMap::new(),
         };
 
         let tool = Self {
@@ -356,7 +368,7 @@ impl McpTool {
     /// (`config.toml` alone when `mcp.json` is unreadable). Reads files
     /// only; starts nothing.
     fn effective_servers(&self) -> HashMap<String, McpServerConfig> {
-        match self.load_workspace_overlay() {
+        match self.load_workspace_overlay(&mut HashMap::new()) {
             Ok(Some((config, _))) => config.servers,
             Ok(None) | Err(_) => self.base_config.servers.clone(),
         }
@@ -519,14 +531,17 @@ impl McpTool {
             state_hasher.update(config_bytes);
             let state_digest: [u8; 32] = state_hasher.finalize().into();
             for (tool, metadata) in tools {
-                // At Full the per-server allow/deny lists are ignored.
-                if !state.full_level && !Self::tool_allowed(server_config, tool) {
+                // At Full the per-server allow/deny lists are ignored. Below
+                // Full a filtered tool is dropped, or kept for Full callers.
+                let full_only = !state.full_level && state.tool_full_only(server, server_config, tool);
+                if full_only && !state.keep_full_only {
                     continue;
                 }
                 snapshot.push(McpCapabilitySpec {
                     server: server.clone(),
                     tool: tool.clone(),
                     state_digest,
+                    full_only,
                     spec: ToolSpec {
                         name: Self::alias_name(&server_config.tool_name_prefix, server, tool),
                         description: metadata
@@ -726,8 +741,20 @@ impl McpTool {
 
     // ── Config loading ──────────────────────────────────────────────
 
+    #[cfg(test)]
     fn load_effective_config_from_json(&self) -> anyhow::Result<Option<McpConfig>> {
-        Ok(self.load_workspace_overlay()?.map(|(config, _)| config))
+        Ok(self.load_effective_config_with_view()?.map(|(config, _)| config))
+    }
+
+    /// The effective config and, with `keep_full_only`, the narrowed view
+    /// of the servers the workspace `mcp.json` narrows.
+    fn load_effective_config_with_view(
+        &self,
+    ) -> anyhow::Result<Option<(McpConfig, HashMap<String, McpServerConfig>)>> {
+        let mut below_full = HashMap::new();
+        Ok(self
+            .load_workspace_overlay(&mut below_full)?
+            .map(|(config, _)| (config, below_full)))
     }
 
     /// One sentence per workspace `mcp.json` entry that did not start as
@@ -735,7 +762,7 @@ impl McpTool {
     /// without an `mcp.json`. Names and transports only, never a value
     /// (D-088 C-7). `mcp_status` and `prx doctor` report these.
     pub fn workspace_server_notes(&self) -> Vec<String> {
-        match self.load_workspace_overlay() {
+        match self.load_workspace_overlay(&mut HashMap::new()) {
             Ok(Some((_, notes))) => notes,
             Ok(None) => Vec::new(),
             Err(error) => vec![format!(
@@ -753,7 +780,10 @@ impl McpTool {
     /// that leaves no tool): a non-empty `mcp.json` never silently empties
     /// the configured set (D-088 C-7).
     #[allow(clippy::too_many_lines)]
-    fn load_workspace_overlay(&self) -> anyhow::Result<Option<(McpConfig, Vec<String>)>> {
+    fn load_workspace_overlay(
+        &self,
+        below_full: &mut HashMap<String, McpServerConfig>,
+    ) -> anyhow::Result<Option<(McpConfig, Vec<String>)>> {
         if !self.mcp_json_path.exists() {
             return Ok(None);
         }
@@ -805,6 +835,11 @@ impl McpTool {
                     continue;
                 }
                 match Self::narrowed(base_server, &server.allow_tools, &server.deny_tools) {
+                    // With a Full caller the definition stays whole and the
+                    // narrowed one is the view of callers below Full.
+                    Some(narrowed) if self.keeps_full_only() => {
+                        below_full.insert(name, narrowed);
+                    }
                     Some(narrowed) => {
                         cfg.servers.insert(name, narrowed);
                     }
@@ -1502,12 +1537,12 @@ impl McpTool {
         // stale configuration or browser/session state from the old generation.
         self.close_stdio_sessions().await;
 
-        let (new_config, config_error) = match self.load_effective_config_from_json() {
-            Ok(Some(from_file)) => (from_file, None),
-            Ok(None) => (self.base_config.clone(), None),
+        let (new_config, below_full, config_error) = match self.load_effective_config_with_view() {
+            Ok(Some((from_file, below_full))) => (from_file, below_full, None),
+            Ok(None) => (self.base_config.clone(), HashMap::new(), None),
             Err(error) => {
                 tracing::warn!(path = %self.mcp_json_path.display(), error = %error, "MCP config reload failed");
-                (self.base_config.clone(), Some(error.to_string()))
+                (self.base_config.clone(), HashMap::new(), Some(error.to_string()))
             }
         };
 
@@ -1532,6 +1567,7 @@ impl McpTool {
         let mut state = self.state.write();
         state.mcp_state_epoch = state.mcp_state_epoch.saturating_add(1);
         state.effective_config = new_config;
+        state.below_full = below_full;
         state.discovered_tools = discovered;
         state.discovery_errors = discovery_errors;
         state.config_error = config_error;
@@ -1554,15 +1590,16 @@ impl McpTool {
             return;
         }
 
-        let (new_config, config_error) = match self.load_effective_config_from_json() {
-            Ok(Some(from_file)) => (from_file, None),
-            Ok(None) => (self.base_config.clone(), None),
-            Err(error) => (self.base_config.clone(), Some(error.to_string())),
+        let (new_config, below_full, config_error) = match self.load_effective_config_with_view() {
+            Ok(Some((from_file, below_full))) => (from_file, below_full, None),
+            Ok(None) => (self.base_config.clone(), HashMap::new(), None),
+            Err(error) => (self.base_config.clone(), HashMap::new(), Some(error.to_string())),
         };
 
         let mut state = self.state.write();
         state.mcp_state_epoch = state.mcp_state_epoch.saturating_add(1);
         state.effective_config = new_config;
+        state.below_full = below_full;
         state.discovered_tools.clear();
         state.discovery_errors.clear();
         state.config_error = config_error;
@@ -1602,7 +1639,7 @@ impl McpTool {
                 published.and_then(|entry| entry.binding_digest()),
             )?;
             let server = Self::resolve_server(&state.effective_config, &server_name)?;
-            if !self.call_full() && !Self::tool_allowed(server, &tool_name) {
+            if !self.call_full() && state.tool_full_only(&server_name, server, &tool_name) {
                 bail!("Tool '{tool_name}' is blocked by allow/deny rules for MCP server '{server_name}'");
             }
             if let Some(discovered) = state.discovered_tools.get(&server_name)
@@ -4167,6 +4204,8 @@ for line in sys.stdin:
         assert!(!tool.is_command_allowed("custom-server", "my-tool"));
     }
 }
+
+pub(super) mod level_view;
 
 #[cfg(test)]
 mod dispatch_binding_tests;

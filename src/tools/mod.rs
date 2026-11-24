@@ -626,7 +626,8 @@ pub fn all_tools_with_runtime_ext_and_extensions(
     // outside the agent's workspace (D-088 C-3).
     // Never inside the workspace: without a configuration directory, only a
     // server with an absolute `working_dir` starts (D-095 N-4).
-    let mut mcp_tool = McpTool::new(security.clone(), config.mcp.clone(), workspace_dir.to_path_buf());
+    let mut mcp_tool = McpTool::new(security.clone(), config.mcp.clone(), workspace_dir.to_path_buf())
+        .with_full_caller(mcp::level_view::has_full_agent(agents));
     if let Some(config_dir) = root_config
         .config_path
         .parent()

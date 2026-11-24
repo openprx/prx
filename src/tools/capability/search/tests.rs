@@ -253,6 +253,7 @@ fn ranked_search_preserves_mixed_alias_and_tokenizer_contracts() {
                 server: "prx_server".into(),
                 tool: "shared_alias".into(),
                 state_digest: [0; 32],
+                full_only: false,
                 spec: ToolSpec {
                     name: "mcp__prx_server__first".into(),
                     description: "alpha beta evidence".into(),
@@ -263,6 +264,7 @@ fn ranked_search_preserves_mixed_alias_and_tokenizer_contracts() {
                 server: "prx_server".into(),
                 tool: "shared_alias".into(),
                 state_digest: [0; 32],
+                full_only: false,
                 spec: ToolSpec {
                     name: "mcp__prx_server__second".into(),
                     description: "beta alpha alpha evidence".into(),
@@ -273,6 +275,7 @@ fn ranked_search_preserves_mixed_alias_and_tokenizer_contracts() {
                 server: "prx_server".into(),
                 tool: "mcp__prx_server__duplicate".into(),
                 state_digest: [0; 32],
+                full_only: false,
                 spec: ToolSpec {
                     name: "mcp__prx_server__duplicate".into(),
                     description: "beta evidence".into(),

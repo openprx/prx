@@ -485,6 +485,7 @@ async fn pinned_mcp_alias_uses_catalog_operation_and_rejects_changed_live_target
         server: "prx_server__nested".into(),
         tool: "action".into(),
         state_digest: [7; 32],
+        full_only: false,
         spec: ToolSpec {
             name: alias.into(),
             description: "project action".into(),
