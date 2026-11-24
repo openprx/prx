@@ -660,9 +660,17 @@ impl McpTool {
         Ok(())
     }
 
-    /// Whether this registry runs at Full (its held policy's level).
+    /// Whether this registry runs at Full (its held policy's level). Used
+    /// for load-time decisions, which have no call.
     fn full(&self) -> bool {
         self.security.autonomy == crate::security::AutonomyLevel::Full
+    }
+
+    /// Whether the current call runs at Full: the per-call level the
+    /// execution service set, else the held policy's level. Used for
+    /// dispatch-time decisions.
+    fn call_full(&self) -> bool {
+        crate::tools::effective_autonomy::call_policy(&self.security).autonomy == crate::security::AutonomyLevel::Full
     }
 
     /// Validate that a stdio server's command is safe to execute.
@@ -1594,7 +1602,7 @@ impl McpTool {
                 published.and_then(|entry| entry.binding_digest()),
             )?;
             let server = Self::resolve_server(&state.effective_config, &server_name)?;
-            if !self.full() && !Self::tool_allowed(server, &tool_name) {
+            if !self.call_full() && !Self::tool_allowed(server, &tool_name) {
                 bail!("Tool '{tool_name}' is blocked by allow/deny rules for MCP server '{server_name}'");
             }
             if let Some(discovered) = state.discovered_tools.get(&server_name)
@@ -1609,7 +1617,7 @@ impl McpTool {
 
         match server.transport {
             McpTransport::Stdio => self.call_stdio(&server_name, &server, &tool_name, arguments).await,
-            McpTransport::Http => Self::call_http(&server_name, &server, &tool_name, arguments, self.full()).await,
+            McpTransport::Http => Self::call_http(&server_name, &server, &tool_name, arguments, self.call_full()).await,
         }
     }
 }
