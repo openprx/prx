@@ -922,13 +922,19 @@ mod local {
         })
     }
 
+    /// The kernel reported a filesystem magic number that is not a valid
+    /// unsigned value, so it cannot match any admitted local filesystem.
+    #[derive(Debug, thiserror::Error)]
+    #[error("filesystem type reported by the kernel is out of range")]
+    struct FilesystemTypeOutOfRange;
+
     /// Only known local filesystems are admitted. NFS/CIFS/FUSE and unknown
     /// types cannot supply this single-host lifetime proof.
     fn local_filesystem(file: &File) -> anyhow::Result<()> {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             let stat = rustix::fs::fstatfs(file)?;
-            let kind = stat.f_type as u64;
+            let kind = u64::try_from(stat.f_type).map_err(|_| FilesystemTypeOutOfRange)?;
             anyhow::ensure!(
                 matches!(
                     kind,
