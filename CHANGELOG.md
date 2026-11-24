@@ -137,7 +137,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `http_request` tools resolve a host once, refuse it when any address is
   private or local, and connect to exactly the checked address (DNS
   rebinding); `web_fetch` does so for every redirect hop. Both now connect
-  directly: a general proxy (`proxy.scope = "zeroclaw"`) and inherited
+  directly: a general proxy (`proxy.scope = "prx"`) and inherited
   `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` are no longer used by them, because
   a proxy resolves the name itself. `http_request` uses the proxy only with
   `proxy.scope = "services"` and the exact key `tool.http_request` in
@@ -147,7 +147,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - BREAKING (operators): PRX no longer writes the process environment.
   `proxy.scope = "environment"` is inactive: a saved configuration that has
   it still loads, with one warning, and its proxy URLs route no traffic.
-  Migrate to `proxy.scope = "zeroclaw"` (all PRX traffic) or to
+  Migrate to `proxy.scope = "prx"` (all PRX traffic) or to
   `proxy.scope = "services"` with `proxy.services`; to rely on inherited
   variables, start PRX with them set. The agent `proxy_config` tool refuses
   `set` with scope `environment`, `apply_env` and `clear_env`, and changes
@@ -166,6 +166,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- BREAKING (operators): the general proxy scope value (`proxy.scope`) is now
+  `"prx"`; the previous value is no longer accepted and a configuration that
+  still has it fails to load.
 - BREAKING (operators): recursive delegation is on by default, so a child
   session equals the main session. Omitting `allow_delegation` on
   `sessions_spawn` gives a child that can spawn its own children, bounded only
