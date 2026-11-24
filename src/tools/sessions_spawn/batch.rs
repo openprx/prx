@@ -29,6 +29,10 @@ pub(super) struct BatchRoster {
     /// The owner the batch was launched for (OWNER-VIS): `join` answers a
     /// batch only to a caller whose run scope admits this owner.
     pub(super) owner_id: Option<String>,
+    /// The session that launched the batch, when known. Only the durable plan
+    /// records it; `join` uses it to tell the spawning session from another
+    /// session of the same owner.
+    pub(super) parent_session: Option<String>,
     pub(super) members: Vec<BatchMember>,
 }
 
@@ -583,6 +587,9 @@ impl SessionsSpawnTool {
                 batch_id: batch_id.clone(),
                 owner_id: batch_owner,
                 agent_partition: batch_partition,
+                parent_session: batch_caller
+                    .as_ref()
+                    .map(|caller| caller.context().envelope.session_key.clone()),
                 members: roster,
             });
         }
@@ -675,7 +682,7 @@ impl SessionsSpawnTool {
             }
             RunBatchLookup::NotARun => {}
         }
-        let mut members = self
+        let (mut members, mut launcher_session) = self
             .journal_or_registry_members(source_fabric.as_ref(), &batch, owner_scope, &mut trace)
             .await?;
         // Only an id that is no known batch is looked up as a run id, so a
@@ -686,7 +693,7 @@ impl SessionsSpawnTool {
                 Self::scan_batch_of_run(source_fabric.as_ref(), None, batch_id, owner_scope).await?
             {
                 batch = found;
-                members = self
+                (members, launcher_session) = self
                     .journal_or_registry_members(source_fabric.as_ref(), &batch, owner_scope, &mut trace)
                     .await?;
             }
@@ -704,6 +711,26 @@ impl SessionsSpawnTool {
         }
 
         drop(trace);
+        // The durable plan admits every session of the owner, but member
+        // results live only in the registry of the process that ran them. A
+        // session other than the launcher that cannot find a member's row
+        // would be handed a summary of `no_result` entries; refuse instead.
+        let caller_session = caller.as_ref().map(|caller| caller.context().envelope.session_key.as_str());
+        if let (Some(launcher), Some(current)) = (launcher_session.as_deref(), caller_session) {
+            if launcher != current {
+                let runs = self.active_runs.read().await;
+                if members.iter().any(|member| !runs.iter().any(|run| run.id == member.run_id)) {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "Unknown batch '{batch_id}': no sub-agent run in this session carries that batch id. \
+                             join takes the batch_id returned by spawn_batch, from the session that launched it."
+                        )),
+                    });
+                }
+            }
+        }
         let settled = join_batch_members(&self.active_runs, &members).await;
         Ok(ToolResult {
             success: true,
@@ -720,7 +747,7 @@ impl SessionsSpawnTool {
         batch: &str,
         owner_scope: &sessions_read_model::RunOwnerScope,
         trace: &mut JoinTrace,
-    ) -> anyhow::Result<Vec<BatchMember>> {
+    ) -> anyhow::Result<(Vec<BatchMember>, Option<String>)> {
         let recorded = if let Some(fabric) = fabric {
             batch_journal::read(fabric, std::path::Path::new(fabric.workspace_id()), batch, owner_scope).await?
         } else {
@@ -728,8 +755,8 @@ impl SessionsSpawnTool {
         };
         trace.journal_roster |= recorded.is_some();
         Ok(match recorded {
-            Some(roster) => roster.members,
-            None => self.batch_members(batch, owner_scope).await,
+            Some(roster) => (roster.members, roster.parent_session),
+            None => (self.batch_members(batch, owner_scope).await, None),
         })
     }
 

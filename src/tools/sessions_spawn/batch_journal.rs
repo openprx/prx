@@ -288,6 +288,7 @@ pub(super) async fn read(
         batch_id: batch.to_owned(),
         owner_id: Some(plan_fields.owner),
         agent_partition: plan_fields.ordinary_source.partition,
+        parent_session: Some(plan_fields.ordinary_source.parent_session),
         members: plan_fields
             .members
             .into_iter()
