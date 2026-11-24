@@ -304,6 +304,61 @@ pub(super) async fn read(
     }))
 }
 
+/// The batch whose durable plan names `run`, among the plans `owner` wrote,
+/// or `None` when no visible batch holds it. A candidate is accepted only
+/// after [`read`] has verified its seal and admitted it to `owners`.
+pub(super) async fn batch_of_run(
+    fabric: &MemoryFabric,
+    owner: &str,
+    run: &str,
+    owners: &crate::tools::sessions_read_model::RunOwnerScope,
+) -> anyhow::Result<Option<String>> {
+    const PAGE: usize = 128;
+    const MAX_PAGES: usize = 16;
+    let mut after = 0;
+    for _ in 0..MAX_PAGES {
+        let page = fabric
+            .memory()
+            .list_owned_message_events_by_type(fabric.workspace_id(), owner, "worker.batch.plan", after, PAGE)
+            .await?;
+        for event in &page {
+            after = after.max(event.id);
+            let Some(batch) = event
+                .idempotency_key
+                .as_deref()
+                .and_then(|key| key.strip_prefix("batch:"))
+                .and_then(|key| key.strip_suffix(":plan"))
+            else {
+                continue;
+            };
+            // Cheap unauthenticated filter; the sealed read below decides.
+            let names_run = event
+                .raw_payload_json
+                .as_deref()
+                .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+                .and_then(|payload| {
+                    payload.pointer("/fields/members").and_then(serde_json::Value::as_array).map(|members| {
+                        members
+                            .iter()
+                            .any(|member| member.get("run_id").and_then(serde_json::Value::as_str) == Some(run))
+                    })
+                })
+                .unwrap_or(false);
+            if !names_run {
+                continue;
+            }
+            let roster = read(fabric, std::path::Path::new(fabric.workspace_id()), batch, owners).await?;
+            if roster.is_some_and(|roster| roster.members.iter().any(|member| member.run_id == run)) {
+                return Ok(Some(batch.to_owned()));
+            }
+        }
+        if page.len() < PAGE {
+            break;
+        }
+    }
+    Ok(None)
+}
+
 fn verify(
     event: &crate::memory::MessageEvent,
     workspace: &str,
