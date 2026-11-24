@@ -1056,7 +1056,7 @@ async fn run_owned_manifest(
                         }
                     }
                     if initial_input {
-                        let user_task = if child_turn.is_some() {
+                        let mut user_task = if child_turn.is_some() {
                             raw_task.to_owned()
                         } else {
                             let shared_context =
@@ -1067,6 +1067,9 @@ async fn run_owned_manifest(
                                 format!("{shared_context}{raw_task}")
                             }
                         };
+                        if child_turn.is_none() {
+                            crate::agent::turn_contracts::push_current_time_tail(&mut user_task);
+                        }
                         segment_history.push(crate::agent::turn_contracts::inbound_user_message(&user_task));
                     }
                     if let (Some(turn), Some(segments)) = (child_turn.as_ref(), child_segments.as_ref()) {

@@ -1224,11 +1224,12 @@ async fn run_gateway_chat_with_multimodal(
                 crate::agent::context_recall::RECALL_CONTEXT_BUDGET,
             )
             .await;
-            let enriched_message = if mem_context.preamble.is_empty() {
+            let mut enriched_message = if mem_context.preamble.is_empty() {
                 message.to_string()
             } else {
                 format!("{}{}", mem_context.preamble, message)
             };
+            crate::agent::turn_contracts::push_current_time_tail(&mut enriched_message);
 
             let user_messages = vec![crate::agent::turn_contracts::inbound_user_message(&enriched_message)];
             let image_marker_count = crate::multimodal::count_image_markers(&user_messages);

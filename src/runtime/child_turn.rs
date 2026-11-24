@@ -232,11 +232,9 @@ impl ChildSegmentTurn {
             input.content == self.proof.routing_input(),
             "child segment history differs from its admitted input"
         );
-        if self.recalled_context.is_empty() {
-            return Ok(());
-        }
         let mut enriched = self.recalled_context.clone();
         enriched.push_str(&input.content);
+        crate::agent::turn_contracts::push_current_time_tail(&mut enriched);
         *input = crate::agent::turn_contracts::inbound_user_message(&enriched);
         Ok(())
     }

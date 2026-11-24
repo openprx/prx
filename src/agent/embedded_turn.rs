@@ -494,6 +494,7 @@ async fn run_work(
         enriched.push('\n');
     }
     enriched.push_str(input);
+    crate::agent::turn_contracts::push_current_time_tail(&mut enriched);
     history.push(crate::agent::turn_contracts::inbound_user_message_owned(enriched));
     let mut history = HistoryWriteback {
         target: &mut agent.history,

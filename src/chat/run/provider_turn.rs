@@ -142,11 +142,12 @@
         let routing_input = admitted_binding.routing_input().to_owned();
         let mem_context = admitted_binding.recalled_context(mem.as_ref()).await;
         let context = mem_context.preamble.clone();
-        let enriched = if context.is_empty() {
+        let mut enriched = if context.is_empty() {
             user_input_for_prompt.clone()
         } else {
             format!("{context}{user_input_for_prompt}")
         };
+        crate::agent::turn_contracts::push_current_time_tail(&mut enriched);
 
         // Build system prompt with skill selection
         let selected_skills = admitted_binding.prompt_skills()?;

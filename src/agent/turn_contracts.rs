@@ -229,6 +229,19 @@ pub(crate) fn inbound_user_message(text: &str) -> ChatMessage {
     ChatMessage::user(neutralize_reserved_markers(text))
 }
 
+/// Appends the current local date and time to the end of the live user message
+/// the provider receives. The system prompt carries only the time zone, so its
+/// bytes stay identical between turns; the clock rides in the one message that
+/// is new every turn.
+pub(crate) fn push_current_time_tail(content: &mut String) {
+    use std::fmt::Write as _;
+    let _ = write!(
+        content,
+        "\n\n[Current date and time: {}]",
+        chrono::Local::now().format("%A, %Y-%m-%d %H:%M %:z")
+    );
+}
+
 /// Fresh inbound text already owned by the caller. Preserve its allocation
 /// unless a reserved opening needs the same escape as borrowed input.
 pub(crate) fn inbound_user_message_owned(text: String) -> ChatMessage {

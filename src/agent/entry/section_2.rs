@@ -741,11 +741,12 @@ pub(crate) async fn run_with_runtime_envelope(
                 )
                 .await;
                 let context = mem_context.preamble.clone();
-                let enriched = if context.is_empty() {
+                let mut enriched = if context.is_empty() {
                     msg.clone()
                 } else {
                     format!("{context}{msg}")
                 };
+                crate::agent::turn_contracts::push_current_time_tail(&mut enriched);
 
                 let mut history = vec![
                     ChatMessage::system(&system_prompt),

@@ -817,6 +817,7 @@ pub(super) async fn run_channel_turn(
                     last_turn.content.push('\n');
                     last_turn.content.push_str(context);
                 }
+                crate::agent::turn_contracts::push_current_time_tail(&mut last_turn.content);
             }
         }
 

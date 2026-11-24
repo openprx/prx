@@ -824,11 +824,12 @@ async fn run_console_runtime_turn(
         crate::agent::context_recall::RECALL_CONTEXT_BUDGET,
     )
     .await;
-    let enriched_message = if mem_context.preamble.is_empty() {
+    let mut enriched_message = if mem_context.preamble.is_empty() {
         visible_message.to_string()
     } else {
         format!("{}{}", mem_context.preamble, visible_message)
     };
+    crate::agent::turn_contracts::push_current_time_tail(&mut enriched_message);
 
     // The stored event of each history message, index for index: none for the
     // system prompt, each stored turn's event, then the request's own event.
