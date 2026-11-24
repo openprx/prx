@@ -244,6 +244,7 @@ pub(super) async fn read(
         .find_message_event_by_idempotency_key(fabric.workspace_id(), &lookup)
         .await?
     else {
+        tracing::debug!("batch journal: no plan row under the batch key");
         return Ok(None);
     };
     let parsed: Signed = serde_json::from_str(plan.raw_payload_json.as_deref().context("batch payload missing")?)?;
@@ -255,6 +256,7 @@ pub(super) async fn read(
     )?;
     let plan_fields = verify(&plan, fabric.workspace_id(), batch, "plan", &key)?;
     if !owners.admits(plan.owner_id.as_deref(), plan_fields.ordinary_source.partition.as_ref()) {
+        tracing::debug!("batch journal: plan row exists but is not admitted to the caller scope");
         return Ok(None);
     }
 
@@ -313,8 +315,17 @@ pub(super) async fn batch_of_run(
     run: &str,
     owners: &crate::tools::sessions_read_model::RunOwnerScope,
 ) -> anyhow::Result<Option<String>> {
-    const PAGE: usize = 128;
+    // The listing accepts 1..=100 rows per page (`list_owned_message_events_by_type_impl`
+    // in the sqlite store, mirrored by the postgres store); it exports no constant.
+    const PAGE: usize = 100;
     const MAX_PAGES: usize = 16;
+    // The listing also requires a non-empty workspace, owner and type and a
+    // non-negative cursor: the workspace is the fabric's, the type is the
+    // constant below, the cursor starts at 0 and only grows, and an empty owner
+    // is refused here as "no batch" rather than as a listing error.
+    if owner.is_empty() {
+        return Ok(None);
+    }
     let mut after = 0;
     for _ in 0..MAX_PAGES {
         let page = fabric

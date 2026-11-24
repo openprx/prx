@@ -641,62 +641,54 @@ impl SessionsSpawnTool {
         let source_fabric = publication
             .map(|publication| publication.source_fabric())
             .or_else(|| self.memory_fabric());
+        let mut trace = JoinTrace {
+            publication: publication.is_some(),
+            fabric: source_fabric.is_some(),
+            journal_roster: false,
+            run_scan: false,
+        };
         // A run id names exactly one batch; accept it where a batch id is
         // expected. The registry row of a run restored by a later process
         // carries no batch id, so the durable journal answers for it.
         let run_lookup = self.run_batch_lookup(batch_id, owner_scope).await;
-        let (known_run, run_owner) = match &run_lookup {
-            RunBatchLookup::InBatch(..) => (true, None),
-            RunBatchLookup::NoBatch { owner } => (true, owner.clone()),
-            RunBatchLookup::NotARun => (false, None),
-        };
-        let resolved: Option<String> = match &run_lookup {
-            RunBatchLookup::InBatch(batch) => Some(batch.clone()),
-            RunBatchLookup::NoBatch { .. } | RunBatchLookup::NotARun => {
-                let owner = run_owner.or_else(|| match owner_scope {
-                    sessions_read_model::RunOwnerScope::Owner(Some(owner)) => Some(owner.clone()),
-                    _ => None,
-                });
-                match (source_fabric.as_ref(), owner) {
-                    (Some(fabric), Some(owner)) => {
-                        batch_journal::batch_of_run(fabric, &owner, batch_id, owner_scope).await?
+        let mut batch = batch_id.to_owned();
+        match &run_lookup {
+            RunBatchLookup::InBatch(known) => batch.clone_from(known),
+            RunBatchLookup::NoBatch { owner } => {
+                trace.run_scan = true;
+                let resolved = Self::scan_batch_of_run(source_fabric.as_ref(), owner.clone(), batch_id, owner_scope).await?;
+                match resolved {
+                    Some(found) => batch = found,
+                    None => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!(
+                                "'{batch_id}' is a run id, and that run belongs to no batch: join takes the batch_id returned by spawn_batch."
+                            )),
+                        });
                     }
-                    _ => None,
                 }
             }
-        };
-        if resolved.is_none() && known_run {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "'{batch_id}' is a run id, and that run belongs to no batch: join takes the batch_id returned by spawn_batch."
-                )),
-            });
+            RunBatchLookup::NotARun => {}
         }
-        let batch_id = resolved.as_deref().unwrap_or(batch_id);
-        let recorded = if let Some(fabric) = source_fabric.as_ref() {
-            batch_journal::read(
-                fabric,
-                std::path::Path::new(fabric.workspace_id()),
-                batch_id,
-                owner_scope,
-            )
-            .await?
-        } else {
-            None
-        };
-        tracing::debug!(
-            publication = publication.is_some(),
-            fabric = source_fabric.is_some(),
-            journal_roster = recorded.is_some(),
-            "sessions_spawn join resolved batch membership"
-        );
-        let members = if let Some(roster) = recorded {
-            roster.members
-        } else {
-            self.batch_members(batch_id, owner_scope).await
-        };
+        let mut members = self
+            .journal_or_registry_members(source_fabric.as_ref(), &batch, owner_scope, &mut trace)
+            .await?;
+        // Only an id that is no known batch is looked up as a run id, so a
+        // batch known here or in the journal never reaches the journal scan.
+        if members.is_empty() && matches!(run_lookup, RunBatchLookup::NotARun) {
+            trace.run_scan = true;
+            if let Some(found) =
+                Self::scan_batch_of_run(source_fabric.as_ref(), None, batch_id, owner_scope).await?
+            {
+                batch = found;
+                members = self
+                    .journal_or_registry_members(source_fabric.as_ref(), &batch, owner_scope, &mut trace)
+                    .await?;
+            }
+        }
+        let batch_id = batch.as_str();
         if members.is_empty() {
             return Ok(ToolResult {
                 success: false,
@@ -708,12 +700,53 @@ impl SessionsSpawnTool {
             });
         }
 
+        drop(trace);
         let settled = join_batch_members(&self.active_runs, &members).await;
         Ok(ToolResult {
             success: true,
             output: serde_json::to_string_pretty(&join_summary(batch_id, &settled))?,
             error: None,
         })
+    }
+
+    /// The batch's members from the durable journal, else from this tool
+    /// instance's roster and registry.
+    async fn journal_or_registry_members(
+        &self,
+        fabric: Option<&crate::memory::MemoryFabric>,
+        batch: &str,
+        owner_scope: &sessions_read_model::RunOwnerScope,
+        trace: &mut JoinTrace,
+    ) -> anyhow::Result<Vec<BatchMember>> {
+        let recorded = if let Some(fabric) = fabric {
+            batch_journal::read(fabric, std::path::Path::new(fabric.workspace_id()), batch, owner_scope).await?
+        } else {
+            None
+        };
+        trace.journal_roster |= recorded.is_some();
+        Ok(match recorded {
+            Some(roster) => roster.members,
+            None => self.batch_members(batch, owner_scope).await,
+        })
+    }
+
+    /// The batch a durable plan places `run` in. The owner is the registry
+    /// row's, else the one the caller's scope is confined to; with neither
+    /// there is nothing to list under.
+    async fn scan_batch_of_run(
+        fabric: Option<&crate::memory::MemoryFabric>,
+        row_owner: Option<String>,
+        run: &str,
+        owner_scope: &sessions_read_model::RunOwnerScope,
+    ) -> anyhow::Result<Option<String>> {
+        let owner = row_owner.or_else(|| match owner_scope {
+            sessions_read_model::RunOwnerScope::Owner(Some(owner)) => Some(owner.clone()),
+            _ => None,
+        });
+        match (fabric, owner) {
+            (Some(fabric), Some(owner)) => batch_journal::batch_of_run(fabric, &owner, run, owner_scope).await,
+            _ => Ok(None),
+        }
     }
 
     /// Whether `id` is the id of a run on file that this caller may see, and
@@ -784,4 +817,24 @@ enum RunBatchLookup {
     NoBatch { owner: Option<String> },
     /// The id is not a run id on file: treat it as a batch id.
     NotARun,
+}
+
+/// What one join consulted, logged when the join ends on any path (no ids).
+struct JoinTrace {
+    publication: bool,
+    fabric: bool,
+    journal_roster: bool,
+    run_scan: bool,
+}
+
+impl Drop for JoinTrace {
+    fn drop(&mut self) {
+        tracing::debug!(
+            publication = self.publication,
+            fabric = self.fabric,
+            journal_roster = self.journal_roster,
+            run_scan = self.run_scan,
+            "sessions_spawn join resolved batch membership"
+        );
+    }
 }
