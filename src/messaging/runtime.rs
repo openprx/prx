@@ -290,16 +290,23 @@ impl MessagingRuntime {
             crate::messaging::mailbox::unauthorized(crate::messaging::mailbox::UnauthorizedReason::LocalOwnerMismatch);
             return Err(MailboxError::OwnerMismatch);
         }
+        // An explicit non-main agent is the sender's claim about the receiver. It is never
+        // replaced by the session's recorded agent: the store and the inbound check then
+        // refuse an unconfigured or mismatching agent instead of delivering to another one.
+        let explicit_agent = address.agent != "main" && target.get("agent").is_some();
         if matches!(address.session.as_str(), "main" | "parent") {
             address.session = self
                 .store
                 .parent_session(&self.workspace, &source.owner, &source.session)?
                 .unwrap_or_else(|| source.session.clone());
-            address.agent = "main".into();
+            if !explicit_agent {
+                address.agent = "main".into();
+            }
         }
-        if let Some(agent) = self
-            .store
-            .logical_agent(&self.workspace, &source.owner, &address.session)?
+        if !explicit_agent
+            && let Some(agent) = self
+                .store
+                .logical_agent(&self.workspace, &source.owner, &address.session)?
         {
             address.agent = agent;
         }

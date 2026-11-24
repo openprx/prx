@@ -2005,6 +2005,13 @@ follow-up text after completion and starts another turn in the same child sessio
 If a process child reports `configuration_changed`, restart its parent chat before
 retrying; a newer disk configuration cannot execute under the parent's old seal.
 
+A local `sessions_send` target may name `agent`. Omitted or `main` addresses the
+session's main agent as before. Any other name is the receiver the sender asked
+for and is never replaced by the session's recorded agent: a name that is not a
+configured, enabled agent that accepts inbound messages, or that does not match
+the session's agent, is refused with `mailbox_unauthorized` before any outbox,
+message or receipt row is written.
+
 Remote `sessions_send` targets supply `instance`, `session`, and optionally `agent`.
 Omit `owner`: the authenticated receiver's `/a2a/v1/pins` response supplies it.
 A queued result always contains a durable message UUID; an assistant's text alone
