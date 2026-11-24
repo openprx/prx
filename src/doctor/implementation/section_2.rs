@@ -63,7 +63,23 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
                     ));
                 }
                 AuthProfileCredentialStatus::Missing => {
-                    items.push(DiagItem::warn(cat, "no api_key or active auth profile credential set"));
+                    // A credential stored through `PUT /api/providers/{id}/credential`
+                    // or `prx providers credential set` is a `cred-<name>` reference in
+                    // the same encrypted store. Presence only; no value is read out.
+                    let references = crate::config::manage::service::provider_credentials(config, provider)
+                        .map(|credentials| credentials.references)
+                        .unwrap_or_else(|error| {
+                            tracing::warn!(%error, "doctor could not read the stored credential references");
+                            Vec::new()
+                        });
+                    if let Some(reference) = references.first() {
+                        items.push(DiagItem::configured(
+                            cat,
+                            format!("stored credential present for \"{provider}\" ({})", reference.id),
+                        ));
+                    } else {
+                        items.push(DiagItem::warn(cat, "no api_key or active auth profile credential set"));
+                    }
                 }
             }
         } else {
