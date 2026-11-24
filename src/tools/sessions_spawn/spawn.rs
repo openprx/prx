@@ -1262,12 +1262,12 @@ impl SessionsSpawnTool {
                                         ProcessFinalization::Natural,
                                     )
                                 }
-                                Ok(ProcessWorkerOutcome::Terminated(reason)) => {
+                                Ok(ProcessWorkerOutcome::Terminated { reason, usage }) => {
                                     let msg = format!("Sub-agent process terminated: {reason}");
                                     (
                                         SubAgentStatus::Failed(reason),
                                         msg,
-                                        Vec::new(),
+                                        usage,
                                         ProcessFinalization::Terminated,
                                     )
                                 }
@@ -1394,11 +1394,9 @@ impl SessionsSpawnTool {
                                 &result_text,
                                 &status,
                                 &process_lineage,
-                                if finalization == ProcessFinalization::Terminated {
-                                    Some("task.killed")
-                                } else {
-                                    worker_cancelled.then_some("task.cancelled")
-                                },
+                                // A `Terminated` run is a requested stop: recorded as cancelled.
+                                (finalization == ProcessFinalization::Terminated || worker_cancelled)
+                                    .then_some("task.cancelled"),
                                 Some(crate::session_worker::protocol::worker_result_key(&rid)),
                             )
                             .await;

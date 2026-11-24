@@ -313,7 +313,10 @@ pub(super) async fn run_sub_agent_process(
 
     if let Some(reason) = process_control.termination_reason() {
         cleanup_process_worker_workspace(run_id, &worker_workspace, keep_workspace);
-        return Ok(ProcessWorkerOutcome::Terminated(reason));
+        return Ok(ProcessWorkerOutcome::Terminated {
+            reason,
+            usage: Vec::new(),
+        });
     }
 
     #[cfg(not(test))]
@@ -603,6 +606,7 @@ pub(super) async fn run_sub_agent_process(
             return Err(error);
         }
     };
+    let stop = super::requested_stop::requested_stop_reason(process_control, worker_registration.kill_requested());
     let (status, stdout, stderr) = match owned_phase {
         OwnedProcessPhase::Exited { status, stdout, stderr } => {
             worker_registration.mark_reaped();
@@ -650,7 +654,7 @@ pub(super) async fn run_sub_agent_process(
                 )
                 .await;
                 cleanup_process_worker_workspace(run_id, &worker_workspace, keep_workspace);
-                return recovered;
+                return super::requested_stop::settle_requested_stop(run_id, recovered, stop.as_deref());
             }
             if let Some(generation) = &operator_generation {
                 let recovered = recover_operator_interruption(
@@ -664,10 +668,13 @@ pub(super) async fn run_sub_agent_process(
                 )
                 .await;
                 cleanup_process_worker_workspace(run_id, &worker_workspace, keep_workspace);
-                return recovered;
+                return super::requested_stop::settle_requested_stop(run_id, recovered, stop.as_deref());
             }
             cleanup_process_worker_workspace(run_id, &worker_workspace, keep_workspace);
-            return Ok(ProcessWorkerOutcome::Terminated(reason));
+            return Ok(ProcessWorkerOutcome::Terminated {
+                reason,
+                usage: Vec::new(),
+            });
         }
         OwnedProcessPhase::TerminationFailed(error) => {
             tracing::warn!(
@@ -842,6 +849,7 @@ pub(super) async fn run_sub_agent_process(
         }
     }
     .await;
+    let outcome = super::requested_stop::settle_requested_stop(run_id, outcome, stop.as_deref());
     // The leader is confirmed reaped here, including decode/verification
     // failures. Unconfirmed cleanup branches above retain their workspace.
     cleanup_process_worker_workspace(run_id, &worker_workspace, keep_workspace);

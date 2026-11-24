@@ -179,7 +179,11 @@ pub(super) enum ProcessWorkerOutcome {
         detail: String,
         usage: process_terminal::RecoveredWorkerUsage,
     },
-    Terminated(String),
+    /// The stop was requested; `usage` is the partial provider usage recovered.
+    Terminated {
+        reason: String,
+        usage: Vec<crate::llm::route_decision::MeteredTokenUsageRecord>,
+    },
     TerminationFailed(String),
     /// The worker's stdout reached EOF without a `WorkerResult` line.
     ///
