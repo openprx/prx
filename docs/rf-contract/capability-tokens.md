@@ -677,8 +677,8 @@ continuation has a fresh run ID; `turn.started`, `turn.appended`, and
 `child_session.upsert` keep that turn's run and the four ancestry links.
 Consumers must accept repeated running-to-succeeded cycles for one child
 session key. Terminal-chat child sessions remain outside this journal.
-Process-child approvals remain denied with `no_resolver`; focused task-child
-approvals resolve only that child's pending call.
+A focused child's approval resolves only that child's pending call; a process
+child's approval is relayed to the root surface (see the approvals section).
 
 Welcome is `{type:"welcome",epoch,head_seq}`; events replay in sequence before
 live delivery. The install epoch is 32 lowercase hex characters and survives
@@ -773,9 +773,12 @@ of at most 256 KiB, at most 8 outstanding requests per run, and that its own
 policy still asks) and refuses a bad one with `ledger_refused` or
 `concurrent_pending`. A decision is bound to the exact call by request id and
 input digest, and an approval carries the same verified one-shot grant an
-in-process child gets; the worker never creates a grant. Without the relay
-(no authenticated pipe, or an operator-rooted child), approval requests still
-end with `no_resolver`; a process turn woken by a message ends with
+in-process child gets; the worker never creates a grant. `no_resolver` occurs
+for a process child only where the relay is not armed (`approval_relay` false):
+a backend without the authenticated mailbox pipe, or an operator-rooted child
+that has no caller approval surface. With the relay armed, a root that has no
+approval resolver at all gets the same outcome a task child would get in that
+position. A process turn woken by a message ends with
 `no_approval_surface`, as a task child's does. While a relayed approval waits,
 the child shows `tool_status{phase:"awaiting_approval"}` on the child run and
 `approval.pending` carries the child `run_id`. The worker does not stream live

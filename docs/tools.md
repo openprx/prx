@@ -1963,7 +1963,7 @@ In `prx chat`, Enter in a focused child starts a turn or queues behind its
 current turn. `/now` puts input first; `/steer` explicitly interrupts the
 current turn. Session commands operate on the focused child's context,
 model, history, usage, and task-mode approvals. `/level` displays the inherited
-level. Process-child approval calls remain denied with `no_resolver`.
+level. A process child's approval calls are relayed to the root approval surface.
 
 ## Messages between sessions
 
@@ -1987,12 +1987,13 @@ turn uses the persisted child session and model, with its level capped by the
 current agent and owner configuration. It gets no inherited approval grant or
 local operator authority. Task approvals use the root session's live surface;
 without one, calls that need approval are denied with `no_approval_surface`.
-Process-child approvals remain denied with `no_resolver`. Message turns count
+A process turn woken by a message ends with `no_approval_surface`, as a task child's does. Message turns count
 toward the receiving agent's limits and daily cost, and run one at a time per
 child session.
 Process children continue in a new worker with public history seeded. Their
-tool approvals remain denied with `no_resolver`; task/delegate approvals use
-the owner's pending-approval surface.
+tool approvals are relayed to the root session's approval surface, like task
+and delegate approvals; `no_resolver` remains only where the relay is not armed
+(a backend without the authenticated mailbox pipe, or an operator-rooted child).
 
 `session_status` includes the caller session's last 64 outbox states, including
 `expired` and permanent refusals, without message bodies or recipient tokens.
