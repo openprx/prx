@@ -119,6 +119,45 @@ latency_budget_ms = 800
   an optional accounting scope ID; older records remain readable. See
   [managed skill prompts](evolution.md#managed-skill-prompts).
 
+## One-time reset of old default values
+
+Earlier `prx init` builds wrote every default into `config.toml` and
+`config.d/*.toml`, so an installation created by one keeps the former limits
+even though the built-in defaults are now unrestricted. The first start of this
+build resets a value to the new default when it is exactly the old default:
+
+| Key | Old default reset |
+| --- | --- |
+| `[autonomy] max_cost_per_day_cents` | `500` |
+| `[cost] daily_limit_usd` | `10.0` |
+| `[cost] monthly_limit_usd` | `100.0` |
+| `[autonomy] workspace_only` | `true` (only when `level = "full"`) |
+| `[autonomy] forbidden_paths` | the former 18-path list, exactly (only when `level = "full"`) |
+| `[multimodal] allow_remote_fetch` | `false` |
+| `[tool_tiering] channel_exclude` | the former 14-tool list, exactly |
+| `[gateway] targeted_agents` | `false` |
+| `[nodes.server] allowed_commands` | `["echo"]` |
+
+`acknowledge_unrestricted_profile` is no longer written when the files are
+rewritten. `autonomy.level` is never touched, and a `supervised` or `readonly`
+install keeps `workspace_only` and `forbidden_paths`. Authentication keys
+(`require_pairing`, tokens, sender allowlists) are never touched.
+
+- **Rule:** a value that differs from the old default, for example
+  `daily_limit_usd = 3.0`, is left alone. The tree cannot tell a value `prx init`
+  wrote from one the operator typed (`.init-defaults.toml` records template
+  values for `prx init --force` only), so equality with the old default is the
+  test. To keep a former limit after the upgrade, set it again once the reset
+  has run, or set it to any other value before upgrading.
+- **How:** the reset goes through the configuration transaction (one history
+  record, revision check) and rewrites the configuration files in canonical form.
+  A marker file `.defaults-migration` beside `config.toml` records that it ran
+  (key names only), so it never runs again. One info line at start names the
+  keys reset. `prx doctor` lists old default values still present.
+- **Roll back:** `prx config rollback` restores the files from before the reset.
+  The marker stays, so the reset is not repeated.
+
+
 ## Remaining lifecycle and runtime interfaces
 
 Ordinary children and operator tasks now share their parent's budget counter

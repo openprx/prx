@@ -9,6 +9,19 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         format!("autonomy level: {:?}", config.autonomy.level),
     ));
 
+    let legacy = crate::config::defaults_migration::legacy_default_keys(config);
+    if !legacy.is_empty() {
+        let state = if crate::config::defaults_migration::migration_has_run(&config.config_path) {
+            "kept after the one-time reset (rolled back or set again; they apply as written)"
+        } else {
+            "the one-time reset has not run yet"
+        };
+        items.push(DiagItem::configured(
+            cat,
+            format!("old default values present ({}): {state}", legacy.join(", ")),
+        ));
+    }
+
     // Config file exists
     if config.config_path.exists() {
         items.push(DiagItem::configured(

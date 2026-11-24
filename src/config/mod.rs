@@ -1,6 +1,7 @@
 pub mod agent_name;
 pub(crate) mod agent_revision;
 pub mod credential_slots;
+pub(crate) mod defaults_migration;
 pub(crate) mod deprecations;
 pub mod files;
 pub mod generation;

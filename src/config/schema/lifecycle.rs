@@ -243,6 +243,8 @@ impl Config {
                 initialized = false,
                 "Config loaded"
             );
+            // One time: reset old init-written default values to the new defaults.
+            let config = crate::config::defaults_migration::run_once(config).await;
             // Eagerly migrate any remaining legacy enc: secrets so they are upgraded
             // even if they have never been accessed since the XOR-cipher era.
             if let Err(e) = migrate_config_legacy_secrets(&config).await {
