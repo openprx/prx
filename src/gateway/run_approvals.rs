@@ -135,6 +135,8 @@ pub(crate) struct RunApprovalResolver {
     /// the run or job also holds (pass a child token of the run's token).
     pub(crate) cancellation: CancellationToken,
     pub(crate) wait_secs: u64,
+    /// The run was woken by a session message and is its own root in the receiver session.
+    pub(crate) woken: bool,
 }
 impl Drop for RunApprovalResolver {
     fn drop(&mut self) {
@@ -297,6 +299,12 @@ impl RunApprovalResolver {
                 .context("approval waiter missing")?;
             self.frames(&request.context.envelope, &HashSet::new())
                 .awaiting_approval(&request.descriptor.public_name);
+            if self.woken {
+                tracing::info!(
+                    wait_secs = self.wait_secs,
+                    "message-woken turn is waiting for the owner's approval decision"
+                );
+            }
             let fresh = created.is_some();
             let mut rx = entry.outcome.subscribe();
             if fresh {

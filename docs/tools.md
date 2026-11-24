@@ -1987,7 +1987,14 @@ turn uses the persisted child session and model, with its level capped by the
 current agent and owner configuration. It gets no inherited approval grant or
 local operator authority. Task approvals use the root session's live surface;
 without one, calls that need approval are denied with `no_approval_surface`.
-A process turn woken by a message ends with `no_approval_surface`, as a task child's does. Message turns count
+A process turn woken by a message ends with `no_approval_surface`, as a task child's does.
+A turn woken by a message in an in-process session is its own approval root, owned by the
+receiving session: a call that needs approval waits for the owner of that session, bounded
+by the receiving agent's `approval_wait_secs`, and an approval resumes the same call in the
+same run. The sender never decides it, and a decision posted under another session id is
+refused. A denial or the timeout refuses the call. The woken run holds its agent's slot while
+it waits, so later messages queue behind it. A restart cancels the approval and does not run
+the message again. Message turns count
 toward the receiving agent's limits and daily cost, and run one at a time per
 child session.
 Process children continue in a new worker with public history seeded. Their

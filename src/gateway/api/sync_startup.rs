@@ -63,6 +63,16 @@ async fn startup_inner(state: &AppState, shutdown: &CancellationToken) -> anyhow
             }
         }
     }
+    // A message-woken run that died with the previous process is never replayed:
+    // close the approvals it left open before any wake or request is served. A
+    // failure leaves them listed but undecidable (no live waiter holds them).
+    let sync = Arc::clone(&store);
+    if !matches!(
+        crate::runtime::blocking::spawn_blocking(move || sync.cancel_orphaned_woken_approvals()).await,
+        Ok(Ok(_))
+    ) {
+        tracing::warn!("startup sweep of message-woken approvals failed");
+    }
     let sync = Arc::clone(&store);
     crate::runtime::blocking::spawn_blocking(move || sync.refresh_config(&config, &revision)).await??;
     let sync = Arc::clone(&store);

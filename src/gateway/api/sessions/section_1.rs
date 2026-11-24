@@ -752,13 +752,20 @@ async fn run_console_runtime_turn(
         // decision slot publishes its tool policy with.
         config_snapshot.autonomy.level = target.autonomy;
     }
-    let live_scope =
-        if let (Some(store), Some(source)) = (state.mem.sync_store(), turn_envelope.source_message_event_id.clone()) {
-            let owner = turn_envelope.resolved_owner_id();
-            crate::runtime::blocking::spawn_blocking(move || store.live_scope(&owner, &source)).await??
-        } else {
-            None
-        };
+    // A message-woken run is its own root, owned by the receiving session and
+    // built explicitly by the mailbox receiver. Every other turn resolves its
+    // root from the stored source event.
+    let woken_root = mailbox::woken_scope();
+    let woken = woken_root.is_some();
+    let live_scope = if let Some(root) = woken_root {
+        Some(root)
+    } else if let (Some(store), Some(source)) = (state.mem.sync_store(), turn_envelope.source_message_event_id.clone())
+    {
+        let owner = turn_envelope.resolved_owner_id();
+        crate::runtime::blocking::spawn_blocking(move || store.live_scope(&owner, &source)).await??
+    } else {
+        None
+    };
     let live = live_scope.map(|scope| {
         let wait_secs = target
             .and_then(|target| config_snapshot.agents.get(target.name.as_str()))
@@ -773,6 +780,7 @@ async fn run_console_runtime_turn(
             // approval waits, while dropping it never cancels the run or the job.
             cancellation: decision.cancellation.child_token(),
             wait_secs,
+            woken,
         }) as std::sync::Arc<dyn crate::agent::live_frames::LiveTurn>
     });
     let live_frames = live.as_ref().map(|live| {
@@ -930,7 +938,7 @@ async fn run_console_runtime_turn(
                         // A message-woken turn with no approval surface refuses a call
                         // that needs approval at once: no pending row nobody can act on.
                         .or_else(|| {
-                            (target.is_none() && mailbox::is_woken_turn())
+                            (target.is_none() && mailbox::woken_scope().is_some())
                                 .then(crate::runtime::mailbox_child::no_surface)
                         });
                     if target.is_some() && live.is_none() {

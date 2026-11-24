@@ -59,5 +59,7 @@ pub trait SyncStore: Send + Sync {
     fn configure(&self, workspace: &str, owner: &str) -> anyhow::Result<()>;
     fn refresh_config(&self, config: &crate::config::Config, revision: &str) -> anyhow::Result<()>;
     fn restart_candidates(&self, after: &str) -> anyhow::Result<Vec<RestartCandidate>>;
+    /// Cancel the approvals that message-woken runs of a dead process left open; returns the runs swept.
+    fn cancel_orphaned_woken_approvals(&self) -> anyhow::Result<usize>;
     fn shutdown_signal(&self) -> CancellationToken;
 }

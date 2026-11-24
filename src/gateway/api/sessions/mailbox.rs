@@ -173,11 +173,37 @@ fn pending_roots(
     Ok(roots)
 }
 
-tokio::task_local! { static WOKEN_TURN: (); }
+tokio::task_local! {
+    /// The woken run's own approval root, `{session, agent, incarnation, run_id}`.
+    static WOKEN_TURN: serde_json::Value;
+}
 
-/// True only inside the turn this module drives for an adopted mailbox message.
-pub(super) fn is_woken_turn() -> bool {
-    WOKEN_TURN.try_with(|()| ()).is_ok()
+/// The approval root of the turn this module drives for an adopted mailbox
+/// message, `None` outside such a turn. The woken run is its own root, scoped
+/// to the receiving session: built here from the receiver address and the new
+/// run id, never from the adopted event (which inherits an earlier run id).
+pub(super) fn woken_scope() -> Option<serde_json::Value> {
+    WOKEN_TURN.try_with(Clone::clone).ok()
+}
+
+/// The explicit approval root of a woken run owned by the receiver session.
+async fn receiver_root(
+    runtime: &Arc<MessagingRuntime>,
+    input: &MessageInput,
+    run_id: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let address = input.message.to.clone();
+    let store = Arc::clone(runtime);
+    let scope = crate::runtime::blocking::spawn_blocking(move || {
+        store.store.session_scope(&store.workspace, &address, false)
+    })
+    .await??;
+    Ok(serde_json::json!({
+        "session": input.message.to.session,
+        "agent": input.message.to.agent,
+        "incarnation": scope.incarnation.to_string(),
+        "run_id": run_id,
+    }))
 }
 
 async fn run(
@@ -206,7 +232,9 @@ async fn run(
     } else {
         (parent, None)
     };
-    envelope.run_id = Some(uuid::Uuid::new_v4().to_string());
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let root = receiver_root(&runtime, &input, &run_id).await?;
+    envelope.run_id = Some(run_id);
     envelope.source_message_event_id = input.receipt.adopted_message_event_id.map(|id| id.to_string());
     envelope = envelope.with_config_generation(&turn_runtime.config_generation);
     // Only the verified adopted event supplies causation. Content never enters
@@ -253,7 +281,7 @@ async fn run(
     };
     WOKEN_TURN
         .scope(
-            (),
+            root,
             crate::gateway::jobs::scope_cancellation(
                 cancellation,
                 run_console_message_job_work(turn_runtime, state, input.text.clone(), turns, source, target),

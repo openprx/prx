@@ -183,6 +183,13 @@ pub(super) fn event_header(conn: &Connection, id: &str, kind: &str) -> anyhow::R
     } else {
         conn.query_row("WITH RECURSIVE family(run) AS (SELECT ?1 UNION SELECT e.parent_run_id FROM message_events e JOIN family f ON e.run_id=f.run WHERE e.workspace_id=?2 AND e.owner_id=?3 AND e.parent_run_id IS NOT NULL) SELECT e.session_key,s.agent_key,s.incarnation,e.run_id,s.session_key FROM message_events e JOIN agent_scopes s ON s.scope_id=e.ma_scope_id WHERE e.workspace_id=?2 AND e.owner_id=?3 AND s.agent_key GLOB 'n:*' AND e.source IN ('cron','xin') AND e.parent_run_id IS NULL AND e.run_id IN(SELECT run FROM family) LIMIT 1", params![root_run, workspace, owner], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).optional()?
     };
+    // A message-woken run is its own root in the receiver session: a top-level
+    // run whose continuation input names the adoption row of its message.
+    let root = if root.is_some() {
+        root
+    } else {
+        conn.query_row(&format!("WITH RECURSIVE family(run) AS (SELECT ?1 UNION SELECT e.parent_run_id FROM message_events e JOIN family f ON e.run_id=f.run WHERE e.workspace_id=?2 AND e.owner_id=?3 AND e.parent_run_id IS NOT NULL) SELECT e.session_key,CASE WHEN s.agent_key='m' THEN 'main' ELSE s.agent_key END,s.incarnation,e.run_id,s.session_key FROM message_events e JOIN agent_scopes s ON s.scope_id=e.ma_scope_id WHERE e.workspace_id=?2 AND e.owner_id=?3 AND e.parent_run_id IS NULL AND e.run_id IN(SELECT run FROM family) AND {} LIMIT 1", super::mailbox_continuation::CONTINUATION_PREDICATE_E), params![root_run, workspace, owner], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).optional()?
+    };
     let Some((root_session, agent, incarnation, root_id, _)) = root else {
         return Ok(None);
     };
@@ -552,6 +559,10 @@ impl SyncStore for SqliteMemory {
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+    fn cancel_orphaned_woken_approvals(&self) -> anyhow::Result<usize> {
+        let conn = self.pool.write();
+        super::sync_woken::sweep(&conn)
     }
     fn shutdown_signal(&self) -> CancellationToken {
         self.sync_runtime.shutdown.lock().clone()

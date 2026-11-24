@@ -787,7 +787,14 @@ a backend without the authenticated mailbox pipe, or an operator-rooted child
 that has no caller approval surface. With the relay armed, a root that has no
 approval resolver at all gets the same outcome a task child would get in that
 position. A process turn woken by a message ends with
-`no_approval_surface`, as a task child's does. While a relayed approval waits,
+`no_approval_surface`, as a task child's does. An in-process turn woken by a
+message is its own root in the receiving session `T`: `approval.pending` and
+`approval.decided` carry `session=T` and the woken `run_id` (no
+`client_message_id`), and only the owner of `T` decides through
+`POST /sessions/<T>/approvals/<id>`. A decision under another session id is
+refused with `approval_run_mismatch`. The woken run's transcript and terminal
+reach the stream as well. After a restart the pending approval is reported as
+`cancelled` and the message is not run again. While a relayed approval waits,
 the child shows `tool_status{phase:"awaiting_approval"}` on the child run and
 `approval.pending` carries the child `run_id`. The worker does not stream live
 `started` or `succeeded` frames after an approval. A root that is not recordable

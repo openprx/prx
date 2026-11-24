@@ -42,6 +42,7 @@ pub(super) async fn live(
                 approvals: Arc::clone(&state.rf_approvals),
                 cancellation: tokio_util::sync::CancellationToken::new(),
                 wait_secs: if console { 240 } else { wait_secs },
+                woken: false,
             }))
         }),
     )
