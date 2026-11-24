@@ -487,14 +487,15 @@ struct PreparedWrite {
 async fn validate_target(file: &FilePatch, security: &SecurityPolicy) -> Result<PathBuf, DiffApplyError> {
     // The diff path is the operator's: `security` carries Main's configured
     // level. At Full the target resolves freely (symlinks followed).
-    let target = if security.autonomy == crate::security::AutonomyLevel::Full && !security.evaluation_sandbox {
+    let full = security.autonomy == crate::security::AutonomyLevel::Full && !security.evaluation_sandbox;
+    let target = if full {
         crate::security::approval_operation::resolve_full_target(&security.workspace_dir, &file.path)
             .await
             .map_err(|err| DiffApplyError::RejectedPath(format!("failed to resolve target: {err}")))?
     } else {
         confined_target(file, security).await?
     };
-    reject_protected_memory_path(&target, security)?;
+    reject_protected_memory_path(&target, security, full)?;
     match tokio::fs::symlink_metadata(&target).await {
         Ok(meta) => {
             let file_type = meta.file_type();
@@ -552,12 +553,17 @@ async fn confined_target(file: &FilePatch, security: &SecurityPolicy) -> Result<
     Ok(resolved_parent.join(file_name))
 }
 
-fn reject_protected_memory_path(target: &Path, security: &SecurityPolicy) -> Result<(), DiffApplyError> {
+fn reject_protected_memory_path(target: &Path, security: &SecurityPolicy, full: bool) -> Result<(), DiffApplyError> {
     let workspace = security
         .workspace_dir
         .canonicalize()
         .unwrap_or_else(|_| security.workspace_dir.clone());
     let Ok(rel) = target.strip_prefix(&workspace) else {
+        // At Full a target outside the workspace is allowed; the protected
+        // memory files live inside it, so there is nothing to refuse.
+        if full {
+            return Ok(());
+        }
         return Err(DiffApplyError::RejectedPath("target escapes workspace".to_string()));
     };
     if rel
