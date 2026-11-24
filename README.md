@@ -2,8 +2,6 @@
 
 Self-hosted AI assistant framework built in Rust. Multi-channel, multi-provider, with built-in self-evolution.
 
-Forked from [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw) and extended with production reliability, governance-aware AI, and a self-evolution system.
-
 ## Highlights
 
 - **Broad LLM provider catalog** — Anthropic (Console API key), OpenAI, Google Gemini (API key), Ollama, AWS Bedrock, GLM, OpenAI Codex via Sign in with ChatGPT, local runtimes, and compatible endpoints. GitHub Copilot login is disabled. Provider requests send `User-Agent: prx/<version>`.
