@@ -106,6 +106,7 @@ pub(super) async fn run_sub_agent_process(
     batch_id: Option<&str>,
     mailbox: Option<&Arc<dyn crate::session_worker::mailbox_binding::WorkerMailboxFactory>>,
     parent_frames: Option<Arc<dyn crate::agent::live_frames::LiveFrameSink>>,
+    approval_relay: Option<crate::session_worker::approval::relay_context::ProcessRelaySeed>,
     #[cfg(test)] test_worker_executable: Option<&TestWorkerExecutable>,
 ) -> anyhow::Result<ProcessWorkerOutcome> {
     if source_fabric.is_some_and(|fabric| fabric.memory().requires_scoped_execution()) {
@@ -286,6 +287,10 @@ pub(super) async fn run_sub_agent_process(
     )
     .map_err(refused_here)?;
 
+    // Sealed before the manifest HMAC below: the switch is on only for an
+    // authenticated pipe, below Full, with a relay built from the caller.
+    let approval_relay =
+        approval_relay.and_then(|relay| relay.arm(mailbox_binding.as_ref(), &mut manifest));
     manifest.seed_history = history
         .read()
         .await
@@ -511,13 +516,18 @@ pub(super) async fn run_sub_agent_process(
             std::fs::remove_file(&config_path)
                 .with_context(|| format!("remove worker config `{}`", config_path.display()))?;
         }
-        run_spawned_child_lifecycle(
+        let mut frames = mailbox_binding.as_mut().and_then(|binding| binding.frames.take());
+        let relay = match (approval_relay, frames.as_mut()) {
+            (Some(armed), Some(frames)) => Some(armed.attach(frames, Arc::clone(&progress))),
+            _ => None,
+        };
+        let lifecycle = run_spawned_child_lifecycle(
             &mut child,
             &mut process_group,
             &payload,
             process_control,
             Some(WorkerSteerPipe {
-                frames: mailbox_binding.as_mut().and_then(|binding| binding.frames.take()),
+                frames,
                 steer_rx,
                 history,
                 run_id: run_id.to_string(),
@@ -527,8 +537,18 @@ pub(super) async fn run_sub_agent_process(
             false,
             #[cfg(test)]
             protocol,
-        )
-        .await
+        );
+        match relay {
+            Some(relay) => {
+                // A cancel or kill request ends every approval wait at once.
+                let phase = relay
+                    .guard(process_control.termination_requested(), lifecycle)
+                    .await;
+                relay.cancel_all();
+                phase
+            }
+            None => lifecycle.await,
+        }
     }
     .await;
     // Confirm the leader's reap only on branches with actual cleanup evidence.

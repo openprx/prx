@@ -58,6 +58,7 @@ async fn process_mode_restores_spawn_context_for_nested_runs() {
         inherited_provenance: None,
         session_addr: None,
         compaction_config: None,
+        approval_relay: false,
     };
 
     let snapshot = with_manifest_spawn_context(&manifest, None, async {
@@ -141,6 +142,7 @@ fn worker_event_scope_preserves_spawn_lineage_and_owner_isolation() {
         inherited_provenance: None,
         session_addr: None,
         compaction_config: None,
+        approval_relay: false,
     };
 
     let scope = worker_message_event_scope(&manifest);

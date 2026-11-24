@@ -140,6 +140,7 @@ impl WorkerMailboxFactory for Factory {
         let frame = actor.lock().next_delivery()?.context("mailbox IPC delivery missing")?;
         let (controls, receiver) = mpsc::channel(64);
         controls.try_send(frame).context("queue initial mailbox Data")?;
+        let control_sender = controls.clone();
         let (outputs, mut output_rx) = mpsc::channel(64);
         std::fs::write(&self.hold, b"wait for real delivery Ack")?;
         let hold = self.hold.clone();
@@ -189,6 +190,7 @@ impl WorkerMailboxFactory for Factory {
                     owner: actor,
                 },
                 outputs,
+                control_sender,
             },
         })
     }

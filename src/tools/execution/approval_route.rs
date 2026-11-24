@@ -17,4 +17,30 @@ impl ToolExecutionService {
         }
         (self.approval.resolve(request).await, false)
     }
+
+    /// Resolve an approval that a process worker relayed to its parent, along
+    /// the chain an in-process child's request takes.
+    pub(crate) async fn resolve_relayed_approval(&self, request: ToolApprovalRequest) -> ToolApprovalDecision {
+        self.resolve_ordinary_approval(request).await.0
+    }
+
+    /// Whether the parent's own policy, at the call's sealed level, still asks
+    /// for approval. A relayed request that would not ask is refused.
+    pub(crate) fn relayed_call_asks(
+        &self,
+        descriptor: &super::ToolDescriptor,
+        context: &super::ToolExecutionContext,
+    ) -> bool {
+        let level = context.child_scope.as_ref().map_or_else(
+            || self.policy.autonomy_level(),
+            |scope| scope.gate_inputs().0.authority.level,
+        );
+        let decision = super::admission::child_autonomy(
+            context,
+            descriptor,
+            self.policy.decide_at(descriptor, context, level),
+            level,
+        );
+        decision == super::ToolExecutionDecision::Ask
+    }
 }

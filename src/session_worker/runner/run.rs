@@ -958,6 +958,10 @@ async fn run_owned_manifest(
         let raw_task = manifest.task.as_str();
         let manifest_ref = &manifest;
         let config_ref = &config;
+        // The relay needs all three: the parent sealed it, the pipe is
+        // authenticated, and the stdin reader that carries decisions is running.
+        let approval_relay =
+            manifest.approval_relay && crate::session_worker::stdout::is_authenticated() && steer_rx.is_some();
         let (history, loop_result) = run_segments_with_controls(
             initial_history,
             &mut steer_rx,
@@ -1062,11 +1066,18 @@ async fn run_owned_manifest(
                     let routing = admitted_turn.routing();
                     let advice = routing.service.advisory().analyze_turn(routing.runtime, &cancel).await;
                     let adapter = child_turn.as_ref().map(|turn| {
-                        let mut adapter = turn.adapter();
+                        // With the relay, an `Ask` goes to the parent's approval
+                        // surface; the worker keeps no ledger and never issues a
+                        // grant. Without it, approval stays denied (`no_resolver`).
+                        let mut adapter = if approval_relay {
+                            turn.adapter_with_approval(Arc::new(crate::session_worker::approval::client::WorkerApprovalClient))
+                        } else {
+                            turn.adapter()
+                        };
                         adapter.live_frames =
                             Some(Arc::clone(&process_denials) as Arc<dyn crate::agent::live_frames::LiveFrameSink>);
                         adapter.tool_execution_context.approval_ledger = None;
-                        adapter.tool_execution_context.pending_approval_denied = true;
+                        adapter.tool_execution_context.pending_approval_denied = !approval_relay;
                         adapter
                     });
                     let child_execution = adapter.as_ref().map(|adapter| adapter.tool_execution_context.clone());

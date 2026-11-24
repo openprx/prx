@@ -19,6 +19,9 @@ pub(crate) trait LiveFrameSink: Send + Sync {
 pub(crate) trait LiveTurn: Send + Sync {
     fn frames(&self, envelope: &RuntimeEnvelope, tools: &std::collections::HashSet<String>) -> Arc<dyn LiveFrameSink>;
     async fn approve(&self, request: crate::tools::ToolApprovalRequest) -> crate::tools::ToolApprovalDecision;
+    /// End every approval this surface still holds for `run_id` as cancelled.
+    /// A surface that keeps no per-run approval has nothing to close.
+    fn close_run(&self, _run_id: &str) {}
 }
 
 /// Runtime-owned hooks are inherited only through trusted child contexts.

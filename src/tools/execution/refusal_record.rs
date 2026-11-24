@@ -121,10 +121,9 @@ impl ToolExecutionService {
         // including refusals that never enter this service. Keep one row per
         // outcome there; the operator notice above retains its original order.
         // The worker's sealed refusal inventory uses that same scheduler
-        // boundary. Approval calls still stay denied with no_resolver.
+        // boundary.
         if context.live_turn.is_some()
-            || (context.pending_approval_denied
-                && context.envelope.source == crate::runtime::envelope::RuntimeSource::SessionWorker)
+            || context.envelope.source == crate::runtime::envelope::RuntimeSource::SessionWorker
         {
             return;
         }

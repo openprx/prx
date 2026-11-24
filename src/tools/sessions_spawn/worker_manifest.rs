@@ -183,6 +183,7 @@ pub(super) fn build_session_worker_manifest(
             .and_then(|context| context.task_input.inherited_provenance),
         session_addr: None,
         compaction_config: Some(compaction_config.clone()),
+        approval_relay: false,
     };
 
     if let Some(launch) = source_launch {

@@ -886,6 +886,18 @@ impl SessionsSpawnTool {
                 )),
                 None => process_source_launch,
             };
+            let process_approval_relay = crate::session_worker::approval::relay_context::RelaySeedInputs {
+                caller: caller.as_ref(),
+                binding: ordinary_binding.as_deref(),
+                resolvers: self.approval_resolver_factory.as_ref(),
+                scope: &spawn_scope_for_event,
+                task,
+                receipt: source_receipt.as_deref(),
+                security: launch_security,
+                level: child_level,
+                run_id: &run_id,
+            }
+            .seed()?;
             let temperature = resolved_temperature;
             let history_arc: Arc<RwLock<Vec<HistoryEntry>>> =
                 Arc::new(RwLock::new(super::continuation::seed_history()));
@@ -1155,6 +1167,7 @@ impl SessionsSpawnTool {
                                 process_batch_id.as_deref(),
                                 process_worker_mailbox.as_ref(),
                                 process_parent_frames,
+                                process_approval_relay,
                                 #[cfg(test)]
                                 test_worker_executable.as_ref(),
                             )

@@ -238,6 +238,12 @@ pub struct WorkerManifest {
     pub inherited_provenance: Option<crate::messaging::InheritedProvenance>,
     #[serde(default)]
     pub compaction_config: Option<crate::config::AgentCompactionConfig>,
+    /// The parent relays this worker's approval requests to the root approval
+    /// surface. Sealed by the manifest HMAC, so a worker cannot turn it on; the
+    /// parent sets it only with an authenticated pipe, below Full and with a
+    /// relay built.
+    #[serde(default)]
+    pub approval_relay: bool,
 }
 
 impl WorkerManifest {
@@ -323,6 +329,9 @@ pub enum WorkerControlFrame {
     BrokerResult { call_id: u64, outcome: BrokerOutcome },
     /// Acknowledgement of `BrokerCancel`.
     BrokerCancelAck { call_id: u64 },
+    /// Answer to a worker `ApprovalRequest`. Accepted only inside an
+    /// authenticated mailbox frame.
+    ApprovalDecision(super::approval::ApprovalDecisionPayload),
 }
 
 /// Worker-to-parent stdout frame. Line-delimited; the terminal `WorkerResult`
@@ -350,6 +359,11 @@ pub enum WorkerOutputFrame {
     },
     /// Cancel a pending broker call.
     BrokerCancel { call_id: u64 },
+    /// Ask the parent to relay one approval to the root approval surface.
+    /// Accepted only inside an authenticated mailbox frame.
+    ApprovalRequest(super::approval::ApprovalRequestPayload),
+    /// The worker stopped waiting for its outstanding approvals.
+    ApprovalWithdraw { request_id: u64 },
 }
 
 /// Issued capability kind on a broker call.
@@ -470,6 +484,7 @@ mod tests {
             inherited_provenance: None,
             session_addr: None,
             compaction_config: Some(crate::config::AgentCompactionConfig::default()),
+            approval_relay: false,
         };
 
         let json = serde_json::to_string(&manifest).expect("serialize manifest");
@@ -653,6 +668,7 @@ mod tests {
             inherited_provenance: None,
             session_addr: None,
             compaction_config: None,
+            approval_relay: false,
         };
         let trigger = uuid::Uuid::from_u128(42);
         let provenance = crate::messaging::InheritedProvenance {

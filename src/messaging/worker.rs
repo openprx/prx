@@ -73,6 +73,7 @@ impl WorkerMailboxFactory for WorkerMailboxes {
         )?;
         let auth = crate::session_worker::frame_auth::FrameAuth::parent(&manifest.run_id)?;
         let (controls, receiver) = mpsc::channel(64);
+        let control_sender = controls.clone();
         let (outputs, mut output_rx) = mpsc::channel(64);
         let cancel = CancellationToken::new();
         let run = manifest.run_id.clone();
@@ -174,6 +175,7 @@ impl WorkerMailboxFactory for WorkerMailboxes {
                     owner,
                 },
                 outputs,
+                control_sender,
             },
         })
     }

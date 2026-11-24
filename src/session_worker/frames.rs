@@ -16,6 +16,9 @@ pub struct WorkerControlQueue {
 pub struct WorkerFrameChannels {
     pub controls: WorkerControlQueue,
     pub outputs: mpsc::Sender<WorkerOutputFrame>,
+    /// A sender into the same queue as `controls.receiver`, for the parent
+    /// side of the approval relay. The control pump signs what it carries.
+    pub control_sender: mpsc::Sender<WorkerControlFrame>,
 }
 
 pub async fn write_control_frame<W: AsyncWrite + Unpin>(writer: &mut W, frame: &WorkerControlFrame) -> Result<()> {
@@ -89,7 +92,13 @@ pub(crate) async fn read_worker_frames_authenticated<R: AsyncRead + Unpin>(
             continue;
         }
         let value: serde_json::Value = serde_json::from_slice(&line).context("invalid worker stdout JSON line")?;
-        if value.get("kind").is_some() {
+        if let Some(kind) = value.get("kind") {
+            // An approval frame is never valid outside an authenticated mailbox
+            // frame: without authentication it fails the read.
+            ensure!(
+                auth.is_some() || !kind.as_str().is_some_and(super::approval::is_approval_kind),
+                "unsigned approval frame refused"
+            );
             let value = match &auth {
                 Some(auth) => auth.verify(value)?,
                 None => value,

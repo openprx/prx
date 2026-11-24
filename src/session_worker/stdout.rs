@@ -32,3 +32,7 @@ pub(crate) fn authenticate(auth: super::frame_auth::FrameAuth) -> Result<()> {
 pub fn frame(frame: &super::protocol::WorkerOutputFrame) -> Result<()> {
     write(frame, false)
 }
+/// True once the parent's frame authentication is installed for this worker.
+pub(crate) fn is_authenticated() -> bool {
+    FRAME_AUTH.get().is_some()
+}

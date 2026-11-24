@@ -403,6 +403,7 @@ async fn restore_operator_process(
         inherited_provenance: None,
         session_addr: None,
         compaction_config: None,
+        approval_relay: false,
     };
     // This exercises the real process-launch binding producer. The fixture
     // does not claim outer worker-channel authentication or an OS spawn.

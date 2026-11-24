@@ -159,7 +159,10 @@ impl WorkerMailboxParent {
                 }
                 Ok(None)
             }
-            WorkerOutputFrame::BrokerCall { .. } | WorkerOutputFrame::BrokerCancel { .. } => {
+            WorkerOutputFrame::BrokerCall { .. }
+            | WorkerOutputFrame::BrokerCancel { .. }
+            | WorkerOutputFrame::ApprovalRequest(_)
+            | WorkerOutputFrame::ApprovalWithdraw { .. } => {
                 Err(crate::messaging::mailbox::unauthorized(
                     crate::messaging::mailbox::UnauthorizedReason::WorkerSenderMismatch,
                 ))

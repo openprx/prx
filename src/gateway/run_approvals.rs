@@ -159,6 +159,16 @@ impl LiveTurn for RunApprovalResolver {
     fn frames(&self, envelope: &RuntimeEnvelope, tools: &HashSet<String>) -> Arc<dyn LiveFrameSink> {
         self.streams.producer(&self.scope, envelope, tools)
     }
+    fn close_run(&self, run_id: &str) {
+        // Cancelling an entry wakes its waiter task, which commits `cancelled`
+        // exactly as a root cancel does. The durable pending row closes with
+        // the run terminal.
+        for entry in self.approvals.entries.lock().values() {
+            if entry.pending.authority().run_id == run_id {
+                entry.cancel.cancel();
+            }
+        }
+    }
     async fn approve(&self, request: ToolApprovalRequest) -> ToolApprovalDecision {
         match self.resolve(request).await {
             Ok(decision) => decision,

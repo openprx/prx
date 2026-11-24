@@ -79,10 +79,14 @@ pub(super) fn spawn_stdin_control_reader(
                                 auth.verify(value)
                                     .map_err(|e| serde_json::Error::io(std::io::Error::other(e)))
                             })
-                    } else if matches!(
+                    } else if (matches!(
                         value.get("kind").and_then(|v| v.as_str()),
                         Some("message" | "message_result")
-                    ) && auth.is_some()
+                    ) && auth.is_some())
+                        || value
+                            .get("kind")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(crate::session_worker::approval::is_approval_kind)
                     {
                         Err(serde_json::Error::io(std::io::Error::other("unsigned mailbox frame")))
                     } else {
@@ -126,8 +130,22 @@ pub(super) fn spawn_stdin_control_reader(
                 WorkerControlFrame::BrokerResult { .. } | WorkerControlFrame::BrokerCancelAck { .. } => {
                     tracing::warn!("session-worker discarded an unregistered broker control frame");
                 }
+                WorkerControlFrame::ApprovalDecision(decision) => {
+                    // The frame is authenticated, but it is accepted only for
+                    // an outstanding request and the digest of that request.
+                    if let Err(rejected) = crate::session_worker::approval::waiters::resolve(
+                        decision.request_id,
+                        &decision.input_sha256,
+                        decision.outcome,
+                    ) {
+                        tracing::warn!(?rejected, "session-worker dropped an approval decision");
+                    }
+                }
             }
         }
+        // Stdin ended (parent gone or pipe closed): nobody can answer an
+        // outstanding approval any more.
+        crate::session_worker::approval::waiters::close_all();
     });
 }
 

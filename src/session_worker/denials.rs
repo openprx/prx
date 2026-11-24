@@ -21,11 +21,6 @@ pub enum WorkerDenialCause {
 impl WorkerDenial {
     pub(crate) const fn valid(&self) -> bool {
         self.tool.len() <= 64
-            && matches!(
-                self.cause,
-                WorkerDenialCause::Approval(crate::tools::ApprovalDenialCause::NoResolver)
-                    | WorkerDenialCause::Refusal(_)
-            )
     }
     pub(crate) fn rf_cause(&self) -> crate::security::approval_ledger::run_call::RfDenialCause {
         match self.cause {
@@ -50,7 +45,8 @@ impl DenialSink {
 }
 impl LiveFrameSink for DenialSink {
     fn thinking(&self) {}
-    // Process workers have no approval relay; only typed denials enter completion.
+    // The parent emits the live awaiting-approval status of a relayed request;
+    // only typed denials enter completion.
     fn awaiting_approval(&self, _tool: &str) {}
     fn child_denial(
         &self,
@@ -71,9 +67,7 @@ impl LiveFrameSink for DenialSink {
         } = event
         {
             let cause = match outcome {
-                ToolCallOutcome::Denied {
-                    cause: Some(crate::tools::ApprovalDenialCause::NoResolver),
-                } => Some(crate::tools::ApprovalDenialCause::NoResolver.into()),
+                ToolCallOutcome::Denied { cause: Some(cause) } => Some((*cause).into()),
                 ToolCallOutcome::Refused => Some(refusal_cause.unwrap_or(ToolCallRefusalReason::PolicyDenied).into()),
                 ToolCallOutcome::PlanOnly => Some(ToolCallRefusalReason::PlanOnly.into()),
                 ToolCallOutcome::Error => Some(refusal_cause.unwrap_or(ToolCallRefusalReason::Failed).into()),
