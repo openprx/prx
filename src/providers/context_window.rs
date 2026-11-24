@@ -291,7 +291,7 @@ const fn cap_to_kernel(tokens: usize) -> CappedContext {
 }
 
 const fn resolved(
-    config: AgentCompactionConfig,
+    mut config: AgentCompactionConfig,
     max_context_source: ContextWindowSource,
     model_context_tokens: Option<usize>,
     requested_context_tokens: Option<usize>,
@@ -299,6 +299,10 @@ const fn resolved(
     selected_provider: String,
     selected_model: String,
 ) -> EffectiveCompactionConfig {
+    // The reply reserve is bounded by its share of the window, so a small
+    // window is not consumed by the fixed default.
+    config.reserve_tokens =
+        crate::agent::budget_inputs::capped_reply_reserve(config.max_context_tokens, config.reserve_tokens);
     EffectiveCompactionConfig {
         config,
         max_context_source,

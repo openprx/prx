@@ -4,6 +4,7 @@ pub(crate) mod automation;
 pub(crate) mod channel_approval;
 pub mod classifier;
 pub(crate) mod compaction;
+pub(crate) mod budget_inputs;
 pub(crate) mod context_budget;
 pub(crate) mod context_paging;
 pub(crate) mod context_preflight;

@@ -87,6 +87,7 @@ and the module-gate family are absorbed on load; they are not live switches.
 | `[scheduler]` | `max_tasks = 64`; `claim_lease_secs = 90` |
 | `[agent]` | `compact_context = false`; `read_only_tool_concurrency_window = 2`; `priority_scheduling_enabled = false`; `low_priority_tools = ["sessions_spawn", "delegate"]` |
 | `[agent.compaction]` | `mode = "switch"`; `reserve_tokens = 4096`; `keep_recent_messages = 12`; `memory_flush = true`; `max_context_tokens = 128000` |
+| `[agent.compaction]` window rules | `reserve_tokens` is an upper bound: the reply reserve used is `min(reserve_tokens, window / 4)`, and the reply reserve plus the measured tool surface never exceed `window / 2` (never below `reserve_tokens` itself). `keep_recent_messages` is an upper bound on the messages a `switch` keeps word for word: the newest messages are kept while together they stay within `min(window / 4, (window - reserve) / 2)` tokens, and the newest message is always kept, so a short history of large messages is folded. `max_context_tokens` is the window |
 | `[agent.compaction.os_paging]` | `eviction_threshold = 0.70`; `proactive_retrieval = true`; `max_recalled_pages = 10`; `retrieval_injection_role = "system"`; `keep_recent_messages = 12`. Exact `switch` handoffs skip paging |
 | `[sessions_spawn]` | `default_mode = "task"`; `process_memory_strategy = "shared_fabric"`; `worker_workspace_root` unset; `cleanup_on_complete = true` |
 | `[chat]` | `max_concurrent_visible_turns = 2` |

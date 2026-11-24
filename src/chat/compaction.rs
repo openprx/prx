@@ -116,7 +116,8 @@ pub(super) fn manual_compact_has_compactable(
     compaction_config: &crate::config::AgentCompactionConfig,
 ) -> bool {
     let system_count = usize::from(source_history.first().is_some_and(|m| m.role == "system"));
-    source_history.len().saturating_sub(system_count) > compaction_config.keep_recent_messages.max(1)
+    let non_system = source_history.get(system_count..).unwrap_or_default();
+    non_system.len() > crate::agent::budget_inputs::effective_keep_recent_messages(non_system, compaction_config)
 }
 
 /// Feedback when `/compact` finds no durable transcript to bind to (D7).

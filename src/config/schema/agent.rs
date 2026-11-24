@@ -53,10 +53,12 @@ pub struct AgentCompactionConfig {
     /// Context rollover strategy (`off`, `switch`, `safeguard`, `aggressive`).
     #[serde(default)]
     pub mode: AgentCompactionMode,
-    /// Tokens reserved for the next model response.
+    /// Tokens reserved for the next model response; an upper bound, capped at
+    /// a quarter of the window.
     #[serde(default = "default_agent_compaction_reserve_tokens")]
     pub reserve_tokens: usize,
-    /// Number of recent non-system messages to keep after compaction.
+    /// Upper bound on the recent non-system messages kept word for word after
+    /// compaction; the token share of the window may keep fewer.
     #[serde(default = "default_agent_compaction_keep_recent_messages")]
     pub keep_recent_messages: usize,
     /// Run memory flush extraction before legacy summary/truncation modes.

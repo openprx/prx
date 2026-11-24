@@ -186,12 +186,7 @@ pub(crate) fn reserve_request_tool_surface(
     config: &crate::config::AgentCompactionConfig,
     tool_surface: crate::agent::turn_context::RequestToolMeasurement,
 ) -> crate::config::AgentCompactionConfig {
-    crate::config::AgentCompactionConfig {
-        reserve_tokens: config
-            .reserve_tokens
-            .saturating_add(budgeted_request_tool_tokens(tool_surface)),
-        ..config.clone()
-    }
+    crate::agent::budget_inputs::reserved_budget_config(config, budgeted_request_tool_tokens(tool_surface))
 }
 
 /// The tool-surface reserve of a chat session's most recent request, shared
@@ -225,10 +220,7 @@ impl ToolSurfaceReserve {
         &self,
         config: &crate::config::AgentCompactionConfig,
     ) -> crate::config::AgentCompactionConfig {
-        crate::config::AgentCompactionConfig {
-            reserve_tokens: config.reserve_tokens.saturating_add(self.tokens()),
-            ..config.clone()
-        }
+        crate::agent::budget_inputs::reserved_budget_config(config, self.tokens())
     }
 
     /// Context tokens one request occupies: the history estimate plus the

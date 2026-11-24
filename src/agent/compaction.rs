@@ -2148,7 +2148,10 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
         return Ok(CompactionBuild::NotNeeded);
     }
 
-    let requested_keep_recent = config.keep_recent_messages.max(1).min(non_system_count);
+    let requested_keep_recent = crate::agent::budget_inputs::effective_keep_recent_messages(
+        source_history.get(start..).unwrap_or_default(),
+        config,
+    );
     let requested_compact_count = non_system_count.saturating_sub(requested_keep_recent);
     if requested_compact_count == 0 {
         return Ok(CompactionBuild::NotNeeded);

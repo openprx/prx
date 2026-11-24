@@ -144,6 +144,19 @@ deleted. A later rollover can reference the prior handoff event exactly, so
 repeated switches form an auditable generation chain within the same durable
 session.
 
+The messages a switch keeps word for word are decided by tokens. Newest
+first, a non-system message is kept while the kept messages together stay
+within `min(window / 4, (window - reserve) / 2)` tokens (the newest message is
+always kept), and `keep_recent_messages` (default 12) is the upper bound on
+their count. A short history of large messages therefore folds on a small
+window; on a large window with ordinary messages the count of 12 still applies.
+The reply reserve is `min(reserve_tokens, window / 4)` and, together with the
+measured tool surface, never exceeds `window / 2`; the terminal chat pre-turn
+check and the engine preflight both derive that budget from one function
+(`agent::budget_inputs::reserved_budget_config`). The system message and the
+current request cannot be folded, so a window that cannot hold them still ends
+in a per-request trim.
+
 The provider view renders each note as one line: `[context_handoff]
 handoff_event_id=<id> -- <n> earlier user and assistant messages were moved out
 of this window. They are recoverable with
