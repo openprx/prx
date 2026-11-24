@@ -180,9 +180,13 @@ const fn windows_task_name() -> &'static str {
 
 pub async fn handle_command(command: &crate::ServiceCommands, config: &Config, init_system: InitSystem) -> Result<()> {
     match command {
-        crate::ServiceCommands::Install { user, .. } => {
+        crate::ServiceCommands::Install { user, dry_run, .. } => {
             if *user && cfg!(target_os = "linux") && init_system.resolve()? == InitSystem::Openrc {
                 anyhow::bail!("service_user_unsupported: OpenRC installation requires a system service");
+            }
+            if *dry_run {
+                println!("{}", render_install_preview(config, init_system)?);
+                return Ok(());
             }
             install(config, init_system).await
         }
@@ -191,6 +195,61 @@ pub async fn handle_command(command: &crate::ServiceCommands, config: &Config, i
         crate::ServiceCommands::Restart => restart(config, init_system).await,
         crate::ServiceCommands::Status => status(config, init_system).await,
         crate::ServiceCommands::Uninstall => uninstall(config, init_system).await,
+    }
+}
+
+/// The file that `service install` would write and its content, as text.
+/// Reads the environment only: no directory is created, no file written and no
+/// service manager is called.
+fn render_install_preview(config: &Config, init_system: InitSystem) -> Result<String> {
+    if cfg!(target_os = "macos") {
+        let file = macos_service_file()?;
+        let exe = std::env::current_exe().context("Failed to resolve current executable")?;
+        let config_dir = selected_config_dir(config)?;
+        let logs_dir = config_dir.join("logs");
+        let service_path = inherited_service_path(&exe);
+        let plist = generate_launchd_plist(
+            &exe,
+            config_dir,
+            &logs_dir.join("daemon.stdout.log"),
+            &logs_dir.join("daemon.stderr.log"),
+            &service_path,
+        );
+        Ok(format!("# Dry run: would write {}\n{plist}", file.display()))
+    } else if cfg!(target_os = "linux") {
+        match init_system.resolve()? {
+            InitSystem::Systemd => {
+                let file = linux_service_file(config)?;
+                let exe = std::env::current_exe().context("Failed to resolve current executable")?;
+                let service_path = inherited_service_path(&exe);
+                let unit = generate_systemd_unit(&exe, selected_config_dir(config)?, &service_path);
+                Ok(format!("# Dry run: would write {}\n{unit}", file.display()))
+            }
+            InitSystem::Openrc => {
+                let exe = resolve_openrc_executable()?;
+                let script = generate_openrc_script(&exe, Path::new("/etc/prx"));
+                Ok(format!("# Dry run: would write /etc/init.d/prx\n{script}"))
+            }
+            InitSystem::Auto => anyhow::bail!("InitSystem::Auto should be resolved before this point"),
+        }
+    } else if cfg!(target_os = "windows") {
+        let exe = std::env::current_exe().context("Failed to resolve current executable")?;
+        let config_dir = selected_config_dir(config)?;
+        let logs_dir = config_dir.join("logs");
+        let wrapper = logs_dir.join("prx-daemon.cmd");
+        let content = generate_windows_wrapper(
+            &exe,
+            config_dir,
+            &logs_dir.join("daemon.stdout.log"),
+            &logs_dir.join("daemon.stderr.log"),
+        );
+        Ok(format!(
+            "# Dry run: would write {} and register scheduled task \"{}\"\n{content}",
+            wrapper.display(),
+            windows_task_name()
+        ))
+    } else {
+        anyhow::bail!("Service management is supported on macOS and Linux only");
     }
 }
 

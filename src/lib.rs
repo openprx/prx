@@ -196,6 +196,9 @@ pub enum ServiceCommands {
         /// Accept non-interactive installation
         #[arg(long)]
         yes: bool,
+        /// Print the unit that would be installed and change nothing
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Start daemon service
     Start,
