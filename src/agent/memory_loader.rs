@@ -163,15 +163,10 @@ impl Memory for SelectedMemoryView<'_> {
                     && hit.source_event_id.as_ref().is_none_or(|id| id.len() <= 128)),
             "selected Memory backend exceeded its result contract"
         );
-        let now = chrono::Utc::now();
         hits.retain(|hit| {
             self.excluded_key != Some(hit.key.as_str())
                 && (self.excluded_event.is_none() || hit.source_event_id.as_deref() != self.excluded_event)
                 && !hit.content.trim().is_empty()
-                && chrono::DateTime::parse_from_rfc3339(&hit.created_at)
-                    .ok()
-                    .and_then(|created| u64::try_from(now.signed_duration_since(created).num_milliseconds()).ok())
-                    .is_some_and(|age| age <= crate::tools::capability::turn_state::STALE_ARTIFACT_MS)
         });
         self.reserved.fetch_sub(limit - hits.len(), Ordering::AcqRel);
         let entries = hits
