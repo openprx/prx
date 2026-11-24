@@ -53,7 +53,8 @@ use crate::agent::response_guard::{
     CORRECTIVE_ASIDE_PREFIX, contains_fabricated_tool_marker, strip_fabricated_tool_markers,
 };
 use crate::agent::response_guard::{
-    EMPTY_ASSISTANT_RESPONSE_RETRY_MESSAGE, TOOL_SUMMARY_ONLY_RESPONSE_MESSAGE, append_corrective_aside,
+    EMPTY_ASSISTANT_RESPONSE_RETRY_MESSAGE, TOOL_SUMMARY_ONLY_RESPONSE_MESSAGE, UNEXECUTED_TOOL_CLAIM_NOTICE,
+    append_corrective_aside,
     contains_assistant_fabricated_tool_marker, is_empty_assistant_response, is_tool_summary_only_response,
     strip_assistant_fabricated_tool_markers,
 };
@@ -1869,15 +1870,24 @@ async fn run_turn_unguarded(
                 continue;
             }
             if fabricated_marker {
-                // Retry spent (or tools really ran): keep whatever the model
-                // actually answered and drop only the marker lines, so the
-                // fabrication never reaches the user, the history, or the next
-                // turn's prompt where it would be imitated again.
-                if let Cow::Owned(cleaned) = strip_assistant_fabricated_tool_markers(&display_text) {
-                    display_text = cleaned;
-                }
-                if display_text.trim().is_empty() {
-                    anyhow::bail!("model returned a tool-summary-only response after one corrective retry");
+                if executed_any_tool_call {
+                    // A tool really ran: keep whatever the model actually
+                    // answered and drop only the marker lines, so the
+                    // fabrication never reaches the user, the history, or the
+                    // next turn's prompt where it would be imitated again.
+                    if let Cow::Owned(cleaned) = strip_assistant_fabricated_tool_markers(&display_text) {
+                        display_text = cleaned;
+                    }
+                    if display_text.trim().is_empty() {
+                        anyhow::bail!("model returned a tool-summary-only response after one corrective retry");
+                    }
+                } else {
+                    // Retry spent and no tool ran: the rest of the reply is
+                    // built on a claim that did not happen, so it is replaced
+                    // whole by a fixed notice. `display_text` is what is
+                    // streamed, pushed to history and returned, so all three
+                    // carry the notice and none the fabricated text.
+                    display_text = UNEXECUTED_TOOL_CLAIM_NOTICE.to_owned();
                 }
             }
             // Tool evidence is written by the runtime only: every evidence

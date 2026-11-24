@@ -12,6 +12,11 @@ pub(super) const TOOL_SUMMARY_ONLY_RESPONSE_MESSAGE: &str = "The previous assist
      Either invoke the required tools now or provide a complete final answer. \
      Do not output a '[Used tools: ...]' summary.";
 
+/// Delivered instead of a reply that still claims a tool ran after the one
+/// corrective retry, when no tool ran in the turn. The fabricated text is
+/// dropped entirely so it is never shown, stored or fed back to the model.
+pub(super) const UNEXECUTED_TOOL_CLAIM_NOTICE: &str = "The model said it used a tool, but no tool was run in this turn. Please try again.";
+
 /// Marks the runtime's own words inside a user turn.
 ///
 /// A corrective retry instruction is not something the operator said, so it is
