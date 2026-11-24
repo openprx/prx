@@ -709,7 +709,7 @@ async fn drive(
                     });
                     if ask_gate {
                         let run_id = envelope.run_id.clone().expect("test: run id");
-                        crate::agent::channel_approval::install(&run_id, resolver.clone(), true, false);
+                        crate::agent::channel_approval::install(&run_id, resolver.clone(), true);
                     }
                     let service = runtime
                         .publication_slot

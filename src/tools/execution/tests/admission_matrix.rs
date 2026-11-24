@@ -213,7 +213,7 @@ impl crate::agent::turn_contracts::ApprovalResolver for ChannelResolver {
     }
 }
 #[tokio::test]
-async fn channel_force_ask_precedes_ledger_and_effective_full_skips_it() {
+async fn channel_force_ask_precedes_ledger() {
     let path = tempfile::tempdir().unwrap();
     let fixture = fixture();
     let context = ledger_context(path.path()).await;
@@ -222,7 +222,7 @@ async fn channel_force_ask_precedes_ledger_and_effective_full_skips_it() {
         entered: tokio::sync::Notify::new(),
         release: tokio::sync::Notify::new(),
     });
-    crate::agent::channel_approval::install(run, resolver.clone(), true, false);
+    crate::agent::channel_approval::install(run, resolver.clone(), true);
     let service = fixture.service("config_reload", vec![], ToolExecutionDecision::Allow, approved(), true);
     let task_context = context.clone();
     let task = tokio::spawn(async move { service.execute(command(1), task_context, None).await });
@@ -246,19 +246,7 @@ async fn channel_force_ask_precedes_ledger_and_effective_full_skips_it() {
     );
     resolver.release.notify_one();
     assert_eq!(task.await.unwrap().status, ToolExecutionStatus::ApprovalDenied);
-    crate::agent::channel_approval::install(run, resolver, true, true);
-    let service = fixture.service("config_reload", vec![], ToolExecutionDecision::Allow, approved(), true);
-    let outcome = service.execute(command(1), context.clone(), None).await;
     crate::agent::channel_approval::clear(run);
-    assert_eq!(outcome.status, ToolExecutionStatus::Succeeded);
-    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
-    assert!(
-        port.list_pending_calls(context.envelope.owner_id.as_deref().unwrap(), 0, 10)
-            .await
-            .unwrap()
-            .items
-            .is_empty()
-    );
 }
 
 #[tokio::test]

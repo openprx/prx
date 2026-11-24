@@ -18,7 +18,6 @@ pub(crate) struct Installed {
     turn_context: Option<TurnContext>,
     resolver: Arc<dyn ApprovalResolver>,
     force_ask: bool,
-    effective_full: bool,
     parent_run_id: Option<String>,
 }
 
@@ -33,14 +32,13 @@ tokio::task_local! {
 
 /// Remember that `run_id` must ask `resolver` before a tool runs.
 #[cfg(test)]
-pub fn install(run_id: &str, resolver: Arc<dyn ApprovalResolver>, force_ask: bool, effective_full: bool) {
+pub fn install(run_id: &str, resolver: Arc<dyn ApprovalResolver>, force_ask: bool) {
     registry().lock().insert(
         run_id.to_string(),
         Installed {
             turn_context: None,
             resolver,
             force_ask,
-            effective_full,
             parent_run_id: None,
         },
     );
@@ -68,12 +66,10 @@ pub fn install_for_turn(
     conversation_id: &str,
     resolver: Arc<dyn ApprovalResolver>,
     force_ask: bool,
-    effective_full: bool,
 ) -> Arc<Installed> {
     let make = || Installed {
         resolver: Arc::clone(&resolver),
         force_ask,
-        effective_full,
         parent_run_id: None,
         turn_context: Some(TurnContext {
             conversation_id: conversation_id.to_owned(),
@@ -100,7 +96,6 @@ pub fn clear(run_id: &str) {
 pub struct ApprovalContext {
     pub resolver: Arc<dyn ApprovalResolver>,
     pub force_ask: bool,
-    pub effective_full: bool,
 }
 
 pub fn lookup(run_id: &str) -> Option<ApprovalContext> {
@@ -111,7 +106,6 @@ fn context_of(installed: &Installed) -> ApprovalContext {
     ApprovalContext {
         resolver: Arc::clone(&installed.resolver),
         force_ask: installed.force_ask,
-        effective_full: installed.effective_full,
     }
 }
 
@@ -154,10 +148,9 @@ mod tests {
     fn lookup_for_call_uses_the_parent_run() {
         let parent = "parent-run";
         let child = "child-run";
-        install(parent, Arc::new(RecordingResolver), true, false);
+        install(parent, Arc::new(RecordingResolver), true);
         let found = lookup_for_call(child, Some(parent)).expect("test: parent gate");
         assert!(found.force_ask);
-        assert!(!found.effective_full);
         clear(parent);
         assert!(lookup_for_call(child, Some(parent)).is_none());
     }

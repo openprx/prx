@@ -181,7 +181,6 @@ async fn delegated_approval_inherits_explicit_context_and_rejects_wrong_decider(
         "conv-1",
         gate as std::sync::Arc<dyn ApprovalResolver>,
         true,
-        false,
     );
     let (pending,) = channel_approval::scope_installed(installed, async {
         (channel_approval::spawn(async {

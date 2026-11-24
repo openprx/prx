@@ -440,12 +440,13 @@ impl ToolExecutionService {
         let prx_operator_ask = decision == ToolExecutionDecision::Ask;
         let channel_policy_ask =
             channel_gate.as_ref().is_some_and(|gate| gate.force_ask) && decision == ToolExecutionDecision::Allow;
-        let decision = if channel_policy_ask && channel_gate.as_ref().is_some_and(|gate| !gate.effective_full) {
+        // The call's effective level decides, not Main's configured level.
+        let decision = if channel_policy_ask && !full {
             ToolExecutionDecision::Ask
         } else {
             decision
         };
-        if channel_policy_ask && channel_gate.as_ref().is_some_and(|gate| gate.effective_full) {
+        if channel_policy_ask && full {
             runtime_approval_granted = true;
         }
         if decision == ToolExecutionDecision::Ask && context.pending_approval_denied {
