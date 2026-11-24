@@ -760,21 +760,41 @@ interception uses `plan_only`. Every denied/failed tool outcome commits a `tool.
 journal row before its live frame, including scheduler refusals before service
 entry. Rows retain the internal `reason` and the same mapped `cause` as the
 live frame. A refusal-storage failure ends the turn without an unrecorded frame.
-No refusal cause contains paths or arguments. Process workers have no approval
-relay in this unit. Their completion returns a bounded, content-free
-`denials:[{tool,cause}]` inventory under the existing completion signature.
-This includes pre-approval refusal and failure causes; approval requests still
-end with `no_resolver`. Only after authentication does the parent emit one
-`tool_status` per outcome on the **parent run**, with `child_run_id` and its
-stable ids. Its phase is `failed` for `failed`/`indeterminate` causes, otherwise
-`denied`; its cause uses the same typed mapping as an in-process child.
-Worker refusal rows are committed before the signed observation is emitted.
-The inventory holds at most 256 denials with tool names at most 64 bytes;
-overflow fails completion explicitly. It carries no model text or arguments.
+No refusal cause contains paths or arguments. A process worker below Full
+relays its approval requests to the root session's approval surface, so a
+process child's approval is answered the way a task child's is. The relay
+travels only as authenticated mailbox frames of the worker pipe (`approval_request`
+and `approval_withdraw` from the worker, `approval_decision` from the parent),
+under the per-run frame MAC with strict sequence numbers. A signed `approval_relay`
+manifest field turns it on, and only the parent sets it: for an authenticated
+pipe, a child below Full, and a relay built from the spawning caller. The parent
+re-checks every request against what it sealed (allowed tool, argument size
+of at most 256 KiB, at most 8 outstanding requests per run, and that its own
+policy still asks) and refuses a bad one with `ledger_refused` or
+`concurrent_pending`. A decision is bound to the exact call by request id and
+input digest, and an approval carries the same verified one-shot grant an
+in-process child gets; the worker never creates a grant. Without the relay
+(no authenticated pipe, or an operator-rooted child), approval requests still
+end with `no_resolver`; a process turn woken by a message ends with
+`no_approval_surface`, as a task child's does. While a relayed approval waits,
+the child shows `tool_status{phase:"awaiting_approval"}` on the child run and
+`approval.pending` carries the child `run_id`. The worker does not stream live
+`started` or `succeeded` frames after an approval. The completion returns a
+bounded, content-free `denials:[{tool,cause}]` inventory under the existing
+completion signature. It carries pre-approval refusal and failure causes and
+every approval denial cause, such as `owner_denied` and `expired`. Only after
+authentication does the parent emit one `tool_status` per outcome on the
+**parent run**, with `child_run_id` and its stable ids. Its phase is `failed`
+for `failed`/`indeterminate` causes, otherwise `denied`; its cause uses the same
+typed mapping as an in-process child. Worker refusal rows are committed before
+the signed observation is emitted. The inventory holds at most 256 denials with
+tool names at most 64 bytes; overflow fails completion explicitly. It carries no
+model text or arguments.
 
 For an rf-keyed root session, `POST /api/sessions/{id}/approvals/{approval_id}`
 accepts exactly `{"decision":"approved"}` or `{"decision":"denied"}` under a
-paired bearer. Child approvals use the root session id. Success is
+paired bearer. Child approvals, of task and process children alike, use the root
+session id. Success is
 `200 {approval_id,run_id,decision}`; the same decision is idempotent, another
 is `409 approval_decided`. Unknown ids return `404 approval_unknown`, mismatched
 owner/session or a run no longer live returns `409 approval_run_mismatch`, and

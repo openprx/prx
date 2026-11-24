@@ -260,9 +260,6 @@ impl ChildFocus {
                 .child_run(&record.session_key)
                 .await
                 .context("child is not running")?;
-            if record.mode == "process" {
-                return Ok(Some("Process-child approval is denied: no_resolver.".into()));
-            }
             let decision = if command == "/approve" {
                 crate::agent::turn_contracts::ApprovalDecision::Grant
             } else {
