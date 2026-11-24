@@ -145,16 +145,6 @@ cargo build --release --locked --bin prx
 - [Community](https://community.openprx.dev) — OpenPRX community forum
 - [OpenPRX](https://openprx.dev) — Project homepage
 
-## Related Projects
-
-| Repository | Description |
-|------------|-------------|
-| [openprx/prx](https://github.com/openprx/prx) | AI assistant framework (this repo) |
-| [openprx/prx-memory](https://github.com/openprx/prx-memory) | Standalone memory MCP server |
-| [openprx/openpr](https://github.com/openprx/openpr) | Project management platform |
-| [openprx/openpr-webhook](https://github.com/openprx/openpr-webhook) | Webhook receiver for OpenPR |
-| [openprx/wacli](https://github.com/openprx/wacli) | WhatsApp CLI with JSON-RPC daemon |
-
 ## Contact
 
 info@sylvode.org — general and partnership enquiries. Report security issues privately as described in [SECURITY.md](SECURITY.md).
