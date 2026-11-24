@@ -792,21 +792,15 @@ impl ApprovalLedgerPort<'_> {
             {
                 continue;
             }
-            if let Some(review) = self
+            // A reviewed call (approved or denied) is already decided: an approved one
+            // only awaits its single claim by the call, so it is not pending any more.
+            if self
                 .memory
                 .find_message_event_by_idempotency_key(self.workspace, &record.authority.review_key())
                 .await?
+                .is_some()
             {
-                let review: Signed<CallReview> = match self.decode(&review, b"call.review") {
-                    Ok(review) => review,
-                    Err(error) => {
-                        tracing::warn!(event_id = %review.event_id, error = %error, "skipping corrupt call approval review event");
-                        continue;
-                    }
-                };
-                if !review.record.approved {
-                    continue;
-                }
+                continue;
             }
             items.push(record);
             if items.len() == limit {
