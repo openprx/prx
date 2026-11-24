@@ -654,10 +654,10 @@ pub(super) fn cost_template(spec: Spec) -> String {
 # Token usage tracking and budget enforcement
 
 [cost]
-# daily_budget_usd = 10.0
-# monthly_budget_usd = 200.0
-# alert_threshold_percent = 80
-# storage_path = "workspace/cost/usage.db"
+# No spend limit is set unless you add one below.
+# daily_limit_usd = 10.0
+# monthly_limit_usd = 100.0
+# warn_at_percent = 80
 "#
         .into(),
     }
