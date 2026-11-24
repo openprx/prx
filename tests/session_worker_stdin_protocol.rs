@@ -73,6 +73,7 @@ fn manifest_for(config_dir: &Path, workspace_dir: &Path) -> WorkerManifest {
         route_credential: None,
         route_uses_root_connection: false,
         direct_uses_root_connection: false,
+        approval_relay: false,
         temperature: 0.7,
         temperature_override: None,
         config_dir: config_dir.to_path_buf(),

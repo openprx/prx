@@ -449,7 +449,7 @@ fn splice_eviction_and_lift_keep_evidence_aligned() {
     let mut broken = canonical_with_evidence(&evidence);
     broken.evidence.pop();
     assert!(
-        !broken.splice(1, 2, &[ChatMessage::assistant("x")], MessageOrigin::Acknowledged),
+        !broken.splice(1, 2, &[ChatMessage::assistant("x")], MessageOrigin::Acknowledged, &MessageSources::turn_round()),
         "a splice over misaligned evidence is refused"
     );
     assert_eq!(
