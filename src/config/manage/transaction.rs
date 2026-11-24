@@ -1036,7 +1036,9 @@ impl ConfigTransactions {
                 revision: Some(request.expected_revision.to_string()),
             });
         }
-        if !request.confirm {
+        // At Full the rollback itself needs no confirmation; the revision
+        // binding, `restore_credentials` and `disable_encryption` stay.
+        if !request.confirm && !plan.applies_at_full() {
             return Err(ConfigTransactionError::ConfirmationRequired {
                 required: "confirm",
                 reasons: reasons.clone(),

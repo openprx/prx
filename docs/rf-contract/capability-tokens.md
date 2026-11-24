@@ -215,7 +215,9 @@ without a level reads back Main's level, the one it runs at.
   answers `428 confirmation_required`; it applies, and `confirm_high_risk`
   is accepted and not required. A stale `If-Match` is still `409`. A write
   that raises the level to `full` from a lower level, and any write below
-  `full`, still answer `428` as before.
+  `full`, still answer `428` as before. `POST /api/config/rollback` at
+  `full` no longer answers `428 confirm`; `restore_credentials` and
+  `disable_encryption` still apply.
 - `500 storage_unavailable`: the configuration, the registry or a reload
   failed.
 

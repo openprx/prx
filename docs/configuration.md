@@ -2921,8 +2921,11 @@ Rules that hold on every endpoint:
   `--yes` still gates a CLI write. `--allow-credential-clear` (and
   `allow_secret_clear=true` on the raw file API) is not a confirmation: it
   permits a raw-file replacement that would drop stored secrets and stays
-  required. Below `Full` the rules below apply unchanged. A rollback keeps its
-  own confirmation.
+  required. Below `Full` the rules below apply unchanged. A rollback at `Full`
+  needs no `confirm` (`POST /api/config/rollback`) and no further
+  confirmation; its `restore_credentials` and `disable_encryption` flags are
+  secret protection and stay required when they apply. `prx config rollback`
+  still needs `--yes`.
 - **High-risk confirmation (below `Full`).** A high-risk plan answers `428` with
   `required`, `risk_reasons`, `revision` and the `plan` text. Examples: an
   endpoint change, clearing the root key, or moving the root key to another

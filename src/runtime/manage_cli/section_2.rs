@@ -121,6 +121,12 @@ pub(crate) async fn run_config(command: ConfigCommands, config: Config, io: &mut
                 Some(revision) => revision,
                 None => config::files::current_config_revision(&service.config().config_path)?,
             };
+            // At Full the transaction asks for no confirmation; `--yes` still
+            // gates the CLI write.
+            if !yes && service.config().autonomy.level == openprx::security::AutonomyLevel::Full {
+                writeln!(io.out, "Dry run: nothing was written. Roll back with --yes")?;
+                return Ok(());
+            }
             let outcome = service
                 .transactions()
                 .rollback(RollbackRequest {
