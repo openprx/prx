@@ -86,10 +86,9 @@ pub struct NodeServerConfig {
     /// TTL for completed task results in milliseconds.
     #[serde(default = "default_node_server_task_result_ttl_ms")]
     pub task_result_ttl_ms: u64,
-    /// Command allowlist matched on first token.
-    ///
-    /// In restricted mode this list is required unless explicitly set to `["*"]`.
-    #[serde(default = "default_node_server_allowed_commands")]
+    /// Command allowlist matched on first token. Default: empty, which allows any
+    /// command from an authenticated caller; `["*"]` means the same.
+    #[serde(default)]
     pub allowed_commands: Vec<String>,
     /// Command denylist matched on first token. Always enforced.
     #[serde(default, alias = "command_blacklist")]
@@ -131,10 +130,6 @@ pub(super) const fn default_node_server_task_result_ttl_ms() -> u64 {
     3_600_000
 }
 
-pub(super) fn default_node_server_allowed_commands() -> Vec<String> {
-    vec!["echo".to_string()]
-}
-
 pub(super) const fn default_node_server_tls_required() -> bool {
     true
 }
@@ -150,7 +145,7 @@ impl Default for NodeServerConfig {
             max_output_bytes: default_node_server_max_output_bytes(),
             max_concurrent_tasks: default_node_server_max_concurrent_tasks(),
             task_result_ttl_ms: default_node_server_task_result_ttl_ms(),
-            allowed_commands: default_node_server_allowed_commands(),
+            allowed_commands: Vec::new(),
             blocked_commands: Vec::new(),
             tls_required: default_node_server_tls_required(),
             tls_cert: None,

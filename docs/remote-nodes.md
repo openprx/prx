@@ -46,7 +46,7 @@ exec_timeout_ms = 15000
 max_output_bytes = 1048576
 max_concurrent_tasks = 8
 task_result_ttl_ms = 3600000
-allowed_commands = ["echo"]
+# allowed_commands = ["echo"]   # unset or empty: any command from an authenticated caller
 blocked_commands = []
 tls_required = true
 tls_cert = "/etc/prx-node/tls.crt"
@@ -91,7 +91,7 @@ addresses are pinned into a no-proxy client, and redirects are not followed.
 - Bearer authentication is mandatory; optional HMAC signing adds request
   integrity and timestamp freshness.
 - Non-loopback listeners require valid TLS material by default.
-- Command allowlist and blocklist checks apply before process creation.
+- Command allowlist and blocklist checks apply before process creation. With no allowlist configured (the default) any command from an authenticated caller is allowed; the blocklist still applies.
 - Timeout and cancellation terminate and reap the child process.
 - Command output, file payloads, RPC bodies, mutation replays, concurrent async
   tasks, and completed task retention are bounded.

@@ -1057,7 +1057,7 @@ fn exposure_and_execution_widenings(before: &Config, after: &Config, reasons: &m
     );
     let (old_server, new_server) = (&before.nodes.server, &after.nodes.server);
     push(
-        adds_entries(&old_server.allowed_commands, &new_server.allowed_commands),
+        allowlist_widened(&old_server.allowed_commands, &new_server.allowed_commands),
         "nodes.server.allowed_commands",
     );
     push(
@@ -1176,6 +1176,16 @@ fn containment_widenings(before: &Config, after: &Config, reasons: &mut Vec<Risk
 /// Whether `after` holds an entry `before` does not.
 fn adds_entries(before: &[String], after: &[String]) -> bool {
     after.iter().any(|entry| !before.contains(entry))
+}
+
+/// Whether a node command allowlist became wider. An empty list or a `"*"`
+/// entry allows any command, so it is the widest state.
+fn allowlist_widened(before: &[String], after: &[String]) -> bool {
+    let allows_any = |list: &[String]| list.is_empty() || list.iter().any(|entry| entry == "*");
+    if allows_any(before) {
+        return false;
+    }
+    allows_any(after) || adds_entries(before, after)
 }
 
 /// Whether `before` holds an entry `after` dropped.
@@ -3155,7 +3165,7 @@ mod tests {
             ),
             (
                 "a node command allowed",
-                |_| {},
+                |c| c.nodes.server.allowed_commands = strings(&["echo"]),
                 |c| c.nodes.server.allowed_commands.push("sh".into()),
                 Some("nodes.server.allowed_commands"),
             ),
