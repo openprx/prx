@@ -27,17 +27,14 @@ pub(crate) fn execution_specs(
     port: &dyn TurnSurfacePort,
     proof: &dyn TurnSourceProof,
 ) -> anyhow::Result<ConstrainedToolSelection> {
-    let model = port.validate_turn(proof)?;
+    port.validate_turn(proof)?;
     let view = port.catalog_view();
     let rules = rules(port, &view);
     anyhow::ensure!(
         rules.turn_scope_admits(),
         "turn scope no longer passes its execution rules"
     );
-    let cost = &port.config().cost;
-    let references = rules.surface(port.outgoing_child(), &|bytes| {
-        crate::cost::estimate::estimate_cost(&model, cost, bytes)
-    });
+    let references = rules.surface(port.outgoing_child());
     anyhow::ensure!(
         references == *port.execution_refs(),
         "published surface changed after admission"

@@ -285,7 +285,7 @@ async fn ordinary_case(level: AutonomyLevel, workspace: &tempfile::TempDir) -> a
             // strict child share, in Full as in Supervised; nothing dispatches.
             let allowance = &publication.parent_authority().allowance;
             allowance.money().store(0, Ordering::Release);
-            assert_eq!(allowance.carve_ordinary_child(1)?.0, 0);
+            assert_eq!(allowance.share_with_child(1)?.0, 0);
             assert_eq!(calls.load(Ordering::SeqCst), executed);
 
             // Parity: a live executor that drifted from the pinned catalog is
@@ -518,10 +518,10 @@ async fn operator_task_cells(
     // task or parent allowance funds no child share in Full as in
     // Supervised; nothing dispatches.
     authority.allowance().money().store(0, Ordering::Release);
-    assert_eq!(authority.allowance().carve_ordinary_child(1)?.0, 0);
+    assert_eq!(authority.allowance().share_with_child(1)?.0, 0);
     let parent = &authority.publication().parent_authority().allowance;
     parent.money().store(0, Ordering::Release);
-    assert_eq!(parent.carve_ordinary_child(1)?.0, 0);
+    assert_eq!(parent.share_with_child(1)?.0, 0);
     assert_eq!(calls.load(Ordering::SeqCst), executed);
 
     // Parity: drift of the live executor refuses the operator source, the

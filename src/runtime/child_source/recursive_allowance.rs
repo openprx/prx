@@ -34,27 +34,28 @@ impl RecursiveAllowance {
         Arc::clone(&self.money)
     }
 
-    /// Each ordinary launch atomically reserves a strict share of the balance.
-    /// Failed launches retain their reservation; siblings cannot reuse it.
-    pub(crate) fn carve_ordinary_child(&self, ceiling_cents: u32) -> anyhow::Result<(u32, Arc<Self>)> {
-        let mut available = self.money.load(Ordering::Acquire);
-        loop {
-            let cents = u32::try_from(available.min(u64::from(ceiling_cents) * 10_000) / 20_000)?;
-            // A zero-price child can still run with a zero money ceiling.
-            // Paid requests remain denied by its accounting owner. Never give
-            // it the parent's sub-cent remainder or manufacture a fresh budget.
-            if cents == 0 {
-                return Ok((0, Arc::new(Self::new(0))));
-            }
-            let share = u64::from(cents) * 10_000;
-            match self
-                .money
-                .compare_exchange_weak(available, available - share, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => return Ok((cents, Arc::new(Self::new(share)))),
-                Err(current) => available = current,
-            }
+    /// An ordinary launch shares this run's counter: no child receives a
+    /// private slice, so siblings never see 1/2, 1/4, 1/8 of the balance. The
+    /// returned cents are the child's visible ceiling (the whole remaining
+    /// balance, capped by `ceiling_cents`). The total stays enforced at spend
+    /// time by the one atomic counter and the workspace cost journal.
+    pub(crate) fn share_with_child(&self, ceiling_cents: u32) -> anyhow::Result<(u32, Arc<Self>)> {
+        let available = self.money.load(Ordering::Acquire);
+        let cents = u32::try_from(available.min(u64::from(ceiling_cents) * 10_000) / 10_000)?;
+        // A zero-price child can still run with a zero money ceiling.
+        // Paid requests remain denied by its accounting owner. Never give
+        // it the parent's sub-cent remainder or manufacture a fresh budget.
+        if cents == 0 {
+            return Ok((0, Arc::new(Self::new(0))));
         }
+        Ok((
+            cents,
+            Arc::new(Self {
+                money: Arc::clone(&self.money),
+                retention: None,
+                contexts: AtomicUsize::new(0),
+            }),
+        ))
     }
 
     pub(in crate::runtime) fn retire(self: &Arc<Self>) {
@@ -157,7 +158,7 @@ mod ordinary_concurrency_tests {
     use super::*;
 
     #[test]
-    fn concurrent_ordinary_reservations_conserve_the_original_envelope() {
+    fn concurrent_ordinary_launches_share_one_counter() {
         let initial = 10_000_000;
         let parent = Arc::new(RecursiveAllowance::new(initial));
         let barrier = Arc::new(std::sync::Barrier::new(16));
@@ -169,16 +170,15 @@ mod ordinary_concurrency_tests {
                 let barrier = Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     barrier.wait();
-                    parent.carve_ordinary_child(1000).map_or(0, |(cents, child)| {
-                        let share = u64::from(cents) * 10_000;
-                        assert_eq!(child.money().load(Ordering::Acquire), share);
-                        share
-                    })
+                    let (cents, child) = parent.share_with_child(1000).expect("test: share");
+                    assert!(Arc::ptr_eq(&child.money(), &parent.money()));
+                    cents
                 })
             })
             .collect();
-        let reserved: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
-        assert!(reserved > 0);
-        assert_eq!(reserved + parent.money().load(Ordering::Acquire), initial);
+        for handle in handles {
+            assert_eq!(handle.join().unwrap(), 1000);
+        }
+        assert_eq!(parent.money().load(Ordering::Acquire), initial);
     }
 }

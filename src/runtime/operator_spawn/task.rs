@@ -119,7 +119,7 @@ impl ChildLaunchSource {
         parent.ensure_child_available()?;
         let (_, allowance) = parent
             .allowance
-            .carve_ordinary_child(parent.constraints.authority.max_cost_cents)?;
+            .share_with_child(parent.constraints.authority.max_cost_cents)?;
         let cancellation = cancellation.child_token();
         let authority = Arc::new(OperatorTaskAuthority {
             id: uuid::Uuid::now_v7(),

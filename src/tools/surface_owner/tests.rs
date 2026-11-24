@@ -11,7 +11,6 @@ use super::facts::PublicationFacts;
 use crate::decision_engine::state::fixtures;
 use crate::security::{AutonomyLevel, SecurityPolicy};
 use crate::tools::capability::catalog::{CapabilityCatalog, CatalogScope, CatalogSources, SurfacePolicy};
-use crate::tools::capability::contract::CostEstimate;
 use crate::tools::capability::turn_state::{ConstraintCode, SideEffectMode, TrustedParts};
 use crate::tools::traits::{Tool, ToolResult};
 
@@ -121,10 +120,6 @@ fn full_turn_discovery_ignores_an_attenuated_child_manifest() {
         .expect("test: catalog");
     let view = catalog.view(&CatalogScope::default());
     let entry = |name: &str| catalog.entry_for_public_name(name).expect("test: registered entry");
-    let cost = Some(CostEstimate {
-        tokens: 0,
-        micro_usd: 0,
-    });
     for (level, mode) in [
         (AutonomyLevel::Full, SideEffectMode::GuardedWrite),
         (AutonomyLevel::Supervised, SideEffectMode::ApprovalRequired),
@@ -161,8 +156,8 @@ fn full_turn_discovery_ignores_an_attenuated_child_manifest() {
             facts: &facts,
             catalog: &view,
         };
-        let member = rules.capability(entry("file_write"), &entry_ref(entry("file_write")), false, cost);
-        let outside = rules.capability(entry("shell"), &entry_ref(entry("shell")), false, cost);
+        let member = rules.capability(entry("file_write"), &entry_ref(entry("file_write")), false);
+        let outside = rules.capability(entry("shell"), &entry_ref(entry("shell")), false);
         if level == AutonomyLevel::Full {
             assert_eq!(
                 member,

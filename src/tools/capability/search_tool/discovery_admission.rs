@@ -139,7 +139,7 @@ fn discovery_turn_states(
 ) -> anyhow::Result<BTreeMap<CapabilityId, DiscoveryTurnState>> {
     let view = port.catalog_view();
     let rules = rules(port, &view);
-    let model = port.resolve_model(proof)?;
+    port.resolve_model(proof)?;
     let incoming = proof.child_scope().map(|scope| scope.gate_inputs().0);
     let mut states = BTreeMap::new();
     for (id, discovered) in entries {
@@ -158,8 +158,7 @@ fn discovery_turn_states(
                 _ => "no_child_manifest",
             })
         } else {
-            let estimate = crate::cost::estimate::estimate_cost(&model, &port.config().cost, entry.schema_bytes);
-            match rules.capability(entry, &discovered.reference, delegation, estimate) {
+            match rules.capability(entry, &discovered.reference, delegation) {
                 PublicationAdmission::Passed => DiscoveryTurnState::Callable,
                 PublicationAdmission::ApprovalRequired => DiscoveryTurnState::ApprovalRequired,
                 PublicationAdmission::Blocked { reason_code, .. } => DiscoveryTurnState::Unavailable(reason_code),
@@ -343,14 +342,13 @@ pub(crate) fn prepare_discovered_tool(
         !rules.restricts(entry),
         "discovered capability conflicts with turn restrictions"
     );
-    let model = port.resolve_model(proof)?;
+    port.resolve_model(proof)?;
     let delegation = is_delegator(&entry.public_name);
     anyhow::ensure!(
         !delegation || port.outgoing_child(),
         "offered delegation has no source-issued child manifest"
     );
-    let estimate = crate::cost::estimate::estimate_cost(&model, &port.config().cost, entry.schema_bytes);
-    let admission = rules.capability(entry, &reference, delegation, estimate);
+    let admission = rules.capability(entry, &reference, delegation);
     let descriptor = port
         .execution()
         .current_descriptor(&entry.public_name)

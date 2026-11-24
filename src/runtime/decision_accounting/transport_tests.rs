@@ -678,9 +678,11 @@ async fn recursive_parent_child_and_leaf_reservations_share_the_original_money()
     );
     let config = Arc::new(config);
     let initial_money = crate::cost::tracker::remaining_micro_usd_read_only(&config.cost, workspace.path())?;
-    let root = RecursiveAllowance::new(40_000);
-    let (_, child) = root.carve_ordinary_child(4)?;
-    let (_, leaf) = child.carve_ordinary_child(2)?;
+    // Three independent counters: each owner's reservation is checked against
+    // its own money, and together they hold the 40_000 envelope.
+    let root = RecursiveAllowance::new(20_000);
+    let child = RecursiveAllowance::new(10_000);
+    let leaf = RecursiveAllowance::new(10_000);
     let cleanup = Arc::new(CleanupTracker::default());
     let result = cleanup
         .scope(Box::pin(async {

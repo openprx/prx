@@ -249,9 +249,7 @@ impl TurnRuntimeService {
             facts: &facts,
             catalog: &catalog,
         }
-        .surface(outgoing_delegation.is_some(), &|bytes| {
-            crate::cost::estimate::estimate_cost(&model, &self.generation.effective.cost, bytes)
-        });
+        .surface(outgoing_delegation.is_some());
         // The turn's one accounting scope, created at opening. Without the
         // prediction hop nothing has been charged to it yet.
         let accounting = accounting_scope(self, proof, budgets, deadline);

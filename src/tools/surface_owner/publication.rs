@@ -17,7 +17,7 @@ use std::collections::BTreeSet;
 use crate::capability::CapabilityAvailabilityLevel;
 use crate::security::AutonomyLevel;
 use crate::tools::capability::catalog::{CapabilityEntry, CatalogView, Exposure};
-use crate::tools::capability::contract::{CapabilityRef, CostEstimate, SideEffectClass};
+use crate::tools::capability::contract::{CapabilityRef, SideEffectClass};
 use crate::tools::capability::turn_state::{SideEffectMode, TrustedParts, TurnSurfaceKind};
 use crate::tools::execution::{ToolExecutionDecision, decide_tool_execution};
 use crate::tools::surface_owner::facts::PublicationFacts;
@@ -150,7 +150,6 @@ impl PublicationRules<'_, '_> {
         entry: &CapabilityEntry,
         reference: &CapabilityRef,
         delegate: bool,
-        estimated_cost: Option<CostEstimate>,
     ) -> PublicationAdmission {
         let trusted = self.trusted;
         let generation = self.catalog.generation();
@@ -164,9 +163,6 @@ impl PublicationRules<'_, '_> {
                     || !(manifest.authority.level == AutonomyLevel::ReadOnly
                         && entry.effect > SideEffectClass::ReadOnly))
                 && !(delegate && manifest.authority.remaining_depth == 0)
-                && estimated_cost.is_some_and(|cost| {
-                    cost.micro_usd <= u64::from(manifest.authority.max_cost_cents).saturating_mul(10_000)
-                })
                 && self.child_membership_admits(reference)
         });
         if trusted.workspace_id.is_empty()
@@ -242,11 +238,7 @@ impl PublicationRules<'_, '_> {
     /// delegator when the turn sealed an outgoing child manifest on a
     /// non-interactive surface or at Full. Entries restricted by the turn or blocked by
     /// [`Self::capability`] are not published.
-    pub(crate) fn direct_surface(
-        &self,
-        outgoing_child: bool,
-        estimate: &dyn Fn(usize) -> Option<CostEstimate>,
-    ) -> BTreeSet<CapabilityRef> {
+    pub(crate) fn direct_surface(&self, outgoing_child: bool) -> BTreeSet<CapabilityRef> {
         if !self.facts.model_can_call_tools {
             return BTreeSet::new();
         }
@@ -292,19 +284,14 @@ impl PublicationRules<'_, '_> {
                 if self.restricts(entry) {
                     return None;
                 }
-                let cost = self.facts.child_scope().and_then(|_| estimate(entry.schema_bytes));
-                (!self.capability(entry, &reference, delegate, cost).is_blocked()).then_some(reference)
+                (!self.capability(entry, &reference, delegate).is_blocked()).then_some(reference)
             })
             .collect()
     }
 
     /// The turn's published surface: the direct core.
-    pub(crate) fn surface(
-        &self,
-        outgoing_child: bool,
-        estimate: &dyn Fn(usize) -> Option<CostEstimate>,
-    ) -> BTreeSet<CapabilityRef> {
-        self.direct_surface(outgoing_child, estimate)
+    pub(crate) fn surface(&self, outgoing_child: bool) -> BTreeSet<CapabilityRef> {
+        self.direct_surface(outgoing_child)
     }
 
     /// A delegator in the published surface may bind the turn's sealed

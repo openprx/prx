@@ -390,7 +390,7 @@ impl OrdinaryChildPublication {
         self.inner
             .authority
             .allowance
-            .carve_ordinary_child(self.scope().gate_inputs().0.authority.max_cost_cents)
+            .share_with_child(self.scope().gate_inputs().0.authority.max_cost_cents)
     }
 
     /// The exact live registry behind the pinned parent catalog.
