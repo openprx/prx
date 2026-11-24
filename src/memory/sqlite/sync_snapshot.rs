@@ -132,8 +132,9 @@ fn inventory(conn: &Connection, id: &str, owner: &str, head: i64, water: i64) ->
     // cut must inventory the primary events, or it could advance past an
     // event that is absent from both snapshot and subsequent replay.
     let continuation_flag = format!(
-        "CASE WHEN {} THEN 1 ELSE 0 END",
-        super::mailbox_continuation::CONTINUATION_PREDICATE_E
+        "CASE WHEN {} OR {} THEN 1 ELSE 0 END",
+        super::mailbox_continuation::CONTINUATION_PREDICATE_E,
+        super::mailbox_continuation::TASK_ECHO_PREDICATE_E
     );
     let mut q=conn.prepare(&format!("WITH candidates AS (
         SELECT e.id,e.event_id,e.workspace_id,e.owner_id,e.run_id,e.role,e.event_type,e.idempotency_key,

@@ -286,6 +286,7 @@ pub(super) fn event_written(conn: &Connection, event: &crate::memory::MessageEve
     if event.role == "user"
         && (h.parent_run_id.is_some() || event.source.as_str() == "prx_mailbox")
         && !super::mailbox_continuation::is_continuation(conn, event)?
+        && !super::mailbox_continuation::is_task_echo(conn, &event.event_id)?
     {
         h.kind = "turn.appended".into();
         h.event_id = format!("turn.appended:{}", h.source_ref);

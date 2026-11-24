@@ -27,3 +27,22 @@ pub(super) fn is_continuation(conn: &Connection, event: &crate::memory::MessageE
         |row| row.get(0),
     )?)
 }
+
+/// SQL predicate over a `message_events` row aliased `e`: true when `e` is a
+/// child task segment input that restates the task already recorded by the
+/// spawn request row (same session, role and content, and the spawn row's run
+/// is the segment's `task_run_id`). History hides it the same way
+/// (`child_turns::history`), so the journal and snapshot must not publish it.
+pub(super) const TASK_ECHO_PREDICATE_E: &str = "(e.role='user' AND EXISTS(SELECT 1 FROM message_events p \
+     WHERE p.workspace_id=e.workspace_id AND p.owner_id=e.owner_id AND p.id<e.id \
+     AND p.session_key=e.session_key AND p.role=e.role AND p.content_hash=e.content_hash \
+     AND json_extract(e.raw_payload_json,'$.task_run_id')=p.run_id))";
+
+/// Whether the stored row `event_id` is a task echo (see [`TASK_ECHO_PREDICATE_E`]).
+pub(super) fn is_task_echo(conn: &Connection, event_id: &str) -> anyhow::Result<bool> {
+    Ok(conn.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM message_events e WHERE e.event_id=?1 AND {TASK_ECHO_PREDICATE_E})"),
+        params![event_id],
+        |row| row.get(0),
+    )?)
+}
