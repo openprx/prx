@@ -2181,6 +2181,24 @@ async fn send_context_degraded_notice(
     Ok(())
 }
 
+/// The budget the caller's lossy token-aware trim leaves behind, measured on a
+/// copy so the degradation record carries real before and after counts even
+/// though the caller owns the actual trim.
+fn lossy_trim_budget(
+    history: &[crate::providers::traits::ChatMessage],
+    compaction_guard_history: &crate::agent::turn_history::CanonicalHistory,
+    config: &crate::config::AgentCompactionConfig,
+) -> crate::agent::context_budget::ContextBudgetSnapshot {
+    let mut trimmed_view = history.to_vec();
+    let mut projection_guard = compaction_guard_history.messages().to_vec();
+    trim_redux_driver_context_budget_after_rollover(&mut trimmed_view, &mut projection_guard, config, None);
+    crate::agent::context_budget::plan_context_budget(
+        &trimmed_view,
+        config,
+        crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
+    )
+}
+
 async fn apply_redux_context_rollover(
     provider: &dyn Provider,
     history: &mut Vec<crate::providers::traits::ChatMessage>,
@@ -2235,12 +2253,13 @@ async fn apply_redux_context_rollover(
                     config,
                     crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
                 );
+                let after_trim = lossy_trim_budget(history, compaction_guard_history, config);
                 crate::agent::compaction::persist_context_switch_degradation(
                     audit,
                     trigger,
                     "handoff_unavailable",
                     budget.used_tokens,
-                    budget.used_tokens,
+                    after_trim.used_tokens,
                     budget.available_input_tokens,
                 )
                 .await;
@@ -2268,12 +2287,13 @@ async fn apply_redux_context_rollover(
                 config,
                 crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
             );
+            let after_trim = lossy_trim_budget(history, compaction_guard_history, config);
             crate::agent::compaction::persist_context_switch_degradation(
                 audit,
                 trigger,
                 "handoff_failed",
                 budget.used_tokens,
-                budget.used_tokens,
+                after_trim.used_tokens,
                 budget.available_input_tokens,
             )
             .await;
@@ -2306,12 +2326,13 @@ async fn apply_redux_context_rollover(
                 config,
                 crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
             );
+            let after_trim = lossy_trim_budget(history, compaction_guard_history, config);
             crate::agent::compaction::persist_context_switch_degradation(
                 audit,
                 trigger,
                 "handoff_failed",
                 budget.used_tokens,
-                budget.used_tokens,
+                after_trim.used_tokens,
                 budget.available_input_tokens,
             )
             .await;
