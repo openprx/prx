@@ -1298,6 +1298,11 @@ impl SessionsSpawnTool {
                                         ProcessFinalization::Natural,
                                     )
                                 }
+                                Ok(ProcessWorkerOutcome::ExitedUnrequested { detail, usage }) => {
+                                    let error = exited_without_result_reason(&detail);
+                                    (SubAgentStatus::Failed(error.clone()), format!("Sub-agent process error: {error}"),
+                                        usage, ProcessFinalization::Natural)
+                                }
                                 Ok(ProcessWorkerOutcome::TerminationFailed(error)) => {
                                     let msg = format!("Sub-agent process termination failed: {error}");
                                     (

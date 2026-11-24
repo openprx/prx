@@ -35,6 +35,7 @@ mod process_control;
 mod process_mode;
 mod provider;
 mod requested_stop;
+mod unrequested_exit;
 mod scope;
 mod spawn;
 mod task_mode;

@@ -185,6 +185,12 @@ pub(super) enum ProcessWorkerOutcome {
         usage: Vec<crate::llm::route_decision::MeteredTokenUsageRecord>,
     },
     TerminationFailed(String),
+    /// The worker died on its own (no stop requested) and recovery found no
+    /// completion record; `usage` is the partial provider usage recovered.
+    ExitedUnrequested {
+        detail: String,
+        usage: Vec<crate::llm::route_decision::MeteredTokenUsageRecord>,
+    },
     /// The worker's stdout reached EOF without a `WorkerResult` line.
     ///
     /// This is the process-mode half of "the run died where the parent cannot

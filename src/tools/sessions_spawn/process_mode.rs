@@ -730,6 +730,8 @@ pub(super) async fn run_sub_agent_process(
             }
         }
     }
+    // Empty stdout is the only case converted below, so note it before recovery.
+    let silent_exit = matches!(outcome, Ok(ProcessWorkerOutcome::ExitedWithoutResult(_))).then_some(status);
     let outcome = async {
         // A cleanup-confirmed worker can exit after journaling but before its
         // stdout result reaches the parent. Reuse its exact launch authority.
@@ -853,6 +855,11 @@ pub(super) async fn run_sub_agent_process(
     }
     .await;
     let outcome = super::requested_stop::settle_requested_stop(run_id, outcome, stop.as_deref());
+    // Read late: a stop requested while recovery ran must not be misread as a crash.
+    let unrequested =
+        stop.is_none() && process_control.termination_reason().is_none() && !worker_registration.kill_requested();
+    let outcome =
+        super::unrequested_exit::settle_unrequested_exit(run_id, outcome, silent_exit.filter(|_| unrequested));
     // The leader is confirmed reaped here, including decode/verification
     // failures. Unconfirmed cleanup branches above retain their workspace.
     cleanup_process_worker_workspace(run_id, &worker_workspace, keep_workspace);
