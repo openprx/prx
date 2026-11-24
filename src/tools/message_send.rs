@@ -1428,7 +1428,7 @@ mod tests {
             .execute(json!({
                 "action": "send",
                 "target": "+15551234567",
-                "message": "Hello from ZeroClaw!"
+                "message": "Hello from PRX!"
             }))
             .await
             .unwrap();
@@ -1436,7 +1436,7 @@ mod tests {
         assert!(result.success, "Expected success, got: {:?}", result.error);
         let msgs = sent.lock().await;
         assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0], "Hello from ZeroClaw!");
+        assert_eq!(msgs[0], "Hello from PRX!");
     }
 
     #[tokio::test]

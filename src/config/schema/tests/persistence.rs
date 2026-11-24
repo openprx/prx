@@ -345,7 +345,7 @@ async fn config_split_and_reload_roundtrip_matches_original() {
     config.default_model = Some("roundtrip-model".into());
     config.channels_config.telegram = Some(TelegramConfig {
         bot_token: "roundtrip-token".into(),
-        allowed_users: vec!["zeroclaw_user".into()],
+        allowed_users: vec!["prx_user".into()],
         stream_mode: StreamMode::default(),
         draft_update_interval_ms: default_draft_update_interval_ms(),
         interrupt_on_new_message: false,

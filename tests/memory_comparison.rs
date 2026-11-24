@@ -84,7 +84,7 @@ async fn compare_recall_quality() {
         ("lang_pref", "User prefers Rust over Python", MemoryCategory::Core),
         ("editor", "Uses VS Code with rust-analyzer", MemoryCategory::Core),
         ("tz", "Timezone is EST, works 9-5", MemoryCategory::Core),
-        ("proj1", "Working on ZeroClaw AI assistant", MemoryCategory::Daily),
+        ("proj1", "Working on PRX AI assistant", MemoryCategory::Daily),
         (
             "proj2",
             "Previous project was a web scraper in Python",

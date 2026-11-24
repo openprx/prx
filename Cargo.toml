@@ -208,7 +208,7 @@ rust-embed = "8.5"
 
 # OpenTelemetry — OTLP trace + metrics export.
 # Use the blocking HTTP exporter client to avoid Tokio-reactor panics in
-# OpenTelemetry background batch threads when ZeroClaw emits spans/metrics from
+# OpenTelemetry background batch threads when PRX emits spans/metrics from
 # non-Tokio contexts.
 opentelemetry = { version = "0.31", default-features = false, features = ["trace", "metrics"] }
 opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "metrics"] }
