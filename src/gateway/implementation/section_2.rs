@@ -573,6 +573,7 @@ async fn run_gateway_inner(
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE));
 
     api::sync_startup::startup(&state, &shutdown).await?;
+    api::recover_mailbox_wakes(&state).await;
     let api_routes = api::router(state.clone()).layer(RequestBodyLimitLayer::new(MAX_API_BODY_SIZE));
 
     // Build router with middleware

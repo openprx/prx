@@ -37,6 +37,7 @@ mod plugins;
 mod providers;
 mod runtime;
 mod sessions;
+pub(super) use sessions::recover_startup as recover_mailbox_wakes;
 #[cfg(test)]
 pub(in crate::gateway) use sessions::post_session_message;
 #[cfg(test)]

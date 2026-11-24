@@ -1,4 +1,5 @@
 mod mailbox;
+pub(in crate::gateway) use mailbox::recover_startup;
 mod rf_delete;
 mod rf_message;
 mod rf_replay;

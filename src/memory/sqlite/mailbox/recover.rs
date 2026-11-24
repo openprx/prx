@@ -15,6 +15,28 @@ use crate::messaging::{DeliveryState, PrxMessage, SessionAddr};
 const MAX_RECOVERED: i64 = 64;
 
 impl SqliteMailbox {
+    /// Sessions `(owner, session, agent)` holding an adoption row that no
+    /// continuation input names, among the newest `MAX_RECOVERED` adoptions.
+    /// Startup uses it to find the sessions whose receiver must be registered.
+    pub(crate) fn unwoken_sessions(&self, workspace: &str) -> MailboxResult<Vec<(String, String, Option<String>)>> {
+        let writer = self.memory.pool.write();
+        let mut query = writer
+            .prepare(
+                "SELECT DISTINCT a.owner_id,a.session_key,a.agent_id FROM \
+                 (SELECT event_id,owner_id,session_key,agent_id FROM message_events \
+                  WHERE workspace_id=?1 AND source='prx_mailbox' AND role='user' \
+                  ORDER BY id DESC LIMIT ?2) a \
+                 WHERE NOT EXISTS(SELECT 1 FROM message_events c \
+                  WHERE c.workspace_id=?1 AND c.causation_event_id=a.event_id)",
+            )
+            .map_err(storage_error)?;
+        query
+            .query_map(params![workspace, MAX_RECOVERED], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map_err(storage_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage_error)
+    }
+
     /// Adopted messages of `address` with no continuation input yet, oldest
     /// first. The adoption commit and the wake are separate steps: a message
     /// is "adopted, not woken" while no `message_events` row names its adoption

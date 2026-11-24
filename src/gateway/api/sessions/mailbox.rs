@@ -43,6 +43,95 @@ pub(super) fn register(
         }),
     )
 }
+/// Registers the receivers of owner sessions that hold adopted but unwoken
+/// messages, so a restart wakes them without further input. Registration is
+/// the existing path: its first poll queues the unwoken messages, and a later
+/// submission to the same session finds the receiver registered and changes
+/// nothing, so a message is never woken twice. A child session is reached
+/// through its root, whose registration drives the children.
+pub(in crate::gateway) async fn recover_startup(state: &AppState) {
+    let config = state.config.load_full();
+    if config.memory.backend != "sqlite" {
+        return;
+    }
+    let Ok(runtime) = MessagingRuntime::for_config(&config) else {
+        return;
+    };
+    let Ok(Ok(roots)) = crate::runtime::blocking::spawn_blocking(move || pending_roots(&runtime)).await else {
+        tracing::warn!("session mailbox startup wake scan failed");
+        return;
+    };
+    let workspace = config.workspace_dir.to_string_lossy().into_owned();
+    for (owner, session, partition) in roots {
+        let Ok(Some(summary)) = state.mem.get_conversation_session(&session).await else {
+            continue;
+        };
+        let envelope = super::console_runtime_envelope_for_workspace(
+            workspace.clone(),
+            &session,
+            &summary.channel,
+            &summary.sender,
+        )
+        .with_owner_id(owner.clone())
+        .with_owner_isolation()
+        .with_agent_partition(partition);
+        let principal = super::super::ApiPrincipal { owner_id: owner };
+        match register(state, envelope, principal) {
+            Ok(()) => tracing::info!("session mailbox startup wake registered a receiver"),
+            Err(error) => {
+                tracing::warn!(error=%crate::agent::diagnostics::error_class(&error),"session mailbox startup wake refused");
+            }
+        }
+    }
+}
+
+/// Owner (`api:` ids only: the Console ingress) root sessions to register.
+fn pending_roots(
+    runtime: &MessagingRuntime,
+) -> crate::messaging::mailbox::MailboxResult<Vec<(String, String, crate::memory::AgentPartition)>> {
+    let workspace = &runtime.workspace;
+    let mut roots: Vec<(String, String, crate::memory::AgentPartition)> = Vec::new();
+    for (owner, session, _) in runtime.store.unwoken_sessions(workspace)? {
+        if !owner.starts_with("api:") {
+            continue;
+        }
+        let mut root = session;
+        for _ in 0..8 {
+            match runtime.store.parent_session(workspace, &owner, &root)? {
+                Some(parent) => root = parent,
+                None => break,
+            }
+        }
+        if roots.iter().any(|(o, s, _)| *o == owner && *s == root) {
+            continue;
+        }
+        let agent = runtime
+            .store
+            .logical_agent(workspace, &owner, &root)?
+            .unwrap_or_else(|| "main".to_owned());
+        let key = if agent == "main" {
+            crate::memory::PartitionKey::Main
+        } else {
+            let address = runtime.address(&owner, &root, &agent);
+            let scope = runtime.store.session_scope(workspace, &address, false)?;
+            let Ok(name) = crate::config::agent_name::AgentName::parse(&agent) else {
+                continue;
+            };
+            crate::memory::PartitionKey::Named {
+                name,
+                incarnation: scope.incarnation,
+            }
+        };
+        let partition = crate::memory::AgentPartition {
+            workspace_id: workspace.clone(),
+            owner_id: owner.clone(),
+            key,
+        };
+        roots.push((owner, root, partition));
+    }
+    Ok(roots)
+}
+
 async fn run(
     state: AppState,
     mut envelope: RuntimeEnvelope,
