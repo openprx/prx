@@ -636,7 +636,8 @@ mod tests {
     /// revision is a conflict, and only the reported revision applies it.
     #[tokio::test]
     async fn a_high_risk_confirmation_is_bound_to_the_reported_revision() {
-        let served = serve_config(|_| {}).await;
+        // The confirmation is demanded below Full only.
+        let served = serve_config(|config| config.autonomy.level = AutonomyLevel::Supervised).await;
         let before = served.disk();
         let body = json!({"api_url": "https://proxy.example/v1"});
 

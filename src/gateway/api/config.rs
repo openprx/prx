@@ -1151,6 +1151,8 @@ mod tests {
         let mut config = Config::default();
         config.config_path = dir.path().join("config.toml");
         config.workspace_dir = dir.path().join("workspace");
+        // The confirmation tests exercise the rule below Full (at Full none is demanded).
+        config.autonomy.level = AutonomyLevel::Supervised;
         mutate(&mut config);
         config.save().await.expect("test: save initial config");
         let loaded = Config::load_from_path(&config.config_path, config.workspace_dir.clone())

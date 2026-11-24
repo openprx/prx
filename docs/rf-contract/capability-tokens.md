@@ -209,6 +209,13 @@ without a level reads back Main's level, the one it runs at.
   high-risk confirmation, whatever the change touches inside `agents.<name>`.
   A `confirm_high_risk` query parameter on these routes is accepted and
   ignored. A stale or missing `If-Match` is still `409` / the refusals above.
+- Config routes (`POST /api/config`, `PUT /api/config/files/{name}`,
+  `PUT /api/config/secrets`, `POST /api/config/apply`): when the install runs
+  at `autonomy.level = "full"` (the default) a high-risk change no longer
+  answers `428 confirmation_required`; it applies, and `confirm_high_risk`
+  is accepted and not required. A stale `If-Match` is still `409`. A write
+  that raises the level to `full` from a lower level, and any write below
+  `full`, still answer `428` as before.
 - `500 storage_unavailable`: the configuration, the registry or a reload
   failed.
 

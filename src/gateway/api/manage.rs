@@ -1396,6 +1396,8 @@ mod tests {
 
     async fn with_agent() -> Served {
         serve_config(|config| {
+            // The confirmation tests exercise the rule below Full.
+            config.autonomy.level = crate::security::policy::AutonomyLevel::Supervised;
             config.agents.insert(
                 "coder".into(),
                 serde_json::from_value(json!({"provider": "openai", "model": "gpt-4o"})).expect("test: agent"),

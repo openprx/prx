@@ -2698,7 +2698,7 @@ The management commands call the same service the Gateway uses, in-process:
 the same validation, the same plan and the same refusal text for the same
 change. Every mutating command prints its plan and writes nothing without
 `--yes`; a high-risk plan (a credential, an endpoint, a stdio MCP launch, …)
-also needs `--confirm-high-risk <REVISION>`, where the revision is the one
+also needs, below `Full`, `--confirm-high-risk <REVISION>`, where the revision is the one
 the plan printed, so a change made in between is refused (`409`-style)
 instead of being confirmed unseen. The CLI writes through the transaction
 (revision check, history record, load validation); a running PRX picks the
@@ -2903,7 +2903,25 @@ Rules that hold on every endpoint:
   - Without `If-Match` a change is applied to whatever revision it was
     planned on.
   - The credential endpoints take no `If-Match`.
-- **High-risk confirmation.** A high-risk plan answers `428` with
+- **Install at `Full`: no confirmation.** When the configuration the plan
+  was made against has `autonomy.level = "full"` (the default), no high-risk
+  confirmation is demanded and no `428 confirmation_required` is returned,
+  on every config write route (`POST /api/config`,
+  `PUT /api/config/files/{name}`, `PUT /api/config/secrets`, the management
+  routes) and on the CLI (`prx config apply`, `prx config autonomy`,
+  `prx config brave-key`, `prx providers migrate --apply`, ...). The level is
+  read before the change: a write that raises the level from supervised or
+  read-only to `full` still confirms; a write made at `full`, including one
+  that lowers the level, does not. `?confirm_high_risk=true`, `If-Match`,
+  `--confirm-high-risk <revision>` and `--allow-credential-clear` stay
+  accepted so existing clients and scripts keep working; the first three are
+  simply not required at `Full`. A stale revision still answers `409`;
+  `--yes` still gates a CLI write. `--allow-credential-clear` (and
+  `allow_secret_clear=true` on the raw file API) is not a confirmation: it
+  permits a raw-file replacement that would drop stored secrets and stays
+  required. Below `Full` the rules below apply unchanged. A rollback keeps its
+  own confirmation.
+- **High-risk confirmation (below `Full`).** A high-risk plan answers `428` with
   `required`, `risk_reasons`, `revision` and the `plan` text. Examples: an
   endpoint change, clearing the root key, or moving the root key to another
   default provider (`credential_owner_changed`). To confirm, resend with
@@ -3320,7 +3338,7 @@ report never changes the configured ceiling.
 
 Run `prx config brave-key --from-stdin` to inspect the current revision without
 reading stdin. Then pipe the key to the same command with `--yes
---confirm-high-risk REVISION`. The confirmed transaction accepts at most 16 KiB,
+--confirm-high-risk REVISION` (at `Full` the flag is optional). The confirmed transaction accepts at most 16 KiB,
 validates the credential, and stores it through the existing secret encryption
 policy. The key is never a CLI argument or part of plan output. A stale revision
 is refused before stdin is consumed. Replacing or clearing it uses the same

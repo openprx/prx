@@ -564,6 +564,8 @@ mod tests {
     async fn switching_the_default_away_from_the_root_key_needs_the_choice_and_confirmation() {
         const KEY: &str = "pmmf-root-key-sentinel";
         let served = serve_config(|config| {
+            // The confirmation is demanded below Full only.
+            config.autonomy.level = crate::security::policy::AutonomyLevel::Supervised;
             config.api_key = Some(KEY.into());
             declare_chat_model(config, "anthropic", "claude-sonnet-4-5");
         })

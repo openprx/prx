@@ -110,7 +110,7 @@ async fn finish(service: &ManagementService, plan: ManagedPlan, apply: &ApplyArg
         return Ok(());
     }
     let revision = plan.revision().unwrap_or("none").to_string();
-    let high_risk = !plan.summary().risk_reasons.is_empty();
+    let high_risk = !plan.summary().risk_reasons.is_empty() && !plan.applies_at_full();
     if !apply.yes {
         if high_risk {
             writeln!(

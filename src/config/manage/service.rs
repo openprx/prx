@@ -216,6 +216,14 @@ impl ManagedPlan {
         self.plan.summary()
     }
 
+    /// Whether the install runs at `Full` before this change, so that no
+    /// high-risk confirmation is demanded (see
+    /// [`ConfigPlan::applies_at_full`]).
+    #[must_use]
+    pub fn applies_at_full(&self) -> bool {
+        self.plan.applies_at_full()
+    }
+
     /// The revision the change is based on: what a high-risk confirmation
     /// must name.
     #[must_use]
@@ -545,7 +553,7 @@ impl ManagementService {
         actor: ConfigActor,
         confirmed_revision: Option<&str>,
     ) -> Result<ConfigTransactionOutcome, ManageError> {
-        if plan.summary().risk == super::plan::ConfigChangeRisk::High {
+        if plan.summary().risk == super::plan::ConfigChangeRisk::High && !plan.applies_at_full() {
             let revision = plan.revision().map(str::to_string);
             match confirmed_revision {
                 None => {

@@ -115,6 +115,20 @@ impl ConfigPlan {
     pub fn planned_revision(&self) -> Option<&str> {
         self.planned_revision.as_deref()
     }
+
+    /// Whether the install this plan was made against runs at the `Full`
+    /// autonomy level, evaluated on the configuration before the change (a
+    /// write that raises the level to `Full` is judged at the lower level it
+    /// leaves; one that lowers it from `Full` is judged at `Full`). At
+    /// `Full` no high-risk confirmation is demanded; the revision guard of
+    /// the commit still refuses a stale write. A configuration that could
+    /// not be loaded is not `Full`.
+    #[must_use]
+    pub fn applies_at_full(&self) -> bool {
+        self.current
+            .as_ref()
+            .is_some_and(|current| current.autonomy.level == crate::security::AutonomyLevel::Full)
+    }
 }
 
 /// How the caller applies a plan.
@@ -721,7 +735,10 @@ impl ConfigTransactions {
         // is asked of the caller: a refused model is refused, not confirmed.
         let warnings = check_plan_selections(&plan, actor).await?;
         let confined = agent.is_some_and(|agent| super::agent_scope::confines(&plan.summary, agent));
-        if plan.summary.risk == ConfigChangeRisk::High && !confined {
+        // At an effective `Full` level nothing is confirmed: the `confirm`
+        // inputs stay accepted and are not required. The commit below is
+        // still guarded by the expected revision (a stale write is a 409).
+        if plan.summary.risk == ConfigChangeRisk::High && !confined && !plan.applies_at_full() {
             if !options.confirm_high_risk {
                 return Err(ConfigTransactionError::ConfirmationRequired {
                     required: "confirm_high_risk",
@@ -1497,7 +1514,9 @@ mod tests {
     /// real load path, with the refusing participant registered.
     async fn fixture() -> Fixture {
         let dir = tempfile::TempDir::new().expect("test: temp dir");
-        let config = fixture::config_in(dir.path());
+        let mut config = fixture::config_in(dir.path());
+        // The confirmation tests exercise the rule below Full (at Full none is demanded).
+        config.autonomy.level = crate::security::AutonomyLevel::Supervised;
         crate::config::files::write_split_config(&config, false)
             .await
             .expect("test: write split fixture");

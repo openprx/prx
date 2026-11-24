@@ -9,16 +9,29 @@ pub(crate) async fn run_config(command: ConfigCommands, config: Config, io: &mut
             Ok(())
         }
         ConfigCommands::BraveKey { from_stdin: _, apply } => {
+            // At Full the confirmation flag is accepted but not required.
+            let at_full = config.autonomy.level == openprx::security::AutonomyLevel::Full;
             let service = service(config);
             let revision = service.revision().unwrap_or_else(|| "none".to_owned());
-            if !apply.yes || apply.confirm_high_risk.is_none() {
-                writeln!(
-                    io.out,
-                    "Dry run: stdin was not read. Set web_search.brave_api_key with --from-stdin --yes --confirm-high-risk {revision}"
-                )?;
+            if !apply.yes || (!at_full && apply.confirm_high_risk.is_none()) {
+                if at_full {
+                    writeln!(
+                        io.out,
+                        "Dry run: stdin was not read. Set web_search.brave_api_key with --from-stdin --yes"
+                    )?;
+                } else {
+                    writeln!(
+                        io.out,
+                        "Dry run: stdin was not read. Set web_search.brave_api_key with --from-stdin --yes --confirm-high-risk {revision}"
+                    )?;
+                }
                 return Ok(());
             }
-            if apply.confirm_high_risk.as_deref() != Some(revision.as_str()) {
+            if apply
+                .confirm_high_risk
+                .as_deref()
+                .is_some_and(|confirmed| confirmed != revision)
+            {
                 bail!("the configuration revision changed; rerun the dry run before supplying a credential");
             }
             let mut value = String::new();
@@ -352,6 +365,8 @@ mod tests {
             default_model: Some("gpt-4o".into()),
             ..Config::default()
         };
+        // The confirmation tests exercise the rule below Full (at Full none is demanded).
+        config.autonomy.level = openprx::security::AutonomyLevel::Supervised;
         edit(&mut config);
         config.save().await.expect("test: save");
         let loaded = reload(&dir).await;

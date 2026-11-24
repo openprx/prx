@@ -1157,6 +1157,8 @@ mod tests {
             credential_ref: None,
         }];
         cfg.memory.auto_save = !Config::default().memory.auto_save;
+        // The confirmation tests exercise the rule below Full (at Full none is demanded).
+        cfg.autonomy.level = crate::security::AutonomyLevel::Supervised;
         crate::config::files::write_split_config(&cfg, false).await.unwrap();
         assert!(
             std::fs::read_to_string(tmp.path().join("config.d/routing.toml"))
@@ -1393,6 +1395,7 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        cfg.autonomy.level = crate::security::AutonomyLevel::Supervised;
         cfg.model_routes = vec![crate::config::ModelRouteConfig {
             settings: Default::default(),
             hint: "fast".into(),
@@ -1455,6 +1458,7 @@ mod tests {
             api_key: Some("sentinel-root-owner-key".into()),
             ..Config::default()
         };
+        cfg.autonomy.level = crate::security::AutonomyLevel::Supervised;
         cfg.providers.models = vec![crate::config::schema::ProviderModelConfig {
             provider: "anthropic".into(),
             model: Some("claude-sonnet-4-5".into()),
