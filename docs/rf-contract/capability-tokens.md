@@ -30,7 +30,10 @@ These codes can answer any `/api` route, in the coded shape:
 - `429 rate_limited` `{"error":{"code","message","retry_after_ms"}}`: the
   shared API rate limit. The response also carries `Retry-After` in seconds.
   Both give the limiter window (60 s) as an upper bound: retry after at most
-  this long. Exception: `GET /api/skills/discover` reports an upstream limit
+  this long. `POST /pair` and `POST /webhook` (and the standalone webhook
+  listener) answer their own limits in the same coded shape with `Retry-After`;
+  a `/pair` lockout after failed codes reports the remaining lockout seconds.
+  Exception: `GET /api/skills/discover` reports an upstream limit
   in its own shape `{"code":"rate_limited","error":"<text>"}`.
 - `503 provider_not_ready` `{"error":{"code","message","reason"}}`: the
   default provider has no usable credential, so the daemon runs without a
@@ -815,6 +818,10 @@ there is no PRX child-count cap; the agent's daily cost policy still applies.
 Owner-bearer inventory/control routes are:
 
 - `GET /api/cron/jobs?agent=<name>` and the existing cron item/control routes.
+  A paired bearer is the install owner: jobs created from the command line
+  (`prx cron`) belong to it and are listed and controllable. They have a null
+  `creator_agent`; jobs created by a named agent keep theirs. A request with
+  pairing off does not see them.
 - `GET /api/xin/tasks?agent=<name>` and `GET /api/xin/tasks/{id}`.
 - `GET /api/xin/goals?agent=<name>` and `GET /api/xin/goals/{id}`.
 - `POST /api/xin/tasks/{id}/pause` and `/resume`; `DELETE /api/xin/tasks/{id}`.
