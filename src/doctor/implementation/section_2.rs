@@ -4,7 +4,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     if !config.autonomy.acknowledge_unrestricted_profile
         && !config.autonomy.workspace_only
         && config.autonomy.forbidden_paths.is_empty()
-        && config.autonomy.max_cost_per_day_cents == u32::MAX
+        && config.autonomy.effective_max_cost_per_day_cents() == u32::MAX
     {
         items.push(DiagItem::warn(
             cat,

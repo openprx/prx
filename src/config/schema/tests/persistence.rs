@@ -212,7 +212,7 @@ max_size_mb = 42
     assert_eq!(loaded.default_model.as_deref(), Some("kept"));
     assert_eq!(loaded.agents["researcher"].model, "kept-agent-model");
     assert_eq!(loaded.sessions_spawn.process_memory_strategy, "isolated_private");
-    assert_eq!(loaded.autonomy.max_cost_per_day_cents, 4_294_967_295);
+    assert_eq!(loaded.autonomy.max_cost_per_day_cents, Some(4_294_967_295));
     assert_eq!(loaded.gateway.port, 3120);
     assert!(loaded.memory.events.record_tool_events);
     assert_eq!(loaded.security.audit.max_size_mb, 42);
@@ -328,7 +328,7 @@ max_memory_mb = 512
 
     let loaded = Config::load_from_path(&dir.join("config.toml"), dir.join("workspace"))
         .expect("a fragment carrying removed keys must still load");
-    assert_eq!(loaded.autonomy.max_cost_per_day_cents, 4_294_967_295);
+    assert_eq!(loaded.autonomy.max_cost_per_day_cents, Some(4_294_967_295));
 
     let _ = fs::remove_dir_all(&dir).await;
 }
@@ -358,7 +358,7 @@ async fn config_split_and_reload_roundtrip_matches_original() {
     // Keep test deterministic even if process env mutates proxy defaults elsewhere.
     config.proxy = ProxyConfig::default();
     config.security.audit.max_size_mb = 120;
-    config.autonomy.max_cost_per_day_cents = 42;
+    config.autonomy.max_cost_per_day_cents = Some(42);
     config.agents.insert(
         "worker".into(),
         DelegateAgentConfig {

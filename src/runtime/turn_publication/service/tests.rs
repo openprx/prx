@@ -32,12 +32,12 @@ fn pinned_policy_version_is_order_independent_and_tracks_policy_changes() {
     );
     assert!(stable.starts_with("cdp-policy-v1:"));
     assert!(!stable.contains("provider/a"));
-    second.cost.daily_limit_usd += 1.0;
+    second.cost.daily_limit_usd = Some(1.0);
     assert_ne!(
         stable,
         pinned_policy_version(&second, &security, &surface, &key).unwrap()
     );
-    second.cost.daily_limit_usd -= 1.0;
+    second.cost.daily_limit_usd = None;
     second.cost.prices.get_mut("provider/a").unwrap().cache_read += 0.25;
     assert_ne!(
         stable,

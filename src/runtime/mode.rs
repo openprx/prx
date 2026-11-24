@@ -500,10 +500,10 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
             println!("Security:");
             println!("  Autonomy level:    {:?}", config.autonomy.level);
             println!("  Workspace only:    {}", config.autonomy.workspace_only);
-            println!(
-                "  Max cost/day:      ${:.2}",
-                f64::from(config.autonomy.max_cost_per_day_cents) / 100.0
-            );
+            match config.autonomy.max_cost_per_day_cents {
+                Some(cents) => println!("  Max cost/day:      ${:.2}", f64::from(cents) / 100.0),
+                None => println!("  Max cost/day:      no limit set"),
+            }
             println!("  Audit logging:     enabled");
             println!("  Audit log path:    {}", config.security.audit.log_path);
             println!();

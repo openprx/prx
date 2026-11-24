@@ -305,7 +305,7 @@ fn priced_config(workspace: &std::path::Path, daily_limit_usd: f64) -> crate::co
             cache_read: 0.0,
         },
     );
-    config.cost.daily_limit_usd = daily_limit_usd;
+    config.cost.daily_limit_usd = Some(daily_limit_usd);
     config.agent.compaction.max_context_tokens = 100_000;
     config.agent.compaction.max_context_tokens_explicit = true;
     config.agent.compaction.reserve_tokens = 100;

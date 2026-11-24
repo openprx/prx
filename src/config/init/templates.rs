@@ -258,8 +258,7 @@ pub(super) fn security_template(spec: Spec) -> String {
 [autonomy]
 level = "full"
 workspace_only = true
-# Secure autonomous defaults. Operators may explicitly widen these values.
-max_cost_per_day_cents = 500
+# No daily cost ceiling unless max_cost_per_day_cents is set here.
 # Set true only when host-wide unrestricted operation is intentional and
 # reviewed. This suppresses doctor noise; it is not a capability gate.
 acknowledge_unrestricted_profile = false
@@ -292,7 +291,6 @@ status = "unclassified"               # unclassified | high_risk | not_high_risk
 level = "full"                         # read_only | supervised | full
 workspace_only = false
 forbidden_paths = []                   # no extra path denylist
-max_cost_per_day_cents = 4294967295
 # Set true only when host-wide unrestricted operation is intentional and
 # reviewed. This suppresses doctor noise; it is not a capability gate.
 acknowledge_unrestricted_profile = false

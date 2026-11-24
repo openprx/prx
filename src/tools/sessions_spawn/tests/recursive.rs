@@ -259,7 +259,7 @@ async fn build_fixture(
     config.reliability.provider_retries = 0;
     config.autonomy.level = options.level;
     if let Some(cap) = options.daily_cap_cents {
-        config.autonomy.max_cost_per_day_cents = cap;
+        config.autonomy.max_cost_per_day_cents = Some(cap);
     }
     for model in ["prx-local-model", FREE_MODEL] {
         config.providers.models.push(

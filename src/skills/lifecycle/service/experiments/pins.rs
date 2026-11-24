@@ -138,7 +138,7 @@ mod tests {
             let restored: Config = serde_json::from_slice(&serde_json::to_vec(&config)?)?;
             assert_eq!(canonical_config(&restored)?, expected);
         }
-        config.cost.daily_limit_usd += 1.0;
+        config.cost.daily_limit_usd = Some(1.0);
         assert_ne!(canonical_config(&config)?, expected);
         Ok(())
     }

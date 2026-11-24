@@ -1197,7 +1197,7 @@ fn server_security_template_defaults_to_autonomous_with_workspace_boundary() {
     let content = security_template(Spec::Server);
     assert!(content.contains("level = \"full\""));
     assert!(content.contains("workspace_only = true"));
-    assert!(content.contains("max_cost_per_day_cents = 500"));
+    assert!(!content.contains("max_cost_per_day_cents ="));
     assert!(content.contains("\"/etc\""));
     assert!(!content.contains("level = \"supervised\""));
 }

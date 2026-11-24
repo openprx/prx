@@ -162,7 +162,9 @@ fn remaining_micro_usd_read_only_inner(
         .saturating_sub(spend.daily)
         .min(spend.month_limit.saturating_sub(spend.monthly))
         .min(security_daily_micro.map_or(u128::MAX, |limit| limit.saturating_sub(spend.daily)));
-    u64::try_from(remaining).context("remaining cost budget is out of range")
+    // Only reachable without any limit (the production caller always carries
+    // the security ceiling): unlimited, not an error.
+    Ok(u64::try_from(remaining).unwrap_or(u64::MAX))
 }
 
 /// A daily limit that today's charged amount has used up, in micro-USD.
@@ -183,6 +185,10 @@ pub(crate) fn exhausted_daily_budget_read_only(
     workspace_dir: &Path,
     max_cost_per_day_cents: u32,
 ) -> Result<Option<ExhaustedDailyBudget>> {
+    // No daily limit at all: nothing can be exhausted, so skip the ledger read.
+    if config.daily_limit_usd.is_none() && max_cost_per_day_cents == u32::MAX {
+        return Ok(None);
+    }
     let spend = read_only_spend(config, workspace_dir)?;
     // Both limits charge the same daily figure, so the lower limit is the one
     // with the lower remaining.
@@ -202,12 +208,10 @@ struct ReadOnlySpend {
 }
 
 fn read_only_spend(config: &CostConfig, workspace_dir: &Path) -> Result<ReadOnlySpend> {
-    if !config.daily_limit_usd.is_finite()
-        || !config.monthly_limit_usd.is_finite()
-        || config.daily_limit_usd < 0.0
-        || config.monthly_limit_usd < 0.0
-    {
-        return Err(anyhow!("cost limits are not finite nonnegative amounts"));
+    for limit in [config.daily_limit_usd, config.monthly_limit_usd].into_iter().flatten() {
+        if !limit.is_finite() || limit < 0.0 {
+            return Err(anyhow!("cost limits are not finite nonnegative amounts"));
+        }
     }
     let workspace = workspace_dir
         .canonicalize()
@@ -256,9 +260,19 @@ fn read_only_spend(config: &CostConfig, workspace_dir: &Path) -> Result<ReadOnly
     Ok(ReadOnlySpend {
         daily,
         monthly,
-        day_limit: floor_micro_usd(config.daily_limit_usd)?,
-        month_limit: floor_micro_usd(config.monthly_limit_usd)?,
+        day_limit: day_limit_micro_usd(config)?,
+        month_limit: month_limit_micro_usd(config)?,
     })
+}
+
+/// The daily limit in micro-USD; `u128::MAX` when none is configured.
+fn day_limit_micro_usd(config: &CostConfig) -> Result<u128> {
+    config.daily_limit_usd.map_or(Ok(u128::MAX), floor_micro_usd)
+}
+
+/// The monthly limit in micro-USD; `u128::MAX` when none is configured.
+fn month_limit_micro_usd(config: &CostConfig) -> Result<u128> {
+    config.monthly_limit_usd.map_or(Ok(u128::MAX), floor_micro_usd)
 }
 
 pub(crate) fn ceil_micro_usd(usd: f64) -> Result<u128> {
@@ -641,9 +655,9 @@ impl CostTracker {
             .monthly_micro_usd
             .checked_add(active)
             .context("monthly reserved cost overflows")?;
-        let remaining = floor_micro_usd(config.daily_limit_usd)?
+        let remaining = day_limit_micro_usd(&config)?
             .saturating_sub(daily)
-            .min(floor_micro_usd(config.monthly_limit_usd)?.saturating_sub(monthly))
+            .min(month_limit_micro_usd(&config)?.saturating_sub(monthly))
             .min(u128::from(request.security_daily_micro_usd).saturating_sub(daily));
         reservations.reserve(workspace, request, remaining)
     }
@@ -669,9 +683,9 @@ impl CostTracker {
             .monthly_micro_usd
             .checked_add(active)
             .context("monthly reserved cost overflows")?;
-        let remaining = floor_micro_usd(config.daily_limit_usd)?
+        let remaining = day_limit_micro_usd(&config)?
             .saturating_sub(daily)
-            .min(floor_micro_usd(config.monthly_limit_usd)?.saturating_sub(monthly))
+            .min(month_limit_micro_usd(&config)?.saturating_sub(monthly))
             .min(u128::from(request.reservation.security_daily_micro_usd).saturating_sub(daily));
         reservations.reserve_estimated(workspace, request, remaining)
     }
@@ -714,9 +728,9 @@ impl CostTracker {
             .monthly_micro_usd
             .checked_add(active)
             .context("monthly reserved cost overflows")?;
-        let remaining = floor_micro_usd(config.daily_limit_usd)?
+        let remaining = day_limit_micro_usd(&config)?
             .saturating_sub(daily)
-            .min(floor_micro_usd(config.monthly_limit_usd)?.saturating_sub(monthly))
+            .min(month_limit_micro_usd(&config)?.saturating_sub(monthly))
             .min(u128::from(request.reservation.security_daily_micro_usd).saturating_sub(daily));
         anyhow::ensure!(may_dispatch(), "attempt deadline elapsed before durable dispatch");
         reservations.reserve_dispatched_estimated(workspace, request, remaining)
@@ -974,42 +988,52 @@ fn budget_check(
     // configured ceilings round down. Floating-point addition can lose a
     // small new charge when the current total is near its limit.
     let estimate = ceil_micro_usd(estimated_cost_usd)?;
-    let day_limit = floor_micro_usd(config.daily_limit_usd)?;
-    let month_limit = floor_micro_usd(config.monthly_limit_usd)?;
+    let day_limit = day_limit_micro_usd(config)?;
+    let month_limit = month_limit_micro_usd(config)?;
     let projected_daily = daily_micro
         .checked_add(estimate)
         .context("daily projected cost overflows")?;
     let projected_monthly = monthly_micro
         .checked_add(estimate)
         .context("monthly projected cost overflows")?;
-    if projected_daily > day_limit {
+    // An unset limit is `u128::MAX` micro-USD and never exceeded.
+    if let Some(limit_usd) = config.daily_limit_usd
+        && projected_daily > day_limit
+    {
         return Ok(BudgetCheck::Exceeded {
             current_usd: daily_cost,
-            limit_usd: config.daily_limit_usd,
+            limit_usd,
             period: UsagePeriod::Day,
         });
     }
-    if projected_monthly > month_limit {
+    if let Some(limit_usd) = config.monthly_limit_usd
+        && projected_monthly > month_limit
+    {
         return Ok(BudgetCheck::Exceeded {
             current_usd: monthly_cost,
-            limit_usd: config.monthly_limit_usd,
+            limit_usd,
             period: UsagePeriod::Month,
         });
     }
     // Divide before multiplying to keep the percentage calculation bounded.
     let percent = u128::from(config.warn_at_percent.min(100));
     let warning_at = |limit: u128| (limit / 100) * percent + ((limit % 100) * percent).div_ceil(100);
-    if projected_daily >= warning_at(day_limit) {
+    // With no limit there is nothing to warn against.
+    if let Some(limit_usd) = config.daily_limit_usd
+        && projected_daily >= warning_at(day_limit)
+    {
         return Ok(BudgetCheck::Warning {
             current_usd: daily_cost,
-            limit_usd: config.daily_limit_usd,
+            limit_usd,
             period: UsagePeriod::Day,
         });
     }
-    if projected_monthly >= warning_at(month_limit) {
+    if let Some(limit_usd) = config.monthly_limit_usd
+        && projected_monthly >= warning_at(month_limit)
+    {
         return Ok(BudgetCheck::Warning {
             current_usd: monthly_cost,
-            limit_usd: config.monthly_limit_usd,
+            limit_usd,
             period: UsagePeriod::Month,
         });
     }
@@ -1578,8 +1602,8 @@ mod tests {
     fn estimated_attempt_overrun_records_actual_without_legacy_poison() {
         let tmp = TempDir::new().unwrap();
         let config = CostConfig {
-            daily_limit_usd: 1.0,
-            monthly_limit_usd: 1.0,
+            daily_limit_usd: Some(1.0),
+            monthly_limit_usd: Some(1.0),
             ..enabled_config()
         };
         let tracker = CostTracker::new(config.clone(), tmp.path()).unwrap();
@@ -1616,8 +1640,8 @@ mod tests {
     fn estimated_unknown_drop_retains_tokens_and_money_across_reopen() {
         let tmp = TempDir::new().unwrap();
         let config = CostConfig {
-            daily_limit_usd: 1.0,
-            monthly_limit_usd: 1.0,
+            daily_limit_usd: Some(1.0),
+            monthly_limit_usd: Some(1.0),
             ..enabled_config()
         };
         let tracker = CostTracker::new(config.clone(), tmp.path()).unwrap();
@@ -1641,8 +1665,8 @@ mod tests {
     fn estimated_dispatch_batches_existing_journal_rows_before_authority_returns() {
         let tmp = TempDir::new().unwrap();
         let config = CostConfig {
-            daily_limit_usd: 1.0,
-            monthly_limit_usd: 1.0,
+            daily_limit_usd: Some(1.0),
+            monthly_limit_usd: Some(1.0),
             ..enabled_config()
         };
         let request = estimated("prx-batched-dispatch", 250_000, 30, 30);
@@ -1690,8 +1714,8 @@ mod tests {
     fn expired_reservation_wait_never_marks_attempt_dispatched() {
         let tmp = TempDir::new().unwrap();
         let config = CostConfig {
-            daily_limit_usd: 1.0,
-            monthly_limit_usd: 1.0,
+            daily_limit_usd: Some(1.0),
+            monthly_limit_usd: Some(1.0),
             ..enabled_config()
         };
         let tracker = Arc::new(CostTracker::new(config, tmp.path()).unwrap());
@@ -1733,8 +1757,8 @@ mod tests {
     fn reservation_reconciliation_requires_cost_first_and_preserves_turn_spend() {
         let tmp = TempDir::new().unwrap();
         let config = CostConfig {
-            daily_limit_usd: 1.0,
-            monthly_limit_usd: 1.0,
+            daily_limit_usd: Some(1.0),
+            monthly_limit_usd: Some(1.0),
             ..enabled_config()
         };
         let tracker = CostTracker::new(config.clone(), tmp.path()).unwrap();
@@ -1906,8 +1930,8 @@ mod tests {
     fn reserved_budget_survives_reopen_and_sent_liability_cannot_be_released() {
         let tmp = TempDir::new().unwrap();
         let config = CostConfig {
-            daily_limit_usd: 1.0,
-            monthly_limit_usd: 1.0,
+            daily_limit_usd: Some(1.0),
+            monthly_limit_usd: Some(1.0),
             ..enabled_config()
         };
         let first = CostTracker::new(config.clone(), tmp.path()).unwrap();
@@ -1954,8 +1978,8 @@ mod tests {
     fn competing_trackers_cannot_reserve_the_same_remaining_balance() {
         let tmp = TempDir::new().unwrap();
         let config = CostConfig {
-            daily_limit_usd: 1.0,
-            monthly_limit_usd: 1.0,
+            daily_limit_usd: Some(1.0),
+            monthly_limit_usd: Some(1.0),
             ..enabled_config()
         };
         let first = CostTracker::new(config.clone(), tmp.path()).unwrap();
@@ -1996,8 +2020,8 @@ mod tests {
     fn budget_rounds_each_charge_up_and_survives_reopen() {
         let tmp = TempDir::new().unwrap();
         let config = CostConfig {
-            daily_limit_usd: 2_f64.powi(-19),
-            monthly_limit_usd: 1.0,
+            daily_limit_usd: Some(2_f64.powi(-19)),
+            monthly_limit_usd: Some(1.0),
             ..enabled_config()
         };
         let tracker = CostTracker::new(config.clone(), tmp.path()).unwrap();
@@ -2030,8 +2054,8 @@ mod tests {
     fn budget_does_not_lose_small_charge_at_large_limit() {
         let limit = 2_f64.powi(53);
         let config = CostConfig {
-            daily_limit_usd: limit,
-            monthly_limit_usd: limit,
+            daily_limit_usd: Some(limit),
+            monthly_limit_usd: Some(limit),
             ..enabled_config()
         };
         let total = ceil_micro_usd(limit).unwrap();
@@ -2052,9 +2076,9 @@ mod tests {
                 let tmp = TempDir::new().unwrap();
                 let mut config = enabled_config();
                 if daily {
-                    config.daily_limit_usd = invalid;
+                    config.daily_limit_usd = Some(invalid);
                 } else {
-                    config.monthly_limit_usd = invalid;
+                    config.monthly_limit_usd = Some(invalid);
                 }
                 let tracker = CostTracker::new(config, tmp.path()).unwrap();
                 assert!(tracker.check_budget(0.0).is_err());
@@ -2115,8 +2139,8 @@ mod tests {
     fn read_only_budget_snapshot_bounds_spend_without_creating_files() {
         let tmp = TempDir::new().unwrap();
         let config = CostConfig {
-            daily_limit_usd: 2.0,
-            monthly_limit_usd: 3.0,
+            daily_limit_usd: Some(2.0),
+            monthly_limit_usd: Some(3.0),
             ..Default::default()
         };
         assert_eq!(remaining_micro_usd_read_only(&config, tmp.path()).unwrap(), 2_000_000);
@@ -2133,8 +2157,8 @@ mod tests {
     fn read_only_security_daily_ceiling_subtracts_prior_spend_and_rejects_bad_ledger() {
         let tmp = TempDir::new().unwrap();
         let config = CostConfig {
-            daily_limit_usd: 100.0,
-            monthly_limit_usd: 100.0,
+            daily_limit_usd: Some(100.0),
+            monthly_limit_usd: Some(100.0),
             ..Default::default()
         };
         assert_eq!(
@@ -2230,8 +2254,8 @@ mod tests {
         }
         ledger.sync_all().unwrap();
         let config = CostConfig {
-            daily_limit_usd: 10_000_000_001.0,
-            monthly_limit_usd: 10_000_000_000.5,
+            daily_limit_usd: Some(10_000_000_001.0),
+            monthly_limit_usd: Some(10_000_000_000.5),
             ..Default::default()
         };
         assert_eq!(remaining_micro_usd_read_only(&config, tmp.path()).unwrap(), 499_998);
@@ -2283,7 +2307,7 @@ mod tests {
     fn budget_exceeded_daily_limit() {
         let tmp = TempDir::new().unwrap();
         let config = CostConfig {
-            daily_limit_usd: 0.01, // Very low limit
+            daily_limit_usd: Some(0.01), // Very low limit
             ..Default::default()
         };
 
@@ -2433,12 +2457,12 @@ mod tests {
     fn older_configuration_lookup_cannot_restore_a_new_views_limits() {
         let tmp = TempDir::new().unwrap();
         let older_config = CostConfig {
-            daily_limit_usd: 10.0,
-            monthly_limit_usd: 20.0,
+            daily_limit_usd: Some(10.0),
+            monthly_limit_usd: Some(20.0),
             ..enabled_config()
         };
         let newer_config = CostConfig {
-            daily_limit_usd: 0.001,
+            daily_limit_usd: Some(0.001),
             ..older_config.clone()
         };
         let older = CostTracker::for_workspace(older_config.clone(), tmp.path()).unwrap();
@@ -2474,8 +2498,8 @@ mod tests {
     fn canonical_settlement_is_process_owned_idempotent_and_budgeted() {
         let tmp = TempDir::new().unwrap();
         let config = CostConfig {
-            daily_limit_usd: 0.001,
-            monthly_limit_usd: 1.0,
+            daily_limit_usd: Some(0.001),
+            monthly_limit_usd: Some(1.0),
             ..Default::default()
         };
         let first = CostTracker::for_workspace(config.clone(), tmp.path()).unwrap();
@@ -2574,8 +2598,8 @@ mod tests {
     fn separate_tracker_instances_refresh_budget_and_summary_from_disk() {
         let tmp = TempDir::new().unwrap();
         let config = CostConfig {
-            daily_limit_usd: 1.0,
-            monthly_limit_usd: 10.0,
+            daily_limit_usd: Some(1.0),
+            monthly_limit_usd: Some(10.0),
             ..Default::default()
         };
         let writer = CostTracker::new(config.clone(), tmp.path()).unwrap();

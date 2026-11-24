@@ -546,7 +546,7 @@ impl AccountingScope {
                             binding_sha256: hex::encode(binding),
                             maximum_micro_usd: maximum,
                             turn_limit_micro_usd: budgets.micro_usd,
-                            security_daily_micro_usd: u64::from(config.autonomy.max_cost_per_day_cents) * 10_000,
+                            security_daily_micro_usd: u64::from(config.autonomy.effective_max_cost_per_day_cents()) * 10_000,
                         },
                         reserved_tokens: tokens,
                         turn_token_limit: budgets.tokens,

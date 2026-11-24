@@ -9,7 +9,7 @@ async fn autonomy_config_default() {
     assert_eq!(a.level, AutonomyLevel::Full);
     assert!(a.workspace_only);
     assert!(a.forbidden_paths.contains(&"/etc".to_string()));
-    assert_eq!(a.max_cost_per_day_cents, DEFAULT_AUTONOMY_MAX_COST_PER_DAY_CENTS);
+    assert_eq!(a.max_cost_per_day_cents, None);
 }
 
 #[test]

@@ -18,8 +18,8 @@ const ATTEMPT: &str = "prx_subscription_attempt";
 
 fn config() -> CostConfig {
     CostConfig {
-        daily_limit_usd: 1.0,
-        monthly_limit_usd: 1.0,
+        daily_limit_usd: Some(1.0),
+        monthly_limit_usd: Some(1.0),
         ..CostConfig::default()
     }
 }

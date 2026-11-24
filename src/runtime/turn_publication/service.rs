@@ -251,8 +251,8 @@ pub(in crate::runtime) fn pinned_policy_version(
             &config.tool_tiering.channel_exclude,
         ),
         (
-            config.cost.daily_limit_usd.to_bits(),
-            config.cost.monthly_limit_usd.to_bits(),
+            config.cost.daily_limit_usd.map(f64::to_bits),
+            config.cost.monthly_limit_usd.map(f64::to_bits),
             config.cost.warn_at_percent,
             config.cost.allow_override,
             prices,

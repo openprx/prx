@@ -128,7 +128,7 @@ async fn wrong_actual_owner_refuses_before_wire_with_real_spent_liability_and_ta
         ..Config::default()
     };
     config.auth.codex_auth_json_auto_import = false;
-    config.autonomy.max_cost_per_day_cents = 1000;
+    config.autonomy.max_cost_per_day_cents = Some(1000);
     config.cost.prices.insert(
         format!("{PROVIDER}/{PROBE_MODEL}"),
         crate::config::schema::ModelPricing {

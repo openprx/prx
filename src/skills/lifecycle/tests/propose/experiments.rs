@@ -725,7 +725,7 @@ async fn experiment_changed_operation_or_configuration_refuses_before_model_send
                 .len(),
             0
         );
-        config.cost.daily_limit_usd += 1.0;
+        config.cost.daily_limit_usd = Some(1.0);
         assert!(
             run_stage(&service, &config, &plan, "proposal", &inputs["proposal"])
                 .await

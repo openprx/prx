@@ -608,7 +608,7 @@ async fn config_toml_roundtrip() {
             level: AutonomyLevel::Full,
             workspace_only: false,
             forbidden_paths: vec!["/secret".into()],
-            max_cost_per_day_cents: 1000,
+            max_cost_per_day_cents: Some(1000),
             scopes: ScopeConfig::default(),
             ..AutonomyConfig::default()
         },

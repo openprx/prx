@@ -722,7 +722,7 @@ async fn a_run_is_refused_when_the_operators_cost_limit_is_already_exceeded() {
     activate(&store, &skill(), &a, 0, true);
 
     let mut config = template(tmp.path(), &loopback);
-    config.cost.daily_limit_usd = 0.5;
+    config.cost.daily_limit_usd = Some(0.5);
     let operator = tmp.path().join("operator-ws");
     std::fs::create_dir_all(&operator).expect("test: operator ws");
     // The operator already spent past the daily limit through the real ledger.

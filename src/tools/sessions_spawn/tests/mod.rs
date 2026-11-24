@@ -802,7 +802,7 @@ async fn execute_admitted_spawn_with_plane(
         .autonomy
         .forbidden_paths
         .clone_from(&tool.security.forbidden_paths);
-    config.autonomy.max_cost_per_day_cents = tool.security.max_cost_per_day_cents;
+    config.autonomy.max_cost_per_day_cents = Some(tool.security.max_cost_per_day_cents);
     config.autonomy.scopes.rules.clone_from(&tool.security.scope_rules);
     config.autonomy.scopes.default = if tool.security.scope_default_allow {
         crate::config::ScopeDefault::Allow

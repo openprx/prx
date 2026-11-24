@@ -330,7 +330,11 @@ pub(super) fn validate_acl_pair_entry(path: &str, left_name: &str, right_name: &
 /// pipeline and the per-tool `auto_approve` / `always_ask` / `allowed_commands`
 /// lists have been removed; coarse risk presets are governed entirely by
 /// `level`. Fine-grained per-risk classification is deferred to Phase 2.
-pub const DEFAULT_AUTONOMY_MAX_COST_PER_DAY_CENTS: u32 = 500;
+/// The value `SecurityPolicy` carries when no daily cost ceiling is configured
+/// (and the value an operator may write to say the same explicitly). The signed
+/// child manifest's `max_cost_cents` is a fixed-width integer compared only as
+/// `child <= parent`, so the maximum stands for "no ceiling" there.
+pub const UNLIMITED_AUTONOMY_MAX_COST_PER_DAY_CENTS: u32 = u32::MAX;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AutonomyConfig {
@@ -355,9 +359,9 @@ pub struct AutonomyConfig {
     /// denylist.
     #[serde(default = "default_forbidden_paths")]
     pub forbidden_paths: Vec<String>,
-    /// Maximum cost per day in cents per policy. Default: `500`.
-    #[serde(default = "default_autonomy_max_cost_per_day_cents")]
-    pub max_cost_per_day_cents: u32,
+    /// Maximum cost per day in cents per policy. Default: unset (no ceiling).
+    #[serde(default)]
+    pub max_cost_per_day_cents: Option<u32>,
 
     /// Operator acknowledgement for an intentionally unrestricted profile.
     /// This suppresses doctor noise only; it does not alter policy behavior.
@@ -376,7 +380,7 @@ impl Default for AutonomyConfig {
             level: AutonomyLevel::Full,
             workspace_only: default_workspace_only(),
             forbidden_paths: default_forbidden_paths(),
-            max_cost_per_day_cents: default_autonomy_max_cost_per_day_cents(),
+            max_cost_per_day_cents: None,
             acknowledge_unrestricted_profile: false,
             scopes: ScopeConfig::default(),
         }
@@ -418,7 +422,14 @@ pub(super) fn default_forbidden_paths() -> Vec<String> {
     ]
 }
 
-/// The default per-policy daily cost ceiling, in cents.
-pub(super) const fn default_autonomy_max_cost_per_day_cents() -> u32 {
-    DEFAULT_AUTONOMY_MAX_COST_PER_DAY_CENTS
+impl AutonomyConfig {
+    /// The per-policy daily ceiling in cents, or
+    /// [`UNLIMITED_AUTONOMY_MAX_COST_PER_DAY_CENTS`] when none is configured.
+    #[must_use]
+    pub const fn effective_max_cost_per_day_cents(&self) -> u32 {
+        match self.max_cost_per_day_cents {
+            Some(cents) => cents,
+            None => UNLIMITED_AUTONOMY_MAX_COST_PER_DAY_CENTS,
+        }
+    }
 }

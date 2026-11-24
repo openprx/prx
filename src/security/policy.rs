@@ -1546,7 +1546,7 @@ impl SecurityPolicy {
             workspace_dir: workspace_dir.to_path_buf(),
             workspace_only: autonomy_config.workspace_only,
             forbidden_paths: autonomy_config.forbidden_paths.clone(),
-            max_cost_per_day_cents: autonomy_config.max_cost_per_day_cents,
+            max_cost_per_day_cents: autonomy_config.effective_max_cost_per_day_cents(),
             scope_rules: autonomy_config.scopes.rules.clone(),
             scope_default_allow: autonomy_config.scopes.default.allows_unmatched(),
             assign_owners: autonomy_config.scopes.assign_owners.clone(),
@@ -4121,7 +4121,7 @@ mod tests {
             level: AutonomyLevel::Full,
             workspace_only: false,
             forbidden_paths: vec!["/secret".into()],
-            max_cost_per_day_cents: 1000,
+            max_cost_per_day_cents: Some(1000),
             ..crate::config::AutonomyConfig::default()
         };
         let workspace = PathBuf::from("/tmp/test-workspace");
@@ -4147,7 +4147,7 @@ mod tests {
         assert!(!p.forbidden_paths.is_empty(), "expected a non-empty value");
         assert_eq!(p.workspace_only, autonomy.workspace_only);
         assert_eq!(p.forbidden_paths, autonomy.forbidden_paths);
-        assert_eq!(p.max_cost_per_day_cents, autonomy.max_cost_per_day_cents);
+        assert_eq!(p.max_cost_per_day_cents, autonomy.effective_max_cost_per_day_cents());
     }
 
     // ── Edge cases: command injection ────────────────────────

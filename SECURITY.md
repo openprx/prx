@@ -82,7 +82,7 @@ split above.
 1. **Workspace isolation** — file operations confined to the workspace when `workspace_only = true` (default)
 2. **Path traversal blocking** — `..` sequences and absolute paths rejected
 3. **Forbidden path list** — critical system paths (`/etc`, `/root`, `~/.ssh`, …) always blocked unless the operator replaces the list
-4. **Daily cost cap** — `autonomy.max_cost_per_day_cents` (default 500)
+4. **Daily cost cap** — `autonomy.max_cost_per_day_cents` (optional; no cap unless configured)
 5. **Identity-scope ACLs** — `[autonomy.scopes]` can deny a tool for a sender, channel, or chat type at every autonomy level
 
 ### What We Protect Against

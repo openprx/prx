@@ -5,15 +5,15 @@ use super::{Deserialize, JsonSchema, Serialize};
 /// Cost tracking and budget enforcement configuration (`[cost]` section).
 #[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct CostConfig {
-    /// Daily spending limit in USD (default: 10.00)
-    #[serde(default = "default_daily_limit")]
-    pub daily_limit_usd: f64,
+    /// Daily spending limit in USD (default: unset, no limit; 0 refuses every priced turn)
+    #[serde(default)]
+    pub daily_limit_usd: Option<f64>,
 
-    /// Monthly spending limit in USD (default: 100.00)
-    #[serde(default = "default_monthly_limit")]
-    pub monthly_limit_usd: f64,
+    /// Monthly spending limit in USD (default: unset, no limit).
+    #[serde(default)]
+    pub monthly_limit_usd: Option<f64>,
 
-    /// Warn when spending reaches this percentage of limit (default: 80)
+    /// Warn when spending reaches this percentage of a configured limit (default: 80)
     #[serde(default = "default_warn_percent")]
     pub warn_at_percent: u8,
 
@@ -56,14 +56,6 @@ impl ModelPricing {
     }
 }
 
-pub(super) const fn default_daily_limit() -> f64 {
-    10.0
-}
-
-pub(super) const fn default_monthly_limit() -> f64 {
-    100.0
-}
-
 pub(super) const fn default_warn_percent() -> u8 {
     80
 }
@@ -71,8 +63,8 @@ pub(super) const fn default_warn_percent() -> u8 {
 impl Default for CostConfig {
     fn default() -> Self {
         Self {
-            daily_limit_usd: default_daily_limit(),
-            monthly_limit_usd: default_monthly_limit(),
+            daily_limit_usd: None,
+            monthly_limit_usd: None,
             warn_at_percent: default_warn_percent(),
             allow_override: false,
             // Operator overrides only. Built-in prices come from the embedded

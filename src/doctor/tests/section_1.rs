@@ -720,7 +720,7 @@
         let mut config = Config::default();
         config.autonomy.workspace_only = false;
         config.autonomy.forbidden_paths.clear();
-        config.autonomy.max_cost_per_day_cents = u32::MAX;
+        config.autonomy.max_cost_per_day_cents = Some(u32::MAX);
         let mut items = Vec::new();
 
         check_config_semantics(&config, &mut items);
@@ -737,7 +737,7 @@
         let mut config = Config::default();
         config.autonomy.workspace_only = false;
         config.autonomy.forbidden_paths.clear();
-        config.autonomy.max_cost_per_day_cents = u32::MAX;
+        config.autonomy.max_cost_per_day_cents = Some(u32::MAX);
         config.autonomy.acknowledge_unrestricted_profile = true;
         let mut items = Vec::new();
 

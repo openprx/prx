@@ -1751,7 +1751,7 @@ async fn post_deletion_turn_commits_terminal_without_decision_rows() {
             "(c) a differing workspace is refused"
         );
         let mut other_cost = cost.clone();
-        other_cost.daily_limit_usd += 1.0;
+        other_cost.daily_limit_usd = Some(1.0);
         assert!(
             finalize_turn(&fabric, draft.clone(), &other_cost, workspace.path())
                 .await

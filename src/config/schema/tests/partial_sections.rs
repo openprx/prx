@@ -73,7 +73,7 @@ fn a_partial_autonomy_section_fails_closed() {
         !parsed.acknowledge_unrestricted_profile,
         "acknowledge_unrestricted_profile must stay false when omitted"
     );
-    assert_eq!(parsed.max_cost_per_day_cents, 500);
+    assert_eq!(parsed.max_cost_per_day_cents, None);
     assert_eq!(parsed.level, AutonomyLevel::Full);
 }
 

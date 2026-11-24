@@ -14,9 +14,9 @@ async fn agent_budget_uses_pinned_route_and_read_only_spend_snapshot() {
     config.agent.compaction.max_context_tokens = 32_768;
     config.agent.compaction.max_context_tokens_explicit = true;
     config.agent.compaction.reserve_tokens = 4_096;
-    config.cost.daily_limit_usd = 100.0;
-    config.cost.monthly_limit_usd = 100.0;
-    config.autonomy.max_cost_per_day_cents = 1_000;
+    config.cost.daily_limit_usd = Some(100.0);
+    config.cost.monthly_limit_usd = Some(100.0);
+    config.autonomy.max_cost_per_day_cents = Some(1_000);
     let tracker =
         crate::cost::tracker::CostTracker::new(config.cost.clone(), workspace.path()).expect("test cost ledger");
     tracker

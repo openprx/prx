@@ -79,7 +79,7 @@ and the module-gate family are absorbed on load; they are not live switches.
 | Section | Keys and defaults |
 | --- | --- |
 | `[observability]` | `backend = "none"`; `otel_endpoint` unset; `otel_service_name` unset (collector name `"prx"` when backend is `otel`) |
-| `[autonomy]` | `level = "full"`; `workspace_only = true`; built-in `forbidden_paths`; `max_cost_per_day_cents = 500`; `acknowledge_unrestricted_profile = false`; `[autonomy.scopes] default = "allow"`, `rules = []`, `assign_owners = []`. A rule may set `user`/`channel`/`chat_type` and `tools_allow`/`tools_deny`/`send_allow`/`send_deny`/`assign_allow`/`assign_deny` (all empty when omitted) |
+| `[autonomy]` | `level = "full"`; `workspace_only = true`; built-in `forbidden_paths`; `max_cost_per_day_cents` unset (no ceiling); `acknowledge_unrestricted_profile = false`; `[autonomy.scopes] default = "allow"`, `rules = []`, `assign_owners = []`. A rule may set `user`/`channel`/`chat_type` and `tools_allow`/`tools_deny`/`send_allow`/`send_deny`/`assign_allow`/`assign_deny` (all empty when omitted) |
 | `[runtime]` | `kind = "native"`; `shell_env_allowlist = []`; `managed_cgroup_root` unset; `reasoning_enabled` unset; `codex_stream_idle_timeout_secs` unset; `codex_reasoning_effort` unset; `max_blocking_threads` unset (derived, floor 2048); `long_task_warn_secs` unset (900); `idle_hang_secs` unset (1800) |
 | `[runtime.docker]` | `image = "alpine:3.20"`; `network = "none"`; `memory_limit_mb = 512`; `cpu_limit = 1.0`; `read_only_rootfs = true`; `mount_workspace = true`; `allowed_workspace_roots = []` |
 | `[reliability]` | `provider_retries = 2`; `provider_backoff_ms = 500`; `fallback_providers = []`; `acknowledge_single_provider_risk = false`; `api_keys = []`; `model_fallbacks = {}`; `channel_initial_backoff_secs = 2`; `channel_max_backoff_secs = 60`; `scheduler_poll_secs = 15`; `scheduler_retries = 2` |
@@ -145,7 +145,7 @@ and the module-gate family are absorbed on load; they are not live switches.
 | `[web_search]` | `provider = "duckduckgo"`; `brave_api_key` unset; `max_results = 15`; `timeout_secs = 15`; `fetch_max_chars = 50000` |
 | `[proxy]` | `http_proxy`/`https_proxy`/`all_proxy` unset; `no_proxy = []`; `scope = "prx"`; `services = []` |
 | `[identity]` | `format = "openclaw"`; `aieos_path` unset; `aieos_inline` unset |
-| `[cost]` | `daily_limit_usd = 10.0`; `monthly_limit_usd = 100.0`; `warn_at_percent = 80`; `allow_override = false`; `prices = {}` (each price: `input`/`output`/`cache_write`/`cache_read = 0`) |
+| `[cost]` | `daily_limit_usd` unset (no limit); `monthly_limit_usd` unset (no limit); `warn_at_percent = 80` (applies only to a configured limit); `allow_override = false`; `prices = {}` (each price: `input`/`output`/`cache_write`/`cache_read = 0`) |
 | `[nodes]` | `request_timeout_ms = 15000`; `retry_max = 2`; `nodes = []`. A node: `id`, `endpoint`, `bearer_token` required; `hmac_secret` unset; `timeout_ms`/`retry_max` unset |
 | `[nodes.server]` | `listen_addr = "127.0.0.1:8787"`; `bearer_token = ""`; `hmac_secret` unset; `sandbox_root = "."`; `exec_timeout_ms = 15000`; `max_output_bytes = 1048576`; `max_concurrent_tasks = 8`; `task_result_ttl_ms = 3600000`; `allowed_commands = ["echo"]`; `blocked_commands = []`; `tls_required = true`; `tls_cert`/`tls_key` unset |
 | `[agents.<name>]` | `provider`/`model` required; `system_prompt`/`api_key`/`credential_ref`/`temperature`/`identity_dir`/`memory_scope`/`spawn_enabled`/`autonomy` unset; `max_depth = 8`; `agentic = true`; `allowed_tools = []` (empty means all tools, the same as `["*"]`); `enabled = true` |
@@ -823,7 +823,7 @@ allow_executable_proposals = false
 level = "full"
 workspace_only = true
 forbidden_paths = ["/etc", "/root", "/home", "/opt", "/tmp", "~/.ssh"]
-max_cost_per_day_cents = 500
+# max_cost_per_day_cents = 500   # unset means no ceiling
 
 # Multi-agent setup
 [agents.researcher]
@@ -905,11 +905,17 @@ agents, and process-isolated session workers.
   `forbidden path argument: <arg>`). The tool checks the same path again when it
   runs, because the file can change in between.
 
-An unrestricted profile is always explicit: set `workspace_only = false`,
-clear `forbidden_paths`, and set `max_cost_per_day_cents = 4294967295`
-(`u32::MAX`). `prx doctor` warns when those three are active together
-unless `acknowledge_unrestricted_profile = true`. There is no hourly action
-cap.
+There is no spend ceiling unless you configure one. Leave
+`max_cost_per_day_cents`, `[cost] daily_limit_usd` and `[cost] monthly_limit_usd`
+out of the file for no limit; set a key and exactly that limit applies (`0`
+refuses every priced turn). The signed child manifest carries "no ceiling" as
+`u32::MAX` cents (4294967295, the same value the key accepts). Spend is still
+recorded in the cost journal. With no limit set, no budget warning or
+"budget exhausted" notice is produced. A host-wide profile is explicit: set
+`workspace_only = false` and clear `forbidden_paths`. `prx doctor` warns when
+those two are active together with no cost ceiling unless
+`acknowledge_unrestricted_profile = true`; the flag only silences that warning.
+There is no hourly action cap.
 
 ### Decision admission and autonomy
 
