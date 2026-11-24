@@ -36,11 +36,11 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub reasoning_enabled: Option<bool>,
 
-    /// Codex stream idle timeout in seconds (replaces ZEROCLAW_CODEX_STREAM_IDLE_TIMEOUT_SECS)
+    /// Codex stream idle timeout in seconds
     #[serde(default)]
     pub codex_stream_idle_timeout_secs: Option<u64>,
 
-    /// Codex reasoning effort (replaces ZEROCLAW_CODEX_REASONING_EFFORT)
+    /// Codex reasoning effort
     #[serde(default)]
     pub codex_reasoning_effort: Option<String>,
 

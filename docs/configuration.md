@@ -143,7 +143,7 @@ and the module-gate family are absorbed on load; they are not live switches.
 | `[http_request]` | `max_response_size = 1000000`; `timeout_secs = 30` |
 | `[multimodal]` | `max_images = 4`; `max_image_size_mb = 5`; `allow_remote_fetch = false` |
 | `[web_search]` | `provider = "duckduckgo"`; `brave_api_key` unset; `max_results = 15`; `timeout_secs = 15`; `fetch_max_chars = 50000` |
-| `[proxy]` | `http_proxy`/`https_proxy`/`all_proxy` unset; `no_proxy = []`; `scope = "zeroclaw"`; `services = []` |
+| `[proxy]` | `http_proxy`/`https_proxy`/`all_proxy` unset; `no_proxy = []`; `scope = "prx"`; `services = []` |
 | `[identity]` | `format = "openclaw"`; `aieos_path` unset; `aieos_inline` unset |
 | `[cost]` | `daily_limit_usd = 10.0`; `monthly_limit_usd = 100.0`; `warn_at_percent = 80`; `allow_override = false`; `prices = {}` (each price: `input`/`output`/`cache_write`/`cache_read = 0`) |
 | `[nodes]` | `request_timeout_ms = 15000`; `retry_max = 2`; `nodes = []`. A node: `id`, `endpoint`, `bearer_token` required; `hmac_secret` unset; `timeout_ms`/`retry_max` unset |
@@ -2033,7 +2033,7 @@ again before downgrading.
 ### Outbound proxy (`[proxy]`)
 
 `[proxy]` routes PRX's outbound HTTP through `http_proxy`, `https_proxy` or
-`all_proxy`. `scope = "zeroclaw"` (the default; `prx` in the agent
+`all_proxy`. `scope = "prx"` (the default; the same word in the agent
 `proxy_config` tool) applies the proxy to all PRX-managed traffic;
 `scope = "services"` applies it only to the selectors in `proxy.services`
 (`provider.openai`, `tool.http_request`, `tool.*`, ...; the `proxy_config`
@@ -2044,7 +2044,7 @@ cannot change `HTTP_PROXY` and its relatives safely, so:
 
 - `scope = "environment"` is inactive. A saved configuration that still has
   it loads, with one warning, and its proxy URLs route no traffic. Migrate
-  to `scope = "zeroclaw"` to proxy all PRX traffic, or to
+  to `scope = "prx"` to proxy all PRX traffic, or to
   `scope = "services"` with a `proxy.services` list. To rely on inherited
   variables instead, start PRX with `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`
   and `NO_PROXY` already set and leave the `[proxy]` URLs empty.
@@ -2057,7 +2057,7 @@ resolve the host once, refuse it when any address is private or local, and
 connect to exactly the checked address; `web_fetch` repeats this for every
 redirect hop and `http_request` does not follow redirects. A proxy resolves
 the host name itself, so through a proxy the checked address would not be
-the one connected to. A general proxy (`scope = "zeroclaw"`) and proxy
+the one connected to. A general proxy (`scope = "prx"`) and proxy
 variables inherited from the environment are therefore not used by these two
 tools:
 

@@ -1127,7 +1127,7 @@ row with summed counters and the worst state.
 - Malformed/unexpected response payloads fail fast with
   `provider_response_parse_error`.
 - Stream idle timeout is controlled by
-  `ZEROCLAW_CODEX_STREAM_IDLE_TIMEOUT_SECS` (default 45 seconds, minimum 5).
+  `[runtime] codex_stream_idle_timeout_secs` (default 45 seconds, minimum 5).
 
 A Root connection with `api_url` or `reliability.api_keys` but no `api_key`
 keeps that owner-bound endpoint and rotation material, then performs the same

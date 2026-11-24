@@ -241,11 +241,11 @@ pub struct SelfSystemConfig {
     #[serde(default = "default_self_system_evolution_interval_hours")]
     pub evolution_interval_hours: u32,
 
-    /// Path to evolution config file (replaces OPENPRX_EVOLUTION_CONFIG / ZEROCLAW_EVOLUTION_CONFIG)
+    /// Path to evolution config file (replaces OPENPRX_EVOLUTION_CONFIG)
     #[serde(default)]
     pub evolution_config_path: Option<String>,
 
-    /// Enable debug raw output for evolution (replaces OPENPRX_EVOLUTION_DEBUG_RAW / ZEROCLAW_EVOLUTION_DEBUG_RAW)
+    /// Enable debug raw output for evolution (replaces OPENPRX_EVOLUTION_DEBUG_RAW)
     #[serde(default)]
     pub evolution_debug_raw: bool,
 

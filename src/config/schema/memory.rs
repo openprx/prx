@@ -194,11 +194,11 @@ pub struct MemoryConfig {
     pub sqlite_read_pool_size: Option<usize>,
 
     // ── Lucid memory backend options ─────────────────────────────
-    /// Path to lucid binary (replaces ZEROCLAW_LUCID_CMD / OPENPRX_LUCID_CMD)
+    /// Path to lucid binary (replaces OPENPRX_LUCID_CMD)
     #[serde(default)]
     pub lucid_cmd: Option<String>,
 
-    /// Token budget for lucid (replaces ZEROCLAW_LUCID_BUDGET / OPENPRX_LUCID_BUDGET)
+    /// Token budget for lucid (replaces OPENPRX_LUCID_BUDGET)
     #[serde(default)]
     pub lucid_budget: Option<u32>,
 

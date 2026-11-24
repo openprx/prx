@@ -1644,8 +1644,8 @@ mod tests {
         assert!(script.contains("description=\"PRX daemon\""));
         assert!(script.contains("command='/usr/local/bin/prx'"));
         assert!(script.contains("command_args=\"--config-dir '/etc/prx' daemon\""));
-        assert!(!script.contains("env ZEROCLAW_CONFIG_DIR"));
-        assert!(!script.contains("env ZEROCLAW_WORKSPACE"));
+        assert!(!script.contains("env OPENPRX_CONFIG_DIR"));
+        assert!(!script.contains("env OPENPRX_WORKSPACE"));
         assert!(script.contains("command_background=\"yes\""));
         assert!(script.contains("command_user=\"prx:prx\""));
         assert!(script.contains("pidfile=\"/run/${RC_SVCNAME}.pid\""));
