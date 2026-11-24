@@ -356,7 +356,7 @@ const FORWARDED_COMPACTION_PRODUCERS: &[(&str, &str, &str, Option<&str>)] = &[
     (
         "src/tools/sessions_spawn/spawn.rs",
         "execute_spawn_with_id",
-        "&process_compaction_config",
+        "resolved_compaction.config.clone()",
         None,
     ),
 ];

@@ -1,27 +1,18 @@
 use super::delegation;
 use super::{
-    AllowedToolProxy, AnnounceOrigin, HistoryEntry, MemoryScope, OutboundNotice, OwnerLossReason, ProcessFinalization,
-    ProcessModeRunSeed, ProcessRunControl, ProcessWorkerOutcome, SPAWN_EXECUTION_CONTEXT, STEER_CHANNEL_CAPACITY,
-    SessionsSpawnTool, SpawnExecutionContext, SpawnRecordCodes, SpawnScope, SubAgentRun, SubAgentStatus,
-    TaskRunControl, TerminationCause, boxed_spawn_field, commit_process_terminal_state,
-    current_spawn_execution_context, deliver_or_withhold_notice, exited_without_result_reason, format_announce_message,
-    new_process_mode_run, normalize_process_memory_strategy, parse_memory_scope, parse_spawn_scope, process_terminal,
-    record_owner_loss_terminal, record_spawn_request_event, record_spawn_result_event, record_spawn_result_event_keyed,
-    refresh_tools_for_explicit_allowlist, register_killable_process_run, resolve_tools_for_agent,
-    resolve_worker_workspace_root, run_sub_agent_process, run_sub_agent_task, running_run_count, spawn_event_scope,
-    spawn_lineage, spawn_session_key, spawn_started_text, sub_agent_reported_failure, task_failure_reason,
-    task_terminal, termination_cause, watch_process_mode_monitor, watch_task_mode_monitor,
+    SessionsSpawnTool, SpawnExecutionContext, SpawnLineage, SpawnRecordCodes, SpawnScope, boxed_spawn_field,
+    current_spawn_execution_context, normalize_process_memory_strategy, parse_spawn_scope,
+    record_spawn_request_event, refresh_tools_for_explicit_allowlist, running_run_count, spawn_event_scope,
+    spawn_lineage, spawn_session_key,
 };
+use crate::channels::traits::Channel;
 use crate::providers;
 use crate::runtime::child_source::publication::ChildDelegation;
 use crate::security::SideEffectGate;
 use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
 use crate::tools::traits::{Tool, ToolResult};
 use anyhow::Context as _;
-use chrono::Utc;
 use std::sync::Arc;
-use tokio::sync::RwLock;
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 /// What one spawn attempt produced: the tool-visible result, plus the run id
@@ -46,7 +37,7 @@ impl SpawnOutcome {
     }
 
     /// A run is registered and its driver task is live.
-    const fn started(run_id: String, output: String) -> Self {
+    pub(super) const fn started(run_id: String, output: String) -> Self {
         Self {
             result: ToolResult {
                 success: true,
@@ -72,6 +63,60 @@ pub(super) fn resolve_pinned_child_compaction(
         &config.model_routes,
         catalog,
     )
+}
+
+/// Everything `execute_spawn_with_id` resolved before the launch mode splits: the admitted source,
+/// the pinned provider route, the run identity and its scope. Borrowed fields point into values the
+/// caller keeps alive for the whole launch.
+pub(super) struct SpawnLaunch<'a> {
+    pub(super) operator_source: &'a Option<Arc<crate::runtime::operator_spawn::ChildLaunchSource>>,
+    pub(super) message_input: Option<crate::messaging::runtime::MessageInput>,
+    pub(super) message_permit: Option<Arc<crate::runtime::agent_admission::AgentTurnPermit>>,
+    pub(super) caller: &'a Option<crate::tools::execution::ChildCallContext>,
+    pub(super) child_delegation: Option<ChildDelegation>,
+    pub(super) ordinary_publication: Option<&'a crate::runtime::child_source::publication::OrdinaryChildPublication>,
+    pub(super) child_model_config: &'a crate::config::Config,
+    pub(super) launch_security: &'a Arc<crate::security::SecurityPolicy>,
+    pub(super) child_level: crate::security::AutonomyLevel,
+    pub(super) spawn_config: &'a crate::config::schema::SessionsSpawnConfig,
+    pub(super) task: &'a str,
+    pub(super) process_memory_strategy: String,
+    pub(super) spawn_scope: Option<SpawnScope>,
+    pub(super) parent_exec_ctx: Option<SpawnExecutionContext>,
+    pub(super) spawn_depth: usize,
+    pub(super) parent_run_id: Option<String>,
+    pub(super) child_full: bool,
+    pub(super) inherited_channel_exclusions: Vec<String>,
+    pub(super) run_id: String,
+    pub(super) session_scope_key: String,
+    pub(super) selected_agent: Option<(String, crate::config::DelegateAgentConfig)>,
+    pub(super) recipient: Option<String>,
+    pub(super) run_channel_name: Option<String>,
+    pub(super) operator_channel: Option<Arc<dyn Channel>>,
+    pub(super) announce_result: bool,
+    pub(super) memory_fabric: crate::memory::MemoryFabric,
+    pub(super) process_memory_backend: String,
+    pub(super) resolved_provider_name: String,
+    pub(super) resolved_model: String,
+    pub(super) child_requested_model: Option<(String, String)>,
+    pub(super) selected_route_hint: Option<String>,
+    pub(super) route_source_provider: Option<String>,
+    pub(super) child_credential: Option<providers::credentials::CredentialRef>,
+    pub(super) route_credential: Option<providers::credentials::CredentialRef>,
+    pub(super) route_uses_root_connection: bool,
+    pub(super) direct_uses_root_connection: bool,
+    pub(super) temperature_override: Option<f64>,
+    pub(super) resolved_temperature: f64,
+    pub(super) ordinary_binding: Option<Arc<crate::runtime::child_source::ChildProviderBinding>>,
+    pub(super) spawn_scope_for_event: crate::memory::fabric::MessageEventScope,
+    pub(super) run_lineage: SpawnLineage,
+    pub(super) allowed_tools: Vec<String>,
+    pub(super) tools: Option<Arc<Vec<Box<dyn Tool>>>>,
+    pub(super) process_config_source: Option<(std::path::PathBuf, String)>,
+    pub(super) source_receipt: Option<Arc<crate::runtime::child_source::ChildInputReceipt>>,
+    pub(super) batch_id: Option<&'a str>,
+    pub(super) process_compaction_config: crate::config::AgentCompactionConfig,
+    pub(super) parent_hooks: Option<Arc<crate::hooks::HookManager>>,
 }
 
 impl SessionsSpawnTool {
@@ -835,1138 +880,61 @@ impl SessionsSpawnTool {
         if let Some(publication) = ordinary_publication {
             publication.watch_mailbox_children()?;
         }
-        if mode == "process" {
-            let process_parent_frames = caller.as_ref().and_then(|caller| {
-                let context = caller.context();
-                context
-                    .live_turn
-                    .as_ref()
-                    .map(|live| live.0.frames(&context.envelope, &std::collections::HashSet::new()))
-            });
-            let (process_config_dir, process_config_generation) =
-                process_config_source.ok_or_else(|| anyhow::anyhow!("process config source was not resolved"))?;
-            let process_provider_selection = if ordinary_publication.is_some() {
-                let (provider, model) = child_requested_model
-                    .as_ref()
-                    .context("process child selection missing")?;
-                Some(crate::session_worker::protocol::WorkerProviderSelection {
-                    provider: provider.clone(),
-                    model: model.clone(),
-                    credential: child_credential.clone().context("process child credential missing")?,
-                })
-            } else {
-                None
-            };
-            let process_source_launch = ordinary_publication
-                .map(|publication| {
-                    publication.capture_process_launch(
-                        caller.as_ref().context("ordinary process caller missing")?,
-                        ordinary_binding
-                            .as_deref()
-                            .context("ordinary process binding missing")?,
-                        &spawn_scope_for_event,
-                        task,
-                        source_receipt.clone(),
-                        process_provider_selection
-                            .clone()
-                            .context("ordinary process selection missing")?,
-                        process_config_generation.clone(),
-                    )
-                })
-                .transpose()?
-                .map(|launch| crate::runtime::operator_spawn::process::ProcessSourceLaunch::Ordinary(Box::new(launch)));
-            let process_source_launch = match &operator_source {
-                Some(source) => Some(crate::runtime::operator_spawn::process::ProcessSourceLaunch::Operator(
-                    Box::new(source.capture_process(
-                        &spawn_scope_for_event,
-                        task,
-                        source_receipt.clone(),
-                        process_config_generation.clone(),
-                    )?),
-                )),
-                None => process_source_launch,
-            };
-            let process_approval_relay = crate::session_worker::approval::relay_context::RelaySeedInputs {
-                caller: caller.as_ref(),
-                binding: ordinary_binding.as_deref(),
-                resolvers: self.approval_resolver_factory.as_ref(),
-                scope: &spawn_scope_for_event,
-                task,
-                receipt: source_receipt.as_deref(),
-                security: launch_security,
-                level: child_level,
-                run_id: &run_id,
-            }
-            .seed()?;
-            let temperature = resolved_temperature;
-            let history_arc: Arc<RwLock<Vec<HistoryEntry>>> =
-                Arc::new(RwLock::new(super::continuation::seed_history()));
-            let process_control = ProcessRunControl::new();
-            let stop_control = Arc::clone(&process_control);
-            let runtime_handle = tokio::runtime::Handle::try_current()?;
-            let message_turn = super::message_lifetime::retain(
-                child_model_config,
-                message_input.as_ref(),
-                &self.active_runs,
-                Arc::new(move || {
-                    let control = Arc::clone(&stop_control);
-                    runtime_handle.spawn(async move {
-                        let _ = control.request_termination("history_erased").await;
-                    });
-                }),
-            )?;
-            // Process-mode steering: the sender lives in the registry exactly as
-            // it does for task mode, so `sessions_send` / `sessions_spawn:steer`
-            // reach an OS-process sub-agent through the same code path. The
-            // receiver is handed to the child owner, which forwards each message
-            // as a line-delimited control frame on the worker's stdin.
-            let (process_steer_tx, process_steer_rx) = tokio::sync::mpsc::channel::<String>(STEER_CHANNEL_CAPACITY);
-            // Minted here, on the *spawning* task, so the run's beat is parented
-            // on the caller's: a parent legitimately blocked on a working child
-            // must not look silent to its own hang detector. A beat minted
-            // inside the spawned monitor would have no parent at all, because
-            // task-locals do not cross `tokio::spawn`.
-            let process_progress = crate::agent::idle::child_beat();
-
-            {
-                let mut runs = self.active_runs.write().await;
-                let mut run = new_process_mode_run(ProcessModeRunSeed {
-                    id: run_id.clone(),
-                    task: task.to_string(),
-                    lineage: &run_lineage,
-                    recipient: recipient.clone(),
-                    channel_name: run_channel_name.clone(),
-                    process_control: process_control.clone(),
-                    history: history_arc.clone(),
-                    steer_tx: process_steer_tx.clone(),
-                    parent_run_id: parent_run_id.clone(),
-                    session_scope_key: session_scope_key.clone(),
-                    spawn_depth,
-                    // Recursive delegation status is issued by no parent (P2-G4).
-                    delegation: None,
-                    progress: Arc::clone(&process_progress),
-                    batch_id: batch_id.map(str::to_string),
-                });
-                run.agent_partition = spawn_scope_for_event.agent_partition.clone();
-                super::continuation::register(&mut runs, run)?;
-            }
-
-            let model = resolved_model;
-            let provider_name = resolved_provider_name;
-            let route_hint = selected_route_hint;
-            let workspace_root = child_model_config.workspace_dir.clone();
-            let worker_workspace_root =
-                resolve_worker_workspace_root(spawn_config.worker_workspace_root.as_deref(), &workspace_root);
-            let active_runs = self.active_runs.clone();
-            // Resolve the announce channel from the *per-turn* channel name bound
-            // to this run (the launching message's scope), not the shared active
-            // channel — so a concurrently-processed message cannot mis-route this
-            // run's result. Falls back to the active channel when no scope name.
-            let channel = match &operator_channel {
-                Some(channel) => Arc::clone(channel),
-                None => self.resolve_announce_channel(run_channel_name.as_deref()).await,
-            };
-            let keep_workspace = !spawn_config.cleanup_on_complete;
-            let process_agent_id = selected_agent.as_ref().map(|(name, _)| name.clone());
-            let identity_dir = selected_agent.as_ref().and_then(|(_, cfg)| {
-                cfg.identity_dir
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_string)
-            });
-            // Process workers need the same explicit agent contract as task-mode
-            // children.  Without carrying this prompt into the signed manifest,
-            // a named agent's tool-use and completion instructions silently vanish
-            // at the OS-process boundary.
-            let process_system_prompt = selected_agent.as_ref().and_then(|(_, cfg)| {
-                cfg.system_prompt
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_string)
-            });
-            let task_owned = task.to_string();
-            let rid = run_id.clone();
-            let process_scope = spawn_scope.clone();
-            // Announcement gate inputs for the process-mode monitor. Same three
-            // values the task-mode branch below captures, handed to the same
-            // `deliver_or_withhold_notice`.
-            let process_announce_security = policy_at_level(launch_security, child_level);
-            let process_announce_origin = AnnounceOrigin::from_scope(spawn_scope.as_ref());
-            let process_announce_history = history_arc.clone();
-            // The worker's parent is the run its bound input names: the
-            // publication's spawn run, or the operator source run. A gateway
-            // Console turn seeds no spawn context, so `parent_run_id` alone is
-            // None there and the manifest would differ from its issued input.
-            let process_parent_run_id = spawn_scope_for_event
-                .parent_run_id
-                .clone()
-                .or_else(|| parent_run_id.clone());
-            let process_session_scope_key = session_scope_key.clone();
-            let process_spawn_depth = spawn_depth;
-            let process_channel_exclusions = inherited_channel_exclusions.clone();
-            let process_compaction_config = resolved_compaction.config.clone();
-            let process_event_recording = child_model_config.memory.event_recording_config();
-            let process_execution_ctx = SpawnExecutionContext {
-                task_input: parent_exec_ctx
-                    .as_ref()
-                    .map(|context| context.task_input.clone())
-                    .unwrap_or_default(),
-                operator_authority: None,
-                ordinary_authority: None,
-                provider_binding: None,
-                terminal_usage: None,
-                input_receipt: source_receipt.clone(),
-                run_id: rid.clone(),
-                session_scope_key: session_scope_key.clone(),
-                spawn_depth,
-                owner_id: run_lineage.owner_id.clone(),
-                owner_isolated: run_lineage.owner_isolated,
-                topic_id: run_lineage.topic_id.clone(),
-                source_message_event_id: run_lineage.source_message_event_id.clone(),
-                // A spawn-run context (this run may itself spawn): its children
-                // compute spawn_depth + 1.
-                is_turn_root: false,
-                channel_excluded_tools: inherited_channel_exclusions.clone(),
-            };
-            let process_memory_fabric = Some(memory_fabric.clone());
-            let process_result_scope = spawn_scope_for_event.clone();
-            let process_lineage = run_lineage.clone();
-            let process_cost_config = child_model_config.cost.clone();
-            let monitor_process_control = process_control.clone();
-
-            // Registry row for this run. The parent is captured *here*, on the
-            // spawning task, because a freshly spawned task inherits no
-            // task-locals. No abort handle is attached: this monitor is the sole
-            // owner responsible for signalling and reaping the OS child, so
-            // aborting it would strand the very process a kill is meant to end.
-            // The row's cooperative token is how a kill reaches it instead —
-            // see `bridge_registry_kill_to_process_control`, which asks that
-            // same owner to stop. A cascade additionally signals the worker's
-            // process group through the child row `run_sub_agent_process`
-            // registers underneath.
-            // Parented to the enclosing turn, not the launching tool call: that row
-            // is gone once the call returns, which would cut this run out of a
-            // cascading cancel of the root.
-            let sub_agent_parent = crate::runtime::registry::current_owner_work_id();
-            let sub_agent_label = process_agent_id
-                .clone()
-                .unwrap_or_else(|| "sub-agent (process)".to_string());
-            let mut sub_agent_work =
-                register_killable_process_run(&sub_agent_label, &rid, sub_agent_parent, batch_id, &process_control);
-            // Publish this run's steering channel on its registry row so the
-            // control plane can address it by run id from another entry point.
-            // Same sender, same bounded queue as `sessions_send` — only the
-            // lookup is new; see `registry::attach_steer_sender`.
-            crate::runtime::registry::attach_steer_sender(sub_agent_work.id(), process_steer_tx.clone());
-            sub_agent_work.require_cleanup_acknowledgement();
-            let process_work_id = sub_agent_work.id();
-            let is_ordinary_process = process_source_launch
-                .as_ref()
-                .is_some_and(|launch| launch.is_ordinary());
-            let ordinary_recovery = if is_ordinary_process {
-                Some(process_terminal::ordinary::OrdinaryProcessRecovery::new(
-                    process_memory_fabric
-                        .clone()
-                        .context("ordinary recovery fabric missing")?,
-                    workspace_root.clone(),
-                    run_lineage
-                        .owner_id
-                        .clone()
-                        .context("ordinary recovery owner missing")?,
-                    run_id.clone(),
-                )?)
-            } else {
-                None
-            };
-            let is_operator_process = process_source_launch
-                .as_ref()
-                .is_some_and(|launch| !launch.is_ordinary());
-            let operator_recovery = if is_operator_process {
-                Some(process_terminal::operator::OperatorProcessRecovery::new(
-                    process_memory_fabric
-                        .clone()
-                        .context("operator recovery fabric missing")?,
-                    workspace_root.clone(),
-                    run_lineage
-                        .owner_id
-                        .clone()
-                        .context("operator recovery owner missing")?,
-                    run_id.clone(),
-                )?)
-            } else {
-                None
-            };
-            let process_worker_mailbox = if let Some(factory) = &self.worker_mailbox {
-                Some(factory.clone())
-            } else if let Some(config) = self
-                .hint_config
-                .as_ref()
-                .filter(|config| config.memory.backend == "sqlite")
-            {
-                Some(crate::messaging::worker::WorkerMailboxes::for_config(config)?
-                    as Arc<dyn crate::session_worker::mailbox_binding::WorkerMailboxFactory>)
-            } else {
-                None
-            };
-            let process_batch_id = batch_id.map(str::to_owned);
-            #[cfg(test)]
-            let test_worker_executable = self.test_worker_executable.clone();
-            let ordinary_terminal = Arc::new(parking_lot::Mutex::new(None));
-            let monitor_ordinary_terminal = Arc::clone(&ordinary_terminal);
-            let operator_terminal = Arc::new(parking_lot::Mutex::new(None));
-            let monitor_operator_terminal = Arc::clone(&operator_terminal);
-            let monitor_active_runs = active_runs.clone();
-            let monitor_progress = Arc::clone(&process_progress);
-            let jh = crate::agent::channel_approval::spawn(crate::runtime::registry::scope_current(
-                process_work_id,
-                SPAWN_EXECUTION_CONTEXT.scope(
-                    process_execution_ctx,
-                    crate::agent::idle::scope_beat(Some(Arc::clone(&monitor_progress)), async move {
-                        let _message_permit=message_permit;
-                        let _message_input=message_input;
-                        let _message_turn=message_turn;
-                        async {
-                            tracing::info!(run_id = %rid, "Sub-agent process starting");
-
-                            let worker_result = run_sub_agent_process(
-                                &rid,
-                                &task_owned,
-                                &provider_name,
-                                &model,
-                                route_hint.as_deref(),
-                                route_source_provider.as_deref(),
-                                route_credential.as_ref(),
-                                route_uses_root_connection,
-                                direct_uses_root_connection,
-                                temperature,
-                                temperature_override,
-                                &workspace_root,
-                                &worker_workspace_root,
-                                identity_dir.as_deref(),
-                                process_system_prompt.as_deref(),
-                                &allowed_tools,
-                                keep_workspace,
-                                process_scope.as_ref(),
-                                process_spawn_depth,
-                                &process_session_scope_key,
-                                process_parent_run_id.as_deref(),
-                                process_agent_id.as_deref(),
-                                &process_lineage,
-                                &process_memory_strategy,
-                                &process_memory_backend,
-                                &process_config_dir,
-                                &process_config_generation,
-                                process_event_recording,
-                                &process_compaction_config,
-                                &process_channel_exclusions,
-                                monitor_process_control.as_ref(),
-                                process_steer_rx,
-                                history_arc,
-                                Arc::clone(&monitor_progress),
-                                process_memory_fabric.as_ref(),
-                                process_source_launch,
-                                process_batch_id.as_deref(),
-                                process_worker_mailbox.as_ref(),
-                                process_parent_frames,
-                                process_approval_relay,
-                                #[cfg(test)]
-                                test_worker_executable.as_ref(),
-                            )
-                            .await;
-
-                            // The worker's own account that its work was cancelled; the run's
-                            // status stays `Failed`, only the recorded task event differs.
-                            let mut worker_cancelled = false;
-                            let (status, result_text, token_usage_records, finalization) = match worker_result {
-                                Ok(ProcessWorkerOutcome::OrdinaryVerifiedFinished(completion)) => {
-                                    *monitor_ordinary_terminal.lock() = Some(completion.clone());
-                                    let result = completion.result;
-                                    worker_cancelled = result.cancelled;
-                                    let (status, text) = if result.success {
-                                        (SubAgentStatus::Completed(result.output.clone()), result.output)
-                                    } else {
-                                        let error = super::failure::llm_visible_error(&result.error.unwrap_or_else(|| "worker failed".to_owned()));
-                                        (SubAgentStatus::Failed(sub_agent_reported_failure(&error)), format!("Sub-agent error: {error}"))
-                                    };
-                                    (status, text, completion.usage, ProcessFinalization::Natural)
-                                }
-                                Ok(ProcessWorkerOutcome::OperatorVerifiedFinished(completion)) => {
-                                    *monitor_operator_terminal.lock() = Some(completion.clone());
-                                    let result = completion.result;
-                                    worker_cancelled = result.cancelled;
-                                    let (status, text) = if result.success {
-                                        (SubAgentStatus::Completed(result.output.clone()), result.output)
-                                    } else {
-                                        let error = super::failure::llm_visible_error(&result.error.unwrap_or_else(|| "worker failed".to_owned()));
-                                        (SubAgentStatus::Failed(sub_agent_reported_failure(&error)), format!("Sub-agent error: {error}"))
-                                    };
-                                    (status, text, completion.usage, ProcessFinalization::Natural)
-                                }
-                                Ok(ProcessWorkerOutcome::VerifiedStartupFailure(result)) => {
-                                    let error = result.error.context("verified startup failure detail missing");
-                                    let error = match error {
-                                        Ok(error) => error,
-                                        Err(error) => {
-                                            tracing::error!(run_id = %rid, error = %error, "verified startup result invalid");
-                                            return;
-                                        }
-                                    };
-                                    (
-                                        SubAgentStatus::Failed(sub_agent_reported_failure(&error)),
-                                        format!("Sub-agent startup error: {error}"),
-                                        Vec::new(),
-                                        ProcessFinalization::Natural,
-                                    )
-                                }
-                                Ok(ProcessWorkerOutcome::UnverifiedStartupFailure(_)) => {
-                                    tracing::error!(run_id = %rid, "unverified startup failure escaped process owner");
-                                    return;
-                                }
-                                Ok(ProcessWorkerOutcome::Finished(result)) if result.success => {
-                                    let token_usage_records = result
-                                        .tokens_used
-                                        .as_ref()
-                                        .and_then(|usage| {
-                                            crate::llm::route_decision::MeteredTokenUsageRecord::from_parts(
-                                                &provider_name,
-                                                &model,
-                                                usage,
-                                                &process_cost_config,
-                                            )
-                                        })
-                                        .into_iter()
-                                        .collect::<Vec<_>>();
-                                    (
-                                        SubAgentStatus::Completed(result.output.clone()),
-                                        result.output,
-                                        token_usage_records,
-                                        ProcessFinalization::Natural,
-                                    )
-                                }
-                                Ok(ProcessWorkerOutcome::Finished(result)) => {
-                                    worker_cancelled = result.cancelled;
-                                    let error = result.error.unwrap_or_else(|| "worker failed".to_string());
-                                    let msg = format!("Sub-agent error: {error}");
-                                    // `result.error` is a field of the JSON the
-                                    // worker itself printed, so it is the run's
-                                    // account of the run — quarantined here so
-                                    // it cannot pass for a runtime wording in
-                                    // `termination_cause`. The announcement
-                                    // above still shows the raw account.
-                                    (
-                                        SubAgentStatus::Failed(sub_agent_reported_failure(&error)),
-                                        msg,
-                                        Vec::new(),
-                                        ProcessFinalization::Natural,
-                                    )
-                                }
-                                Ok(ProcessWorkerOutcome::Terminated { reason, usage }) => {
-                                    let msg = format!("Sub-agent process terminated: {reason}");
-                                    (
-                                        SubAgentStatus::Failed(reason),
-                                        msg,
-                                        usage,
-                                        ProcessFinalization::Terminated,
-                                    )
-                                }
-                                Ok(ProcessWorkerOutcome::OrdinaryInterrupted { detail, usage }) => {
-                                    let error = format!("{}; cleanup and provider usage remain unconfirmed; {} visible segments lack a terminal",
-                                        exited_without_result_reason(&detail), usage.unfinished_segments);
-                                    (SubAgentStatus::Failed(error.clone()), format!("Sub-agent process error: {error}"),
-                                        usage.records, ProcessFinalization::Unconfirmed)
-                                }
-                                Ok(ProcessWorkerOutcome::OperatorInterrupted { detail, usage }) => {
-                                    let error = format!("{}; cleanup and provider usage remain unconfirmed; {} visible segments lack a terminal",
-                                        exited_without_result_reason(&detail), usage.unfinished_segments);
-                                    (SubAgentStatus::Failed(error.clone()), format!("Sub-agent process error: {error}"),
-                                        usage.records, ProcessFinalization::Unconfirmed)
-                                }
-                                Ok(ProcessWorkerOutcome::ExitedWithoutResult(detail)) => {
-                                    // MUTATION GUARD: folding this back into the
-                                    // generic parse-error path loses the only
-                                    // wording an operator can act on, and folding it
-                                    // into "keep waiting" would leave the run
-                                    // `Running` for as long as the process lives.
-                                    let error = exited_without_result_reason(&detail);
-                                    let msg = format!("Sub-agent process error: {error}");
-                                    (
-                                        SubAgentStatus::Failed(error),
-                                        msg,
-                                        Vec::new(),
-                                        ProcessFinalization::Natural,
-                                    )
-                                }
-                                Ok(ProcessWorkerOutcome::ExitedUnrequested { detail, usage }) => {
-                                    let error = exited_without_result_reason(&detail);
-                                    (SubAgentStatus::Failed(error.clone()), format!("Sub-agent process error: {error}"),
-                                        usage, ProcessFinalization::Natural)
-                                }
-                                Ok(ProcessWorkerOutcome::TerminationFailed(error)) => {
-                                    let msg = format!("Sub-agent process termination failed: {error}");
-                                    (
-                                        SubAgentStatus::Failed(error),
-                                        msg,
-                                        Vec::new(),
-                                        ProcessFinalization::TerminationFailed,
-                                    )
-                                }
-                                Err(error) => {
-                                    // Nothing was spawned for a refused launch, so its
-                                    // failure is final rather than left to recovery.
-                                    let launch_refused =
-                                        error.downcast_ref::<super::process_mode::WorkerLaunchRefused>().is_some();
-                                    tracing::warn!(
-                                        run_id = %rid,
-                                        launch_refused,
-                                        error = %crate::agent::diagnostics::error_class(&error),
-                                        "sub-agent process ended with an error"
-                                    );
-                                    let detail = super::failure::llm_visible_error(&format!("{error:#}"));
-                                    let msg = format!("Sub-agent process error: {detail}");
-                                    (
-                                        SubAgentStatus::Failed(detail),
-                                        msg,
-                                        Vec::new(),
-                                        if (is_ordinary_process || is_operator_process) && !launch_refused {
-                                            ProcessFinalization::Unconfirmed
-                                        } else { ProcessFinalization::Natural },
-                                    )
-                                }
-                            };
-
-                            let announce = format_announce_message(&rid, &status, &result_text);
-                            // An exiting owner waits only for finalization, so the run's
-                            // durable terminal row is written before the commit publishes it.
-                            let owner_exiting = monitor_process_control.termination_reason().as_deref()
-                                == Some(OwnerLossReason::OwnerExited.code());
-                            if owner_exiting {
-                                if matches!(finalization, ProcessFinalization::Terminated | ProcessFinalization::Unconfirmed) {
-                                    if let Some(fabric) = process_memory_fabric.as_ref() {
-                                        if let Err(error) = record_owner_loss_terminal(
-                                            fabric,
-                                            process_result_scope.clone(),
-                                            &rid,
-                                            OwnerLossReason::OwnerExited,
-                                        )
-                                        .await
-                                        {
-                                            tracing::error!(
-                                                run_id = %rid,
-                                                error = %crate::agent::diagnostics::error_class(&error),
-                                                "owner-exit terminal row remains unconfirmed"
-                                            );
-                                        }
-                                    }
-                                } else if finalization == ProcessFinalization::Natural {
-                                    // Finished on its own within the bound: its real outcome.
-                                    record_spawn_result_event_keyed(
-                                        process_memory_fabric.as_ref(),
-                                        process_result_scope.clone(),
-                                        &result_text,
-                                        &status,
-                                        &process_lineage,
-                                        worker_cancelled.then_some("task.cancelled"),
-                                        Some(crate::session_worker::protocol::worker_result_key(&rid)),
-                                    )
-                                    .await;
-                                }
-                            }
-                            if let Err(error) = commit_process_terminal_state(
-                                &active_runs,
-                                &rid,
-                                status.clone(),
-                                token_usage_records,
-                                monitor_process_control.as_ref(),
-                                finalization,
-                                None,
-                                #[cfg(test)]
-                                None,
-                            )
-                            .await {
-                                tracing::error!(run_id = %rid, error = %error, "process terminal registry commit remains unconfirmed");
-                                return;
-                            }
-                            if finalization == ProcessFinalization::Unconfirmed || owner_exiting {
-                                return;
-                            }
-                            // One result row per run: the worker's own row, if it wrote one,
-                            // already holds the run's key and this write adds nothing.
-                            record_spawn_result_event_keyed(
-                                process_memory_fabric.as_ref(),
-                                process_result_scope,
-                                &result_text,
-                                &status,
-                                &process_lineage,
-                                // A `Terminated` run is a requested stop: recorded as cancelled.
-                                (finalization == ProcessFinalization::Terminated || worker_cancelled)
-                                    .then_some("task.cancelled"),
-                                Some(crate::session_worker::protocol::worker_result_key(&rid)),
-                            )
-                            .await;
-
-                            if !announce_result {
-                                tracing::debug!(
-                                    run_id = %rid,
-                                    "Sub-agent process result withheld from the channel (announce=false); \
-                                     it is delivered to whoever joins this run's batch"
-                                );
-                            } else if let Some(target) = recipient {
-                                // Not a mirror of the task-mode block any more:
-                                // the same function, so the gate this path gets
-                                // is literally the gate the task-mode tests
-                                // exercise. Driving a real process-mode
-                                // announcement from a unit test is impossible
-                                // (the worker re-execs `current_exe`, which under
-                                // `cargo test` is the test binary), so sharing the
-                                // implementation is what covers it.
-                                deliver_or_withhold_notice(
-                                    &process_announce_security,
-                                    process_announce_origin.as_ref(),
-                                    channel.as_ref(),
-                                    &process_announce_history,
-                                    &rid,
-                                    &target,
-                                    &announce,
-                                    OutboundNotice::ProcessRunResult,
-                                )
-                                .await;
-                            }
-
-                            tracing::info!(run_id = %rid, "Sub-agent process finished");
-                        }
-                        .await;
-                    }),
-                ),
-            ));
-
-            // Process-mode callers must never abort this monitor: it is the
-            // sole owner responsible for signalling and reaping the OS child.
-            // Awaiting the handle from a *separate* task does not abort it, and
-            // is the only way a cancellation of the monitor (runtime shutdown,
-            // a future registry abort) can still reach the tool-plane row.
-            watch_process_mode_monitor(
-                jh,
-                monitor_active_runs,
-                run_id.clone(),
-                process_control.clone(),
-                sub_agent_work,
-                ordinary_terminal,
-                ordinary_recovery,
-                operator_terminal,
-                operator_recovery,
-            );
-
-            return Ok(SpawnOutcome::started(
-                run_id.clone(),
-                spawn_started_text(
-                    "Sub-agent spawned in process mode",
-                    &run_id,
-                    child_delegation,
-                    announce_result,
-                ),
-            ));
-        }
-
-        // Create shared history and steer channel for this run
-        let history_arc: Arc<RwLock<Vec<HistoryEntry>>> = Arc::new(RwLock::new(super::continuation::seed_history()));
-        // Class B — bounded. Steering messages are produced by operators and by
-        // model tool calls, neither of which is rate-limited now that sub-agent
-        // concurrency is uncapped, while the consumer only polls between tool
-        // iterations. An unbounded queue therefore grows for the whole lifetime
-        // of a long-running sub-agent.
-        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<String>(STEER_CHANNEL_CAPACITY);
-        // Minted on the spawning task so the run's beat is parented on the
-        // caller's (see `crate::agent::idle::child_beat`). The sub-agent's own
-        // guarded turn parents *its* beat on this one, so every ProgressKind
-        // event it produces refreshes this row and the caller's window alike.
-        let task_progress = crate::agent::idle::child_beat();
-
-        // Clone everything the spawned task needs.
-        // Resolve the announce channel from the *per-turn* channel name bound to
-        // this run (the launching message's scope), not the shared active channel
-        // — so a concurrently-processed message cannot mis-route this run's
-        // result. Falls back to the active channel when no scope name is present.
-        let channel = match &operator_channel {
-            Some(channel) => Arc::clone(channel),
-            None => self.resolve_announce_channel(run_channel_name.as_deref()).await,
-        };
-        let mut provider_name = resolved_provider_name;
-        let mut model = resolved_model;
-        let child_provider_binding = if let Some(source) = &operator_source {
-            let binding = Arc::new(crate::runtime::child_source::ChildProviderBinding::build_independent(
-                source,
-            )?);
-            provider_name = binding.provider_name().to_owned();
-            model = binding.model().to_owned();
-            Some(binding)
-        } else if let Some(binding) = ordinary_binding {
-            provider_name = binding.provider_name().to_owned();
-            model = binding.model().to_owned();
-            Some(binding)
-        } else {
-            None
-        };
-        let temperature = resolved_temperature;
-        // An explicit hint always builds its exact selected chain, even when
-        // it names the gateway provider: the gateway may hold another route's
-        // credential. Direct models keep their existing provider plan.
-        if let Some(source) = &operator_source {
-            source.verify_live()?;
-            let binding = child_provider_binding
-                .as_ref()
-                .context("operator child model binding missing")?;
-            anyhow::ensure!(
-                Arc::ptr_eq(&binding.provider(), source.provider()),
-                "operator child provider differs from captured ingress"
-            );
-        }
-        let provider = child_provider_binding
-            .as_ref()
-            .context("admitted sessions_spawn child model binding missing")?
-            .provider();
-        let active_runs = self.active_runs.clone();
-        let rid = run_id.clone();
-        // Event bridge (v1.1a): if a chat-side sink is attached, create this
-        // session's middle channels + drainer up front (run_id is already
-        // minted, so the drainer is tagged with the correct id — no race). The
-        // background agent only ever `.send().await`s onto these; the drainer
-        // continuously empties them, so the agent never back-pressures.
-        let run_event_streams = self.event_sink.as_ref().map(|sink| sink.streams_for(&run_id));
-        // NeedsInput (chat `/bg` only): mint this run's approval resolver so a
-        // supervised gate hit suspends awaiting an operator decision instead of
-        // auto-failing. `None` everywhere else (channels/gateway) preserves the
-        // historical auto-fail-on-gate semantics.
-        let run_approval_resolver = self
-            .approval_resolver_factory
-            .as_ref()
-            .map(|factory| factory.resolver_for(&run_id));
-        // Only approval suspension needs the optional restoration registry.
-        // Every task still carries its admitted run identity, including mailbox
-        // continuations without an approval surface.
-        let restore_active_runs = run_approval_resolver.as_ref().map(|_| self.active_runs.clone());
-        let restore_run_id = Some(run_id.clone());
-        let task_owned = task.to_string();
-        let identity_workspace = child_model_config.workspace_dir.clone();
-        let security = Arc::clone(launch_security);
-        // Second handle, for the announcement gate: `security` above is moved
-        // into the sub-agent's own loop, and the announcement is authorized only
-        // once that loop has returned.
-        let announce_security = policy_at_level(launch_security, child_level);
-        // The launching turn's trusted identity, captured atomically with
-        // `recipient` / `run_channel_name` from the same scope snapshot.
-        let announce_origin = AnnounceOrigin::from_scope(spawn_scope.as_ref());
-        // Same handle the run writes its transcript through, so a refused
-        // announcement is visible on the run itself and not only in the log.
-        let announce_history = history_arc.clone();
-        let mut terminal_usage = None;
-        let mut task_execution_ctx = SpawnExecutionContext {
-            task_input: parent_exec_ctx
-                .as_ref()
-                .map(|context| context.task_input.clone())
-                .unwrap_or_default(),
-            operator_authority: None,
-            ordinary_authority: None,
-            provider_binding: child_provider_binding,
-            terminal_usage: terminal_usage.clone(),
-            input_receipt: source_receipt,
-            run_id: rid.clone(),
-            session_scope_key: session_scope_key.clone(),
-            spawn_depth,
-            owner_id: run_lineage.owner_id.clone(),
-            owner_isolated: run_lineage.owner_isolated,
-            topic_id: run_lineage.topic_id.clone(),
-            source_message_event_id: run_lineage.source_message_event_id.clone(),
-            // A spawn-run context (this run may itself spawn): its children
-            // compute spawn_depth + 1.
-            is_turn_root: false,
-            channel_excluded_tools: inherited_channel_exclusions.clone(),
-        };
-        let task_memory_fabric = memory_fabric.clone();
-        let task_result_scope = spawn_scope_for_event.clone();
-        let task_lineage = run_lineage.clone();
-        let agent_label_for_registry = selected_agent.as_ref().map(|(name, _)| name.clone());
-        let (system_prompt, filtered_tools) = if let Some((agent, cfg)) = selected_agent {
-            let identity_path = cfg
-                .identity_dir
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(|directory| identity_workspace.join(directory));
-            let prompt = crate::identity::delegated::compose(identity_path.as_deref(), cfg.system_prompt.as_deref());
-            let memory_scope = parse_memory_scope(cfg.memory_scope.as_deref())?;
-            let tools = tools.map(|registry| {
-                if ordinary_publication.is_some() {
-                    // Keep the backend root identity and dynamic metadata for
-                    // the sealed catalog. The child service enforces the exact
-                    // manifest, agent allowance and inherited exclusions.
-                    let memory_prefix = (memory_scope == MemoryScope::Isolated).then(|| agent.clone());
-                    return Arc::new(
-                        registry
-                            .iter()
-                            .map(|tool| {
-                                Box::new(AllowedToolProxy {
-                                    source: Arc::clone(&registry),
-                                    public_name: tool.name().to_owned(),
-                                    memory_prefix: memory_prefix.clone(),
-                                }) as Box<dyn Tool>
-                            })
-                            .collect(),
-                    );
-                }
-                resolve_tools_for_agent(
-                    registry,
-                    &agent,
-                    memory_scope,
-                    if child_full || cfg.allowed_tools.is_empty() {
-                        None
-                    } else {
-                        Some(&cfg.allowed_tools)
-                    },
-                    &inherited_channel_exclusions,
-                )
-            });
-            (prompt, tools)
-        } else {
-            (crate::identity::delegated::DEFAULT_PROMPT.to_owned(), tools)
-        };
-
-        // Register the run.
-        //
-        // A background run outlives its spawning turn. Its independent observer
-        // owns cleanup; parenting this to the caller would cancel valid work
-        // when that caller returns. Register before publishing the active row.
-        let task_control = TaskRunControl::new();
-        let stop_token = task_control.cancellation().clone();
-        let message_turn = super::message_lifetime::retain(
+        let process_compaction_config = resolved_compaction.config.clone();
+        let launch = SpawnLaunch {
+            operator_source: &operator_source,
+            message_input,
+            message_permit,
+            caller: &caller,
+            child_delegation,
+            ordinary_publication,
             child_model_config,
-            message_input.as_ref(),
-            &self.active_runs,
-            Arc::new(move || stop_token.cancel()),
-        )?;
-        if let Some(source) = &operator_source {
-            let (authority, lifetime) = source.issue_task(
-                Arc::clone(
-                    task_execution_ctx
-                        .provider_binding
-                        .as_ref()
-                        .context("operator model binding missing")?,
-                ),
-                &task_result_scope,
-                task,
-                task_execution_ctx.input_receipt.as_deref(),
-                task_control.cancellation(),
-            )?;
-            task_control.retain_operator_lifetime(lifetime)?;
-            use crate::runtime::turn_source::TurnSourceProof;
-            let usage = Arc::new(crate::runtime::turn_terminal::TerminalUsageCollector::new_ordinary(
-                authority.workspace_id().to_owned(),
-                authority.owner_id().to_owned(),
-                rid.clone(),
-                authority.generation().effective.memory.event_recording_config(),
-            ));
-            terminal_usage = Some(Arc::clone(&usage));
-            task_execution_ctx.terminal_usage = Some(usage);
-            task_execution_ctx.operator_authority = Some(authority);
-        }
-        if ordinary_publication.is_some() {
-            let binding = task_execution_ctx
-                .provider_binding
-                .as_ref()
-                .context("ordinary task provider binding missing")?;
-            let caller = caller.as_ref().context("ordinary task caller missing")?;
-            let (authority, lifetime) = binding.issue_ordinary_task(
-                caller,
-                &task_result_scope,
-                task,
-                task_execution_ctx.input_receipt.as_deref(),
-                task_control.cancellation(),
-            )?;
-            task_control.retain_ordinary_lifetime(lifetime)?;
-            use crate::runtime::turn_source::TurnSourceProof;
-            let (proof, _) = authority.source()?;
-            let usage = Arc::new(crate::runtime::turn_terminal::TerminalUsageCollector::new_ordinary(
-                proof.workspace_id().to_owned(),
-                proof.owner_id().to_owned(),
-                rid.clone(),
-                authority
-                    .publication()
-                    .generation()
-                    .effective
-                    .memory
-                    .event_recording_config(),
-            ));
-            terminal_usage = Some(Arc::clone(&usage));
-            task_execution_ctx.terminal_usage = Some(usage);
-            task_execution_ctx.ordinary_authority = Some(authority);
-        }
-        let logical_terminal = {
-            use crate::agent::terminal::logical::LogicalTaskTerminalRef;
-            match (
-                task_execution_ctx.ordinary_authority.as_deref(),
-                task_execution_ctx.operator_authority.as_deref(),
-            ) {
-                (Some(authority), None) => LogicalTaskTerminalRef::ordinary(authority)?,
-                (None, Some(authority)) => LogicalTaskTerminalRef::operator(authority)?,
-                _ => anyhow::bail!("logical task completion requires one issued source authority"),
-            }
+            launch_security,
+            child_level,
+            spawn_config,
+            task,
+            process_memory_strategy,
+            spawn_scope,
+            parent_exec_ctx,
+            spawn_depth,
+            parent_run_id,
+            child_full,
+            inherited_channel_exclusions,
+            run_id,
+            session_scope_key,
+            selected_agent,
+            recipient,
+            run_channel_name,
+            operator_channel,
+            announce_result,
+            memory_fabric,
+            process_memory_backend,
+            resolved_provider_name,
+            resolved_model,
+            child_requested_model,
+            selected_route_hint,
+            route_source_provider,
+            child_credential,
+            route_credential,
+            route_uses_root_connection,
+            direct_uses_root_connection,
+            temperature_override,
+            resolved_temperature,
+            ordinary_binding,
+            spawn_scope_for_event,
+            run_lineage,
+            allowed_tools,
+            tools,
+            process_config_source,
+            source_receipt,
+            batch_id,
+            process_compaction_config,
+            parent_hooks,
         };
-        let run_cleanup = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
-        let run_cleanup_scope =
-            crate::runtime::turn_cleanup::CleanupScope::new(Some(&run_cleanup), CancellationToken::new())?;
-
-        // Deliberately the *last* fallible-free step before the driver task is
-        // spawned, and never earlier: everything between this block and
-        // `tokio::spawn` below is infallible, so the presence of a row in
-        // `active_runs` implies a driver task that will publish a terminal status
-        // for it. Registering before the fallible preparation above (agent prompt
-        // and tool resolution) left a `Running` row behind on every early return —
-        // no abort handle, no driver task, no observer — and `join` polls such a
-        // row forever, with no wall-clock fallback in this runtime to break the
-        // tie. Keep any new fallible step above this block.
-        //
-        // `abort_handle` is filled in right after `tokio::spawn` returns.
-        {
-            let mut runs = self.active_runs.write().await;
-            super::continuation::register(
-                &mut runs,
-                SubAgentRun {
-                    agent_partition: spawn_scope_for_event.agent_partition.clone(),
-                    id: run_id.clone(),
-                    task: task.to_string(),
-                    owner_id: run_lineage.owner_id.clone(),
-                    topic_id: run_lineage.topic_id.clone(),
-                    source_message_event_id: run_lineage.source_message_event_id.clone(),
-                    started_at: Utc::now(),
-                    finished_at: None,
-                    status: SubAgentStatus::Running,
-                    recipient: recipient.clone(),
-                    channel_name: run_channel_name.clone(),
-                    abort_handle: None,
-                    process_control: None,
-                    task_control: Some(Arc::clone(&task_control)),
-                    history: history_arc.clone(),
-                    steer_tx: Some(steer_tx.clone()),
-                    parent_run_id: parent_run_id.clone(),
-                    session_scope_key: session_scope_key.clone(),
-                    spawn_depth,
-                    // Recursive delegation status is issued by no parent (P2-G4).
-                    delegation: None,
-                    token_usage_records: Vec::new(),
-                    progress: Arc::clone(&task_progress),
-                    batch_id: batch_id.map(str::to_string),
-                },
-            )?;
+        if mode == "process" {
+            return self.launch_process_run(launch).await;
         }
-
-        // Registry row for this run. Parent captured on the spawning task, which
-        // is the enclosing turn (not the launching tool call, which is gone once
-        // it returns); a spawned task inherits no task-locals of its own.
-        let sub_agent_parent = crate::runtime::registry::current_owner_work_id();
-        let sub_agent_label = agent_label_for_registry.unwrap_or_else(|| "sub-agent".to_string());
-        let mut sub_agent_work =
-            crate::runtime::registry::register_sub_agent(&sub_agent_label, &rid, sub_agent_parent, batch_id, None);
-        let sub_agent_work_id = sub_agent_work.id();
-        sub_agent_work.require_cleanup_acknowledgement();
-        // As in the process branch: the control plane resolves `run_id` through
-        // the process-wide work registry, so the run's existing steer sender is
-        // published there. `active_runs` stays the tool-plane source of truth.
-        crate::runtime::registry::attach_steer_sender(sub_agent_work_id, steer_tx.clone());
-
-        let terminal_journal = Arc::new(task_terminal::TaskTerminalJournal::new(
-            task_memory_fabric.clone(),
-            task_result_scope.clone(),
-            logical_terminal,
-            true,
-            terminal_usage,
-        ));
-        let driver_terminal_journal = Arc::clone(&terminal_journal);
-        // Spawn async task (fire-and-forget); capture handle to support kill
-        let jh = crate::agent::channel_approval::spawn(crate::runtime::registry::scope_current(
-            sub_agent_work_id,
-            SPAWN_EXECUTION_CONTEXT.scope(task_execution_ctx, async move {
-                let _message_permit = message_permit;
-                let _message_input = message_input;
-                let _message_turn = message_turn;
-                tracing::info!(run_id = %rid, "Sub-agent task starting");
-                let provider_started_at = Utc::now();
-                let (run_on_delta, run_on_tool) = match run_event_streams {
-                    Some((delta_tx, tool_tx)) => (Some(delta_tx), Some(tool_tx)),
-                    None => (None, None),
-                };
-                // Construct the large child loop behind the existing allocation
-                // boundary before adding task-local temperature ownership.
-                let run_future = boxed_spawn_field(|| {
-                    run_sub_agent_task(
-                        &task_owned,
-                        provider,
-                        &provider_name,
-                        &model,
-                        temperature,
-                        filtered_tools,
-                        &system_prompt,
-                        security,
-                        steer_rx,
-                        history_arc,
-                        run_on_delta,
-                        run_on_tool,
-                        run_approval_resolver,
-                        restore_active_runs,
-                        restore_run_id,
-                        Arc::clone(&task_progress),
-                        parent_hooks,
-                    )
-                });
-                let result = run_cleanup_scope
-                    .run(crate::providers::model_settings::with_temperature(
-                        temperature_override,
-                        run_future,
-                    ))
-                    .await;
-                tracing::info!(run_id = %rid, success = result.is_ok(), "Sub-agent task finished");
-
-                let (status, result_text, terminal_status, history_projection, token_usage_records) = match result {
-                    Ok(task_result) => (
-                        SubAgentStatus::Completed(task_result.output.clone()),
-                        task_result.output.clone(),
-                        crate::agent::terminal::TurnTerminalStatus::Completed,
-                        Some(crate::agent::terminal::TurnHistoryProjection {
-                            assistant_content: task_result.output,
-                            history_commit_len: task_result.history_commit_len,
-                        }),
-                        task_result.segment_usage,
-                    ),
-                    Err(error) => {
-                        // Persist the same runtime-classified reason used by the
-                        // live registry. Recovery after commit must not lose the
-                        // quarantine tag on provider/tool-authored failure text.
-                        let reason = task_failure_reason(&error);
-                        let terminal_status = if matches!(termination_cause(&reason), TerminationCause::Killed) {
-                            crate::agent::terminal::TurnTerminalStatus::Cancelled
-                        } else {
-                            crate::agent::terminal::TurnTerminalStatus::Failed
-                        };
-                        (
-                            SubAgentStatus::Failed(reason.clone()),
-                            reason,
-                            terminal_status,
-                            None,
-                            Vec::new(),
-                        )
-                    }
-                };
-
-                let delivery_intent = recipient.as_ref().map_or_else(
-                    || crate::agent::terminal::TurnDeliveryIntent::Deferred {
-                        route: "sessions_registry".to_string(),
-                    },
-                    |target| crate::agent::terminal::TurnDeliveryIntent::Reply { target: target.clone() },
-                );
-                match driver_terminal_journal
-                    .commit(crate::agent::terminal::TurnTerminalDraft {
-                        binding: None,
-                        terminal_id: rid.clone(),
-                        scope: task_result_scope.clone(),
-                        status: terminal_status,
-                        history: history_projection,
-                        history_scope: None,
-                        provider_outcome: None,
-                        telemetry: crate::agent::terminal::TurnTerminalTelemetry {
-                            summary: result_text.clone(),
-                            started_at: provider_started_at,
-                            finished_at: Utc::now(),
-                        },
-                        delivery_intent,
-                    })
-                    .await
-                {
-                    Ok(_) => {}
-                    Err(error) => {
-                        tracing::error!(run_id = %rid, error = %error, "task terminal persistence remains unconfirmed");
-                        // The external observer retries this exact proposal.
-                        // Do not publish a result or a substitute usage receipt.
-                        return;
-                    }
-                }
-                let announce = format_announce_message(&rid, &status, &result_text);
-                record_spawn_result_event(
-                    Some(&task_memory_fabric),
-                    task_result_scope,
-                    &result_text,
-                    &status,
-                    &task_lineage,
-                    None,
-                )
-                .await;
-
-                // Update run status
-                {
-                    let mut runs = active_runs.write().await;
-                    if let Some(run) = runs.iter_mut().find(|r| r.id == rid) {
-                        run.finished_at = Some(Utc::now());
-                        run.status = status;
-                        run.token_usage_records.extend(token_usage_records);
-                        run.steer_tx = None; // drop sender — no more steering possible
-                    }
-                }
-
-                // Announce result back to channel if we have a recipient
-                if !announce_result {
-                    tracing::debug!(
-                        run_id = %rid,
-                        "Sub-agent result withheld from the channel (announce=false); \
-                         it is delivered to whoever joins this run's batch"
-                    );
-                } else if let Some(target) = recipient {
-                    // MUTATION GUARD: route this straight to `channel.send` and the
-                    // model-supplied `recipient` on the spawn call reaches the
-                    // channel with no authorization at all — the hole
-                    // `message_send`'s own outbound gate closes on its side.
-                    deliver_or_withhold_notice(
-                        &announce_security,
-                        announce_origin.as_ref(),
-                        channel.as_ref(),
-                        &announce_history,
-                        &rid,
-                        &target,
-                        &announce,
-                        OutboundNotice::RunResult,
-                    )
-                    .await;
-                } else {
-                    tracing::warn!(
-                        run_id = %rid,
-                        "Sub-agent completed but no recipient configured for announcement"
-                    );
-                }
-            }),
-        ));
-
-        // Install the external owner before the first suspension after spawn.
-        let abort_handle = jh.abort_handle();
-        task_control.attach(abort_handle.clone());
-        crate::runtime::registry::attach_abort_handle(sub_agent_work_id, abort_handle.clone());
-        watch_task_mode_monitor(
-            jh,
-            self.active_runs.clone(),
-            run_id.clone(),
-            Some(run_cleanup),
-            Some(task_control),
-            Some(sub_agent_work),
-            Some(terminal_journal),
-        );
-        {
-            let mut runs = self.active_runs.write().await;
-            if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
-                run.abort_handle = Some(abort_handle);
-            }
-        }
-
-        Ok(SpawnOutcome::started(
-            run_id.clone(),
-            spawn_started_text("Sub-agent spawned", &run_id, child_delegation, announce_result),
-        ))
+        self.launch_task_run(launch).await
     }
 }
 
@@ -1980,7 +948,7 @@ fn requested_agent_name(args: &serde_json::Value) -> Option<&str> {
 
 /// `policy` at the level of the run that sends an announcement: the gate
 /// applies the outbound scope at that run's level.
-fn policy_at_level(
+pub(super) fn policy_at_level(
     policy: &Arc<crate::security::SecurityPolicy>,
     level: crate::security::AutonomyLevel,
 ) -> Arc<crate::security::SecurityPolicy> {

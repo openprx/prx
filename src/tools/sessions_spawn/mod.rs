@@ -37,7 +37,9 @@ mod provider;
 mod requested_stop;
 mod unrequested_exit;
 mod scope;
+mod process_launch;
 mod spawn;
+mod task_launch;
 mod task_mode;
 #[cfg(test)]
 pub(crate) use task_mode::configure_operator_child_approval;
