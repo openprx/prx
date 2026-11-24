@@ -132,6 +132,13 @@ fn pending_roots(
     Ok(roots)
 }
 
+tokio::task_local! { static WOKEN_TURN: (); }
+
+/// True only inside the turn this module drives for an adopted mailbox message.
+pub(super) fn is_woken_turn() -> bool {
+    WOKEN_TURN.try_with(|()| ()).is_ok()
+}
+
 async fn run(
     state: AppState,
     mut envelope: RuntimeEnvelope,
@@ -203,11 +210,15 @@ async fn run(
         guard,
         owner_authenticated: false,
     };
-    crate::gateway::jobs::scope_cancellation(
-        cancellation,
-        run_console_message_job_work(turn_runtime, state, input.text.clone(), turns, source, target),
-    )
-    .await
+    WOKEN_TURN
+        .scope(
+            (),
+            crate::gateway::jobs::scope_cancellation(
+                cancellation,
+                run_console_message_job_work(turn_runtime, state, input.text.clone(), turns, source, target),
+            ),
+        )
+        .await
     .map_err(anyhow::Error::msg)?;
     drop(input);
     Ok(())

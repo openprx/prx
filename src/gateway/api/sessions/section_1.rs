@@ -926,7 +926,13 @@ async fn run_console_runtime_turn(
                         .with_dispatch_origin(crate::tools::DispatchOrigin::ModelTurn);
                     context.live_turn = live
                         .as_ref()
-                        .map(|live| crate::agent::live_frames::LiveTurnRef(std::sync::Arc::clone(live)));
+                        .map(|live| crate::agent::live_frames::LiveTurnRef(std::sync::Arc::clone(live)))
+                        // A message-woken turn with no approval surface refuses a call
+                        // that needs approval at once: no pending row nobody can act on.
+                        .or_else(|| {
+                            (target.is_none() && mailbox::is_woken_turn())
+                                .then(crate::runtime::mailbox_child::no_surface)
+                        });
                     if target.is_some() && live.is_none() {
                         // Until MA-04 a targeted call that needs approval ends
                         // denied: no durable ledger route, no pending decision.
