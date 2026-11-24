@@ -67,7 +67,7 @@ use crate::agent::tool_evidence::{claims_tool_evidence, strip_model_written_tool
 #[cfg(test)]
 use crate::agent::tool_result_recording::INTERRUPTED_TOOL_RESULT;
 use crate::agent::tool_result_recording::{
-    ExecutedToolRecords, MAX_TOOL_RESULT_INLINE_CHARS, ToolResultRecorder, compact_tool_result_for_history_with_status,
+    ExecutedToolRecords, ToolResultRecorder, compact_tool_result_for_history_with_status,
     tool_result_inline_budget_for_history,
 };
 use crate::agent::tool_scheduler::{
@@ -2249,20 +2249,18 @@ async fn run_turn_unguarded(
             }
 
             // P0-8: Keep history bounded and persist oversized outputs in the
-            // document layer when a runtime document sink is available.
-            let document_status = persist_tool_output_document(
-                document_ingest.as_ref(),
-                &call.name,
-                result,
-                MAX_TOOL_RESULT_INLINE_CHARS,
-            )
-            .await
-            .unwrap_or("pending_document_backend");
+            // document layer when a runtime document sink is available. The
+            // storage threshold is the same budget the history cut uses, so a
+            // result is stored exactly when it is cut.
+            let max_inline_chars =
+                tool_result_inline_budget_for_history(&call.name, executed.history(), reserved_config.as_ref());
+            let document_status =
+                persist_tool_output_document(document_ingest.as_ref(), &call.name, result, max_inline_chars)
+                    .await
+                    .unwrap_or("pending_document_backend");
             // FIX-P2-02: record the status so the native-history branch can reuse
             // it without persisting the same document a second time.
             document_statuses.push(document_status);
-            let max_inline_chars =
-                tool_result_inline_budget_for_history(&call.name, executed.history(), reserved_config.as_ref());
             let truncated_result =
                 compact_tool_result_for_history_with_status(&call.name, result, max_inline_chars, document_status);
             let _ = writeln!(

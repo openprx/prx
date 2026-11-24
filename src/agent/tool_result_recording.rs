@@ -73,6 +73,9 @@ pub(crate) fn tool_result_inline_budget_for_history(
     token_derived_chars.max(MIN_TOOL_RESULT_INLINE_CHARS).min(absolute_cap)
 }
 
+/// Status `persist_tool_output_document` reports for a stored document.
+const PERSISTED_DOCUMENT_STATUS: &str = "persisted_document_backend";
+
 /// Compact a large tool result before inserting it into LLM history.
 ///
 /// This is the Phase-0 document-ingest spike: the full document backend is not
@@ -97,6 +100,14 @@ pub(super) fn compact_tool_result_for_history_with_status(
         .last()
         .unwrap_or(0);
     let preview = &content[..boundary];
+    // A reference is written only for a document that was stored. Without a
+    // stored copy the cut is stated plainly and nothing points at a document.
+    if status != PERSISTED_DOCUMENT_STATUS {
+        return format!(
+            "{preview}\n\n[output truncated: {boundary} of {} bytes shown; the full output was not stored]",
+            content.len()
+        );
+    }
     let (document_id, sha256) = tool_output_document_id(tool_name, content);
     let chunk_count = crate::memory::chunker::chunk_markdown(content, TOOL_OUTPUT_DOCUMENT_CHUNK_TOKENS)
         .len()

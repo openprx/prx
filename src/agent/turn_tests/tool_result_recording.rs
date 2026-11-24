@@ -59,7 +59,7 @@ fn compact_tool_result_for_history_emits_document_reference_for_large_output() {
         "shell",
         &content,
         MAX_TOOL_RESULT_INLINE_CHARS,
-        "pending_document_backend",
+        "persisted_document_backend",
     );
 
     assert!(compacted.len() < content.len() + 512);
@@ -67,7 +67,7 @@ fn compact_tool_result_for_history_emits_document_reference_for_large_output() {
     assert!(compacted.contains("document_id: tool-output:shell:"));
     assert!(compacted.contains("source: tool_output"));
     assert!(compacted.contains("vector_anchor: vector://tool-output:shell:"));
-    assert!(compacted.contains("status: pending_document_backend"));
+    assert!(compacted.contains("status: persisted_document_backend"));
     assert!(compacted.contains(&format!("inline_preview_bytes: {MAX_TOOL_RESULT_INLINE_CHARS}")));
 }
 

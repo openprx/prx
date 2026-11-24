@@ -11,6 +11,7 @@
 )]
 
 use super::*;
+use crate::agent::tool_result_recording::MAX_TOOL_RESULT_INLINE_CHARS;
 
 #[tokio::test]
 async fn run_tool_call_loop_executes_read_only_tools_with_bounded_parallelism() {

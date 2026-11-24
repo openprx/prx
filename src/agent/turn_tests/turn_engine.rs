@@ -10,6 +10,7 @@
     clippy::unreadable_literal
 )]
 use super::*;
+use crate::agent::tool_result_recording::MAX_TOOL_RESULT_INLINE_CHARS;
 use crate::agent::turn_tests::{
     CONTEXT_BUDGET_FIXTURE_RESERVE_TOKENS, DelayTool, NativeScriptedProvider, RecordingTool, RefreshCountingTool,
     ScriptedProvider, SystemSummaryProvider, WIDE_SCHEMA_TOOL_BODY_MARKER, WideSchemaTool, business_tool_specs_of,
