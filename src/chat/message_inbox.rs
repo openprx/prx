@@ -191,7 +191,8 @@ pub(super) async fn send_command(
             .into_iter()
             .find(|record| record.session_key == source_session && record.parent_session == parent)
             .ok_or_else(|| anyhow::anyhow!("child_session_unknown"))?;
-        record.level.min(
+        crate::security::agent_level::live_wins_to_full(
+            record.level,
             crate::security::agent_level::named_child_level(config, Some(&record.agent), config.autonomy.level)
                 .unwrap_or(config.autonomy.level),
         )

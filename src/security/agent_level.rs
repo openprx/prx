@@ -137,7 +137,7 @@ pub fn scheduled_agent_refusal(
 /// - Named-agent work uses that agent's own live level.
 /// - Non-agent work the local operator created keeps Main's live level.
 /// - Otherwise the stored creator level, lowered to the creator's current
-///   level. A row with no recorded creator runs at Main's level; a creator
+///   level, except that a creator whose live level is `Full` runs at `Full`. A row with no recorded creator runs at Main's level; a creator
 ///   with an unreadable spelling is capped at `Supervised`. A named creator
 ///   that is gone fails the run.
 /// - A run started from a tool call is lowered to that call's level.
@@ -158,13 +158,26 @@ pub fn scheduled_level(
     } else {
         match (creator.level, creator.agent.as_deref()) {
             (Some(stored), Some(agent)) => match creator_current_level(agent, config) {
-                Some(current) => stored.min(current?),
+                Some(current) => live_wins_to_full(stored, current?),
                 None => AutonomyLevel::Supervised.min(main),
             },
             _ => main,
         }
     };
     Ok(caller.map_or(base, |caller| base.min(caller)))
+}
+
+/// The stored creator level combined with the creator's live level: a live
+/// `Full` runs at `Full` whatever was stored (the live level wins upward),
+/// otherwise the lower of the two applies, so lowering the level still lowers
+/// work created earlier at a higher one.
+#[must_use]
+pub fn live_wins_to_full(stored: AutonomyLevel, live: AutonomyLevel) -> AutonomyLevel {
+    if live == AutonomyLevel::Full {
+        AutonomyLevel::Full
+    } else {
+        stored.min(live)
+    }
 }
 
 /// `None` when `agent` is not a creator spelling (the stamp is unreadable).

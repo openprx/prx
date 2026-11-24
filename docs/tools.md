@@ -1476,6 +1476,9 @@ as before. The Full autonomy sentence is rendered once for Full children.
 A Full spawning turn starts every child at Full, including a named agent whose
 configured level is lower. Below Full, an unnamed child keeps its parent's
 level and a named child uses its configured level (or Main's when unset).
+A restored child and a cron or Xin job created earlier run at Full whenever the live
+level is Full, whatever level was stored at creation; below Full the lower of the stored
+and the live level still applies.
 The default child model and provider come from the spawning turn's current
 selection, including terminal switches. Explicit request overrides take priority;
 a named agent's model and provider apply only when that agent is requested.

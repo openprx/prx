@@ -100,7 +100,7 @@ impl MailboxChildSource {
         };
         let now = crate::security::agent_level::named_child_level(config, Some(&record.agent), root_level)
             .unwrap_or(root_level);
-        let level = record.level.min(now);
+        let level = crate::security::agent_level::live_wins_to_full(record.level, now);
         let retained = Arc::clone(parent);
         let configured = current.clone();
         let agent = record.agent.clone();
