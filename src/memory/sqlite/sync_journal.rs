@@ -308,7 +308,17 @@ pub(super) fn event_written(conn: &Connection, event: &crate::memory::MessageEve
             "cancelled" => Some("turn.cancelled"),
             _ => Some("turn.failed"),
         };
-        if let Some(kind) = kind {
+        // A turn the parent already closed after its writer died keeps that
+        // terminal; the real marker adds none.
+        let closed: bool = match &h.run_id {
+            Some(run) => conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sync_journal WHERE event_id=?1)",
+                [super::sync_lifecycle::open_terminal_id(run)],
+                |r| r.get(0),
+            )?,
+            None => false,
+        };
+        if let Some(kind) = kind.filter(|_| !closed) {
             h.kind = kind.into();
             h.event_id = format!("terminal:{}", event.event_id);
             append(conn, &h)?;

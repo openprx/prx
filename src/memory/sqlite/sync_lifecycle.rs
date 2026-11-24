@@ -34,6 +34,14 @@ pub(super) fn memory_written(conn: &Connection, event: &MemoryEvent) -> anyhow::
     h.source_ref = format!("memory:{}", event.event_id);
     h.event_id = format!("child:{}", event.event_id);
     h.timestamp = event.created_at.clone();
+    if matches!(event.event_type.as_str(), "task.cancelled" | "task.failed") {
+        let kind = if event.event_type == "task.cancelled" {
+            "turn.cancelled"
+        } else {
+            "turn.failed"
+        };
+        close_open_turns(conn, event, &source, kind)?;
+    }
     // A child run ends once for clients: a terminal already projected from the
     // run's own turn terminal keeps the slot.
     if event.event_type == "task.spawned" || !terminal_upsert_exists(conn, &h.owner, run)? {
@@ -42,6 +50,56 @@ pub(super) fn memory_written(conn: &Connection, event: &MemoryEvent) -> anyhow::
     if event.event_type == "task.spawned" {
         h.kind = "turn.started".into();
         h.event_id = format!("child-turn:{}", event.event_id);
+        append(conn, &h)?;
+    }
+    Ok(())
+}
+
+/// The journal id of the terminal written for a turn that its own writer never
+/// finished. A turn terminal projected later from the real marker is dropped
+/// when this one exists.
+pub(super) fn open_terminal_id(run: &str) -> String {
+    format!("terminal:open:{run}")
+}
+
+/// A child whose run ended as cancelled or failed may leave its own turn and
+/// its segment turns without a terminal: the worker that would have written
+/// it was killed or died. The parent has settled the run, so each such turn
+/// ends here, once, with the settlement's kind. A turn that already has its
+/// marker keeps it, and the id is fixed per run so a replay adds nothing.
+fn close_open_turns(conn: &Connection, event: &MemoryEvent, source: &str, kind: &str) -> anyhow::Result<()> {
+    let mut firsts = vec![source.to_owned()];
+    let mut query = conn.prepare(
+        "SELECT e.event_id FROM message_events e
+         WHERE e.workspace_id=?1 AND e.owner_id=?2
+           AND e.session_key=(SELECT s.session_key FROM message_events s WHERE s.event_id=?3)
+           AND (e.run_id LIKE 'child-segment:%' OR e.run_id LIKE 'operator-worker-segment:%')
+           AND e.id=(SELECT MIN(x.id) FROM message_events x WHERE x.workspace_id=e.workspace_id AND x.owner_id=e.owner_id AND x.run_id=e.run_id)
+         ORDER BY e.id",
+    )?;
+    for row in query.query_map(params![event.workspace_id, event.owner_id, source], |r| {
+        r.get::<_, String>(0)
+    })? {
+        firsts.push(row?);
+    }
+    for first in firsts {
+        let Some(mut h) = event_header(conn, &first, kind)? else {
+            continue;
+        };
+        let Some(run) = h.run_id.clone() else {
+            continue;
+        };
+        let finished: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM message_events WHERE workspace_id=?1 AND owner_id=?2 AND run_id=?3
+                AND event_type IN ('turn.finalized','turn.admission.failed'))",
+            params![event.workspace_id, h.owner, run],
+            |r| r.get(0),
+        )?;
+        if finished {
+            continue;
+        }
+        h.event_id = open_terminal_id(&run);
+        h.timestamp = event.created_at.clone();
         append(conn, &h)?;
     }
     Ok(())
