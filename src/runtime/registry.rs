@@ -349,6 +349,30 @@ pub fn current_work_id() -> Option<WorkId> {
     CURRENT_WORK.try_with(|id| *id).ok()
 }
 
+/// The nearest enclosing work item that is not a tool call.
+///
+/// A run that outlives the tool call that launched it must not hang off that
+/// call: the row is deregistered when the call returns, which cuts the run out
+/// of the lineage a cascading kill of the turn walks. Parenting it to the
+/// enclosing turn (or sub-agent) keeps the run reachable for as long as that
+/// owner is registered.
+#[must_use]
+pub fn current_owner_work_id() -> Option<WorkId> {
+    let mut id = current_work_id()?;
+    loop {
+        let Some(slot) = REGISTRY.get(id.raw()) else {
+            return Some(id);
+        };
+        if slot.kind != WorkKind::ToolCall {
+            return Some(id);
+        }
+        match slot.parent {
+            Some(parent) => id = WorkId(parent),
+            None => return Some(id),
+        }
+    }
+}
+
 /// RAII registration. Dropping it deregisters the work item.
 ///
 /// Deregistration lives in `Drop` rather than at a call site on purpose: a

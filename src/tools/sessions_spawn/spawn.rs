@@ -1046,7 +1046,10 @@ impl SessionsSpawnTool {
             // same owner to stop. A cascade additionally signals the worker's
             // process group through the child row `run_sub_agent_process`
             // registers underneath.
-            let sub_agent_parent = crate::runtime::registry::current_work_id();
+            // Parented to the enclosing turn, not the launching tool call: that row
+            // is gone once the call returns, which would cut this run out of a
+            // cascading cancel of the root.
+            let sub_agent_parent = crate::runtime::registry::current_owner_work_id();
             let sub_agent_label = process_agent_id
                 .clone()
                 .unwrap_or_else(|| "sub-agent (process)".to_string());
@@ -1755,9 +1758,9 @@ impl SessionsSpawnTool {
         }
 
         // Registry row for this run. Parent captured on the spawning task, which
-        // is the tool call that requested the spawn; a spawned task inherits no
-        // task-locals of its own.
-        let sub_agent_parent = crate::runtime::registry::current_work_id();
+        // is the enclosing turn (not the launching tool call, which is gone once
+        // it returns); a spawned task inherits no task-locals of its own.
+        let sub_agent_parent = crate::runtime::registry::current_owner_work_id();
         let sub_agent_label = agent_label_for_registry.unwrap_or_else(|| "sub-agent".to_string());
         let mut sub_agent_work =
             crate::runtime::registry::register_sub_agent(&sub_agent_label, &rid, sub_agent_parent, batch_id, None);
