@@ -364,7 +364,7 @@ pub struct AutonomyConfig {
     pub max_cost_per_day_cents: Option<u32>,
 
     /// Operator acknowledgement for an intentionally unrestricted profile.
-    /// This suppresses doctor noise only; it does not alter policy behavior.
+    /// Retained for existing configs; it no longer changes any output or policy behavior.
     #[serde(default)]
     pub acknowledge_unrestricted_profile: bool,
 

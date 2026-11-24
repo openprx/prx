@@ -1,16 +1,13 @@
 fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "config";
 
-    if !config.autonomy.acknowledge_unrestricted_profile
-        && !config.autonomy.workspace_only
-        && config.autonomy.forbidden_paths.is_empty()
-        && config.autonomy.effective_max_cost_per_day_cents() == u32::MAX
-    {
-        items.push(DiagItem::warn(
-            cat,
-            "explicit unrestricted autonomy profile: host-wide paths and an unbounded cost ceiling",
-        ));
-    }
+    // A neutral statement of the active level; limits being absent is the
+    // default and never a warning. `acknowledge_unrestricted_profile` is kept
+    // for existing configs and no longer changes any output.
+    items.push(DiagItem::configured(
+        cat,
+        format!("autonomy level: {:?}", config.autonomy.level),
+    ));
 
     // Config file exists
     if config.config_path.exists() {

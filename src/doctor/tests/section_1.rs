@@ -716,7 +716,7 @@
     }
 
     #[test]
-    fn config_validation_warns_for_explicit_unrestricted_autonomy() {
+    fn config_validation_does_not_warn_for_explicit_unrestricted_autonomy() {
         let mut config = Config::default();
         config.autonomy.workspace_only = false;
         config.autonomy.forbidden_paths.clear();
@@ -725,11 +725,11 @@
 
         check_config_semantics(&config, &mut items);
 
-        let item = items
-            .iter()
-            .find(|item| item.message.contains("explicit unrestricted autonomy profile"))
-            .expect("unrestricted posture warning");
-        assert_eq!(item.severity, Severity::Warn);
+        assert!(
+            !items
+                .iter()
+                .any(|item| item.message.contains("unrestricted autonomy profile"))
+        );
     }
 
     #[test]

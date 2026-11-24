@@ -156,7 +156,7 @@ and the module-gate family are absorbed on load; they are not live switches.
 | `[security]` | `workspace_hooks` omitted when off |
 | `[compliance.interaction_notice]` | `version = "1"`; default notice text; `applicability = "required"`; `exception_owner`/`exception_reviewed_at` unset |
 | `[compliance.eu_ai_act]` | classification `status = "unclassified"`; `owner`/`assessed_at` unset; `incident_store_path` unset; declaration fields all optional/empty |
-| `[tool_tiering]` | `always_include = []`; `always_exclude = []`; `channel_exclude` the operations/development set |
+| `[tool_tiering]` | `always_include = []`; `always_exclude = []`; `channel_exclude = []` (nothing hidden from channel sessions) |
 | `[providers]` | `[providers.ollama] num_ctx` unset. `[[providers.tool_dialects]]`: `provider` required; `model` unset (all models); `tool_schema`/`tool_call` unset (`raw` / `native`). `[[providers.models]]`: `provider` required; `model` unset; `operations`, `native_tools`, `vision_input`, `streaming`, `structured_output`, `tool_schema_dialect`, `tool_call_dialect`, `context_window` all unset. See later sections |
 | `[model_settings.<id>]` | catalog levels and explicit parameters; omitted keys stay with the catalog |
 
@@ -718,14 +718,15 @@ low_priority_tools = ["sessions_spawn", "delegate"]
 # Per-turn capability policy. The surface owner applies these filters (they are
 # not owned by the decision engine). `always_include` prefers direct publication;
 # `always_exclude` removes names from the surface. `channel_exclude` applies to IM
-# channel sessions only (Signal / Telegram / Discord / WhatsApp / …) and defaults
-# to the operations/development surface: wasm_plugins_manage, wasm_plugin_reload,
+# channel sessions only (Signal / Telegram / Discord / WhatsApp / …) and is empty
+# by default, so nothing is hidden. To hide the operations/development surface on
+# channels list its names, for example: wasm_plugins_manage, wasm_plugin_reload,
 # wasm_plugins_status, hooks_manage, hooks_status, proxy_config, config_reload,
 # gateway, mcp_status, nodes, skills_manage, memory_reindex,
 # document_sync, document_ingest. Terminal chat, the gateway and the console are
-# unaffected. Name a tool in `always_include` to put it back on channels, or set
-# `channel_exclude = []` to drop the default entirely. `always_include` does not
-# override `always_exclude`: a name in `always_exclude` is excluded everywhere.
+# unaffected. Name a tool in `always_include` to put it back on channels.
+# `always_include` does not override `always_exclude`: a name in `always_exclude`
+# is excluded everywhere.
 [tool_tiering]
 always_include = []
 always_exclude = []
@@ -912,10 +913,11 @@ refuses every priced turn). The signed child manifest carries "no ceiling" as
 `u32::MAX` cents (4294967295, the same value the key accepts). Spend is still
 recorded in the cost journal. With no limit set, no budget warning or
 "budget exhausted" notice is produced. A host-wide profile is explicit: set
-`workspace_only = false` and clear `forbidden_paths`. `prx doctor` warns when
-those two are active together with no cost ceiling unless
-`acknowledge_unrestricted_profile = true`; the flag only silences that warning.
-There is no hourly action cap.
+`workspace_only = false` and clear `forbidden_paths`; at level `full` the file
+tools and shell ignore both keys anyway. `prx doctor` prints one neutral line
+with the active autonomy level and never warns about absent limits.
+`acknowledge_unrestricted_profile` is kept so existing configs still load and
+no longer changes any output. There is no hourly action cap.
 
 ### Decision admission and autonomy
 

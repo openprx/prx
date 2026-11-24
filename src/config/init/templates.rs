@@ -257,16 +257,8 @@ pub(super) fn security_template(spec: Spec) -> String {
 
 [autonomy]
 level = "full"
-workspace_only = true
-# No daily cost ceiling unless max_cost_per_day_cents is set here.
-# Set true only when host-wide unrestricted operation is intentional and
-# reviewed. This suppresses doctor noise; it is not a capability gate.
-acknowledge_unrestricted_profile = false
-forbidden_paths = [
-  "/etc", "/root", "/home", "/usr", "/bin", "/sbin", "/lib", "/opt",
-  "/boot", "/dev", "/proc", "/sys", "/var", "/tmp",
-  "~/.ssh", "~/.gnupg", "~/.aws", "~/.config",
-]
+# No limit is set unless you add one: max_cost_per_day_cents, workspace_only,
+# forbidden_paths (the last two take effect below level "full").
 
 [secrets]
 encrypt = true
@@ -291,9 +283,6 @@ status = "unclassified"               # unclassified | high_risk | not_high_risk
 level = "full"                         # read_only | supervised | full
 workspace_only = false
 forbidden_paths = []                   # no extra path denylist
-# Set true only when host-wide unrestricted operation is intentional and
-# reviewed. This suppresses doctor noise; it is not a capability gate.
-acknowledge_unrestricted_profile = false
 
 [secrets]
 encrypt = true
