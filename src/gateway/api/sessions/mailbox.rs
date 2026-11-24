@@ -93,10 +93,12 @@ pub(in crate::gateway) async fn recover_startup(state: &AppState) {
 
 /// The isolation the owner's next submission to this session would get,
 /// from the current pairing and config. It evaluates the submission's own
-/// rule ([`console_owner_isolated`]) with an owner-authenticated flag that is
-/// true only when pairing is required, a paired token remains and the owner is
-/// the install owner. Any failure (target unresolved, runtime not admitted)
-/// yields isolation.
+/// rule ([`console_owner_isolated`]) with the same inputs: an
+/// owner-authenticated flag that is true only when pairing is required, a
+/// paired token remains and the owner is the install owner, the target's
+/// level and the controlled flag. An unauthenticated owner is isolated unless
+/// the target runs at `Full`, exactly as on submission. Any failure (target
+/// unresolved, runtime not admitted) yields isolation.
 fn startup_owner_isolated(state: &AppState, owner: &str, partition: &crate::memory::AgentPartition) -> bool {
     let owner_authenticated = state.pairing.require_pairing()
         && state.pairing.is_paired()
@@ -104,9 +106,6 @@ fn startup_owner_isolated(state: &AppState, owner: &str, partition: &crate::memo
             .pairing
             .install_owner()
             .is_some_and(|install| install.as_str() == owner);
-    if !owner_authenticated {
-        return true;
-    }
     let Ok(runtime) = state.admit_turn_runtime() else {
         return true;
     };
