@@ -826,7 +826,7 @@ async fn run_console_runtime_turn(
     .await;
     // What is put around the message is stored beside it and replayed on later
     // turns, so the message keeps its bytes. It is stored (and sent) masked.
-    let attachment = crate::agent::tool_replay::Attachment {
+    let attachment = crate::context::transcript::Attachment {
         prefix: crate::security::redaction::redact_secrets(&mem_context.preamble),
         tail: crate::agent::turn_contracts::current_time_tail(),
     };
@@ -834,7 +834,7 @@ async fn run_console_runtime_turn(
     let replay_fabric = MemoryFabric::new(state.mem.clone(), turn_envelope.workspace_id.clone())
         .with_event_recording(config_snapshot.memory.event_recording_config());
     if let Some(user_event_id) = turn_envelope.source_message_event_id.as_deref() {
-        crate::agent::tool_replay::record_attachment(
+        crate::context::transcript::append_attachment(
             &replay_fabric,
             turn_envelope.message_scope(),
             user_event_id,
@@ -842,7 +842,7 @@ async fn run_console_runtime_turn(
         )
         .await;
     }
-    let replay_log = crate::agent::tool_replay::ReplayLog::load(state.mem.as_ref(), &turn_envelope.memory_principal()).await;
+    let transcript = crate::context::transcript::Transcript::new(state.mem.as_ref(), turn_envelope.memory_principal());
 
     // OQ-23 / R5: budget on the *effective* window of the model this turn
     // serves (the operator/discovery/catalog model limits and
@@ -860,7 +860,7 @@ async fn run_console_runtime_turn(
     // when the request would be over budget. The stored event of each history
     // message, index for index: none for the system prompt or a tool message,
     // each stored turn's event, then the request's own event.
-    let mut replayed = replay_log.expand_turns(previous_turns);
+    let mut replayed = transcript.expand_turns(previous_turns).await;
     let stubbed = replayed.fit(&system_message, &request_message, &effective_compaction.config);
     if stubbed > 0 {
         tracing::info!(stubbed, "oldest replayed tool results were replaced by stubs to fit the request");

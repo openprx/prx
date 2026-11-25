@@ -5,9 +5,9 @@
 //! stream never carries them:
 //!
 //! - `tool.call.recorded` / `tool.result.recorded` (see
-//!   [`crate::agent::tool_event_recording`]): every call and result of a turn,
+//!   [`super::tool_rows`]): every call and result of a turn,
 //!   paired by run, round and call id.
-//! - `message.attachment.recorded` (written by [`record_attachment`]): the text
+//! - `message.attachment.recorded` (written by [`super::tool_rows::append_attachment`]): the text
 //!   put before and after a user message when it was sent (recalled memory and
 //!   the date line), so a later turn replays the message with the same bytes.
 //!
@@ -20,19 +20,14 @@
 //!
 //! When the request would be over its budget, the oldest replayed results are
 //! replaced by a one-line stub before anything else gives way
-//! ([`ReplayedTurns::fit`]). The stored rows are never touched.
+//! ([`History::fit`]). The stored rows are never touched.
 
+use super::tool_rows::{ATTACHMENT_EVENT_TYPE, TOOL_CALL_EVENT_TYPE, TOOL_RESULT_EVENT_TYPE};
 use crate::agent::context_budget::{PRE_TURN_FLUSH_THRESHOLD, estimate_history_tokens, plan_context_budget};
 use crate::agent::history::build_native_assistant_history;
-use crate::agent::tool_event_recording::{TOOL_CALL_EVENT_TYPE, TOOL_RESULT_EVENT_TYPE};
-use crate::memory::{
-    ConversationTurn, MemoryFabric, MemoryPrincipal, MessageEvent, MessageEventScope, SessionContextQuery,
-};
+use crate::memory::{ConversationTurn, MemoryPrincipal, MessageEvent, SessionContextQuery};
 use crate::providers::{ChatMessage, ToolCall};
 use std::collections::{BTreeMap, HashMap, HashSet};
-
-/// Event type of the row that stores a user message's attachment.
-pub(crate) const ATTACHMENT_EVENT_TYPE: &str = "message.attachment.recorded";
 
 /// Rows read per query (the store's own page cap).
 const REPLAY_ROW_LIMIT: usize = 500;
@@ -104,7 +99,13 @@ fn text(value: &serde_json::Value, key: &str) -> Option<String> {
 fn wire_id(call_id: &str) -> String {
     let id: String = call_id
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     if id.is_empty() { "call".to_owned() } else { id }
 }
@@ -112,13 +113,13 @@ fn wire_id(call_id: &str) -> String {
 impl ReplayLog {
     /// Read the session's tool, attachment and message rows. A read that fails
     /// leaves the log empty, so the turn replays as it did before these rows.
-    pub(crate) async fn load(mem: &dyn crate::memory::Memory, principal: &MemoryPrincipal) -> Self {
+    pub(super) async fn load(mem: &dyn crate::memory::Memory, principal: &MemoryPrincipal) -> Self {
         Self::load_rows(mem, principal, true).await
     }
 
     /// As [`Self::load`] without the user and assistant rows: enough to build
     /// [`Self::replay_of_run`].
-    pub(crate) async fn load_tool_rows(mem: &dyn crate::memory::Memory, principal: &MemoryPrincipal) -> Self {
+    pub(super) async fn load_tool_rows(mem: &dyn crate::memory::Memory, principal: &MemoryPrincipal) -> Self {
         Self::load_rows(mem, principal, false).await
     }
 
@@ -264,8 +265,8 @@ impl ReplayLog {
     /// its stored attachment, each assistant reply preceded by the tool rounds
     /// of its run. Event ids line up with the messages, `None` for a replayed
     /// tool message.
-    pub(crate) fn expand_turns(&self, turns: Vec<ConversationTurn>) -> ReplayedTurns {
-        let mut out = ReplayedTurns::default();
+    pub(crate) fn expand_turns(&self, turns: Vec<ConversationTurn>) -> History {
+        let mut out = History::default();
         let mut replayed_runs: HashSet<&str> = HashSet::new();
         for turn in turns {
             let event_id = turn.message_event_id.clone();
@@ -276,7 +277,10 @@ impl ReplayLog {
             {
                 out.push_replay(&replay);
             }
-            let content = match (turn.role.as_str(), event_id.as_deref().and_then(|id| self.attachments.get(id))) {
+            let content = match (
+                turn.role.as_str(),
+                event_id.as_deref().and_then(|id| self.attachments.get(id)),
+            ) {
                 ("user", Some(attachment)) => format!("{}{}{}", attachment.prefix, turn.content, attachment.tail),
                 _ => turn.content,
             };
@@ -318,7 +322,7 @@ impl Eq for TurnReplay {}
 
 /// The turns of a session as history messages, with their tool rounds.
 #[derive(Debug, Default)]
-pub(crate) struct ReplayedTurns {
+pub(crate) struct History {
     pub messages: Vec<ChatMessage>,
     /// The stored event of each message, index for index.
     pub event_ids: Vec<Option<String>>,
@@ -364,7 +368,7 @@ impl TurnReplay {
     }
 }
 
-impl ReplayedTurns {
+impl History {
     /// Append `replay` after the messages held so far.
     fn push_replay(&mut self, replay: &TurnReplay) {
         let base = self.messages.len();
@@ -423,7 +427,9 @@ fn fit_results(
         if excess == 0 {
             break;
         }
-        let Some(message) = messages.get_mut(result.index) else { continue };
+        let Some(message) = messages.get_mut(result.index) else {
+            continue;
+        };
         let stub = result_message(&result.wire_id, &stub_text(result));
         let saved = estimate_history_tokens(std::slice::from_ref(message))
             .saturating_sub(estimate_history_tokens(std::slice::from_ref(&stub)));
@@ -452,15 +458,20 @@ pub(crate) fn stub_replayed_results(
     let mut cursor = 0;
     for replay in replays {
         for result in &replay.results {
-            let Some(original) = replay.messages.get(result.index) else { continue };
-            let Some(offset) = view
-                .get(cursor..)
-                .and_then(|rest| rest.iter().position(|m| m.role == "tool" && m.content == original.content))
-            else {
+            let Some(original) = replay.messages.get(result.index) else {
+                continue;
+            };
+            let Some(offset) = view.get(cursor..).and_then(|rest| {
+                rest.iter()
+                    .position(|m| m.role == "tool" && m.content == original.content)
+            }) else {
                 continue;
             };
             let index = cursor.saturating_add(offset);
-            found.push(ReplayedResult { index, ..result.clone() });
+            found.push(ReplayedResult {
+                index,
+                ..result.clone()
+            });
             cursor = index.saturating_add(1);
         }
     }
@@ -477,34 +488,4 @@ fn stub_text(result: &ReplayedResult) -> String {
         "[tool result cleared: tool {}, status {}, {} bytes; {lookup}]",
         result.tool, result.status, result.bytes
     )
-}
-
-/// Append the attachment row of a user message: `prefix` and `tail` are the
-/// text put before and after it. Nothing is written when tool events are not
-/// recorded; the message is then replayed plain, as before.
-pub(crate) async fn record_attachment(
-    fabric: &MemoryFabric,
-    scope: MessageEventScope,
-    user_event_id: &str,
-    attachment: &Attachment,
-) {
-    let payload = serde_json::json!({
-        "schema_version": 1,
-        "run_id": scope.run_id,
-        "user_event_id": user_event_id,
-        "prefix": attachment.prefix,
-        "tail": attachment.tail,
-    });
-    if let Err(error) = fabric
-        .record_tool_round_event(
-            scope,
-            ATTACHMENT_EVENT_TYPE,
-            format!("attachment of {user_event_id}"),
-            Some(payload.to_string()),
-        )
-        .await
-    {
-        let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
-        tracing::warn!(error_len, error_sha256, "Failed to persist message attachment");
-    }
 }

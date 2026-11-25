@@ -63,7 +63,7 @@ use crate::agent::stream_buffer::StreamBoundaryBuffer;
 use crate::agent::tool_call_parser::{
     looks_like_unparsed_tool_call_syntax, parse_structured_tool_calls, parse_tool_calls,
 };
-use crate::agent::tool_event_recording::{RoundLog, call_id_for};
+use crate::context::transcript::{RoundLog, call_id_for};
 use crate::agent::tool_evidence::{claims_tool_evidence, strip_model_written_tool_evidence};
 #[cfg(test)]
 use crate::agent::tool_result_recording::INTERRUPTED_TOOL_RESULT;
@@ -2199,7 +2199,7 @@ async fn run_turn_unguarded(
             .unwrap_or_else(|| execution_adapter.tool_execution_context.envelope.message_scope());
         let round_log = RoundLog::new(event_fabric.as_ref(), &tool_event_scope, iteration);
         if let Some(log) = round_log.as_ref() {
-            log.calls(&tool_calls, &native_tool_calls).await;
+            log.append_calls(&tool_calls, &native_tool_calls).await;
         }
         let executed = ExecutedToolRecords::new(history, &recorder, &tool_calls, &native_tool_calls);
 
@@ -2337,7 +2337,7 @@ async fn run_turn_unguarded(
                 compact_tool_result_for_history_with_status(&call.name, result, max_inline_chars, document_status);
             if let Some(log) = round_log.as_ref() {
                 let call_id = call_id_for(&call.name, index, &native_tool_calls);
-                log.result(&call_id, &call.name, outcome, &truncated_result, document_status)
+                log.append_result(&call_id, &call.name, outcome, &truncated_result, document_status)
                     .await;
             }
             let _ = writeln!(

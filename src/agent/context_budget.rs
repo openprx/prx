@@ -31,7 +31,7 @@ pub(super) fn trim_history_token_aware(history: &mut Vec<ChatMessage>, max_token
     drop_orphan_tool_results_at(history, start_of_non_system);
 }
 
-pub(super) fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
+pub(crate) fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
     estimate_history_tokens_with_source(history).tokens
 }
 

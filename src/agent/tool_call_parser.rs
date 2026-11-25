@@ -813,9 +813,9 @@ pub(super) fn unparseable_native_arguments(call: &ToolCall) -> Option<String> {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct ParsedToolCall {
-    pub(super) name: String,
-    pub(super) arguments: serde_json::Value,
+pub(crate) struct ParsedToolCall {
+    pub(crate) name: String,
+    pub(crate) arguments: serde_json::Value,
 }
 
 #[path = "turn_tests/tool_call_parser.rs"]

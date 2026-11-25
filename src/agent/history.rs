@@ -167,7 +167,7 @@ pub(super) fn latest_user_query(history: &[ChatMessage]) -> Option<&str> {
 /// Build assistant history entry in JSON format for native tool-call APIs.
 /// `convert_messages` in the OpenRouter provider parses this JSON to reconstruct
 /// the proper `NativeMessage` with structured `tool_calls`.
-pub(super) fn build_native_assistant_history(
+pub(crate) fn build_native_assistant_history(
     text: &str,
     tool_calls: &[ToolCall],
     reasoning_content: Option<&str>,

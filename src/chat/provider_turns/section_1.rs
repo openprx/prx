@@ -79,7 +79,7 @@ pub(super) struct PerTurnContext {
     pub(super) tool_event_forwarder: Option<tokio::task::JoinHandle<()>>,
     pub(super) user_input: String,
     /// The form the request was sent in (see [`crate::chat::turn_replay`]).
-    pub(super) sent: Option<crate::agent::tool_replay::Attachment>,
+    pub(super) sent: Option<crate::context::transcript::Attachment>,
     pub(super) turn_run_id: String,
     pub(super) route_scope: MessageEventScope,
     pub(super) route_decision: RouteDecision,

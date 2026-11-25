@@ -226,7 +226,7 @@ impl DocumentIngestRuntime {
 /// 🟡 Behavior-limits Phase 1: raised 2048 -> 4096 (fewer chunks per big output).
 pub(super) const TOOL_OUTPUT_DOCUMENT_CHUNK_TOKENS: usize = 4_096;
 
-pub(super) fn tool_output_document_id(tool_name: &str, content: &str) -> (String, String) {
+pub(crate) fn tool_output_document_id(tool_name: &str, content: &str) -> (String, String) {
     let mut hasher = sha2::Sha256::new();
     hasher.update(tool_name.as_bytes());
     hasher.update(b"\0");

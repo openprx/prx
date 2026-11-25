@@ -1,3 +1,5 @@
-//! Values computed once per turn and handed to every consumer of that turn.
+//! The context module: what a turn sends to the model, how a session's log
+//! is kept, and the values computed once per turn for every consumer.
 
 pub(crate) mod call;
+pub(crate) mod transcript;

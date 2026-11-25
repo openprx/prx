@@ -7,13 +7,13 @@
 //! [`crate::agent::turn_history::project`], so the provider view, the
 //! compaction guard and the reducer form keep describing the same canonical
 //! messages. The tool rounds come from the durable log
-//! ([`crate::agent::tool_replay`]); they are attached after each commit and when
+//! ([`crate::context::transcript`]); they are attached after each commit and when
 //! a saved session is loaded, and never saved with the session.
 
 use super::chat_events::chat_runtime_envelope;
 use super::dispatcher::{ChatDispatcher, TurnCompletionSignal};
 use super::session::ChatSession;
-use crate::agent::tool_replay::{Attachment, ReplayLog, TurnReplay};
+use crate::context::transcript::{Attachment, Transcript, TurnReplay};
 use crate::memory::Memory;
 use crate::providers::ChatMessage;
 use std::sync::Arc;
@@ -57,7 +57,8 @@ pub(super) async fn attach_turn_records(
 ) {
     let replay = if reply.is_some() {
         let principal = chat_runtime_envelope(workspace_id, chat_session_key).memory_principal();
-        ReplayLog::load_tool_rows(memory, &principal)
+        Transcript::new(memory, principal)
+            .tool_log()
             .await
             .replay_of_run(run_id)
             .map(Arc::new)
@@ -90,7 +91,7 @@ pub(super) async fn attach_stored_replays(mem: &dyn Memory, workspace_id: &str, 
         return;
     }
     let principal = chat_runtime_envelope(workspace_id, &session.id).memory_principal();
-    let log = ReplayLog::load(mem, &principal).await;
+    let log = Transcript::new(mem, principal).replay_log().await;
     let runs: Vec<Option<String>> = {
         let replies: Vec<&str> = session
             .turns
@@ -128,5 +129,5 @@ pub(super) fn stub_replayed_results(
     if replays.is_empty() {
         return 0;
     }
-    crate::agent::tool_replay::stub_replayed_results(view, &replays, request, config)
+    crate::context::transcript::stub_replayed_results(view, &replays, request, config)
 }

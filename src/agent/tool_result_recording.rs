@@ -8,7 +8,7 @@ use std::fmt::Write;
 
 /// Facts returned by the execution service, kept separate from model text.
 #[derive(Debug, Clone)]
-pub(super) struct ObservedToolResult {
+pub(crate) struct ObservedToolResult {
     pub content: String,
     pub status: crate::tools::ToolExecutionStatus,
     pub executed: bool,
@@ -32,7 +32,7 @@ impl ObservedToolResult {
 /// represented as a document-ingest reference in model history.
 /// 🟡 Behavior-limits Phase 1: raised 8K -> 48K (6x) so medium tool outputs stay
 /// directly visible to the agent instead of needing a second search.
-pub(super) const MAX_TOOL_RESULT_INLINE_CHARS: usize = 48_000;
+pub(crate) const MAX_TOOL_RESULT_INLINE_CHARS: usize = 48_000;
 
 /// Browser and other MCP results commonly contain accessibility trees or
 /// structured payloads much larger than the decision-relevant part. Keep those

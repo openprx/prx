@@ -88,7 +88,7 @@ read their own state and move in a later step.
 
 The history of a Console or rf session turn is built from the stored
 conversation turns plus the durable log rows of role `tool`
-(`src/agent/tool_replay.rs`). Each earlier user message is replayed with its
+(`src/context/transcript/replay.rs`). Each earlier user message is replayed with its
 stored attachment (the masked recall text before it and the date line after it,
 `message.attachment.recorded`), so its bytes do not change between turns. Each
 earlier assistant reply is preceded by the tool rounds of its run
@@ -127,6 +127,38 @@ canonical messages (the canonical history still holds the typed text only).
   without stored rows (an older session) keeps it. Before each turn the oldest
   replayed results become the gateway's one-line stubs while the request is over
   the warning threshold; compaction then runs unchanged on the canonical history.
+
+## The transcript
+
+`src/context/transcript/` is the single place that writes and reads the rows a
+session's model history is made of; no other module imports the row writers or
+the replay reader.
+
+- Writers (`tool_rows.rs`): `RoundLog::append_calls` and
+  `RoundLog::append_result` write the `tool.call.recorded` and
+  `tool.result.recorded` rows of a provider round, and `append_attachment`
+  writes the `message.attachment.recorded` row of a user message. All three go
+  through `MemoryFabric::record_tool_round_event`: role `tool`, an event type
+  other than `message.created`, so the sync stream, the history loaders and the
+  handoff provenance match never see them. A new row kind is added in the same
+  way (additive, role `tool`, own event type) and is not projected to the sync
+  stream until rf agrees a shape. Stored text is the redacted form; the
+  redaction is unchanged.
+- Readers (`replay.rs`, reached through `Transcript`): a `Transcript` is built
+  from a store and the `MemoryPrincipal` of one session. `replay_log` reads the
+  session's tool, attachment and message rows; `tool_log` reads only the tool
+  rows; `expand_turns` turns stored conversation turns into model-facing
+  `History` (each user message with its stored attachment, each reply preceded
+  by the tool rounds of its run) with `History::fit` as the stub step.
+- What is not behind the transcript yet: the user and assistant message rows
+  (written by admission, the terminal commit and the chat events), the terminal
+  chat session JSON, the channel history map and the child session store. The
+  gateway session route, the mailbox-woken turn and the rf route still take
+  their user and assistant text from `conversation_turns` and only the tool
+  rounds and attachments from the log. A loader that reads the log alone needs
+  a session read that is not filtered by row visibility (see the design
+  question in the work package notes); until then `conversation_turns` stays
+  the source of the message text.
 
 ## Ownership
 

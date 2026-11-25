@@ -353,9 +353,9 @@ impl ChatState {
     pub(super) fn reduce_turn_records_attached(
         &mut self,
         user_text: &str,
-        sent: Option<crate::agent::tool_replay::Attachment>,
+        sent: Option<crate::context::transcript::Attachment>,
         reply: Option<&str>,
-        replay: Option<std::sync::Arc<crate::agent::tool_replay::TurnReplay>>,
+        replay: Option<std::sync::Arc<crate::context::transcript::TurnReplay>>,
     ) -> Vec<Effect> {
         let user_text = crate::agent::turn_contracts::neutralize_reserved_markers(user_text);
         let mut sent_attached = false;

@@ -568,9 +568,9 @@ pub enum Action {
     /// assistant turn when that turn is exactly `reply`.
     TurnRecordsAttached {
         user_text: String,
-        sent: Option<crate::agent::tool_replay::Attachment>,
+        sent: Option<crate::context::transcript::Attachment>,
         reply: Option<String>,
-        replay: Option<std::sync::Arc<crate::agent::tool_replay::TurnReplay>>,
+        replay: Option<std::sync::Arc<crate::context::transcript::TurnReplay>>,
     },
     /// Ask the reducer to persist the assistant turn (writes session.turns + LLM history)
     RecordAssistantTurn {

@@ -111,12 +111,12 @@ pub struct TurnToolEvidence {
     /// it; it is replayed with the turn so the message keeps its bytes. The
     /// turn's own text stays what the user typed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sent: Option<crate::agent::tool_replay::Attachment>,
+    pub sent: Option<crate::context::transcript::Attachment>,
     /// The tool rounds of an `assistant` turn, replayed before its reply.
     /// Never saved: it is rebuilt from the durable log after a commit and
     /// when a session is loaded.
     #[serde(skip)]
-    pub replay: Option<std::sync::Arc<crate::agent::tool_replay::TurnReplay>>,
+    pub replay: Option<std::sync::Arc<crate::context::transcript::TurnReplay>>,
 }
 
 /// Serde's `skip_serializing_if` callback, which receives a reference.

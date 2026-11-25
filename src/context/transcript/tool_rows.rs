@@ -1,4 +1,5 @@
-//! Durable log rows for tool calls and tool results.
+//! Writers of the transcript's tool rows: tool calls, tool results and the
+//! attachment of a user message.
 //!
 //! Each call the model makes is appended to `message_events` when the round
 //! dispatches it, and each result when the call returns. A pair shares the
@@ -16,6 +17,7 @@
 //! preview plus a document reference, and only when that document was
 //! stored.
 
+use super::replay::Attachment;
 use crate::agent::tool_call_parser::ParsedToolCall;
 use crate::agent::tool_result_recording::{MAX_TOOL_RESULT_INLINE_CHARS, ObservedToolResult};
 use crate::memory::{MemoryFabric, MessageEventScope};
@@ -23,13 +25,15 @@ use crate::providers::ToolCall;
 
 pub(crate) const TOOL_CALL_EVENT_TYPE: &str = "tool.call.recorded";
 pub(crate) const TOOL_RESULT_EVENT_TYPE: &str = "tool.result.recorded";
+/// Event type of the row that stores a user message's attachment.
+pub(crate) const ATTACHMENT_EVENT_TYPE: &str = "message.attachment.recorded";
 
 /// Status `persist_tool_output_document` reports for a stored document.
 const STORED_DOCUMENT_STATUS: &str = "persisted_document_backend";
 
 /// The id a call is paired by: the provider's call id, or `<tool>#<index>`
 /// for a call that has none (the same fallback the live notifications use).
-pub(super) fn call_id_for(tool: &str, index: usize, native: &[ToolCall]) -> String {
+pub(crate) fn call_id_for(tool: &str, index: usize, native: &[ToolCall]) -> String {
     native
         .get(index)
         .map(|call| call.id.clone())
@@ -52,7 +56,7 @@ fn bounded(text: String, max_bytes: usize) -> String {
 }
 
 /// Where one provider round writes its tool rows.
-pub(super) struct RoundLog<'a> {
+pub(crate) struct RoundLog<'a> {
     fabric: &'a MemoryFabric,
     scope: &'a MessageEventScope,
     round: usize,
@@ -60,17 +64,17 @@ pub(super) struct RoundLog<'a> {
 
 impl<'a> RoundLog<'a> {
     /// `None` when the turn has no durable event sink.
-    pub(super) fn new(fabric: Option<&'a MemoryFabric>, scope: &'a MessageEventScope, round: usize) -> Option<Self> {
+    pub(crate) fn new(fabric: Option<&'a MemoryFabric>, scope: &'a MessageEventScope, round: usize) -> Option<Self> {
         fabric.map(|fabric| Self { fabric, scope, round })
     }
 
     /// Append one `tool.call.recorded` row per call of the round.
-    pub(super) async fn calls(&self, calls: &[ParsedToolCall], native: &[ToolCall]) {
+    pub(crate) async fn append_calls(&self, calls: &[ParsedToolCall], native: &[ToolCall]) {
         record_tool_calls(self.fabric, self.scope, self.round, calls, native).await;
     }
 
     /// Append the `tool.result.recorded` row of one call.
-    pub(super) async fn result(
+    pub(crate) async fn append_result(
         &self,
         call_id: &str,
         tool: &str,
@@ -167,5 +171,35 @@ async fn append(
     {
         let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
         tracing::warn!(error_len, error_sha256, event_type, "Failed to persist tool event");
+    }
+}
+
+/// Append the attachment row of a user message: `prefix` and `tail` are the
+/// text put before and after it. Nothing is written when tool events are not
+/// recorded; the message is then replayed plain, as before.
+pub(crate) async fn append_attachment(
+    fabric: &MemoryFabric,
+    scope: MessageEventScope,
+    user_event_id: &str,
+    attachment: &Attachment,
+) {
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "run_id": scope.run_id,
+        "user_event_id": user_event_id,
+        "prefix": attachment.prefix,
+        "tail": attachment.tail,
+    });
+    if let Err(error) = fabric
+        .record_tool_round_event(
+            scope,
+            ATTACHMENT_EVENT_TYPE,
+            format!("attachment of {user_event_id}"),
+            Some(payload.to_string()),
+        )
+        .await
+    {
+        let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+        tracing::warn!(error_len, error_sha256, "Failed to persist message attachment");
     }
 }
