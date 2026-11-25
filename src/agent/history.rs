@@ -44,13 +44,13 @@ pub(super) const DEFAULT_MAX_HISTORY_MESSAGES: usize = 300;
 /// strand a tool result; native providers reject a tool message that has no
 /// matching `tool_calls` ahead of it, which would turn a survivable trim into
 /// a failed turn.
-pub(super) fn drop_orphan_tool_results_at(history: &mut Vec<ChatMessage>, from: usize) {
+pub(crate) fn drop_orphan_tool_results_at(history: &mut Vec<ChatMessage>, from: usize) {
     while history.len() > from && history.get(from).is_some_and(|message| message.role == "tool") {
         history.remove(from);
     }
 }
 
-pub(super) fn history_non_system_start(history: &[ChatMessage]) -> usize {
+pub(crate) fn history_non_system_start(history: &[ChatMessage]) -> usize {
     usize::from(history.first().is_some_and(|message| message.role == "system"))
 }
 
@@ -61,10 +61,10 @@ pub(super) fn history_non_system_start(history: &[ChatMessage]) -> usize {
 /// per trim call, before the trim starts; a view without a handoff trims
 /// exactly as without the protection.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct ProtectedHandoff(Option<usize>);
+pub(crate) struct ProtectedHandoff(Option<usize>);
 
 impl ProtectedHandoff {
-    pub(super) fn of(history: &[ChatMessage]) -> Self {
+    pub(crate) fn of(history: &[ChatMessage]) -> Self {
         Self(crate::agent::compaction::newest_validated_context_handoff_index(
             history,
         ))
@@ -75,7 +75,7 @@ impl ProtectedHandoff {
     /// `oldest` is the protected handoff and another message lies before
     /// `newest`, else `oldest` (with only the handoff and the newest message
     /// left, the handoff goes first, as without the protection).
-    pub(super) fn removal_index(self, oldest: usize, newest: usize) -> usize {
+    pub(crate) fn removal_index(self, oldest: usize, newest: usize) -> usize {
         let next = oldest.saturating_add(1);
         if self.0 == Some(oldest) && next < newest {
             next
@@ -87,7 +87,7 @@ impl ProtectedHandoff {
     /// Remove `history[index]` and the tool results that removal strands,
     /// keeping track of where the protected handoff now is. Nothing happens
     /// when `index` is outside the history.
-    pub(super) fn remove_at(&mut self, history: &mut Vec<ChatMessage>, index: usize) {
+    pub(crate) fn remove_at(&mut self, history: &mut Vec<ChatMessage>, index: usize) {
         let before = history.len();
         if index >= before {
             return;

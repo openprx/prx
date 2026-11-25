@@ -4,7 +4,7 @@
 use super::engine::{AfterTools, Round};
 use super::preflight::{preflight_config, preflight_trim_projection};
 use super::{Outcome, Reason, Reducer, Removed, Tier};
-use crate::agent::context_budget::{estimate_history_tokens, trim_history_token_aware};
+use crate::agent::context_budget::{estimate_history_tokens, planning_history_tokens, trim_history_token_aware};
 use crate::agent::context_preflight::{
     RestoredRequestPosition, capture_current_turn_request, restore_current_turn_request,
 };
@@ -81,7 +81,7 @@ impl<'a> Reducer<AfterTools<'a>> for MidTurnTrim {
     }
 
     fn applies(&self, state: &AfterTools<'a>) -> bool {
-        estimate_history_tokens(state.history) > mid_turn_limit(state.reserved_config)
+        planning_history_tokens(state.history) > mid_turn_limit(state.reserved_config)
     }
 
     async fn apply(&self, state: &mut AfterTools<'a>) -> Result<Outcome> {

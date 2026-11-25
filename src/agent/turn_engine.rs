@@ -27,9 +27,9 @@ use crate::agent::context_budget::budgeted_request_tool_tokens;
 #[cfg(test)]
 use crate::agent::context_budget::{APPENDED_SECTION_FRAMING_TOKENS, TOKEN_HEURISTIC_BUDGET_MULTIPLIER};
 use crate::agent::context_budget::{
-    PRE_TURN_FLUSH_THRESHOLD, RequestToolSurfaceCounts, budgeted_tokens, estimate_budgeted_request_tokens,
-    estimate_history_tokens, estimate_history_tokens_with_source, estimate_request_tokens, plan_context_budget,
-    reserve_request_tool_surface, token_source_label, trim_history_to_context_budget,
+    PRE_TURN_FLUSH_THRESHOLD, RequestToolSurfaceCounts, budgeted_tokens, estimate_history_tokens,
+    estimate_history_tokens_with_source, estimate_request_tokens, plan_context_budget, reserve_request_tool_surface,
+    token_source_label, trim_history_to_context_budget,
     trim_history_to_context_budget_preserving_compaction_replacement_with_floor,
 };
 use crate::agent::context_paging::{
@@ -78,6 +78,8 @@ use crate::agent::turn_contracts::{
 };
 use crate::agent::turn_history::{TurnHistory, same_messages};
 use crate::agent::turn_request::{ToolLoopMemory, TurnDecision, TurnDelivery, TurnRequest, TurnSchedule, TurnServices};
+use crate::context::budget::anchor::{self, RequestBudget};
+use crate::context::budget::record::{plan_round, settle_round};
 use crate::context::reduce::clear::ClearOldResults;
 use crate::context::reduce::compact::{PreTurnCompact, RoundCompact};
 use crate::context::reduce::engine::{
@@ -527,6 +529,12 @@ async fn run_turn_unguarded(
         caller_rollover,
         history_event_ids,
     } = memory_runtime;
+    // The provider's count of each request anchors the estimate of the next
+    // one; a chat session keeps its anchors across turns, any other turn its own.
+    let usage_anchors = tool_surface_reserve.as_ref().map_or_else(
+        anchor::UsageAnchors::default,
+        crate::agent::context_budget::ToolSurfaceReserve::usage_anchors,
+    );
     // A session authority adopts this turn's durable compactions as patches
     // over its acknowledged history, so the turn must build them from that
     // history, never from the provider view (I-CANON).
@@ -923,9 +931,13 @@ async fn run_turn_unguarded(
         // read rather than an invariant nobody can check. `None` on the
         // entrypoints that pass no compaction config: there is no budget to
         // report there.
+        let mut request_budget: Option<RequestBudget> = None;
         let budgeted_totals: Option<(usize, usize)> = if let Some(config) = compaction_config {
             // The durable phase, then the projection phase: the two steps of
-            // the reduction ladder that run on every round.
+            // the reduction ladder that run on every round, under the
+            // calibration the last response's reported usage gives.
+            let tool_hash = anchor::tool_surface_hash(&tool_specs, &decision_fingerprints);
+            let probe = usage_anchors.probe(history, Some(tool_hash), provider_name, model);
             let mut round = Round {
                 history: &mut *history,
                 turn_history: &mut turn_history,
@@ -943,13 +955,12 @@ async fn run_turn_unguarded(
                 compaction: PreflightCompaction::default(),
                 budget: None,
             };
-            Box::pin(ladder(&[&ClearOldResults, &RoundCompact, &RoundTrim], &mut round)).await?;
-            round.budget.map(|budget| {
-                (
-                    budget.used_tokens,
-                    estimate_budgeted_request_tokens(budget.measurement(), tool_surface),
-                )
-            })
+            let planning = probe.planning(tool_surface);
+            anchor::scoped(planning, Box::pin(ladder(&[&ClearOldResults, &RoundCompact, &RoundTrim], &mut round))).await?;
+            request_budget = round
+                .budget
+                .map(|budget| plan_round(&usage_anchors, probe, config, budget, tool_surface));
+            round.budget.map(|budget| budget.local_request_totals(tool_surface))
         } else {
             None
         };
@@ -1318,6 +1329,10 @@ async fn run_turn_unguarded(
                         "hits": tool_snapshot_render_cache.hits(),
                         "misses": tool_snapshot_render_cache.misses(),
                     },
+                    "budget": request_budget
+                        .as_ref()
+                        .zip(compaction_config)
+                        .map(|(planned, config)| planned.to_json(config, budgeted_request_tokens)),
                     "request_estimate": {
                         "messages_bytes": messages_bytes,
                         "messages_chars": messages_chars,
@@ -1522,6 +1537,16 @@ async fn run_turn_unguarded(
                     any_turn_had_fallback = true;
                 }
                 usage_accumulator.record(trace.tokens_used.clone());
+                if let Some(planned) = request_budget.as_ref() {
+                    let sink = event_fabric.as_ref().map(|fabric| {
+                        let scope = request_event_scope
+                            .clone()
+                            .unwrap_or_else(|| execution_adapter.tool_execution_context.envelope.message_scope())
+                            .with_recipient(format!("{provider_name}/{model}"));
+                        (fabric, scope)
+                    });
+                    settle_round(&usage_anchors, planned, &trace, (iteration, provider_name, model), sink).await;
+                }
                 // Record this turn's real attribution. Overwritten each turn;
                 // the value at the returning turn is what the caller receives.
                 // The served member is named by its unique key when the chain
@@ -1711,6 +1736,7 @@ async fn run_turn_unguarded(
                         .into());
                     }
                     overflow_recovery_passes += 1;
+                    usage_anchors.invalidate();
                     let messages_before_compaction = history.len();
                     let tokens_before_compaction = estimate_history_tokens(history);
                     tracing::warn!("Context overflow detected; running compaction and retrying LLM call");
@@ -2423,12 +2449,15 @@ async fn run_turn_unguarded(
         // without the question it was asked. Captured inside the branch, so a
         // round that needs no trim still clones nothing.
         if let Some(reserved_config) = reserved_config.as_ref() {
+            let planning = usage_anchors
+                .probe(history, None, provider_name, model)
+                .planning(tool_surface);
             let mut after_tools = AfterTools {
                 history: &mut *history,
                 turn_history: &mut turn_history,
                 reserved_config,
             };
-            Box::pin(ladder(&[&MidTurnTrim], &mut after_tools)).await?;
+            anchor::scoped(planning, Box::pin(ladder(&[&MidTurnTrim], &mut after_tools))).await?;
         }
         if let Some(tool_name) = repeated_unrecoverable {
             anyhow::bail!(

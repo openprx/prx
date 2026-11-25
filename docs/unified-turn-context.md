@@ -405,6 +405,197 @@ budget trim or an aggressive trim), the OS-paging eviction, the dispatcher
 rollover, the line-mode chat preflight compaction, the manual `/compact`, and
 the tool-surface deferral at turn opening (`src/runtime/turn_context/tool_fit.rs`).
 
+## The request budget
+
+The budget arithmetic lives in `src/context/budget.rs` (`src/agent/context_budget.rs`
+only re-exports it). The history is compared with a hard limit and a warning
+threshold: the limit is `max_context_tokens` less the reply reserve and the
+measured tool surface (both capped, see `docs/configuration.md`), the threshold
+0.85 of the limit. The reduction steps decide against one estimate of the
+history, built in this order of preference:
+
+1. With an anchor: the local count planned under the ratio the provider
+   showed on the last request. After a response that reports `R` input tokens
+   for a request whose local plan (history plus tool surface, no safety
+   factor) was `P0`, the ratio is `k = R / P0`. A local count `L` is scaled as
+   `apply(L) = ceil(L * k) + margin`, with
+   `margin = max(2% of ceil(L * k), 16)` (`ANCHOR_MARGIN_PERCENT`,
+   `ANCHOR_MARGIN_FLOOR_TOKENS`). Because `k` was measured on history plus
+   tool surface, a reduction step plans a history of local count `H` as
+   `apply(H + T) - T_reserved` (`anchor::Planning`), where `T` is the local
+   count of the published tool surface and `T_reserved` the same surface as
+   the limit reserves it. Removing a message therefore lowers the estimate in
+   proportion, and nothing constant stays behind from content that is gone.
+2. Without one: the local tokenizer count. When only the character heuristic is
+   available (the tokenizer did not initialize) it is doubled for safety, and
+   no anchor is formed from a heuristic measurement.
+
+An anchor is formed only when `P0` and `R` are both at least 500 tokens
+(`ANCHOR_MIN_TOKENS`) and `0.800 <= k <= 1.600`
+(`ANCHOR_RATIO_MIN_MILLI`, `ANCHOR_RATIO_MAX_MILLI`). The band is a starting
+value, not a measurement: provider tokenizers count about 0.8 to 1.3 times the
+cl100k proxy on prose and code and up to about 1.5 on dense JSON or non-Latin
+text. A lower ratio more likely means the provider counted only part of the
+request (for example only what was not served from a prompt cache), and one
+above 1.6 means it counted what the local estimator does not see or counted
+twice. A refused ratio leaves the request on the local estimate, unchanged,
+and is recorded with its reason (`ratio_out_of_band`). The constants are in
+`src/context/budget/anchor.rs`.
+
+Why the lower bound is 0.800. A low ratio is the one that lets more through:
+an anchored request may carry up to `1 / (k * 1.02)` times the local tokens
+the unanchored limit allows. At window 128000 with a reply reserve of 16384
+the input window is 111616; at `k = 0.800` an anchored request of local size
+up to 136785 passes, 1.23 times the input window; at `k = 0.600` it was
+182380, 1.63 times (for a history limit of 101616: 124530 and 166040). If the
+low ratio came from a partial count rather than a smaller tokenizer, the
+request is that much larger than the provider accepts, and the overflow
+recovery handles it. At the upper bound `k = 1.600` the factor is about 0.61:
+a high ratio only trims earlier.
+
+Which quantities are scaled. Multiplied by `k`: the local history plus the
+local tool surface, in every comparison a reduction step makes
+(`plan_context_budget`, the token-aware trims, the mid-turn trim test and the
+compaction trigger, all through `planning_history_tokens` or
+`plan_context_budget` under `anchor::scoped`), and in the window check of the
+whole request. Not multiplied: the reply reserve, the window, the limit, the
+threshold and the caps on them (the window/2 cap on reply plus tools, the
+window/4 shares in `src/agent/budget_inputs.rs`); the window policy is
+unchanged, and without an anchor every comparison is the old one.
+
+The steps and the window check agree. The limit of a step is
+`window - reserve`, with `reserve = reply + T_reserved` while the window/2 cap
+does not bind, so `apply(H + T) - T_reserved <= window - reply - T_reserved`
+is `apply(H + T) <= window - reply`, the comparison `check_request_window`
+makes on the anchored estimate. A request the steps accept is not reported over
+the window. The exception is a binding window/2 cap with a tool surface over
+its window/4 share, or with a configured reply reserve of half the window or
+more; the same numbers disagree there without an anchor too, and that is the
+window policy, not the calibration.
+
+Worked example, the tool reserve. Window 128000, reply reserve 16384, tool
+surface `T = 10000`, `k = 1.300`; the history limit is
+`128000 - 16384 - 10000 = 101616` and the input window 111616. Scaling the
+history alone, as before, let a history of local 76633 through:
+`apply(76633) = 99623 + 1992 = 101615`, under the limit, while the whole
+request is `apply(86633) = 114875` against 111616, over the window (the true
+request, `1.3 * 86633 + 16384`, is about 129007 with the reply, over 128000).
+Planning `apply(H + T) - T`, the largest history let through is 74175:
+`apply(84175) = 109428 + 2188 = 111616`, so the step compares
+`111616 - 10000 = 101616` with the limit 101616, and the window check compares
+111616 with the input window 111616; both accept. The true request is
+`1.3 * 84175 + 16384`, about 125812, within 128000.
+
+Worked example, a small window (`reserve_tokens = 4096`, window 16000, a tool
+surface of 4000 local tokens): the reply reserve is capped at 4000 for the
+window check, reply plus tools at 8000 for the steps, so the limit is 8000 and
+the warning threshold 6800. A request with local history 6000 and tools 4000
+(`P0 = 10000`) is answered with `R = 11000`, so `k = 1.100`. The next request
+has local history 6500: the step plans `ceil(10500 * 1.1) = 11550` plus 231,
+which is 11781, less 4000: 7781. It is over the threshold and under the limit.
+A trim that removes 2000 local tokens leaves 4500, planned as
+`9350 + 187 - 4000 = 5537`: the estimate shrank with what was removed. The
+window check of the request with history 6500 sets 11781 against an input
+window of `16000 - 4000 = 12000`.
+
+An anchor is kept per session (it lives next to the tool-surface reserve of a
+chat session) and per turn for every other caller, so a child run has its own.
+It is used only while the requested provider and model, the system prompt and
+the tool surface are those of the request that produced it, and it is formed
+only from a response served by the requested provider and model. The probe and
+the anchor both hold the requested provider and model, so they compare like
+with like. A response whose serving provider (compared with URL userinfo
+redacted on both sides, as a failover chain reports its member by the redacted
+label) or serving model differs from the requested one forms no anchor
+(`served_by_fallback`): its count describes another tokenizer. A request routed
+through a `hint:` model resolves to another model name and so never anchors.
+The system prompt is checked by the hash of the first system message only: a
+change to any other message, to text injected into a later message, or to what
+a hook adds after the preflight is not seen, and the ratio absorbs it. The tool
+surface is checked by the digest of the published specs (the same per-spec
+digest the compiled snapshot uses, reused from the digests the round already
+computed for its decision record), taken at the preflight, so a different
+surface with the same counts invalidates the anchor. It is replaced by the next
+response that gives a usable ratio, cleared by one that does not, and dropped
+when the provider rejects a request for its size.
+
+Where the local estimate stays. The pre-turn step (it runs before the surface
+is measured), the chat front end's footer and `/compact` decisions, the
+overflow-retry trims and cost admission. A provider that reports no usage
+(streaming without a usage frame, custom endpoints that omit it) never
+anchors. Providers that report only part of the prompt, such as Ollama, whose
+`prompt_eval_count` the adapter forwards as the prompt tokens with no cache
+split and which is believed (not verified here) to count only the tokens
+Ollama evaluated when part of the prompt is served from its cache, fall
+outside the band in that case and stay on the local estimate. Images and other
+attachments are measured locally as markers only, so an image-heavy request
+gives a ratio above the band and is not anchored; this work does not count
+images.
+
+The planning is set around the round's reduction steps and the mid-turn trim
+(`anchor::scoped`). Two functions keep it from leaking:
+`estimate_history_tokens` is always the local count, used for every
+measurement of a slice and every number reported to a hook or an event, and
+`planning_history_tokens` is the only one that applies the calibration, used by
+the planning comparisons. Numbers sent to hooks and events (`tokens_before`,
+`tokens_after`, `used_context_tokens`, the removed tokens of a trim) are local.
+The `used_tokens` of a budget snapshot taken inside the scope is the planned,
+calibrated figure; it appears in log lines and in the context-switch
+degradation audit record, and in no request record.
+
+After the reduction steps of each round, the host sets the request estimate
+against the window once (`check_request_window`). It refuses nothing: a request
+still over the window is sent and the provider-overflow recovery handles it; the
+check is logged and recorded.
+
+Records. Every token field below is one of: local (the local tokenizer count
+with no safety factor), budgeted local (the local count, doubled when the
+character heuristic measured it), provider (a count the provider reported) or
+calibrated (scaled by an anchor, with its margin). No field mixes them except
+`budget.window.estimate_tokens`, whose kind follows whether an anchor was in
+force.
+
+`llm.request.context.compiled`, `request_estimate` (all budgeted local; the
+`budgeted_*` fields describe the history the preflight planned, the others the
+messages finally prepared):
+
+| Field | Kind |
+| --- | --- |
+| `messages_bytes`, `messages_chars` | local size of the prepared messages |
+| `messages_tokens` | budgeted local |
+| `native_tool_tokens`, `instruction_tokens` | budgeted local |
+| `budgeted_messages_tokens` | budgeted local |
+| `budgeted_total_tokens` | budgeted local |
+| `total_tokens` | budgeted local |
+
+`llm.request.context.compiled`, `budget` (additive):
+
+| Field | Kind |
+| --- | --- |
+| `request_ordinal`, `anchor_request` | ordinals (`anchor_request` is `"none"` without an anchor) |
+| `reported_input_tokens` | provider, of the anchor's request |
+| `anchor_planned_tokens` | local, of the anchor's request |
+| `ratio` | three decimals; the ratio in force, or the last one refused |
+| `fallback` | why no anchor was used: `first_request`, `no_usage`, `system_prompt_changed`, `tool_surface_changed`, `ratio_out_of_band`, `too_small`, `heuristic_source`, `model_changed`, `served_by_fallback`, `overflowed` |
+| `local_estimate_tokens`, `local_history_tokens`, `local_tool_tokens` | local |
+| `anchored_estimate_tokens` | calibrated, history plus tools; `null` without an anchor |
+| `window.window_tokens`, `window.input_window_tokens` | configuration (window, window less the capped reply reserve) |
+| `window.estimate_tokens` | calibrated with an anchor, budgeted local without one |
+| `window.over_window` | the check's result for `estimate_tokens` |
+
+`llm.request.usage.reported`, written when the response arrives:
+
+| Field | Kind |
+| --- | --- |
+| `provider`, `model` | the requested ones (URL userinfo redacted) |
+| `request_ordinal`, `anchor_request` | ordinals |
+| `reported_input_tokens` | provider, of this request |
+| `ratio` | provider over local, of this request, kept or refused |
+| `completion_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens` | provider |
+| `local_estimate_tokens` | local, history plus tools |
+| `anchored_estimate_tokens` | calibrated; `null` without an anchor |
+| `local_error_tokens`, `anchored_error_tokens` | estimate minus reported |
+
 ## Request provenance
 
 The `llm.request.context.compiled` row carries one additive object,

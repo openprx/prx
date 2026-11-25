@@ -280,6 +280,10 @@ same session only). Attachments that quote only a memory that still exists are
 not touched by a plain delete. No schema migration, no sync-stream change and
 no change to the session routes' JSON.
 
+## Requests may be reduced later than before
+
+The size of a request was estimated only with a local tokenizer. The provider's own count of the previous request now calibrates the estimate: the ratio of the input tokens it reported to the local count of that request scales the local count of the history and the tool surface, plus a small margin (2%, at least 16). The ratio is used only between 0.800 and 1.600, for requests of at least 500 tokens, and never with the character heuristic. A request is therefore reduced (cleared, handed off or trimmed) when it is close to the window the provider sees, not the window a proxy tokenizer sees, which is later than before on a model whose tokenizer counts fewer tokens than the proxy and earlier on one that counts more. Before the first response of a session, after a response that reported no input tokens or an unusable ratio, and whenever the system prompt, the tool surface or the model changed, the local estimate is used as before. A request that is still over the window after the reduction steps is not refused: it goes out and the provider-overflow recovery handles it, as before. The compiled-request event (`llm.request.context.compiled`) has an additive `budget` object, and a new event `llm.request.usage.reported` records the provider's count for each request next to the estimates. No configuration change is needed.
+
 ## A process child no longer fails after a configuration write
 
 On a running gateway or chat, `prx config apply` (and any other write of the

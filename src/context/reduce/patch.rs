@@ -16,7 +16,7 @@ use super::summary::{
     COMPACTION_MAX_SUMMARY_CHARS, MEMORY_FLUSH_MAX_CHARS, bounded_compaction_projection, build_compaction_audit_source,
     build_compaction_transcript, compaction_patch_guard_for, compaction_summary_fidelity_status,
 };
-use crate::agent::context_budget::estimate_history_tokens;
+use crate::agent::context_budget::planning_history_tokens;
 use crate::agent::document_ingest::DocumentIngestRuntime;
 use crate::agent::response_guard::strip_assistant_fabricated_tool_markers;
 use crate::agent::turn_contracts::CompactionPatch;
@@ -119,7 +119,7 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
     let Some(limit) = compaction_trigger_limit(config) else {
         return Ok(CompactionBuild::NotNeeded);
     };
-    if !CompactionDemand::from_trigger(trigger).is_forced() && estimate_history_tokens(budget_history) <= limit {
+    if !CompactionDemand::from_trigger(trigger).is_forced() && planning_history_tokens(budget_history) <= limit {
         return Ok(CompactionBuild::NotNeeded);
     }
     // One successful automatic switch per admitted turn.

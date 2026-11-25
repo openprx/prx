@@ -4,7 +4,7 @@
 
 use super::preflight::PreflightCompaction;
 use crate::agent::context_budget::{
-    ContextBudgetSnapshot, PRE_TURN_FLUSH_THRESHOLD, estimate_history_tokens, plan_context_budget,
+    ContextBudgetSnapshot, PRE_TURN_FLUSH_THRESHOLD, estimate_history_tokens, plan_context_budget_local,
 };
 use crate::agent::document_ingest::DocumentIngestRuntime;
 use crate::agent::turn_context::RequestToolMeasurement;
@@ -126,7 +126,7 @@ pub(crate) async fn report_durable_compaction(
     };
     let system_messages =
         |messages: &[ChatMessage]| usize::from(messages.first().is_some_and(|message| message.role == "system"));
-    let used_context_tokens = plan_context_budget(compacted_messages, config, PRE_TURN_FLUSH_THRESHOLD).used_tokens;
+    let used_context_tokens = plan_context_budget_local(compacted_messages, config, PRE_TURN_FLUSH_THRESHOLD).used_tokens;
     emit_tool_loop_event(
         runtime_adapter,
         ToolLoopEvent::ContextCompactionPatch {
