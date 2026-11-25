@@ -1654,17 +1654,7 @@
                 let _ = tx.try_send(());
             }
             observer.record_event(&ObserverEvent::TurnComplete);
-            if !dual_write_guard.is_active() {
-                hooks
-                    .emit(
-                        HookEvent::TurnComplete,
-                        serde_json::json!({
-                            "mode": "chat",
-                            "response_chars": 0,
-                        }),
-                    )
-                    .await;
-            }
+            // `turn_complete` is emitted once, by the turn engine, for every surface.
             finish_inline_provider_turn(&mut provider_turn_workers, provider_turn_task_id, Some(inline_payload));
             mark_provider_turn_completed(
                 &mut turn_scheduler,
@@ -1826,20 +1816,12 @@
         // The guard is turn-level (not effect-level): once Redux has executed either
         // SaveSession or NotifyHook during a turn, the guard is active and every later write of the
         // old path is suppressed.
+        // The `turn_complete` hook event is emitted once, by the turn engine.
         if !dual_write_guard.is_active() {
             observer.record_event(&ObserverEvent::TurnComplete);
-            hooks
-                .emit(
-                    HookEvent::TurnComplete,
-                    serde_json::json!({
-                        "mode": "chat",
-                        "response_chars": response.chars().count(),
-                    }),
-                )
-                .await;
         } else {
-            // Guard active: the Redux path already handled hooks.emit.
-            tracing::debug!("P0-1: dual_write_guard active — legacy path skipping hooks.emit(TurnComplete)");
+            // Guard active: the Redux path already handled the turn's effects.
+            tracing::debug!("P0-1: dual_write_guard active — legacy path skipping its turn-complete writes");
             // observer.record_event is still called (the observer is only a local counter, with no
             // external side effects).
             observer.record_event(&ObserverEvent::TurnComplete);

@@ -48,9 +48,23 @@ pub struct HookDispatchStats {
 /// turn.
 pub struct HookManager {
     pub(super) core: std::sync::Arc<HookCore>,
-    pub(super) queue: std::sync::OnceLock<tokio::sync::mpsc::Sender<DispatchMessage>>,
+    pub(super) queue: std::sync::Arc<std::sync::OnceLock<tokio::sync::mpsc::Sender<DispatchMessage>>>,
     pub(super) capacity: usize,
     pub(super) stats: std::sync::Arc<DispatchStats>,
+}
+
+/// A second handle on the same manager: the same configuration, queue and
+/// counters, so events emitted through either are delivered in one order by
+/// one worker.
+impl Clone for HookManager {
+    fn clone(&self) -> Self {
+        Self {
+            core: std::sync::Arc::clone(&self.core),
+            queue: std::sync::Arc::clone(&self.queue),
+            capacity: self.capacity,
+            stats: std::sync::Arc::clone(&self.stats),
+        }
+    }
 }
 
 impl std::ops::Deref for HookManager {
@@ -82,7 +96,7 @@ impl HookManager {
                 #[cfg(feature = "wasm-plugins")]
                 plugin_runtime: tokio::sync::RwLock::new(None),
             }),
-            queue: std::sync::OnceLock::new(),
+            queue: std::sync::Arc::new(std::sync::OnceLock::new()),
             capacity: capacity.max(1),
             stats: std::sync::Arc::new(DispatchStats::default()),
         }
@@ -96,6 +110,24 @@ impl HookManager {
     pub fn with_config(self, shared: crate::config::SharedConfig) -> Self {
         *self.core.policy.write() = HookPolicy::Live(shared);
         self
+    }
+
+    /// A manager for a process that holds a configuration snapshot but no
+    /// live configuration handle (the scheduler): whether workspace command
+    /// hooks run, and the directory they start in, are taken from `config`
+    /// now.
+    #[must_use]
+    pub fn for_config_snapshot(config: &crate::config::Config) -> Self {
+        let manager = Self::new(config.workspace_dir.clone());
+        *manager.core.policy.write() = HookPolicy::Fixed {
+            allowed: config.security.workspace_hooks == crate::config::WorkspaceHooks::On,
+            launch_root: config
+                .config_path
+                .parent()
+                .filter(|dir| !dir.as_os_str().is_empty())
+                .map(|dir| dir.join("hooks")),
+        };
+        manager
     }
 
     /// Shorten the per-event delivery bound (tests).
@@ -134,11 +166,33 @@ impl HookManager {
     /// so no secret waits in the queue. When the queue is full the event is
     /// dropped and counted (see [`Self::dispatch_stats`]).
     pub fn emit(&self, event: HookEvent, payload: serde_json::Value) -> impl std::future::Future<Output = ()> + use<> {
-        let owned = match redacted_hook_payload(&payload) {
+        self.emit_as(event, payload, super::identity::current().as_ref())
+    }
+
+    /// [`Self::emit`] for an event that belongs to `identity` rather than to
+    /// the turn the calling task runs (a session opened, a scheduled run
+    /// claimed).
+    pub fn emit_for(
+        &self,
+        identity: &super::identity::HookIdentity,
+        event: HookEvent,
+        payload: serde_json::Value,
+    ) -> impl std::future::Future<Output = ()> + use<> {
+        self.emit_as(event, payload, Some(identity))
+    }
+
+    pub(super) fn emit_as(
+        &self,
+        event: HookEvent,
+        data: serde_json::Value,
+        identity: Option<&super::identity::HookIdentity>,
+    ) -> impl std::future::Future<Output = ()> + use<> {
+        let owned = match redacted_hook_payload(&data) {
             std::borrow::Cow::Owned(redacted) => Some(redacted),
             std::borrow::Cow::Borrowed(_) => None,
         };
-        let payload = owned.unwrap_or(payload);
+        let data = owned.unwrap_or(data);
+        let payload = super::envelope::build(event, &self.workspace_dir, identity, data);
         let sent = self.sender().map_or(Err("no async runtime"), |sender| {
             sender
                 .try_send(DispatchMessage::Event { event, payload })

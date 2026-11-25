@@ -351,9 +351,10 @@ impl ChatState {
     ///
     /// Effect ordering guarantee (the executor consumes the Vec in order):
     ///
-    /// - `[0]` NotifyHook(TurnComplete) — webhooks / observers learn the turn finished first
-    /// - `[1]` SaveSession(snapshot)    — persist turns (dual_write_guard prevents double writes)
-    /// - `[2]` RequestRedraw            — the UI refresh comes last
+    /// - `[0]` SaveSession(snapshot)    — persist turns (dual_write_guard prevents double writes)
+    /// - `[1]` RequestRedraw            — the UI refresh comes last
+    ///
+    /// The `turn_complete` hook event is not an effect: the turn engine emits it.
     ///
     /// **Important**: the snapshot uses the reducer's own `session.turns` (written by
     /// `RecordAssistantTurn`), not the legacy `chat_session` copy. Pure mode keeps both in sync and
@@ -397,15 +398,7 @@ impl ChatState {
             });
         }
         self.refresh_provider_worker_view_if_focused();
-        let chars = final_text.chars().count();
         let effects = vec![
-            Effect::NotifyHook {
-                event: HookEvent::TurnComplete,
-                payload: serde_json::json!({
-                    "mode": "chat",
-                    "response_chars": chars,
-                }),
-            },
             Effect::SaveSession(self.session_commit()),
             Effect::RequestRedraw,
         ];
@@ -441,15 +434,7 @@ impl ChatState {
         if !reasoning.trim().is_empty() {
             self.ui.conversation_lines.push(reasoning);
         }
-        let chars = final_text.chars().count();
         let effects = vec![
-            Effect::NotifyHook {
-                event: HookEvent::TurnComplete,
-                payload: serde_json::json!({
-                    "mode": "chat",
-                    "response_chars": chars,
-                }),
-            },
             Effect::SaveSession(self.session_commit()),
             Effect::RequestRedraw,
         ];

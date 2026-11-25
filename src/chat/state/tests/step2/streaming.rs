@@ -209,8 +209,8 @@ fn test_redux_stream_completed_clears_draft_and_pushes_assistant() {
     }
     assert!(has_request_redraw(&effects));
     assert!(
-        effects.iter().any(|e| matches!(e, Effect::NotifyHook { .. })),
-        "must contain NotifyHook(TurnComplete)"
+        effects.iter().any(|e| matches!(e, Effect::SaveSession(_))),
+        "must contain SaveSession"
     );
 }
 

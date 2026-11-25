@@ -276,7 +276,7 @@ pub(super) fn provider_label_sinks_redact_url_userinfo() {
         ),
         // The fan-out point: command hooks, WASM lifecycle hooks and the
         // plugin event bus all receive the payload `emit` redacted.
-        ("src/hooks/manager.rs", "pub fn emit(", "redacted_hook_payload("),
+        ("src/hooks/manager.rs", "fn emit_as(", "redacted_hook_payload("),
         (
             "src/hooks/event.rs",
             "fn redacted_hook_payload(",

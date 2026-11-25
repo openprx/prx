@@ -1,11 +1,15 @@
 //! Lifecycle hooks: the event types, the workspace `hooks.json`, command
 //! launch, the queued delivery and the manager that owns them.
 
+mod child;
 mod config;
-mod hook_core;
+mod envelope;
 mod event;
+mod hook_core;
+mod identity;
 mod launch;
 mod manager;
+mod schedule;
 mod tools;
 
 #[cfg(test)]
@@ -15,7 +19,10 @@ pub use config::{
     HookChange, HookDiagnostics, WORKSPACE_HOOKS_OPT_IN, blocked_hooks_note, workspace_hook_actions,
 };
 pub use event::{HookEvent, payload_error};
+pub use identity::{HookIdentity, current as current_identity, notify, scope as identity_scope, scope_optional as identity_scope_optional, set_round};
+pub use child::ChildRun;
 pub use manager::HookManager;
+pub use schedule::ScheduleRun;
 #[cfg(test)]
 use launch::truncate_for_log;
 

@@ -931,15 +931,6 @@ pub(crate) async fn run_with_runtime_envelope(
                     println!("{response}");
                 }
                 observer.record_event(&ObserverEvent::TurnComplete);
-                hooks
-                    .emit(
-                        HookEvent::TurnComplete,
-                        serde_json::json!({
-                            "mode": "single",
-                            "response_chars": response.chars().count(),
-                        }),
-                    )
-                    .await;
                 Ok::<(), anyhow::Error>(())
             });
             let single_result = tokio::select! {

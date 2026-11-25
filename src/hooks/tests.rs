@@ -737,7 +737,7 @@ fn logged_seqs(log: &Path) -> Vec<u64> {
         .unwrap_or_default()
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter_map(|value| value["seq"].as_u64())
+        .filter_map(|value| value["data"]["seq"].as_u64())
         .collect()
 }
 

@@ -5,6 +5,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 use super::config::{HookAction, bounded_timeout};
+use super::envelope::identity_variables;
 use super::hook_core::HookCore;
 use super::event::{HookEvent, redacted_hook_payload};
 use super::{MAX_PAYLOAD_BYTES, MAX_STDERR_BYTES, MAX_STDERR_CHARS};
@@ -80,6 +81,9 @@ impl HookCore {
         cmd.envs(environment);
         cmd.current_dir(&working_dir);
         cmd.env("ZERO_HOOK_EVENT", event.as_str());
+        for (name, value) in identity_variables(payload) {
+            cmd.env(name, value);
+        }
 
         // Avoid execve argv+env size overflow for large payloads.
         const MAX_ENV_PAYLOAD_BYTES: usize = 8 * 1024;

@@ -10,6 +10,18 @@ pub enum HookEvent {
     ToolCall,
     TurnComplete,
     Error,
+    SessionOpened,
+    SessionEnded,
+    TurnOpened,
+    ApprovalRequested,
+    ApprovalDecided,
+    ChildStarted,
+    ChildFinished,
+    ChildFailed,
+    ReductionFinished,
+    ScheduleRunStarted,
+    ScheduleRunFinished,
+    BudgetWarning,
 }
 
 impl HookEvent {
@@ -23,6 +35,18 @@ impl HookEvent {
             Self::ToolCall => "tool_call",
             Self::TurnComplete => "turn_complete",
             Self::Error => "error",
+            Self::SessionOpened => "session_opened",
+            Self::SessionEnded => "session_ended",
+            Self::TurnOpened => "turn_opened",
+            Self::ApprovalRequested => "approval_requested",
+            Self::ApprovalDecided => "approval_decided",
+            Self::ChildStarted => "child_started",
+            Self::ChildFinished => "child_finished",
+            Self::ChildFailed => "child_failed",
+            Self::ReductionFinished => "reduction_finished",
+            Self::ScheduleRunStarted => "schedule_run_started",
+            Self::ScheduleRunFinished => "schedule_run_finished",
+            Self::BudgetWarning => "budget_warning",
         }
     }
 
@@ -35,7 +59,7 @@ impl HookEvent {
         }
     }
 
-    pub(super) const ALL: [Self; 8] = [
+    pub(super) const ALL: [Self; 20] = [
         Self::AgentStart,
         Self::AgentEnd,
         Self::LlmRequest,
@@ -44,6 +68,18 @@ impl HookEvent {
         Self::ToolCall,
         Self::TurnComplete,
         Self::Error,
+        Self::SessionOpened,
+        Self::SessionEnded,
+        Self::TurnOpened,
+        Self::ApprovalRequested,
+        Self::ApprovalDecided,
+        Self::ChildStarted,
+        Self::ChildFinished,
+        Self::ChildFailed,
+        Self::ReductionFinished,
+        Self::ScheduleRunStarted,
+        Self::ScheduleRunFinished,
+        Self::BudgetWarning,
     ];
 
     pub(super) fn from_name(name: &str) -> Option<Self> {

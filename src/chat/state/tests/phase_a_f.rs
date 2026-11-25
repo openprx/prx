@@ -746,7 +746,7 @@ fn test_s2a_stream_completed_effect_sequence() {
     assert!(!state.control.generating, "generating=false after completion");
     assert!(state.control.active_cancel.is_none(), "active_cancel is reset");
 
-    // Effect sequence: NotifyHook(TurnComplete) + RequestRedraw
+    // The turn engine emits `turn_complete`; the reducer does not.
     let notify_turn_complete = effects.iter().any(|e| {
         matches!(
             e,
@@ -757,8 +757,8 @@ fn test_s2a_stream_completed_effect_sequence() {
         )
     });
     assert!(
-        notify_turn_complete,
-        "StreamCompleted must emit NotifyHook(TurnComplete)"
+        !notify_turn_complete,
+        "StreamCompleted must not emit NotifyHook(TurnComplete): the turn engine does"
     );
     assert!(has_request_redraw(&effects), "StreamCompleted must emit RequestRedraw");
 }

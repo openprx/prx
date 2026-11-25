@@ -152,11 +152,46 @@ pub(crate) async fn run_turn(
         .and_then(|adapter| adapter.provider_trace.clone());
     let started = std::time::Instant::now();
     let provenance = turn_write_provenance(&services);
+    // Every hook event of this turn carries the same identity, whichever
+    // surface runs it; the start and the completion are emitted here, once,
+    // for all of them.
+    let hooks = services.hooks;
+    let turn_id = uuid::Uuid::new_v4().to_string();
+    let (identity, mode) = match services.runtime_adapter.as_ref() {
+        Some(adapter) => {
+            let envelope = &adapter.tool_execution_context.envelope;
+            let mode = match envelope.source {
+                crate::runtime::envelope::RuntimeSource::Chat => "chat",
+                crate::runtime::envelope::RuntimeSource::Agent => "single",
+                source => crate::hooks::HookIdentity::origin_of(source),
+            };
+            (crate::hooks::HookIdentity::from_envelope(envelope, turn_id), mode)
+        }
+        None => (crate::hooks::HookIdentity::bare_turn(turn_id), channel_name),
+    };
+    let input_chars = history
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map_or(0, |message| message.content.chars().count());
+    hooks
+        .emit_for(
+            &identity,
+            HookEvent::TurnOpened,
+            serde_json::json!({"input_chars": input_chars, "surface": channel_name}),
+        )
+        .await;
     // The loop future is boxed before the scope takes it, so only a pointer
     // moves through the scope's frames.
-    let inner = Box::pin(crate::memory::write_provenance::scope_turn(
-        provenance,
-        Box::pin(run_turn_unguarded(history, request, services, delivery)),
+    // Type-erased so the auto-trait proof of every future that awaits a turn
+    // stops here instead of walking the whole loop future again.
+    let inner: std::pin::Pin<Box<dyn std::future::Future<Output = Result<(ToolLoopOutcome, ToolLoopTrace)>> + Send + '_>> =
+        Box::pin(crate::hooks::identity_scope(
+        identity.clone().with_manager(hooks.clone()),
+        crate::memory::write_provenance::scope_turn(
+            provenance,
+            Box::pin(run_turn_unguarded(history, request, services, delivery)),
+        ),
     ));
     let result = crate::agent::idle::run_guarded(
         crate::agent::idle::configured(),
@@ -187,6 +222,34 @@ pub(crate) async fn run_turn(
         duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         usage,
     };
+    let response_chars = match &result {
+        Ok((ToolLoopOutcome::Text(text), _)) => text.chars().count(),
+        Ok((ToolLoopOutcome::AwaitingApproval { reply }, _)) => reply.chars().count(),
+        _ => 0,
+    };
+    let token_source = match &result {
+        Ok((_, trace)) => Some(trace),
+        Err(_) => settled_trace.as_ref(),
+    };
+    let tokens = |pick: fn(&crate::llm::route_decision::TokenUsage) -> Option<u32>| {
+        token_source.and_then(|trace| pick(&trace.tokens_used))
+    };
+    hooks
+        .emit_for(
+            &identity,
+            HookEvent::TurnComplete,
+            serde_json::json!({
+                "mode": mode,
+                "response_chars": response_chars,
+                "status": ended.result.as_str(),
+                "awaiting_approval": matches!(&result, Ok((ToolLoopOutcome::AwaitingApproval { .. }, _))),
+                "rounds": identity.round().unwrap_or(0),
+                "duration_ms": ended.duration_ms,
+                "input_tokens": tokens(|usage| usage.prompt_tokens),
+                "output_tokens": tokens(|usage| usage.completion_tokens),
+            }),
+        )
+        .await;
     advisory_service
         .advisory()
         .observe(|| advisory_context.terminal_execution_trace(), advisory_id, ended);
@@ -687,6 +750,7 @@ async fn run_turn_unguarded(
     let mut iteration = 0usize;
     loop {
         iteration = iteration.saturating_add(1);
+        crate::hooks::set_round(iteration);
         // Notify progress for multi-iteration tool loops (skip the first iteration).
         if iteration > 1 {
             if let Some(ref tx) = on_tool_call {
