@@ -424,6 +424,22 @@ pub struct SkillsConfig {
     /// environment variable is never read for this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_token: Option<String>,
+    /// Git repositories that `prx skills sync` and the `skills_manage` action
+    /// `sync` clone or pull. Default: the two community repositories below.
+    /// An empty list makes sync do nothing. The repository whose name is
+    /// `openclaw` is sparse-cloned (`skills/` only) into `openclaw_skills_dir`;
+    /// at most one other repository is cloned into `open_skills_dir`. Each
+    /// URL is printed before it is contacted.
+    #[serde(default = "default_skills_sync_repositories")]
+    pub sync_repositories: Vec<String>,
+}
+
+/// Default `[skills] sync_repositories`.
+pub fn default_skills_sync_repositories() -> Vec<String> {
+    vec![
+        "https://github.com/besoeasy/open-skills".to_string(),
+        "https://github.com/openclaw/openclaw".to_string(),
+    ]
 }
 
 impl Default for SkillsConfig {
@@ -432,6 +448,7 @@ impl Default for SkillsConfig {
             open_skills_dir: None,
             openclaw_skills_dir: None,
             github_token: None,
+            sync_repositories: default_skills_sync_repositories(),
         }
     }
 }

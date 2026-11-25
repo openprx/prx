@@ -1209,9 +1209,14 @@ impl SkillsManageTool {
                 crate::skills::validate_installed_skill(&self.workspace_dir, name)
                     .map(|path| json!({"action": action, "name": name, "valid": true, "path": path}))
             }
-            "sync" => crate::skills::sync_community_skill_repositories(&self.config)
+            "sync" => {
+                let mut contacted: Vec<String> = Vec::new();
+                crate::skills::sync_community_skill_repositories(&self.config, &mut |line| {
+                    contacted.push(line.to_string());
+                })
                 .await
-                .map(|()| json!({"action": action, "synchronized": true})),
+                .map(|synced| json!({"action": action, "synchronized": synced > 0, "repositories": synced, "log": contacted}))
+            }
             "remove" => {
                 let name = Self::required_string(&args, "name")?;
                 crate::skills::remove_installed_skill(&self.workspace_dir, name)

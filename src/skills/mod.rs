@@ -10,18 +10,18 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 
+mod community_sync;
 pub mod discovery;
 mod catalog_stamp;
 mod publication;
+pub use community_sync::sync_community_skill_repositories;
 pub(crate) use publication::publish_staged_skill_inactive;
 pub mod lifecycle;
 mod lifecycle_cli;
 pub mod lifecycle_runtime;
 
-const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".openprx-open-skills-sync";
 
-const OPENCLAW_SKILLS_REPO_URL: &str = "https://github.com/openclaw/openclaw";
 const OPENCLAW_SKILLS_SYNC_MARKER: &str = ".openprx-openclaw-skills-sync";
 
 const MAX_SKILLS: usize = 256;
@@ -771,7 +771,7 @@ fn resolve_open_skills_dir(config_open_skills_dir: Option<&str>) -> Option<PathB
     crate::config::user_home_dir().map(|home| home.join("open-skills"))
 }
 
-async fn clone_open_skills_repo(repo_dir: &Path) -> bool {
+async fn clone_open_skills_repo(repo_dir: &Path, repo_url: &str) -> bool {
     if let Some(parent) = repo_dir.parent() {
         if let Err(err) = std::fs::create_dir_all(parent) {
             tracing::warn!(
@@ -789,7 +789,7 @@ async fn clone_open_skills_repo(repo_dir: &Path) -> bool {
             return false;
         }
     };
-    cmd.args(["clone", "--depth", "1", OPEN_SKILLS_REPO_URL]).arg(repo_dir);
+    cmd.args(["clone", "--depth", "1", "--", repo_url]).arg(repo_dir);
     let output = crate::runtime::shell_process::run_managed_output(cmd).await;
 
     match output {
@@ -965,7 +965,7 @@ fn resolve_openclaw_skills_dir(config_openclaw_skills_dir: Option<&str>) -> Opti
 }
 
 /// Sparse-clone the OpenClaw repository, checking out only the `skills/` directory.
-async fn clone_openclaw_skills_repo(repo_dir: &Path) -> bool {
+async fn clone_openclaw_skills_repo(repo_dir: &Path, repo_url: &str) -> bool {
     if let Some(parent) = repo_dir.parent() {
         if let Err(err) = std::fs::create_dir_all(parent) {
             tracing::warn!(
@@ -989,7 +989,8 @@ async fn clone_openclaw_skills_repo(repo_dir: &Path) -> bool {
         "1",
         "--filter=blob:none",
         "--sparse",
-        OPENCLAW_SKILLS_REPO_URL,
+        "--",
+        repo_url,
     ])
     .arg(repo_dir);
     let output = crate::runtime::shell_process::run_managed_output(cmd).await;
@@ -1068,36 +1069,6 @@ async fn pull_openclaw_skills_repo(repo_dir: &Path) -> bool {
 
 fn mark_openclaw_skills_synced(repo_dir: &Path) -> Result<()> {
     std::fs::write(repo_dir.join(OPENCLAW_SKILLS_SYNC_MARKER), b"synced")?;
-    Ok(())
-}
-
-/// Explicitly clone/pull enabled community repositories outside inference and
-/// catalog request paths.
-pub async fn sync_community_skill_repositories(config: &crate::config::Config) -> Result<()> {
-    let repo_dir = resolve_open_skills_dir(config.skills.open_skills_dir.as_deref())
-        .context("could not resolve open-skills directory")?;
-    let synced = if repo_dir.exists() {
-        pull_open_skills_repo(&repo_dir).await
-    } else {
-        clone_open_skills_repo(&repo_dir).await
-    };
-    if !synced {
-        bail!("failed to synchronize open-skills repository");
-    }
-    mark_open_skills_synced(&repo_dir)?;
-
-    let repo_dir = resolve_openclaw_skills_dir(config.skills.openclaw_skills_dir.as_deref())
-        .context("could not resolve OpenClaw skills directory")?;
-    let synced = if repo_dir.exists() {
-        pull_openclaw_skills_repo(&repo_dir).await
-    } else {
-        clone_openclaw_skills_repo(&repo_dir).await
-    };
-    if !synced {
-        bail!("failed to synchronize OpenClaw skills repository");
-    }
-    mark_openclaw_skills_synced(&repo_dir)?;
-    invalidate_skill_catalog(&config.workspace_dir);
     Ok(())
 }
 
@@ -1867,11 +1838,13 @@ pub async fn handle_command(command: crate::SkillCommands, config: &crate::confi
             println!();
         }
         crate::SkillCommands::Sync => {
-            sync_community_skill_repositories(config).await?;
-            println!(
-                "  {} Community skill repositories synchronized.",
-                console::style("✓").green().bold()
-            );
+            let synced = sync_community_skill_repositories(config, &mut |line| println!("  {line}")).await?;
+            if synced > 0 {
+                println!(
+                    "  {} Community skill repositories synchronized.",
+                    console::style("✓").green().bold()
+                );
+            }
         }
         crate::SkillCommands::Install { source } => {
             println!("Installing skill from: {source}");
