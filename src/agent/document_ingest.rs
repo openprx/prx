@@ -260,11 +260,17 @@ pub(super) async fn persist_tool_output_document(
         );
         return Some("backend_not_supported");
     }
+    // The document id and hash name the original output (they are what the
+    // history reference and the tool rows quote); the stored text is the
+    // redacted form the persistence layer applies to every stored tool text,
+    // so a later chunk lookup returns the same masked text a replay shows.
     let (document_id, sha256) = tool_output_document_id(tool_name, content);
+    let stored_content = crate::security::redaction::redact_secrets(content);
     let metadata_json = serde_json::json!({
         "tool": tool_name,
         "content_sha256": sha256,
         "bytes": content.len(),
+        "redacted": stored_content != content,
     })
     .to_string();
     let input = DocumentIngestInput {
@@ -278,7 +284,7 @@ pub(super) async fn persist_tool_output_document(
         source_kind: "tool_output".to_string(),
         source_uri: Some(format!("tool:{tool_name}")),
         title: Some(format!("Tool output: {tool_name}")),
-        content: content.to_string(),
+        content: stored_content,
         mime_type: Some("text/plain".to_string()),
         visibility: runtime.visibility.clone(),
         metadata_json: Some(metadata_json),
