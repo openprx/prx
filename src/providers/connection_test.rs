@@ -123,11 +123,11 @@ pub async fn test_connection(
         Ok(resolved) => {
             let verified = matches!(resolved.verification(), Verification::Verified);
             let mut detail = resolved.warning().unwrap_or_default();
-            if let Some(warning) = selection::pricing_warning(&resolved, &config.cost) {
+            if let Some(note) = selection::pricing_note(&resolved, config) {
                 if !detail.is_empty() {
                     detail.push_str("; ");
                 }
-                detail.push_str(&warning);
+                detail.push_str(note.text());
             } else if let Some(notice) =
                 selection::subscription_billing_notice(resolved.provider_label(), resolved.model(), &config.cost)
             {

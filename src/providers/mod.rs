@@ -803,7 +803,8 @@ pub fn create_provider_for(
         model_fallbacks,
         ..reliability.clone()
     };
-    let fallback_admission = fallback_admission_for(resolved, catalog, &reliability, cost);
+    let fallback_admission =
+        fallback_admission_for(resolved, catalog, &reliability, cost, options.cost_ceiling_configured);
     let mut scoped = options.clone();
     if accepts_tool_dialect_declarations(label) {
         scoped
@@ -936,6 +937,7 @@ pub(crate) fn fallback_admission_for(
     catalog: &catalog::CatalogView,
     reliability: &crate::config::ReliabilityConfig,
     cost: &crate::config::schema::CostConfig,
+    ceiling_configured: bool,
 ) -> reliable::FallbackAdmission {
     let primary = resolved.model();
     let siblings = reliability.model_fallbacks.get(primary).map_or(&[][..], Vec::as_slice);
@@ -955,16 +957,19 @@ pub(crate) fn fallback_admission_for(
                 match crate::llm::route_decision::usage_cost_resolution(provider, model, 1, 1, 0, 0, cost) {
                     crate::llm::route_decision::UsagePrice::Priced(_)
                     | crate::llm::route_decision::UsagePrice::Subscription => true,
+                    // With no spend ceiling an unpriced fallback has nothing to
+                    // be budgeted against and is admitted.
                     crate::llm::route_decision::UsagePrice::Missing => {
-                        crate::cost::estimate::provider_is_zero_price_exempt(
-                            &provider_id,
-                            // Sibling models and a deduplicated fallback entry of the primary
-                            // provider run on the primary connection; other providers use
-                            // their own default endpoint.
-                            (provider_id == *resolved.provider())
-                                .then(|| resolved.credential().api_url())
-                                .flatten(),
-                        )
+                        !ceiling_configured
+                            || crate::cost::estimate::provider_is_zero_price_exempt(
+                                &provider_id,
+                                // Sibling models and a deduplicated fallback entry of the primary
+                                // provider run on the primary connection; other providers use
+                                // their own default endpoint.
+                                (provider_id == *resolved.provider())
+                                    .then(|| resolved.credential().api_url())
+                                    .flatten(),
+                            )
                     }
                     crate::llm::route_decision::UsagePrice::Invalid => false,
                 };

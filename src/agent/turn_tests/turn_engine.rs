@@ -3690,7 +3690,7 @@ async fn run_turn_refuses_unpriced_and_tool_less_fallbacks_after_primary_429() {
         )
         .expect("primary chat selection resolves");
         let fallback_admission =
-            crate::providers::fallback_admission_for(&resolved, &catalog, &config.reliability, &config.cost);
+            crate::providers::fallback_admission_for(&resolved, &catalog, &config.reliability, &config.cost, true);
 
         let primary_calls = Arc::new(AtomicUsize::new(0));
         let unpriced_calls = Arc::new(AtomicUsize::new(0));

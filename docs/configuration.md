@@ -3180,6 +3180,13 @@ That is why hosted rows differ:
   (the bare model id, not `custom:<url>/moonshotai/kimi-k2.5`)
 - `custom:<url>` / `kimi-k2.5` → `[cost.prices."custom:<url>/kimi-k2.5"]`
 
+A model with no entry here and no catalog tariff is admitted while no spend
+ceiling is configured (`[cost] daily_limit_usd` or `monthly_limit_usd`,
+`[autonomy] max_cost_per_day_cents`, an agent's `limits.max_cost_per_day_cents`):
+its tokens run, its cost is not tracked (`unknown_pricing`, never zero). Once any
+ceiling is configured G6 refuses such a model with `G6 budget admission refuses
+unpriced model`, because it cannot be budgeted; add its price to lift that.
+
 A key that matches no configured provider/model under that rule, and no
 catalog-derived router candidate when `[[router.models]]` is empty, is a
 warning at load and in `prx doctor`, not a load error. For a `custom:<url>`

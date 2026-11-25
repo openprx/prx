@@ -641,13 +641,13 @@ pub(crate) fn subscription_billing_notice(
     .then_some(SUBSCRIPTION_BILLING_NOTICE)
 }
 
-/// Diagnose the same missing tariff that leaves G6 without a cost estimate.
-/// This reports configuration to the operator; it never changes admission.
-/// A subscription row is not unpriced; [`subscription_billing_notice`] covers it.
-pub(crate) fn pricing_warning(
+/// The `provider`, `model` and `[cost.prices]` key of `resolved`, redacted for
+/// display, when it has no price row, no catalog tariff and is not a local
+/// zero-price model.
+fn missing_price_labels(
     resolved: &catalog::ResolvedModel,
     cost: &crate::config::schema::CostConfig,
-) -> Option<String> {
+) -> Option<(String, String, String)> {
     use crate::llm::route_decision::{UsagePrice, usage_cost_resolution};
     let provider = resolved.provider_label();
     let model = resolved.model();
@@ -659,12 +659,70 @@ pub(crate) fn pricing_warning(
         return None;
     }
     let key = crate::config::schema::usage_pricing_key(provider, model);
-    let key = crate::security::redaction::redact_provider_text(&key);
-    let provider = crate::security::redaction::redact_provider_text(provider);
-    let model = crate::security::redaction::redact_provider_text(model);
-    Some(format!(
-        "G6 budget admission refuses unpriced model '{provider}/{model}'; configure [cost.prices.{key:?}] with input, output, cache_read and cache_write in USD per 1M tokens, or select a priced model"
+    Some((
+        crate::security::redaction::redact_provider_text(provider),
+        crate::security::redaction::redact_provider_text(model),
+        crate::security::redaction::redact_provider_text(&key),
     ))
+}
+
+/// Said once when a turn runs on a model with no price because no spend
+/// ceiling applies: its cost is not tracked.
+pub(crate) fn untracked_cost_notice(resolved: &catalog::ResolvedModel) -> String {
+    let provider = crate::security::redaction::redact_provider_text(resolved.provider_label());
+    let model = crate::security::redaction::redact_provider_text(resolved.model());
+    format!("cost of model '{provider}/{model}' is not tracked: no price configured and no cost limit is set")
+}
+
+/// What a missing tariff means for `resolved` under the configuration's spend
+/// limits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PricingNote {
+    /// A spend ceiling is configured, so G6 budget admission refuses the model.
+    Refused(String),
+    /// No spend ceiling is configured: the model runs and its cost is not
+    /// tracked. Informational.
+    Untracked(String),
+}
+
+impl PricingNote {
+    /// The sentence, whichever kind.
+    pub(crate) fn text(&self) -> &str {
+        match self {
+            Self::Refused(text) | Self::Untracked(text) => text,
+        }
+    }
+}
+
+/// Diagnose a model that has no tariff: [`PricingNote::Refused`] when a spend
+/// ceiling is configured (G6 cannot budget it), otherwise
+/// [`PricingNote::Untracked`]. This reports configuration to the operator; it
+/// never changes admission. A subscription row is not unpriced;
+/// [`subscription_billing_notice`] covers it.
+pub(crate) fn pricing_note(resolved: &catalog::ResolvedModel, config: &Config) -> Option<PricingNote> {
+    let (provider, model, key) = missing_price_labels(resolved, &config.cost)?;
+    Some(if crate::cost::estimate::cost_ceiling_configured(config, None) {
+        PricingNote::Refused(refusal_text(&provider, &model, &key))
+    } else {
+        PricingNote::Untracked(format!(
+            "cost of this model is not tracked: no price configured for '{provider}/{model}'; add [cost.prices.{key:?}] with input, output, cache_read and cache_write in USD per 1M tokens to record it (a price is required once a cost limit is set)"
+        ))
+    })
+}
+
+/// The refusal G6 reports for an unpriced model while a spend ceiling applies.
+pub(crate) fn pricing_warning(
+    resolved: &catalog::ResolvedModel,
+    cost: &crate::config::schema::CostConfig,
+) -> Option<String> {
+    let (provider, model, key) = missing_price_labels(resolved, cost)?;
+    Some(refusal_text(&provider, &model, &key))
+}
+
+fn refusal_text(provider: &str, model: &str, key: &str) -> String {
+    format!(
+        "G6 budget admission refuses unpriced model '{provider}/{model}'; configure [cost.prices.{key:?}] with input, output, cache_read and cache_write in USD per 1M tokens, or select a priced model"
+    )
 }
 
 /// How the configured default resolves, in one line for `prx doctor` and

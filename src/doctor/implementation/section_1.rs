@@ -1,7 +1,3 @@
-
-
-
-
 use crate::config::Config;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -1241,8 +1237,11 @@ fn check_model_selection(config: &Config, items: &mut Vec<DiagItem>) {
         &crate::providers::catalog::Requirement::chat(),
         crate::providers::catalog::UnknownPolicy::Invocation,
     ) {
-        if let Some(warning) = crate::providers::selection::pricing_warning(&resolved, &config.cost) {
-            items.push(DiagItem::warn(cat, warning));
+        if let Some(note) = crate::providers::selection::pricing_note(&resolved, config) {
+            items.push(match note {
+                crate::providers::selection::PricingNote::Refused(text) => DiagItem::warn(cat, text),
+                crate::providers::selection::PricingNote::Untracked(text) => DiagItem::ok(cat, text),
+            });
         } else if let Some(notice) = crate::providers::selection::subscription_billing_notice(
             resolved.provider_label(),
             resolved.model(),

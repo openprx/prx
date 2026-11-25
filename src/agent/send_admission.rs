@@ -95,10 +95,11 @@ pub(crate) fn call_token_budget(
     let model = Arc::new(limits.model);
     let cost = Arc::new(limits.cost);
     let (token_model, token_cost) = (Arc::clone(&model), Arc::clone(&cost));
+    let ceiling_configured = limits.ceiling_configured;
     Ok(CallTokenBudget::new(
         move || live_g6_tokens(&context),
         move |schema_bytes| {
-            crate::cost::estimate::estimate_cost(&token_model, &token_cost, schema_bytes)
+            crate::cost::estimate::estimate_cost(&token_model, &token_cost, schema_bytes, ceiling_configured)
                 .map(|estimate| u64::from(estimate.tokens))
         },
     )
@@ -110,7 +111,7 @@ pub(crate) fn call_token_budget(
                 .ok()
         },
         move |schema_bytes| {
-            crate::cost::estimate::estimate_cost(&model, &cost, schema_bytes).map(|estimate| estimate.micro_usd)
+            crate::cost::estimate::estimate_cost(&model, &cost, schema_bytes, ceiling_configured).map(|estimate| estimate.micro_usd)
         },
     ))
 }
@@ -139,7 +140,7 @@ pub(crate) fn protected_first_send(service: &TurnRuntimeService, proof: &dyn Tur
         ),
         crate::llm::route_decision::UsagePrice::Invalid
     );
-    let refusal = unpriced_refusal(&limits.model, &limits.cost)
+    let refusal = unpriced_refusal(&limits.model, &limits.cost, limits.ceiling_configured)
         .or_else(|| invalid.then_some(crate::agent::refusal::RefusalReason::Budget));
     if let Some(reason) = refusal {
         return Err(ProviderSendRefused {
@@ -153,6 +154,7 @@ pub(crate) fn protected_first_send(service: &TurnRuntimeService, proof: &dyn Tur
         &limits.cost,
         u64::try_from(limits.main_input_limit).unwrap_or(u64::MAX),
         u64::try_from(limits.response_reserve).unwrap_or(u64::MAX),
+        limits.ceiling_configured,
     )
     .ok_or_else(|| ProviderSendRefused {
         reason: crate::agent::refusal::RefusalReason::Budget,
@@ -162,10 +164,13 @@ pub(crate) fn protected_first_send(service: &TurnRuntimeService, proof: &dyn Tur
 }
 
 /// The refusal reason when `cost` holds an invalid price row, or `model` has
-/// no price row and is not zero-price exempt.
+/// no price row while a spend ceiling applies (`ceiling_configured`) and it is
+/// not zero-price exempt. Without a ceiling an unpriced model is admitted and
+/// its cost is not tracked.
 fn unpriced_refusal(
     model: &crate::providers::catalog::ResolvedModel,
     cost: &crate::config::schema::CostConfig,
+    ceiling_configured: bool,
 ) -> Option<crate::agent::refusal::RefusalReason> {
     use crate::agent::refusal::RefusalReason;
     use crate::llm::route_decision::UsagePrice;
@@ -176,7 +181,7 @@ fn unpriced_refusal(
         crate::llm::route_decision::usage_cost_resolution(model.provider_label(), model.model(), 0, 0, 0, 0, cost),
         UsagePrice::Missing
     );
-    (missing && !crate::cost::estimate::zero_price_exempt(model))
+    (missing && !crate::cost::estimate::unpriced_is_admitted(model, ceiling_configured))
         .then(|| crate::agent::refusal::unpriced_reason(model.provider_label(), model.model()))
 }
 
@@ -237,9 +242,11 @@ pub(crate) fn admit_provider_send(
         &cost,
         u64::try_from(request).unwrap_or(u64::MAX),
         u64::try_from(limits.response_reserve).unwrap_or(u64::MAX),
+        limits.ceiling_configured,
     )
     .ok_or_else(|| {
-        let reason = unpriced_refusal(&limits.model, &cost).unwrap_or(crate::agent::refusal::RefusalReason::Budget);
+        let reason = unpriced_refusal(&limits.model, &cost, limits.ceiling_configured)
+            .unwrap_or(crate::agent::refusal::RefusalReason::Budget);
         ProviderSendRefused {
             reason,
             diagnostic: "provider send refused: the request cost cannot be estimated".to_owned(),

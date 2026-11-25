@@ -166,6 +166,10 @@ impl<'a> PublicationScope<'a> {
             response_reserve: effective.config.reserve_tokens,
             main_input_limit,
             remaining_micro_usd: budget.budgets.micro_usd,
+            ceiling_configured: crate::cost::estimate::cost_ceiling_configured(
+                &self.generation.effective,
+                proof.cost_root_agent().as_ref().map(|agent| agent.name.as_str()),
+            ),
             model: self.resolve_agent_model(proof)?,
             cost: self.generation.effective.cost.clone(),
         })

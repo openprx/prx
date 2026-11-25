@@ -83,6 +83,12 @@ pub struct ProviderRuntimeOptions {
     /// Which textual tool-call grammar each declared endpoint emits. Empty
     /// means only native `tool_calls` are read, anywhere.
     pub tool_call_dialects: Vec<ToolCallDialectDeclaration>,
+    /// Whether a spend ceiling applies
+    /// ([`crate::cost::estimate::cost_ceiling_configured`]). While it does, a
+    /// fallback model with no price is refused before transport; without one
+    /// it is admitted and its cost is not tracked. Defaults to `true`, the
+    /// refusing side, for options not built from a configuration.
+    pub cost_ceiling_configured: bool,
 }
 
 impl ProviderRuntimeOptions {
@@ -141,6 +147,7 @@ impl Default for ProviderRuntimeOptions {
             ollama_model_num_ctx: Vec::new(),
             tool_schema_dialects: Vec::new(),
             tool_call_dialects: Vec::new(),
+            cost_ceiling_configured: true,
         }
     }
 }
@@ -165,6 +172,7 @@ pub fn provider_runtime_options_from_config(config: &crate::config::Config) -> P
         // inferred from its URL.
         tool_schema_dialects: tool_schema_dialects_from_config(&config.providers),
         tool_call_dialects: tool_call_dialects_from_config(&config.providers),
+        cost_ceiling_configured: crate::cost::estimate::cost_ceiling_configured(config, None),
     }
 }
 

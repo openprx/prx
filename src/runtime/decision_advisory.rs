@@ -68,6 +68,7 @@ impl AdvisoryInput {
             &limits.cost,
             u64::try_from(limits.main_input_limit).unwrap_or(u64::MAX),
             u64::try_from(limits.response_reserve).unwrap_or(u64::MAX),
+            limits.ceiling_configured,
         )
         .map(|estimate| (crate::cost::estimate::candidate_tokens(0), estimate.micro_usd));
         Some(Self {

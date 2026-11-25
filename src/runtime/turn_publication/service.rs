@@ -313,6 +313,10 @@ pub(crate) struct SendLimits {
     /// window minus the response and decision reserves.
     pub(crate) main_input_limit: usize,
     pub(crate) remaining_micro_usd: u64,
+    /// Whether any spend ceiling applies to this turn
+    /// ([`crate::cost::estimate::cost_ceiling_configured`]). Without one, a
+    /// model with no price is admitted and its cost is not tracked.
+    pub(crate) ceiling_configured: bool,
     pub(crate) model: ResolvedModel,
     pub(crate) cost: crate::config::schema::CostConfig,
 }

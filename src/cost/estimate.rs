@@ -5,15 +5,40 @@ use crate::providers::catalog::ResolvedModel;
 use crate::tools::capability::contract::CostEstimate;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// Whether any spend ceiling applies to a turn: `[cost] daily_limit_usd` or
+/// `monthly_limit_usd`, `[autonomy] max_cost_per_day_cents`, or the named
+/// agent's own `limits.max_cost_per_day_cents`. PRX sets none by default. A
+/// child's allowance and manifest are carved out of its parent's remaining
+/// spend, so they are a ceiling exactly when the parent's is.
+///
+/// A model with no price cannot be budgeted: it is refused only while this
+/// returns true. Without a ceiling its cost is simply not tracked.
+#[must_use]
+pub(crate) fn cost_ceiling_configured(config: &crate::config::Config, root_agent: Option<&str>) -> bool {
+    config.cost.daily_limit_usd.is_some()
+        || config.cost.monthly_limit_usd.is_some()
+        || config.autonomy.effective_max_cost_per_day_cents()
+            != crate::config::schema::UNLIMITED_AUTONOMY_MAX_COST_PER_DAY_CENTS
+        || root_agent
+            .and_then(|name| config.agents.get(name))
+            .is_some_and(|agent| agent.limits.max_cost_per_day_cents.is_some())
+}
+
 /// Candidate estimate for one schema, with the shared pricing and refusal rules.
-pub(crate) fn estimate_cost(model: &ResolvedModel, pricing: &CostConfig, schema_bytes: usize) -> Option<CostEstimate> {
+/// `ceiling_configured` is [`cost_ceiling_configured`] for the turn.
+pub(crate) fn estimate_cost(
+    model: &ResolvedModel,
+    pricing: &CostConfig,
+    schema_bytes: usize,
+    ceiling_configured: bool,
+) -> Option<CostEstimate> {
     let prices_valid = pricing.prices.values().all(|price| price.is_finite_nonnegative());
     estimate_cost_with_validity(
         model,
         pricing,
         schema_bytes,
         prices_valid,
-        zero_price_exempt(model),
+        unpriced_is_admitted(model, ceiling_configured),
         &AtomicBool::new(false),
         &AtomicBool::new(false),
     )
@@ -22,6 +47,14 @@ pub(crate) fn estimate_cost(model: &ResolvedModel, pricing: &CostConfig, schema_
 pub(crate) fn zero_price_exempt(model: &ResolvedModel) -> bool {
     provider_is_zero_price_exempt(model.provider(), model.credential().api_url())
         || (cfg!(test) && model.provider().catalog_name() == Some("mock"))
+}
+
+/// Whether a model with no price row is admitted at zero estimated money: no
+/// spend ceiling applies to the turn (nothing to budget against, so its cost
+/// is simply not tracked), or the model is exempt under
+/// [`provider_is_zero_price_exempt`].
+pub(crate) fn unpriced_is_admitted(model: &ResolvedModel, ceiling_configured: bool) -> bool {
+    !ceiling_configured || zero_price_exempt(model)
 }
 
 /// The one provider rule for "no price row means no money": a local Ollama
@@ -100,6 +133,7 @@ pub(crate) fn estimate_request_cost(
     pricing: &CostConfig,
     input_tokens: u64,
     output_tokens: u64,
+    ceiling_configured: bool,
 ) -> Option<CostEstimate> {
     if !pricing.prices.values().all(|price| price.is_finite_nonnegative()) {
         return None;
@@ -108,7 +142,7 @@ pub(crate) fn estimate_request_cost(
         model,
         pricing,
         (input_tokens, output_tokens),
-        zero_price_exempt(model),
+        unpriced_is_admitted(model, ceiling_configured),
         &AtomicBool::new(false),
         &AtomicBool::new(false),
     )
@@ -144,7 +178,21 @@ fn estimate_tokens_with_validity(
             }
             0.0
         }
-        crate::llm::route_decision::UsagePrice::Missing if zero_price_exempt => 0.0,
+        crate::llm::route_decision::UsagePrice::Missing if zero_price_exempt => {
+            // A local Ollama model is free by rule and says nothing. Any other
+            // unpriced model runs because no spend ceiling applies: say once
+            // that its cost is not tracked.
+            if !provider_is_zero_price_exempt(model.provider(), model.credential().api_url())
+                && !noted_subscription.swap(true, Ordering::Relaxed)
+            {
+                tracing::info!(
+                    target: "providers::selection",
+                    "{}",
+                    crate::providers::selection::untracked_cost_notice(model)
+                );
+            }
+            0.0
+        }
         crate::llm::route_decision::UsagePrice::Missing => {
             if !warned_unpriced.swap(true, Ordering::Relaxed)
                 && let Some(warning) = crate::providers::selection::pricing_warning(model, pricing)
@@ -287,7 +335,7 @@ mod tests {
         let recorded_usd = crate::llm::route_decision::usage_cost_usd("openai", "gpt-4o", 64, 64, 0, 0, &config.cost)
             .expect("configured price");
         let expected = crate::cost::tracker::ceil_micro_usd(recorded_usd).expect("recorded amount");
-        let estimate = estimate_cost(&model, &config.cost, 0).expect("priced candidate");
+        let estimate = estimate_cost(&model, &config.cost, 0, true).expect("priced candidate");
         assert_eq!(expected, 4);
         assert_eq!(u128::from(estimate.micro_usd), expected);
     }
@@ -323,14 +371,14 @@ mod tests {
             UnknownPolicy::Invocation,
         )
         .expect("remote ollama resolves");
-        assert!(estimate_cost(&remote, &config.cost, 0).is_none());
+        assert!(estimate_cost(&remote, &config.cost, 0, true).is_none());
     }
 
     #[test]
     fn mock_is_zero_money_without_an_external_tariff() {
         let config = crate::config::Config::default();
         let model = model(&config, "mock", "prx-local-model");
-        let estimate = estimate_cost(&model, &config.cost, 0).expect("local mock estimate");
+        let estimate = estimate_cost(&model, &config.cost, 0, true).expect("local mock estimate");
         assert_eq!(estimate.tokens, 128);
         assert_eq!(estimate.micro_usd, 0);
     }
@@ -339,7 +387,7 @@ mod tests {
     fn huge_schema_saturates_over_budget_instead_of_wrapping_to_zero() {
         let config = crate::config::Config::default();
         let model = model(&config, "openai", "gpt-4o");
-        let result = estimate_cost(&model, &config.cost, usize::MAX);
+        let result = estimate_cost(&model, &config.cost, usize::MAX, true);
         assert!(result.is_none_or(|cost| cost.tokens == u32::MAX && cost.micro_usd > 1_000_000));
     }
 }

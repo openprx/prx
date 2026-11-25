@@ -2313,6 +2313,7 @@ fn byo_isolated_options(temp: &TempDir) -> ProviderRuntimeOptions {
         // (`Raw` schemas, native tool calls only) these tests assume.
         tool_schema_dialects: Vec::new(),
         tool_call_dialects: Vec::new(),
+        cost_ceiling_configured: true,
     }
 }
 

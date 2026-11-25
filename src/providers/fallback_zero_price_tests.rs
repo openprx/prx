@@ -25,7 +25,7 @@ fn sibling_is_cost_admitted(api_url: Option<&str>) -> bool {
     reliability
         .model_fallbacks
         .insert("prx-local-model".to_string(), vec!["prx-unpriced-sibling".to_string()]);
-    let admission = fallback_admission_for(&resolved, &catalog, &reliability, &config.cost);
+    let admission = fallback_admission_for(&resolved, &catalog, &reliability, &config.cost, true);
     admission
         .eligibility(&ProviderId::of("ollama"), "prx-unpriced-sibling")
         .expect("test: sibling is described")

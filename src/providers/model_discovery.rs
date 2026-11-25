@@ -130,7 +130,7 @@ pub(crate) fn onboarding_model_warning(
         Some(crate::providers::selection::SUBSCRIPTION_BILLING_NOTICE.to_owned())
     } else {
         model_has_no_billing_tariff(provider, model, &crate::config::schema::CostConfig::default())
-            .then_some("pricing unavailable; add [cost.prices] before cost-admitted use".to_owned())
+            .then_some("pricing unavailable; its cost is not tracked unless [cost.prices] is added (required once a cost limit is set)".to_owned())
     };
     match (lifecycle, pricing) {
         (Some(lifecycle), Some(pricing)) => Some(format!("{lifecycle}; {pricing}")),

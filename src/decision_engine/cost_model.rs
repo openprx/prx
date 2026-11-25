@@ -7,7 +7,7 @@ use crate::config::Config;
 use crate::config::schema::CostConfig;
 #[cfg(test)]
 use crate::cost::estimate::estimate_cost;
-use crate::cost::estimate::{estimate_cost_with_validity, zero_price_exempt};
+use crate::cost::estimate::{cost_ceiling_configured, estimate_cost_with_validity, unpriced_is_admitted};
 use crate::providers::catalog::ResolvedModel;
 use crate::tools::capability::catalog::CapabilityEntry;
 #[cfg(test)]
@@ -93,7 +93,7 @@ impl<'a> RuntimeCostModel<'a> {
             pricing: &config.cost,
             observed_latency_ms,
             prices_valid: config.cost.prices.values().all(|price| price.is_finite_nonnegative()),
-            zero_price_exempt: zero_price_exempt(model),
+            zero_price_exempt: unpriced_is_admitted(model, cost_ceiling_configured(config, None)),
             warned_unpriced: AtomicBool::new(false),
             noted_subscription: AtomicBool::new(false),
         }
@@ -170,7 +170,7 @@ pub(crate) fn build_cost_model(
 ) -> CapabilityCostModel {
     let mut per_capability = BTreeMap::new();
     for entry in catalog.iter_entries() {
-        if let Some(cost) = estimate_cost(model, pricing, entry.schema_bytes) {
+        if let Some(cost) = estimate_cost(model, pricing, entry.schema_bytes, true) {
             per_capability.insert(
                 CapabilityRef {
                     id: entry.id.clone(),
@@ -188,7 +188,7 @@ pub(crate) fn build_cost_model(
         }
     }
     let mut estimates = BTreeMap::new();
-    if let Some(cost) = estimate_cost(model, pricing, 0) {
+    if let Some(cost) = estimate_cost(model, pricing, 0, true) {
         estimates.insert(
             CapabilityTarget::None,
             (cost, default_latency_ms(CapabilityTarget::None)),
@@ -612,7 +612,7 @@ mod tests {
     fn ollama_is_zero_money_unless_it_has_an_explicit_price() {
         let config = crate::config::Config::default();
         let model = model(&config, "ollama", "prx-local-model");
-        let zero = estimate_cost(&model, &config.cost, 0).expect("local token estimate");
+        let zero = estimate_cost(&model, &config.cost, 0, true).expect("local token estimate");
         assert_eq!(zero.tokens, 128);
         assert_eq!(zero.micro_usd, 0);
 
@@ -627,7 +627,7 @@ mod tests {
             },
         );
         assert!(
-            estimate_cost(&model, &priced.cost, 0)
+            estimate_cost(&model, &priced.cost, 0, true)
                 .expect("explicit local price")
                 .micro_usd
                 > 0
@@ -639,7 +639,7 @@ mod tests {
             .expect("local price")
             .input = -1.0;
         assert!(
-            estimate_cost(&model, &priced.cost, 0).is_none(),
+            estimate_cost(&model, &priced.cost, 0, true).is_none(),
             "invalid tariff must not become local free pricing"
         );
         assert!(
@@ -654,7 +654,7 @@ mod tests {
             .expect("local price")
             .input = f64::MAX;
         assert!(
-            estimate_cost(&model, &priced.cost, 0).is_none(),
+            estimate_cost(&model, &priced.cost, 0, true).is_none(),
             "overflowed tariff must not become local free pricing"
         );
         priced
@@ -670,7 +670,7 @@ mod tests {
             .expect("local price")
             .output = f64::from_bits(1);
         assert!(
-            estimate_cost(&model, &priced.cost, 0).is_none(),
+            estimate_cost(&model, &priced.cost, 0, true).is_none(),
             "positive subnormal tariff must not become local free pricing"
         );
     }

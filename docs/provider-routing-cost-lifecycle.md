@@ -54,6 +54,14 @@ is disabled; disabling reporting does not erase a charge. Projection failure
 remains an explicit terminal settlement result and is not evidence that no
 provider cost was incurred.
 
+G6 admits a model with no price only while no spend ceiling is configured
+(`[cost]` daily or monthly limit, `[autonomy] max_cost_per_day_cents`, or the
+named agent's `limits.max_cost_per_day_cents`; children inherit the parent's).
+PRX sets none by default, so an unpriced model, such as a `custom:<url>`
+endpoint, runs with its cost untracked (`unknown_pricing`). With a ceiling
+configured the same model is refused, because a turn that cannot be priced
+cannot be held to a limit. Fallback admission follows the same rule.
+
 Physical subscription settlements use versioned `subscription_settled_v1`
 reservation-journal entries. Existing journals remain readable. After such a
 settlement, a binary without that event type cannot replay the journal; rollback

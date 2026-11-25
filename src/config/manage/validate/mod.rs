@@ -486,8 +486,10 @@ pub(crate) fn check_affected_selections(
         selection::default_model(candidate),
         &Requirement::chat(),
         UnknownPolicy::Invocation,
-    ) && let Some(warning) = selection::pricing_warning(&resolved, &candidate.cost)
+    ) && let Some(selection::PricingNote::Refused(warning)) = selection::pricing_note(&resolved, candidate)
     {
+        // Without a spend ceiling the model runs and its cost is not tracked:
+        // that is not a warning.
         warnings.push(warning);
     }
     // The decision backend: the same check a reload runs (CDP-12).

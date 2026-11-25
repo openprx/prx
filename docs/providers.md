@@ -308,8 +308,9 @@ channel `/models <provider>` switch while that hint is selected preserve the
 same route-named refusal text.
 
 At failover time, every fallback pair is checked against the primary turn's
-admission facts before a request is sent. A fallback needs a valid cost entry
-(except the existing local Ollama zero-cost case), and a turn that published
+admission facts before a request is sent. While a spend ceiling is configured, a fallback needs a valid cost entry
+(except the existing local Ollama zero-cost case); without a ceiling an
+unpriced fallback is admitted. A turn that published
 native tools skips any fallback whose exact model lacks verified native-tool
 support. A rate-limited primary therefore cannot move the request onto an
 unpriced or tool-less fallback.
@@ -329,8 +330,10 @@ encrypted provider-reference store; if that store step fails after the files
 were written, the error names the directory and what remains. `--from-env VAR`
 sets the same root `api_key`.
 
-The endpoint's models have no catalog price; see [Unpriced models and operator
-overrides](#unpriced-models-and-operator-overrides).
+The endpoint's models have no catalog price. With no spend ceiling configured
+they run and their cost is not tracked; add `[cost.prices."<model>"]` (see
+[`[cost.prices]` keys](configuration.md#costprices-keys)) to record cost, which
+is required once a cost limit is set.
 
 ## Streaming failure rules
 
@@ -811,15 +814,29 @@ checked against the providers' published pricing:
 [Gemini](https://ai.google.dev/gemini-api/docs/pricing),
 [xAI pricing](https://docs.x.ai/developers/pricing), and
 [Moonshot/Kimi token tariffs](https://platform.kimi.ai/docs/pricing/chat)
-(platform Kimi chat models, not Kimi Code). An unpriced non-subscription
-selection, including an unpriced OpenRouter row, is refused by G6 before a
-model call, even when credentials and model capabilities are valid. Selecting
-it explicitly does not bypass that gate. Supply an operator price override as
-described below or select a priced or subscription model. The generic
-user-facing policy reply does not expose configuration; operator logs,
-`prx doctor`, and `prx providers test` name the missing tariff and its
-configuration key. Selecting an unpriced default also prints a warning in the
-configuration change plan.
+(platform Kimi chat models, not Kimi Code).
+
+A model with no price is admitted or refused according to whether a spend
+ceiling applies to the turn. PRX sets no ceiling by default; one exists only
+when the operator configures `[cost] daily_limit_usd` or `monthly_limit_usd`,
+`[autonomy] max_cost_per_day_cents`, or a named agent's
+`limits.max_cost_per_day_cents` (a child's allowance is carved out of its
+parent's, so it is bounded exactly when the parent is).
+
+- No ceiling: an unpriced model, including an unpriced OpenRouter row or a
+  `custom:<url>` endpoint, runs. Its tokens are counted, its cost is not
+  tracked (the settlement is `unknown_pricing`, never a zero-cost row), and
+  `prx doctor` and `prx providers test` say so informationally
+  (`cost of this model is not tracked: no price configured ...`). Add a
+  `[cost.prices]` entry to have its cost recorded.
+- A ceiling is configured: an unpriced non-subscription selection cannot be
+  budgeted and is refused by G6 before a model call, even when credentials and
+  model capabilities are valid. Supply an operator price override as
+  described below or select a priced or subscription model. The generic
+  user-facing policy reply does not expose configuration; operator logs,
+  `prx doctor`, and `prx providers test` name the missing tariff and its
+  configuration key. Selecting an unpriced default also prints a warning in
+  the configuration change plan.
 
 An uncertain model-specific price is omitted instead of inferred from another
 generation. Router ranking cost is a separate catalog hint and is never used as
@@ -942,9 +959,10 @@ server web-search tool. The variant and its extra search pricing are documented
 by [OpenRouter](https://openrouter.ai/docs/guides/features/server-tools/web-search).
 
 `[cost.prices]` is an operator-override table and wins over the release catalog.
-When neither source has a matching price, only `ollama` is treated as zero-cost.
-LM Studio, llama.cpp, vLLM, and custom loopback endpoints need an explicit
-`cost.prices` entry before PRX can produce a cost estimate.
+When neither source has a matching price, only `ollama` is treated as zero-cost
+under a spend ceiling. LM Studio, llama.cpp, vLLM, and custom endpoints need an
+explicit `cost.prices` entry before PRX can produce a cost estimate; while no
+spend ceiling is configured they run without one and their cost is not tracked.
 
 ### Unpriced models and operator overrides
 

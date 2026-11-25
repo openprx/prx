@@ -259,3 +259,7 @@ or schema migration is needed.
 ## Custom endpoint key from stdin
 
 `prx init --provider custom:<url> ... --from-stdin` now stores the key from standard input as the encrypted root `api_key`, in the same init generation as the configuration files. It used to write the files and then fail with `provider requires a catalog identity`. A key that cannot be stored now leaves no files behind for a custom endpoint; for a catalog provider whose reference store step fails, the error names the directory that was already written.
+
+## Models without a price run while no cost limit is set
+
+A model with no price is no longer refused when no cost limit is configured. PRX sets none by default, so a `custom:<url>` endpoint or any other model without a `[cost.prices]` entry now runs, its cost is not tracked (`unknown_pricing`), and `prx doctor`, `prx providers test` and the configuration plan report that as information instead of `G6 budget admission refuses unpriced model`. When `[cost] daily_limit_usd` or `monthly_limit_usd`, `[autonomy] max_cost_per_day_cents` or an agent's `limits.max_cost_per_day_cents` is set, the present refusal stays. To have the cost of an unpriced model counted, add `[cost.prices."<model>"]`. No configuration change is needed.
