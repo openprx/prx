@@ -150,6 +150,11 @@ other stripped secrets (`shell_secret_environment` in
 Cron and Xin shell jobs, the external editor, media helper commands and the
 `/shell` session of `prx chat` start with the parent environment.
 
+Cron `shell` jobs and Xin shell tasks follow the same rule as the `shell`
+tool, at the level the run executes at. No command is refused or rewritten by
+this; it only keeps secrets out of the child. See [tools](tools.md) for the
+baseline and the allowlist.
+
 ## Evidence and privacy
 
 Configuration, endpoint labels and inspection output must use the existing

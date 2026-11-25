@@ -1038,7 +1038,7 @@ async fn run_shell_with_cancellation(
     task: &XinTask,
     cancellation: Option<CancellationToken>,
 ) -> (bool, String) {
-    let process = match ShellProcessAdapter::from_config(config) {
+    let process = match ShellProcessAdapter::from_config_filtered(config) {
         Ok(process) => process,
         Err(error) => return (false, format!("runtime error: {error}")),
     };

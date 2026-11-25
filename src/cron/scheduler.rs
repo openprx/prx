@@ -1127,7 +1127,7 @@ fn job_run_level(config: &Config, job: &CronJob) -> Result<crate::security::Auto
 }
 
 async fn run_job_command(config: &Config, job: &CronJob) -> (bool, String) {
-    let process = match ShellProcessAdapter::from_config(config) {
+    let process = match ShellProcessAdapter::from_config_filtered(config) {
         Ok(process) => process,
         Err(error) => return (false, format!("runtime error: {error}")),
     };

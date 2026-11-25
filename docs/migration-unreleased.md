@@ -232,3 +232,26 @@ A process-mode child (`sessions_spawn` with `mode: "process"`) now receives the 
 The worker's tracing output, which was dropped before, and anything it prints to stderr are now kept in `<config dir>/logs/workers/<run id>.log` (private files, at most 4 MiB each, the newest 64 runs kept). The parent logs the path on the `process worker log` line.
 
 The worker protocol is now version 2: a `prx` that spawns workers and the `prx` that runs them must be the same build. A mixed pair refuses to start the worker with a `protocol version mismatch` error. No database schema migration is introduced.
+
+## Scheduled shell commands no longer inherit secrets
+
+Cron `shell` jobs and Xin shell tasks now run with the environment of the
+`shell` tool at the run's level instead of the daemon's whole environment.
+At Full (the default) only the secret set is removed (provider keys, tokens,
+`OPENPRX_*`); below Full the child gets the safe baseline plus
+`[runtime] shell_env_allowlist`. A cron or Xin command that read a provider key
+or another secret from its environment no longer finds it: pass the value in
+the command itself or, below Full, list an exact non-secret name in
+`shell_env_allowlist`. No database schema migration is introduced.
+
+## Deleting a message also removes its tool and attachment rows
+
+A message or reply delete now also tombstones, in the same transaction, the
+`message.attachment.recorded`, `tool.call.recorded`, `tool.result.recorded`
+and `turn.decision.claimed` rows keyed to the deleted turn (by run or by the
+user event they name), and deletes the stored tool-output documents of the
+run (`tool_output` and `untrusted_external`) unless a surviving tool result
+row still quotes the same document. A document is not deleted when another
+run's tool result references it. Memories stay unless the request carries
+`forget_writes: true`. The sync stream is unchanged. No configuration change
+or schema migration is needed.

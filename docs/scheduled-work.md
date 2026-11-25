@@ -194,6 +194,14 @@ cancelled, so scheduling still skips it, until `prx xin resume`.
 `prx cron mark-operator` and `prx xin mark-operator` record that a pre-existing
 shell command is the operator's own, so it runs at the operator level.
 
+A cron `shell` job and a Xin shell task run with the same child environment
+as the `shell` tool at the level of the run (the configured `[autonomy] level`
+for operator work, default Full): at Full every variable except the secret set
+(provider keys and other credentials are absent), below Full the safe baseline
+plus `[runtime] shell_env_allowlist`. A command that read a provider key from
+its environment no longer finds it; ordinary variables such as `PATH` and
+custom ones stay at Full. See [child process environment](security.md#child-process-environment).
+
 Field defaults live in the [configuration reference](configuration.md):
 
 ```toml

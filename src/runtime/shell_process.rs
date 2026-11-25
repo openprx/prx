@@ -156,6 +156,16 @@ impl ShellProcessAdapter {
         Ok(Self::new(runtime))
     }
 
+    /// The adapter of a scheduled shell command (cron job, Xin task): the
+    /// same environment the `shell` tool's process gets at the run's level
+    /// (`[runtime] shell_env_allowlist` applied; at Full everything except
+    /// the secret set, below Full the safe baseline plus that list). It keeps
+    /// provider keys and other secrets out of the child; it restricts no
+    /// command.
+    pub fn from_config_filtered(config: &Config) -> anyhow::Result<Self> {
+        Ok(Self::from_config(config)?.with_environment_allowlist(config.runtime.shell_env_allowlist.clone()))
+    }
+
     pub async fn execute(&self, request: ShellProcessRequest<'_>) -> Result<ShellProcessOutcome, ShellProcessError> {
         self.execute_with(request, false, None, false)
             .await
