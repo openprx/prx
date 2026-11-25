@@ -109,7 +109,7 @@ pub(crate) enum ProvenanceResolution {
 }
 
 /// Role of a pool row (only user and assistant rows are transcript rows).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum PoolRole {
     User,
     Assistant,
@@ -153,6 +153,96 @@ pub(crate) struct PoolSwitchRow {
     parent_handoff_event_id: Option<String>,
 }
 
+/// The keys of one own user/assistant row that decide task echoes (the same
+/// rule the child history loader applies). Its content is not kept.
+#[derive(Debug)]
+struct TaskRowKey {
+    id: i64,
+    workspace_id: String,
+    owner_id: String,
+    role: PoolRole,
+    content_hash: String,
+    /// The row's raw run id.
+    run_id: Option<String>,
+    /// For a `message.created` row: the string `task_run_id` of its payload.
+    task_run_id: Option<String>,
+}
+
+impl TaskRowKey {
+    /// The key of `event`, or `None` when the row cannot take part in an echo
+    /// match: it needs an owner and a content hash, and a run id or a task run id.
+    fn of(event: &MessageEvent, role: PoolRole) -> Option<Self> {
+        let owner_id = event.owner_id.clone()?;
+        let content_hash = event.content_hash.clone()?;
+        let task_run_id = if event.event_type == "message.created" {
+            task_run_id_of(event.raw_payload_json.as_deref())
+        } else {
+            None
+        };
+        if event.run_id.is_none() && task_run_id.is_none() {
+            return None;
+        }
+        Some(Self {
+            id: event.id,
+            workspace_id: event.workspace_id.clone(),
+            owner_id,
+            role,
+            content_hash,
+            run_id: event.run_id.clone(),
+            task_run_id,
+        })
+    }
+}
+
+/// The string `task_run_id` of a row's raw payload. A payload that does not
+/// parse, or whose `task_run_id` is absent or not a string, yields `None`, so
+/// its row is never an echo.
+fn task_run_id_of(raw_payload_json: Option<&str>) -> Option<String> {
+    let raw = raw_payload_json?;
+    if !raw.contains("task_run_id") {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    value.get("task_run_id")?.as_str().map(str::to_owned)
+}
+
+/// The ids of the task echoes among `keys`: a `message.created` row E whose
+/// `task_run_id` names the run of an earlier row P with the same workspace,
+/// owner, role and content hash. Owner and hash must be present, as NULL never
+/// matches in the history loader.
+fn task_echo_ids(keys: &[TaskRowKey]) -> HashSet<i64> {
+    // The smallest row id per (workspace, owner, role, content hash, run id).
+    let mut first: HashMap<(&str, &str, PoolRole, &str, &str), i64> = HashMap::new();
+    for key in keys {
+        let Some(run) = key.run_id.as_deref() else {
+            continue;
+        };
+        let slot = first
+            .entry((
+                key.workspace_id.as_str(),
+                key.owner_id.as_str(),
+                key.role,
+                key.content_hash.as_str(),
+                run,
+            ))
+            .or_insert(i64::MAX);
+        *slot = (*slot).min(key.id);
+    }
+    keys.iter()
+        .filter_map(|key| {
+            let task_run = key.task_run_id.as_deref()?;
+            let earliest = first.get(&(
+                key.workspace_id.as_str(),
+                key.owner_id.as_str(),
+                key.role,
+                key.content_hash.as_str(),
+                task_run,
+            ))?;
+            (*earliest < key.id).then_some(key.id)
+        })
+        .collect()
+}
+
 /// Every own transcript row of the session that could be a candidate, read to
 /// the session's first row (§3.1).
 #[derive(Debug, Default)]
@@ -162,6 +252,9 @@ pub(crate) struct CandidatePool {
     pub(crate) switches: Vec<PoolSwitchRow>,
     /// Ids of every own user/assistant `message.created` row read.
     pub(crate) message_ids: Vec<i64>,
+    /// Keys of the own user/assistant rows that can match or be a task echo.
+    /// Read only until [`CandidatePool::finish`] removes the echoes.
+    task_keys: Vec<TaskRowKey>,
 }
 
 /// The accepted persisted forms of every durable source message
@@ -272,6 +365,9 @@ impl CandidatePool {
             let Some(role) = PoolRole::of(&event.role) else {
                 continue;
             };
+            if let Some(key) = TaskRowKey::of(&event, role) {
+                self.task_keys.push(key);
+            }
             match event.event_type.as_str() {
                 "message.created" => {
                     self.message_ids.push(event.id);
@@ -302,8 +398,15 @@ impl CandidatePool {
         }
     }
 
-    /// Sort the rows by id and rank every matching row in store order.
+    /// Drop the task echoes, sort the rows by id and rank every matching row in
+    /// store order.
     fn finish(&mut self) {
+        let echoes = task_echo_ids(&self.task_keys);
+        self.task_keys = Vec::new();
+        if !echoes.is_empty() {
+            self.message_ids.retain(|id| !echoes.contains(id));
+            self.messages.retain(|row| !echoes.contains(&row.id));
+        }
         self.message_ids.sort_unstable();
         self.message_ids.dedup();
         self.messages.sort_by_key(|row| row.id);
