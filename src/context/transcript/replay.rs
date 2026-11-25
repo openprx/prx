@@ -287,7 +287,10 @@ impl ReplayLog {
                 turn.role.as_str(),
                 event_id.as_deref().and_then(|id| self.attachments.get(id)),
             ) {
-                ("user", Some(attachment)) => format!("{}{}{}", attachment.prefix, turn.content, attachment.tail),
+                ("user", Some(attachment)) => {
+                    out.attachments += 1;
+                    format!("{}{}{}", attachment.prefix, turn.content, attachment.tail)
+                }
                 _ => turn.content,
             };
             out.messages
@@ -332,6 +335,8 @@ pub(crate) struct History {
     pub messages: Vec<ChatMessage>,
     /// The stored event of each message, index for index.
     pub event_ids: Vec<Option<String>>,
+    /// User messages that were replayed with their stored attachment.
+    pub(crate) attachments: usize,
     results: Vec<ReplayedResult>,
 }
 

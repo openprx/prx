@@ -1322,6 +1322,16 @@ async fn run_turn_unguarded(
                         "total_tokens": request_tokens,
                         "token_source": token_source_label(messages_measurement.source),
                     },
+                    "provenance": crate::context::request_provenance::request_provenance(
+                        &crate::context::request_provenance::RequestFacts {
+                            messages: &prepared_messages.messages,
+                            system_sha256: system_prompt_sha256.as_deref(),
+                            system_chars: system_prompt_chars,
+                            tool_surface_sha256: &tool_snapshot.sha256,
+                            tools_published: tool_snapshot.count,
+                            tools_deferred: tool_surface_counts.deferred_roots(),
+                        },
+                    ),
                 });
                 let scope = request_event_scope
                     .clone()

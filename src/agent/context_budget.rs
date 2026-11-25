@@ -151,6 +151,12 @@ impl RequestToolSurfaceCounts {
         counts
     }
 
+    /// Registered tools this turn did not route: callable through
+    /// `capability_search`, not published.
+    pub(super) const fn deferred_roots(&self) -> usize {
+        self.registry_roots.saturating_sub(self.routed_roots)
+    }
+
     pub(super) fn to_json(self) -> serde_json::Value {
         serde_json::json!({
             "registry_roots": self.registry_roots,

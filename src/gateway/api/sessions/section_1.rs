@@ -870,6 +870,15 @@ async fn run_console_runtime_turn(
     // message, index for index: none for the system prompt or a tool message,
     // each stored turn's event, then the request's own event.
     let mut replayed = transcript.expand_turns(previous_turns).await;
+    crate::context::request_provenance::note_live_attachment(crate::context::request_provenance::LiveAttachment {
+        prefix_chars: Some(attachment.prefix.chars().count()),
+        tail_chars: Some(attachment.tail.chars().count()),
+        attachments_replayed: Some(replayed.attachments),
+        ..crate::context::request_provenance::LiveAttachment::new(
+            request_message.content.chars().count(),
+            &mem_context.sources,
+        )
+    });
     let stubbed = replayed.fit(&system_message, &request_message, &effective_compaction.config);
     if stubbed > 0 {
         tracing::info!(stubbed, "oldest replayed tool results were replaced by stubs to fit the request");

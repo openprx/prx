@@ -150,6 +150,15 @@
             crate::agent::turn_contracts::current_time_tail(),
         );
 
+        crate::context::request_provenance::note_live_attachment(crate::context::request_provenance::LiveAttachment {
+            prefix_chars: sent_form.as_ref().map(|sent| sent.prefix.chars().count()),
+            tail_chars: sent_form.as_ref().map(|sent| sent.tail.chars().count()),
+            ..crate::context::request_provenance::LiveAttachment::new(
+                crate::agent::turn_contracts::inbound_user_message(&enriched).content.chars().count(),
+                &mem_context.sources,
+            )
+        });
+
         // Build system prompt with skill selection
         let selected_skills = admitted_binding.prompt_skills()?;
         // Publish only this turn's selected metadata. Previous turns do not

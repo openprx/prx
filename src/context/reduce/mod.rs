@@ -43,6 +43,17 @@ pub(crate) enum Tier {
     Trim,
 }
 
+impl Tier {
+    /// The name recorded in the request provenance.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Clear => "clear",
+            Self::Handoff => "handoff",
+            Self::Trim => "trim",
+        }
+    }
+}
+
 /// Why a step ran, as a typed value (never free text).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Reason {
@@ -50,6 +61,16 @@ pub(crate) enum Reason {
     OverWarning,
     /// The request is over the hard limit of the window.
     OverHardLimit,
+}
+
+impl Reason {
+    /// The name recorded in the request provenance.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::OverWarning => "over_warning",
+            Self::OverHardLimit => "over_hard_limit",
+        }
+    }
 }
 
 /// What one step took out of the request. A figure a step does not measure is
@@ -130,16 +151,28 @@ pub(crate) async fn ladder<S: Send>(reducers: &[&dyn Reducer<S>], state: &mut S)
     // A stable sort: within a tier the caller's order stands.
     ordered.sort_by_key(|reducer| reducer.tier());
     let mut report = Report::default();
+    let mut considered = Vec::with_capacity(ordered.len());
     for reducer in ordered {
         if !reducer.applies(state) {
+            considered.push(super::request_provenance::ReducerNote::skipped(
+                reducer.name(),
+                reducer.tier(),
+            ));
             continue;
         }
         let outcome = reducer.apply(state).await?;
+        considered.push(super::request_provenance::ReducerNote::ran(
+            reducer.name(),
+            reducer.tier(),
+            outcome,
+        ));
         report.ran.push(Ran {
             reducer: reducer.name(),
             tier: reducer.tier(),
             outcome,
         });
     }
+    // The request record of the round this call belongs to reads what ran.
+    super::request_provenance::note_reducers(considered);
     Ok(report)
 }

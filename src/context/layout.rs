@@ -101,8 +101,13 @@ pub(crate) trait Source: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptSectionFingerprint {
     pub name: String,
+    /// The slot the source fills (see [`Slot::name`]).
+    pub slot: &'static str,
+    /// Whether the source is volatile: placed after every stable source.
+    pub volatile: bool,
     pub included: bool,
     pub chars: usize,
+    pub bytes: usize,
     pub sha256: String,
 }
 
@@ -178,8 +183,11 @@ impl Layout {
             let included = !part.trim().is_empty();
             fingerprints.push(PromptSectionFingerprint {
                 name: source.name().to_string(),
+                slot: source.slot().name(),
+                volatile: source.is_volatile(),
                 included,
                 chars: part.chars().count(),
+                bytes: part.len(),
                 sha256: prompt_sha256(part),
             });
             if !included {
@@ -188,11 +196,15 @@ impl Layout {
             output.push_str(part);
             output.push_str("\n\n");
         }
-        Ok(CompiledSystemPrompt {
+        let compiled = CompiledSystemPrompt {
             chars: output.chars().count(),
             sha256: prompt_sha256(&output),
             content: output,
             sections: fingerprints,
-        })
+        };
+        // The manifest travels beside the text, never inside it: the request
+        // record looks it up by the hash of the prompt it sends.
+        super::request_provenance::register_prompt(&compiled);
+        Ok(compiled)
     }
 }

@@ -405,6 +405,51 @@ budget trim or an aggressive trim), the OS-paging eviction, the dispatcher
 rollover, the line-mode chat preflight compaction, the manual `/compact`, and
 the tool-surface deferral at turn opening (`src/runtime/turn_context/tool_fit.rs`).
 
+## Request provenance
+
+The `llm.request.context.compiled` row carries one additive object,
+`provenance`, that answers "why does this request look like this" and "what
+broke the cache". It holds hashes, counts, names and typed reasons only: no
+prompt text, no message text, no file path and no memory key. Code:
+`src/context/request_provenance.rs`.
+
+| Field | Meaning |
+|---|---|
+| `version` | shape version, `1` |
+| `segments` | the system prompt's manifest, one entry per source in layout order: `slot`, `source`, `stable` (false for a volatile source), `included` (false when the source rendered nothing), `chars`, `bytes`, `sha256` of the segment text. `null` when the system message is not a prompt the layout compiled in this process (for example a skill section was removed afterwards) |
+| `segments_match` | `exact` when the sent system message is the compiled prompt, `prefix` when a surface or the engine appended text after it, `null` with no manifest |
+| `system_extra_chars` | characters after the compiled prompt (`0` when exact) |
+| `tools` | `published` (the snapshot's tool count), `deferred` (registered tools this turn did not route; callable through `capability_search`), `surface_sha256` (the snapshot hash already in `tool_snapshot`) |
+| `history` | messages before the live user message: `messages` by role (`user`, `assistant`, `tool`, `other`), `tool_rounds` (runs of tool results), `stubbed_results` (results replaced by a stub), `attachments_replayed` (stored attachments replayed; `null` where the surface does not count them), `chars`, `bytes`, and `after_live` (messages and chars after the live message, this turn's own tool rounds) |
+| `live` | the live user message: `chars`, `bytes`, and `attachment` (`prefix_chars`, `tail_chars`, and the counts of `events`, `memories` and `documents` it quotes) or `null` when the surface noted none or the message was changed after it was built |
+| `reducers` | the ladder steps considered since the previous request row of the turn: `reducer`, `tier`, `applied`, `reason` (`over_warning` or `over_hard_limit`), `items_removed`, `tokens_removed`, `bytes_removed` (each `null` when not applied or not measured) |
+| `hooks` | always empty today; context-contributing hooks do not exist yet and the key keeps the shape stable |
+
+The segment hashes are computed once per compile of the system prompt (the
+fingerprints the layout always kept); history is counted, not hashed. The
+manifest travels beside the prompt text, which is byte-identical to before. It
+reaches the engine through a small process-local table keyed by the prompt's
+hash, so the terminal chat, the gateway, scheduled runs, task children and the
+process worker (which builds its prompt in its own process) all report it.
+Reducer notes and the live attachment are filed per task and read by the next
+request row of that task.
+
+To read it, with sqlite:
+
+```sql
+SELECT json_extract(raw_payload_json, '$.iteration'),
+       json_extract(raw_payload_json, '$.provenance.segments_match'),
+       json_extract(raw_payload_json, '$.provenance.reducers')
+FROM message_events
+WHERE event_type = 'llm.request.context.compiled'
+ORDER BY rowid DESC LIMIT 5;
+
+SELECT json_extract(s.value, '$.slot'), json_extract(s.value, '$.chars'), json_extract(s.value, '$.sha256')
+FROM message_events, json_each(raw_payload_json, '$.provenance.segments') AS s
+WHERE event_type = 'llm.request.context.compiled'
+ORDER BY rowid DESC LIMIT 12;
+```
+
 ## Ownership
 
 | Concern | Owner | Rule |

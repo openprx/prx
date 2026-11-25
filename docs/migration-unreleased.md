@@ -341,3 +341,13 @@ user turn or after a function response turn`, is repaired and logged
 replays the tool rounds of the oldest assistant reply when its user message is
 outside the 500 rows read.
 
+## The compiled-request event gains a `provenance` object
+
+The `llm.request.context.compiled` row carries a new object key `provenance`:
+the system prompt's per-segment manifest (slot, source, stable flag, chars,
+bytes, SHA-256), the tool counts and surface hash, history and live-message
+counts, the reducers considered for the round, and an empty `hooks` list. It is
+additive: no existing field changes, the system prompt text and hash are
+byte-identical, hashes and counts only, and nothing is added to the sync
+stream. No configuration change is needed. Field by field:
+`docs/unified-turn-context.md`.
