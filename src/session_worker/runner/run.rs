@@ -122,14 +122,24 @@ struct PreparedWorkerResult {
 }
 
 /// The worker's direct names: the sealed chat-lineage set when the parent
-/// filled one (D5), else `always_include`. A name is still published only
-/// where this worker's registry serves it and no exclusion hides it.
+/// filled one (D5), else `always_include` plus the publish-all member unless
+/// the operator defers tools. A name is still published only where this
+/// worker's registry serves it and no exclusion hides it.
 fn worker_direct_names(
     manifest: &WorkerManifest,
     tiering: &crate::config::ToolTieringConfig,
 ) -> std::collections::BTreeSet<String> {
     manifest.direct_tools.as_ref().map_or_else(
-        || tiering.always_include.iter().cloned().collect(),
+        || {
+            let publish_all = (!tiering.defer_unlisted).then_some(crate::tools::capability::catalog::ALL_TOOLS_DIRECT);
+            tiering
+                .always_include
+                .iter()
+                .map(String::as_str)
+                .chain(publish_all)
+                .map(str::to_owned)
+                .collect()
+        },
         |names| names.iter().cloned().collect(),
     )
 }

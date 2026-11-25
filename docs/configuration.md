@@ -157,7 +157,7 @@ and the module-gate family are absorbed on load; they are not live switches.
 | `[security]` | `workspace_hooks` omitted when off |
 | `[compliance.interaction_notice]` | `version = "1"`; default notice text; `applicability = "required"`; `exception_owner`/`exception_reviewed_at` unset |
 | `[compliance.eu_ai_act]` | classification `status = "unclassified"`; `owner`/`assessed_at` unset; `incident_store_path` unset; declaration fields all optional/empty |
-| `[tool_tiering]` | `always_include = []`; `always_exclude = []`; `channel_exclude = []` (nothing hidden from channel sessions) |
+| `[tool_tiering]` | `always_include = []`; `always_exclude = []`; `channel_exclude = []` (nothing hidden from channel sessions); `defer_unlisted = false` (every available tool is published to the model) |
 | `[providers]` | `[providers.ollama] num_ctx` unset. `[[providers.tool_dialects]]`: `provider` required; `model` unset (all models); `tool_schema`/`tool_call` unset (`raw` / `native`). `[[providers.models]]`: `provider` required; `model` unset; `operations`, `native_tools`, `vision_input`, `streaming`, `structured_output`, `tool_schema_dialect`, `tool_call_dialect`, `context_window` all unset. See later sections |
 | `[model_settings.<id>]` | catalog levels and explicit parameters; omitted keys stay with the catalog |
 
@@ -717,8 +717,12 @@ priority_scheduling_enabled = false
 low_priority_tools = ["sessions_spawn", "delegate"]
 
 # Per-turn capability policy. The surface owner applies these filters (they are
-# not owned by the decision engine). `always_include` prefers direct publication;
-# `always_exclude` removes names from the surface. `channel_exclude` applies to IM
+# not owned by the decision engine). Every available tool is published to the
+# model by default. `defer_unlisted = true` is the operator option that
+# publishes only the core tools (file_read, file_write, file_edit, shell) plus
+# `always_include`; every other tool then waits behind `capability_search` and
+# can also be called by its exact name. `always_exclude` removes names from the
+# surface. `channel_exclude` applies to IM
 # channel sessions only (Signal / Telegram / Discord / WhatsApp / …) and is empty
 # by default, so nothing is hidden. To hide the operations/development surface on
 # channels list its names, for example: wasm_plugins_manage, wasm_plugin_reload,
@@ -732,6 +736,7 @@ low_priority_tools = ["sessions_spawn", "delegate"]
 always_include = []
 always_exclude = []
 # channel_exclude = []
+# defer_unlisted = false
 
 # A request that advertises skill metadata also admits its live skill_read
 # dependency. Missing or denied readers suppress that metadata with a diagnostic.

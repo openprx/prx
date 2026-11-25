@@ -225,6 +225,10 @@ pub struct ToolTieringConfig {
     /// Tool names hidden from IM channel sessions only, on top of `always_exclude`.
     /// Default: empty (nothing is hidden); list tool names to hide them on channels.
     pub channel_exclude: Vec<String>,
+    /// Operator option: publish only the core tools plus `always_include` and
+    /// leave every other tool behind `capability_search` and its exact name.
+    /// Default: false (every available tool is published to the model).
+    pub defer_unlisted: bool,
 }
 
 impl Default for ToolTieringConfig {
@@ -233,6 +237,7 @@ impl Default for ToolTieringConfig {
             always_include: Vec::new(),
             always_exclude: Vec::new(),
             channel_exclude: Vec::new(),
+            defer_unlisted: false,
         }
     }
 }
@@ -292,6 +297,7 @@ impl ToolTieringConfig {
                 always_include: self.always_include.clone(),
                 always_exclude: Vec::new(),
                 channel_exclude: Vec::new(),
+                defer_unlisted: self.defer_unlisted,
             })
         } else {
             std::borrow::Cow::Borrowed(self)

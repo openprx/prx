@@ -243,6 +243,16 @@ impl CatalogSources {
     }
 }
 
+/// A `direct_names` member that publishes every tool directly: native tools,
+/// MCP, plugin and node aliases. Installed skills stay discoverable through
+/// the skill index and `skill_read`. Named members still count on their own,
+/// so a surface that defers tools simply leaves this member out.
+pub(crate) const ALL_TOOLS_DIRECT: &str = "*";
+
+/// Control tools the turn engine adds to a request itself. The publish-all
+/// member leaves them out so one name is never declared twice.
+const ENGINE_ADDED_TOOLS: [&str; 3] = ["capability_search", "stay_silent", "transcript_history_lookup"];
+
 /// The entrypoint's publication boundary, applied after registry discovery.
 #[derive(Clone, Default)]
 pub(crate) struct SurfacePolicy {
@@ -915,7 +925,11 @@ fn entry_from_spec(
         Exposure::Unavailable {
             reason: "not available on this surface".to_string(),
         }
-    } else if surface.direct_names.contains(&spec.name) {
+    } else if surface.direct_names.contains(&spec.name)
+        || (surface.direct_names.contains(ALL_TOOLS_DIRECT)
+            && !matches!(target, ExecutionTarget::Skill { .. })
+            && !ENGINE_ADDED_TOOLS.contains(&spec.name.as_str()))
+    {
         Exposure::Direct
     } else {
         Exposure::Searchable

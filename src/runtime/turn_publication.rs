@@ -17,10 +17,10 @@ use crate::tools;
 use anyhow::Result;
 use std::sync::Arc;
 
-/// The bounded native schemas kept on ordinary model turns. These are the
-/// common file and shell operations from the standard progressive-disclosure
-/// contract; publication still applies source, model, surface, security and
-/// approval gates before any one of them can execute.
+/// The core native schemas. A default install publishes every tool, so these
+/// are the whole direct set only when `[tool_tiering] defer_unlisted = true`;
+/// publication still applies source, model, surface, security and approval
+/// gates before any one of them can execute.
 const DEFAULT_DIRECT_TOOLS: [&str; 4] = ["file_edit", "file_read", "file_write", "shell"];
 
 /// The sessions tools a chat turn and its whole lineage publish directly
@@ -30,9 +30,12 @@ const CHAT_SESSIONS_TOOLS: [&str; 4] = ["sessions_spawn", "sessions_send", "sess
 
 fn direct_tool_names(configured: &crate::config::ToolTieringConfig, chat: bool) -> std::collections::BTreeSet<String> {
     let chat_tools: &[&str] = if chat { &CHAT_SESSIONS_TOOLS } else { &[] };
+    // Every tool is published unless the operator asks to defer the rest.
+    let publish_all = (!configured.defer_unlisted).then_some(tools::capability::catalog::ALL_TOOLS_DIRECT);
     DEFAULT_DIRECT_TOOLS
         .into_iter()
         .chain(chat_tools.iter().copied())
+        .chain(publish_all)
         .map(str::to_owned)
         .chain(configured.always_include.iter().cloned())
         .filter(|name| !configured.always_exclude.contains(name))
