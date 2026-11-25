@@ -458,7 +458,8 @@ pub(super) async fn run_sub_agent_task(
                                             .into_nested_turn(),
                                     ),
                                 )
-                                .with_event_fabric(child_fabric_owned),
+                                .with_event_fabric(child_fabric_owned)
+                                .with_rendered_stored_handoffs(),
                             },
                             crate::agent::turn_request::TurnDelivery {
                                 cancellation: Some(cancel_token_owned.clone()),

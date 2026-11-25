@@ -1151,7 +1151,8 @@ async fn run_owned_manifest(
                                                 .into_nested_turn()
                                         }),
                                     )
-                                    .with_event_fabric(request_event_fabric),
+                                    .with_event_fabric(request_event_fabric)
+                                    .with_rendered_stored_handoffs(),
                                 },
                                 crate::agent::turn_request::TurnDelivery {
                                     // Steering cancels the in-flight segment; without a token the
