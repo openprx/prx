@@ -2314,6 +2314,8 @@ fn byo_isolated_options(temp: &TempDir) -> ProviderRuntimeOptions {
         tool_schema_dialects: Vec::new(),
         tool_call_dialects: Vec::new(),
         cost_ceiling_configured: true,
+        app_identification: true,
+        endpoint_headers: Default::default(),
     }
 }
 
