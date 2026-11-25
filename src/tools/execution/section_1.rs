@@ -573,6 +573,9 @@ pub struct ToolExecutionContext {
     pub(crate) child_pin: Option<Arc<super::capability::child::ChildDispatchPin>>,
     /// Live G6 tokens for the model turn's called tools; absent outside model turns.
     pub(crate) call_budget: Option<admission::CallTokenBudget>,
+    /// The call context computed once when the turn was opened; tools read
+    /// level, workspace and owner from it. Absent outside model turns.
+    pub(crate) call: Option<Arc<crate::context::call::TurnCallContext>>,
     /// A call that needs approval ends denied before any ledger route or
     /// durable pending decision exists. Set for targeted agent turns, which
     /// have no resumable approval until MA-04.
@@ -647,6 +650,7 @@ impl ToolExecutionContext {
             child_scope: None,
             child_pin: None,
             call_budget: None,
+            call: None,
             pending_approval_denied: false,
             admitted_binding: None,
             execution_admission: None,

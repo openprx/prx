@@ -110,8 +110,11 @@ impl FileReadTool {
         self
     }
 
-    fn working_root(&self) -> &std::path::Path {
-        crate::security::path_policy::effective_root(self.working_root.as_deref(), &self.security)
+    /// The call's working directory, else the one this tool was built with.
+    fn working_root(&self) -> std::path::PathBuf {
+        crate::context::call::working_dir().unwrap_or_else(|| {
+            crate::security::path_policy::effective_root(self.working_root.as_deref(), &self.security).to_path_buf()
+        })
     }
 
     /// The one below-Full path policy for this tool, run by the precheck and
@@ -122,7 +125,7 @@ impl FileReadTool {
         path: &str,
     ) -> Result<std::io::Result<std::path::PathBuf>, crate::security::PathRefusalReason> {
         use crate::security::PathRefusalReason;
-        let root = self.working_root();
+        let root = &self.working_root();
         self.security.check_path_at(root, path)?;
         let full_path = crate::security::path_policy::resolve_request_path(root, path)
             .map_err(|_| PathRefusalReason::InvalidPath)?;
@@ -162,7 +165,7 @@ impl FileReadTool {
             && !self.security.evaluation_sandbox;
         let resolved_path = if full {
             // Full: absolute paths, `..` and symlinks resolve; the OS decides.
-            match crate::security::approval_operation::resolve_full_target(self.working_root(), path).await {
+            match crate::security::approval_operation::resolve_full_target(&self.working_root(), path).await {
                 Ok(full_path) => tokio::fs::canonicalize(&full_path).await,
                 Err(error) => Err(error),
             }

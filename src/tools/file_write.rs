@@ -44,8 +44,11 @@ impl FileWriteTool {
         self
     }
 
-    fn working_root(&self) -> &std::path::Path {
-        crate::security::path_policy::effective_root(self.working_root.as_deref(), &self.security)
+    /// The call's working directory, else the one this tool was built with.
+    fn working_root(&self) -> std::path::PathBuf {
+        crate::context::call::working_dir().unwrap_or_else(|| {
+            crate::security::path_policy::effective_root(self.working_root.as_deref(), &self.security).to_path_buf()
+        })
     }
 
     async fn execute_operation(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -86,10 +89,10 @@ impl FileWriteTool {
             && !self.security.evaluation_sandbox;
         let resolved_target = if full {
             // Full: absolute paths, `..` and symlinks resolve; the OS decides.
-            crate::security::approval_operation::resolve_full_target(self.working_root(), path).await
+            crate::security::approval_operation::resolve_full_target(&self.working_root(), path).await
         } else {
             // Below Full: the same confinement the precheck ran, re-checked now.
-            match crate::security::path_policy::confine_file_target(&self.security, self.working_root(), path, true)
+            match crate::security::path_policy::confine_file_target(&self.security, &self.working_root(), path, true)
                 .await
             {
                 Ok(target) => target,
@@ -155,7 +158,7 @@ impl FileWriteTool {
         // the workspace. At Full the resolved path is opened as resolved.
         if !full {
             let current =
-                crate::security::approval_operation::resolve_file_target(self.working_root(), path, false).await?;
+                crate::security::approval_operation::resolve_file_target(&self.working_root(), path, false).await?;
             if current != resolved_target
                 || !self
                     .security
@@ -293,7 +296,7 @@ impl Tool for FileWriteTool {
         let Some(path) = args.get("path").and_then(serde_json::Value::as_str) else {
             return Ok(());
         };
-        crate::security::path_policy::confine_file_target(&self.security, self.working_root(), path, true)
+        crate::security::path_policy::confine_file_target(&self.security, &self.working_root(), path, true)
             .await
             .map(|_| ())
             .map_err(|reason| crate::security::PathRefusal::file(reason, path))

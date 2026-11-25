@@ -8,8 +8,10 @@ tokio::task_local! {
     static EVALUATION_PATH_POLICY: SecurityPolicy;
 }
 
+/// The call's level: the call context's when the turn was opened with one,
+/// else the execution service's per-call carrier.
 pub(crate) fn current() -> Option<AutonomyLevel> {
-    CURRENT.try_with(|level| *level).ok()
+    crate::context::call::level().or_else(|| CURRENT.try_with(|level| *level).ok())
 }
 
 pub(crate) async fn scope<T>(level: AutonomyLevel, future: impl Future<Output = T>) -> T {

@@ -40,6 +40,11 @@ impl ShellTool {
         self
     }
 
+    /// The call's working directory, else the one this tool was built with.
+    fn working_dir(&self) -> std::path::PathBuf {
+        crate::context::call::working_dir().unwrap_or_else(|| self.workspace_dir.clone())
+    }
+
     fn legacy_truncation_marker(mut output: String, truncated: bool, marker: &str) -> String {
         if truncated && output.ends_with(SHELL_OUTPUT_TRUNCATED_MARKER) {
             output.truncate(output.len() - SHELL_OUTPUT_TRUNCATED_MARKER.len());
@@ -76,9 +81,10 @@ impl ShellTool {
             .get("command")
             .and_then(|value| value.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'command' parameter"))?;
+        let workspace_dir = self.working_dir();
         if super::effective_autonomy::current() != Some(crate::security::AutonomyLevel::Full) {
             if let Some(policy) = &self.path_policy {
-                if let Err(error) = policy.validate_command_paths_at(&self.workspace_dir, command) {
+                if let Err(error) = policy.validate_command_paths_at(&workspace_dir, command) {
                     return Ok(ToolInvocationResult {
                         result: ToolResult {
                             success: false,
@@ -94,7 +100,7 @@ impl ShellTool {
             .process
             .execute_observed(ShellProcessRequest {
                 command,
-                workspace_dir: &self.workspace_dir,
+                workspace_dir: &workspace_dir,
                 timeout: None,
                 cancellation,
             })
@@ -192,7 +198,7 @@ impl Tool for ShellTool {
         ) else {
             return Ok(());
         };
-        policy.validate_command_paths_at(&self.workspace_dir, command)
+        policy.validate_command_paths_at(&self.working_dir(), command)
     }
 
     fn name(&self) -> &str {

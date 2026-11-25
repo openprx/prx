@@ -339,9 +339,15 @@ impl ToolExecutionService {
         // A child runs at its sealed scope level: its parent's level, or a
         // named agent's own configured level (verified against the seal).
         // Without a child scope the call runs at the service's level.
-        let effective_level = context.child_scope.as_ref().map_or_else(
-            || self.policy.autonomy_level(),
-            |scope| scope.gate_inputs().0.authority.level,
+        // A turn opened with a call context runs at that context's level.
+        let effective_level = context.call.as_ref().map_or_else(
+            || {
+                context.child_scope.as_ref().map_or_else(
+                    || self.policy.autonomy_level(),
+                    |scope| scope.gate_inputs().0.authority.level,
+                )
+            },
+            |call| call.authority.level,
         );
         let full = effective_level == crate::security::AutonomyLevel::Full;
         let decision = admission::child_autonomy(
@@ -397,10 +403,13 @@ impl ToolExecutionService {
         // above). The backend re-checks at execute time with the same
         // function. A private owner filesystem has its own resolver.
         if effective_level != crate::security::AutonomyLevel::Full && private_filesystem.is_none() {
-            if let Err(refusal) = resolved
-                .backend
-                .path_precheck(&descriptor.public_name, &command.arguments)
-                .await
+            if let Err(refusal) = crate::context::call::scope(
+                context.call.clone(),
+                resolved
+                    .backend
+                    .path_precheck(&descriptor.public_name, &command.arguments),
+            )
+            .await
             {
                 // The audit error and the durable row stay payload-free; only
                 // the model-visible result and the operator notice name the path.
@@ -878,6 +887,7 @@ impl ToolExecutionService {
         let public_name = command.name.as_str();
         let execution_parameters = descriptor.execution_parameters.clone();
         let schema_dialect = context.schema_dialect;
+        let call_context = context.call.clone();
         let live_frames = context
             .live_turn
             .as_ref()
@@ -921,9 +931,12 @@ impl ToolExecutionService {
                                         backend_h2_invocation.map(|invocation| {
                                             (invocation, backend_cancellation.clone().unwrap_or_default())
                                         }),
-                                        super::effective_autonomy::scope(
-                                            effective_level,
-                                            backend.invoke_observed(public_name, arguments, backend_cancellation),
+                                        crate::context::call::scope(
+                                            call_context,
+                                            super::effective_autonomy::scope(
+                                                effective_level,
+                                                backend.invoke_observed(public_name, arguments, backend_cancellation),
+                                            ),
                                         ),
                                     ),
                                 ),
