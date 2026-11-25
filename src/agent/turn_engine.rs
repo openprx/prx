@@ -620,9 +620,9 @@ async fn run_turn_unguarded(
                 .iter()
                 .any(|tool| tool.supports_name(crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME))
         {
-            anyhow::bail!(
-                "context switch requires the '{}' recovery tool, but it is not registered",
-                crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME
+            tracing::warn!(
+                tool = crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME,
+                "context switch recovery tool is not registered; continuing without it"
             );
         }
     }
@@ -981,16 +981,10 @@ async fn run_turn_unguarded(
             && !selected_tools
                 .iter()
                 .any(|tool| tool.supports_name(crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME))
-        {
-            let lookup = tools_registry
+            && let Some(lookup) = tools_registry
                 .iter()
                 .find(|tool| tool.supports_name(crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME))
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "context switch recovery tool '{}' disappeared from the registry",
-                        crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME
-                    )
-                })?;
+        {
             refresh_selected_tool(lookup.as_ref(), observer, hooks).await;
             selected_tools.push(lookup.as_ref());
             let tool_catalog = crate::tools::ToolCatalog::from_tools(selected_tools.iter().copied());
