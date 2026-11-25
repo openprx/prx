@@ -89,6 +89,11 @@ pub struct ProviderRuntimeOptions {
     /// it is admitted and its cost is not tracked. Defaults to `true`, the
     /// refusing side, for options not built from a configuration.
     pub cost_ceiling_configured: bool,
+    /// `[providers] app_identification`: send `HTTP-Referer` and `X-Title`
+    /// to OpenRouter and to `custom:` OpenAI-compatible endpoints.
+    pub app_identification: bool,
+    /// `[providers.endpoint_headers]`: static headers per custom endpoint.
+    pub endpoint_headers: super::app_identity::EndpointHeaders,
 }
 
 impl ProviderRuntimeOptions {
@@ -148,6 +153,8 @@ impl Default for ProviderRuntimeOptions {
             tool_schema_dialects: Vec::new(),
             tool_call_dialects: Vec::new(),
             cost_ceiling_configured: true,
+            app_identification: true,
+            endpoint_headers: super::app_identity::EndpointHeaders::default(),
         }
     }
 }
@@ -173,6 +180,8 @@ pub fn provider_runtime_options_from_config(config: &crate::config::Config) -> P
         tool_schema_dialects: tool_schema_dialects_from_config(&config.providers),
         tool_call_dialects: tool_call_dialects_from_config(&config.providers),
         cost_ceiling_configured: crate::cost::estimate::cost_ceiling_configured(config, None),
+        app_identification: config.providers.app_identification,
+        endpoint_headers: super::app_identity::EndpointHeaders::from_config(&config.providers.endpoint_headers),
     }
 }
 

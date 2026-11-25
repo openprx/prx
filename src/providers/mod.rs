@@ -17,6 +17,7 @@
 //! in [`create_provider_with_url`]. See `AGENTS.md` §7.1 for the full change playbook.
 
 pub mod anthropic;
+pub mod app_identity;
 pub(crate) mod attempt_accounting;
 pub mod bedrock;
 pub mod catalog;
@@ -397,6 +398,8 @@ fn create_provider_with_url_and_options(
         return match dialect {
             ByoDialect::OpenAiCompatible => Ok(Box::new(
                 OpenAiCompatibleProvider::new_optional_credential("Custom", &base_url, key, AuthStyle::Bearer)
+                    .with_static_headers(app_identity::app_identity_headers(options.app_identification))
+                    .with_static_headers(options.endpoint_headers.for_endpoint(name))
                     // A bring-your-own endpoint is the one case PRX knows
                     // nothing about, so it is the one that needs a declaration.
                     .with_declared_tool_dialects(name, options),
@@ -415,7 +418,9 @@ fn create_provider_with_url_and_options(
         #[cfg(any(test, feature = "test-mock"))]
         "mock" => Ok(Box::new(router::MockEnvProvider::from_env())),
         // ── Primary providers (custom implementations) ───────
-        "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(key))),
+        "openrouter" => Ok(Box::new(
+            openrouter::OpenRouterProvider::new(key).with_app_identification(options.app_identification),
+        )),
         "anthropic" => {
             if resolved.claude_refresh_token.is_some()
                 || resolved.claude_expires_at.is_some()

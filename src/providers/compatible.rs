@@ -43,6 +43,10 @@ pub struct OpenAiCompatibleProvider {
     /// GLM/Zhipu does not support the responses API.
     supports_responses_fallback: bool,
     user_agent: Option<String>,
+    /// Static headers sent on every request (app identification, an
+    /// operator's per-endpoint headers). Values are marked sensitive and are
+    /// never logged.
+    static_headers: HeaderMap,
     /// When true, collect all `system` messages and prepend their content
     /// to the first `user` message, then drop the system messages.
     /// Required for providers that reject `role: system` (e.g. MiniMax).
@@ -216,6 +220,7 @@ impl OpenAiCompatibleProvider {
             auth_header: auth_style,
             supports_responses_fallback,
             user_agent: user_agent.map(ToString::to_string),
+            static_headers: HeaderMap::new(),
             merge_system_into_user,
             allows_anonymous: false,
             tool_schema_dialects: Vec::new(),
@@ -223,6 +228,16 @@ impl OpenAiCompatibleProvider {
             declaration_provider: None,
             configured_label: None,
         }
+    }
+
+    /// Add static headers sent on every request; a later call replaces a
+    /// header of the same name.
+    #[must_use]
+    pub(crate) fn with_static_headers(mut self, headers: HeaderMap) -> Self {
+        for (name, value) in &headers {
+            self.static_headers.insert(name.clone(), value.clone());
+        }
+        self
     }
 
     /// Bind catalog parameter lookup to the configured factory identity.
@@ -475,23 +490,21 @@ impl OpenAiCompatibleProvider {
     }
 
     fn build_http_client(&self, builder: reqwest::ClientBuilder) -> Client {
+        let mut headers = HeaderMap::new();
         if let Some(ua) = self.user_agent.as_deref() {
-            let mut headers = HeaderMap::new();
             if let Ok(value) = HeaderValue::from_str(ua) {
                 headers.insert(USER_AGENT, value);
             }
-
-            let builder = builder.default_headers(headers);
-
-            return builder
-                .build()
-                .map_err(|error| {
-                    tracing::error!("proxy build failed for provider.compatible (user-agent), using direct: {error}");
-                    error
-                })
-                .unwrap_or_else(|_| crate::prx_http_client());
+        }
+        for (name, value) in &self.static_headers {
+            headers.insert(name.clone(), value.clone());
         }
 
+        let builder = if headers.is_empty() {
+            builder
+        } else {
+            builder.default_headers(headers)
+        };
         builder
             .build()
             .map_err(|error| {

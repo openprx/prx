@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 
 pub struct OpenRouterProvider {
     credential: Option<String>,
+    /// Send `HTTP-Referer` and `X-Title` (`[providers] app_identification`).
+    app_identification: bool,
     #[cfg(test)]
     chat_endpoint: Option<String>,
 }
@@ -158,9 +160,21 @@ impl OpenRouterProvider {
     pub fn new(credential: Option<&str>) -> Self {
         Self {
             credential: credential.map(ToString::to_string),
+            app_identification: true,
             #[cfg(test)]
             chat_endpoint: None,
         }
+    }
+
+    /// Turn the app identification headers on or off.
+    #[must_use]
+    pub fn with_app_identification(mut self, enabled: bool) -> Self {
+        self.app_identification = enabled;
+        self
+    }
+
+    fn app_headers(&self) -> reqwest::header::HeaderMap {
+        super::app_identity::app_identity_headers(self.app_identification)
     }
 
     /// Lower every published tool schema to what this endpoint was declared to
@@ -310,8 +324,7 @@ impl OpenRouterProvider {
             .http_client()
             .post(self.chat_endpoint())
             .header("Authorization", format!("Bearer {credential}"))
-            .header("HTTP-Referer", "https://github.com/openprx/prx")
-            .header("X-Title", "OpenPRX")
+            .headers(self.app_headers())
             .json(&super::parameter_wire::request(
                 "openrouter",
                 super::parameter_wire::Format::OpenRouter,
@@ -411,8 +424,7 @@ impl Provider for OpenRouterProvider {
             .http_client()
             .post("https://openrouter.ai/api/v1/chat/completions")
             .header("Authorization", format!("Bearer {credential}"))
-            .header("HTTP-Referer", "https://github.com/openprx/prx")
-            .header("X-Title", "OpenPRX")
+            .headers(self.app_headers())
             .json(&super::parameter_wire::request(
                 "openrouter",
                 super::parameter_wire::Format::OpenRouter,
@@ -464,8 +476,7 @@ impl Provider for OpenRouterProvider {
             .http_client()
             .post("https://openrouter.ai/api/v1/chat/completions")
             .header("Authorization", format!("Bearer {credential}"))
-            .header("HTTP-Referer", "https://github.com/openprx/prx")
-            .header("X-Title", "OpenPRX")
+            .headers(self.app_headers())
             .json(&super::parameter_wire::request(
                 "openrouter",
                 super::parameter_wire::Format::OpenRouter,
@@ -609,6 +620,7 @@ impl Provider for OpenRouterProvider {
             tools,
         };
         let client = self.http_client();
+        let app_headers = self.app_headers();
         let count_tokens = options.count_tokens;
         let endpoint = self.chat_endpoint().to_owned();
 
@@ -617,8 +629,7 @@ impl Provider for OpenRouterProvider {
             let response = match client
                 .post(endpoint)
                 .header("Authorization", format!("Bearer {credential}"))
-                .header("HTTP-Referer", "https://github.com/openprx/prx")
-                .header("X-Title", "OpenPRX")
+                .headers(app_headers)
                 .header("Accept", "text/event-stream")
                 .json(&super::parameter_wire::request(
                     "openrouter",

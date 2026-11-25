@@ -276,7 +276,7 @@ pub struct RouterModelConfig {
 }
 
 /// Provider-specific runtime configuration (`[providers]`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ProvidersConfig {
     /// Ollama-specific request options (`[providers.ollama]`).
     #[serde(default)]
@@ -295,6 +295,34 @@ pub struct ProvidersConfig {
     /// model) descriptor the model resolver consults.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<ProviderModelConfig>,
+    /// Send the app identification headers `HTTP-Referer:
+    /// https://github.com/openprx/prx` and `X-Title: OpenPRX` to OpenRouter and
+    /// to `custom:` OpenAI-compatible endpoints (`[providers]
+    /// app_identification`). Default `true`; `false` removes both headers
+    /// everywhere. The `User-Agent: prx/<version>` header is always sent.
+    #[serde(default = "default_app_identification")]
+    pub app_identification: bool,
+    /// Extra static headers per `custom:` endpoint
+    /// (`[providers.endpoint_headers."custom:https://gw.example/v1"]`, then
+    /// `X-App-Code = "..."`). Values are treated as secrets: never logged.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub endpoint_headers: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+}
+
+const fn default_app_identification() -> bool {
+    true
+}
+
+impl Default for ProvidersConfig {
+    fn default() -> Self {
+        Self {
+            ollama: OllamaProviderConfig::default(),
+            tool_dialects: Vec::new(),
+            models: Vec::new(),
+            app_identification: default_app_identification(),
+            endpoint_headers: std::collections::BTreeMap::new(),
+        }
+    }
 }
 
 /// One `[[providers.tool_dialects]]` entry: what one OpenAI-compatible
