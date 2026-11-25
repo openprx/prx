@@ -74,12 +74,26 @@ impl NamedJob {
         })
     }
 
-    pub fn prompt(&self, config: &Config) -> Result<String> {
+    /// The standard sections at the agent's own effective level, with the
+    /// agent's composed identity in place of the main persona.
+    pub fn prompt(
+        &self,
+        config: &Config,
+        model_name: &str,
+        skills: &[crate::skills::Skill],
+        native_tools: bool,
+    ) -> Result<String> {
         let agent = config.agents.get(self.name.as_str()).context("creator_gone")?;
         let identity = agent.identity_dir.as_ref().map(|path| config.workspace_dir.join(path));
-        Ok(crate::identity::delegated::compose(
-            identity.as_deref(),
-            agent.system_prompt.as_deref(),
+        let identity = crate::identity::delegated::compose(identity.as_deref(), agent.system_prompt.as_deref());
+        let level = crate::security::agent_level::agent_level(agent.autonomy, config.autonomy.level);
+        Ok(crate::agent::runtime_prompt::build_named_agent_system_prompt(
+            config,
+            level,
+            model_name,
+            skills,
+            native_tools,
+            &identity,
         ))
     }
 

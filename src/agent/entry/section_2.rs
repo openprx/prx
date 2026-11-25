@@ -703,7 +703,7 @@ pub(crate) async fn run_with_runtime_envelope(
                 let decision_proof = *decision_proof;
                 let selected_skills = decision_service.agent_prompt_skills(decision_proof, decision_context)?;
                 let system_prompt = match &named_job {
-                    Some(job) => job.prompt(&config)?,
+                    Some(job) => job.prompt(&config, model_name, &selected_skills, native_tools)?,
                     None => build_runtime_system_prompt(&config, model_name, &selected_skills, native_tools),
                 };
 
