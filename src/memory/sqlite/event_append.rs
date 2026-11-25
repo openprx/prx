@@ -145,12 +145,18 @@ impl SqliteMemory {
             &input.workspace_id,
             input.owner_id.as_deref(),
         )?;
-        if bound_scope.is_none()
-            && matches!(
-                input.source,
-                crate::memory::MessageEventSource::SessionsSpawn | crate::memory::MessageEventSource::SessionWorker
-            )
-        {
+        // A compaction audit row of a child turn (switch handoff, degradation,
+        // compaction summary) carries no partition for a Main child, so it binds
+        // the child's own scope the same way the child's message rows do.
+        let child_message_source = matches!(
+            input.source,
+            crate::memory::MessageEventSource::SessionsSpawn | crate::memory::MessageEventSource::SessionWorker
+        );
+        let child_audit_source = matches!(
+            &input.source,
+            crate::memory::MessageEventSource::Other(source) if matches!(source.as_str(), "context_switch" | "compaction")
+        );
+        if bound_scope.is_none() && (child_message_source || child_audit_source) {
             bound_scope = tx
                 .query_row(
                     "SELECT ma_scope_id FROM child_sessions WHERE workspace_id=?1 AND owner_id=?2 AND session_id=?3",
@@ -166,11 +172,12 @@ impl SqliteMemory {
                     |r| r.get(0),
                 )?;
                 anyhow::ensure!(!fenced, AgentScopeRefused);
-            } else if input
-                .raw_payload_json
-                .as_deref()
-                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-                .is_some_and(|value| value.get("child_session_record").is_some())
+            } else if child_message_source
+                && input
+                    .raw_payload_json
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                    .is_some_and(|value| value.get("child_session_record").is_some())
             {
                 let owner = input.owner_id.clone().ok_or(AgentScopeRefused)?;
                 bound_scope = Some(super::agent_migration::resolve_write_scope(
