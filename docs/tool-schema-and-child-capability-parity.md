@@ -222,6 +222,12 @@ worker manifest. Each entry records an execution location:
 The worker compares its reconstructed local catalog with the manifest before the
 first model request. Missing parent capabilities cannot be silently ignored.
 
+The manifest also carries the published surface the parent decided for the
+worker (allowed, hidden and direct names) inside its sealed `call_context`
+(see `docs/unified-turn-context.md`). The worker publishes exactly that surface;
+it does not read the tool tiering from its own configuration. The parity check
+above is unchanged.
+
 Parent-proxy execution uses a bidirectional framed protocol separate from final
 human-readable output. Each request carries run id, tool call id, public tool
 name, arguments, sealed scope, and cancellation identity. The parent resolves

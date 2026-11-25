@@ -99,6 +99,48 @@ only, no value) says so. A skill process still starts in its skill root (or
 the staged run directory of a managed run), not in the call's working
 directory.
 
+### Across the process boundary
+
+A process-mode child (`sessions_spawn` with `mode: "process"`) runs in a
+separate `prx session-worker` process. The parent decides the worker's call
+context once, when it binds the worker manifest, and seals it into the
+manifest as `call_context` (`WorkerCallContext`,
+`src/session_worker/protocol/call_context.rs`). The manifest HMAC covers it
+like every other manifest field.
+
+The sealed value carries what the parent decided: the owner, the session key
+and the named agent; the level and why it applies (`child_scope`); the
+workspace root and the working directory; the provider and model; and the
+published surface (the allowed names, the hidden names and the direct names).
+
+The worker builds its call context from that value. It does not derive the
+level, the workspace root, the working directory, the owner, the agent, the
+model or the tool surface from its own configuration: `TurnRuntimeService`
+holds the sealed value as `call_seed`, and `call_context()` takes these fields
+from it when it is set (every other service computes them as before). The
+worker still compares the sealed value with the sealed child scope or operator
+publication and the signed generation binding (level, workspace and working
+root) and refuses to start on any difference, so the existing integrity checks
+are no stricter or weaker than before. The parent computes the surface with the
+rules the worker used to apply itself, so what a process child can do does not
+change.
+
+Version: the call context carries `version`, and the manifest reference
+envelope that opens a manifest in the worker is version 2. A parent and a
+worker of different builds refuse each other with a "protocol version
+mismatch" error naming both versions, instead of reading a manifest they do not
+share. A manifest without a call context is refused the same way.
+
+Worker logs: the worker installs a tracing subscriber that writes to stderr
+(stdout is the IPC channel and stays clean; `RUST_LOG` applies, default
+`info`). The parent keeps what the worker writes to stderr, line by line and
+redacted, in `<config dir>/logs/workers/<run id>.log` (directory mode 0700,
+file mode 0600, at most 4 MiB per run, the newest 64 runs kept). The file
+exists from the moment the worker is spawned, so a worker that dies at start
+still leaves its stderr there. The parent logs the path as `worker_log` on the
+`process worker log` line. Provider credentials are not part of the manifest or
+the log: the worker resolves its credential from its sealed binding, as before.
+
 ## Replayed history on the gateway session route
 
 The history of a Console or rf session turn is built from the session's stored

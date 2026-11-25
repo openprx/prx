@@ -224,3 +224,11 @@ when signed). Existing hook files parse unchanged; an action with both
 `webhook_count` and `webhook_urls`, the proxy service key `hook.webhook`
 (selector `hook.*`) is new, and the Gateway hooks API keeps webhook fields
 when it rewrites `hooks.json`. No database schema migration is introduced.
+
+## Process-mode children use the parent's call context and keep a log
+
+A process-mode child (`sessions_spawn` with `mode: "process"`) now receives the parent's sealed call context in its manifest: owner, level, workspace root, working directory, model and the published tool surface. The worker no longer derives them from its own configuration, so process and task children run with the same tools, directory and level. No configuration change is needed and the level a child runs at does not change.
+
+The worker's tracing output, which was dropped before, and anything it prints to stderr are now kept in `<config dir>/logs/workers/<run id>.log` (private files, at most 4 MiB each, the newest 64 runs kept). The parent logs the path on the `process worker log` line.
+
+The worker protocol is now version 2: a `prx` that spawns workers and the `prx` that runs them must be the same build. A mixed pair refuses to start the worker with a `protocol version mismatch` error. No database schema migration is introduced.
