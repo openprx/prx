@@ -606,10 +606,14 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
         }
 
         Commands::Doctor { doctor_command } => match doctor_command {
-            Some(DoctorCommands::Models { provider, use_cache }) => {
+            Some(DoctorCommands::Models {
+                provider,
+                all_providers,
+                use_cache,
+            }) => {
                 let config_for_models = config.clone();
                 crate::runtime::blocking::spawn_blocking(move || {
-                    doctor::run_models(&config_for_models, provider.as_deref(), use_cache)
+                    doctor::run_models(&config_for_models, provider.as_deref(), all_providers, use_cache)
                 })
                 .await
                 .map_err(|e| anyhow::anyhow!("doctor models task failed: {e}"))?

@@ -1562,9 +1562,15 @@ fn parse_setting<T: serde::de::DeserializeOwned>(text: &str) -> std::result::Res
 enum DoctorCommands {
     /// Probe model catalogs across providers and report availability
     Models {
-        /// Probe a specific provider only (default: all known providers)
+        /// Probe a specific provider only (default: the providers configured in this install)
         #[arg(long)]
         provider: Option<String>,
+
+        /// Probe every catalog provider, including ones not configured here.
+        /// A provider that is not configured never receives a key taken
+        /// from the process environment.
+        #[arg(long, conflicts_with = "provider")]
+        all_providers: bool,
 
         /// Prefer cached catalogs when available (skip forced live refresh)
         #[arg(long)]

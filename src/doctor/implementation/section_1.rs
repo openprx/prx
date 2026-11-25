@@ -1139,26 +1139,83 @@ fn classify_model_probe_error(err_message: &str) -> ModelProbeVerdict {
     ModelProbeVerdict::Error
 }
 
-fn doctor_model_targets(provider_override: Option<&str>) -> Vec<String> {
-    if let Some(provider) = provider_override.map(str::trim).filter(|p| !p.is_empty()) {
-        return vec![provider.to_string()];
-    }
-
-    crate::providers::list_providers()
-        .into_iter()
-        .map(|provider| provider.name.to_string())
-        .collect()
+/// The providers `doctor models` probes, and the catalog providers it leaves
+/// alone because this install does not configure them.
+struct DoctorModelTargets {
+    probe: Vec<String>,
+    skipped: Vec<String>,
+    /// Providers named by the operator (`--provider`) or configured here may
+    /// receive a key from the process environment; the rest never do.
+    configured: Vec<String>,
 }
 
-pub fn run_models(config: &Config, provider_override: Option<&str>, use_cache: bool) -> Result<()> {
-    let targets = doctor_model_targets(provider_override);
+fn doctor_model_targets(config: &Config, provider_override: Option<&str>, all_providers: bool) -> DoctorModelTargets {
+    use crate::providers::configured_providers::{configured_provider_names, is_configured};
 
-    if targets.is_empty() {
-        anyhow::bail!("No providers available for model probing");
+    if let Some(provider) = provider_override.map(str::trim).filter(|p| !p.is_empty()) {
+        return DoctorModelTargets {
+            probe: vec![provider.to_string()],
+            skipped: Vec::new(),
+            configured: vec![provider.to_string()],
+        };
     }
 
+    let configured = configured_provider_names(config);
+    let catalog: Vec<String> = crate::providers::list_providers()
+        .into_iter()
+        .map(|provider| provider.name.to_string())
+        .collect();
+    if all_providers {
+        return DoctorModelTargets {
+            probe: catalog,
+            skipped: Vec::new(),
+            configured,
+        };
+    }
+
+    // Configured providers first (a `custom:` endpoint has no catalog row),
+    // then nothing else.
+    let skipped = catalog
+        .into_iter()
+        .filter(|name| !is_configured(&configured, name))
+        .collect();
+    DoctorModelTargets {
+        probe: configured.clone(),
+        skipped,
+        configured,
+    }
+}
+
+pub fn run_models(
+    config: &Config,
+    provider_override: Option<&str>,
+    all_providers: bool,
+    use_cache: bool,
+) -> Result<()> {
+    let plan = doctor_model_targets(config, provider_override, all_providers);
+    let targets = &plan.probe;
+
     println!("🩺 OpenPRX Doctor — Model Catalog Probe");
+    if targets.is_empty() {
+        println!("  No provider is configured, so nothing was probed.");
+        println!("  Use `--provider <name>` to probe one provider or `--all-providers` to probe the whole catalog.");
+        return Ok(());
+    }
     println!("  Providers to probe: {}", targets.len());
+    println!(
+        "  Probed: {}.",
+        targets
+            .iter()
+            .map(|name| crate::security::redaction::redact_provider_text(name))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if !plan.skipped.is_empty() {
+        println!(
+            "  Skipped (not configured, nothing sent): {}. Use `--all-providers` to probe them too.",
+            plan.skipped.join(", ")
+        );
+    }
     println!(
         "  Mode: {}",
         if use_cache { "cache-first" } else { "force live refresh" }
@@ -1170,13 +1227,19 @@ pub fn run_models(config: &Config, provider_override: Option<&str>, use_cache: b
     let mut auth_count = 0usize;
     let mut error_count = 0usize;
 
-    for provider_name in &targets {
+    for provider_name in targets {
         println!(
             "  [{}]",
             crate::security::redaction::redact_provider_text(provider_name)
         );
 
-        match crate::providers::model_discovery::run_models_probe_read_only(config, Some(provider_name), use_cache) {
+        let use_env_credential = crate::providers::configured_providers::is_configured(&plan.configured, provider_name);
+        match crate::providers::model_discovery::run_models_probe_read_only_with_env(
+            config,
+            Some(provider_name),
+            use_cache,
+            use_env_credential,
+        ) {
             Ok(()) => {
                 ok_count += 1;
                 println!("    ✅ model catalog check passed");

@@ -414,9 +414,23 @@ pub(crate) fn fetch_live_models_for_provider(
     api_key: &str,
     provider_api_url: Option<&str>,
 ) -> Result<Vec<DiscoveredModel>> {
+    fetch_live_models_for_provider_with_env(provider_name, api_key, provider_api_url, true)
+}
+
+/// Like [`fetch_live_models_for_provider`]; `use_env_credential = false`
+/// never reads the provider's standard key from the process environment, so
+/// a provider the operator did not configure or name cannot receive it.
+pub(crate) fn fetch_live_models_for_provider_with_env(
+    provider_name: &str,
+    api_key: &str,
+    provider_api_url: Option<&str>,
+    use_env_credential: bool,
+) -> Result<Vec<DiscoveredModel>> {
     let requested_provider_name = provider_name;
     let provider_name = canonical_provider_name(provider_name);
-    let api_key = if api_key.trim().is_empty() {
+    let api_key = if api_key.trim().is_empty() && !use_env_credential {
+        None
+    } else if api_key.trim().is_empty() {
         provider_credential_env_var(provider_name)
             .and_then(|variable| std::env::var(variable).ok())
             .or_else(|| {
@@ -527,14 +541,19 @@ pub(crate) fn model_discovery_connection<'a>(config: &'a Config, provider_name: 
     }
 }
 
-/// The selected provider's own auth-profile credential, or empty.
-pub(crate) fn model_discovery_api_key(config: &Config, provider_name: &str) -> String {
-    let state_dir = config
+/// The directory that holds this install's auth-profile store.
+pub(crate) fn auth_state_dir(config: &Config) -> PathBuf {
+    config
         .config_path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| crate::config::default_openprx_dir().unwrap_or_else(|| PathBuf::from(".openprx")));
+        .unwrap_or_else(|| crate::config::default_openprx_dir().unwrap_or_else(|| PathBuf::from(".openprx")))
+}
+
+/// The selected provider's own auth-profile credential, or empty.
+pub(crate) fn model_discovery_api_key(config: &Config, provider_name: &str) -> String {
+    let state_dir = auth_state_dir(config);
     let store = AuthProfilesStore::new(&state_dir, config.secrets.encrypt);
     let Ok(data) = store.load_read_only() else {
         return String::new();
@@ -854,6 +873,18 @@ pub fn run_models_refresh(config: &Config, provider_override: Option<&str>, forc
 /// Probe a provider model catalog without creating or updating the workspace
 /// cache. A fresh or stale cache may be read as fallback evidence only.
 pub fn run_models_probe_read_only(config: &Config, provider_override: Option<&str>, prefer_cache: bool) -> Result<()> {
+    run_models_probe_read_only_with_env(config, provider_override, prefer_cache, true)
+}
+
+/// [`run_models_probe_read_only`] with control over the environment
+/// credential: `use_env_credential = false` is for a provider the operator
+/// neither configured nor named.
+pub fn run_models_probe_read_only_with_env(
+    config: &Config,
+    provider_override: Option<&str>,
+    prefer_cache: bool,
+    use_env_credential: bool,
+) -> Result<()> {
     let provider_name = provider_override
         .or(config.default_provider.as_deref())
         .unwrap_or("openrouter")
@@ -882,7 +913,12 @@ pub fn run_models_probe_read_only(config: &Config, provider_override: Option<&st
     }
 
     let connection = model_discovery_connection(config, &provider_name);
-    match fetch_live_models_for_provider(&provider_name, &connection.api_key, connection.api_url) {
+    match fetch_live_models_for_provider_with_env(
+        &provider_name,
+        &connection.api_key,
+        connection.api_url,
+        use_env_credential,
+    ) {
         Ok(models) if !models.is_empty() => {
             println!(
                 "Read-only live probe returned {} model(s) for '{}'; cache was not updated.",

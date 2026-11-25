@@ -22,6 +22,7 @@ pub mod bedrock;
 pub mod catalog;
 pub mod circuit_breaker;
 pub mod compatible;
+pub mod configured_providers;
 pub mod connection_test;
 pub mod context_window;
 pub mod copilot;
