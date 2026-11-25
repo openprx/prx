@@ -2,4 +2,6 @@
 //! is kept, and the values computed once per turn for every consumer.
 
 pub(crate) mod call;
+pub(crate) mod layout;
+pub(crate) mod sources;
 pub(crate) mod transcript;

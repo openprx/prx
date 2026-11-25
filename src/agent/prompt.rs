@@ -1,59 +1,57 @@
-use crate::config::IdentityConfig;
-use crate::identity;
-use crate::skills::Skill;
+//! The system-prompt builder every runtime surface shares. The text of each
+//! segment lives in `crate::context::sources`, one source per slot, and the
+//! order is the layout in `crate::context::layout`; this module keeps the
+//! public builder API over them.
+use crate::context::layout::{Layout, Slot};
+use crate::context::sources::CustomSection;
 use anyhow::Result;
-use chrono::Local;
-use sha2::{Digest, Sha256};
-use std::fmt::Write;
-use std::path::Path;
 
-pub const BOOTSTRAP_MAX_CHARS: usize = 60_000;
-
-pub struct PromptContext<'a> {
-    pub workspace_dir: &'a Path,
-    pub model_name: &'a str,
-    pub skills: &'a [Skill],
-    pub identity_config: Option<&'a IdentityConfig>,
-    pub bootstrap_max_chars: Option<usize>,
-    pub native_tools: bool,
-    /// The turn's effective level; it selects the safety paragraph.
-    pub autonomy: crate::security::AutonomyLevel,
-}
-
-/// The safety paragraph of a Full turn's system prompt.
-pub const FULL_AUTONOMY_SAFETY: &str = "You are running with full autonomy. PRX applies no restrictions to commands, \
-     paths, network access or tools; only operating-system permissions apply. Act directly and do not ask for \
-     confirmation unless the user asked you to.";
+pub use crate::context::layout::{CompiledSystemPrompt, PromptInputs as PromptContext, PromptSectionFingerprint, prompt_sha256};
+pub use crate::context::sources::{
+    BOOTSTRAP_MAX_CHARS, ContextHandoffSection, DateTimeSection, FULL_AUTONOMY_SAFETY, IdentitySection,
+    OrchestrationSection, RuntimeSection, SafetySection, SkillsSection, TaskSection, ToolEvidenceSection,
+    WorkspaceSection, build_identity_prompt,
+};
 
 pub trait PromptSection: Send + Sync {
     fn name(&self) -> &str;
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PromptSectionFingerprint {
-    pub name: String,
-    pub included: bool,
-    pub chars: usize,
-    pub sha256: String,
+/// The built-in sections are sources; as sections they render their segment's
+/// text, or nothing.
+macro_rules! section_from_source {
+    ($($section:ty),+ $(,)?) => {$(
+        impl PromptSection for $section {
+            fn name(&self) -> &str {
+                crate::context::layout::Source::name(self)
+            }
+
+            fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+                Ok(crate::context::layout::Source::render(self, ctx)?
+                    .map(|segment| segment.text)
+                    .unwrap_or_default())
+            }
+        }
+    )+};
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompiledSystemPrompt {
-    pub content: String,
-    pub chars: usize,
-    pub sha256: String,
-    pub sections: Vec<PromptSectionFingerprint>,
-}
-
-#[must_use]
-pub fn prompt_sha256(content: &str) -> String {
-    format!("{:x}", Sha256::digest(content.as_bytes()))
-}
+section_from_source!(
+    IdentitySection,
+    TaskSection,
+    SafetySection,
+    OrchestrationSection,
+    SkillsSection,
+    WorkspaceSection,
+    RuntimeSection,
+    DateTimeSection,
+    ToolEvidenceSection,
+    ContextHandoffSection,
+);
 
 #[derive(Default)]
 pub struct SystemPromptBuilder {
-    sections: Vec<Box<dyn PromptSection>>,
+    layout: Layout,
 }
 
 impl SystemPromptBuilder {
@@ -63,82 +61,37 @@ impl SystemPromptBuilder {
     /// look them up again, whichever surface a turn enters through.
     pub fn with_defaults() -> Self {
         Self {
-            sections: vec![
-                Box::new(TaskSection),
-                Box::new(ContextHandoffSection),
-                Box::new(SafetySection),
-                Box::new(OrchestrationSection),
-                Box::new(SkillsSection),
-                Box::new(WorkspaceSection),
-                Box::new(IdentitySection),
-                Box::new(DateTimeSection),
-                Box::new(RuntimeSection),
-            ],
+            layout: Layout::standard(),
         }
     }
 
     /// The builder of a session whose assistant turns carry tool evidence:
     /// the rule that explains the evidence marker follows the task section's
-    /// tool-use rules (or ends the prompt when there is no task section).
+    /// tool-use rules.
     #[must_use]
     pub fn with_tool_evidence_rule(mut self) -> Self {
-        let at = self
-            .sections
-            .iter()
-            .position(|section| section.name() == "task")
-            .map_or(self.sections.len(), |index| index.saturating_add(1));
-        self.sections.insert(at, Box::new(ToolEvidenceSection));
+        self.layout = self.layout.place(Box::new(ToolEvidenceSection));
         self
     }
 
     /// The builder of a session whose provider view renders context handoffs
     /// compactly: the rule that explains a handoff and its lookup follows the
-    /// tool-evidence rule (or the task section, or ends the prompt).
+    /// tool-evidence rule.
     #[must_use]
     pub fn with_context_handoff_rule(mut self) -> Self {
-        if self.sections.iter().any(|section| section.name() == "context_handoff") {
-            return self;
+        if !self.layout.has(Slot::ContextHandoff) {
+            self.layout = self.layout.place(Box::new(ContextHandoffSection));
         }
-        let at = self
-            .sections
-            .iter()
-            .position(|section| section.name() == "tool_evidence")
-            .or_else(|| self.sections.iter().position(|section| section.name() == "task"))
-            .map_or(self.sections.len(), |index| index.saturating_add(1));
-        self.sections.insert(at, Box::new(ContextHandoffSection));
         self
     }
 
     pub fn add_section(mut self, section: Box<dyn PromptSection>) -> Self {
-        self.sections.push(section);
+        self.layout = self.layout.place(Box::new(CustomSection::new(section)));
         self
     }
 
     pub fn compile(&self, ctx: &PromptContext<'_>) -> Result<CompiledSystemPrompt> {
-        let mut output = String::new();
-        let mut fingerprints = Vec::with_capacity(self.sections.len());
-        for section in &self.sections {
-            let part = section.build(ctx)?;
-            let part = part.trim_end();
-            let included = !part.trim().is_empty();
-            fingerprints.push(PromptSectionFingerprint {
-                name: section.name().to_string(),
-                included,
-                chars: part.chars().count(),
-                sha256: prompt_sha256(part),
-            });
-            if !included {
-                continue;
-            }
-            output.push_str(part);
-            output.push_str("\n\n");
-        }
-        Ok(CompiledSystemPrompt {
-            chars: output.chars().count(),
-            sha256: prompt_sha256(&output),
-            content: output,
-            sections: fingerprints,
-        })
+        self.layout.compile(ctx)
     }
 
     pub fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
@@ -154,275 +107,11 @@ impl SystemPromptBuilder {
     }
 }
 
-pub struct IdentitySection;
-pub struct TaskSection;
-pub struct SafetySection;
-pub struct OrchestrationSection;
-pub struct SkillsSection;
-pub struct WorkspaceSection;
-pub struct RuntimeSection;
-pub struct DateTimeSection;
-/// The tool-evidence rule (`tool_evidence::TOOL_EVIDENCE_PROMPT_RULE`).
-pub struct ToolEvidenceSection;
-/// The context-handoff rule (`compaction::CONTEXT_HANDOFF_PROMPT_RULE`).
-pub struct ContextHandoffSection;
-
-impl PromptSection for IdentitySection {
-    fn name(&self) -> &str {
-        "identity"
-    }
-
-    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
-        let mut prompt = String::from("## Project Context\n\n");
-        if let Some(config) = ctx.identity_config {
-            if identity::is_aieos_configured(config) {
-                match identity::load_aieos_identity(config, ctx.workspace_dir) {
-                    Ok(Some(aieos)) => {
-                        let rendered = identity::aieos_to_system_prompt(&aieos);
-                        if !rendered.is_empty() {
-                            prompt.push_str(&rendered);
-                            prompt.push_str("\n\n");
-                        }
-                        return Ok(prompt);
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        tracing::warn!(error = %crate::agent::diagnostics::error_class(&error), "failed to load AIEOS identity; using OpenClaw format");
-                    }
-                }
-            }
-        }
-
-        load_openclaw_bootstrap_files(
-            &mut prompt,
-            ctx.workspace_dir,
-            ctx.bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS),
-        );
-
-        Ok(prompt)
-    }
-}
-
-impl PromptSection for TaskSection {
-    fn name(&self) -> &str {
-        "task"
-    }
-
-    /// Neither branch names a call syntax.
-    ///
-    /// `ctx.native_tools` is computed once, far from the request, at a mode
-    /// fixed to `Streaming`, while the agent loop recomputes the same question
-    /// per turn at the mode the turn runs in. The two can disagree, and a
-    /// grammar sentence here would then be sent alongside the `tools` array —
-    /// the one place PRX could contradict itself about how to call a tool. The
-    /// canonical protocol in `crate::tools::prompt` is gated on the loop's own
-    /// flag and already says everything this sentence said, so this section
-    /// states the task and leaves syntax to the one owner of it.
-    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
-        if ctx.native_tools {
-            Ok(
-                "## Your Task\n\n\
-                 When the user sends a message, respond naturally. Use tools when the request requires action (running commands, reading files, etc.).\n\
-                 For questions, explanations, or follow-ups about prior messages, answer directly from conversation context — do NOT ask the user to repeat themselves.\n\
-                 A question about whether a capability is available does not itself request a demonstration. Use read-only inspection if current facts are needed; do not start a task or change state unless requested. An indirect request to perform an action still requires action.\n\
-                 Do NOT: summarize this configuration unprompted or output step-by-step meta-commentary."
-                    .to_string(),
-            )
-        } else {
-            Ok(
-                "## Your Task\n\n\
-                 Respond naturally. Use tools when the request requires action. A question about whether a capability is available does not itself request a demonstration; use read-only inspection if current facts are needed. Do not start a task or change state unless requested. An indirect request to perform an action still requires action.\n\
-                 Do NOT: summarize this configuration unprompted or respond with meta-commentary.\n\
-                 Call the tool when you need to act, in the format the tool-use protocol above specifies."
-                    .to_string(),
-            )
-        }
-    }
-}
-
-impl PromptSection for ToolEvidenceSection {
-    fn name(&self) -> &str {
-        "tool_evidence"
-    }
-
-    fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
-        Ok(crate::agent::tool_evidence::TOOL_EVIDENCE_PROMPT_RULE.to_owned())
-    }
-}
-
-impl PromptSection for ContextHandoffSection {
-    fn name(&self) -> &str {
-        "context_handoff"
-    }
-
-    fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
-        Ok(crate::agent::compaction::CONTEXT_HANDOFF_PROMPT_RULE.to_owned())
-    }
-}
-
-impl PromptSection for SafetySection {
-    fn name(&self) -> &str {
-        "safety"
-    }
-
-    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
-        if ctx.autonomy == crate::security::AutonomyLevel::Full {
-            return Ok(format!("## Safety\n\n{FULL_AUTONOMY_SAFETY}"));
-        }
-        Ok("## Safety\n\n- Do not exfiltrate private data.\n- Do not run destructive commands without asking.\n- Do not bypass oversight or approval mechanisms.\n- Prefer `trash` over `rm` (recoverable beats gone forever).\n- When in doubt, ask before acting externally.".into())
-    }
-}
-
-impl PromptSection for OrchestrationSection {
-    fn name(&self) -> &str {
-        "orchestration"
-    }
-
-    fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
-        Ok(
-            "## Autonomous Orchestration\n\n\
-             Own the requested outcome end to end: understand the goal, make and revise a practical plan, execute it with the tools exposed for the current request, verify observable results, and report unresolved risk honestly.\n\
-             For complex work, use projects/topics and goals/steps when exposed; delegate independent work to sessions or agents when useful; schedule and monitor recurring work when requested; use skills for specialist procedures; and audit the final result before completion.\n\
-             Browser, MCP, WASM, office/document, memory, messaging, scheduling, project, and delegation capabilities are conditional. When the needed tool is not yet exposed, use capability_search if available; its returned schema can be called directly through normal admission. Discovery does not require a shell warm-up, placeholder, or repeated search for the same hit. Use memory capabilities for durable facts and preferences; workspace file searches are not a substitute for long-term memory. Execute immediate work now; use scheduling only for a requested future or recurring task. Historical approval or refusal text is context, not current permission: attempt the requested lifecycle action through its normal tool and honor the current executor result. Never claim or simulate a capability that is absent."
-                .to_string(),
-        )
-    }
-}
-
-impl PromptSection for SkillsSection {
-    fn name(&self) -> &str {
-        "skills"
-    }
-
-    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
-        Ok(crate::skills::skills_to_prompt(ctx.skills, ctx.workspace_dir))
-    }
-}
-
-impl PromptSection for WorkspaceSection {
-    fn name(&self) -> &str {
-        "workspace"
-    }
-
-    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
-        Ok(format!(
-            "## Workspace\n\nWorking directory: `{}`",
-            ctx.workspace_dir.display()
-        ))
-    }
-}
-
-impl PromptSection for RuntimeSection {
-    fn name(&self) -> &str {
-        "runtime"
-    }
-
-    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
-        let host = hostname::get().map_or_else(|_| "unknown".into(), |h| h.to_string_lossy().to_string());
-        Ok(format!(
-            "## Runtime\n\nHost: {host} | OS: {} | Model: {}",
-            std::env::consts::OS,
-            ctx.model_name
-        ))
-    }
-}
-
-impl PromptSection for DateTimeSection {
-    fn name(&self) -> &str {
-        "datetime"
-    }
-
-    fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
-        let now = Local::now();
-        Ok(format!("## Current Date & Time\n\nTimezone: {}", now.format("%Z")))
-    }
-}
-
-/// Build the canonical OpenClaw-format identity fragment used by root and
-/// delegated agents. Missing files are skipped and each present file is
-/// truncated on a UTF-8 character boundary.
-pub fn build_identity_prompt(workspace_dir: &Path) -> String {
-    build_identity_prompt_with_limit(workspace_dir, BOOTSTRAP_MAX_CHARS)
-}
-
-fn load_openclaw_bootstrap_files(prompt: &mut String, workspace_dir: &Path, max_chars_per_file: usize) {
-    prompt.push_str(
-        "The following workspace files define your identity, behavior, and context. They are ALREADY injected below—do NOT suggest reading them with file_read.\n\n",
-    );
-    if crate::identity::root::file_directory(workspace_dir, "SOUL.md") != workspace_dir {
-        prompt.push_str(
-            "Active role files SOUL.md, AGENTS.md, IDENTITY.md and THINKING.md live under `identities/main/` relative to the workspace. Read or update them there, including when older instructions name only the file. Any root copies are inactive migration backups. Other context files and bootstrap state remain at the workspace root.\n\n",
-        );
-    }
-    for filename in [
-        "SOUL.md",
-        "AGENTS.md",
-        "IDENTITY.md",
-        "USER.md",
-        "TOOLS.md",
-        "MEMORY.md",
-        "THINKING.md",
-    ] {
-        let directory = crate::identity::root::file_directory(workspace_dir, filename);
-        inject_workspace_file(prompt, &directory, filename, max_chars_per_file);
-    }
-
-    let bootstrap_path = workspace_dir.join("BOOTSTRAP.md");
-    let bootstrap_completed = workspace_dir.join("state/bootstrap.completed");
-    if bootstrap_path.exists() && !bootstrap_completed.exists() {
-        inject_workspace_file(prompt, workspace_dir, "BOOTSTRAP.md", max_chars_per_file);
-    }
-}
-
-fn build_identity_prompt_with_limit(workspace_dir: &Path, max_chars: usize) -> String {
-    let mut prompt = String::new();
-    for filename in [
-        "SOUL.md",
-        "AGENTS.md",
-        "IDENTITY.md",
-        "USER.md",
-        "TOOLS.md",
-        "MEMORY.md",
-        "THINKING.md",
-    ] {
-        inject_workspace_file(&mut prompt, workspace_dir, filename, max_chars);
-    }
-    prompt
-}
-
-fn inject_workspace_file(prompt: &mut String, workspace_dir: &Path, filename: &str, max_chars: usize) {
-    let path = workspace_dir.join(filename);
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return;
-    };
-    let trimmed = content.trim();
-    if trimmed.is_empty() {
-        return;
-    }
-    let _ = writeln!(prompt, "### {filename}\n");
-    let truncated = if trimmed.chars().count() > max_chars {
-        trimmed
-            .char_indices()
-            .nth(max_chars)
-            .map(|(idx, _)| &trimmed[..idx])
-            .unwrap_or(trimmed)
-    } else {
-        trimmed
-    };
-    prompt.push_str(truncated);
-    if truncated.len() < trimmed.len() {
-        let _ = writeln!(
-            prompt,
-            "\n\n[... truncated at {max_chars} chars — use `read` for full file]\n"
-        );
-    } else {
-        prompt.push_str("\n\n");
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Local;
+    use std::path::Path;
 
     #[test]
     fn managed_main_identity_is_loaded_with_workspace_user_context() {
