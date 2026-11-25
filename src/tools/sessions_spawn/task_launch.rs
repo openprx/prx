@@ -176,6 +176,13 @@ impl SessionsSpawnTool {
         let task_result_scope = spawn_scope_for_event.clone();
         let task_lineage = run_lineage.clone();
         let agent_label_for_registry = selected_agent.as_ref().map(|(name, _)| name.clone());
+        let task_mailbox_announce = super::mailbox_announce::MailboxAnnouncement::capture(
+            caller,
+            child_model_config,
+            recipient.as_deref(),
+            &session_scope_key,
+            agent_label_for_registry.as_deref(),
+        );
         let (system_prompt, filtered_tools) = if let Some((agent, cfg)) = selected_agent {
             let identity_path = cfg
                 .identity_dir
@@ -479,6 +486,7 @@ impl SessionsSpawnTool {
                     }
                 }
                 let announce = format_announce_message(&rid, &status, &result_text);
+                let task_completed = matches!(status, SubAgentStatus::Completed(_));
                 record_spawn_result_event(
                     Some(&task_memory_fabric),
                     task_result_scope,
@@ -500,6 +508,11 @@ impl SessionsSpawnTool {
                     }
                 }
 
+                // A gateway parent session receives the completion through its mailbox.
+                let task_mailbox_delivered = match &task_mailbox_announce {
+                    Some(mailbox) if announce_result => mailbox.deliver(&rid, task_completed, &result_text).await,
+                    _ => false,
+                };
                 // Announce result back to channel if we have a recipient
                 if !announce_result {
                     tracing::debug!(
@@ -507,6 +520,8 @@ impl SessionsSpawnTool {
                         "Sub-agent result withheld from the channel (announce=false); \
                          it is delivered to whoever joins this run's batch"
                     );
+                } else if task_mailbox_delivered {
+                    // The parent session received it as an inbound message.
                 } else if let Some(target) = recipient {
                     // MUTATION GUARD: route this straight to `channel.send` and the
                     // model-supplied `recipient` on the spawn call reaches the

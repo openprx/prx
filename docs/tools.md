@@ -2059,6 +2059,21 @@ Messages never approve tools, execute slash commands, or publish into an rf
 chat. Local adoption is journaled with session provenance; peer adoption carries
 its TLS SPIFFE identity. Erasing the local copy cannot erase a remote copy.
 
+A child launched from a gateway session (Console, rf or webhook) announces its
+completion the same way: the gateway has no outbound channel, so the parent
+session receives one message from the child's own session
+(`[message from spawn:<run id>/<agent>] Sub-agent \`<run id>\` completed: <result>`,
+the result bounded to 16,000 characters), adopted like any other mailbox
+message. It wakes the parent session as a turn of its own; when a turn of that
+session is still running, the message waits and wakes the session once that
+turn ends. The row is an adopted mailbox row (source `prx_mailbox`, channel
+`mailbox`, provenance `session`), not text the user typed, and it is on the sync
+stream like every adopted mailbox message. A run whose `recipient` names
+something other than the parent session, a parent that is not a gateway
+session, and a mailbox that refuses the send keep the previous behavior (the
+channel announcement, or the log line when there is none); `join`,
+`sessions_list` and `sessions_history` always return the result.
+
 An idle child can receive a message after its parent's turn ends. Its next
 turn uses the persisted child session and model, with its level capped by the
 current agent and owner configuration. It gets no inherited approval grant or

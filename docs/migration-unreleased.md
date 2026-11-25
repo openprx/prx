@@ -300,3 +300,17 @@ is a `reason` field in the worker's and the parent's log lines, and is written
 to the worker log (`logs/workers/<run id>.log`) even when the parent itself
 refuses the launch after the spawn. The previous text `configuration_changed`
 is now `config_changed`. No configuration change or schema migration is needed.
+
+## A child's completion reaches the gateway session that launched it
+
+A `sessions_spawn` child started from a Console, rf or webhook session used to
+announce its completion on the gateway's announce channel, which has no
+outbound transport: the announcement was only logged, and a parent told to wait
+for it never received anything. The completion is now sent through the session
+mailbox, from the child's session (`spawn:<run id>`) to the parent session, and
+wakes the parent as one inbound message (after the running turn, if any). The
+rf client sees it as it sees any adopted mailbox message from another session:
+a `turn.appended` user-role row whose text starts with
+`[message from spawn:<run id>/<agent>]`, followed by the woken turn's events.
+No configuration change or schema migration is needed.
+

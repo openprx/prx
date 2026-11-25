@@ -28,6 +28,7 @@ mod events;
 mod failure;
 mod live_usage;
 mod memory_scope;
+mod mailbox_announce;
 mod message_lifetime;
 mod monitor;
 mod owned_process;

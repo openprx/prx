@@ -234,6 +234,13 @@ impl SessionsSpawnTool {
             .clone()
             .or_else(|| parent_run_id.clone());
         let process_session_scope_key = session_scope_key.clone();
+        let process_mailbox_announce = super::mailbox_announce::MailboxAnnouncement::capture(
+            caller,
+            child_model_config,
+            recipient.as_deref(),
+            &session_scope_key,
+            process_agent_id.as_deref(),
+        );
         let process_spawn_depth = spawn_depth;
         let process_channel_exclusions = inherited_channel_exclusions.clone();
         let process_event_recording = child_model_config.memory.event_recording_config();
@@ -647,12 +654,22 @@ impl SessionsSpawnTool {
                         )
                         .await;
 
+                        let process_mailbox_delivered = match &process_mailbox_announce {
+                            Some(mailbox) if announce_result => {
+                                mailbox
+                                    .deliver(&rid, matches!(status, SubAgentStatus::Completed(_)), &result_text)
+                                    .await
+                            }
+                            _ => false,
+                        };
                         if !announce_result {
                             tracing::debug!(
                                 run_id = %rid,
                                 "Sub-agent process result withheld from the channel (announce=false); \
                                  it is delivered to whoever joins this run's batch"
                             );
+                        } else if process_mailbox_delivered {
+                            // The parent session received it as an inbound message.
                         } else if let Some(target) = recipient {
                             // Not a mirror of the task-mode block any more:
                             // the same function, so the gate this path gets
