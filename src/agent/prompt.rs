@@ -10,7 +10,7 @@ pub use crate::context::layout::{CompiledSystemPrompt, PromptInputs as PromptCon
 pub use crate::context::sources::{
     BOOTSTRAP_MAX_CHARS, ContextHandoffSection, DateTimeSection, FULL_AUTONOMY_SAFETY, IdentitySection,
     OrchestrationSection, RuntimeSection, SafetySection, SkillsSection, TaskSection, ToolEvidenceSection,
-    WorkspaceSection, build_identity_prompt,
+    WorkspaceSection, build_identity_prompt, set_share_host_identity,
 };
 
 pub trait PromptSection: Send + Sync {

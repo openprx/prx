@@ -484,6 +484,7 @@ impl ConfigGenerationManager {
         // Preserve standalone startup setup, but take every value from the
         // supplied effective snapshot rather than loading a new revision.
         crate::config::set_runtime_proxy_config(generation.effective.proxy.clone());
+        crate::context::sources::set_share_host_identity(generation.effective.agent.prompt.share_host_identity);
         if let Some(warning) = crate::config::manage::validate::decision_startup_check(&generation.effective) {
             tracing::warn!("{warning}");
         }
@@ -522,6 +523,7 @@ impl ConfigGenerationManager {
         model_allowlist: Arc<crate::observability::labels::ModelAllowlist>,
     ) -> Self {
         crate::config::set_runtime_proxy_config(initial.proxy.clone());
+        crate::context::sources::set_share_host_identity(initial.agent.prompt.share_host_identity);
         // Startup never fails for the decision plane: a refused backend
         // runs builtin-only, and says so (D-094 C-1).
         if let Some(warning) = crate::config::manage::validate::decision_startup_check(&initial) {
@@ -879,6 +881,7 @@ impl ConfigGenerationManager {
                     "restarted": restarted,
                 }),
             });
+            crate::context::sources::set_share_host_identity(generation.effective.agent.prompt.share_host_identity);
             let previous_runtime_proxy = effective_changed
                 .iter()
                 .any(|field| field == "proxy")

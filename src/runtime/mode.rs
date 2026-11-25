@@ -296,6 +296,7 @@ fn spawn_signal_task(root: CancellationToken) {
 /// `config` is the value previously bound from `Config::load_or_init_with_config_dir`.
 #[allow(clippy::too_many_lines)]
 pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
+    openprx::agent::prompt::set_share_host_identity(config.agent.prompt.share_host_identity);
     // D5/D9 §3.3.3: single root shutdown token for this dispatch. The signal
     // source is installed via an *explicit whitelist* (see `should_bind_signal`)
     // — only gateway / daemon / channel-start get a dispatch-owned

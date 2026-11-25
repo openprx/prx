@@ -10,6 +10,9 @@ impl Source for WorkspaceSection {
     }
 
     fn render(&self, inputs: &PromptInputs<'_>) -> Result<Option<Segment>> {
+        if !super::host_identity::share_host_identity() {
+            return Ok(Segment::new("## Workspace\n\nWorking directory: `.`".to_string()));
+        }
         Ok(Segment::new(format!(
             "## Workspace\n\nWorking directory: `{}`",
             inputs.workspace_dir.display()

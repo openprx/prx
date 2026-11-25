@@ -29,6 +29,33 @@ pub struct AgentConfig {
     /// Context compaction controls (`[agent.compaction]`).
     #[serde(default)]
     pub compaction: AgentCompactionConfig,
+    /// System-prompt content controls (`[agent.prompt]`).
+    #[serde(default)]
+    pub prompt: AgentPromptConfig,
+}
+
+/// System-prompt content controls (`[agent.prompt]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AgentPromptConfig {
+    /// Whether the system prompt tells the model provider which machine it
+    /// runs on: the host name, the absolute workspace path and the time zone
+    /// abbreviation. Default `true`: an agent uses them. When `false`, the
+    /// host name is replaced by `host`, the workspace is given as `.`, and
+    /// the prompt carries no host identity; tools still use real paths.
+    #[serde(default = "default_share_host_identity")]
+    pub share_host_identity: bool,
+}
+
+const fn default_share_host_identity() -> bool {
+    true
+}
+
+impl Default for AgentPromptConfig {
+    fn default() -> Self {
+        Self {
+            share_host_identity: default_share_host_identity(),
+        }
+    }
 }
 
 /// Compaction mode for long conversation contexts.
@@ -403,6 +430,7 @@ impl Default for AgentConfig {
             priority_scheduling_enabled: false,
             low_priority_tools: default_agent_low_priority_tools(),
             compaction: AgentCompactionConfig::default(),
+            prompt: AgentPromptConfig::default(),
         }
     }
 }
