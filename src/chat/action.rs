@@ -560,12 +560,17 @@ pub enum Action {
     /// inline path). The admission stays open until the turn commits; a
     /// failed or cancelled turn removes exactly this request, once.
     UserTurnAdmitted { admission: AdmissionId, content: String },
-    /// After a turn's commit: attach the form the user's request was sent in
-    /// (`sent`) to the newest user turn holding `user_text` that has none, so
-    /// the provider view replays the request as it was sent.
+    /// After a turn's commit: attach what the runtime kept of the turn to the
+    /// stored turns it just recorded, so the provider view replays them as the
+    /// turn had them. `sent` is the form the user's request was sent in; it goes
+    /// to the newest user turn holding `user_text` that has none. `replay` holds
+    /// the tool rounds of the run that made `reply`; it goes to the newest
+    /// assistant turn when that turn is exactly `reply`.
     TurnRecordsAttached {
         user_text: String,
         sent: Option<crate::agent::tool_replay::Attachment>,
+        reply: Option<String>,
+        replay: Option<std::sync::Arc<crate::agent::tool_replay::TurnReplay>>,
     },
     /// Ask the reducer to persist the assistant turn (writes session.turns + LLM history)
     RecordAssistantTurn {

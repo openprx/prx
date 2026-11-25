@@ -138,7 +138,7 @@ impl CanonicalHistory {
     }
 
     /// As [`Self::from_acknowledged`], with each stored turn's runtime record
-    /// (tool evidence of a reply, sent form of a request).
+    /// (tool evidence and replayed rounds of a reply, sent form of a request).
     pub(crate) fn from_acknowledged_turns<'a, I>(leading_system: Option<&str>, turns: I) -> Self
     where
         I: IntoIterator<Item = (&'a str, &'a str, Option<&'a TurnToolEvidence>)>,
@@ -687,6 +687,28 @@ pub(crate) fn project(canonical: &CanonicalHistory, inputs: &ProjectionInputs) -
             message.content = rendered;
         }
     }
+    // The tool rounds of an acknowledged reply come right before it. Where
+    // each canonical message starts in the expanded view is kept for the
+    // refresh notes, which are placed by canonical index.
+    let mut starts = Vec::new();
+    if canonical
+        .evidence
+        .iter()
+        .any(|evidence| evidence.as_deref().is_some_and(|evidence| evidence.replay.is_some()))
+    {
+        let mut expanded = Vec::with_capacity(messages.len());
+        for (message, evidence) in std::mem::take(&mut messages).into_iter().zip(&canonical.evidence) {
+            starts.push(expanded.len());
+            if message.role == "assistant"
+                && let Some(replay) = evidence.as_deref().and_then(|evidence| evidence.replay.as_ref())
+            {
+                expanded.extend(replay.messages.iter().cloned());
+            }
+            expanded.push(message);
+        }
+        starts.push(expanded.len());
+        messages = expanded;
+    }
     if let Some((plain, enriched)) = &inputs.enriched_request
         && let Some(request) = messages
             .iter_mut()
@@ -696,6 +718,7 @@ pub(crate) fn project(canonical: &CanonicalHistory, inputs: &ProjectionInputs) -
         *request = enriched.clone();
     }
     for (offset, (at, note)) in inputs.refresh_notes.iter().enumerate() {
+        let at = starts.get(*at).copied().unwrap_or(*at);
         let index = at.saturating_add(offset).min(messages.len());
         messages.insert(index, note.clone());
     }

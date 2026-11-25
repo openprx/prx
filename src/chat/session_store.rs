@@ -216,7 +216,9 @@ pub(super) async fn project_chat_session_from_message_events(
             };
         }
     };
-    let projection = apply_chat_message_event_projection(snapshot, &events, cost_config);
+    let mut projection = apply_chat_message_event_projection(snapshot, &events, cost_config);
+    // The tool rounds of each reply are read back from the durable log.
+    super::turn_replay::attach_stored_replays(mem, workspace_id, &mut projection.session).await;
     tracing::debug!(
         session_id = %crate::agent::diagnostics::text_class(&session_id),
         turns_from_events = projection.turns_from_events,
@@ -348,8 +350,8 @@ pub(super) fn session_turns_to_history(session: &session::ChatSession) -> Vec<Ch
 
 /// The provider view of `session`'s stored turns: [`session_turns_to_history`]
 /// with every context handoff in its compact form, every user message in the
-/// form it was sent and every assistant reply with its tool evidence, each by
-/// its one renderer, so a resumed or
+/// form it was sent, and every assistant reply with its replayed tool rounds
+/// before it, or its tool evidence, each by its one renderer, so a resumed or
 /// switched view holds the bytes the turn had in-process.
 pub(super) fn session_turns_to_provider_view(session: &session::ChatSession) -> Vec<ChatMessage> {
     let history = session_turns_to_history(session);
@@ -372,6 +374,11 @@ pub(super) fn session_turns_to_provider_view(session: &session::ChatSession) -> 
         };
         if let std::borrow::Cow::Owned(rendered) = rendered {
             message.content = rendered;
+        }
+        if message.role == "assistant"
+            && let Some(replay) = evidence.and_then(|evidence| evidence.replay.as_ref())
+        {
+            view.extend(replay.messages.iter().cloned());
         }
         view.push(message);
     }

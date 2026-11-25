@@ -112,6 +112,11 @@ pub struct TurnToolEvidence {
     /// turn's own text stays what the user typed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sent: Option<crate::agent::tool_replay::Attachment>,
+    /// The tool rounds of an `assistant` turn, replayed before its reply.
+    /// Never saved: it is rebuilt from the durable log after a commit and
+    /// when a session is loaded.
+    #[serde(skip)]
+    pub replay: Option<std::sync::Arc<crate::agent::tool_replay::TurnReplay>>,
 }
 
 /// Serde's `skip_serializing_if` callback, which receives a reference.
@@ -199,6 +204,8 @@ fn sanitize_tool_name(name: &str) -> String {
 /// `content` followed by the evidence suffix, borrowed when the turn has no
 /// record (an untracked turn renders nothing).
 pub(crate) fn render_assistant_content<'a>(content: &'a str, evidence: Option<&TurnToolEvidence>) -> Cow<'a, str> {
+    // A turn whose tool rounds are replayed needs no summary line.
+    let evidence = evidence.filter(|evidence| evidence.replay.is_none());
     evidence.map_or(Cow::Borrowed(content), |evidence| {
         let suffix = evidence.suffix();
         let mut rendered = String::with_capacity(content.len().saturating_add(suffix.len()));

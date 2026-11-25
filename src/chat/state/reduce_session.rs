@@ -345,16 +345,20 @@ impl ChatState {
         effects
     }
 
-    /// `Action::TurnRecordsAttached` — keep, beside the turn a commit just
-    /// recorded, the form its request was sent in (saved with the session).
-    /// Nothing is attached to a turn that is not exactly the one the action
-    /// names; the stored text of a turn never changes.
+    /// `Action::TurnRecordsAttached` — keep, beside the turns a commit just
+    /// recorded, the form the request was sent in (saved with the session) and
+    /// the tool rounds of the reply (rebuilt from the durable log, never
+    /// saved). Nothing is attached to a turn that is not exactly the one the
+    /// action names; the stored text of a turn never changes.
     pub(super) fn reduce_turn_records_attached(
         &mut self,
         user_text: &str,
         sent: Option<crate::agent::tool_replay::Attachment>,
+        reply: Option<&str>,
+        replay: Option<std::sync::Arc<crate::agent::tool_replay::TurnReplay>>,
     ) -> Vec<Effect> {
         let user_text = crate::agent::turn_contracts::neutralize_reserved_markers(user_text);
+        let mut sent_attached = false;
         if let Some(sent) = sent
             && let Some(turn) = self.session.turns.iter_mut().rev().find(|turn| {
                 turn.role == "user"
@@ -363,9 +367,28 @@ impl ChatState {
             })
         {
             turn.tool_evidence.get_or_insert_with(Default::default).sent = Some(sent);
-            return vec![Effect::SaveSession(self.session_commit())];
+            sent_attached = true;
         }
-        Vec::new()
+        let mut replay_attached = false;
+        if let Some(replay) = replay
+            && let Some(turn) = self
+                .session
+                .turns
+                .iter_mut()
+                .rev()
+                .find(|turn| turn.role == "assistant")
+                .filter(|turn| Some(turn.content.as_str()) == reply)
+        {
+            turn.tool_evidence.get_or_insert_with(Default::default).replay = Some(replay);
+            replay_attached = true;
+        }
+        if sent_attached {
+            vec![Effect::SaveSession(self.session_commit())]
+        } else if replay_attached {
+            vec![Effect::PublishSession(self.session_commit())]
+        } else {
+            Vec::new()
+        }
     }
 
     /// `Action::RecordAssistantTurn` — persist an assistant turn into the session record and LLM history.

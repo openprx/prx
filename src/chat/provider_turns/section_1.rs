@@ -1249,8 +1249,13 @@ async fn commit_completed_provider_turn(
         crate::chat::turn_replay::attach_turn_records(
             chat_dispatcher,
             turn_signal,
+            memory_fabric.memory().as_ref(),
+            memory_fabric.workspace_id(),
+            chat_session_key,
+            &pending.turn_run_id,
             &pending.user_input,
             pending.sent.as_ref(),
+            None,
         )
         .await;
         adopt_committed_turn(history, chat_dispatcher, &pending, None);
@@ -1311,8 +1316,13 @@ async fn commit_completed_provider_turn(
     crate::chat::turn_replay::attach_turn_records(
         chat_dispatcher,
         turn_signal,
+        memory_fabric.memory().as_ref(),
+        memory_fabric.workspace_id(),
+        chat_session_key,
+        &pending.turn_run_id,
         &pending.user_input,
         pending.sent.as_ref(),
+        Some(&final_text),
     )
     .await;
     adopt_committed_turn(history, chat_dispatcher, &pending, Some(&final_text));
@@ -1350,8 +1360,8 @@ async fn commit_completed_provider_turn(
 /// ([`super::compaction::provider_view_from_acked`]). Without a compaction
 /// since the turn copied its view, the committed request and reply are
 /// appended; the request is in the form it was sent (recalled context, attached
-/// files and date line kept beside the turn). After a worker compaction the
-/// view is rebuilt
+/// files and date line kept beside the turn), the reply is preceded by its tool
+/// rounds. After a worker compaction the view is rebuilt
 /// from the committed snapshot instead: appending to the pre-compaction view
 /// would resend the replaced cold prefix and force another rollover or a lossy
 /// fallback on the next turn.
@@ -1380,6 +1390,16 @@ fn adopt_committed_turn(
         |sent| sent.compose(&pending.user_input),
     )));
     if let Some(reply) = reply {
+        // The tool rounds of the reply come right before it.
+        if let Some(replay) = acked
+            .session
+            .turns
+            .last()
+            .filter(|turn| turn.role == "assistant" && turn.content == reply)
+            .and_then(|turn| turn.tool_evidence.as_ref()?.replay.as_ref())
+        {
+            history.extend(replay.messages.iter().cloned());
+        }
         history.push(committed_reply_message(&acked, reply));
     }
 }

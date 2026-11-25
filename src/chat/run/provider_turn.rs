@@ -185,7 +185,7 @@
         #[cfg(feature = "terminal-tui")]
         let compaction_epoch_at_start = admitted_session.compaction_epoch;
         #[cfg(feature = "terminal-tui")]
-        let history_for_provider = {
+        let mut history_for_provider = {
             let mut history_for_provider = history.clone();
             history_for_provider.push(history_user_message.clone());
             history_for_provider
@@ -402,6 +402,21 @@
         effective_compaction.config = admitted_binding.main_compaction()
             .ok_or_else(|| anyhow::anyhow!("chat compaction requires an admitted decision"))?.clone();
         crate::providers::context_window::trace_effective_compaction_resolution(&effective_compaction);
+        // Earlier turns' tool results give way to one-line stubs, oldest first,
+        // before the request is over budget; the compaction below runs as before.
+        let stubbed_results = super::turn_replay::stub_replayed_results(
+            &mut history,
+            &admitted_session.session,
+            &history_user_message,
+            &tool_surface_reserve.reserved_config(&effective_compaction.config),
+        );
+        if stubbed_results > 0 {
+            tracing::info!(stubbed_results, "oldest replayed tool results were replaced by stubs to fit the request");
+            #[cfg(feature = "terminal-tui")]
+            for (target, stubbed) in history_for_provider.iter_mut().zip(&history) {
+                target.clone_from(stubbed);
+            }
+        }
         #[cfg(feature = "terminal-tui")]
         refresh_context_budget_for_tui(
             &history_for_provider,
@@ -1614,7 +1629,11 @@
             {
                 anyhow::bail!("Chat stopped after an unconfirmed history commit: {error}");
             }
-            super::turn_replay::attach_turn_records(&chat_dispatcher, &turn_signal, &user_input, sent_form.as_ref()).await;
+            super::turn_replay::attach_turn_records(
+                &chat_dispatcher, &turn_signal, memory_fabric.memory().as_ref(), memory_fabric.workspace_id(),
+                &chat_session_key, &turn_run_id, &user_input, sent_form.as_ref(), None,
+            )
+            .await;
             super::compaction::reconcile_inline_turn(&mut history, &chat_dispatcher);
             if let Some(ref d_id) = draft_id
                 && let Err(e) = terminal.cancel_draft("user", d_id).await
@@ -1732,7 +1751,11 @@
         {
             anyhow::bail!("Chat stopped after an unconfirmed history commit: {error}");
         }
-        super::turn_replay::attach_turn_records(&chat_dispatcher, &turn_signal, &user_input, sent_form.as_ref()).await;
+        super::turn_replay::attach_turn_records(
+            &chat_dispatcher, &turn_signal, memory_fabric.memory().as_ref(), memory_fabric.workspace_id(),
+            &chat_session_key, &turn_run_id, &user_input, sent_form.as_ref(), Some(&response),
+        )
+        .await;
         super::compaction::reconcile_inline_turn(&mut history, &chat_dispatcher);
         #[cfg(feature = "terminal-tui")]
         if let Some(tx) = redraw_tx_for_main.as_ref() {

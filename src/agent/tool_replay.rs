@@ -85,6 +85,8 @@ pub(crate) struct ReplayLog {
     attachments: HashMap<String, Attachment>,
     /// The run of each stored user or assistant message, by event id.
     run_of_event: HashMap<String, String>,
+    /// The stored assistant replies, oldest first: text and run.
+    assistant_runs: Vec<(String, String)>,
 }
 
 fn payload_of(event: &MessageEvent) -> Option<serde_json::Value> {
@@ -111,35 +113,52 @@ impl ReplayLog {
     /// Read the session's tool, attachment and message rows. A read that fails
     /// leaves the log empty, so the turn replays as it did before these rows.
     pub(crate) async fn load(mem: &dyn crate::memory::Memory, principal: &MemoryPrincipal) -> Self {
+        Self::load_rows(mem, principal, true).await
+    }
+
+    /// As [`Self::load`] without the user and assistant rows: enough to build
+    /// [`Self::replay_of_run`].
+    pub(crate) async fn load_tool_rows(mem: &dyn crate::memory::Memory, principal: &MemoryPrincipal) -> Self {
+        Self::load_rows(mem, principal, false).await
+    }
+
+    async fn load_rows(mem: &dyn crate::memory::Memory, principal: &MemoryPrincipal, with_messages: bool) -> Self {
         let query = |roles: &[&str]| SessionContextQuery {
             principal: principal.clone(),
             since_event_id: None,
             limit: REPLAY_ROW_LIMIT,
             include_roles: roles.iter().map(|role| (*role).to_owned()).collect(),
         };
-        let (tool_rows, message_rows) = match (
-            mem.load_recent_session_context(query(&["tool"])).await,
-            mem.load_recent_session_context(query(&["user", "assistant"])).await,
-        ) {
-            (Ok(tool_rows), Ok(message_rows)) => (tool_rows, message_rows),
+        let tool_rows = mem.load_recent_session_context(query(&["tool"])).await;
+        let message_rows = if with_messages {
+            mem.load_recent_session_context(query(&["user", "assistant"])).await
+        } else {
+            Ok(Vec::new())
+        };
+        match (tool_rows, message_rows) {
+            (Ok(tool_rows), Ok(message_rows)) => Self::from_rows(&tool_rows, &message_rows),
             (Err(error), _) | (_, Err(error)) => {
                 tracing::warn!(
                     error = %crate::agent::diagnostics::error_class(&error),
                     "tool replay rows unavailable; history is replayed without them"
                 );
-                return Self::default();
+                Self::default()
             }
-        };
-        Self::from_rows(&tool_rows, &message_rows)
+        }
     }
 
     fn from_rows(tool_rows: &[MessageEvent], message_rows: &[MessageEvent]) -> Self {
         let mut log = Self::default();
-        for event in message_rows {
+        let mut ordered: Vec<&MessageEvent> = message_rows.iter().collect();
+        ordered.sort_by_key(|event| event.id);
+        for event in ordered {
             if event.event_type == "message.created"
                 && let Some(run_id) = &event.run_id
             {
                 log.run_of_event.insert(event.event_id.clone(), run_id.clone());
+                if event.role == "assistant" {
+                    log.assistant_runs.push((event.content.clone(), run_id.clone()));
+                }
             }
         }
         for event in tool_rows {
@@ -213,6 +232,34 @@ impl ReplayLog {
         }
     }
 
+    /// The tool rounds of `run_id` in replay form, `None` when it made none.
+    pub(crate) fn replay_of_run(&self, run_id: &str) -> Option<TurnReplay> {
+        let mut replay = TurnReplay::default();
+        for round in self.rounds.get(run_id)?.values() {
+            replay.push_round(round);
+        }
+        (!replay.messages.is_empty()).then_some(replay)
+    }
+
+    /// The run of each reply in `replies` (oldest first), matched with the
+    /// stored assistant messages from the newest back by their text. A reply
+    /// that does not match its stored message, and every older one, gets
+    /// `None`: a run is never guessed.
+    pub(crate) fn runs_of_replies(&self, replies: &[&str]) -> Vec<Option<&str>> {
+        let mut runs = vec![None; replies.len()];
+        let pairs = runs
+            .iter_mut()
+            .rev()
+            .zip(replies.iter().rev().zip(self.assistant_runs.iter().rev()));
+        for (slot, (reply, (stored, run))) in pairs {
+            if *reply != stored.as_str() {
+                break;
+            }
+            *slot = Some(run.as_str());
+        }
+        runs
+    }
+
     /// The stored turns as history messages, in order: each user message with
     /// its stored attachment, each assistant reply preceded by the tool rounds
     /// of its run. Event ids line up with the messages, `None` for a replayed
@@ -225,11 +272,9 @@ impl ReplayLog {
             if turn.role == "assistant"
                 && let Some(run_id) = event_id.as_deref().and_then(|id| self.run_of_event.get(id))
                 && replayed_runs.insert(run_id.as_str())
-                && let Some(rounds) = self.rounds.get(run_id)
+                && let Some(replay) = self.replay_of_run(run_id)
             {
-                for round in rounds.values() {
-                    out.push_round(round);
-                }
+                out.push_replay(&replay);
             }
             let content = match (turn.role.as_str(), event_id.as_deref().and_then(|id| self.attachments.get(id))) {
                 ("user", Some(attachment)) => format!("{}{}{}", attachment.prefix, turn.content, attachment.tail),
@@ -245,8 +290,8 @@ impl ReplayLog {
 
 /// A replayed result message, kept so it can be turned into a stub.
 #[derive(Debug, Clone)]
-struct ReplayedResult {
-    /// Index into [`ReplayedTurns::messages`].
+pub struct ReplayedResult {
+    /// Index of the result message in the messages that hold it.
     index: usize,
     wire_id: String,
     tool: String,
@@ -254,6 +299,22 @@ struct ReplayedResult {
     bytes: u64,
     document_id: Option<String>,
 }
+
+/// The tool rounds of one run as history messages: for each round an
+/// assistant envelope carrying the calls, then one `tool` message per call.
+#[derive(Debug, Clone, Default)]
+pub struct TurnReplay {
+    pub(crate) messages: Vec<ChatMessage>,
+    results: Vec<ReplayedResult>,
+}
+
+impl PartialEq for TurnReplay {
+    fn eq(&self, other: &Self) -> bool {
+        crate::agent::turn_history::same_messages(&self.messages, &other.messages)
+    }
+}
+
+impl Eq for TurnReplay {}
 
 /// The turns of a session as history messages, with their tool rounds.
 #[derive(Debug, Default)]
@@ -270,7 +331,7 @@ fn result_message(wire_id: &str, content: &str) -> ChatMessage {
     ChatMessage::tool(serde_json::json!({ "tool_call_id": wire_id, "content": content }).to_string())
 }
 
-impl ReplayedTurns {
+impl TurnReplay {
     fn push_round(&mut self, round: &StoredRound) {
         if round.calls.is_empty() {
             return;
@@ -286,7 +347,6 @@ impl ReplayedTurns {
             .collect();
         self.messages
             .push(ChatMessage::assistant(build_native_assistant_history("", &calls, None)));
-        self.event_ids.push(None);
         for call in round.calls.values() {
             let id = wire_id(&call.call_id);
             let stored = round.results.get(&call.call_id);
@@ -300,8 +360,20 @@ impl ReplayedTurns {
                 document_id: stored.and_then(|result| result.document_id.clone()),
             });
             self.messages.push(result_message(&id, content));
-            self.event_ids.push(None);
         }
+    }
+}
+
+impl ReplayedTurns {
+    /// Append `replay` after the messages held so far.
+    fn push_replay(&mut self, replay: &TurnReplay) {
+        let base = self.messages.len();
+        self.messages.extend(replay.messages.iter().cloned());
+        self.event_ids.extend(replay.messages.iter().map(|_| None));
+        self.results.extend(replay.results.iter().map(|result| ReplayedResult {
+            index: result.index + base,
+            ..result.clone()
+        }));
     }
 
     /// Replace the oldest replayed results by a stub, as many as it takes for
@@ -314,36 +386,85 @@ impl ReplayedTurns {
         request: &ChatMessage,
         config: &crate::config::AgentCompactionConfig,
     ) -> usize {
-        if self.results.is_empty() {
-            return 0;
-        }
-        let mut whole = Vec::with_capacity(self.messages.len() + 2);
-        whole.push(leading.clone());
-        whole.extend(self.messages.iter().cloned());
-        whole.push(request.clone());
-        let budget = plan_context_budget(&whole, config, PRE_TURN_FLUSH_THRESHOLD);
-        if !budget.over_warning {
-            return 0;
-        }
-        let mut excess = budget.used_tokens.saturating_sub(budget.warning_threshold_tokens);
-        let mut stubbed = 0;
-        for result in &self.results {
-            if excess == 0 {
-                break;
-            }
-            let Some(message) = self.messages.get_mut(result.index) else { continue };
-            let stub = result_message(&result.wire_id, &stub_text(result));
-            let saved = estimate_history_tokens(std::slice::from_ref(message))
-                .saturating_sub(estimate_history_tokens(std::slice::from_ref(&stub)));
-            if saved == 0 {
-                continue;
-            }
-            *message = stub;
-            excess = excess.saturating_sub(saved);
-            stubbed += 1;
-        }
-        stubbed
+        fit_results(
+            &mut self.messages,
+            &self.results,
+            std::slice::from_ref(leading),
+            std::slice::from_ref(request),
+            config,
+        )
     }
+}
+
+/// Replace the oldest of `results` (in `messages`) by a stub until
+/// `before`, `messages` and `after` together fit under the compaction warning
+/// threshold. Returns how many were stubbed.
+fn fit_results(
+    messages: &mut [ChatMessage],
+    results: &[ReplayedResult],
+    before: &[ChatMessage],
+    after: &[ChatMessage],
+    config: &crate::config::AgentCompactionConfig,
+) -> usize {
+    if results.is_empty() {
+        return 0;
+    }
+    let mut whole = Vec::with_capacity(messages.len() + before.len() + after.len());
+    whole.extend(before.iter().cloned());
+    whole.extend(messages.iter().cloned());
+    whole.extend(after.iter().cloned());
+    let budget = plan_context_budget(&whole, config, PRE_TURN_FLUSH_THRESHOLD);
+    if !budget.over_warning {
+        return 0;
+    }
+    let mut excess = budget.used_tokens.saturating_sub(budget.warning_threshold_tokens);
+    let mut stubbed = 0;
+    for result in results {
+        if excess == 0 {
+            break;
+        }
+        let Some(message) = messages.get_mut(result.index) else { continue };
+        let stub = result_message(&result.wire_id, &stub_text(result));
+        let saved = estimate_history_tokens(std::slice::from_ref(message))
+            .saturating_sub(estimate_history_tokens(std::slice::from_ref(&stub)));
+        if saved == 0 {
+            continue;
+        }
+        *message = stub;
+        excess = excess.saturating_sub(saved);
+        stubbed += 1;
+    }
+    stubbed
+}
+
+/// Terminal chat: replace the oldest replayed results held in `view` by a
+/// stub until `view` and the `request` that follows it fit under the warning
+/// threshold. `replays` are the replayed rounds of the view's turns, oldest
+/// first; a result is found in the view by its bytes, in order, and one that
+/// is not found is left alone. Returns how many were stubbed.
+pub(crate) fn stub_replayed_results(
+    view: &mut [ChatMessage],
+    replays: &[&TurnReplay],
+    request: &ChatMessage,
+    config: &crate::config::AgentCompactionConfig,
+) -> usize {
+    let mut found = Vec::new();
+    let mut cursor = 0;
+    for replay in replays {
+        for result in &replay.results {
+            let Some(original) = replay.messages.get(result.index) else { continue };
+            let Some(offset) = view
+                .get(cursor..)
+                .and_then(|rest| rest.iter().position(|m| m.role == "tool" && m.content == original.content))
+            else {
+                continue;
+            };
+            let index = cursor.saturating_add(offset);
+            found.push(ReplayedResult { index, ..result.clone() });
+            cursor = index.saturating_add(1);
+        }
+    }
+    fit_results(view, &found, &[], std::slice::from_ref(request), config)
 }
 
 /// The one-line text a cleared result is replaced by.
