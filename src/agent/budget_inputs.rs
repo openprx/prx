@@ -18,6 +18,23 @@ pub(crate) const REPLY_RESERVE_WINDOW_DIVISOR: usize = 4;
 /// `1 / TOTAL_RESERVE_WINDOW_DIVISOR` of the window.
 pub(crate) const TOTAL_RESERVE_WINDOW_DIVISOR: usize = 2;
 
+/// The published tool definitions may take at most
+/// `1 / TOOL_SURFACE_WINDOW_DIVISOR` of the window and still be published in
+/// full. A quarter is what is left of the half that [`reserved_budget_config`]
+/// allows reply plus tools once the reply reserve has taken its own quarter,
+/// so a surface within it never meets the total cap.
+pub(crate) const TOOL_SURFACE_WINDOW_DIVISOR: usize = 4;
+
+/// Whether `tool_tokens` of tool definitions fit their share of `window_tokens`.
+pub(crate) const fn tool_surface_fits_window(window_tokens: usize, tool_tokens: usize) -> bool {
+    tool_tokens.saturating_mul(TOOL_SURFACE_WINDOW_DIVISOR) <= window_tokens
+}
+
+/// The share of the window the tool definitions may take, in percent.
+pub(crate) const fn tool_surface_share_percent() -> usize {
+    100 / TOOL_SURFACE_WINDOW_DIVISOR
+}
+
 /// The messages a switch keeps word for word occupy at most
 /// `1 / KEEP_RECENT_WINDOW_DIVISOR` of the window.
 pub(crate) const KEEP_RECENT_WINDOW_DIVISOR: usize = 4;

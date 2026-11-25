@@ -157,7 +157,7 @@ and the module-gate family are absorbed on load; they are not live switches.
 | `[security]` | `workspace_hooks` omitted when off |
 | `[compliance.interaction_notice]` | `version = "1"`; default notice text; `applicability = "required"`; `exception_owner`/`exception_reviewed_at` unset |
 | `[compliance.eu_ai_act]` | classification `status = "unclassified"`; `owner`/`assessed_at` unset; `incident_store_path` unset; declaration fields all optional/empty |
-| `[tool_tiering]` | `always_include = []`; `always_exclude = []`; `channel_exclude = []` (nothing hidden from channel sessions); `defer_unlisted = false` (every available tool is published to the model) |
+| `[tool_tiering]` | `always_include = []`; `always_exclude = []`; `channel_exclude = []` (nothing hidden from channel sessions); `defer_unlisted` unset (every available tool is published to the model, unless their definitions would take more than a quarter of the model's context window; then that turn defers them) |
 | `[providers]` | `[providers.ollama] num_ctx` unset. `[[providers.tool_dialects]]`: `provider` required; `model` unset (all models); `tool_schema`/`tool_call` unset (`raw` / `native`). `[[providers.models]]`: `provider` required; `model` unset; `operations`, `native_tools`, `vision_input`, `streaming`, `structured_output`, `tool_schema_dialect`, `tool_call_dialect`, `context_window` all unset. See later sections |
 | `[model_settings.<id>]` | catalog levels and explicit parameters; omitted keys stay with the catalog |
 
@@ -718,7 +718,11 @@ low_priority_tools = ["sessions_spawn", "delegate"]
 
 # Per-turn capability policy. The surface owner applies these filters (they are
 # not owned by the decision engine). Every available tool is published to the
-# model by default. `defer_unlisted = true` is the operator option that
+# model by default, unless their definitions would take more than a quarter of
+# the model's context window: a small window (for example 8k or 32k) then
+# defers them for that turn, a 128k or 200k window publishes them all.
+# `defer_unlisted = false` always publishes every tool, whatever the window.
+# `defer_unlisted = true` is the operator option that
 # publishes only the core tools (file_read, file_write, file_edit, shell) plus
 # `always_include`; every other tool then waits behind `capability_search` and
 # can also be called by its exact name. `always_exclude` removes names from the
@@ -736,7 +740,7 @@ low_priority_tools = ["sessions_spawn", "delegate"]
 always_include = []
 always_exclude = []
 # channel_exclude = []
-# defer_unlisted = false
+# defer_unlisted = true   # unset: publish all, deferring only on a small window
 
 # A request that advertises skill metadata also admits its live skill_read
 # dependency. Missing or denied readers suppress that metadata with a diagnostic.

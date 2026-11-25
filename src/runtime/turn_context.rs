@@ -418,6 +418,7 @@ mod execution_binding;
 mod opened_turn;
 mod opening;
 mod owner_filesystem;
+mod tool_fit;
 pub(crate) mod publication_scope;
 pub(crate) mod surface_binding;
 

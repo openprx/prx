@@ -892,6 +892,13 @@ impl ChatTurnBinding {
         self.decision.get().map(|decided| decided.context.main_compaction())
     }
 
+    /// Tokens the admitted turn's tool definitions are estimated to occupy.
+    pub(super) fn tool_surface_tokens(&self) -> usize {
+        self.decision
+            .get()
+            .map_or(0, |decided| decided.context.tool_surface_tokens())
+    }
+
     pub(super) fn effective_compaction(
         &self,
     ) -> anyhow::Result<crate::providers::context_window::EffectiveCompactionConfig> {

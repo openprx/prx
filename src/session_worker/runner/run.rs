@@ -131,7 +131,9 @@ fn worker_direct_names(
 ) -> std::collections::BTreeSet<String> {
     manifest.direct_tools.as_ref().map_or_else(
         || {
-            let publish_all = (!tiering.defer_unlisted).then_some(crate::tools::capability::catalog::ALL_TOOLS_DIRECT);
+            let publish_all = tiering
+                .publishes_all_tools()
+                .then_some(crate::tools::capability::catalog::ALL_TOOLS_DIRECT);
             tiering
                 .always_include
                 .iter()

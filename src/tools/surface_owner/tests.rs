@@ -61,6 +61,7 @@ fn facts_for(policy: Arc<SecurityPolicy>) -> PublicationFacts {
         child_scope: None,
         child_discovery: false,
         child_served: None,
+        fit_defers: false,
     }
 }
 

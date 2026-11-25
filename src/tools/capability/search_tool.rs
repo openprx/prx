@@ -14,6 +14,7 @@ use anyhow::Context as _;
 use std::collections::BTreeMap;
 use std::sync::Weak;
 
+mod deferred_index;
 pub(crate) mod discovery_admission;
 pub(crate) use discovery_admission::{
     DiscoveredToolProposal, DiscoveryState, MAX_DISCOVERED_TOOLS_PER_TURN, admit_discovered_tool,

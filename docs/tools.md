@@ -50,6 +50,19 @@ declares it on the following request, and runs the call. Channel exclusions,
 model policy and issued child scope still apply. Search does not expand that
 scope.
 
+The published definitions must fit the model's window. When they would take
+more than a quarter of the context window, that turn defers the tools it would
+otherwise publish, exactly as `defer_unlisted = true` does: the file/shell
+core, the chat session tools, `always_include` names and the skill tools stay
+direct, and the others stay reachable through `capability_search` and by exact
+name. A compact index of the deferred tool names (about 2.4 KB at most) is
+appended to the `capability_search` description, so a tool can be called by
+name without a search round. The decision depends only on the window and the
+tool set, so the tool definitions are the same on every turn of a session; it
+is logged once per session (`window_tokens`, `tool_tokens`, `share_percent`,
+`decision`). `defer_unlisted = false` turns the fit off (every tool is always
+published); `defer_unlisted = true` always defers.
+
 Eligible installed skills are advertised as metadata. A request that advertises skills
 includes an admitted `skill_read` definition; instruction bodies stay lazy.
 If the live reader cannot be admitted, the metadata is suppressed with a

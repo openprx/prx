@@ -225,10 +225,11 @@ pub struct ToolTieringConfig {
     /// Tool names hidden from IM channel sessions only, on top of `always_exclude`.
     /// Default: empty (nothing is hidden); list tool names to hide them on channels.
     pub channel_exclude: Vec<String>,
-    /// Operator option: publish only the core tools plus `always_include` and
-    /// leave every other tool behind `capability_search` and its exact name.
-    /// Default: false (every available tool is published to the model).
-    pub defer_unlisted: bool,
+    /// Operator option for the tools outside the core set.
+    /// - `None` (default): publish every available tool, unless their definitions would take more than a quarter of the model's context window; then the turn defers them, as `Some(true)` does.
+    /// - `Some(true)`: publish only the core tools plus `always_include` and leave every other tool behind `capability_search` and its exact name.
+    /// - `Some(false)`: always publish every available tool, whatever the window.
+    pub defer_unlisted: Option<bool>,
 }
 
 impl Default for ToolTieringConfig {
@@ -237,12 +238,20 @@ impl Default for ToolTieringConfig {
             always_include: Vec::new(),
             always_exclude: Vec::new(),
             channel_exclude: Vec::new(),
-            defer_unlisted: false,
+            defer_unlisted: None,
         }
     }
 }
 
 impl ToolTieringConfig {
+    /// Whether the publication names every available tool directly (the
+    /// `"*"` member). Only an explicit `defer_unlisted = true` leaves it out;
+    /// the automatic window fit then decides per turn.
+    #[must_use]
+    pub const fn publishes_all_tools(&self) -> bool {
+        !matches!(self.defer_unlisted, Some(true))
+    }
+
     /// A policy that hides [`RECOMMENDED_CHANNEL_EXCLUDED_TOOLS`] from channel
     /// sessions: what an operator gets by copying that list into the config.
     #[must_use]

@@ -257,7 +257,9 @@ impl PublicationRules<'_, '_> {
             .filter_map(|entry| {
                 let delegate = is_delegator(&entry.public_name);
                 let reference = entry_ref(entry);
-                let directly_exposed = self.catalog.directly_exposes(entry);
+                // A turn that fits its window keeps only the named tools direct.
+                let directly_exposed = self.catalog.directly_exposes(entry)
+                    && (!self.facts.fit_defers || self.catalog.names_directly(entry));
                 let minted_delegator = delegate
                     && outgoing_child
                     && (self.trusted.surface != TurnSurfaceKind::Interactive || self.full_autonomy());

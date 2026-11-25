@@ -20,6 +20,10 @@ pub(crate) struct OpenedTurn {
     pub(in crate::runtime) source_actor: (Arc<str>, Arc<str>),
     pub(in crate::runtime) service_id: uuid::Uuid,
     pub(in crate::runtime) main_compaction: crate::config::AgentCompactionConfig,
+    /// Budgeted tokens the published tool definitions occupy in a request,
+    /// measured at opening, so a budget check made before the first request
+    /// has been measured reserves them too.
+    pub(in crate::runtime) tool_surface_tokens: usize,
     /// The logical deadline of this turn, fixed at opening from its budget.
     pub(in crate::runtime) deadline: Instant,
 }
@@ -40,6 +44,11 @@ impl OpenedTurn {
 
     pub(crate) const fn main_compaction(&self) -> &crate::config::AgentCompactionConfig {
         &self.main_compaction
+    }
+
+    /// Tokens the tool definitions of this turn are estimated to occupy.
+    pub(crate) const fn tool_surface_tokens(&self) -> usize {
+        self.tool_surface_tokens
     }
 
     pub(crate) fn decision_id(&self) -> DecisionId {

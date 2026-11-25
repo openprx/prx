@@ -402,6 +402,9 @@
         effective_compaction.config = admitted_binding.main_compaction()
             .ok_or_else(|| anyhow::anyhow!("chat compaction requires an admitted decision"))?.clone();
         crate::providers::context_window::trace_effective_compaction_resolution(&effective_compaction);
+        // The tool definitions' size is known at turn opening, so the first
+        // turn's capacity check reserves them like the engine preflight.
+        tool_surface_reserve.seed_unmeasured(admitted_binding.tool_surface_tokens());
         // Earlier turns' tool results give way to one-line stubs, oldest first,
         // before the request is over budget; the compaction below runs as before.
         let stubbed_results = super::turn_replay::stub_replayed_results(

@@ -31,7 +31,7 @@ const CHAT_SESSIONS_TOOLS: [&str; 4] = ["sessions_spawn", "sessions_send", "sess
 fn direct_tool_names(configured: &crate::config::ToolTieringConfig, chat: bool) -> std::collections::BTreeSet<String> {
     let chat_tools: &[&str] = if chat { &CHAT_SESSIONS_TOOLS } else { &[] };
     // Every tool is published unless the operator asks to defer the rest.
-    let publish_all = (!configured.defer_unlisted).then_some(tools::capability::catalog::ALL_TOOLS_DIRECT);
+    let publish_all = configured.publishes_all_tools().then_some(tools::capability::catalog::ALL_TOOLS_DIRECT);
     DEFAULT_DIRECT_TOOLS
         .into_iter()
         .chain(chat_tools.iter().copied())

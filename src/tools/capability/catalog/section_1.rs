@@ -831,6 +831,15 @@ impl<'a> CatalogView<'a> {
                 .is_some_and(|surface| surface.direct_names.contains(&entry.public_name))
     }
 
+    /// Whether the surface policy names `entry` itself as direct: the core
+    /// tools, the surface's session tools and `always_include`, but not the
+    /// publish-all member. A turn that fits its tool definitions to a small
+    /// window publishes only these directly.
+    pub(crate) fn names_directly(&self, entry: &CapabilityEntry) -> bool {
+        self.surface
+            .is_some_and(|surface| surface.direct_names.contains(&entry.public_name))
+    }
+
     pub(crate) fn surface_excludes(&self, entry: &CapabilityEntry) -> bool {
         self.surface.is_some_and(|surface| {
             !surface.permits(&entry.public_name, &entry.root, &entry.target)

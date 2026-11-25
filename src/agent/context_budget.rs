@@ -73,7 +73,7 @@ pub(super) const APPENDED_SECTION_FRAMING_TOKENS: usize = 4;
 /// native payload that rides beside the messages plus the prompt sections the
 /// compiled snapshot appends to the system message, with the framing those
 /// sections arrive in.
-pub(super) const fn budgeted_request_tool_tokens(
+pub(crate) const fn budgeted_request_tool_tokens(
     tool_surface: crate::agent::turn_context::RequestToolMeasurement,
 ) -> usize {
     let sections = budgeted_tokens(tool_surface.instructions);
@@ -205,6 +205,17 @@ impl ToolSurfaceReserve {
     pub(crate) fn record(&self, tool_surface: crate::agent::turn_context::RequestToolMeasurement) {
         self.0.store(
             budgeted_request_tool_tokens(tool_surface),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Set the reserve from the size known at turn opening, only while no
+    /// request has been measured yet; a measurement always replaces it.
+    pub(crate) fn seed_unmeasured(&self, tokens: usize) {
+        let _ = self.0.compare_exchange(
+            0,
+            tokens,
+            std::sync::atomic::Ordering::Relaxed,
             std::sync::atomic::Ordering::Relaxed,
         );
     }

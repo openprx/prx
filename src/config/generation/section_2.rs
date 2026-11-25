@@ -32,7 +32,7 @@ mod tests {
             b"]",
         ]
         .concat();
-        const FOR_CHILD_FINGERPRINT: &str = "205bb9dd92ff723b2353b3ee4bbf3d863c05c03a9befe49fe3506bfe4567f9c1";
+        const FOR_CHILD_FINGERPRINT: &str = "98a73219ec8529e6afad412ada3e3009e10e6145d4d4f27b74db71ea0d367e18";
         assert_eq!(format!("{:x}", sha2::Sha256::digest(&preimage)), FOR_CHILD_FINGERPRINT);
         assert_eq!(generation.source_revision.fingerprint_sha256, FOR_CHILD_FINGERPRINT);
         assert_eq!(generation.id.0, 0);

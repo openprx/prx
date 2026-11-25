@@ -3012,6 +3012,7 @@ async fn drive_start_turn_stream(
     // One budget with the turn preflight: the last measured tool surface is
     // reserved here too, while the turn itself still receives the configured
     // budget and reserves its freshly measured surface.
+    tool_surface_reserve.seed_unmeasured(routing.context.tool_surface_tokens());
     let reserved_compaction_config = compaction_config
         .as_ref()
         .map(|config| tool_surface_reserve.reserved_config(config));

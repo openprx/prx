@@ -36,6 +36,11 @@ pub(crate) struct PublicationFacts {
     /// `None` below Full and for non-child turns, where the manifest (or no
     /// child scope) bounds publication.
     pub(crate) child_served: Option<Arc<BTreeSet<CapabilityId>>>,
+    /// The turn fits its tool definitions to the model's window: only the
+    /// tools the surface policy names stay direct, and the rest are reached
+    /// through `capability_search` or by exact name. Fixed at opening from the
+    /// model window and the tool set, so every later rebuild agrees.
+    pub(crate) fit_defers: bool,
 }
 
 impl PublicationFacts {

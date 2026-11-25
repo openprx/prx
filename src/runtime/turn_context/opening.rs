@@ -216,7 +216,7 @@ impl TurnRuntimeService {
             }),
             None => None,
         };
-        let facts = PublicationFacts {
+        let mut facts = PublicationFacts {
             policy: Arc::clone(&self.security),
             owner_id: Arc::from(proof.owner_id()),
             sender: Arc::from(proof.policy_sender()),
@@ -241,15 +241,34 @@ impl TurnRuntimeService {
                 .child_scope()
                 .is_some_and(|scope| scope.gate_inputs().0.authority.level == crate::security::AutonomyLevel::Full)
                 .then(|| Arc::new(self.child_served_entries(&catalog))),
+            fit_defers: false,
         };
         // The published surface is an execution rule over the pinned scope,
         // the publication facts and the catalog (R28).
-        let published = crate::tools::surface_owner::publication::PublicationRules {
-            trusted: &trusted,
-            facts: &facts,
-            catalog: &catalog,
-        }
-        .surface(outgoing_delegation.is_some());
+        let publish = |facts: &PublicationFacts| {
+            crate::tools::surface_owner::publication::PublicationRules {
+                trusted: &trusted,
+                facts,
+                catalog: &catalog,
+            }
+            .surface(outgoing_delegation.is_some())
+        };
+        let mut published = publish(&facts);
+        // Fit the tool definitions to the model's window (deterministic for
+        // the window and the tool set). A deferring turn is republished with
+        // only the tools the surface policy names.
+        let fit = self.fit_tool_surface(
+            proof.session_key(),
+            budget.main_compaction.max_context_tokens,
+            &published,
+        );
+        let tool_surface_tokens = if fit.defers {
+            facts.fit_defers = true;
+            published = publish(&facts);
+            self.published_surface_tokens(&published, true)
+        } else {
+            fit.full_tokens
+        };
         // The turn's one accounting scope, created at opening. Without the
         // prediction hop nothing has been charged to it yet.
         let accounting = accounting_scope(self, proof, budgets, deadline);
@@ -284,6 +303,7 @@ impl TurnRuntimeService {
             source_actor: (Arc::from(proof.policy_channel()), Arc::from(proof.policy_sender())),
             service_id: self.service_id,
             main_compaction: budget.main_compaction,
+            tool_surface_tokens,
             deadline,
         }))
     }

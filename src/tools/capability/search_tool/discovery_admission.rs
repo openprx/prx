@@ -179,6 +179,9 @@ pub(crate) fn discovery_entries(
     let rules = rules(port, &view);
     let trusted = port.trusted();
     let offered_direct = direct_discovery_ids(port);
+    // A turn that fitted its tool definitions to the window left every
+    // publish-all tool out of the request, and offers each through search.
+    let fit_deferred = port.facts().fit_defers;
     let mut entries = BTreeMap::new();
     for entry in view.iter_entries() {
         let reference = entry_ref(entry);
@@ -189,7 +192,8 @@ pub(crate) fn discovery_entries(
         ) && (entry.public_name != "delegate"
             || port.facts().policy.autonomy == crate::security::AutonomyLevel::Full)
             && (entry.supports_metadata_discovery()
-                || matches!(entry.exposure, Exposure::Direct) && (offered_direct.contains(&entry.id) || core))
+                || matches!(entry.exposure, Exposure::Direct)
+                    && (offered_direct.contains(&entry.id) || core || fit_deferred))
             && rules.owner_isolation_admits(entry)
             && entry.availability.level >= CapabilityAvailabilityLevel::Configured
             && !trusted.excludes_entry(entry)
@@ -213,7 +217,9 @@ pub(crate) fn discovery_entries(
             DiscoveryEntry {
                 reference,
                 core,
-                searchable: entry.supports_metadata_discovery() || offered_direct.contains(&entry.id),
+                searchable: entry.supports_metadata_discovery()
+                    || offered_direct.contains(&entry.id)
+                    || (fit_deferred && !core && matches!(entry.exposure, Exposure::Direct)),
             },
         );
     }
@@ -233,7 +239,8 @@ pub(crate) fn capability_search_spec(
     {
         return Ok(None);
     }
-    if !discovery_entries(port, proof)?.values().any(|entry| entry.searchable) {
+    let discovered = discovery_entries(port, proof)?;
+    if !discovered.values().any(|entry| entry.searchable) {
         return Ok(None);
     }
     let Some(entry) = port.catalog().entry_for_public_name("capability_search") else {
@@ -270,7 +277,7 @@ pub(crate) fn capability_search_spec(
         }
         return Err(SearchControlUnavailable::MissingBackend.into());
     };
-    let spec = ToolSpec {
+    let mut spec = ToolSpec {
         name: descriptor.public_name,
         description: descriptor.description,
         parameters: descriptor.parameters,
@@ -284,6 +291,11 @@ pub(crate) fn capability_search_spec(
             ) == entry.fingerprint,
         "capability search definition changed"
     );
+    // The index is added after the definition was verified, and every reader
+    // of this spec (request, execution binding) gets it from this function.
+    if port.facts().fit_defers {
+        spec.description.push_str(&super::deferred_index::deferred_index(port, &discovered));
+    }
     Ok(Some(spec))
 }
 
