@@ -305,6 +305,13 @@ impl ReplayLog {
         runs
     }
 
+    /// The stored attachments of the log, by the event id of the user message
+    /// each belongs to. Holds only what the load read: the rows of the session's
+    /// own scoped read.
+    pub(crate) fn into_attachments(self) -> HashMap<String, Attachment> {
+        self.attachments
+    }
+
     /// The stored turns as history messages, in order: each user message with
     /// its stored attachment, each assistant reply preceded by the tool rounds
     /// of its run. Event ids line up with the messages, `None` for a replayed

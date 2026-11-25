@@ -5,6 +5,8 @@ use super::handoff_note::{is_context_handoff_message, parse_context_handoff_note
 use super::roundtrips::RoundCompanions;
 use super::summary::CompactionAuditSource;
 use crate::agent::document_ingest::DocumentIngestRuntime;
+use crate::agent::turn_contracts::neutralize_reserved_markers;
+use crate::context::transcript::{Attachment, Transcript};
 use crate::memory::CompactionSourceEventRange;
 use crate::memory::Memory;
 use crate::memory::MemoryPrincipal;
@@ -167,6 +169,10 @@ pub(crate) struct CandidatePool {
 /// and form, to the indices of the messages that have them.
 pub(crate) struct SourceForms {
     by_role: HashMap<String, HashMap<String, Vec<usize>>>,
+    /// The stored attachment of each user message, by its event id. A user
+    /// message is replayed as its attachment's prefix, text and tail, so its
+    /// composed form is matched as well ([`Self::row_matches`]).
+    attachments: HashMap<String, Attachment>,
 }
 
 impl SourceForms {
@@ -181,7 +187,18 @@ impl SourceForms {
                 }
             }
         }
-        Self { by_role }
+        Self {
+            by_role,
+            attachments: HashMap::new(),
+        }
+    }
+
+    /// These forms with the stored attachments of the session's own rows,
+    /// by user event id. An empty map leaves the plain-text match as it was.
+    #[must_use]
+    pub(crate) fn with_attachments(mut self, attachments: HashMap<String, Attachment>) -> Self {
+        self.attachments = attachments;
+        self
     }
 
     fn matches(&self, role: &str, content: &str) -> Vec<usize> {
@@ -191,6 +208,34 @@ impl SourceForms {
             .cloned()
             .unwrap_or_default()
     }
+
+    /// The source messages a stored row may stand for: the union, ascending
+    /// and de-duplicated, of its plain text and, for a user row, the text as
+    /// it was replayed: its stored attachment composed around the text, then
+    /// neutralized exactly as the replay neutralizes it. Byte equality only.
+    fn row_matches(&self, role: &str, event_id: &str, content: &str) -> Vec<usize> {
+        let mut indices = self.matches(role, content);
+        if role == "user" {
+            indices.extend(self.matches(role, &neutralize_reserved_markers(content)));
+            if let Some(attachment) = self.attachments.get(event_id) {
+                let composed = attachment.compose(content);
+                indices.extend(self.matches(role, &neutralize_reserved_markers(&composed)));
+            }
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        indices
+    }
+}
+
+/// The stored attachments of the session's own rows, by user event id, read
+/// with the principal the pool is read with. A failed read gives none (the
+/// reader logs it), so the match is then the plain-text match alone.
+async fn stored_attachments(mem: &dyn Memory, principal: &MemoryPrincipal) -> HashMap<String, Attachment> {
+    Transcript::new(mem, principal.clone())
+        .replay_log()
+        .await
+        .into_attachments()
 }
 
 /// The lookup event ids and parent of a stored handoff note.
@@ -230,7 +275,7 @@ impl CandidatePool {
             match event.event_type.as_str() {
                 "message.created" => {
                     self.message_ids.push(event.id);
-                    let matches = forms.matches(&event.role, &event.content);
+                    let matches = forms.row_matches(&event.role, &event.event_id, &event.content);
                     if !matches.is_empty() {
                         self.messages.push(PoolRow {
                             id: event.id,
@@ -712,7 +757,8 @@ pub(crate) async fn resolve_provenance_with_kept(
         legacy_session_key: None,
         ..principal
     };
-    let forms = SourceForms::new(&joint_messages);
+    let attachments = stored_attachments(mem, &principal).await;
+    let forms = SourceForms::new(&joint_messages).with_attachments(attachments);
     let pool = match load_complete_pool(mem, &principal, &forms).await? {
         Ok(pool) => pool,
         Err(gap) => return Ok(ProvenanceResolution::Unavailable(gap)),
