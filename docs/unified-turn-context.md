@@ -750,7 +750,8 @@ check and the engine preflight both derive that budget from one function
 current request cannot be folded, so a window that cannot hold them still ends
 in a per-request trim.
 
-The provider view renders each note as one line: `[context_handoff]
+The provider view renders each note as one line (plus the optional lines
+described below when the note carries them): `[context_handoff]
 handoff_event_id=<id> -- <n> earlier user and assistant messages were moved out
 of this window. They are recoverable with
 transcript_history_lookup(handoff_event_id="<id>"). The tool calls and tool
@@ -758,6 +759,21 @@ results of the replaced turns are not recoverable.` (the separator is an em
 dash), followed by the folded round-trip count when it is not zero. The
 system-prompt rule says the same: user and assistant messages can be read back,
 tool calls and tool results of those turns cannot.
+
+A note may also carry three optional fields (`schema_version` stays 1; a note
+without them validates and renders exactly as above). `skills_in_use` lists up
+to 8 skill names the session had loaded before the handoff (each 1 to 128
+bytes, no control characters, no `[` or `]`). `summary_status` is one of
+`written`, `failed`, `empty` or `omitted_size`; `summary` must be present
+exactly when the status is `written`, and then holds 1 to 6000 bytes that
+contain none of the markers `[context_handoff]`, `[/context_handoff]`,
+`[document_ingest_ref]` or `[/document_ingest_ref]`. A note that breaks any of
+these rules is invalid, as any other invalid note is. The rendering keeps the
+first line above and appends, in order and only when present: the skills line
+`Skills loaded before the handoff: a, b. Call skill_read for each one before
+continuing its procedure.`; for status `written`, a summary block that opens
+`Summary of the moved turns, written by the model at the handoff` and then the
+summary; for any other status, `No summary was written for these turns.`
 
 Each handoff references only the rows it replaced, its parent handoff row
 among them, so a fact older than the newest handoff is reached by following

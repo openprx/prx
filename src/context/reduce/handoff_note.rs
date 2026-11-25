@@ -100,7 +100,46 @@ pub(crate) struct HandoffNoteSchema {
     #[serde(rename = "retained_recent_message_count")]
     _retained_recent_message_count: u64,
     lookup: HandoffNoteLookup,
+    /// How the model's summary of the moved turns ended. Absent for a note
+    /// written before summaries existed.
+    #[serde(default)]
+    summary_status: Option<HandoffSummaryStatus>,
+    /// The summary itself, present exactly when `summary_status` is `written`.
+    #[serde(default)]
+    summary: Option<String>,
+    /// Skills the session had loaded before the handoff; absent or empty means none.
+    #[serde(default)]
+    skills_in_use: Vec<String>,
 }
+
+/// The outcome of the summary a handoff note may carry. Only `written` carries
+/// a summary; the other statuses say why none was written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HandoffSummaryStatus {
+    Written,
+    Failed,
+    Empty,
+    OmittedSize,
+}
+
+/// Longest summary a validated note may carry, in bytes.
+pub(crate) const HANDOFF_SUMMARY_MAX_BYTES: usize = 6_000;
+
+/// Most skill names a validated note may carry.
+pub(crate) const HANDOFF_SKILLS_MAX_COUNT: usize = 8;
+
+/// Longest skill name a validated note may carry, in bytes.
+pub(crate) const HANDOFF_SKILL_NAME_MAX_BYTES: usize = 128;
+
+/// Markers a summary may not contain: a summary that carried one could be
+/// read as a handoff or a document reference by the provider view.
+const HANDOFF_SUMMARY_FORBIDDEN_MARKERS: [&str; 4] = [
+    CONTEXT_HANDOFF_START,
+    CONTEXT_HANDOFF_END,
+    "[document_ingest_ref]",
+    "[/document_ingest_ref]",
+];
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -198,6 +237,38 @@ pub(crate) fn is_handoff_note_tool_name(value: &str) -> bool {
     !value.is_empty() && value.len() <= HANDOFF_NOTE_MAX_TOOL_NAME_BYTES && !value.chars().any(char::is_control)
 }
 
+/// Whether a summary status and summary pair is one the writer may produce:
+/// a summary exactly with status `written`, a text within the bound and free
+/// of the reserved markers.
+fn is_valid_handoff_summary(status: Option<HandoffSummaryStatus>, summary: Option<&str>) -> bool {
+    match (status, summary) {
+        (Some(HandoffSummaryStatus::Written), Some(text)) => {
+            !text.is_empty()
+                && text.len() <= HANDOFF_SUMMARY_MAX_BYTES
+                && !HANDOFF_SUMMARY_FORBIDDEN_MARKERS
+                    .iter()
+                    .any(|marker| text.contains(*marker))
+        }
+        (Some(HandoffSummaryStatus::Written), None) => false,
+        (Some(_), None) | (None, None) => true,
+        (_, Some(_)) => false,
+    }
+}
+
+/// Whether a list of skill names is one the writer may produce: at most
+/// [`HANDOFF_SKILLS_MAX_COUNT`] names, each non-empty, bounded, without control
+/// characters, `[` or `]`.
+fn is_valid_handoff_skills(skills: &[String]) -> bool {
+    skills.len() <= HANDOFF_SKILLS_MAX_COUNT
+        && skills.iter().all(|skill| {
+            !skill.is_empty()
+                && skill.len() <= HANDOFF_SKILL_NAME_MAX_BYTES
+                && !skill
+                    .chars()
+                    .any(|character| character.is_control() || character == '[' || character == ']')
+        })
+}
+
 /// The note of `content` when it is a handoff the compaction code could have
 /// written: the exact framing, at most [`MAX_HANDOFF_MESSAGE_BYTES`], the
 /// exact schema ([`HandoffNoteSchema`], no other field) and every value in its
@@ -224,6 +295,29 @@ pub(crate) struct ValidatedContextHandoff {
     pub(crate) last_row_id: i64,
     /// Tool round-trips folded into the handoff (they have no events).
     pub(crate) folded_roundtrips: usize,
+    /// The summary status; `None` for a note without the field.
+    summary_status: Option<HandoffSummaryStatus>,
+    /// The summary, present exactly when the status is `written`.
+    summary: Option<String>,
+    /// The skills loaded before the handoff, in note order.
+    skills_in_use: Vec<String>,
+}
+
+impl ValidatedContextHandoff {
+    /// The status of the summary of the moved turns, `None` when the note has none.
+    pub(crate) fn summary_status(&self) -> Option<HandoffSummaryStatus> {
+        self.summary_status
+    }
+
+    /// The summary of the moved turns, present exactly when the status is `written`.
+    pub(crate) fn summary(&self) -> Option<&str> {
+        self.summary.as_deref()
+    }
+
+    /// The skills loaded before the handoff; empty when none were recorded.
+    pub(crate) fn skills_in_use(&self) -> &[String] {
+        &self.skills_in_use
+    }
 }
 
 /// [`validated_context_handoff_note`] as typed values; `None` exactly when the
@@ -278,7 +372,9 @@ pub(crate) fn validate_context_handoff(content: &str) -> Option<(ValidatedContex
         && (range.first_row_id, range.last_row_id) == (lookup.first_row_id, lookup.last_row_id)
         && folded.tools.len() <= FOLDED_TOOL_NAME_LIMIT
         && folded.tools.iter().all(|tool| is_handoff_note_tool_name(tool))
-        && note.folded_tool_roundtrips_notice == format_folded_tool_roundtrips_notice(&folded);
+        && note.folded_tool_roundtrips_notice == format_folded_tool_roundtrips_notice(&folded)
+        && is_valid_handoff_summary(note.summary_status, note.summary.as_deref())
+        && is_valid_handoff_skills(&note.skills_in_use);
     if !valid {
         return None;
     }
@@ -294,6 +390,9 @@ pub(crate) fn validate_context_handoff(content: &str) -> Option<(ValidatedContex
             first_row_id,
             last_row_id,
             folded_roundtrips: folded.count,
+            summary_status: note.summary_status,
+            summary: note.summary,
+            skills_in_use: note.skills_in_use,
         },
         json,
     ))
@@ -302,7 +401,7 @@ pub(crate) fn validate_context_handoff(content: &str) -> Option<(ValidatedContex
 /// The system-prompt paragraph of a chat session that states what a handoff
 /// in its window means and how earlier turns are reached. Its bytes never
 /// change between turns, so the cacheable prompt prefix stays stable.
-pub(crate) const CONTEXT_HANDOFF_PROMPT_RULE: &str = "A message that starts with [context_handoff] means earlier turns of this session were moved out of this window; their user and assistant messages still exist and can be read back, but the tool calls and tool results of those turns cannot be recovered. Never treat the oldest visible message as the start of the session. Before answering a question about anything that may have happened earlier than the visible window, call transcript_history_lookup with that handoff's handoff_event_id and read the result; if the result contains another [context_handoff], look that one up too.";
+pub(crate) const CONTEXT_HANDOFF_PROMPT_RULE: &str = "A message that starts with [context_handoff] means earlier turns of this session were moved out of this window; their user and assistant messages still exist and can be read back, but the tool calls and tool results of those turns cannot be recovered. Never treat the oldest visible message as the start of the session. Before answering a question about anything that may have happened earlier than the visible window, call transcript_history_lookup with that handoff's handoff_event_id and read the result; if the result contains another [context_handoff], look that one up too. When a handoff carries a summary, use it to continue the work and look up the exact earlier messages before quoting them.";
 
 /// Whether `messages` hold a context handoff, in its stored or its rendered
 /// form: both start with the handoff marker.
@@ -334,12 +433,54 @@ pub(crate) fn render_context_handoff_for_provider<'a>(role: &str, content: &'a s
 /// tool results of the replaced turns are not recoverable.`, followed by
 /// ` <k> tool round-trips were folded.` only when `k` is not zero.
 pub(crate) fn format_compact_context_handoff(handoff: &ValidatedContextHandoff) -> String {
-    format_compact_context_handoff_parts(
+    let mut rendered = format_compact_context_handoff_parts(
         &handoff.handoff_event_id,
         handoff.event_ids.len(),
         handoff.folded_roundtrips,
-    )
+    );
+    rendered.push_str(&format_compact_context_handoff_tail(handoff));
+    rendered
 }
+
+/// What follows the first line of a compact rendering when the note carries
+/// skills or a summary status: the skills line, then the summary block or the
+/// no-summary line. Empty for a note without either field.
+fn format_compact_context_handoff_tail(handoff: &ValidatedContextHandoff) -> String {
+    let mut tail = String::new();
+    let skills = handoff.skills_in_use();
+    if !skills.is_empty() {
+        let _ = write!(
+            tail,
+            "{COMPACT_HANDOFF_SKILLS_HEADER}{}. Call skill_read for each one before continuing its procedure.",
+            skills.join(", ")
+        );
+    }
+    match handoff.summary_status() {
+        Some(HandoffSummaryStatus::Written) => {
+            if let Some(summary) = handoff.summary() {
+                let _ = write!(
+                    tail,
+                    "{COMPACT_HANDOFF_SUMMARY_HEADER} (use it to continue; look up the exact messages before quoting them):\n{summary}"
+                );
+            }
+        }
+        Some(_) => tail.push_str(COMPACT_HANDOFF_NO_SUMMARY),
+        None => {}
+    }
+    tail
+}
+
+/// The line that opens the skills list of a compact rendering, through the
+/// names.
+pub(crate) const COMPACT_HANDOFF_SKILLS_HEADER: &str = "\nSkills loaded before the handoff: ";
+
+/// The opening of the summary block of a compact rendering, through the
+/// parenthesised instruction that the summary follows.
+pub(crate) const COMPACT_HANDOFF_SUMMARY_HEADER: &str =
+    "\n\nSummary of the moved turns, written by the model at the handoff";
+
+/// The line a compact rendering carries when the summary status is not `written`.
+pub(crate) const COMPACT_HANDOFF_NO_SUMMARY: &str = "\nNo summary was written for these turns.";
 
 /// The compact rendering of a note with handoff id `id`, `messages`
 /// referenced events and `folded` folded tool round-trips.
@@ -360,14 +501,25 @@ pub(crate) const COMPACT_HANDOFF_ID_FIELD: &str = " handoff_event_id=";
 /// The sentence after the folded round-trip count of a compact rendering.
 pub(crate) const COMPACT_HANDOFF_FOLDED_SUFFIX: &str = " tool round-trips were folded.";
 
-/// Whether `content` is exactly a compact rendering
-/// ([`format_compact_context_handoff_parts`]) of a validated note: a
-/// well-formed handoff id, a positive message count, an optional positive
-/// folded count, and every other byte as the renderer writes it. The parts
-/// are read back and the rendering rebuilt from them, so the renderer stays
-/// the one definition of the shape.
+/// Whether `content` is a compact rendering
+/// ([`format_compact_context_handoff`]) of a validated note: its first line is
+/// exactly the compact rendering of the parts it reads back
+/// ([`format_compact_context_handoff_parts`]), and any text after the first
+/// line starts with one of the fixed headers the renderer writes for skills or
+/// the summary status. Every other byte of the first line is as the renderer
+/// writes it.
 pub(crate) fn is_compact_context_handoff(content: &str) -> bool {
-    let Some(rest) = content
+    let first_line = content.split_once('\n').map_or(content, |(first, _)| first);
+    let Some(tail) = content.get(first_line.len()..) else {
+        return false;
+    };
+    is_compact_context_handoff_line(first_line) && is_compact_context_handoff_tail(tail)
+}
+
+/// Whether `line` is exactly the first line of a compact rendering of a note
+/// with a well-formed handoff id.
+fn is_compact_context_handoff_line(line: &str) -> bool {
+    let Some(rest) = line
         .strip_prefix(CONTEXT_HANDOFF_START)
         .and_then(|rest| rest.strip_prefix(COMPACT_HANDOFF_ID_FIELD))
     else {
@@ -383,12 +535,25 @@ pub(crate) fn is_compact_context_handoff(content: &str) -> bool {
     else {
         return false;
     };
-    let folded = content
+    let folded = line
         .strip_suffix(COMPACT_HANDOFF_FOLDED_SUFFIX)
         .and_then(|head| head.rsplit_once(' '))
         .and_then(|(_, count)| count.parse::<usize>().ok())
         .unwrap_or(0);
-    is_handoff_note_identifier(id) && format_compact_context_handoff_parts(id, messages, folded) == content
+    is_handoff_note_identifier(id) && format_compact_context_handoff_parts(id, messages, folded) == line
+}
+
+/// Whether the text after the first line of a compact rendering is empty or
+/// opens with one of the headers the renderer writes after it.
+fn is_compact_context_handoff_tail(tail: &str) -> bool {
+    tail.is_empty()
+        || [
+            COMPACT_HANDOFF_SKILLS_HEADER,
+            COMPACT_HANDOFF_SUMMARY_HEADER,
+            COMPACT_HANDOFF_NO_SUMMARY,
+        ]
+        .iter()
+        .any(|header| tail.starts_with(header))
 }
 
 /// The newest context-handoff generation in `history`, 0 when none.
