@@ -414,7 +414,7 @@ async fn execute_single_task(
     let mut execution = Box::pin(async {
         match task.execution_mode {
             ExecutionMode::Internal => run_internal(config, registry, task).await,
-            ExecutionMode::AgentSession => run_agent(config, security, task, execution_authority).await,
+            ExecutionMode::AgentSession => run_agent(config, security, task, None, execution_authority).await,
             ExecutionMode::Shell => run_shell_with_cancellation(config, task, Some(shell_cancellation)).await,
         }
     });
@@ -824,7 +824,7 @@ async fn execute_step_inner(
     let bridge = step_as_task(step, goal);
     match step.execution_mode {
         ExecutionMode::Internal => run_internal(config, registry, &bridge).await,
-        ExecutionMode::AgentSession => run_agent(config, security, &bridge, authority).await,
+        ExecutionMode::AgentSession => run_agent(config, security, &bridge, Some((step, goal)), authority).await,
         ExecutionMode::Shell => run_shell_with_cancellation(config, &bridge, cancellation).await,
     }
 }
@@ -895,6 +895,7 @@ async fn run_agent(
     config: &Config,
     security: &SecurityPolicy,
     task: &XinTask,
+    step: Option<(&XinStep, &XinGoal)>,
     authority: XinRuntimeAuthority,
 ) -> (bool, String) {
     if !security.can_act()
@@ -929,7 +930,12 @@ async fn run_agent(
     let scheduled_tool_scope = task
         .origin
         .scheduled_tool_scope(runtime_envelope.clone(), config, level);
+    let card = match step {
+        Some((step, goal)) => crate::agent::scheduled_card::for_xin_step(config, step, goal),
+        None => crate::agent::scheduled_card::for_xin_task(task),
+    };
     match crate::agent::scheduled_source::ScheduledAgentOrigin::from_xin(task)
+        .with_card(card)
         .scope(crate::agent::run_with_runtime_envelope(
             match (
                 CONFIG_GENERATION.try_with(Arc::clone),

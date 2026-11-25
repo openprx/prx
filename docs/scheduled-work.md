@@ -34,6 +34,38 @@ are `interval_minutes = 30`, `active_hours = [8, 23]`, and
 `HEARTBEAT.md` in the workspace if it is missing. Heartbeat health is an
 optional component owned by Xin.
 
+## What a scheduled agent run is told
+
+An `agent_session` task, a goal step, a heartbeat item and an agent cron job
+each run as a single-shot turn: the system message plus one user message. The
+run has no transcript of earlier runs. The scheduler therefore opens the user
+message with a task card, read from its own store and marked in its header as
+data and not as an instruction. The task instruction follows the line
+`[Task instruction]`. The card carries:
+
+- the kind of run (Xin task, goal step, heartbeat item or cron job), the id and
+  the name, and the schedule (interval, cron expression or one-shot instant);
+- the run number: for a Xin task its stored run count plus one; for a cron job
+  the length of the retained run history plus one, shown as "N or later" once
+  the history has reached `[cron] max_run_history`;
+- the previous run's start time, status and the last 3,000 bytes of its stored
+  output, each line prefixed with `| `;
+- for a goal step: the goal's name and description, "step i of n", every step
+  with its status, and the outputs of the completed earlier steps (last 2,000
+  bytes each, 8,000 bytes in total, newest steps first), and on a retry the
+  previous attempt's output.
+
+The card is redacted with the persistence redaction before it enters the
+request. It is not stored with the message and is not part of recall. The
+stored Xin run output is cut at 16 KiB and the cut ends with a `...[truncated]`
+line. A named agent's job still gets that agent's identity text as its system
+prompt, not the full interactive prompt.
+
+Cron `session_target` accepts `isolated` (default) and `main`. Today both take
+the same path: the job runs as a single-shot turn under the session key
+`cron:{job_id}` and its result stays in the run history; `main` does not
+deliver anything to a main session.
+
 ## HEARTBEAT.md materialization
 
 Each trimmed line that starts with `-` followed by a space becomes a recurring

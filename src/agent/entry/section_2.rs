@@ -279,6 +279,7 @@ pub(crate) async fn run_with_runtime_envelope(
             scope.context.envelope.agent_partition = envelope.agent_partition.clone();
         }
     }
+    let scheduled_card = super::scheduled_source::current_card();
     let mut scheduled_admission = super::scheduled_source::validate_current(
         runtime_envelope_override.as_ref(),
         scheduled_tool_scope.as_ref(),
@@ -741,10 +742,11 @@ pub(crate) async fn run_with_runtime_envelope(
                 )
                 .await;
                 let context = mem_context.preamble.clone();
-                let mut enriched = if context.is_empty() {
+                let card = scheduled_card.as_deref().unwrap_or_default();
+                let mut enriched = if context.is_empty() && card.is_empty() {
                     msg.clone()
                 } else {
-                    format!("{context}{msg}")
+                    format!("{context}{card}{msg}")
                 };
                 crate::agent::turn_contracts::push_current_time_tail(&mut enriched);
 

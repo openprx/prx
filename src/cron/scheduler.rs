@@ -706,6 +706,7 @@ async fn run_agent_job_with_origin(
             // Background cron job: no cooperative shutdown signal of its own;
             // the scheduler drops/aborts the task. See never_cancelled_shutdown.
             origin
+                .with_card(crate::agent::scheduled_card::for_cron_job(config, job))
                 .scope(crate::agent::run_with_runtime_envelope(
                     match (
                         CONFIG_GENERATION.try_with(Arc::clone),

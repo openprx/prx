@@ -22,6 +22,8 @@ pub(crate) struct ScheduledAgentOrigin {
     origin: JobOrigin,
     claimed_attempt: Option<String>,
     retry_boundary: ScheduledRetryBoundary,
+    /// Task card text built by the scheduler from its own store.
+    card: Option<String>,
 }
 
 /// A read-only observation held by the scheduler, never a permission to replay
@@ -33,6 +35,11 @@ impl ScheduledRetryBoundary {
     pub(crate) fn may_retry_startup(&self) -> bool {
         !self.0.load(Ordering::Acquire)
     }
+}
+
+/// The task card of the scheduled invocation this call runs inside, if any.
+pub(super) fn current_card() -> Option<String> {
+    SCHEDULED_ORIGIN.try_with(|origin| origin.card.clone()).ok().flatten()
 }
 
 pub(super) fn begin_decision() -> Result<()> {
@@ -58,6 +65,7 @@ impl ScheduledAgentOrigin {
             origin: job.origin.clone(),
             claimed_attempt: claim.map(|claim| claim.attempt_id.clone()),
             retry_boundary: ScheduledRetryBoundary::default(),
+            card: None,
         }
     }
 
@@ -71,7 +79,15 @@ impl ScheduledAgentOrigin {
             origin: task.origin.clone(),
             claimed_attempt: None,
             retry_boundary: ScheduledRetryBoundary::default(),
+            card: None,
         }
+    }
+
+    /// Attach the task card the run's user message opens with.
+    #[must_use]
+    pub(crate) fn with_card(mut self, card: String) -> Self {
+        self.card = Some(card);
+        self
     }
 
     pub(crate) fn retry_boundary(&self) -> ScheduledRetryBoundary {
