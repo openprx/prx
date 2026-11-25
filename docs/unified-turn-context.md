@@ -81,8 +81,23 @@ Precedence: when a call context is present its level is the call's level
 fall back to the directory they were built with only when no call context is
 set (tests, operator and job dispatch). Tools do not re-read configuration
 for the level or the directory. The budget handle, published surface and
-control handles are not carried yet. MCP dispatch and skill execution still
-read their own state and move in a later step.
+control handles are not carried yet.
+
+MCP dispatch and skill execution read the call's level through
+`effective_autonomy::call_policy`, which starts from the call context. The
+MCP registry is built once for all callers at the main agent's level; a
+dispatch-time check (allow/deny view, HTTP transport, read-only refusal,
+side-effect gate) uses the call's level, and a registry with a Full named
+agent keeps the tools the lists filter for it (`mcp/level_view.rs`). Which
+servers load, and the dedicated launch directory of each stdio server (one
+long-lived process shared by all callers), do not depend on the call. Managed
+skill execution takes every level decision from the call: the tool grant, the
+excluded tool tiers, the review skip, the policy part of the run identity and
+the side-effect gate. The run owner still comes from `effective_run_owner`;
+where the call context carries an owner that differs, a debug log line (site
+only, no value) says so. A skill process still starts in its skill root (or
+the staged run directory of a managed run), not in the call's working
+directory.
 
 ## Replayed history on the gateway session route
 
