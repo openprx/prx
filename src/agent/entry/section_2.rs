@@ -730,21 +730,10 @@ pub(crate) async fn run_with_runtime_envelope(
                     &fabric_scope,
                     agent_user_event.as_ref().map(|event| event.event_id.as_str()),
                 );
-                let mem_context = crate::agent::context_recall::scoped_recall(
-                    mem.as_ref(),
-                    &crate::agent::context_recall::RecallScope::from_envelope(
-                        &runtime_envelope,
-                        &config.memory,
-                        "private",
-                    ),
-                    &msg,
-                    crate::agent::context_recall::RECALL_CONTEXT_BUDGET,
-                )
-                .await;
-                // A scheduled run opens from its session's earlier runs; a plain run
-                // keeps the single-message request it always had.
+                // A scheduled run opens from its session's earlier runs and recalls
+                // once, inside the opening; a plain run keeps the request it always had.
                 let scheduled_turn = scheduled_admission.is_some();
-                let (mut history, history_event_ids) = if scheduled_turn {
+                let (mut history, history_event_ids, recalled_ids) = if scheduled_turn {
                     let previous_turns = scheduled_previous_turns(
                         &mem,
                         &runtime_envelope,
@@ -767,8 +756,19 @@ pub(crate) async fn run_with_runtime_envelope(
                         model: model_name,
                     })
                     .await;
-                    (opening.history, opening.history_event_ids)
+                    (opening.history, opening.history_event_ids, opening.recalled_ids)
                 } else {
+                    let mem_context = crate::agent::context_recall::scoped_recall(
+                        mem.as_ref(),
+                        &crate::agent::context_recall::RecallScope::from_envelope(
+                            &runtime_envelope,
+                            &config.memory,
+                            "private",
+                        ),
+                        &msg,
+                        crate::agent::context_recall::RECALL_CONTEXT_BUDGET,
+                    )
+                    .await;
                     let context = mem_context.preamble.clone();
                     let card = scheduled_card.as_deref().unwrap_or_default();
                     let mut enriched = if context.is_empty() && card.is_empty() {
@@ -783,6 +783,7 @@ pub(crate) async fn run_with_runtime_envelope(
                             crate::agent::turn_contracts::inbound_user_message(&enriched),
                         ],
                         Vec::new(),
+                        mem_context.ids,
                     )
                 };
                 let memory_runtime = if scheduled_turn {
@@ -963,7 +964,7 @@ pub(crate) async fn run_with_runtime_envelope(
                 {
                     return Err(error);
                 }
-                increment_recalled_useful_counts(mem.as_ref(), &mem_context.ids).await;
+                increment_recalled_useful_counts(mem.as_ref(), &recalled_ids).await;
                 final_output = response.clone();
                 if !QUIET_SINGLE_SHOT.try_with(|quiet| *quiet).unwrap_or(false) {
                     println!("{response}");
@@ -1090,7 +1091,7 @@ async fn scheduled_previous_turns(
             if let Some(input_event_id) = input_event_id {
                 turns.retain(|turn| turn.message_event_id.as_deref() != Some(input_event_id));
             }
-            turns
+            drop_unanswered_user_turns(turns)
         }
         Err(error) => {
             let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
@@ -1102,6 +1103,25 @@ async fn scheduled_previous_turns(
             Vec::new()
         }
     }
+}
+
+/// Drop the user turns that a failed run left without a reply: a user turn
+/// directly followed by another user turn, and a user turn at the end (the live
+/// request follows it). Assistant turns, the handoff included, are kept.
+fn drop_unanswered_user_turns(turns: Vec<crate::memory::ConversationTurn>) -> Vec<crate::memory::ConversationTurn> {
+    let mut kept = Vec::with_capacity(turns.len());
+    let mut turns = turns.into_iter().peekable();
+    while let Some(turn) = turns.next() {
+        let followed_by_user = turns.peek().is_some_and(|next| next.role == "user");
+        if turn.role == "user" && followed_by_user {
+            continue;
+        }
+        kept.push(turn);
+    }
+    if kept.last().is_some_and(|turn| turn.role == "user") {
+        kept.pop();
+    }
+    kept
 }
 
 // This invocation state preserves all captures across the boxed work boundary.

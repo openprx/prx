@@ -137,13 +137,52 @@ impl ReplayLog {
             Ok(Vec::new())
         };
         match (tool_rows, message_rows) {
-            (Ok(tool_rows), Ok(message_rows)) => Self::from_rows(&tool_rows, &message_rows),
+            (Ok(mut tool_rows), Ok(message_rows)) => {
+                if with_messages {
+                    // Attachment rows share the tool window with the calls and results
+                    // of many runs, so the newest ones are read on their own.
+                    let extra = Self::attachment_rows_outside(mem, principal, &tool_rows).await;
+                    tool_rows.extend(extra);
+                }
+                Self::from_rows(&tool_rows, &message_rows)
+            }
             (Err(error), _) | (_, Err(error)) => {
                 tracing::warn!(
                     error = %crate::agent::diagnostics::error_class(&error),
                     "tool replay rows unavailable; history is replayed without them"
                 );
                 Self::default()
+            }
+        }
+    }
+
+    /// The newest attachment rows of the session that `tool_rows` does not hold.
+    /// A backend without the read, or a failed read, adds none.
+    async fn attachment_rows_outside(
+        mem: &dyn crate::memory::Memory,
+        principal: &MemoryPrincipal,
+        tool_rows: &[MessageEvent],
+    ) -> Vec<MessageEvent> {
+        let Some(session_key) = principal.session_key.as_deref() else {
+            return Vec::new();
+        };
+        match mem
+            .newest_session_events_of_type(principal, session_key, ATTACHMENT_EVENT_TYPE, REPLAY_ROW_LIMIT)
+            .await
+        {
+            Ok(rows) => {
+                let held: HashSet<&str> = tool_rows.iter().map(|event| event.event_id.as_str()).collect();
+                rows.into_iter()
+                    .filter(|event| !held.contains(event.event_id.as_str()))
+                    .collect()
+            }
+            Err(error) if error.is::<crate::memory::erasure::Unsupported>() => Vec::new(),
+            Err(error) => {
+                tracing::warn!(
+                    error = %crate::agent::diagnostics::error_class(&error),
+                    "attachment replay rows unavailable; older attachments are replayed without their stored text"
+                );
+                Vec::new()
             }
         }
     }

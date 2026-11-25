@@ -832,6 +832,7 @@ async fn run_console_runtime_turn(
         mut history,
         history_event_ids,
         compaction: effective_compaction,
+        recalled_ids: _,
     } = crate::context::api::open::open_turn(crate::context::api::open::OpenInput {
         memory: &state.mem,
         envelope: &turn_envelope,

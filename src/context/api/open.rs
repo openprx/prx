@@ -60,6 +60,8 @@ pub(crate) struct TurnOpening {
     pub(crate) history_event_ids: Vec<Option<String>>,
     /// The compaction config the turn runs with.
     pub(crate) compaction: AgentCompactionConfig,
+    /// The memory ids the recall of the turn read, for the usefulness counts.
+    pub(crate) recalled_ids: Vec<String>,
 }
 
 /// Open a turn: recall, store the attachment row, replay the earlier turns,
@@ -156,5 +158,6 @@ pub(crate) async fn open_turn(input: OpenInput<'_>) -> TurnOpening {
         history,
         history_event_ids,
         compaction: effective_compaction.config,
+        recalled_ids: mem_context.ids,
     }
 }
