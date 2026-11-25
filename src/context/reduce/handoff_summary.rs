@@ -302,16 +302,18 @@ fn bound_chars(text: &str, budget: usize) -> String {
 /// control characters other than newline and tab removed, the text trimmed and
 /// bounded to [`HANDOFF_SUMMARY_MAX_BYTES`] bytes including the cut marker.
 fn clean_summary(raw: &str) -> String {
-    let stripped = strip_assistant_fabricated_tool_markers(raw);
+    // Control characters go first: removed later, they could rejoin a marker or
+    // a secret that the steps below had looked past.
+    let printable: String = raw
+        .chars()
+        .filter(|character| !character.is_control() || *character == '\n' || *character == '\t')
+        .collect();
+    let stripped = strip_assistant_fabricated_tool_markers(&printable);
     let stripped = strip_model_written_tool_evidence(&stripped);
     let mut text = redact_secrets(&stripped);
     for marker in FORBIDDEN_MARKERS {
         text = text.replace(marker, MARKER_REPLACEMENT);
     }
-    let text: String = text
-        .chars()
-        .filter(|character| !character.is_control() || *character == '\n' || *character == '\t')
-        .collect();
     let text = text.trim();
     if text.len() <= HANDOFF_SUMMARY_MAX_BYTES {
         return text.to_string();
