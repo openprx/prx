@@ -1,6 +1,6 @@
 use super::{
     HistoryEntry, MAX_SUBPROCESS_OUTPUT, OwnedProcessGroup, OwnedProcessPhase, ProcessRunControl, ProcessWorkerOutcome,
-    WorkerSteerPipe, hold_unresolved_child_ownership, process_terminal, relinquish_process_group_after_leader_exit,
+    WorkerLog, WorkerSteerPipe, hold_unresolved_child_ownership, process_terminal, relinquish_process_group_after_leader_exit,
     run_owned_child_phase, steering_instruction, terminate_owned_child,
 };
 #[cfg(test)]
@@ -118,6 +118,7 @@ pub(super) async fn drain_worker_stream<R>(
     stream: R,
     pipe: &'static str,
     progress: Option<Arc<crate::agent::idle::ProgressBeat>>,
+    mut log: Option<WorkerLog>,
 ) -> anyhow::Result<Vec<u8>>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -137,9 +138,17 @@ where
             beat.record(crate::agent::idle::ProgressKind::ChannelOutput);
         }
         match chunk.get(..read) {
-            Some(bytes) => buffer.extend_from_slice(bytes),
+            Some(bytes) => {
+                buffer.extend_from_slice(bytes);
+                if let Some(log) = log.as_mut() {
+                    log.push(bytes).await;
+                }
+            }
             None => anyhow::bail!("session-worker {pipe} read reported more bytes than the buffer holds"),
         }
+    }
+    if let Some(log) = log.as_mut() {
+        log.finish().await;
     }
     if total >= MAX_SUBPROCESS_OUTPUT {
         tracing::warn!(
@@ -159,6 +168,7 @@ pub(super) async fn run_spawned_child_lifecycle(
     process_control: &ProcessRunControl,
     steer: Option<WorkerSteerPipe>,
     progress: Option<Arc<crate::agent::idle::ProgressBeat>>,
+    stderr_log: Option<WorkerLog>,
     #[cfg(test)] panic_before_wait: bool,
     #[cfg(test)] protocol: Option<&TestWorkerProtocolControl>,
 ) -> anyhow::Result<OwnedProcessPhase> {
@@ -252,6 +262,7 @@ pub(super) async fn run_spawned_child_lifecycle(
         stderr_stream,
         "stderr",
         progress.as_ref().map(Arc::clone),
+        stderr_log,
     ));
 
     #[cfg(test)]

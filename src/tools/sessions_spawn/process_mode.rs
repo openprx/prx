@@ -5,7 +5,7 @@ use super::{
     build_session_worker_cli_args, build_session_worker_manifest, cleanup_owned_child_after_panic,
     cleanup_process_worker_workspace, copy_dir_recursive, describe_worker_exit, normalize_process_memory_strategy,
     private_worker_memory_db_path, process_terminal, recover_operator_interruption, recover_ordinary_interruption,
-    run_spawned_child_lifecycle, shared_worker_memory_db_path, start_kill_and_reap_direct_child,
+    run_spawned_child_lifecycle, shared_worker_memory_db_path, start_kill_and_reap_direct_child, WorkerLog,
 };
 #[cfg(test)]
 use super::{TestWorkerExecutable, test_worker_cleanup_error_class, test_worker_process_identity};
@@ -378,6 +378,19 @@ pub(super) async fn run_sub_agent_process(
         control.claim()?;
         control.check_serialized_precondition(&payload)?;
     }
+    // The worker's stderr (its tracing output and anything it prints when it
+    // dies at start) is kept in a private per-run file under the state
+    // directory. A log that cannot be created never stops the worker.
+    let worker_log = match WorkerLog::create(&manifest.config_dir, run_id) {
+        Ok(log) => {
+            tracing::info!(run_id, worker_log = %log.path().display(), "process worker log");
+            Some(log)
+        }
+        Err(error) => {
+            tracing::warn!(run_id, error = %crate::agent::diagnostics::error_class(&error), "process worker log unavailable");
+            None
+        }
+    };
     let mut child = command
         .spawn()
         .with_context(|| {
@@ -540,6 +553,7 @@ pub(super) async fn run_sub_agent_process(
                 run_id: run_id.to_string(),
             }),
             Some(progress),
+            worker_log,
             #[cfg(test)]
             false,
             #[cfg(test)]

@@ -99,9 +99,11 @@ fn scrub_capability_env() {
     //
     // * `async_main` dispatches to `Commands::SessionWorker` (`src/main.rs`)
     //   having done nothing but install the rustls provider and parse the CLI:
-    //   no `tokio::spawn`, no `spawn_blocking`, no tracing subscriber. The
-    //   runtime's worker threads therefore hold no work at all and sit in the
-    //   scheduler park loop, which reads no environment.
+    //   no `tokio::spawn`, no `spawn_blocking`. The runtime's worker threads
+    //   therefore hold no work at all and sit in the scheduler park loop, which
+    //   reads no environment. `run_from_stdin` then installs the worker's
+    //   tracing subscriber inline on this same task: it starts no thread and
+    //   its one environment read (`RUST_LOG`) happens here, before the scrub.
     // * `run_from_stdin` reads and validates the manifest inline on this task.
     //   The one environment read on that stretch — the capability and its
     //   expiry — happens on this same thread, before this call.
@@ -150,6 +152,24 @@ fn parse_worker_manifest_line(raw: &str) -> Result<WorkerManifest> {
     }
 }
 
+/// Send the worker's tracing to stderr. Stdout is the IPC channel and must stay
+/// clean; the parent reads stderr, redacts it and keeps it in the run's worker
+/// log (`sessions_spawn::worker_log`). Before this, the worker installed no
+/// subscriber at all and every event was dropped.
+fn install_worker_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let subscriber = tracing_subscriber::fmt::Subscriber::builder()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .finish();
+    // A subscriber installed earlier (an embedding test harness) stays: the
+    // worker has no other sink to report this to, and running unlogged is
+    // exactly the state this function replaces.
+    let _ = tracing::subscriber::set_global_default(subscriber);
+}
+
 pub async fn run_from_stdin(
     task: Option<String>,
     workspace: Option<String>,
@@ -157,6 +177,7 @@ pub async fn run_from_stdin(
     tools: Option<String>,
     explicit_config_dir: Option<String>,
 ) -> Result<()> {
+    install_worker_tracing();
     let mut raw = String::new();
     std::io::stdin()
         .read_line(&mut raw)
@@ -165,6 +186,7 @@ pub async fn run_from_stdin(
     let manifest: WorkerManifest = match parse_worker_manifest_line(raw.trim()) {
         Ok(value) => value,
         Err(error) => {
+            tracing::error!(error = %crate::agent::diagnostics::error_class(&error), "session worker refused its manifest");
             let result = WorkerResult {
                 denials: Vec::new(),
                 ordinary_completion: None,
@@ -193,6 +215,7 @@ pub async fn run_from_stdin(
         parsed_tools.as_deref(),
         explicit_config_dir.as_deref(),
     ) {
+        tracing::error!(error = %crate::agent::diagnostics::error_class(&error), "session worker refused its overrides");
         let result = WorkerResult {
             denials: Vec::new(),
             ordinary_completion: None,
@@ -210,6 +233,7 @@ pub async fn run_from_stdin(
     let result = match run_manifest(manifest, true, explicit_config_dir.as_deref()).await {
         Ok(result) => result,
         Err(error) => {
+            tracing::error!(error = %crate::agent::diagnostics::error_class(&error), "session worker failed");
             if let Some(failure) = error.downcast_ref::<super::startup_failure::AuthenticatedStartupFailure>() {
                 return write_worker_result(failure.envelope());
             }

@@ -127,7 +127,7 @@ async fn worker_output_refreshes_the_run_beat_while_it_is_still_arriving() {
     let stdout = child.stdout.take().expect("worker stdout");
     let progress = crate::agent::idle::child_beat();
 
-    let bytes = drain_worker_stream(stdout, "stdout", Some(Arc::clone(&progress)))
+    let bytes = drain_worker_stream(stdout, "stdout", Some(Arc::clone(&progress)), None)
         .await
         .expect("drain succeeds");
 
@@ -184,6 +184,7 @@ async fn a_sigkilled_worker_is_classified_as_exited_without_result() {
         &control,
         None,
         Some(progress),
+        None,
         false,
         None,
     )

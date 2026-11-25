@@ -93,6 +93,7 @@ async fn owned_child_panic_cleanup_signals_once_and_reaps_before_return() {
         &control,
         None,
         None,
+        None,
         true,
         None,
     ))

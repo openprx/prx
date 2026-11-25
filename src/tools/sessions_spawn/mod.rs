@@ -51,6 +51,7 @@ mod test_worker;
 mod tool;
 mod tool_proxy;
 mod worker_capability;
+mod worker_log;
 mod worker_manifest;
 
 pub(crate) use self::actions::{STEER_CHANNEL_CAPACITY, steering_instruction};
@@ -129,6 +130,7 @@ pub(crate) use self::test_worker::{TestWorkerProtocolCase, TestWorkerProtocolCon
 use self::tool_proxy::AllowedToolProxy;
 pub(crate) use self::tool_proxy::{refresh_tools_for_explicit_allowlist, resolve_tools_for_agent};
 pub(crate) use self::worker_capability::{SESSION_WORKER_CAP_ENV, SESSION_WORKER_CAP_EXPIRY_ENV};
+use self::worker_log::WorkerLog;
 use self::worker_capability::{
     SESSION_WORKER_CAP_TTL_SECS, capability_now_unix, compute_worker_capability_with_key, manifest_signing_payload,
 };

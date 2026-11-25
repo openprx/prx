@@ -413,7 +413,7 @@ async fn a_join_survives_a_real_child_process_that_never_writes_anything() {
     let monitor_runs = Arc::clone(&active_runs);
     let monitor_beat = Arc::clone(&member_beat);
     tokio::spawn(async move {
-        let drained = drain_worker_stream(stdout, "stdout", Some(monitor_beat)).await;
+        let drained = drain_worker_stream(stdout, "stdout", Some(monitor_beat), None).await;
         let _ = child.wait().await;
         let mut runs = monitor_runs.write().await;
         if let Some(run) = runs.iter_mut().find(|run| run.id == "silent-child") {
