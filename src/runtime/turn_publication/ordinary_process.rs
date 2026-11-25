@@ -17,6 +17,7 @@ pub(super) fn ordinary_process_publication(
     build: PublicationInputs<'_>,
     runtime: PublicationLoopRuntime,
     chat_lineage: bool,
+    call_seed: Option<Arc<crate::session_worker::protocol::WorkerCallContext>>,
 ) -> anyhow::Result<Arc<TurnRuntimeService>> {
     authority.verify()?;
     let snapshots = authority.snapshots();
@@ -104,6 +105,7 @@ pub(super) fn ordinary_process_publication(
         execution: build.execution,
         memory: build.memory,
         security: build.security,
+        call_seed,
     });
     service.check_live_parity()?;
     Ok(service)

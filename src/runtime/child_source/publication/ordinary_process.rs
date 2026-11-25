@@ -3,7 +3,8 @@ use super::OrdinaryChildPublication;
 use crate::runtime::child_source::{ChildInputReceipt, ChildProviderBinding};
 use crate::runtime::turn_source::TurnSourceProof;
 use crate::session_worker::protocol::{
-    WorkerManifest, WorkerOrdinarySource, WorkerProviderSelection, WorkerRecordedInput,
+    WorkerCallContext, WorkerCallInputs, WorkerManifest, WorkerOrdinarySource, WorkerProviderSelection,
+    WorkerRecordedInput,
 };
 use std::sync::Arc;
 
@@ -85,6 +86,7 @@ impl OrdinaryProcessLaunch {
                 && worker.ordinary_source.is_none()
                 && worker.operator_source.is_none()
                 && worker.direct_tools.is_none()
+                && worker.call_context.is_none()
                 && worker.task == proof.routing_input()
                 && worker.config_generation == self.config_generation,
             "ordinary worker manifest differs from captured launch"
@@ -255,6 +257,22 @@ impl OrdinaryProcessLaunch {
         worker.route_source_provider = route.map(|_| selection.provider.clone());
         worker.route_credential = route.map(|_| resolved.credential().reference().clone());
         worker.direct_tools = publication.chat_lineage_direct_tools();
+        // The parent decides the worker's level, place, model and published
+        // surface once, here; the worker reads them from the sealed manifest.
+        worker.call_context = Some(WorkerCallContext::for_worker(&WorkerCallInputs {
+            owner_id: proof.owner_id(),
+            session_key: proof.session_key(),
+            agent_id: worker.agent_id.as_deref(),
+            level: child.authority.level,
+            workspace_root: &source.parent_constraints.workspace,
+            working_root: source.config_generation.working_root.as_deref(),
+            provider: resolved.provider_label(),
+            model: resolved.model(),
+            config: &publication.generation().effective,
+            allowed_tools: &worker.allowed_tools,
+            channel_excluded_tools: &worker.channel_excluded_tools,
+            direct_tools: worker.direct_tools.as_deref(),
+        }));
         worker.ordinary_source = Some(source);
         Ok(())
     }

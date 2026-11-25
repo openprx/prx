@@ -80,5 +80,6 @@ pub(super) fn fresh(
         execution: Arc::clone(&parent.execution),
         memory: Arc::clone(&parent.memory),
         security,
+        call_seed: None,
     }))
 }

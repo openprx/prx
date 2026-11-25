@@ -322,6 +322,7 @@ impl IndependentChildPublication {
             execution,
             memory: Arc::clone(&parent.memory),
             security,
+            call_seed: None,
         });
         service.resolve_agent_model(task.as_ref())?;
         task.verify()?;

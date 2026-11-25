@@ -549,6 +549,7 @@ impl OrdinaryChildPublication {
             execution,
             memory: Arc::clone(&parent.memory),
             security: Arc::clone(&security),
+            call_seed: None,
         }))
     }
 

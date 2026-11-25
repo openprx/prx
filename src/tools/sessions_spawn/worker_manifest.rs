@@ -184,6 +184,7 @@ pub(super) fn build_session_worker_manifest(
         session_addr: None,
         compaction_config: Some(compaction_config.clone()),
         approval_relay: false,
+        call_context: None,
     };
 
     if let Some(launch) = source_launch {

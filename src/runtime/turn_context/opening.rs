@@ -335,42 +335,64 @@ impl TurnRuntimeService {
             .agent_partition
             .as_ref()
             .map(|partition| partition.key.clone());
-        let agent_id = match &memory_partition {
-            Some(crate::memory::PartitionKey::Named { name, .. }) => Some(Arc::from(name.as_str())),
-            Some(crate::memory::PartitionKey::Main) | None => None,
+        // A process worker's owner, agent, authority, place and model come
+        // from the manifest its parent sealed (`call_seed`); nothing is
+        // derived from the worker's own configuration. Every other service
+        // computes them here from the same inputs the opening already used.
+        let seed = self.call_seed.as_deref();
+        let owner_id: Arc<str> = Arc::from(seed.map_or_else(|| proof.owner_id(), |seed| seed.owner_id.as_str()));
+        let session_key: Arc<str> =
+            Arc::from(seed.map_or_else(|| proof.session_key(), |seed| seed.session_key.as_str()));
+        let agent_id: Option<Arc<str>> = match (seed, &memory_partition) {
+            (Some(seed), _) => seed.agent_id.as_deref().map(Arc::from),
+            (None, Some(crate::memory::PartitionKey::Named { name, .. })) => Some(Arc::from(name.as_str())),
+            (None, Some(crate::memory::PartitionKey::Main) | None) => None,
         };
-        let reason = if proof.child_scope().is_some() {
-            LevelReason::ChildScope
-        } else {
-            LevelReason::ServicePolicy
-        };
-        let workspace_root = self.security.workspace_dir.clone();
-        let working_dir = crate::security::path_policy::effective_root(
-            self.generation.effective.runtime.workdir.as_deref(),
-            &self.security,
-        )
-        .to_path_buf();
+        let authority = seed.map_or_else(
+            || CallAuthority {
+                level: turn_level(&self.security, proof),
+                reason: if proof.child_scope().is_some() {
+                    LevelReason::ChildScope
+                } else {
+                    LevelReason::ServicePolicy
+                },
+            },
+            |seed| CallAuthority {
+                level: seed.level,
+                reason: seed.level_reason,
+            },
+        );
+        let place = seed.map_or_else(
+            || CallPlace {
+                workspace_root: self.security.workspace_dir.clone(),
+                working_dir: crate::security::path_policy::effective_root(
+                    self.generation.effective.runtime.workdir.as_deref(),
+                    &self.security,
+                )
+                .to_path_buf(),
+            },
+            |seed| CallPlace {
+                workspace_root: seed.workspace_root.clone(),
+                working_dir: seed.working_dir.clone(),
+            },
+        );
+        let provider: Arc<str> = Arc::from(seed.map_or_else(|| model.provider_label(), |seed| seed.provider.as_str()));
+        let model_id: Arc<str> = Arc::from(seed.map_or_else(|| model.model(), |seed| seed.model.as_str()));
         TurnCallContext {
             identity: CallIdentity {
-                owner_id: Arc::from(proof.owner_id()),
-                session_key: Arc::from(proof.session_key()),
+                owner_id,
+                session_key,
                 run_id: Arc::from(proof.run_id()),
                 agent_id,
                 surface: proof.surface(),
                 channel: Arc::from(proof.policy_channel()),
                 task_id: proof.task_id().map(Arc::from),
             },
-            authority: CallAuthority {
-                level: turn_level(&self.security, proof),
-                reason,
-            },
-            place: CallPlace {
-                workspace_root,
-                working_dir,
-            },
+            authority,
+            place,
             model: CallModel {
-                provider: Arc::from(model.provider_label()),
-                model: Arc::from(model.model()),
+                provider,
+                model: model_id,
                 window_tokens,
                 can_call_tools,
             },

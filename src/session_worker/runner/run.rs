@@ -121,38 +121,15 @@ struct PreparedWorkerResult {
     ordinary_completion: Option<Arc<crate::runtime::child_source::ordinary_process::OrdinaryProcessAuthority>>,
 }
 
-/// The worker's direct names: the sealed chat-lineage set when the parent
-/// filled one (D5), else `always_include` plus the publish-all member unless
-/// the operator defers tools. A name is still published only where this
-/// worker's registry serves it and no exclusion hides it.
-fn worker_direct_names(
-    manifest: &WorkerManifest,
-    tiering: &crate::config::ToolTieringConfig,
-) -> std::collections::BTreeSet<String> {
-    manifest.direct_tools.as_ref().map_or_else(
-        || {
-            let publish_all = tiering
-                .publishes_all_tools()
-                .then_some(crate::tools::capability::catalog::ALL_TOOLS_DIRECT);
-            tiering
-                .always_include
-                .iter()
-                .map(String::as_str)
-                .chain(publish_all)
-                .map(str::to_owned)
-                .collect()
-        },
-        |names| names.iter().cloned().collect(),
-    )
-}
-
-/// The level a worker runs at: the level sealed into its child scope or
-/// operator publication. It is not read from Main's level on disk. A level
-/// above Main's is accepted only when it is the level the named agent's
+/// The level a worker runs at: the level its parent put in the manifest call
+/// context. It is not derived from this process's configuration, and it must
+/// equal the level sealed into the child scope or operator publication. A
+/// level above Main's is accepted only when it is the level the named agent's
 /// configuration derives.
-fn worker_sealed_level(
+fn worker_call_level(
     config: &Config,
     manifest: &WorkerManifest,
+    call: &crate::session_worker::protocol::WorkerCallContext,
     ordinary: Option<&crate::runtime::child_source::ordinary_process::OrdinaryProcessSnapshots>,
     operator: Option<&crate::runtime::operator_spawn::process::OperatorProcessSnapshots>,
 ) -> Result<crate::security::AutonomyLevel> {
@@ -177,26 +154,11 @@ fn worker_sealed_level(
         level <= config.autonomy.level || named == Some(level),
         "session-worker sealed level exceeds its configuration"
     );
-    Ok(level)
-}
-
-/// The names a worker's surface hides: the configured and inherited
-/// exclusions below Full, none at Full.
-fn worker_excluded_names(
-    config: &Config,
-    manifest: &WorkerManifest,
-    level: crate::security::AutonomyLevel,
-) -> std::collections::BTreeSet<String> {
-    if level == crate::security::AutonomyLevel::Full {
-        return std::collections::BTreeSet::new();
-    }
-    config
-        .tool_tiering
-        .always_exclude
-        .iter()
-        .chain(&manifest.channel_excluded_tools)
-        .cloned()
-        .collect()
+    anyhow::ensure!(
+        call.level == level,
+        "session-worker call context level differs from its sealed scope"
+    );
+    Ok(call.level)
 }
 
 fn worker_source_workspace(manifest: &WorkerManifest) -> Result<&str> {
@@ -367,6 +329,9 @@ async fn run_owned_manifest(
     if manifest.ordinary_source.is_some() == manifest.operator_source.is_some() {
         return Err(crate::session_worker::protocol::WorkerManifestUnsupported.into());
     }
+    // Everything the parent decided (owner, level, place, model, published
+    // surface) comes from this sealed call context, not from our configuration.
+    let call = Arc::new(crate::session_worker::protocol::require_call_context(&manifest)?.clone());
     let explicit_config_dir = explicit_config_dir
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -419,7 +384,11 @@ async fn run_owned_manifest(
         crate::config::generation::process_paths_match(&config.workspace_dir, Path::new(source_workspace))?,
         "session-worker parent workspace differs from configuration"
     );
-    config.workspace_dir = PathBuf::from(source_workspace);
+    anyhow::ensure!(
+        call.workspace_root == Path::new(source_workspace),
+        "session-worker call context workspace differs from its sealed source"
+    );
+    config.workspace_dir = call.workspace_root.clone();
     // All three sources are covered by the worker transport signature. The
     // effective-config seal below additionally authenticates this override.
     let binding = manifest
@@ -437,11 +406,16 @@ async fn run_owned_manifest(
     // Tool and policy root: the authenticated parent workspace. The worker's
     // private `manifest.workspace_dir` only holds the worker's own state (sealed
     // snapshot, isolated database, identity copy, cleanup target).
-    let parent_workspace = PathBuf::from(source_workspace);
-    let tool_working_root = binding
-        .working_root
-        .clone()
-        .unwrap_or_else(|| parent_workspace.clone());
+    let parent_workspace = call.workspace_root.clone();
+    let tool_working_root = call.working_dir.clone();
+    anyhow::ensure!(
+        binding
+            .working_root
+            .as_deref()
+            .unwrap_or(&parent_workspace)
+            == tool_working_root,
+        "session-worker call context working directory differs from its sealed configuration binding"
+    );
     let working_root_sealed: bool = binding.working_root.is_some();
     tracing::info!(
         tool_root = "parent_workspace",
@@ -487,9 +461,10 @@ async fn run_owned_manifest(
         })
         .transpose()?;
     config.workspace_dir = manifest.workspace_dir.clone();
-    let level = worker_sealed_level(
+    let level = worker_call_level(
         &config,
         &manifest,
+        &call,
         ordinary_snapshots.as_ref(),
         operator_snapshots.as_ref(),
     )?;
@@ -784,7 +759,6 @@ async fn run_owned_manifest(
     let tools_registry = select_tools_for_manifest(full_tools, &manifest).await?;
     let _ = spawn_tools_handle.set(&tools_registry);
     let child_service = if let Some(authority) = &ordinary_authority {
-        let excluded_names = worker_excluded_names(&config, &manifest, level);
         Some(
             crate::runtime::turn_publication::OrdinaryProcessPublication {
                 authority: Arc::clone(authority),
@@ -795,24 +769,14 @@ async fn run_owned_manifest(
                     observer: Arc::new(NoopObserver),
                 },
                 chat_lineage: manifest.direct_tools.is_some(),
-                surface_policy: crate::tools::capability::catalog::SurfacePolicy {
-                    allowed_tools: if manifest.allowed_tools.is_empty()
-                        || manifest.allowed_tools.iter().any(|name| name == "*")
-                    {
-                        None
-                    } else {
-                        Some(manifest.allowed_tools.iter().cloned().collect())
-                    },
-                    excluded_names,
-                    direct_names: worker_direct_names(&manifest, &config.tool_tiering),
-                    channel_allowed: false,
-                },
+                // The surface the parent published for this worker, as sealed.
+                surface_policy: call.surface_policy(),
+                call: Some(Arc::clone(&call)),
             }
             .publish()
             .await?,
         )
     } else if let Some(authority) = &operator_authority {
-        let excluded_names = worker_excluded_names(&config, &manifest, level);
         Some(
             crate::runtime::turn_publication::OperatorProcessPublication {
                 authority: Arc::clone(authority),
@@ -823,18 +787,9 @@ async fn run_owned_manifest(
                     observer: Arc::new(NoopObserver),
                 },
                 chat_lineage: manifest.direct_tools.is_some(),
-                surface_policy: crate::tools::capability::catalog::SurfacePolicy {
-                    allowed_tools: if manifest.allowed_tools.is_empty()
-                        || manifest.allowed_tools.iter().any(|name| name == "*")
-                    {
-                        None
-                    } else {
-                        Some(manifest.allowed_tools.iter().cloned().collect())
-                    },
-                    excluded_names,
-                    direct_names: worker_direct_names(&manifest, &config.tool_tiering),
-                    channel_allowed: false,
-                },
+                // The surface the parent published for this worker, as sealed.
+                surface_policy: call.surface_policy(),
+                call: Some(Arc::clone(&call)),
             }
             .publish()
             .await?,

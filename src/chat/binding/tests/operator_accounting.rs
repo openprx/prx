@@ -404,6 +404,7 @@ async fn restore_operator_process(
         session_addr: None,
         compaction_config: None,
         approval_relay: false,
+        call_context: None,
     };
     // This exercises the real process-launch binding producer. The fixture
     // does not claim outer worker-channel authentication or an OS spawn.
@@ -452,6 +453,7 @@ async fn process_segment(
         runtime: runtime_security.0,
         chat_lineage: false,
         surface_policy: crate::tools::capability::catalog::SurfacePolicy::default(),
+        call: None,
     }
     .publish()
     .await?;

@@ -1,3 +1,7 @@
+mod call_context;
+pub use call_context::{
+    WORKER_CALL_CONTEXT_VERSION, WorkerCallContext, WorkerCallInputs, WorkerPublishedSurface, require_call_context,
+};
 mod operator_completion;
 pub use operator_completion::OperatorWorkerCompletionEvidence;
 mod ordinary_completion;
@@ -244,6 +248,12 @@ pub struct WorkerManifest {
     /// relay built.
     #[serde(default)]
     pub approval_relay: bool,
+    /// The parent-decided call context: identity, level, place, model and the
+    /// published surface. Sealed by the manifest HMAC like every field; the
+    /// worker builds its calls from it and requires it (a manifest without it
+    /// fails with a protocol-version error).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_context: Option<WorkerCallContext>,
 }
 
 impl WorkerManifest {
@@ -489,6 +499,7 @@ mod tests {
             session_addr: None,
             compaction_config: Some(crate::config::AgentCompactionConfig::default()),
             approval_relay: false,
+            call_context: None,
         };
 
         let json = serde_json::to_string(&manifest).expect("serialize manifest");
@@ -673,6 +684,7 @@ mod tests {
             session_addr: None,
             compaction_config: None,
             approval_relay: false,
+            call_context: None,
         };
         let trigger = uuid::Uuid::from_u128(42);
         let provenance = crate::messaging::InheritedProvenance {

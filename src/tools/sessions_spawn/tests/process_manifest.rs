@@ -200,6 +200,7 @@ fn process_mode_task_arg_is_not_json_encoded() {
         session_addr: None,
         compaction_config: None,
         approval_relay: false,
+        call_context: None,
     };
 
     let args = build_session_worker_cli_args(&manifest).unwrap();

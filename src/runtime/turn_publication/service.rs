@@ -61,6 +61,10 @@ pub(crate) struct TurnRuntimeService {
     pub(in crate::runtime) execution: Arc<ToolExecutionService>,
     pub(in crate::runtime) memory: Arc<dyn Memory>,
     pub(in crate::runtime) security: Arc<SecurityPolicy>,
+    /// The parent-decided call context of a process worker's service. Its
+    /// turns build their call context from it instead of from this
+    /// process's configuration; `None` everywhere else.
+    pub(in crate::runtime) call_seed: Option<Arc<crate::session_worker::protocol::WorkerCallContext>>,
 }
 
 impl TurnRuntimeService {

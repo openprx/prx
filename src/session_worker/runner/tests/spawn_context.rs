@@ -59,6 +59,7 @@ async fn process_mode_restores_spawn_context_for_nested_runs() {
         session_addr: None,
         compaction_config: None,
         approval_relay: false,
+        call_context: None,
     };
 
     let snapshot = with_manifest_spawn_context(&manifest, None, async {
@@ -143,6 +144,7 @@ fn worker_event_scope_preserves_spawn_lineage_and_owner_isolation() {
         session_addr: None,
         compaction_config: None,
         approval_relay: false,
+        call_context: None,
     };
 
     let scope = worker_message_event_scope(&manifest);

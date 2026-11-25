@@ -101,6 +101,7 @@ async fn hybrid_worker_shared_context_reads_parent_fabric() {
         session_addr: None,
         compaction_config: None,
         approval_relay: false,
+        call_context: None,
     };
     let context = load_worker_shared_context(&manifest, &Config::default(), &shared_memory).await;
 
@@ -223,6 +224,7 @@ async fn process_mode_worker_prompt_carries_no_other_owners_spawn_text() {
         session_addr: None,
         compaction_config: None,
         approval_relay: false,
+        call_context: None,
     };
     let context = load_worker_shared_context(&manifest, &Config::default(), &shared_memory).await;
 
@@ -320,6 +322,7 @@ async fn hybrid_worker_result_creates_private_draft_and_parent_merge_request() {
         session_addr: None,
         compaction_config: None,
         approval_relay: false,
+        call_context: None,
     };
 
     record_hybrid_worker_draft_if_needed(
@@ -473,6 +476,7 @@ async fn hybrid_worker_draft_obeys_readonly_resource_gate() {
         session_addr: None,
         compaction_config: None,
         approval_relay: false,
+        call_context: None,
     };
     let readonly = SecurityPolicy {
         autonomy: crate::security::policy::AutonomyLevel::ReadOnly,

@@ -17,6 +17,11 @@ const MAX_REFERENCE_BYTES: usize = 3071;
 const SNAPSHOT: &str = "manifest.json";
 const CLAIM: &str = "claimed";
 const DOMAIN: &[u8] = b"prx-worker-manifest-reference-v1\0";
+/// Version of the worker protocol this reference opens. Version 2 added the
+/// parent-sealed call context to the manifest; a parent and a worker of
+/// different builds refuse each other here, with a version error, before any
+/// manifest byte is read.
+const REFERENCE_VERSION: u8 = 2;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -102,7 +107,7 @@ impl PreparedManifest {
             .context("worker snapshot directory name is not UTF-8")?
             .to_owned();
         let body = ReferenceBody {
-            version: 1,
+            version: REFERENCE_VERSION,
             directory: directory.path().to_path_buf(),
             nonce,
             run_id: manifest.run_id.clone(),
@@ -202,7 +207,12 @@ pub(crate) fn restore(
     let envelope: Envelope = serde_json::from_value(value)?;
     let reference = envelope.worker_manifest_reference;
     let body = &reference.body;
-    anyhow::ensure!(body.version == 1, "worker manifest reference version is unsupported");
+    anyhow::ensure!(
+        body.version == REFERENCE_VERSION,
+        "session-worker protocol version mismatch: manifest reference version {} (this build requires {REFERENCE_VERSION}); \
+         parent and worker must be the same build",
+        body.version
+    );
     hmac::verify(key, &signing_bytes(body)?, &reference.seal)
         .map_err(|_| anyhow::anyhow!("worker manifest reference signature is invalid"))?;
     // The existing process channel binds this reference to this launch. No

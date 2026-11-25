@@ -15,6 +15,7 @@ pub(super) async fn operator_process_publication(
     mut build: PublicationInputs<'_>,
     runtime: PublicationLoopRuntime,
     chat_lineage: bool,
+    call_seed: Option<Arc<crate::session_worker::protocol::WorkerCallContext>>,
 ) -> anyhow::Result<Arc<TurnRuntimeService>> {
     authority.verify()?;
     let snapshots = authority.snapshots();
@@ -144,6 +145,7 @@ pub(super) async fn operator_process_publication(
         execution: build.execution,
         memory: build.memory,
         security: build.security,
+        call_seed,
     });
     service.resolve_agent_model(&authority.source_proof()?)?;
     service.check_live_parity()?;

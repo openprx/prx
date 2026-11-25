@@ -66,5 +66,6 @@ pub(crate) fn base_manifest(workspace: &Path, capability: &str) -> WorkerManifes
         session_addr: None,
         compaction_config: None,
         approval_relay: false,
+        call_context: None,
     }
 }

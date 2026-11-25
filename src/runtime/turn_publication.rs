@@ -254,6 +254,8 @@ pub(crate) struct OrdinaryProcessPublication {
     pub(crate) security: Arc<crate::security::SecurityPolicy>,
     pub(crate) runtime: PublicationLoopRuntime,
     pub(crate) surface_policy: crate::tools::capability::catalog::SurfacePolicy,
+    /// The parent-decided call context the worker's turns are built from.
+    pub(crate) call: Option<Arc<crate::session_worker::protocol::WorkerCallContext>>,
 }
 
 impl OrdinaryProcessPublication {
@@ -295,6 +297,7 @@ impl OrdinaryProcessPublication {
             },
             self.runtime,
             self.chat_lineage,
+            self.call,
         )?;
         if let Err(error) = owner.retain_child_service(Arc::clone(&service)) {
             service
@@ -317,6 +320,8 @@ pub(crate) struct OperatorProcessPublication {
     pub(crate) security: Arc<crate::security::SecurityPolicy>,
     pub(crate) runtime: PublicationLoopRuntime,
     pub(crate) surface_policy: crate::tools::capability::catalog::SurfacePolicy,
+    /// The parent-decided call context the worker's turns are built from.
+    pub(crate) call: Option<Arc<crate::session_worker::protocol::WorkerCallContext>>,
 }
 
 impl OperatorProcessPublication {
@@ -358,6 +363,7 @@ impl OperatorProcessPublication {
             },
             self.runtime,
             self.chat_lineage,
+            self.call,
         )
         .await?;
         if let Err(error) = owner.retain_child_service(Arc::clone(&service)) {

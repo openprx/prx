@@ -228,6 +228,7 @@ impl OperatorProcessLaunch {
                 && worker.ordinary_source.is_none()
                 && worker.operator_source.is_none()
                 && worker.direct_tools.is_none()
+                && worker.call_context.is_none()
                 && worker.task == source.task.trim()
                 && Some(worker.run_id.as_str()) == self.scope.run_id.as_deref()
                 && worker.config_generation == self.config_generation
@@ -270,6 +271,16 @@ impl OperatorProcessLaunch {
                 })
             })
             .transpose()?;
+        let level = if source.is_message_continuation() {
+            source.security.autonomy
+        } else {
+            crate::security::agent_level::named_child_level(
+                &source.generation.effective,
+                self.scope.agent_id.as_deref(),
+                source.security.autonomy,
+            )
+            .unwrap_or(source.security.autonomy)
+        };
         let snapshots = source.publication.bind_process_snapshots(
             self.id,
             &key,
@@ -281,16 +292,7 @@ impl OperatorProcessLaunch {
             },
             self.scope.attempt_id.clone(),
             self.scope.lease_epoch,
-            if source.is_message_continuation() {
-                source.security.autonomy
-            } else {
-                crate::security::agent_level::named_child_level(
-                    &source.generation.effective,
-                    self.scope.agent_id.as_deref(),
-                    source.security.autonomy,
-                )
-                .unwrap_or(source.security.autonomy)
-            },
+            level,
         )?;
         source.publication.verify(
             &source.proof,
@@ -310,6 +312,24 @@ impl OperatorProcessLaunch {
             .as_ref()
             .map(|_| source.resolved.credential().reference().clone());
         worker.direct_tools = source.publication.chat_lineage_direct_tools();
+        // The parent decides the worker's level, place, model and published
+        // surface once, here; the worker reads them from the sealed manifest.
+        worker.call_context = Some(crate::session_worker::protocol::WorkerCallContext::for_worker(
+            &crate::session_worker::protocol::WorkerCallInputs {
+                owner_id: source.proof.owner_id(),
+                session_key: source.proof.session_key(),
+                agent_id: worker.agent_id.as_deref(),
+                level,
+                workspace_root: &snapshots.publication.workspace,
+                working_root: snapshots.config_generation.working_root.as_deref(),
+                provider: source.resolved.provider_label(),
+                model: source.resolved.model(),
+                config: &source.generation.effective,
+                allowed_tools: &worker.allowed_tools,
+                channel_excluded_tools: &worker.channel_excluded_tools,
+                direct_tools: worker.direct_tools.as_deref(),
+            },
+        ));
         worker.operator_source = Some(snapshots);
         Ok(())
     }

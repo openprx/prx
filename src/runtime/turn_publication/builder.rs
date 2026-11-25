@@ -135,6 +135,7 @@ pub(crate) async fn build_publication(
         execution: build.execution,
         memory: build.memory,
         security: build.security,
+        call_seed: None,
     }))
 }
 

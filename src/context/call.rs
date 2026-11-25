@@ -9,6 +9,11 @@
 //! the memory partition. The budget handle, the published surface and the
 //! control handles (audit sink, log sink, hook dispatcher) are not carried
 //! yet; no consumer reads them.
+//!
+//! A process worker does not decide any of these itself: the parent seals the
+//! parent-decided part into the worker manifest
+//! (`session_worker::protocol::WorkerCallContext`) and the worker's turn
+//! opening builds its call context from that seed.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -24,8 +29,9 @@ tokio::task_local! {
 }
 
 /// Why the call runs at its level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LevelReason {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LevelReason {
     /// A child turn runs at the level its sealed scope carries: its parent's
     /// level, or a named agent's own level.
     ChildScope,
