@@ -19,25 +19,26 @@ use tokio_util::sync::CancellationToken;
 #[cfg(test)]
 use crate::agent::compaction::is_tool_roundtrip_companion;
 use crate::agent::compaction::{
-    COMPACTION_KEEP_RECENT_MESSAGES, CompactionApply, CompactionBuild, apply_configurable_compaction_over_view,
-    build_configurable_compaction_patch_with_source_history, persist_context_switch_degradation,
+    COMPACTION_KEEP_RECENT_MESSAGES, CompactionBuild, build_configurable_compaction_patch_with_source_history,
+    persist_context_switch_degradation,
 };
 #[cfg(test)]
 use crate::agent::context_budget::budgeted_request_tool_tokens;
+#[cfg(test)]
+use crate::agent::context_budget::trim_history_token_aware;
 #[cfg(test)]
 use crate::agent::context_budget::{APPENDED_SECTION_FRAMING_TOKENS, TOKEN_HEURISTIC_BUDGET_MULTIPLIER};
 use crate::agent::context_budget::{
     PRE_TURN_FLUSH_THRESHOLD, RequestToolSurfaceCounts, budgeted_tokens, estimate_budgeted_request_tokens,
     estimate_history_tokens, estimate_history_tokens_with_source, estimate_request_tokens, plan_context_budget,
     reserve_request_tool_surface, token_source_label, trim_history_to_context_budget,
-    trim_history_to_context_budget_preserving_compaction_replacement_with_floor, trim_history_token_aware,
+    trim_history_to_context_budget_preserving_compaction_replacement_with_floor,
 };
 use crate::agent::context_paging::{
     context_mode_uses_os_paging, inject_recalled_context, plan_os_paging, recall_context_pages,
 };
 use crate::agent::context_preflight::{
-    RestoredRequestPosition, capture_current_turn_request, preflight_config, preflight_durable_compaction,
-    preflight_trim_projection, restore_current_turn_request,
+    RestoredRequestPosition, capture_current_turn_request, restore_current_turn_request,
 };
 use crate::agent::diagnostics::{redact_sensitive_json_keys, scrub_credentials, tool_parse_log_digest};
 #[cfg(test)]
@@ -54,16 +55,14 @@ use crate::agent::response_guard::{
 };
 use crate::agent::response_guard::{
     EMPTY_ASSISTANT_RESPONSE_RETRY_MESSAGE, TOOL_SUMMARY_ONLY_RESPONSE_MESSAGE, UNEXECUTED_TOOL_CLAIM_NOTICE,
-    append_corrective_aside,
-    contains_assistant_fabricated_tool_marker, is_empty_assistant_response, is_tool_summary_only_response,
-    strip_assistant_fabricated_tool_markers,
+    append_corrective_aside, contains_assistant_fabricated_tool_marker, is_empty_assistant_response,
+    is_tool_summary_only_response, strip_assistant_fabricated_tool_markers,
 };
 use crate::agent::sanitize::{known_tool_names, sanitize_stream_chunk};
 use crate::agent::stream_buffer::StreamBoundaryBuffer;
 use crate::agent::tool_call_parser::{
     looks_like_unparsed_tool_call_syntax, parse_structured_tool_calls, parse_tool_calls,
 };
-use crate::context::transcript::{RoundLog, call_id_for};
 use crate::agent::tool_evidence::{claims_tool_evidence, strip_model_written_tool_evidence};
 #[cfg(test)]
 use crate::agent::tool_result_recording::INTERRUPTED_TOOL_RESULT;
@@ -79,8 +78,16 @@ use crate::agent::turn_contracts::ChatMode;
 use crate::agent::turn_contracts::{
     ToolCallNotification, ToolLoopCancelled, ToolLoopEvent, ToolLoopOutcome, ToolLoopTrace, emit_tool_loop_event,
 };
-use crate::agent::turn_history::{CanonicalHistory, TurnHistory, same_messages};
+use crate::agent::turn_history::{TurnHistory, same_messages};
 use crate::agent::turn_request::{ToolLoopMemory, TurnDecision, TurnDelivery, TurnRequest, TurnSchedule, TurnServices};
+use crate::context::reduce::compact::{PreTurnCompact, RoundCompact};
+use crate::context::reduce::engine::{
+    AfterTools, PreTurn, Round, Services, history_before_change, report_durable_compaction,
+};
+use crate::context::reduce::ladder;
+use crate::context::reduce::preflight::PreflightCompaction;
+use crate::context::reduce::trim::{MidTurnTrim, RoundTrim};
+use crate::context::transcript::{RoundLog, call_id_for};
 #[cfg(test)]
 use crate::memory::{DocumentSearchResult, MemoryPrincipal};
 #[cfg(test)]
@@ -185,8 +192,9 @@ pub(crate) async fn run_turn(
     // moves through the scope's frames.
     // Type-erased so the auto-trait proof of every future that awaits a turn
     // stops here instead of walking the whole loop future again.
-    let inner: std::pin::Pin<Box<dyn std::future::Future<Output = Result<(ToolLoopOutcome, ToolLoopTrace)>> + Send + '_>> =
-        Box::pin(crate::hooks::identity_scope(
+    let inner: std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(ToolLoopOutcome, ToolLoopTrace)>> + Send + '_>,
+    > = Box::pin(crate::hooks::identity_scope(
         identity.clone().with_manager(hooks.clone()),
         crate::memory::write_provenance::scope_turn(
             provenance,
@@ -348,6 +356,16 @@ async fn rederive_provider_view(
     #[cfg(not(feature = "wasm-plugins"))]
     let _ = (hooks, channel_name);
     turn_history.reshape(history, |view| *view = projected);
+}
+
+/// [`rederive_provider_view`] as the function pointer the reduction steps hold.
+fn rederive_boxed<'x>(
+    turn_history: &'x mut TurnHistory,
+    history: &'x mut Vec<ChatMessage>,
+    hooks: &'x HookManager,
+    channel_name: &'x str,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'x>> {
+    Box::pin(rederive_provider_view(turn_history, history, hooks, channel_name))
 }
 
 /// The bytes an accepted turn delivers once outbound middleware has had its say.
@@ -607,7 +625,14 @@ async fn run_turn_unguarded(
         if plan_context_budget(history, config, config.os_paging.eviction_threshold).over_warning {
             let canonical = turn_history.canonical_mut(history);
             let before = history_before_change(&runtime_adapter, canonical);
-            match plan_os_paging(canonical.messages(), canonical.sources(), config, document_ingest.as_ref()).await {
+            match plan_os_paging(
+                canonical.messages(),
+                canonical.sources(),
+                config,
+                document_ingest.as_ref(),
+            )
+            .await
+            {
                 Ok(Some(eviction)) if canonical.apply_page_eviction(&eviction) => {
                     crate::agent::idle::beat(crate::agent::idle::ProgressKind::Compaction);
                     tracing::debug!("os-paging: pre-turn eviction applied");
@@ -632,49 +657,23 @@ async fn run_turn_unguarded(
     // P1-3: Proactive pre-turn memory flush — compact before starting the loop
     // if the context is already above 85% of the token budget, unless the
     // caller's own pre-turn rollover is current (`caller_rollover_current`).
-    if let Some(config) = compaction_config
-        && !turn_history.caller_rollover_current(history)
-    {
-        let budget = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
-        if budget.over_warning {
-            tracing::info!(
-                token_estimate = budget.used_tokens,
-                threshold = budget.warning_threshold_tokens,
-                "Pre-turn memory flush: context near limit, running pre-emptive compaction"
-            );
-            // Gated on the provider view, built from the canonical history.
-            let canonical = turn_history.canonical_mut(history);
-            let before = history_before_change(&runtime_adapter, canonical);
-            // Measured on the provider view the gate saw (the enriched
-            // request included), built from and applied to the canonical history.
-            match apply_configurable_compaction_over_view(
-                canonical,
-                history,
+    // The step is `PreTurnCompact` of the reduction ladder.
+    if let Some(config) = compaction_config {
+        let mut pre_turn = PreTurn {
+            history: &mut *history,
+            turn_history: &mut turn_history,
+            config,
+            services: Services {
                 provider,
                 model,
-                config,
-                document_ingest.as_ref(),
-                "pre_turn",
-            )
-            .await
-            {
-                Ok(CompactionApply::Applied(_)) => {
-                    report_durable_compaction(
-                        &runtime_adapter,
-                        before,
-                        turn_history.finish_durable_compaction(history),
-                        config,
-                    )
-                    .await?;
-                    rederive_provider_view(&mut turn_history, history, hooks, channel_name).await;
-                }
-                Ok(CompactionApply::NotNeeded | CompactionApply::Suppressed) => {}
-                Err(error) => {
-                    let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
-                    tracing::warn!(error_len, error_sha256, "Pre-turn compaction failed");
-                }
-            }
-        }
+                audit: document_ingest.as_ref(),
+                runtime_adapter: &runtime_adapter,
+                hooks,
+                channel_name,
+                rederive: rederive_boxed,
+            },
+        };
+        Box::pin(ladder(&[&PreTurnCompact], &mut pre_turn)).await?;
     }
 
     // One inbound middleware pass per user turn. Every TUI, CLI, gateway, and
@@ -913,47 +912,32 @@ async fn run_turn_unguarded(
         // entrypoints that pass no compaction config: there is no budget to
         // report there.
         let budgeted_totals: Option<(usize, usize)> = if let Some(config) = compaction_config {
-            // A summary or handoff applied here (typically after tool output
-            // grew the history mid-turn) is reported to the session authority
-            // like every durable in-turn compaction; a trim after it is this
-            // request's projection.
-            // The summary or handoff is built from the canonical history, so a
-            // trim that ran earlier in this turn cannot cost it any turn.
-            let reserved_config = preflight_config(config, tool_surface);
-            let mut compaction = preflight_durable_compaction(
-                history,
-                &mut turn_history,
-                provider,
-                model,
-                &reserved_config,
+            // The durable phase, then the projection phase: the two steps of
+            // the reduction ladder that run on every round.
+            let mut round = Round {
+                history: &mut *history,
+                turn_history: &mut turn_history,
+                config,
                 tool_surface,
-                document_ingest.as_ref(),
-                "pre_provider_call",
-            )
-            .await?;
-            if let Some(before) = compaction.source.take() {
-                report_durable_compaction(
-                    &runtime_adapter,
-                    Some(before),
-                    turn_history.finish_durable_compaction(history),
-                    config,
+                services: Services {
+                    provider,
+                    model,
+                    audit: document_ingest.as_ref(),
+                    runtime_adapter: &runtime_adapter,
+                    hooks,
+                    channel_name,
+                    rederive: rederive_boxed,
+                },
+                compaction: PreflightCompaction::default(),
+                budget: None,
+            };
+            Box::pin(ladder(&[&RoundCompact, &RoundTrim], &mut round)).await?;
+            round.budget.map(|budget| {
+                (
+                    budget.used_tokens,
+                    estimate_budgeted_request_tokens(budget.measurement(), tool_surface),
                 )
-                .await?;
-                rederive_provider_view(&mut turn_history, history, hooks, channel_name).await;
-            }
-            let budget = preflight_trim_projection(
-                history,
-                &mut turn_history,
-                &reserved_config,
-                &compaction,
-                document_ingest.as_ref(),
-                "pre_provider_call",
-            )
-            .await;
-            Some((
-                budget.used_tokens,
-                estimate_budgeted_request_tokens(budget.measurement(), tool_surface),
-            ))
+            })
         } else {
             None
         };
@@ -2408,24 +2392,12 @@ async fn run_turn_unguarded(
         // without the question it was asked. Captured inside the branch, so a
         // round that needs no trim still clones nothing.
         if let Some(reserved_config) = reserved_config.as_ref() {
-            let mid_turn_tokens = estimate_history_tokens(history);
-            let mid_turn_limit: usize = reserved_config
-                .max_context_tokens
-                .saturating_sub(reserved_config.reserve_tokens);
-            if mid_turn_tokens > mid_turn_limit {
-                tracing::warn!(mid_turn_tokens, mid_turn_limit, "Mid-turn token trim triggered");
-                // A projection: the canonical history keeps the trimmed turns.
-                turn_history.reshape(history, |view| {
-                    let current_request = capture_current_turn_request(view);
-                    trim_history_token_aware(view, mid_turn_limit);
-                    restore_current_turn_request(
-                        view,
-                        current_request,
-                        "mid_turn_trim",
-                        RestoredRequestPosition::AboveEverythingLeftStanding,
-                    );
-                });
-            }
+            let mut after_tools = AfterTools {
+                history: &mut *history,
+                turn_history: &mut turn_history,
+                reserved_config,
+            };
+            Box::pin(ladder(&[&MidTurnTrim], &mut after_tools)).await?;
         }
         if let Some(tool_name) = repeated_unrecoverable {
             anyhow::bail!(
@@ -2433,86 +2405,6 @@ async fn run_turn_unguarded(
             );
         }
     }
-}
-
-/// The loop's history before a step that may compact it durably, kept only
-/// while a session authority listens (`runtime_adapter.events`), so
-/// [`report_durable_compaction`] can describe the step to it.
-fn history_before_change(
-    runtime_adapter: &crate::agent::turn_contracts::ToolLoopRuntimeAdapter,
-    canonical: &CanonicalHistory,
-) -> Option<CanonicalHistory> {
-    runtime_adapter.events.as_ref().map(|_| canonical.clone())
-}
-
-/// Report one durable in-turn compaction (a handoff, a summary or an evicted
-/// page applied by the loop on its own: pre-turn, per-provider preflight,
-/// overflow recovery) to the session authority, in order with the turn's
-/// other events: one exact patch whose guarded range is the whole
-/// pre-compaction canonical history `before` and whose replacement is the
-/// compacted canonical history `compacted` (never the provider view, which may
-/// hold this turn's earlier trims).
-/// Lossy trims are not reported: they are the projection of one request, and
-/// the session keeps the turns a later handoff can still recover (the run loop
-/// rebuilds an inline view that diverged from the session after the turn).
-/// Nothing is sent when nobody listens or nothing changed.
-async fn report_durable_compaction(
-    runtime_adapter: &crate::agent::turn_contracts::ToolLoopRuntimeAdapter,
-    before: Option<CanonicalHistory>,
-    compacted: &CanonicalHistory,
-    config: &crate::config::AgentCompactionConfig,
-) -> Result<()> {
-    let Some(source_history) = before else {
-        return Ok(());
-    };
-    if source_history == *compacted {
-        return Ok(());
-    }
-    let skipped_system = |messages: &[ChatMessage]| usize::from(messages.first().is_some_and(|m| m.role == "system"));
-    crate::hooks::notify(
-        HookEvent::ReductionFinished,
-        serde_json::json!({
-            "step": "compaction",
-            "tokens_before": estimate_history_tokens(source_history.messages()),
-            "tokens_after": estimate_history_tokens(compacted.messages()),
-            "turns_before": source_history.len().saturating_sub(skipped_system(source_history.messages())),
-            "turns_after": compacted.messages().len().saturating_sub(skipped_system(compacted.messages())),
-        }),
-    );
-    if runtime_adapter.events.is_none() {
-        return Ok(());
-    }
-    let guard = source_history
-        .guard()
-        .ok_or_else(|| anyhow::anyhow!("invalid in-turn compaction range"))?;
-    let compacted_messages = compacted.messages();
-    let patch = crate::agent::turn_contracts::CompactionPatch {
-        replacement: compacted_messages.to_vec(),
-        append_after: Vec::new(),
-        guard,
-    };
-    let system_messages =
-        |messages: &[ChatMessage]| usize::from(messages.first().is_some_and(|message| message.role == "system"));
-    let used_context_tokens = plan_context_budget(compacted_messages, config, PRE_TURN_FLUSH_THRESHOLD).used_tokens;
-    emit_tool_loop_event(
-        runtime_adapter,
-        ToolLoopEvent::ContextCompactionPatch {
-            turns_before: source_history
-                .len()
-                .saturating_sub(system_messages(source_history.messages())),
-            tokens_before: estimate_history_tokens(source_history.messages()),
-            source_history,
-            compacted_history: Box::new(compacted.clone()),
-            patch,
-            config: config.clone(),
-            turns_after: compacted_messages
-                .len()
-                .saturating_sub(system_messages(compacted_messages)),
-            tokens_after: estimate_history_tokens(compacted_messages),
-            used_context_tokens,
-        },
-    )
-    .await
 }
 
 /// Logs a refused overflow compaction patch with lengths and range only.

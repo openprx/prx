@@ -586,7 +586,7 @@ pub trait ApprovalResolver: Send + Sync {
     async fn resolve(&self, request: &ApprovalRequest, channel: &str) -> ApprovalDecision;
 }
 
-pub(super) async fn emit_tool_loop_event(adapter: &ToolLoopRuntimeAdapter, event: ToolLoopEvent) -> Result<()> {
+pub(crate) async fn emit_tool_loop_event(adapter: &ToolLoopRuntimeAdapter, event: ToolLoopEvent) -> Result<()> {
     // Anything reaching a user-visible sink is progress by definition.
     crate::agent::idle::beat(crate::agent::idle::ProgressKind::ChannelOutput);
     if let Some(live) = &adapter.live_frames {

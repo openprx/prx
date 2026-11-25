@@ -13,7 +13,7 @@ pub(super) const TOKEN_HEURISTIC_BUDGET_MULTIPLIER: usize = 2;
 /// until the estimated token count drops below max_tokens. The newest validated
 /// context handoff is skipped while another message older than the newest one
 /// remains ([`ProtectedHandoff`]).
-pub(super) fn trim_history_token_aware(history: &mut Vec<ChatMessage>, max_tokens: usize) {
+pub(crate) fn trim_history_token_aware(history: &mut Vec<ChatMessage>, max_tokens: usize) {
     let start_of_non_system = history_non_system_start(history);
     let mut handoff = ProtectedHandoff::of(history);
     loop {
@@ -39,7 +39,7 @@ pub(crate) fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
 ///
 /// The character heuristic under-counts real tokenizers, so a heuristic
 /// measurement is scaled before it is compared against a context window.
-pub(super) const fn budgeted_tokens(measurement: TokenMeasurement) -> usize {
+pub(crate) const fn budgeted_tokens(measurement: TokenMeasurement) -> usize {
     match measurement.source {
         TokenMeasurementSource::Cl100kProxy => measurement.tokens,
         TokenMeasurementSource::Heuristic => measurement.tokens.saturating_mul(TOKEN_HEURISTIC_BUDGET_MULTIPLIER),
@@ -94,7 +94,7 @@ pub(crate) const fn budgeted_request_tool_tokens(
 /// Distinct from [`estimate_request_tokens`], which totals a request that has
 /// already been prepared: there the appended prompt sections are inside the
 /// message estimate and must not be added a second time.
-pub(super) const fn estimate_budgeted_request_tokens(
+pub(crate) const fn estimate_budgeted_request_tokens(
     messages: TokenMeasurement,
     tool_surface: crate::agent::turn_context::RequestToolMeasurement,
 ) -> usize {
@@ -167,7 +167,7 @@ impl RequestToolSurfaceCounts {
 }
 
 /// Stable label for the estimator a request measurement came from.
-pub(super) const fn token_source_label(source: TokenMeasurementSource) -> &'static str {
+pub(crate) const fn token_source_label(source: TokenMeasurementSource) -> &'static str {
     match source {
         TokenMeasurementSource::Cl100kProxy => "cl100k_proxy",
         TokenMeasurementSource::Heuristic => "heuristic",

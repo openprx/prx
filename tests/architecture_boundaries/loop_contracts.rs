@@ -64,7 +64,7 @@ pub(super) fn context_handoff_has_one_production_owner_and_exact_lookup_is_regis
             (!is_test_only_file(&source) && source.contains("[context_handoff]")).then_some(relative)
         })
         .collect::<Vec<_>>();
-    assert_eq!(owners, vec!["src/agent/compaction.rs"]);
+    assert_eq!(owners, vec!["src/context/reduce/handoff_note.rs"]);
 
     let tools = fs::read_to_string(repository_root().join("src/tools/mod.rs")).expect("read src/tools/mod.rs");
     assert!(tools.contains("TranscriptHistoryLookupTool::new(memory.clone())"));
@@ -417,7 +417,7 @@ fn without_feature_gated_test_items(text: &str) -> String {
 /// history, one entry per construction, with the reason.
 const USER_MESSAGE_CONSTRUCTION_SITES: &[&str] = &[
     // Loop-written notes: the reserved markers themselves, and the corrective aside.
-    "src/agent/compaction.rs::post_compaction_refresh_aside",
+    "src/context/reduce/patch.rs::post_compaction_refresh_aside",
     "src/agent/context_paging.rs::recall_context_pages",
     "src/agent/response_guard.rs::append_corrective_aside",
     "src/agent/tool_result_recording.rs::drop",
@@ -428,7 +428,7 @@ const USER_MESSAGE_CONSTRUCTION_SITES: &[&str] = &[
     "src/agent/dispatcher.rs::to_provider_messages",
     // Copies of messages already in a history (content truncated or normalised,
     // role kept): compaction and audit projections, multimodal normalisation.
-    "src/agent/compaction.rs::bounded_compaction_projection",
+    "src/context/reduce/summary.rs::bounded_compaction_projection",
     "src/chat/compaction.rs::bounded_legacy_chat_compaction_audit_source",
     "src/multimodal.rs::prepare_messages_for_provider",
     // One-shot provider calls that build no loop history.

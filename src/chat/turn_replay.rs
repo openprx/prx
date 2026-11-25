@@ -13,6 +13,8 @@
 use super::chat_events::chat_runtime_envelope;
 use super::dispatcher::{ChatDispatcher, TurnCompletionSignal};
 use super::session::ChatSession;
+use crate::context::reduce::ladder;
+use crate::context::reduce::stub_replayed::{ReplayedView, StubReplayed};
 use crate::context::transcript::{Attachment, Transcript, TurnReplay};
 use crate::memory::Memory;
 use crate::providers::ChatMessage;
@@ -115,7 +117,7 @@ pub(super) async fn attach_stored_replays(mem: &dyn Memory, workspace_id: &str, 
 /// Before a turn: replace the oldest replayed tool results held in `view` by a
 /// stub while `view` and `request` are over the warning threshold. The replayed
 /// rounds are those of `session`'s turns. Returns how many were stubbed.
-pub(super) fn stub_replayed_results(
+pub(super) async fn stub_replayed_results(
     view: &mut [ChatMessage],
     session: &ChatSession,
     request: &ChatMessage,
@@ -126,8 +128,18 @@ pub(super) fn stub_replayed_results(
         .iter()
         .filter_map(|turn| turn.tool_evidence.as_ref()?.replay.as_deref())
         .collect();
-    if replays.is_empty() {
-        return 0;
+    let mut state = ReplayedView {
+        view,
+        replays,
+        request,
+        config,
+    };
+    match Box::pin(ladder(&[&StubReplayed], &mut state)).await {
+        Ok(report) => report.removed_items(),
+        Err(error) => {
+            let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+            tracing::warn!(error_len, error_sha256, "clearing replayed tool results failed");
+            0
+        }
     }
-    crate::context::transcript::stub_replayed_results(view, &replays, request, config)
 }

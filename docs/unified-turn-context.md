@@ -279,6 +279,47 @@ The system prompt hash recorded per request (`system_prompt_sha256`) is
 computed over the assembled prompt together with the request-local tool
 capability text that `src/agent/turn_context.rs` appends to it each round.
 
+## The reduction ladder
+
+Every step that makes a request smaller is a `Reducer` in `src/context/reduce/`.
+A reducer declares a tier, says whether the request still needs it
+(`applies`), and reports what it removed (`apply`). The entry point `ladder`
+runs the reducers it is given cheapest tier first, keeps the caller's order
+inside a tier, runs only those that apply when their turn comes, and returns a
+`Report` of what ran. The state a reducer works on is the caller's own type, so
+each surface lists the reducers it runs.
+
+| Tier | Meaning | Reducers today |
+|---|---|---|
+| `Clear` | replace replayed tool results in the view by a stub; the log is untouched | `StubReplayed` |
+| `Handoff` | move old turns out of the window behind a handoff note or summary | `PreTurnCompact`, `RoundCompact` |
+| `Trim` | drop messages from this request's view; the last resort | `RoundTrim`, `MidTurnTrim` |
+
+Offloading an oversized tool result to a stored document happens once, when the
+result is recorded (`src/agent/tool_result_recording.rs`), and is not a step of
+the ladder.
+
+Files: `mod.rs` (trait, tiers, report, `ladder`), `stub_replayed.rs`,
+`compact.rs`, `trim.rs`, `engine.rs` (the loop's step states and the report of a
+durable compaction), `preflight.rs` (the durable and the projection phase of the
+provider preflight), and the former `agent::compaction` code split by
+responsibility: `summary.rs`, `handoff_note.rs`, `roundtrips.rs`,
+`provenance.rs`, `audit.rs`, `patch.rs`. `src/agent/compaction.rs` only
+re-exports them.
+
+Which surface runs which step, in order (the order is today's behaviour):
+
+| Surface | Before the loop | Each provider round | After a round's tool results |
+|---|---|---|---|
+| Console, rf, channels, scheduled runs, task and process children, `prx agent` | `PreTurnCompact` | `RoundCompact`, `RoundTrim` | `MidTurnTrim` |
+| Terminal chat, line mode | `StubReplayed`, then the chat preflight compaction (not yet a reducer) | as above, inside the engine | as above |
+| Terminal chat, full-screen | the dispatcher rollover and trim (not yet a reducer) | as above, inside the engine | as above |
+
+Steps that still run outside the ladder: the overflow retry (compaction, then a
+budget trim or an aggressive trim), the OS-paging eviction, the dispatcher
+rollover, the line-mode chat preflight compaction, the manual `/compact`, and
+the tool-surface deferral at turn opening (`src/runtime/turn_context/tool_fit.rs`).
+
 ## Ownership
 
 | Concern | Owner | Rule |
@@ -290,7 +331,7 @@ capability text that `src/agent/turn_context.rs` appends to it each round.
 | Tool schemas and availability | canonical tool registry/catalog | Do not maintain a parallel description array for model exposure |
 | Tool execution | `ToolExecutionService` plus the compiled exposure guard | Registered does not mean exposed |
 | Skill selection | skill catalog/RAG plus `skill_read` dependency check | Do not inject unusable skills |
-| Context rollover | `agent::compaction` handoff builder plus `message_events` | Cold history becomes an exact reference, never an invented summary |
+| Context rollover | `context::reduce` handoff builder (`handoff_note.rs`, `patch.rs`) plus `message_events` | Cold history becomes an exact reference, never an invented summary |
 | Transcript recovery | `transcript_history_lookup` | Resolve only referenced events inside the authenticated workspace/session |
 
 Providers may delegate textual rendering to the canonical renderer for direct

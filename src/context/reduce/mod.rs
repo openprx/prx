@@ -15,6 +15,18 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
+pub(crate) mod audit;
+pub(crate) mod compact;
+pub(crate) mod engine;
+pub(crate) mod handoff_note;
+pub(crate) mod patch;
+pub(crate) mod preflight;
+pub(crate) mod provenance;
+pub(crate) mod roundtrips;
+pub(crate) mod stub_replayed;
+pub(crate) mod summary;
+pub(crate) mod trim;
+
 /// How costly a step is for the cache and for the model's memory of the
 /// session. The ladder runs lower tiers first; the declaration order is the
 /// ordering (`Clear < Handoff < Trim`). Offloading a tool result to a stored document
@@ -29,17 +41,6 @@ pub(crate) enum Tier {
     Trim,
 }
 
-impl Tier {
-    /// The name a log line or an event carries.
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Clear => "clear",
-            Self::Handoff => "handoff",
-            Self::Trim => "trim",
-        }
-    }
-}
-
 /// Why a step ran, as a typed value (never free text).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Reason {
@@ -47,16 +48,6 @@ pub(crate) enum Reason {
     OverWarning,
     /// The request is over the hard limit of the window.
     OverHardLimit,
-}
-
-impl Reason {
-    /// The name a log line or an event carries.
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::OverWarning => "over_warning",
-            Self::OverHardLimit => "over_hard_limit",
-        }
-    }
 }
 
 /// What one step took out of the request. A figure a step does not measure is
@@ -98,9 +89,11 @@ impl Report {
         &self.ran
     }
 
-    /// Whether `reducer` ran.
-    pub(crate) fn did_run(&self, reducer: &str) -> bool {
-        self.ran.iter().any(|entry| entry.reducer == reducer)
+    /// The messages, results or pages the steps that ran took out, summed.
+    pub(crate) fn removed_items(&self) -> usize {
+        self.ran()
+            .iter()
+            .fold(0usize, |total, entry| total.saturating_add(entry.outcome.removed.items))
     }
 }
 

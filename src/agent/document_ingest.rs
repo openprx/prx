@@ -7,57 +7,57 @@ use uuid::Uuid;
 
 #[derive(Clone)]
 pub(crate) struct DocumentIngestRuntime {
-    pub(super) memory: Arc<dyn Memory>,
-    pub(super) workspace_id: String,
-    pub(super) owner_id: Option<String>,
+    pub(crate) memory: Arc<dyn Memory>,
+    pub(crate) workspace_id: String,
+    pub(crate) owner_id: Option<String>,
     /// Whether document reads for this turn must match `owner_id` exactly.
     ///
     /// Authenticated external entrypoints set this on their runtime envelope;
     /// retaining it here keeps ingest provenance and context-page recall on
     /// the same owner boundary as the rest of the turn.
-    pub(super) require_owner_match: bool,
-    pub(super) topic_id: Option<String>,
-    pub(super) task_id: Option<String>,
-    pub(super) source_message_event_id: Option<String>,
-    pub(super) session_key: Option<String>,
-    pub(super) legacy_session_key: Option<String>,
+    pub(crate) require_owner_match: bool,
+    pub(crate) topic_id: Option<String>,
+    pub(crate) task_id: Option<String>,
+    pub(crate) source_message_event_id: Option<String>,
+    pub(crate) session_key: Option<String>,
+    pub(crate) legacy_session_key: Option<String>,
     /// Agent partition of the turn this runtime serves (MA-01b3); `None` when
     /// the runtime is built from a scope that carries none.
-    pub(super) agent_partition: Option<crate::memory::AgentPartition>,
+    pub(crate) agent_partition: Option<crate::memory::AgentPartition>,
     /// Stable identity of the turn this runtime serves.
     ///
     /// The runtime is built once per turn, so the incoming message event id
     /// identifies it; entry points without one (agent runs, cron) mint a value
     /// here instead, which is per-turn for the same reason.
-    pub(super) turn_key: String,
+    pub(crate) turn_key: String,
     /// Set the first time this turn records a `context.compaction.degraded`
     /// event. The pre-provider budget check runs on every tool-loop iteration
     /// and the overflow retry adds four more call sites, so a session that
     /// stays degraded used to open one synchronous write transaction per
     /// iteration, forever.
-    pub(super) degradation_recorded: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) degradation_recorded: Arc<std::sync::atomic::AtomicBool>,
     /// Set once this admitted turn has spent its automatic `switch` budget: a
     /// switch succeeded or made no progress. The turn then fits its requests
     /// without another switch. Manual `/compact` is outside the budget and never
     /// reads it. Fresh for each admitted turn, shared by clones like
     /// `degradation_recorded`.
-    pub(super) automatic_switch_spent: Arc<std::sync::atomic::AtomicBool>,
-    pub(super) agent_id: Option<String>,
-    pub(super) persona_id: Option<String>,
-    pub(super) channel: Option<String>,
+    pub(crate) automatic_switch_spent: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) agent_id: Option<String>,
+    pub(crate) persona_id: Option<String>,
+    pub(crate) channel: Option<String>,
     /// Originating sender. Retained so OS-paging recall (FIX-P3-05) can rebuild
     /// the exact owner-scoped `MemoryPrincipal` used when pages were ingested.
-    pub(super) sender: Option<String>,
-    pub(super) config_generation_id: Option<u64>,
-    pub(super) config_source_revision: Option<String>,
-    pub(super) visibility: MemoryVisibility,
+    pub(crate) sender: Option<String>,
+    pub(crate) config_generation_id: Option<u64>,
+    pub(crate) config_source_revision: Option<String>,
+    pub(crate) visibility: MemoryVisibility,
     /// Set only for a child tool loop (`from_scope`). A child recalls only
     /// context pages its own logical task wrote; main turns are unrestricted.
-    pub(super) child_turn: bool,
+    pub(crate) child_turn: bool,
     /// Run provenance of the turn this runtime serves, taken from its
     /// envelope; `None` for a runtime built from a scope (a child loop, whose
     /// execution adapter carries its run).
-    pub(super) write_provenance: Option<crate::memory::write_provenance::WriteProvenance>,
+    pub(crate) write_provenance: Option<crate::memory::write_provenance::WriteProvenance>,
 }
 
 impl DocumentIngestRuntime {
@@ -205,7 +205,7 @@ impl DocumentIngestRuntime {
         Ok(Some(self.with_source_message_event_id(Some(newest.event_id))))
     }
 
-    pub(super) fn memory_principal(&self) -> MemoryPrincipal {
+    pub(crate) fn memory_principal(&self) -> MemoryPrincipal {
         MemoryPrincipal {
             workspace_id: self.workspace_id.clone(),
             agent_id: self.agent_id.clone(),
@@ -224,7 +224,7 @@ impl DocumentIngestRuntime {
 
 /// Approximate chunk size for large tool-output document references.
 /// 🟡 Behavior-limits Phase 1: raised 2048 -> 4096 (fewer chunks per big output).
-pub(super) const TOOL_OUTPUT_DOCUMENT_CHUNK_TOKENS: usize = 4_096;
+pub(crate) const TOOL_OUTPUT_DOCUMENT_CHUNK_TOKENS: usize = 4_096;
 
 pub(crate) fn tool_output_document_id(tool_name: &str, content: &str) -> (String, String) {
     let mut hasher = sha2::Sha256::new();
@@ -237,7 +237,7 @@ pub(crate) fn tool_output_document_id(tool_name: &str, content: &str) -> (String
     (format!("tool-output:{tool_name}:{short}"), sha256)
 }
 
-pub(super) async fn persist_tool_output_document(
+pub(crate) async fn persist_tool_output_document(
     runtime: Option<&DocumentIngestRuntime>,
     tool_name: &str,
     content: &str,
@@ -343,7 +343,7 @@ const UNTRUSTED_EXTERNAL_SOURCE_KIND: &str = "untrusted_external";
 /// ingest would *amplify* the prompt-injection surface it was meant to contain.
 /// Results whose `source_kind` is `None` (backends that cannot resolve it) or any
 /// other value are retained unchanged.
-pub(super) fn drop_untrusted_external_results(results: &mut Vec<DocumentSearchResult>) {
+pub(crate) fn drop_untrusted_external_results(results: &mut Vec<DocumentSearchResult>) {
     results.retain(|result| result.source_kind.as_deref() != Some(UNTRUSTED_EXTERNAL_SOURCE_KIND));
 }
 
@@ -358,7 +358,7 @@ pub(super) fn drop_untrusted_external_results(results: &mut Vec<DocumentSearchRe
 /// tamper-evident reference for the originally retrieved bytes. Backends without
 /// durable document ingest (NoneMemory / MarkdownMemory) skip silently; ingest
 /// failures are logged and never surfaced as a tool error (best-effort sink).
-pub(super) async fn persist_untrusted_external_copy(
+pub(crate) async fn persist_untrusted_external_copy(
     runtime: Option<&DocumentIngestRuntime>,
     tool_name: &str,
     content: &str,

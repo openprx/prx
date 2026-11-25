@@ -412,7 +412,8 @@
             &admitted_session.session,
             &history_user_message,
             &tool_surface_reserve.reserved_config(&effective_compaction.config),
-        );
+        )
+        .await;
         if stubbed_results > 0 {
             tracing::info!(stubbed_results, "oldest replayed tool results were replaced by stubs to fit the request");
             #[cfg(feature = "terminal-tui")]
