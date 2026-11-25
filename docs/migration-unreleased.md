@@ -263,3 +263,19 @@ or schema migration is needed.
 ## Models without a price run while no cost limit is set
 
 A model with no price is no longer refused when no cost limit is configured. PRX sets none by default, so a `custom:<url>` endpoint or any other model without a `[cost.prices]` entry now runs, its cost is not tracked (`unknown_pricing`), and `prx doctor`, `prx providers test` and the configuration plan report that as information instead of `G6 budget admission refuses unpriced model`. When `[cost] daily_limit_usd` or `monthly_limit_usd`, `[autonomy] max_cost_per_day_cents` or an agent's `limits.max_cost_per_day_cents` is set, the present refusal stays. To have the cost of an unpriced model counted, add `[cost.prices."<model>"]`. No configuration change is needed.
+
+## Deleting or forgetting a message also rewrites later attachments that quoted it
+
+The recall text a later turn attached to its user message could quote a
+message that was deleted afterwards, and the stored attachment still replayed
+it to the model. The attachment row (`message.attachment.recorded`) now records
+the ids it was built from (payload `schema_version` 2, additive field
+`sources` with `memories`, `events` and `documents`). A message or reply delete,
+and `forget_writes`, now rewrite, in the same transaction, the attachments of
+the session whose sources are gone: the recalled text is emptied (the row gets
+`"blanked": true`, the date line stays) and the message replays as plain
+input. Rows written before this change carry no `sources`; they are matched by
+the text of the deleted message (at least 12 characters, first 64 compared,
+same session only). Attachments that quote only a memory that still exists are
+not touched by a plain delete. No schema migration, no sync-stream change and
+no change to the session routes' JSON.

@@ -10,9 +10,11 @@
 //! [`Transcript::expand_turns`] until the loader reads the log itself.
 
 mod replay;
+mod sources;
 mod tool_rows;
 
 pub(crate) use replay::{Attachment, History, ReplayLog, TurnReplay, stub_replayed_results};
+pub(crate) use sources::AttachmentSources;
 pub(crate) use tool_rows::{RoundLog, append_attachment, call_id_for};
 
 use crate::memory::session_transcript::SessionTranscriptUnsupported;

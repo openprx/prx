@@ -18,6 +18,7 @@
 //! stored.
 
 use super::replay::Attachment;
+use super::sources::{ATTACHMENT_SCHEMA_VERSION, AttachmentSources};
 use crate::agent::tool_call_parser::ParsedToolCall;
 use crate::agent::tool_result_recording::{MAX_TOOL_RESULT_INLINE_CHARS, ObservedToolResult};
 use crate::memory::{MemoryFabric, MessageEventScope};
@@ -175,20 +176,23 @@ async fn append(
 }
 
 /// Append the attachment row of a user message: `prefix` and `tail` are the
-/// text put before and after it. Nothing is written when tool events are not
+/// text put before and after it and `sources` the ids that text was built from
+/// (see [`AttachmentSources`]). Nothing is written when tool events are not
 /// recorded; the message is then replayed plain, as before.
 pub(crate) async fn append_attachment(
     fabric: &MemoryFabric,
     scope: MessageEventScope,
     user_event_id: &str,
     attachment: &Attachment,
+    sources: &AttachmentSources,
 ) {
     let payload = serde_json::json!({
-        "schema_version": 1,
+        "schema_version": ATTACHMENT_SCHEMA_VERSION,
         "run_id": scope.run_id,
         "user_event_id": user_event_id,
         "prefix": attachment.prefix,
         "tail": attachment.tail,
+        "sources": sources,
     });
     if let Err(error) = fabric
         .record_tool_round_event(

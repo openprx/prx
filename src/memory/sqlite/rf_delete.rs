@@ -24,6 +24,7 @@
 //! job has ended.
 
 use super::SqliteMemory;
+use super::rf_attachments;
 use super::rf_forget::{self, ForgetState, Partition};
 use crate::memory::rf_messages::{RfDeletedAgent, RfForget, RfForgetCounts, RfMessageDelete, RfReplyDelete};
 use crate::runtime::sqlite_pool::begin_immediate;
@@ -215,6 +216,11 @@ pub(super) fn delete_message(conn: &Connection, request: &RfMessageDelete) -> an
             }
         }
     }
+    if request.forget_writes {
+        // A forget after a plain delete finds no row left to erase; the
+        // attachments that quoted the forgotten memories are still checked.
+        blank_attachments(&tx, &target, &[])?;
+    }
     refresh_preview(&tx, &request.session_key)?;
     mark_scrub(&tx, &now)?;
     tx.commit()?;
@@ -275,6 +281,7 @@ pub(super) fn delete_reply(
         // A replay answers the recorded counts; a first forget on an
         // already deleted run runs now (its log rows are still there).
         let forget = forget_attempt(&tx, &target, &attempt, false)?;
+        blank_attachments(&tx, &target, &[])?;
         if attempt.forget.recorded.is_none() {
             mark_scrub(&tx, &now)?;
         }
@@ -511,6 +518,7 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
         &attempt.input_event_id,
         &contents,
     )?;
+    let texts: Vec<String> = contents.iter().map(|text| (*text).to_owned()).collect();
     let mut ids = rows.into_iter().map(|row| row.event_id).collect::<Vec<_>>();
     let mut forgotten = tx.execute(
         "DELETE FROM memories WHERE source_event_id IN (SELECT value FROM json_each(?1))",
@@ -560,7 +568,24 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
         params![target.workspace_id, all, target.now],
     )?;
     erase_tool_output_documents(tx, &attempt.input_event_id, &output_documents)?;
+    // After the memories and events above are gone: a later attachment of the
+    // session that quoted any of them is rewritten (`rf_attachments`).
+    blank_attachments(tx, target, &texts.iter().map(String::as_str).collect::<Vec<_>>())?;
     tombstone_turns(tx, &ids, target.now)
+}
+
+/// Rewrite the later attachments of the session that quote deleted content;
+/// `deleted_texts` serve the text match of attachments without provenance.
+fn blank_attachments(tx: &Connection, target: &Target<'_>, deleted_texts: &[&str]) -> anyhow::Result<()> {
+    rf_attachments::blank_stale_attachments(
+        tx,
+        target.workspace_id,
+        target.owner_id,
+        target.session_key,
+        target.now,
+        deleted_texts,
+    )?;
+    Ok(())
 }
 
 /// The document kinds a run's tool outputs are stored as: the oversized

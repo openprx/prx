@@ -440,6 +440,29 @@ The deleted bytes leave PRX's store files (`brain.db` and its WAL) before the de
 Each deleted run (or `context` message) gets one content-free `turn.deleted`
 record for the sync stream (SYNC-1).
 
+**Later attachments.** The recall text of a later turn can quote a deleted
+message (or a memory or document made from it), and that text is stored in the
+later turn's attachment row and replayed to the model. A delete (and a forget)
+therefore also rewrites, in the same transaction, the attachment rows of the
+same session that still quote deleted content. A row written with provenance
+(its payload `sources`: the ids of the memories, session or shared events and
+documents its text was built from) is rewritten when any of them is gone: a
+quoted event is tombstoned, or a quoted memory or document no longer exists
+(deleted with the message, or forgotten by `forget_writes`). A memory that
+still exists is not a reason, so after a plain delete the attachments that
+quote only a surviving memory stay; those that quote the deleted message's own
+text are rewritten. A row written before provenance (no `sources`) is matched
+by text, within the session only: it is rewritten when its recalled text
+contains the first 64 characters (line breaks read as spaces) of a deleted
+user or assistant message of at least 12 characters. A rewritten row keeps its
+date line, gets an empty recalled text and the mark `"blanked":true`; the
+message then replays as plain input with its date line. The rewrite is
+content-only: no new sync-stream record, and the session routes' JSON does not
+change. Limits of the text match: a message shorter than 12 characters, a
+message whose recall line was clipped before the 64 characters, one that
+contained media markers or was masked by secret redaction, may not be found in
+an old row.
+
 **Running turns.** Deleting a message whose turn is still running cancels
 nothing: its input is a tombstone in the history at once, and its reply and
 working rows are tombstoned when the turn ends (PRX applies the delete as

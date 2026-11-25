@@ -847,6 +847,7 @@ async fn run_console_runtime_turn(
             turn_envelope.message_scope(),
             user_event_id,
             &attachment,
+            &mem_context.sources,
         )
         .await;
     }

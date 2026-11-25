@@ -158,6 +158,15 @@ warning threshold, the oldest replayed results become one-line stubs first.
 The rows are not on the sync stream, and `conversation_turns` is unchanged.
 Channels, scheduled turns and children are not covered yet.
 
+The attachment row records what its recall text was built from: payload
+`schema_version` 2 adds `sources` (`memories`, `events`, `documents`: the ids of
+the recalled memories, the session and shared events quoted in the context
+blocks, and the document chunks quoted as evidence). The lists may name more
+rows than the clipped text finally holds, never fewer. A delete or forget of
+any of those rows rewrites the attachment (empty recalled text, `blanked: true`,
+date line kept); version 1 rows have no `sources` and are matched by text. Replay
+reads `prefix` and `tail` only, so a blanked row replays as plain input.
+
 ## Replayed history in terminal chat
 
 `prx chat` (TUI and `--plain`) replays the same two things, carried on the

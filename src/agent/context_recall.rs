@@ -33,6 +33,9 @@ pub(crate) struct RecalledMemoryContext {
     pub(crate) ids: Vec<String>,
     pub(crate) semantic_range: std::ops::Range<usize>,
     pub(crate) summaries: Vec<String>,
+    /// The stored rows the preamble was built from (empty when the caller's
+    /// path does not track them).
+    pub(crate) sources: crate::context::transcript::AttachmentSources,
 }
 
 /// Read scope authored by the runtime, independent of decision admission.
@@ -177,6 +180,7 @@ pub(crate) async fn scoped_recall(
             ids: Vec::new(),
             semantic_range: 0..0,
             summaries: Vec::new(),
+            sources: Default::default(),
         };
     }
     // Retrieval uses the projected, bounded query; exclusions compare against
@@ -199,6 +203,13 @@ pub(crate) async fn scoped_recall(
     let semantic_end = semantic_start + bundle.semantic_memory_context.len();
     let mut preamble = bundle.preamble();
     let budget = budget.min(RECALL_CONTEXT_BUDGET);
+    // Every id the preamble was built from, kept even when the clip below
+    // drops the ones it cannot attribute: a delete may then blank more, never less.
+    let sources = crate::context::transcript::AttachmentSources {
+        memories: bundle.recalled_memory_ids.clone(),
+        events: bundle.source_events.clone(),
+        documents: bundle.source_documents.clone(),
+    };
     let mut ids = bundle.recalled_memory_ids;
     if preamble.len() > budget {
         preamble.truncate(preamble.floor_char_boundary(budget));
@@ -215,6 +226,7 @@ pub(crate) async fn scoped_recall(
         },
         ids,
         semantic_range,
+        sources,
     }
 }
 
@@ -224,6 +236,10 @@ pub(crate) struct AgentContextBundle {
     pub(crate) semantic_memory_context: String,
     pub(crate) document_context: String,
     pub(crate) recalled_memory_ids: Vec<String>,
+    /// Ids of the stored events the session and shared blocks quote.
+    source_events: Vec<String>,
+    /// Ids of the documents the evidence block quotes.
+    source_documents: Vec<String>,
     semantic_summaries: Vec<String>,
 }
 
@@ -353,6 +369,7 @@ async fn build_semantic_context(
                 ids,
                 semantic_range: 0..0,
                 summaries,
+                sources: Default::default(),
             };
         };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -372,6 +389,7 @@ async fn build_semantic_context(
                 ids,
                 semantic_range: 0..0,
                 summaries,
+                sources: Default::default(),
             };
         }
         let hits = match tokio::time::timeout_at(
@@ -456,6 +474,7 @@ async fn build_semantic_context(
         ids,
         semantic_range,
         summaries,
+        sources: Default::default(),
     }
 }
 
@@ -519,7 +538,14 @@ fn format_session_event_line(event: &MessageEvent) -> String {
     format!("- [{}:{}] {}\n", event.role, actor, content)
 }
 
+#[cfg(test)]
 fn build_shared_events_preamble(principal: &MemoryPrincipal, events: &[MessageEvent]) -> String {
+    build_shared_events_preamble_sourced(principal, events).0
+}
+
+/// The shared-events block and the ids of the events it quotes.
+fn build_shared_events_preamble_sourced(principal: &MemoryPrincipal, events: &[MessageEvent]) -> (String, Vec<String>) {
+    let mut quoted = Vec::new();
     // D4 review: classify "current session" by the full candidate key set
     // (canonical + legacy), not the single canonical `session_key`. Otherwise a
     // legacy-keyed current-session event is not recognized as belonging to the
@@ -551,11 +577,12 @@ fn build_shared_events_preamble(principal: &MemoryPrincipal, events: &[MessageEv
             break;
         }
         context.push_str(&line);
+        quoted.push(event.event_id.clone());
     }
     if !context.is_empty() {
         context.push('\n');
     }
-    context
+    (context, quoted)
 }
 
 /// The rows of the current session that `[Current session context]` may still
@@ -591,11 +618,22 @@ fn quotable_current_session_events<'a>(
 /// back to conversation turns). A session whose rows a handoff replaced
 /// yields `Some` even when nothing is left to quote, so the fallback never
 /// re-quotes what the handoff replaced.
+#[cfg(test)]
 fn build_current_session_events_preamble(
     principal: &MemoryPrincipal,
     events: &[MessageEvent],
     user_msg: &str,
 ) -> Option<String> {
+    build_current_session_events_preamble_sourced(principal, events, user_msg).map(|(context, _)| context)
+}
+
+/// [`build_current_session_events_preamble`] with the ids of the events quoted.
+fn build_current_session_events_preamble_sourced(
+    principal: &MemoryPrincipal,
+    events: &[MessageEvent],
+    user_msg: &str,
+) -> Option<(String, Vec<String>)> {
+    let mut quoted = Vec::new();
     // D4 review: an event belongs to the current session when its `session_key`
     // is any candidate key (canonical OR legacy), so legacy-keyed current-session
     // history is preserved in `[Current session context]` after a canonical
@@ -629,11 +667,12 @@ fn build_current_session_events_preamble(
             break;
         }
         context.push_str(&line);
+        quoted.push(event.event_id.clone());
     }
     if !context.is_empty() {
         context.push('\n');
     }
-    Some(context)
+    Some((context, quoted))
 }
 
 fn format_session_turn_line(turn: &ConversationTurn) -> String {
@@ -645,7 +684,15 @@ fn format_session_turn_line(turn: &ConversationTurn) -> String {
     format!("- [{}] {}\n", turn.role, content)
 }
 
+#[cfg(test)]
 fn build_current_session_preamble(turns: &[ConversationTurn], user_msg: &str) -> String {
+    build_current_session_preamble_sourced(turns, user_msg).0
+}
+
+/// The conversation-turn fallback block and the ids of the events its turns
+/// were projected from.
+fn build_current_session_preamble_sourced(turns: &[ConversationTurn], user_msg: &str) -> (String, Vec<String>) {
+    let mut quoted = Vec::new();
     let mut context = String::new();
     for turn in turns {
         if turn.role == "tool" || turn.role == "system" {
@@ -662,11 +709,12 @@ fn build_current_session_preamble(turns: &[ConversationTurn], user_msg: &str) ->
             break;
         }
         context.push_str(&line);
+        quoted.extend(turn.message_event_id.clone());
     }
     if !context.is_empty() {
         context.push('\n');
     }
-    context
+    (context, quoted)
 }
 
 fn format_document_result_line(result: &DocumentSearchResult) -> String {
@@ -943,14 +991,21 @@ async fn build_agent_context(
         &dropped_document_items,
     )
     .await;
-    let current_session_context = {
-        build_current_session_events_preamble(&principal, &current_session_events, live_input)
-            .unwrap_or_else(|| build_current_session_preamble(&current_session_turns, live_input))
-    };
+    let (current_session_context, mut source_events) =
+        build_current_session_events_preamble_sourced(&principal, &current_session_events, live_input)
+            .unwrap_or_else(|| build_current_session_preamble_sourced(&current_session_turns, live_input));
+    let (recent_shared_context, shared_event_ids) = build_shared_events_preamble_sourced(&principal, &shared_events);
+    source_events.extend(shared_event_ids);
+    let source_documents = selected_document_items
+        .iter()
+        .filter_map(|item| item.document_id.clone())
+        .collect();
 
     AgentContextBundle {
         current_session_context,
-        recent_shared_context: build_shared_events_preamble(&principal, &shared_events),
+        recent_shared_context,
+        source_events,
+        source_documents,
         semantic_memory_context: semantic.preamble,
         document_context,
         recalled_memory_ids: semantic.ids,
@@ -973,6 +1028,11 @@ pub(crate) async fn build_context_with_shared_events_and_scope(
     let semantic_range = semantic_start..semantic_start + bundle.semantic_memory_context.len();
     RecalledMemoryContext {
         preamble: bundle.preamble(),
+        sources: crate::context::transcript::AttachmentSources {
+            memories: bundle.recalled_memory_ids.clone(),
+            events: bundle.source_events.clone(),
+            documents: bundle.source_documents.clone(),
+        },
         ids: bundle.recalled_memory_ids,
         semantic_range,
         summaries: bundle.semantic_summaries,
