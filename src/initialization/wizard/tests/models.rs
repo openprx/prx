@@ -741,7 +741,7 @@ fn run_models_refresh_rejects_unsupported_provider() {
         ..Config::default()
     };
 
-    let err = run_models_refresh(&config, None, true).unwrap_err();
+    let err = run_models_refresh(&config, Some("imessage"), true).unwrap_err();
     assert!(err.to_string().contains("does not support live model discovery"));
 }
 

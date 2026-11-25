@@ -53,8 +53,8 @@ question for each row; the answer is "no" for all of them.
 | # | Flow | Trigger | Destination | What is sent | Default | Controlled by | Fresh install |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | 1 | Model providers (chat, streaming, tools) | A turn on a configured provider (`prx chat`, `prx go`, gateway, channels, cron, Xin, delegated children) | The provider's own API host from the provider catalog (for example `api.openai.com`, `api.anthropic.com`, `openrouter.ai`, `generativelanguage.googleapis.com`, `api.x.ai`), or the `api_url` / `custom:<url>` endpoint the operator set. `src/providers/mod.rs`, `src/providers/info.rs` | Prompt and credential. `User-Agent: prx/<version>`. OpenRouter and `custom:` OpenAI-compatible endpoints also send `HTTP-Referer` and `X-Title` (row 8). Gemini sends the key as a `?key=` query parameter; Anthropic as `x-api-key` and `anthropic-version`; others as `Authorization: Bearer` | Off until `default_provider` and a credential are set | `default_provider`, `api_url`, `[reliability] fallback_providers`, `[agents.<name>]`, `[[model_routes]]`, `[providers] app_identification` | No |
-| 2 | Model discovery: `prx models refresh` | The operator runs it | The named or default provider's model-list endpoint (`/models` on the provider host; local servers for `ollama`, `llamacpp`, `litellm`, `vllm`). `src/providers/model_discovery.rs` | Credential of that provider (configured key, stored profile, or its standard environment variable) where the provider needs one. `User-Agent: prx/<version>` | Does nothing, and says so, when no provider is configured and none is named | `--provider`, `default_provider` | No |
-| 3 | Model discovery: `prx doctor models` | The operator runs it | By default only the providers configured in this install (default provider, fallbacks, named agents, model routes, embedding routes, stored credentials). With `--all-providers`, every catalog provider's model-list endpoint, several of them unauthenticated | As row 2. A key from the process environment is sent only to a provider that is configured or named with `--provider`; a provider that is not configured never receives one, even with `--all-providers` | Configured providers only; one line lists the providers probed and the ones skipped | `--provider`, `--all-providers`, `--use-cache` | No |
+| 2 | Model discovery: `prx models refresh` | The operator runs it | The named or default provider's model-list endpoint (`/models` on the provider host; local servers for `ollama`, `llamacpp`, `litellm`, `vllm`). `src/providers/model_discovery.rs` | Credential of that provider (configured key, stored profile, or its standard environment variable) where the provider needs one. `User-Agent: prx/<version>` | Does nothing, and says so, when no provider is configured (see [What "configured" means](#what-configured-means)) and none is named | `--provider`, `default_provider` (used only when it is configured) | No |
+| 3 | Model discovery: `prx doctor models` | The operator runs it | By default only the providers configured in this install (see [What "configured" means](#what-configured-means)). With `--all-providers`, every catalog provider's model-list endpoint, several of them unauthenticated | As row 2. A key from the process environment is sent only to a provider that is configured or named with `--provider`; a provider that is not configured never receives one, even with `--all-providers` | Configured providers only; one line lists the providers probed and the ones skipped. With none configured it contacts no host and prints one line saying so | `--provider`, `--all-providers`, `--use-cache` | No |
 | 4 | Onboarding model fetch | The operator picks a provider in the `prx init` wizard | The selected provider's model-list endpoint | As row 2 | Interactive only | The wizard | No |
 | 5 | `prx go -k <key>` | The operator runs it | The provider named by `--provider`, or inferred from an explicit key prefix: `sk-ant-` Anthropic, `sk-or-` OpenRouter, `sk-` OpenAI. A key with any other prefix is not sent anywhere; the command asks for `--provider` | Credential and prompt, as row 1 | Interactive only | `-p/--provider`, `-k`, `--from-env`, `--from-stdin` | No |
 | 6 | Doctor probes | `prx doctor` with an embedding endpoint configured | The configured custom embedding endpoint (`HEAD`, then `OPTIONS`, 2 s timeout, no body). `src/doctor/implementation/section_1.rs` | No credential, no body, no `User-Agent` set by PRX | Only with a custom embedding endpoint | `[memory]` embedding settings | No |
@@ -69,7 +69,7 @@ question for each row; the answer is "no" for all of them.
 | 15 | `web_fetch` tool | A model turn calls the tool | The URL the model chooses, public hosts only (private and loopback addresses are refused; redirects are re-checked). `src/tools/web_fetch.rs` | A `GET` with `User-Agent: Mozilla/5.0 (compatible; PRX/1.0; +https://openprx.dev)`. No credential. It connects directly and ignores proxies | Registered always; runs only when called | `[browser] allowed_domains` (empty means any public host) | No |
 | 16 | `http_request` tool | A model turn calls the tool | The URL the model chooses, public hosts, restricted by `[browser] allowed_domains`. `src/tools/http_request.rs` | The method, headers and body the model supplies, with `User-Agent: prx/<version>`. Routed through the proxy only when `tool.http_request` is listed in `proxy.services` | Registered always; runs only when called | `[http_request]`, `[browser] allowed_domains`, `[proxy]` | No |
 | 17 | Other built-in tools | A model turn calls them | `composio`: `backend.composio.dev` (needs `composio.api_key`); `pushover`: `api.pushover.net`; media and artifact downloads from a remote URL (`src/media/artifact.rs`, direct connection, no proxy, no `User-Agent`); audio transcription at `[media] audio_ollama_url` (default `http://localhost:11434`) | Tool arguments and the tool's credential | Composio only with a key; Pushover only with its credentials | Tool sections | No |
-| 18 | Skills sync | `prx skills sync`, or the agent's `skills_manage` action `sync` | The repositories in `[skills] sync_repositories`; default `https://github.com/besoeasy/open-skills` and `https://github.com/openclaw/openclaw`. `src/skills/community_sync.rs` | `git clone --depth 1` or `git pull --ff-only`: Git's own `User-Agent`. Each URL is printed before it is contacted. An empty list does nothing and says so | Never at startup or on a catalog load; only on the command or action | `[skills] sync_repositories` | No |
+| 18 | Skills sync | `prx skills sync`, or the agent's `skills_manage` action `sync` | The repositories in `[skills] sync_repositories`; default `https://github.com/besoeasy/open-skills` and `https://github.com/openclaw/openclaw`. `src/skills/community_sync.rs` | `git clone --depth 1` or `git pull --ff-only`: Git's own `User-Agent`. Each URL is printed before it is contacted. An empty list does nothing and says so. The sync stops at the first repository that fails (the non-`openclaw` repository is synchronized first, then the `openclaw` one), so a later repository is not contacted after an earlier failure; nothing is retried or skipped over. `src/skills/community_sync.rs` | Never at startup or on a catalog load; only on the command or action | `[skills] sync_repositories` | No |
 | 19 | Skills install and update | `prx skills install <git url>`, `skills_manage` `install` / `update` | The Git URL given (a local path contacts nothing). `src/skills/mod.rs` | `git clone --depth 1`: Git's own `User-Agent` | On request only | The command or action | No |
 | 20 | Skills discovery | `GET /api/skills/discover` on the gateway | `api.github.com/search/repositories`. `src/skills/discovery.rs`, `src/gateway/api/skills.rs` | The search query and the skill-discovery `User-Agent` (see [User-Agent and identifying headers](#user-agent-and-identifying-headers)). A `Bearer` token only when `[skills] github_token` is set; the `GITHUB_TOKEN` environment variable is never used | On request only; unauthenticated | `[skills] github_token` | No |
 | 21 | Embeddings | Memory indexing and recall with a remote embedding provider | `api.openai.com`, `openrouter.ai/api/v1`, or a `custom:` endpoint. `src/memory/embeddings.rs` | The text to embed and a credential. The default `local` provider is an in-process hash embedding and contacts nobody | `memory.embedding_provider = "local"` | `[memory] embedding_provider` | No |
@@ -98,6 +98,68 @@ question for each row; the answer is "no" for all of them.
 `https://openprx.dev/credentials/approval-grant/v2` in
 `src/acl/approval_grant.rs` is a JSON-LD context identifier written into a
 locally stored credential. PRX does not fetch it.
+
+## What "configured" means
+
+Commands that probe providers on their own initiative (`prx doctor models`,
+`prx models refresh`) contact only configured providers. One helper decides
+(`src/providers/configured_providers.rs`, `configured_provider_names` and
+`configured_default_provider`). A provider is configured when the operator
+named it somewhere durable (`default_provider`, `[reliability]
+fallback_providers`, a named agent, a model route, an embedding route, or a
+stored auth profile) and one of these holds:
+
+- the operator gave it a credential: the root `api_key`, a rotation key
+  (`[reliability] api_keys`) or an `api_url` (default provider only), a route
+  or agent `api_key` or `credential_ref`, a stored `cred-<name>` reference, or
+  an auth profile (OAuth or token) for it; or
+- it needs none: a local runtime in the catalog (`ollama`, `llamacpp`, `vllm`,
+  `lmstudio`) or a `custom:<url>` endpoint the operator wrote; or
+- it is named explicitly on the command line (`--provider`).
+
+A `default_provider` value that only came from the `prx init` template, with
+no credential, is not configured. A key in the process environment is never
+proof of configuration: it is sent only to a provider that is configured by
+this definition or named explicitly. With nothing configured, both commands
+contact no host and print one line that says so and names the ways to set one
+up (`prx init --provider <name> --from-stdin`, `prx auth login --provider
+<name>`); the exit status is success.
+
+On a fresh `prx init` install, `prx status` and `prx doctor` (without
+`models`) contact no host (`doctor` makes a local TCP connect to the gateway
+bind address, loopback by default), and a chat turn fails locally with a
+missing-credential error before any request is built.
+
+## What each user message can carry
+
+Each user message can be preceded by a `[Recent shared workspace events]`
+block (`src/agent/context_recall.rs`, `build_shared_events_preamble_sourced`).
+It quotes up to 24 recent user and assistant message rows of the same
+workspace from other sessions: for each row the source, channel and sender
+label and the row text, one line per row, each row cut at 3,072 bytes and the
+block at 12,288 bytes. The block is part of the prompt, so it goes to the
+operator's model provider with the rest of it (row 1). No configuration key
+turns the block off by itself. `[memory.events] record_user_messages = false`
+removes user rows from it and stops new user rows being stored;
+`record_assistant_messages = false` stops assistant rows being stored (both
+default to `true`).
+
+## Is the install-owner id sent to a model provider
+
+The install owner id (`api:install:<32 hex>`, `src/security/install_owner.rs`)
+is not placed in the system prompt or in the user-message preambles: the
+shared-event and session-event lines use the source, channel and sender labels
+only (`src/agent/context_recall.rs`, `format_shared_event_line`,
+`format_session_event_line`), and the provider request builders in
+`src/providers/` take no owner argument. It is logged locally when the gateway
+starts (`src/gateway/implementation/section_2.rs:112`). It can appear in a
+request to a provider only through a tool result: `document_get_chunk` returns
+the `owner_id` of the chunk it reads (`src/tools/document_get_chunk.rs:191`),
+and a chunk stored by a paired gateway (console or API) session carries the
+install owner as its owner. Tool results are part of the next provider
+request. Other uses of the id (`src/gateway/api/*`, `sessions_send` event
+payloads) are stored or compared locally; a `sessions_send` payload reaching a
+model is not verified.
 
 ## What the system prompt tells the model provider
 

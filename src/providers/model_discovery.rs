@@ -798,13 +798,15 @@ pub fn run_models_list(config: &Config, provider_override: Option<&str>) -> Resu
 }
 
 pub fn run_models_refresh(config: &Config, provider_override: Option<&str>, force: bool) -> Result<()> {
-    let Some(provider_name) = provider_override
-        .or(config.default_provider.as_deref())
-        .map(|name| name.trim().to_string())
+    // A provider named on the command line is the operator's choice. Without
+    // one, only a configured default provider is refreshed: a default that has
+    // no credential (the `prx init` template value) contacts nobody.
+    let named = provider_override.map(str::trim).filter(|name| !name.is_empty());
+    let Some(provider_name) = named
+        .map(str::to_string)
+        .or_else(|| crate::providers::configured_providers::configured_default_provider(config))
     else {
-        // No provider is configured and none was named: contact nobody.
-        println!("No provider is configured and none was named; nothing was refreshed.");
-        println!("Tip: run `prx models refresh --provider <provider>` or set `default_provider` first.");
+        println!("{}", crate::providers::configured_providers::NO_PROVIDER_CONFIGURED);
         return Ok(());
     };
 

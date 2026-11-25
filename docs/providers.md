@@ -15,12 +15,20 @@ binary embeds a validated [release model catalog](model-catalog.md) for offline
 defaults, listings, and model evidence. `prx doctor models` (read-only) or
 `prx models refresh --provider <id>` (cache-updating) adds current provider
 discovery evidence when the provider exposes a model-list API. `prx doctor
-models` probes only the providers configured in this install (default,
-fallbacks, named agents, routes, stored credentials) and says which it
-skipped; `--all-providers` probes the whole catalog, and a key from the
-process environment is sent only to a configured or explicitly named
-provider. `prx models refresh` with no provider configured and none named
-does nothing. `prx go -k` infers the provider only from `sk-ant-`
+models` probes only the providers configured in this install and
+says which it skipped; `--all-providers` probes the whole catalog, and a key
+from the process environment is sent only to a configured or explicitly named
+provider. A provider is configured when it is named (default, fallback, named
+agent, route, stored profile) and has a credential the operator gave it (an
+inline key, a rotation key, a `credential_ref` or stored `cred-<name>`
+reference, or an auth profile), or needs none (a local runtime such as
+`ollama`, `llamacpp`, `vllm` or `lmstudio`, or a `custom:<url>` endpoint). The
+`default_provider` that `prx init` writes without `--provider` has no
+credential and is not configured; an environment key never makes a provider
+configured. `prx models refresh` with no `--provider` and no configured
+default provider contacts no host and prints one line saying how to set a
+provider up; so does `prx doctor models` with nothing configured.
+`prx go -k` infers the provider only from `sk-ant-`
 (Anthropic), `sk-or-` (OpenRouter) or `sk-` (OpenAI); any other key needs
 `--provider` and is not sent anywhere before that.
 

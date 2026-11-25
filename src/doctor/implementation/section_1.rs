@@ -1197,7 +1197,7 @@ pub fn run_models(
 
     println!("🩺 OpenPRX Doctor — Model Catalog Probe");
     if targets.is_empty() {
-        println!("  No provider is configured, so nothing was probed.");
+        println!("  {}", crate::providers::configured_providers::NO_PROVIDER_CONFIGURED);
         println!("  Use `--provider <name>` to probe one provider or `--all-providers` to probe the whole catalog.");
         return Ok(());
     }
