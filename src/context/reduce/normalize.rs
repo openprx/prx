@@ -178,6 +178,12 @@ fn judge_round(messages: &[ChatMessage], results: &Range<usize>, calls: &[Option
     if count < calls.len() {
         return RoundMatch::Broken;
     }
+    // Some providers send an empty call id on every native call. An empty id
+    // identifies nothing, so it counts as a missing id, never as a repeat.
+    let calls: Vec<Option<String>> = calls
+        .iter()
+        .map(|id| id.as_ref().filter(|value| !value.is_empty()).cloned())
+        .collect();
     let has_repeat = calls
         .iter()
         .enumerate()
@@ -193,6 +199,7 @@ fn judge_round(messages: &[ChatMessage], results: &Range<usize>, calls: &[Option
         .unwrap_or_default()
         .iter()
         .map(result_call_id)
+        .map(|id| id.filter(|value| !value.is_empty()))
         .collect();
     if calls.iter().any(Option::is_none) || result_ids.iter().any(Option::is_none) {
         return RoundMatch::Whole((calls.len()..count).collect());
