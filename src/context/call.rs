@@ -104,3 +104,11 @@ pub(crate) fn working_dir() -> Option<PathBuf> {
         .ok()
         .flatten()
 }
+
+/// The owner id of the current call, when a call context is set.
+pub(crate) fn owner_id() -> Option<Arc<str>> {
+    CURRENT
+        .try_with(|call| call.as_ref().map(|call| Arc::clone(&call.identity.owner_id)))
+        .ok()
+        .flatten()
+}

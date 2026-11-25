@@ -281,7 +281,7 @@ impl SkillReadTool {
         resource_path: Option<&str>,
         args: &serde_json::Value,
     ) -> anyhow::Result<Option<ToolResult>> {
-        let Some(owner_id) = super::sessions_read_model::effective_run_owner(args) else {
+        let Some(owner_id) = execute_managed::checked_run_owner("skill_read", args) else {
             return Ok(None);
         };
         let owner = match crate::skills::lifecycle::OwnerScope::new(&owner_id) {
@@ -911,7 +911,7 @@ impl SkillsManageTool {
         if isolated_without_owner {
             return None;
         }
-        super::sessions_read_model::effective_run_owner(args)
+        execute_managed::checked_run_owner("skills_manage", args)
     }
 
     fn required_string<'a>(args: &'a serde_json::Value, key: &str) -> anyhow::Result<&'a str> {

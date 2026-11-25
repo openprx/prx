@@ -32,6 +32,20 @@ impl crate::skills::lifecycle::ToolGrant for PolicyGrant {
     }
 }
 
+/// The run owner of a skill call, from the same source as before
+/// (`effective_run_owner`). Where the call context carries an owner too, a
+/// disagreement is noted in the debug log only; no value is logged and the
+/// returned owner is unchanged.
+pub(super) fn checked_run_owner(site: &'static str, args: &serde_json::Value) -> Option<String> {
+    let owner = crate::tools::sessions_read_model::effective_run_owner(args);
+    if let (Some(owner), Some(call_owner)) = (owner.as_deref(), crate::context::call::owner_id())
+        && owner != &*call_owner
+    {
+        tracing::debug!(site, "skill run owner differs from the call context owner");
+    }
+    owner
+}
+
 impl SkillExecuteTool {
     /// Refuses a call that would take the legacy path for a skill the
     /// lifecycle manages in the configured owner's store: only a skill that is
@@ -95,7 +109,7 @@ impl SkillExecuteTool {
             .then(|| self.config.skills_lifecycle.owner_scope.clone())
             .flatten();
         let Some(owner) = scheduler_owner
-            .or_else(|| crate::tools::sessions_read_model::effective_run_owner(args))
+            .or_else(|| checked_run_owner("skill_execute", args))
             .and_then(|owner_id| lifecycle::OwnerScope::new(&owner_id).ok())
         else {
             // No trusted owner this call could be pinned for. A skill the
@@ -108,26 +122,28 @@ impl SkillExecuteTool {
             trusted_scope_field(args, &["parent_run_id"]).as_deref(),
         );
         let caller = |key: &str| trusted_scope_field(args, &[key]).unwrap_or_else(|| "unknown".to_string());
+        // The grant decides at the call's level, not the registry's.
+        let call_security = match crate::tools::effective_autonomy::call_policy(&self.security) {
+            std::borrow::Cow::Borrowed(_) => Arc::clone(&self.security),
+            std::borrow::Cow::Owned(policy) => Arc::new(policy),
+        };
+        let excluded = self
+            .config
+            .tool_tiering
+            .at_level(call_security.autonomy, call_security.evaluation_sandbox)
+            .always_exclude
+            .clone();
         let grant = PolicyGrant {
-            security: Arc::clone(&self.security),
-            excluded: self
-                .config
-                .tool_tiering
-                .at_level(
-                    crate::tools::effective_autonomy::call_policy(&self.security).autonomy,
-                    self.security.evaluation_sandbox,
-                )
-                .always_exclude
-                .clone(),
+            security: call_security,
+            excluded,
             sender: caller("sender"),
             channel: caller("channel"),
             chat_type: caller("chat_type"),
         };
         // At an effective Full level outside the evaluation sandbox the
         // lifecycle needs no local owner review.
-        let skip_review = !self.security.evaluation_sandbox
-            && crate::tools::effective_autonomy::call_policy(&self.security).autonomy
-                == crate::security::AutonomyLevel::Full;
+        let skip_review =
+            !grant.security.evaluation_sandbox && grant.security.autonomy == crate::security::AutonomyLevel::Full;
         let workspace = self.workspace_dir.clone();
         let (skill, tool) = (skill_name.to_string(), tool_name.to_string());
         let call_arguments = args.get("arguments").cloned();
@@ -157,11 +173,11 @@ impl SkillExecuteTool {
         // under. It names the run in the side-effect audit record.
         let policy = format!(
             "autonomy={:?};caller={}/{}/{};direct_tool={:?};excluded={}",
-            self.security.autonomy,
+            grant.security.autonomy,
             grant.sender,
             grant.channel,
             grant.chat_type,
-            self.security.decide(
+            grant.security.decide(
                 lifecycle::equivalent_direct_tool(&prepared.tool.kind),
                 &grant.sender,
                 &grant.channel,
