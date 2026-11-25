@@ -497,6 +497,24 @@ pub fn workspace_launch_environment<S: std::hash::BuildHasher>(
     (launch_environment(std::env::vars_os(), &allowed), dropped)
 }
 
+/// The environment of a workspace command hook: the launch allowlist of
+/// PRX's own environment, which keeps every provider key and other secret of
+/// PRX away from the hook, plus the hook's own `env` exactly as written. Only
+/// an entry a process cannot carry (a NUL byte) is dropped. Returns the
+/// environment and how many entries were dropped.
+#[must_use]
+pub fn hook_launch_environment<S: std::hash::BuildHasher>(
+    own: &HashMap<String, String, S>,
+) -> (Vec<(OsString, OsString)>, usize) {
+    let carried = own
+        .iter()
+        .filter(|(name, value)| !name.contains('\0') && !value.contains('\0'))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<HashMap<_, _>>();
+    let dropped = own.len() - carried.len();
+    (launch_environment(std::env::vars_os(), &carried), dropped)
+}
+
 /// Every `working_dir` a change sets or alters (compared with `current`)
 /// must be an existing directory that is not a symlink, so a plan refuses
 /// it instead of the server failing at launch (D-095 N-4). A directory an

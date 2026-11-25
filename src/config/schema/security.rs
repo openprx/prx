@@ -154,13 +154,13 @@ pub struct SecurityConfig {
     /// Audit logging configuration
     #[serde(default)]
     pub audit: AuditConfig,
-    /// Whether the command hooks of the workspace `hooks.json` run
-    /// (HOOKS-ENV, D-085 O-1). `hooks.json` lives in the agent's workspace,
-    /// where the workspace file tools can write it, and each hook runs a
-    /// program as PRX's user; so they run only when the operator turns them
-    /// `on` here. Turning it on is a high-risk change. WASM plugin hooks are
-    /// not affected.
-    #[serde(default, skip_serializing_if = "WorkspaceHooks::is_off")]
+    /// Whether the command hooks of the workspace `hooks.json` run. They run
+    /// by default (`on`): at the default autonomy level the agent can already
+    /// start any program through `shell`, so a hook gives it nothing new.
+    /// `off` is the operator's switch to stop them. A hook always starts from
+    /// a cleared environment, so no provider key of PRX reaches it unless the
+    /// hook's own `env` names it. WASM plugin hooks are not affected.
+    #[serde(default, skip_serializing_if = "WorkspaceHooks::is_on")]
     pub workspace_hooks: WorkspaceHooks,
 }
 
@@ -169,19 +169,25 @@ pub struct SecurityConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceHooks {
-    /// They do not run (the default); `prx doctor` and `hooks_status` say so.
-    #[default]
+    /// They do not run; `prx doctor` and `hooks_status` say so.
     Off,
-    /// They run, in a cleared environment and a dedicated directory beside
-    /// `config.toml`.
+    /// They run (the default), in a cleared environment and, unless the hook
+    /// names a `cwd`, a dedicated directory beside `config.toml`.
+    #[default]
     On,
 }
 
 impl WorkspaceHooks {
-    /// Whether this is the default (`off`).
+    /// Whether command hooks are switched off.
     #[must_use]
     pub fn is_off(&self) -> bool {
         *self == Self::Off
+    }
+
+    /// Whether this is the default (`on`).
+    #[must_use]
+    pub fn is_on(&self) -> bool {
+        *self == Self::On
     }
 }
 

@@ -21,6 +21,7 @@ impl Fixture {
         config.runtime.kind = "native".into();
         config.tunnel.provider = "none".into();
         config.plugins.enabled = false;
+        config.security.workspace_hooks = crate::config::WorkspaceHooks::Off;
         let profile = profile_over(kind, &config);
         Self {
             directory,

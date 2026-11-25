@@ -14,8 +14,11 @@ use super::{MAX_HOOKS_FILE_BYTES, MAX_TIMEOUT_MS, WORKSPACE_HOOKS_OPT_IN};
 /// Where a [`HookManager`] reads whether workspace command hooks run, and
 /// the directory they start in.
 pub(super) enum HookPolicy {
-    /// Fixed at construction. Without a configuration (a sub-agent's own
-    /// manager, an embedding caller) workspace hooks do not run.
+    /// Fixed at construction. A manager built without a configuration (an
+    /// embedding caller with no process configuration) has no policy to read
+    /// and no launch directory, so its workspace hooks do not run. A child
+    /// session never builds such a manager of its own when its parent has
+    /// one: it delivers through its parent's.
     Fixed {
         allowed: bool,
         launch_root: Option<PathBuf>,

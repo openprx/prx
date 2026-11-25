@@ -32,20 +32,28 @@ impl HookCore {
                 payload_json.len()
             );
         }
-        // The dedicated directory the hook starts in: beside config.toml,
-        // never the workspace (which the agent's file tools can write) and
-        // never PRX's own working directory (HOOKS-ENV). A `cwd` in
-        // hooks.json is workspace-controlled and is not used.
-        let (_, launch_root) = self.workspace_policy();
-        let Some(launch_root) = launch_root else {
-            anyhow::bail!(
-                "workspace hooks have no launch directory: PRX starts them in `hooks/` beside config.toml, and this \
-                 process has no configuration directory"
-            );
+        // The directory the hook starts in: the `cwd` the action names (a
+        // relative one is taken from the workspace), else the dedicated
+        // directory beside config.toml, never PRX's own working directory.
+        let working_dir = if let Some(cwd) = action.cwd.as_deref().map(str::trim).filter(|cwd| !cwd.is_empty()) {
+            if Path::new(cwd).is_absolute() {
+                PathBuf::from(cwd)
+            } else {
+                self.workspace_dir.join(cwd)
+            }
+        } else {
+            let (_, launch_root) = self.workspace_policy();
+            let Some(launch_root) = launch_root else {
+                anyhow::bail!(
+                    "workspace hooks have no launch directory: PRX starts them in `hooks/` beside config.toml, and \
+                     this process has no configuration directory"
+                );
+            };
+            let working_dir = crate::config::mcp_launch::launch_directory(&launch_root, "workspace-hooks", None)
+                .map_err(|error| anyhow::anyhow!(error))?;
+            crate::config::mcp_launch::prepare_launch_directory(&launch_root, &working_dir).await?;
+            working_dir
         };
-        let working_dir = crate::config::mcp_launch::launch_directory(&launch_root, "workspace-hooks", None)
-            .map_err(|error| anyhow::anyhow!(error))?;
-        crate::config::mcp_launch::prepare_launch_directory(&launch_root, &working_dir).await?;
         // A command with a path separator is workspace content (a script in
         // the workspace): resolve it against the workspace, since the hook
         // no longer starts there. A bare name is looked up in `PATH`.
@@ -55,15 +63,15 @@ impl HookCore {
             PathBuf::from(command)
         };
 
-        // A cleared environment through the shared launch builder: the
-        // launch allowlist of PRX's environment plus the hook's own `env`,
-        // without the variables a workspace may not set (HOOKS-ENV, D-045).
-        let (environment, dropped) = crate::config::mcp_launch::workspace_launch_environment(&action.env);
-        if !dropped.is_empty() {
+        // A cleared environment: the launch allowlist of PRX's environment
+        // (so no provider key of PRX reaches the hook) plus the hook's own
+        // `env`, which is passed as written.
+        let (environment, dropped) = crate::config::mcp_launch::hook_launch_environment(&action.env);
+        if dropped > 0 {
             tracing::warn!(
                 event = event.as_str(),
-                dropped = ?dropped,
-                "hook environment variables a workspace may not set were dropped"
+                dropped,
+                "hook environment entries holding a NUL byte were dropped"
             );
         }
         let mut cmd = Command::new(&program);

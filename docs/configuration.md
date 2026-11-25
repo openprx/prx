@@ -154,7 +154,7 @@ and the module-gate family are absorbed on load; they are not live switches.
 | `[decision_engine]` | `enabled = false`; `mode = "pre"`; `prompt_budget_tokens = 300`; `candidates = 5`; `timeout_ms = 1500`; `telemetry_cap = 1000`; `observe_queue = 64`; `latency_budget_ms = 500`; `token_ratio_limit = 0.35`; `max_candidates = 12`; `backend` unset |
 | `[decision_engine.backend]` | optional; absent = `kind = "auto"`, `remote_enabled = false`, `endpoint = ""`, `model = ""`, `pinned_snapshot = ""`, `credential_ref` unset, `timeout_ms = 250`, `max_request_bytes = 65536`, `max_response_bytes = 262144`, `circuit_breaker = { failure_threshold = 5, cooldown_secs = 60 }` |
 | `[security.audit]` | `log_path = "audit.log"`; `max_size_mb = 100` |
-| `[security]` | `workspace_hooks` omitted when off |
+| `[security]` | `workspace_hooks` omitted when on |
 | `[compliance.interaction_notice]` | `version = "1"`; default notice text; `applicability = "required"`; `exception_owner`/`exception_reviewed_at` unset |
 | `[compliance.eu_ai_act]` | classification `status = "unclassified"`; `owner`/`assessed_at` unset; `incident_store_path` unset; declaration fields all optional/empty |
 | `[tool_tiering]` | `always_include = []`; `always_exclude = []`; `channel_exclude = []` (nothing hidden from channel sessions); `defer_unlisted` unset (every available tool is published to the model, unless their definitions would take more than a quarter of the model's context window; then that turn defers them) |
@@ -2200,72 +2200,69 @@ workspace_servers = "stdio"      # HTTP and stdio servers: a workspace can then 
 ### Workspace command hooks
 
 A workspace `hooks.json` defines command hooks: programs PRX starts as its
-own user on lifecycle events. The workspace file tools can write that file,
-so it is not an operator surface, and its command hooks run only when the
-operator opts in:
+own user on lifecycle events. They run by default, because at the default
+autonomy level the agent can already start any program through `shell`, so a
+hook gives it nothing it does not have. `off` is the operator's switch to stop
+them:
 
 ```toml
 [security]
-workspace_hooks = "off"   # default: command hooks in hooks.json do not run
-# workspace_hooks = "on"  # run them (a workspace can then start programs that run as PRX's user)
+# workspace_hooks = "on"   # default: command hooks in hooks.json run
+workspace_hooks = "off"    # stop them
 ```
 
-Turning it on is a high-risk configuration change. The setting is read at
-every event, so turning it off stops hooks at once. Hooks run in the background, off the turn path (queued, delivered in order,
-dropped and counted when 1024 events are waiting). Hooks owned by a
-sub-agent (`delegate`, `sessions_spawn`) never run workspace command hooks.
-Delivery of each event, across all command hooks, WASM hooks and event-bus
-subscribers, has a shared 300-second bound. At shutdown, queued delivery gets
-up to three seconds to drain; individual command timeouts still apply.
+The setting is read at every event, so turning it off stops hooks at once.
+Hooks run in the background, off the turn path (queued, delivered in order,
+dropped and counted when 1024 events are waiting). A child session
+(`delegate`, `sessions_spawn`, a session worker) delivers its events to the
+same hooks as its parent: a child that shares its parent's runtime queues
+through the parent's hook manager, and a worker process builds its own from
+the same configuration and `hooks.json`. Each event carries the child's own
+identity and the `parent` session and run. Delivery of each event, across all
+command hooks, WASM hooks and event-bus subscribers, has a shared 300-second
+bound. At shutdown, queued delivery gets up to three seconds to drain;
+individual command timeouts still apply.
 
 A command hook that runs:
 
 - starts from the cleared launch environment of MCP servers (`PATH`, `HOME`,
   `LANG`, `LC_*`, `TMPDIR`, on Windows also `SYSTEMROOT`, `USERPROFILE`,
-  `TEMP` and `TMP`), plus its own `env` from `hooks.json` and the
+  `TEMP` and `TMP`), plus its own `env` from `hooks.json` as written and the
   `ZERO_HOOK_*` event variables. No provider key or other variable of PRX's
-  environment reaches it. Its `env` cannot set a loader, interpreter,
-  search-path, configuration-lookup or certificate/proxy variable (the list
-  under "MCP server launch environment"); such variables are dropped with a
-  warning naming them.
-- starts in a dedicated empty directory, `hooks/workspace-hooks-<hash>`
-  beside `config.toml` (owner-only; a symlink or a file at that place is
-  refused), never in the workspace. A `cwd` field in `hooks.json`
-  is refused when the file is loaded (the whole file is then invalid until it
-  is removed). A relative `command` that contains a path
-  separator (`./scripts/notify.sh`) is resolved against the workspace; a bare
-  name is looked up in `PATH`. Without a configuration directory, command
-  hooks are not started.
+  environment reaches it unless the hook's own `env` names it: this is secret
+  protection and stays. The `env` of a hook may set any variable (`PATH`, a
+  proxy, `NODE_OPTIONS`); only an entry holding a NUL byte is dropped, with a
+  warning.
+- starts in the directory its `cwd` names (an absolute path, or a path
+  relative to the workspace), else in a dedicated empty directory,
+  `hooks/workspace-hooks-<hash>` beside `config.toml` (owner-only; a symlink
+  or a file at that place is refused). A relative `command` that contains a
+  path separator (`./scripts/notify.sh`) is resolved against the workspace; a
+  bare name is looked up in `PATH`. Without `cwd` and without a configuration
+  directory, command hooks are not started.
 
-Writing or editing `hooks.json` or `mcp.json` at the workspace root, or any
-file under `<workspace>/plugins/` (WASM plugin code and manifests), with the
-file tools is a high-risk operation of its own (`write-launch-definition`,
-`edit-launch-definition`). Every other surface classifies a `hooks.json`
-change the same way: a change that installs, changes or runs a hook command
-(its program, arguments or event) is high risk (`hooks_manage` `replace` and
-`test`, Gateway `POST /api/hooks` and a `PUT /api/hooks/{id}` that sets
-`command`, `args` or `event`); one that only removes hooks or changes a
-timeout is medium risk (`hooks_manage` `remove`, `DELETE /api/hooks/{id}`, a
-timeout-only `PUT`). At `supervised` autonomy a Gateway request carries no
-approval grant, so these Gateway writes need `full` autonomy.
+A change to hooks is classified no higher than running the same command
+through `shell` at the current level: at `full` nothing about hooks asks for
+confirmation (writing `hooks.json` with the file tools, `hooks_manage`,
+Gateway `POST /api/hooks`, turning `workspace_hooks` on or off). Below `full`
+the side-effect gate applies as for any resource write: `hooks_manage`
+`replace` and `test`, Gateway `POST /api/hooks` and a `PUT /api/hooks/{id}`
+that sets `command`, `args` or `event` are high risk; `hooks_manage` `remove`,
+`DELETE /api/hooks/{id}` and a timeout-only `PUT` are medium risk. At
+`supervised` autonomy a Gateway request carries no approval grant, so these
+Gateway writes need `full` autonomy. Writing `mcp.json` or a file under
+`<workspace>/plugins/` is classified the same way (`write-launch-definition`,
+`edit-launch-definition`); that class is shared with MCP and plugin files.
 
 `prx doctor` (category `hooks`) and the `hooks_status` tool (`runs`,
 `blocked`) report command hooks that do not run, with the one line that
 allows them.
 
-**Upgrading (breaking):** workspace `hooks.json` command hooks no longer run
-unless `config.toml` holds
-
-```toml
-[security]
-workspace_hooks = "on"
-```
-
-There is no automatic migration, because allowing them is the operator's
-high-risk decision. Hooks that run now start in the cleared environment and
-the dedicated directory above: a hook that relied on an exported variable
-must list it in its `env` in `hooks.json`, and one that relied on starting in
-the workspace must use absolute paths or change directory itself.
+**Upgrading (breaking):** workspace `hooks.json` command hooks now run on an
+install that does not set `[security] workspace_hooks`. A config that sets it
+keeps its value; to keep hooks from running, write `workspace_hooks = "off"`.
+`prx init` never wrote the key, so no stored value is reset. A hook that
+carried a `cwd` field is now accepted and starts there.
 
 ### WASM plugins
 

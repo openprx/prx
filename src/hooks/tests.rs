@@ -458,8 +458,8 @@ async fn workspace_hooks_do_not_run_without_the_operator_opt_in() {
 
 /// RED before HOOKS-ENV: a hook inherited PRX's whole environment (every
 /// provider key exported in its shell) and ran in the workspace. It now
-/// starts from the cleared launch environment plus its own `env` (minus
-/// the variables a workspace may not set), in its dedicated directory.
+/// starts from the cleared launch environment plus its own `env`, in its
+/// dedicated directory.
 #[tokio::test]
 async fn a_hook_starts_in_a_cleared_environment_and_its_dedicated_directory() {
     let temp = TempDir::new().unwrap();
@@ -481,7 +481,7 @@ async fn a_hook_starts_in_a_cleared_environment_and_its_dedicated_directory() {
             ("LD_PRELOAD".to_string(), "/tmp/evil.so".to_string()),
             ("npm_config_registry".to_string(), "https://evil.example".to_string()),
         ]),
-        cwd: Some(".".into()),
+        cwd: None,
         timeout_ms: Some(5_000),
         stdin_json: false,
     };
@@ -497,11 +497,12 @@ async fn a_hook_starts_in_a_cleared_environment_and_its_dedicated_directory() {
         .collect::<Vec<_>>();
     assert!(names.contains(&"HOOK_OWN".to_string()), "{names:?}");
     assert!(names.contains(&"ZERO_HOOK_EVENT".to_string()), "{names:?}");
-    for refused in [parent_only.as_str(), "LD_PRELOAD", "npm_config_registry"] {
-        assert!(
-            !names.iter().any(|name| name == refused),
-            "`{refused}` reached the hook: {names:?}"
-        );
+    assert!(
+        !names.iter().any(|name| *name == parent_only),
+        "`{parent_only}` reached the hook: {names:?}"
+    );
+    for passed in ["LD_PRELOAD", "npm_config_registry"] {
+        assert!(names.iter().any(|name| name == passed), "`{passed}` was dropped: {names:?}");
     }
     let cwd = std::fs::read_to_string(format!("{}.cwd", out.display())).unwrap();
     let expected =
@@ -509,7 +510,7 @@ async fn a_hook_starts_in_a_cleared_environment_and_its_dedicated_directory() {
     assert_eq!(
         std::fs::canonicalize(cwd.trim()).unwrap(),
         std::fs::canonicalize(expected).unwrap(),
-        "the hook must start in its dedicated directory, not the workspace or `cwd`"
+        "the hook must start in its dedicated directory, not the workspace"
     );
 }
 
@@ -935,23 +936,4 @@ async fn replacing_hooks_json_applies_to_later_events() {
     manager.emit(HookEvent::TurnComplete, json!({})).await;
     assert!(manager.drain(TEST_DRAIN).await);
     assert!(second.exists() && !first.exists());
-}
-
-// ── cwd (finding 96 c) ──────────────────────────────────────
-
-#[test]
-fn a_hook_cwd_is_refused_at_load() {
-    let temp = TempDir::new().unwrap();
-    let manager = HookManager::new(temp.path().to_path_buf());
-    let with_cwd = r#"{"hooks": {"turn_complete": [{"command": "true", "cwd": ".."}]}}"#;
-    let error = manager.validate_config(with_cwd).expect_err("test: cwd refused");
-    assert!(error.to_string().contains("`cwd` is not supported"), "{error}");
-
-    std::fs::write(temp.path().join(HOOKS_JSON_FILE), with_cwd).unwrap();
-    assert!(manager.refresh_if_changed().is_err());
-    assert!(manager.replace_config(with_cwd).is_err());
-
-    // An explicit null is the same as no `cwd`.
-    let null_cwd = r#"{"hooks": {"turn_complete": [{"command": "true", "cwd": null}]}}"#;
-    manager.validate_config(null_cwd).expect("test: null cwd is absent");
 }

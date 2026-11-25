@@ -304,7 +304,6 @@ impl ConfigChangeSummary {
                 .map(|path| RiskReason::CredentialOwnerChanged { path }),
         );
         risk_reasons.extend(workspace_mcp_widening(before, after));
-        risk_reasons.extend(workspace_hooks_widening(before, after));
         if let Some(before) = before {
             risk_reasons.extend(widenings(before, after));
         }
@@ -852,18 +851,6 @@ fn credential_holders(config: &Config) -> Vec<(String, crate::providers::Provide
         }
     }
     holders
-}
-
-/// Turning `security.workspace_hooks` on (HOOKS-ENV): the workspace
-/// `hooks.json`, which the agent's file tools can write, then starts
-/// programs that run as PRX's user and can read the stored credentials. A
-/// first write counts from `off`.
-fn workspace_hooks_widening(before: Option<&Config>, after: &Config) -> Option<RiskReason> {
-    use crate::config::WorkspaceHooks;
-    let before = before.map_or(WorkspaceHooks::Off, |before| before.security.workspace_hooks);
-    (after.security.workspace_hooks > before).then(|| RiskReason::CredentialRecipientChanged {
-        path: "security.workspace_hooks".to_string(),
-    })
 }
 
 /// Widening `mcp.workspace_servers` (D-085 F-1): letting a workspace
@@ -2167,22 +2154,6 @@ mod tests {
         reordered.reliability.api_keys.reverse();
         let summary = ConfigChangeSummary::between(Some(&keyed), &reordered).expect("test: summary");
         assert!(summary.secret_writes.is_empty() && summary.secret_clears.is_empty());
-    }
-
-    #[test]
-    fn turning_workspace_hooks_on_is_high_risk() {
-        let before = Config::default();
-        let mut on = before.clone();
-        on.security.workspace_hooks = crate::config::WorkspaceHooks::On;
-        let summary = ConfigChangeSummary::between(Some(&before), &on).expect("test: summary");
-        assert!(
-            summary.risk_reasons.contains(&RiskReason::CredentialRecipientChanged {
-                path: "security.workspace_hooks".into()
-            }),
-            "{summary:?}"
-        );
-        let summary = ConfigChangeSummary::between(Some(&on), &before).expect("test: summary");
-        assert_eq!(summary.risk, ConfigChangeRisk::Low, "{summary:?}");
     }
 
     /// D-085 F-1: letting a workspace `mcp.json` add stdio servers is high

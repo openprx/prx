@@ -191,7 +191,7 @@ impl ControlledH2Profile {
         );
         ensure!(
             config.security.workspace_hooks.is_off(),
-            "controlled experiments refuse command hooks"
+            "controlled experiments refuse command hooks: set `[security] workspace_hooks = \"off\"`"
         );
         ensure!(
             config.memory.backend == "sqlite",

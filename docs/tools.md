@@ -1661,7 +1661,7 @@ Create `hooks.json` in the workspace directory:
 
 - `command` + `args` — executed directly, not via shell (no injection risk)
 - `timeout_ms` — per-hook timeout, default 5000ms; valid range 1–300000ms
-- `cwd` is not supported: a hook always starts in its dedicated `hooks/` directory beside `config.toml`, so a `hooks.json` that sets `cwd` is refused at load with a clear error (remove the field)
+- `cwd` (optional) — the directory the hook starts in: absolute, or relative to the workspace; without it a hook starts in its dedicated `hooks/` directory beside `config.toml`. `env` is passed as written on top of a cleared launch environment, so no provider key of PRX reaches a hook unless `env` names it
 - hooks are observe-only and run off the turn path: an event is queued and a background worker per hook manager delivers it (command hooks in file order, then WASM hooks and the plugin event bus), in emit order. A slow hook never delays a turn; each hook keeps its own timeout, and all delivery for one event shares a 300-second bound. The queue holds 1024 events; when it is full the new event is dropped, counted and logged (first drop, then every 100th). At gateway shutdown queued events are given up to 3 seconds to finish
 - `hooks.json` is capped at 256 KiB and hot-reloaded by content generation; an invalid candidate leaves the active generation unchanged
 - payloads are capped at 4 MiB and passed through a restrictive temporary file plus optional stdin

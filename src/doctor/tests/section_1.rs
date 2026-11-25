@@ -467,6 +467,7 @@
         let temp = TempDir::new().unwrap();
         let mut config = Config::default();
         config.workspace_dir = temp.path().to_path_buf();
+        config.security.workspace_hooks = crate::config::WorkspaceHooks::Off;
         std::fs::write(
             temp.path().join("hooks.json"),
             r#"{"hooks": {"turn_complete": [{"command": "true"}]}}"#,

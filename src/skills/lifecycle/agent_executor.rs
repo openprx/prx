@@ -217,6 +217,8 @@ impl AgentCaseExecutor {
             SideEffects::WorkspaceWrite => crate::security::AutonomyLevel::Full,
         };
         config.autonomy.evaluation_sandbox = true;
+        // An evaluation run starts no workspace command hook.
+        config.security.workspace_hooks = crate::config::WorkspaceHooks::Off;
         config.autonomy.workspace_only = true;
         // The run may not touch its own evaluator state through the file tools:
         // the cost ledger, memory, lifecycle store, installed skill and config.

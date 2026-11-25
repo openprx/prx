@@ -68,8 +68,8 @@ pub struct HookDiagnostics {
     #[serde(skip)]
     pub(crate) catalog_digest: Option<[u8; 32]>,
     pub error: Option<String>,
-    /// Whether the command hooks of this `hooks.json` run: only with
-    /// `security.workspace_hooks = "on"` in config.toml (HOOKS-ENV).
+    /// Whether the command hooks of this `hooks.json` run: unless
+    /// `security.workspace_hooks = "off"` is set in config.toml.
     pub runs: bool,
     /// When configured hooks do not run: why, with the one-line fix.
     pub blocked: Option<String>,
@@ -99,8 +99,7 @@ pub fn blocked_hooks_note(actions: usize) -> Option<String> {
     (actions > 0).then(|| {
         format!(
             "{actions} workspace command hook(s) in hooks.json are not run: `security.workspace_hooks` is off. To \
-             run them, add `{WORKSPACE_HOOKS_OPT_IN}` to config.toml (a high-risk change: the workspace can then \
-             start programs that run as PRX's user)"
+             run them, add `{WORKSPACE_HOOKS_OPT_IN}` to config.toml"
         )
     })
 }
@@ -176,14 +175,9 @@ fn validate_hooks_file(file: &HooksFile) -> anyhow::Result<()> {
             if let Some(timeout_ms) = action.timeout_ms {
                 bounded_timeout(timeout_ms)?;
             }
-            // A hook starts in its dedicated directory beside config.toml.
-            // `cwd` is workspace-controlled, so it is refused here rather
-            // than accepted and silently ignored.
-            if action.cwd.is_some() {
-                anyhow::bail!(
-                    "hooks.json `cwd` is not supported: hooks always start in their dedicated `hooks/` directory \
-                     beside config.toml; remove `cwd` and use an absolute path or a workspace-relative `command`"
-                );
+            // Integrity only: a NUL byte cannot be passed to a process.
+            if action.cwd.as_deref().is_some_and(|cwd| cwd.contains('\0')) {
+                anyhow::bail!("hook `cwd` contains a NUL byte");
             }
         }
     }

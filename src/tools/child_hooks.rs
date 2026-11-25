@@ -18,7 +18,8 @@ where
 }
 
 /// The manager a child without an Ordinary parent runtime uses: the parent's,
-/// else an inert one rooted at `workspace_dir`.
+/// else an inert one rooted at `workspace_dir` (an embedding caller with no
+/// hook manager of its own has no hooks to deliver to).
 pub(crate) fn child_hooks(parent: Option<Arc<HookManager>>, workspace_dir: &Path) -> Arc<HookManager> {
     parent.unwrap_or_else(|| Arc::new(HookManager::new(workspace_dir.to_path_buf())))
 }
