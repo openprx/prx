@@ -3,5 +3,6 @@
 
 pub(crate) mod call;
 pub(crate) mod layout;
+pub(crate) mod reduce;
 pub(crate) mod sources;
 pub(crate) mod transcript;
