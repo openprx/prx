@@ -137,6 +137,7 @@ build resets a value to the new default when it is exactly the old default:
 | `[tool_tiering] channel_exclude` | the former 14-tool list, exactly |
 | `[gateway] targeted_agents` | `false` |
 | `[nodes.server] allowed_commands` | `["echo"]` |
+| `[memory.events] record_tool_events` | `false` |
 
 `acknowledge_unrestricted_profile` is no longer written when the files are
 rewritten. `autonomy.level` is never touched, and a `supervised` or `readonly`
@@ -152,7 +153,10 @@ install keeps `workspace_only` and `forbidden_paths`. Authentication keys
 - **How:** the reset goes through the configuration transaction (one history
   record, revision check) and rewrites the configuration files in canonical form.
   A marker file `.defaults-migration` beside `config.toml` records that it ran
-  (key names only), so it never runs again. One info line at start names the
+  (key names only) and its version, so it never runs again. A later version
+  adds keys to the table: an install whose marker holds an older version resets
+  only the keys added since (for example `record_tool_events`), never a key it
+  already went through. One info line at start names the
   keys reset. `prx doctor` lists old default values still present.
 - **Roll back:** `prx config rollback` restores the files from before the reset.
   The marker stays, so the reset is not repeated.
@@ -188,6 +192,6 @@ the inline limit; above it the row holds the preview and the document
 reference of the stored tool output. Stored text and arguments are redacted.
 These rows are log-only: they are not `message.created`, so history loaders and
 the handoff match ignore them, and the gateway sync stream carries nothing for
-them. A config file that sets `record_tool_events` explicitly (including the
-`false` that older generated templates wrote) keeps its value; set it to `true`
-to start recording. No database schema migration is introduced.
+them. Older generated templates wrote `record_tool_events = false` explicitly, so the
+one-time reset above also changes that exact value to `true`; to keep recording
+off after the upgrade, set it to `false` again once the reset has run. No database schema migration is introduced.

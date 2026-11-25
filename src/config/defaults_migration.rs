@@ -19,6 +19,9 @@
 //! - The migration runs once: the marker file records its version, and it is
 //!   written whether or not anything was reset. A rolled-back install is not
 //!   migrated again; `prx doctor` reports the old values it still holds.
+//! - A key added by a later version carries that version in `since`. An install
+//!   whose marker holds an older version resets only the keys newer than its
+//!   marker, so keys it already went through are not reset a second time.
 
 use super::Config;
 use super::manage::{ConfigActor, ManagementService};
@@ -26,7 +29,7 @@ use crate::security::AutonomyLevel;
 use std::path::{Path, PathBuf};
 
 /// Version of this migration. Raising it runs a later migration once more.
-const MIGRATION_VERSION: u32 = 1;
+const MIGRATION_VERSION: u32 = 2;
 
 /// Marker file beside `config.toml`.
 const MARKER_FILE: &str = ".defaults-migration";
@@ -75,6 +78,8 @@ const OLD_CHANNEL_EXCLUDE: &[&str] = &[
 /// reset it to the new built-in default.
 struct LegacyDefault {
     key: &'static str,
+    /// Migration version that introduced this entry.
+    since: u32,
     /// Reset only while `autonomy.level = "full"`.
     full_only: bool,
     is_old: fn(&Config) -> bool,
@@ -89,57 +94,73 @@ fn equals(list: &[String], old: &[&str]) -> bool {
 const LEGACY_DEFAULTS: &[LegacyDefault] = &[
     LegacyDefault {
         key: "autonomy.max_cost_per_day_cents",
+        since: 1,
         full_only: false,
         is_old: |c| c.autonomy.max_cost_per_day_cents == Some(500),
         reset: |c| c.autonomy.max_cost_per_day_cents = None,
     },
     LegacyDefault {
         key: "cost.daily_limit_usd",
+        since: 1,
         full_only: false,
         is_old: |c| c.cost.daily_limit_usd == Some(10.0),
         reset: |c| c.cost.daily_limit_usd = None,
     },
     LegacyDefault {
         key: "cost.monthly_limit_usd",
+        since: 1,
         full_only: false,
         is_old: |c| c.cost.monthly_limit_usd == Some(100.0),
         reset: |c| c.cost.monthly_limit_usd = None,
     },
     LegacyDefault {
         key: "autonomy.workspace_only",
+        since: 1,
         full_only: true,
         is_old: |c| c.autonomy.workspace_only,
         reset: |c| c.autonomy.workspace_only = false,
     },
     LegacyDefault {
         key: "autonomy.forbidden_paths",
+        since: 1,
         full_only: true,
         is_old: |c| equals(&c.autonomy.forbidden_paths, OLD_FORBIDDEN_PATHS),
         reset: |c| c.autonomy.forbidden_paths.clear(),
     },
     LegacyDefault {
         key: "multimodal.allow_remote_fetch",
+        since: 1,
         full_only: false,
         is_old: |c| !c.multimodal.allow_remote_fetch,
         reset: |c| c.multimodal.allow_remote_fetch = true,
     },
     LegacyDefault {
         key: "tool_tiering.channel_exclude",
+        since: 1,
         full_only: false,
         is_old: |c| equals(&c.tool_tiering.channel_exclude, OLD_CHANNEL_EXCLUDE),
         reset: |c| c.tool_tiering.channel_exclude.clear(),
     },
     LegacyDefault {
         key: "gateway.targeted_agents",
+        since: 1,
         full_only: false,
         is_old: |c| !c.gateway.targeted_agents,
         reset: |c| c.gateway.targeted_agents = true,
     },
     LegacyDefault {
         key: "nodes.server.allowed_commands",
+        since: 1,
         full_only: false,
         is_old: |c| c.nodes.server.allowed_commands == ["echo"],
         reset: |c| c.nodes.server.allowed_commands.clear(),
+    },
+    LegacyDefault {
+        key: "memory.events.record_tool_events",
+        since: 2,
+        full_only: false,
+        is_old: |c| !c.memory.events.record_tool_events,
+        reset: |c| c.memory.events.record_tool_events = true,
     },
 ];
 
@@ -161,14 +182,20 @@ fn marker_path(config_path: &Path) -> PathBuf {
         .join(MARKER_FILE)
 }
 
-/// Whether the migration has run (its marker is present at this version).
-#[must_use]
-pub(crate) fn migration_has_run(config_path: &Path) -> bool {
+/// Version recorded in the marker file, 0 when there is no readable marker.
+fn marker_version(config_path: &Path) -> u32 {
     std::fs::read_to_string(marker_path(config_path))
         .ok()
         .and_then(|text| text.parse::<toml::Table>().ok())
         .and_then(|table| table.get("version").and_then(toml::Value::as_integer))
-        .is_some_and(|version| version >= i64::from(MIGRATION_VERSION))
+        .and_then(|version| u32::try_from(version).ok())
+        .unwrap_or(0)
+}
+
+/// Whether the migration has run (its marker is present at this version).
+#[must_use]
+pub(crate) fn migration_has_run(config_path: &Path) -> bool {
+    marker_version(config_path) >= MIGRATION_VERSION
 }
 
 fn write_marker(config_path: &Path, removed: &[&str]) {
@@ -192,7 +219,13 @@ pub(crate) async fn run_once(config: Config) -> Config {
     if migration_has_run(&config.config_path) {
         return config;
     }
-    let keys = legacy_default_keys(&config);
+    let done = marker_version(&config.config_path);
+    let full = config.autonomy.level == AutonomyLevel::Full;
+    let keys: Vec<&'static str> = LEGACY_DEFAULTS
+        .iter()
+        .filter(|entry| entry.since > done && (full || !entry.full_only) && (entry.is_old)(&config))
+        .map(|entry| entry.key)
+        .collect();
     if keys.is_empty() {
         write_marker(&config.config_path, &keys);
         return config;
