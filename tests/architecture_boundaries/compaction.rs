@@ -98,6 +98,10 @@ const FORWARDED_COMPACTION_SITES: &[&str] = &[
     // Source-bound decision snapshots reserve the actual served model's window.
     "src/agent/embedded_turn.rs::run_work",
     "src/agent/entry.rs::run_with_runtime_envelope",
+    // The turn opening (`src/context/api/open.rs::open_turn`) resolves the
+    // effective window from the decision service and returns it with the history
+    // it fitted.
+    "src/gateway/api/sessions.rs::run_console_runtime_turn",
     "src/channels/turn.rs::run_channel_turn",
     // The reducer action carries its explicitly resolved compaction config.
     "src/chat/dispatcher.rs::drive_start_turn_stream",
@@ -573,6 +577,7 @@ pub(super) fn production_turns_budget_on_the_effective_context_window() {
                         "src/agent/entry.rs::run_with_runtime_envelope" => "Some(decision_context.main_compaction())",
                         "src/channels/turn.rs::run_channel_turn" => "Some(decision_turn.compaction())",
                         "src/chat/dispatcher.rs::drive_start_turn_stream" => "compaction_config.as_ref()",
+                        "src/gateway/api/sessions.rs::run_console_runtime_turn" => "Some(&effective_compaction)",
                         "src/session_worker/runner/run.rs::run_owned_manifest" => {
                             "child_turn.as_ref().map(|turn|turn.compaction()).or(compaction_config_ref)"
                         }
@@ -604,7 +609,6 @@ pub(super) fn production_turns_budget_on_the_effective_context_window() {
         effective,
         &[
             "src/chat/run.rs::run_internal",
-            "src/gateway/api/sessions.rs::run_console_runtime_turn",
             "src/gateway/mod.rs::run_gateway_chat_with_multimodal",
         ],
     );

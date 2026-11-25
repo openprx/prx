@@ -6,6 +6,7 @@ use crate::agent::turn_engine::run_turn;
 use crate::gateway::jobs;
 use crate::memory::MemoryFabric;
 use crate::observability::NoopObserver;
+#[cfg(test)]
 use crate::providers::ChatMessage;
 use crate::runtime::envelope::RuntimeEnvelope;
 use crate::security::policy::ResourceRiskLevel;
@@ -825,73 +826,27 @@ async fn run_console_runtime_turn(
         build_runtime_system_prompt(&config_snapshot, &turn_runtime.model, &selected_skills, native_tools)
     };
 
-    let mem_context = crate::agent::context_recall::scoped_recall(
-        state.mem.as_ref(),
-        &crate::agent::context_recall::RecallScope::from_envelope(&turn_envelope, &config_snapshot.memory, "private"),
+    // The turn opening: recall, the stored attachment row, the replay of the
+    // earlier turns with their tool rounds, and the fit to the budget.
+    let crate::context::api::open::TurnOpening {
+        mut history,
+        history_event_ids,
+        compaction: effective_compaction,
+    } = crate::context::api::open::open_turn(crate::context::api::open::OpenInput {
+        memory: &state.mem,
+        envelope: &turn_envelope,
+        memory_config: &config_snapshot.memory,
+        chat_type: "private",
         visible_message,
-        crate::agent::context_recall::RECALL_CONTEXT_BUDGET,
-    )
+        card: None,
+        previous_turns,
+        system_prompt,
+        service: &decision.service,
+        context: &decision.context,
+        provider_label: &provider_label,
+        model: &turn_runtime.model,
+    })
     .await;
-    // What is put around the message is stored beside it and replayed on later
-    // turns, so the message keeps its bytes. It is stored (and sent) masked.
-    let attachment = crate::context::transcript::Attachment {
-        prefix: crate::security::redaction::redact_secrets(&mem_context.preamble),
-        tail: crate::agent::turn_contracts::current_time_tail(),
-    };
-    let enriched_message = format!("{}{visible_message}{}", attachment.prefix, attachment.tail);
-    let replay_fabric = MemoryFabric::new(state.mem.clone(), turn_envelope.workspace_id.clone())
-        .with_event_recording(config_snapshot.memory.event_recording_config());
-    if let Some(user_event_id) = turn_envelope.source_message_event_id.as_deref() {
-        crate::context::transcript::append_attachment(
-            &replay_fabric,
-            turn_envelope.message_scope(),
-            user_event_id,
-            &attachment,
-            &mem_context.sources,
-        )
-        .await;
-    }
-    let transcript = crate::context::transcript::Transcript::new(state.mem.as_ref(), turn_envelope.memory_principal());
-
-    // OQ-23 / R5: budget on the *effective* window of the model this turn
-    // serves (the operator/discovery/catalog model limits and
-    // `reserved_output_tokens`), with the same arguments the CLI, TUI and
-    // webhook resolve with, so one request is trimmed the same way on every
-    // surface of this process.
-    let mut effective_compaction = decision
-        .service
-        .effective_compaction(&provider_label, &turn_runtime.model);
-    effective_compaction.config = decision.context.main_compaction().clone();
-    crate::providers::context_window::trace_effective_compaction_resolution(&effective_compaction);
-    let system_message = ChatMessage::system(system_prompt);
-    let request_message = crate::agent::turn_contracts::inbound_user_message(&enriched_message);
-    // Earlier turns with their tool rounds; the oldest results become stubs
-    // when the request would be over budget. The stored event of each history
-    // message, index for index: none for the system prompt or a tool message,
-    // each stored turn's event, then the request's own event.
-    let mut replayed = transcript.expand_turns(previous_turns).await;
-    crate::context::request_provenance::note_live_attachment(crate::context::request_provenance::LiveAttachment {
-        run_id: turn_envelope.run_id.clone(),
-        prefix_chars: Some(attachment.prefix.chars().count()),
-        tail_chars: Some(attachment.tail.chars().count()),
-        attachments_replayed: Some(replayed.attachments),
-        ..crate::context::request_provenance::LiveAttachment::new(
-            request_message.content.chars().count(),
-            &mem_context.sources,
-        )
-    });
-    let stubbed = replayed.fit(&system_message, &request_message, &effective_compaction.config);
-    if stubbed > 0 {
-        tracing::info!(stubbed, "oldest replayed tool results were replaced by stubs to fit the request");
-    }
-    let history_event_ids: Vec<Option<String>> = std::iter::once(None)
-        .chain(replayed.event_ids)
-        .chain(std::iter::once(turn_envelope.source_message_event_id.clone()))
-        .collect();
-    let mut history = Vec::with_capacity(replayed.messages.len() + 2);
-    history.push(system_message);
-    history.extend(replayed.messages);
-    history.push(request_message);
 
     // D2 / FIX-P1-31: build via the shared `build_security_policy` helper so this
     // per-turn gateway authz site cannot drift from (or forget) the audit-config
@@ -938,7 +893,7 @@ async fn run_console_runtime_turn(
                 priority_scheduling_enabled: config_snapshot.agent.priority_scheduling_enabled,
                 low_priority_tool_names: config_snapshot.agent.low_priority_tools.clone(),
             },
-            compaction: Some(&effective_compaction.config),
+            compaction: Some(&effective_compaction),
             decision: crate::agent::turn_request::TurnDecision {
                 service: &decision.service,
                 context: &decision.context,
