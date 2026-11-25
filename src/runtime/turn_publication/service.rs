@@ -139,6 +139,16 @@ impl TurnRuntimeService {
         self.publication_scope().tool_tiering()
     }
 
+    /// The installed skills differ from the snapshot this publication pinned:
+    /// a skill was installed, edited or removed since. The owner publishes a
+    /// fresh service at its next turn boundary; opened turns keep their own.
+    #[must_use]
+    pub(crate) fn skills_changed(&self) -> bool {
+        let config = &self.generation.effective;
+        let live = crate::skills::catalog_skill_metadata(&config.workspace_dir, config);
+        crate::tools::capability::catalog::skills_epoch(&live) != self.catalog.skills_epoch()
+    }
+
     #[must_use]
     pub(crate) const fn channel_surface(&self) -> bool {
         matches!(self.surface, TurnSurfaceKind::Channel)

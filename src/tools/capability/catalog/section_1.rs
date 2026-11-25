@@ -192,17 +192,7 @@ impl CatalogSources {
         let mcp_digest = mcp_hasher.finalize();
         let mut mcp_epoch_bytes = [0_u8; 8];
         mcp_epoch_bytes.copy_from_slice(mcp_digest.get(..8).unwrap_or_default());
-        let mut skill_hasher = Sha256::new();
-        for skill in &skills {
-            skill_hasher.update(skill.name.len().to_be_bytes());
-            skill_hasher.update(skill.name.as_bytes());
-            skill_hasher.update(skill.frontmatter_sha);
-            skill_hasher.update(skill.location.to_string_lossy().as_bytes());
-        }
-        let skill_digest = skill_hasher.finalize();
-        let mut epoch_bytes = [0_u8; 8];
-        epoch_bytes.copy_from_slice(skill_digest.get(..8).unwrap_or_default());
-        let skills_dir_epoch = u64::from_be_bytes(epoch_bytes);
+        let skills_dir_epoch = skills_epoch(&skills);
         let hooks = hooks
             .events
             .iter()
@@ -241,6 +231,25 @@ impl CatalogSources {
             node_key: None,
         }
     }
+}
+
+/// The change counter of a skill snapshot: a digest of every skill's name,
+/// location and frontmatter, independent of the order they are listed in.
+/// An install, edit or removal of a skill changes it.
+pub(crate) fn skills_epoch<'a>(skills: impl IntoIterator<Item = &'a SkillMetadata>) -> u64 {
+    let mut ordered: Vec<&SkillMetadata> = skills.into_iter().collect();
+    ordered.sort_by(|left, right| (&left.name, &left.location).cmp(&(&right.name, &right.location)));
+    let mut hasher = Sha256::new();
+    for skill in ordered {
+        hasher.update(skill.name.len().to_be_bytes());
+        hasher.update(skill.name.as_bytes());
+        hasher.update(skill.frontmatter_sha);
+        hasher.update(skill.location.to_string_lossy().as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut epoch_bytes = [0_u8; 8];
+    epoch_bytes.copy_from_slice(digest.get(..8).unwrap_or_default());
+    u64::from_be_bytes(epoch_bytes)
 }
 
 /// A `direct_names` member that publishes every tool directly: native tools,
@@ -533,6 +542,11 @@ impl CapabilityCatalog {
 
     pub(crate) const fn generation(&self) -> &CatalogGeneration {
         &self.generation
+    }
+
+    /// The change counter of the skill snapshot this catalog was built from.
+    pub(crate) fn skills_epoch(&self) -> u64 {
+        skills_epoch(self.entries.iter().filter_map(|entry| entry.skill_metadata.as_deref()))
     }
 
     pub(crate) fn view(&self, scope: &CatalogScope) -> CatalogView<'_> {

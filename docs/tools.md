@@ -34,22 +34,28 @@ main agent or a named agent runs at Full; below Full they are dropped as
 before. Servers that the opt-in, launcher allowlist or private-address checks
 block for the main agent still start only by the main agent's level.
 
-Native tool turns start with the file/shell core (`file_read`, `file_write`,
-`file_edit`, `shell`). When eligible deferred capabilities exist, the request
-also declares `capability_search`, including for brief inputs and with the
-advisory decision engine disabled. Search returns bounded, source-scoped offers;
-a hit becomes a declared tool on the next request after fresh admission. Channel
-exclusions, model policy and issued child scope still apply. Search does not
-expand that scope. A catalog with deferred tools but no live search backend
-reports a publication error rather than advertising an unusable discovery path.
+Native tool turns publish every available tool directly, in a stable name
+order, so a provider can cache the tool definitions as a prefix. This holds on
+every surface: terminal chat, gateway, channels, scheduled runs and children
+(a child still sees only the tools its parent granted). Dynamic MCP, WASM and
+node tools are published too. `[tool_tiering] defer_unlisted = true` is the
+operator option that turns this off: only the file/shell core (`file_read`,
+`file_write`, `file_edit`, `shell`), the chat session tools and the names in
+`always_include` stay direct. The request then also declares
+`capability_search`. Search returns bounded, source-scoped offers; a hit
+becomes a declared tool on the next request after fresh admission. A tool that
+was deferred can also be called by its exact public name or capability ID
+without a search: the runtime admits it under the same rules as a search hit,
+declares it on the following request, and runs the call. Channel exclusions,
+model policy and issued child scope still apply. Search does not expand that
+scope.
 
 Eligible installed skills are advertised as metadata. A request that advertises skills
 includes an admitted `skill_read` definition; instruction bodies stay lazy.
 If the live reader cannot be admitted, the metadata is suppressed with a
-diagnostic. Chat's `sessions_spawn` definition is deferred behind search by
-default. An explicit `[tool_tiering] always_include = ["sessions_spawn"]`
-preference can publish it directly when policy permits. Chat's slash-command
-session controls remain available independently.
+diagnostic. The skill catalog follows the files on disk: a skill installed,
+edited or removed while a gateway, a channel listener or a chat session runs is
+seen by its next turn without a restart.
 
 | Category | Tools |
 |----------|-------|

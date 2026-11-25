@@ -16,7 +16,7 @@
         };
         let provider_admission =
             provider_turn_visible_admission(&provider_turn_workers, provider_worker_kind, provider_admission_max);
-        let catalog_changed = turn_service.check_live_parity().is_err();
+        let catalog_changed = turn_service.check_live_parity().is_err() || turn_service.skills_changed();
         if !provider_admission.can_start_visible || (catalog_changed && provider_admission.active_workers > 0) {
             tracing::warn!(
                 active_workers = provider_admission.active_workers,

@@ -777,7 +777,7 @@ async fn run_console_message_job_work(
         };
         let provider_trace = None;
         ConsoleDecisionTurn {
-            service: std::sync::Arc::clone(service),
+            service: std::sync::Arc::clone(&service),
             provider_trace,
             context,
             advice,

@@ -1,12 +1,14 @@
 //! Decision publication belongs to the same immutable gateway generation as
 //! provider/model/tools. Initialization is shared by concurrent first turns.
+//! The service is published again when the installed skills change, so a skill
+//! created while the gateway runs is offered by the next turn.
 use crate::runtime::turn_publication::TurnRuntimeService;
 use std::sync::Arc;
 
 pub(in crate::gateway) struct GatewayPublicationSlot {
     pub(in crate::gateway) controlled: Option<Arc<crate::runtime::h2_entry::ControlledH2Profile>>,
     pub(in crate::gateway) cleanup: Arc<super::CleanupTracker>,
-    service: tokio::sync::OnceCell<Arc<TurnRuntimeService>>,
+    service: tokio::sync::Mutex<Option<Arc<TurnRuntimeService>>>,
     security: Arc<crate::security::SecurityPolicy>,
     plugin_generation: u64,
     /// Set only for a targeted agent turn.
@@ -18,7 +20,7 @@ impl GatewayPublicationSlot {
         Self {
             controlled: None,
             cleanup: Arc::new(super::CleanupTracker::default()),
-            service: tokio::sync::OnceCell::new(),
+            service: tokio::sync::Mutex::new(None),
             security,
             plugin_generation,
             targeted: None,
@@ -36,7 +38,7 @@ impl GatewayPublicationSlot {
         Self {
             controlled: self.controlled.clone(),
             cleanup: Arc::clone(&self.cleanup),
-            service: tokio::sync::OnceCell::new(),
+            service: tokio::sync::Mutex::new(None),
             security,
             plugin_generation: self.plugin_generation,
             targeted: Some(surface),
@@ -55,7 +57,7 @@ impl GatewayPublicationSlot {
         &self,
         runtime: &crate::gateway::TurnRuntimeGeneration,
         state: &crate::gateway::AppState,
-    ) -> anyhow::Result<&Arc<TurnRuntimeService>> {
+    ) -> anyhow::Result<Arc<TurnRuntimeService>> {
         self.publish_parts(
             &runtime.config_generation,
             &runtime.tools_registry,
@@ -73,47 +75,42 @@ impl GatewayPublicationSlot {
         registry: &Arc<Vec<Box<dyn crate::tools::Tool>>>,
         mcp_tool: Option<&Arc<crate::tools::McpTool>>,
         state: &crate::gateway::AppState,
-    ) -> anyhow::Result<&Arc<TurnRuntimeService>> {
+    ) -> anyhow::Result<Arc<TurnRuntimeService>> {
         if let Some(profile) = &self.controlled {
             profile.verify(&generation.effective)?;
         }
-        self.service
-            .get_or_try_init(|| async {
-                let service = crate::runtime::turn_publication::TurnPublication {
-                    generation: Arc::clone(generation),
-                    registry: Arc::clone(registry),
-                    mcp_tool: mcp_tool.cloned(),
-                    security: Arc::clone(&self.security),
-                    observer: Arc::clone(&state.observer),
-                    hooks: Arc::clone(&state.hooks),
-                    memory: Arc::clone(&state.mem),
-                    plugin_generation: self.plugin_generation,
-                }
-                .publish_scoped(
-                    crate::tools::capability::turn_state::TurnSurfaceKind::Server,
-                    None,
-                    self.targeted.clone(),
-                )
-                .await?;
-                self.cleanup.retain_service(Arc::clone(&service));
-                Ok(service)
-            })
-            .await
+        let mut published = self.service.lock().await;
+        if let Some(service) = published.as_ref()
+            && !service.skills_changed()
+        {
+            return Ok(Arc::clone(service));
+        }
+        let service = crate::runtime::turn_publication::TurnPublication {
+            generation: Arc::clone(generation),
+            registry: Arc::clone(registry),
+            mcp_tool: mcp_tool.cloned(),
+            security: Arc::clone(&self.security),
+            observer: Arc::clone(&state.observer),
+            hooks: Arc::clone(&state.hooks),
+            memory: Arc::clone(&state.mem),
+            plugin_generation: self.plugin_generation,
+        }
+        .publish_scoped(
+            crate::tools::capability::turn_state::TurnSurfaceKind::Server,
+            None,
+            self.targeted.clone(),
+        )
+        .await?;
+        self.cleanup.retain_service(Arc::clone(&service));
+        if let Some(previous) = published.replace(Arc::clone(&service)) {
+            self.retire(previous);
+        }
+        Ok(service)
     }
-}
 
-#[cfg(test)]
-impl Default for GatewayPublicationSlot {
-    fn default() -> Self {
-        Self::new(Arc::new(crate::security::SecurityPolicy::default()), 0)
-    }
-}
-
-impl Drop for GatewayPublicationSlot {
-    fn drop(&mut self) {
-        let Some(service) = self.service.get().cloned() else {
-            return;
-        };
+    /// Drain a service's decision writes in the background and register the
+    /// retirement with the cleanup owner. Turns that opened on it keep it alive.
+    fn retire(&self, service: Arc<TurnRuntimeService>) {
         let ticket = match self.cleanup.retire(&service) {
             Ok(ticket) => ticket,
             Err(error) => {
@@ -131,6 +128,21 @@ impl Drop for GatewayPublicationSlot {
                 });
             }
             Err(_) => tracing::warn!("Gateway decision generation dropped without a runtime to drain writes"),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Default for GatewayPublicationSlot {
+    fn default() -> Self {
+        Self::new(Arc::new(crate::security::SecurityPolicy::default()), 0)
+    }
+}
+
+impl Drop for GatewayPublicationSlot {
+    fn drop(&mut self) {
+        if let Some(service) = self.service.get_mut().take() {
+            self.retire(service);
         }
     }
 }

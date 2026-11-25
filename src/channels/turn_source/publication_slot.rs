@@ -39,6 +39,7 @@ impl ChannelPublicationSlot {
         published.generations.retain(|_, service| service.strong_count() > 0);
         if let Some(service) = published.generations.get(&generation.id.0).and_then(Weak::upgrade)
             && Arc::ptr_eq(service.memory(), &memory)
+            && !service.skills_changed()
         {
             owner.retain_child_service(Arc::clone(&service))?;
             return Ok(service);

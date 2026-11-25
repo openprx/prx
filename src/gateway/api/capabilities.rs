@@ -451,7 +451,7 @@ async fn published_tools(
             .map_err(|_| CatalogError::Draining)?;
     let service = cleanup
         .run(Box::pin(async {
-            Ok::<_, anyhow::Error>(std::sync::Arc::clone(runtime.publish(state).await?))
+            Ok::<_, anyhow::Error>(runtime.publish(state).await?)
         }))
         .await
         .map_err(|_| CatalogError::Surface)?;

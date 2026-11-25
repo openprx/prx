@@ -139,7 +139,7 @@ async fn run(state: AppState, record: ChildSessionRecord, input: MessageInput, c
                 });
             let live = approvals::live(&state, &record, &input, console, wait_secs).await?;
             crate::runtime::mailbox_child::MailboxChildSource::admit(
-                publication,
+                &publication,
                 record.clone(),
                 input.clone(),
                 Some(live),

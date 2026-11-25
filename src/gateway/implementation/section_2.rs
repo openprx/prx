@@ -1161,7 +1161,7 @@ async fn run_gateway_chat_with_multimodal(
             Ok::<_, anyhow::Error>((service, context))
         }))
         .await;
-    let (service, context) = match admission {
+    let (published_service, context) = match admission {
         Ok(admitted) => admitted,
         Err(error) => {
             // Admission is no longer polled. Settle its owned accounting work
@@ -1191,6 +1191,7 @@ async fn run_gateway_chat_with_multimodal(
             return Err(error);
         }
     };
+    let service = &published_service;
     // Bind before the handoff: a refusal here still has the admission guard
     // to record the failed input and answer the job monitor.
     *stage = TurnFailureClass::TerminalBinding;

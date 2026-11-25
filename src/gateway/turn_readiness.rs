@@ -110,11 +110,11 @@ impl GatewayTurnState {
         }
     }
 
-    /// This state's published decision service (initialised once per state).
+    /// This state's published decision service (published again when the installed skills change).
     pub(super) async fn publish(
         &self,
         state: &AppState,
-    ) -> anyhow::Result<&Arc<crate::runtime::turn_publication::TurnRuntimeService>> {
+    ) -> anyhow::Result<Arc<crate::runtime::turn_publication::TurnRuntimeService>> {
         self.publication_slot()
             .publish_parts(self.config_generation(), self.tools_registry(), self.mcp_tool(), state)
             .await
