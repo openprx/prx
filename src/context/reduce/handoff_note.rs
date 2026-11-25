@@ -546,6 +546,16 @@ fn is_compact_context_handoff_line(line: &str) -> bool {
 /// Whether the text after the first line of a compact rendering is empty or
 /// opens with one of the headers the renderer writes after it.
 fn is_compact_context_handoff_tail(tail: &str) -> bool {
+    // The largest tail a valid note can render: every skill name at its bound,
+    // a summary at its bound, and the fixed text around them. A longer tail
+    // was not rendered from a note, so it earns no handoff protection.
+    const FIXED_TEXT_BYTES: usize = 512;
+    let longest = HANDOFF_SUMMARY_MAX_BYTES
+        .saturating_add(HANDOFF_SKILLS_MAX_COUNT.saturating_mul(HANDOFF_SKILL_NAME_MAX_BYTES.saturating_add(2)))
+        .saturating_add(FIXED_TEXT_BYTES);
+    if tail.len() > longest {
+        return false;
+    }
     tail.is_empty()
         || [
             COMPACT_HANDOFF_SKILLS_HEADER,
