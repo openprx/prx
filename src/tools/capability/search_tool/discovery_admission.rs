@@ -314,23 +314,52 @@ fn direct_discovery_ids(port: &dyn TurnSurfacePort) -> BTreeSet<CapabilityId> {
         .collect()
 }
 
+/// The reference of a deferred capability named by its exact public name or
+/// capability ID, when this turn's search could have returned it.
+fn exact_deferred_reference(
+    port: &dyn TurnSurfacePort,
+    proof: &dyn TurnSourceProof,
+    name_or_id: &str,
+) -> anyhow::Result<Option<CapabilityRef>> {
+    let entries = discovery_entries(port, proof)?;
+    let view = port.catalog_view();
+    Ok(entries
+        .values()
+        .filter(|discovered| discovered.searchable && !discovered.core)
+        .find(|discovered| {
+            view.entry_any(&discovered.reference.id)
+                .is_some_and(|entry| entry.public_name == name_or_id || entry.id.as_str() == name_or_id)
+        })
+        .map(|discovered| discovered.reference.clone()))
+}
+
 /// Recheck one actually returned offer against the turn's publication rules.
 pub(crate) fn prepare_discovered_tool(
     port: &dyn TurnSurfacePort,
     proof: &dyn TurnSourceProof,
     name_or_id: &str,
 ) -> anyhow::Result<Option<DiscoveredToolProposal>> {
-    let Some(offers) = port.discovery().offers.get() else {
-        return Ok(None);
+    let offered = port
+        .discovery()
+        .offers
+        .get()
+        .and_then(|offers| offers.lock().find(name_or_id));
+    let reference = match offered {
+        Some(reference) => {
+            anyhow::ensure!(
+                capability_search_spec(port, proof)?.is_some(),
+                "turn no longer permits discovered capability admission"
+            );
+            reference
+        }
+        // A deferred tool called by its exact name needs no prior search.
+        // It must be one this turn's search could have returned, so it goes
+        // through the same eligibility and admission rules as a search hit.
+        None => match exact_deferred_reference(port, proof, name_or_id)? {
+            Some(reference) => reference,
+            None => return Ok(None),
+        },
     };
-    let reference = offers.lock().find(name_or_id);
-    let Some(reference) = reference else {
-        return Ok(None);
-    };
-    anyhow::ensure!(
-        capability_search_spec(port, proof)?.is_some(),
-        "turn no longer permits discovered capability admission"
-    );
     let catalog = port.catalog();
     let entries = catalog.resolve(std::slice::from_ref(&reference))?;
     let entry = entries.first().context("offered capability is absent")?;
