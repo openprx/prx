@@ -20,6 +20,7 @@ pub(crate) mod clear;
 pub(crate) mod compact;
 pub(crate) mod engine;
 pub(crate) mod handoff_note;
+pub(crate) mod handoff_summary;
 pub(crate) mod normalize;
 pub(crate) mod patch;
 pub(crate) mod preflight;

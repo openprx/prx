@@ -5,6 +5,7 @@ use super::audit::{persist_compaction_audit, persist_context_switch, switch_refu
 use super::handoff_note::{
     MAX_HANDOFF_MESSAGE_BYTES, context_handoff_lineage, format_context_handoff_message, validated_context_handoff_note,
 };
+use super::handoff_summary::summarize_cold_window;
 use super::provenance::{COMPACTION_PROVENANCE_EXACT_WITH_TOOL_ROUNDTRIPS, attach_compaction_event_provenance};
 use super::roundtrips::{
     RoundCompanions, compaction_boundary_without_orphan_tool_results, folded_tool_roundtrips,
@@ -242,38 +243,61 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
         // substance of an agentic window — is gone with nothing naming it.
         let folded = folded_tool_roundtrips(compacted_source_messages.unwrap_or_default(), compacted_companions);
         let folded_notice = format_folded_tool_roundtrips_notice(&folded);
-        let note = serde_json::json!({
-            "schema_version": 1,
-            "kind": "context_handoff",
-            "strategy": "hard_switch",
-            "handoff_event_id": handoff_event_id,
-            "parent_handoff_event_id": parent_handoff_event_id,
-            "from_generation": from_generation,
-            "to_generation": to_generation,
-            "created_at": timestamp,
-            "trigger": trigger,
-            "source_message_count": source.message_count,
-            "source_token_estimate": source.token_estimate,
-            "unpersisted_companion_count": source.unpersisted_companion_count,
-            "folded_tool_roundtrips": {
-                "count": folded.count,
-                "tools": folded.tools,
-            },
-            "folded_tool_roundtrips_notice": folded_notice,
-            "provenance_status": source.source_event_provenance_status,
-            "source_event_range": range,
-            "retained_recent_message_count": keep_recent,
-            "lookup": {
-                "tool": crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME,
-                "arguments": {
-                    "event_ids": source.source_event_ids,
-                    "first_row_id": range.first_row_id,
-                    "last_row_id": range.last_row_id
-                }
+        // One model summary of the cold window, asked of this turn's own model. It
+        // never fails the turn: a failed or empty call writes the note without one.
+        let cold_summary = summarize_cold_window(
+            provider,
+            model,
+            compacted_source_messages.unwrap_or_default(),
+            config.max_context_tokens,
+            &[],
+            trigger,
+        )
+        .await;
+        let build_note = |summary_status: &'static str, summary: Option<&str>| {
+            let mut note = serde_json::json!({
+                "schema_version": 1,
+                "kind": "context_handoff",
+                "strategy": "hard_switch",
+                "handoff_event_id": handoff_event_id,
+                "parent_handoff_event_id": parent_handoff_event_id,
+                "from_generation": from_generation,
+                "to_generation": to_generation,
+                "created_at": timestamp,
+                "trigger": trigger,
+                "source_message_count": source.message_count,
+                "source_token_estimate": source.token_estimate,
+                "unpersisted_companion_count": source.unpersisted_companion_count,
+                "folded_tool_roundtrips": {
+                    "count": folded.count,
+                    "tools": folded.tools,
+                },
+                "folded_tool_roundtrips_notice": folded_notice,
+                "provenance_status": source.source_event_provenance_status,
+                "source_event_range": range,
+                "retained_recent_message_count": keep_recent,
+                "lookup": {
+                    "tool": crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME,
+                    "arguments": {
+                        "event_ids": source.source_event_ids,
+                        "first_row_id": range.first_row_id,
+                        "last_row_id": range.last_row_id
+                    }
+                },
+                "summary_status": summary_status,
+            });
+            if let (Some(object), Some(text)) = (note.as_object_mut(), summary) {
+                object.insert("summary".to_string(), serde_json::Value::String(text.to_string()));
             }
-        });
-        let note_json = serde_json::to_string(&note)?;
-        let handoff_message = format_context_handoff_message(&note_json);
+            note
+        };
+        let mut note_json = serde_json::to_string(&build_note(cold_summary.status(), cold_summary.text()))?;
+        let mut handoff_message = format_context_handoff_message(&note_json);
+        // A summary that pushes the note past its bound is dropped; the handoff is kept.
+        if cold_summary.text().is_some() && validated_context_handoff_note(&handoff_message).is_none() {
+            note_json = serde_json::to_string(&build_note("omitted_size", None))?;
+            handoff_message = format_context_handoff_message(&note_json);
+        }
         // Every applied handoff is one a later load can validate, within its
         // size bound; anything else is refused before it is written.
         if validated_context_handoff_note(&handoff_message).is_none() {

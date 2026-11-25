@@ -775,6 +775,14 @@ continuing its procedure.`; for status `written`, a summary block that opens
 `Summary of the moved turns, written by the model at the handoff` and then the
 summary; for any other status, `No summary was written for these turns.`
 
+A `switch` handoff that is built asks the turn's own model once, with no tools
+and temperature 0.2, for a summary of the cold window under six fixed headings
+(at most 600 words). The reply is cleaned, bounded to 6000 bytes and stored as
+`summary` with status `written`; a failed call or an empty reply stores status
+`failed` or `empty` instead. The call is made only when a handoff is returned,
+never for a suppressed or refused switch, and a summary that would push the
+note past its bound is dropped with status `omitted_size`.
+
 Each handoff references only the rows it replaced, its parent handoff row
 among them, so a fact older than the newest handoff is reached by following
 the chain: one lookup per generation. Once a handoff exists, the
