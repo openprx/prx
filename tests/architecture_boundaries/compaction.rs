@@ -598,6 +598,18 @@ pub(super) fn production_turns_budget_on_the_effective_context_window() {
         }
     }
 
+    // The console forwards what the turn opening resolved, so the opening
+    // itself is held to the effective window here.
+    let opening_path = repository_root().join("src/context/api/open.rs");
+    let opening = strip_cfg_test_items(&blank_comments_and_literals(&read_source(&opening_path)));
+    assert!(
+        compact_rust_tokens(&opening).contains("service.effective_compaction("),
+        "src/context/api/open.rs must resolve the effective compaction window"
+    );
+    assert!(
+        BASE_COMPACTION_MARKERS.iter().all(|marker| !opening.contains(marker)),
+        "src/context/api/open.rs must not budget on the base window"
+    );
     assert_inventory("production loop engine calls budgeted on the base window", base, &[]);
     assert_inventory(
         "production loop engine calls whose compaction config is forwarded",
