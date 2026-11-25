@@ -255,3 +255,7 @@ row still quotes the same document. A document is not deleted when another
 run's tool result references it. Memories stay unless the request carries
 `forget_writes: true`. The sync stream is unchanged. No configuration change
 or schema migration is needed.
+
+## Custom endpoint key from stdin
+
+`prx init --provider custom:<url> ... --from-stdin` now stores the key from standard input as the encrypted root `api_key`, in the same init generation as the configuration files. It used to write the files and then fail with `provider requires a catalog identity`. A key that cannot be stored now leaves no files behind for a custom endpoint; for a catalog provider whose reference store step fails, the error names the directory that was already written.

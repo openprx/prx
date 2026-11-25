@@ -106,14 +106,52 @@ pub fn provider_key(stdin: &mut dyn Read) -> Result<zeroize::Zeroizing<String>> 
     Ok(secret)
 }
 
-/// Persist only through the approved encrypted provider-reference store.
+/// Whether `provider` names a bring-your-own endpoint (`custom:<url>` or
+/// `anthropic-custom:<url>`), which has no catalog identity and so no
+/// default-named `cred-<name>` reference.
+#[must_use]
+pub fn is_endpoint_provider(provider: &str) -> bool {
+    use crate::providers::{ProviderId, ProviderNamespace};
+    matches!(
+        ProviderId::of(provider).namespace(),
+        ProviderNamespace::Custom | ProviderNamespace::AnthropicCustom
+    )
+}
+
+/// Persist only through an approved encrypted store: the provider-reference
+/// store for a catalog provider, and the encrypted root connection `api_key`
+/// for a bring-your-own endpoint (the connection the resolver releases to the
+/// configured default provider; there is no catalog name to build a
+/// reference from). Neither path writes the key in plaintext.
 pub async fn store_provider_key(config: Config, secret: &str) -> Result<Config> {
     let provider = crate::providers::selection::default_provider(&config).to_owned();
+    anyhow::ensure!(config.secrets.encrypt, "credential_encryption_required");
+    if is_endpoint_provider(&provider) {
+        let mut updated = config.clone();
+        updated.api_key = Some(secret.to_owned());
+        let tx = ConfigTransactions::new(crate::config::new_shared(config.clone())).deferring_activation();
+        let plan = tx
+            .plan(ConfigChange::Structured(Box::new(updated)))
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let revision = plan.planned_revision().map(str::to_owned);
+        tx.apply(
+            plan,
+            ConfigActor::Cli,
+            ApplyOptions {
+                expected_revision: revision.as_deref(),
+                confirm_high_risk: true,
+                confirmed_revision: revision.as_deref(),
+            },
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+        return Config::load_from_path(&config.config_path, config.workspace_dir);
+    }
     let name = crate::providers::ProviderId::of(&provider)
         .catalog_name()
         .context(BootstrapError::Invalid("provider requires a catalog identity"))?
         .to_owned();
-    anyhow::ensure!(config.secrets.encrypt, "credential_encryption_required");
     crate::config::manage::service::ManagementService::deferred(crate::config::new_shared(config.clone()))
         .set_credential(provider, name, secret.to_owned(), ConfigActor::Cli)
         .await

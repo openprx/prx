@@ -314,6 +314,24 @@ native tools skips any fallback whose exact model lacks verified native-tool
 support. A rate-limited primary therefore cannot move the request onto an
 unpriced or tool-less fallback.
 
+## Custom endpoint key and pricing
+
+`prx init --provider custom:<url> --model <model> --native-tools --from-stdin`
+(`https://example.invalid/v1` as the URL) stores the key from standard input
+as the root connection `api_key`, which the resolver releases to the configured
+default provider (see the credential order above). A `custom:<url>` provider
+has no catalog name, so no `cred-<name>` reference exists for it; the key is
+written encrypted with the rest of the configuration (`secrets.encrypt`, the
+default) in the same init generation, so a key that cannot be stored leaves
+nothing written. It is never written in plaintext, logged or echoed in an
+error. For a catalog provider `--from-stdin` still stores `cred-<name>` in the
+encrypted provider-reference store; if that store step fails after the files
+were written, the error names the directory and what remains. `--from-env VAR`
+sets the same root `api_key`.
+
+The endpoint's models have no catalog price; see [Unpriced models and operator
+overrides](#unpriced-models-and-operator-overrides).
+
 ## Streaming failure rules
 
 A streamed reply is used only if it ended the way the provider's protocol says

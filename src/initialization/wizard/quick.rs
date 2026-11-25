@@ -71,6 +71,7 @@ pub async fn run_quick_setup(
     config_dir: Option<&str>,
     spec: Spec,
     force: bool,
+    require_encryption: bool,
 ) -> Result<Config> {
     let target = crate::config::resolve_init_target_dir(None, config_dir).await?;
     let customize = |config: &mut Config| -> Result<()> {
@@ -86,6 +87,12 @@ pub async fn run_quick_setup(
             config.default_model = Some(model.trim().to_owned());
         }
         if let Some(key) = credential_override {
+            // A key read from standard input is never written in plaintext:
+            // refuse before any file is written when encryption is off.
+            anyhow::ensure!(
+                !require_encryption || config.secrets.encrypt,
+                "credential_encryption_required: enable `secrets.encrypt` to store the provider key"
+            );
             config.api_key = Some(key.to_owned());
         }
         if let Some(backend) = memory_backend {
@@ -172,6 +179,7 @@ pub(super) async fn run_quick_setup_with_home(
         memory,
         target.to_str(),
         Spec::Minimal,
+        false,
         false,
     )
     .await?;

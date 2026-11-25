@@ -102,6 +102,20 @@ pub(crate) async fn run(cli: &Cli) -> Result<()> {
         })?
         .or_else(|| api_key.clone());
         let provider = provider.clone();
+        // A bring-your-own endpoint (`custom:<url>`, `anthropic-custom:<url>`)
+        // has no catalog name, so no `cred-<name>` reference exists for it.
+        // Its key belongs to the root connection, which the resolver releases
+        // to the configured default provider and the encrypting save writes
+        // as an encrypted slot. Staging it in the same init generation as the
+        // files means a refused key leaves no half-written directory behind.
+        let staged_stdin_key = provider_secret.is_some()
+            && provider
+                .as_deref()
+                .is_some_and(crate::runtime::host_bootstrap::is_endpoint_provider);
+        let (api_key, provider_secret) = match provider_secret {
+            Some(secret) if staged_stdin_key => (Some((*secret).clone()), None),
+            secret => (api_key, secret),
+        };
         let model = model.clone();
         let memory = memory.clone();
 
@@ -152,17 +166,30 @@ pub(crate) async fn run(cli: &Cli) -> Result<()> {
                     config_dir,
                     spec,
                     *force,
+                    staged_stdin_key,
                 )
                 .await?
             } else {
                 spec.generate(&target, *force).await?;
                 // Same resolution the runtime uses: the global flag, else the
                 // environment. Only `init --dir` names the directory itself.
-                let load_dir = if dir.is_some() { config_dir } else { cli.config_dir.as_deref() };
+                let load_dir = if dir.is_some() {
+                    config_dir
+                } else {
+                    cli.config_dir.as_deref()
+                };
                 openprx::config::Config::load_or_init_with_config_dir(load_dir).await?
             };
             let config = if let Some(secret) = provider_secret {
-                crate::runtime::host_bootstrap::store_provider_key(config, &secret).await?
+                crate::runtime::host_bootstrap::store_provider_key(config, &secret)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "the provider key was not stored; the configuration files in {} were already written and \
+                             remain (store the key with `prx providers credential set`, or rerun with --force)",
+                            target.display()
+                        )
+                    })?
             } else {
                 config
             };
