@@ -131,12 +131,23 @@ pub struct DiscoverResult {
 }
 
 pub async fn discover_skills(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Query(params): Query<DiscoverQuery>,
 ) -> Result<Json<DiscoverResponse>, (StatusCode, Json<serde_json::Value>)> {
+    // Only a token the operator configured for skill discovery is sent; the
+    // daemon's ambient `GITHUB_TOKEN` is never used.
+    let token = state
+        .config
+        .load_full()
+        .skills
+        .github_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string);
     discover_with(
         params,
-        std::env::var("GITHUB_TOKEN").ok(),
+        token,
         crate::skills::discovery::GITHUB_API_BASE,
     )
     .await

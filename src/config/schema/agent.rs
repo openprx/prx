@@ -418,6 +418,12 @@ pub struct SkillsConfig {
     /// If unset, defaults to `$HOME/.openprx/openclaw-skills/` when enabled.
     #[serde(default)]
     pub openclaw_skills_dir: Option<String>,
+    /// GitHub token for skill discovery (`GET /api/skills/discover`), stored
+    /// encrypted at rest like other secrets. Unset (the default): discovery
+    /// searches api.github.com unauthenticated. The `GITHUB_TOKEN`
+    /// environment variable is never read for this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_token: Option<String>,
 }
 
 impl Default for SkillsConfig {
@@ -425,6 +431,7 @@ impl Default for SkillsConfig {
         Self {
             open_skills_dir: None,
             openclaw_skills_dir: None,
+            github_token: None,
         }
     }
 }

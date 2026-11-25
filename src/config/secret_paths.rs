@@ -156,6 +156,14 @@ pub static SECRET_PATHS: &[SecretPath] = &[
     },
     // ── Tool and storage credentials ───────────────────────────────
     SecretPath {
+        pattern: "skills.github_token",
+        segments: &[Key("skills"), Key("github_token")],
+        handling: EncryptedAtRest,
+        domain: SecretDomain::Tool,
+        alias_of: None,
+        used_as: SecretUse::Credential,
+    },
+    SecretPath {
         pattern: "composio.api_key",
         segments: &[Key("composio"), Key("api_key")],
         handling: EncryptedAtRest,
