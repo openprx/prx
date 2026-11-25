@@ -85,7 +85,7 @@ and the module-gate family are absorbed on load; they are not live switches.
 | `[reliability]` | `provider_retries = 2`; `provider_backoff_ms = 500`; `fallback_providers = []`; `acknowledge_single_provider_risk = false`; `api_keys = []`; `model_fallbacks = {}`; `channel_initial_backoff_secs = 2`; `channel_max_backoff_secs = 60`; `scheduler_poll_secs = 15`; `scheduler_retries = 2` |
 | `[reliability.circuit_breaker]` | `enabled = true`; `failure_threshold = 5`; `open_secs = 30`; `max_open_secs = 300` |
 | `[scheduler]` | `max_tasks = 64`; `claim_lease_secs = 90` |
-| `[agent]` | `compact_context = false`; `read_only_tool_concurrency_window = 2`; `priority_scheduling_enabled = false`; `low_priority_tools = ["sessions_spawn", "delegate"]` |
+| `[agent]` | `compact_context = false`; `read_only_tool_concurrency_window = 2`; `priority_scheduling_enabled = false`; `low_priority_tools = ["sessions_spawn", "delegate"]`; `[agent.prompt] share_host_identity = true` |
 | `[agent.compaction]` | `mode = "switch"`; `reserve_tokens = 4096`; `keep_recent_messages = 12`; `memory_flush = true`; `max_context_tokens = 128000` |
 | `[agent.compaction]` window rules | `reserve_tokens` is an upper bound: the reply reserve used is `min(reserve_tokens, window / 4)`, and the reply reserve plus the measured tool surface never exceed `window / 2` (never below `reserve_tokens` itself). `keep_recent_messages` is an upper bound on the messages a `switch` keeps word for word: the newest messages are kept while together they stay within `min(window / 4, (window - reserve) / 2)` tokens, and the newest message is always kept, so a short history of large messages is folded. `max_context_tokens` is the window |
 | `[agent.compaction.os_paging]` | `eviction_threshold = 0.70`; `proactive_retrieval = true`; `max_recalled_pages = 10`; `retrieval_injection_role = "system"`; `keep_recent_messages = 12`. Exact `switch` handoffs skip paging |
@@ -94,7 +94,7 @@ and the module-gate family are absorbed on load; they are not live switches.
 | `[chat.daemon]` | `url = ""` (derived from `[gateway]`); `token = ""` |
 | `[self_system]` | `fitness_interval_hours = 24` (accepted, unused for scheduling); `evolution_interval_hours = 24`; `evolution_config_path` unset; `evolution_debug_raw = false`; `evolution_judge_timeout_secs = 180`; `evolution_model_max_tokens = 16384`; `evolution_model_max_micro_usd = 0` |
 | `[self_system.fitness]` | `auto_run = true`; `timezone = "UTC"`; `run_at = "00:10"`; `retention_days = 180`; `max_backfill_days = 7`; `min_samples = 5`; `min_coverage = 0.60` |
-| `[skills]` | `open_skills_dir` unset (`$HOME/open-skills` when used); `openclaw_skills_dir` unset (`$HOME/.openprx/openclaw-skills/` when used) |
+| `[skills]` | `open_skills_dir` unset (`$HOME/open-skills` when used); `openclaw_skills_dir` unset (`$HOME/.openprx/openclaw-skills/` when used); `github_token` unset (unauthenticated discovery); `sync_repositories = ["https://github.com/besoeasy/open-skills", "https://github.com/openclaw/openclaw"]` |
 | `[skill_rag]` | `top_k = 32` |
 | `[plugins]` | `enabled = false` |
 | `[skills_lifecycle]` | `enabled = false`; `mode = "draft_only"`; `owner_scope` required when enabled; `storage_dir = "self/skill-lifecycle"`; `require_holdout = true`; `min_cases_floor = 3`; `max_concurrent_evaluations = 1`; `max_proposals_per_cycle = 1`; `max_edit_tokens = 300`; `max_edit_fraction = 0.20`; `allow_executable_proposals = false`; `suites = []` |
@@ -158,7 +158,7 @@ and the module-gate family are absorbed on load; they are not live switches.
 | `[compliance.interaction_notice]` | `version = "1"`; default notice text; `applicability = "required"`; `exception_owner`/`exception_reviewed_at` unset |
 | `[compliance.eu_ai_act]` | classification `status = "unclassified"`; `owner`/`assessed_at` unset; `incident_store_path` unset; declaration fields all optional/empty |
 | `[tool_tiering]` | `always_include = []`; `always_exclude = []`; `channel_exclude = []` (nothing hidden from channel sessions); `defer_unlisted` unset (every available tool is published to the model, unless their definitions would take more than a quarter of the model's context window; then that turn defers them) |
-| `[providers]` | `[providers.ollama] num_ctx` unset. `[[providers.tool_dialects]]`: `provider` required; `model` unset (all models); `tool_schema`/`tool_call` unset (`raw` / `native`). `[[providers.models]]`: `provider` required; `model` unset; `operations`, `native_tools`, `vision_input`, `streaming`, `structured_output`, `tool_schema_dialect`, `tool_call_dialect`, `context_window` all unset. See later sections |
+| `[providers]` | `app_identification = true`; `[providers.endpoint_headers]` empty. `[providers.ollama] num_ctx` unset. `[[providers.tool_dialects]]`: `provider` required; `model` unset (all models); `tool_schema`/`tool_call` unset (`raw` / `native`). `[[providers.models]]`: `provider` required; `model` unset; `operations`, `native_tools`, `vision_input`, `streaming`, `structured_output`, `tool_schema_dialect`, `tool_call_dialect`, `context_window` all unset. See later sections |
 | `[model_settings.<id>]` | catalog levels and explicit parameters; omitted keys stay with the catalog |
 
 ## Interactive chat sessions
@@ -2053,6 +2053,48 @@ encryption is on, no PRX surface writes these keys as plaintext:
 A rollback to a history record taken while encryption was on restores
 `enc2:` values: if one happens after encryption was turned off, turn it off
 again before downgrading.
+
+### Outbound disclosure settings
+
+[Outbound connections](outbound-connections.md) lists every host PRX can
+contact. These keys control what is sent where the operator did not pick the
+destination field by field:
+
+```toml
+[providers]
+# Send `HTTP-Referer: https://github.com/openprx/prx` and `X-Title: OpenPRX`
+# to OpenRouter and to `custom:` OpenAI-compatible endpoints. `false` removes
+# both headers everywhere; the `User-Agent: prx/<version>` header stays.
+app_identification = true
+
+# Extra static headers for one custom endpoint, matched by provider identity.
+# Values are treated as secrets: never logged, never shown in Debug output.
+[providers.endpoint_headers."custom:https://gateway.example/v1"]
+X-App-Code = "replace-me"
+
+[agent.prompt]
+# The system prompt names the host, the absolute workspace path and the time
+# zone abbreviation. `false` sends `host` and `.` instead of the first two.
+# Tools keep real paths; workspace files already written are not edited.
+share_host_identity = true
+
+[skills]
+# Token for `GET /api/skills/discover` (stored encrypted at rest). Unset:
+# unauthenticated search. The GITHUB_TOKEN environment variable is never used.
+# github_token = "..."
+# Repositories `prx skills sync` and `skills_manage` `sync` clone or pull.
+# `[]` makes sync do nothing. The repository named `openclaw` is sparse-cloned
+# into `openclaw_skills_dir`; at most one other repository goes into
+# `open_skills_dir`. Each URL is printed before it is contacted.
+sync_repositories = ["https://github.com/besoeasy/open-skills", "https://github.com/openclaw/openclaw"]
+```
+
+Related commands: `prx doctor models` probes only providers configured in
+this install and prints which were probed and which skipped;
+`--all-providers` probes the whole catalog (an environment key is still sent
+only to a configured provider); `prx models refresh` with no provider
+configured and none named does nothing; `prx go -k` with an unrecognised key
+prefix sends nothing and asks for `--provider`.
 
 ### Outbound proxy (`[proxy]`)
 

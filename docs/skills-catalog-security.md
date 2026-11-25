@@ -19,13 +19,20 @@ When the 256-entry limit is reached, workspace entries receive admission
 priority and the admitted set is then emitted in deterministic name order.
 
 The catalog is capped at 256 entries. Community sources must already exist on
-disk. Operators synchronize enabled community repositories explicitly with:
+disk. Operators synchronize the repositories listed in
+`[skills] sync_repositories` (default: `besoeasy/open-skills` and
+`openclaw/openclaw` on GitHub) explicitly with:
 
 ```bash
 prx skills sync
 ```
 
-That command is a control-plane operation and may run Git. Normal catalog loads
+That command is a control-plane operation and may run Git. It prints each
+repository URL before contacting it, and an empty list does nothing and says
+so. The agent's `skills_manage` action `sync` does the same. Skill discovery
+(`GET /api/skills/discover`) searches `api.github.com` unauthenticated unless
+`[skills] github_token` is set; the `GITHUB_TOKEN` environment variable is not
+read. Normal catalog loads
 never clone or pull. A process-local catalog is invalidated after a successful
 install, uninstall, toggle, or explicit synchronization.
 Manual filesystem edits require a process restart or an explicit catalog

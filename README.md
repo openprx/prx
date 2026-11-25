@@ -125,6 +125,7 @@ cargo build --release --locked --bin prx
 |-------|-------------|
 | [Installation](docs/one-click-bootstrap.md) | Binary install, source build, upgrades, rollback |
 | [Providers](docs/providers.md) | Provider catalog, fallback chains, token refresh |
+| [Outbound connections](docs/outbound-connections.md) | Every host PRX can contact, what is sent, and how to turn it off |
 | [Channels](docs/channels.md) | Messaging platforms, DM/group policies |
 | [Tools](docs/tools.md) | Built-in tools, hooks system, webhooks |
 | [Scheduled work](docs/scheduled-work.md) | Cron, Xin, and HEARTBEAT.md: what runs, leases, ordering |

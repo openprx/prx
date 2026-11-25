@@ -6,11 +6,23 @@ transactions, credential references and recovery.
 OpenPRX supports native and OpenAI-compatible LLM providers with model routing,
 ordered fallback, token refresh, streaming, tools, and usage attribution. Every
 outbound provider auth and API request sends `User-Agent: prx/<package version>`
-from the Cargo package version. Each
+from the Cargo package version. OpenRouter and `custom:` OpenAI-compatible
+endpoints also send `HTTP-Referer` and `X-Title` app identification headers
+unless `[providers] app_identification = false`; `[providers.endpoint_headers]`
+adds operator headers per custom endpoint (see
+[outbound connections](outbound-connections.md)). Each
 binary embeds a validated [release model catalog](model-catalog.md) for offline
 defaults, listings, and model evidence. `prx doctor models` (read-only) or
 `prx models refresh --provider <id>` (cache-updating) adds current provider
-discovery evidence when the provider exposes a model-list API.
+discovery evidence when the provider exposes a model-list API. `prx doctor
+models` probes only the providers configured in this install (default,
+fallbacks, named agents, routes, stored credentials) and says which it
+skipped; `--all-providers` probes the whole catalog, and a key from the
+process environment is sent only to a configured or explicitly named
+provider. `prx models refresh` with no provider configured and none named
+does nothing. `prx go -k` infers the provider only from `sk-ant-`
+(Anthropic), `sk-or-` (OpenRouter) or `sk-` (OpenAI); any other key needs
+`--provider` and is not sent anywhere before that.
 
 Declared request parameters are resolved from the embedded catalog before
 adapter serialization. Codex effort constraints and Kimi Code's fixed

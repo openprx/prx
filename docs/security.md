@@ -155,6 +155,13 @@ tool, at the level the run executes at. No command is refused or rewritten by
 this; it only keeps secrets out of the child. See [tools](tools.md) for the
 baseline and the allowlist.
 
+## Outbound connections
+
+[Outbound connections](outbound-connections.md) lists every host PRX can
+contact, what is sent and the setting that controls it. PRX has no analytics,
+crash reporting, installation identifier, update check or remote
+configuration, and a fresh install contacts nothing.
+
 ## Evidence and privacy
 
 Configuration, endpoint labels and inspection output must use the existing
