@@ -9,6 +9,7 @@ pub(crate) mod builtin;
 mod cli;
 pub mod config;
 pub mod evolution;
+mod run_envelope;
 pub(crate) mod runner;
 pub(crate) mod store;
 pub(crate) mod types;
