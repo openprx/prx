@@ -775,6 +775,15 @@ impl Memory for SqliteMemory {
             .await
     }
 
+    async fn session_transcript_rows(
+        &self,
+        principal: &MemoryPrincipal,
+        session_key: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MessageEvent>> {
+        self.session_transcript_rows_impl(principal, session_key, limit).await
+    }
+
     async fn load_recent_conversation_histories(
         &self,
         principal: &MemoryPrincipal,

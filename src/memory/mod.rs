@@ -26,6 +26,7 @@ pub mod retrieval;
 pub mod rf_messages;
 pub(crate) mod router_history;
 pub mod session_predicate;
+pub(crate) mod session_transcript;
 pub mod snapshot;
 pub mod sqlite;
 pub mod sync;

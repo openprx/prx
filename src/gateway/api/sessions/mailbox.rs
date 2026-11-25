@@ -252,10 +252,8 @@ async fn run(
         .source_message_event_id
         .clone()
         .ok_or_else(|| anyhow::anyhow!("mailbox adoption row is missing"))?;
-    let principal_memory = envelope.memory_principal();
-    let mut turns = state
-        .mem
-        .list_console_conversation_turns(&principal_memory, &input.message.to.session, MAX_PAGE_LIMIT, 0)
+    let mut turns = crate::context::transcript::Transcript::new(state.mem.as_ref(), envelope.memory_principal())
+        .load_turns(&input.message.to.session, MAX_PAGE_LIMIT)
         .await?;
     let before = turns.len();
     turns.retain(|turn| turn.message_event_id.as_deref() != Some(adopted.as_str()));

@@ -15,7 +15,8 @@ mod tool_rows;
 pub(crate) use replay::{Attachment, History, ReplayLog, TurnReplay, stub_replayed_results};
 pub(crate) use tool_rows::{RoundLog, append_attachment, call_id_for};
 
-use crate::memory::{ConversationTurn, Memory, MemoryPrincipal};
+use crate::memory::session_transcript::SessionTranscriptUnsupported;
+use crate::memory::{ConversationTurn, Memory, MemoryPrincipal, MessageEvent};
 
 /// Read handle for the log of one session.
 pub(crate) struct Transcript<'a> {
@@ -27,6 +28,28 @@ impl<'a> Transcript<'a> {
     /// `principal` names the session and the visibility the reads run with.
     pub(crate) fn new(memory: &'a dyn Memory, principal: MemoryPrincipal) -> Self {
         Self { memory, principal }
+    }
+
+    /// The user and assistant turns of `session_key`, oldest first, at most the
+    /// newest `limit`, read from the log (`message_events`) through the
+    /// session's own rows: owner, session and agent partition only. A mailbox
+    /// adoption row is present, a continuation input is not, and a deleted turn
+    /// is not. A backend without that read answers from the display projection
+    /// (`list_console_conversation_turns`), which is the same selection.
+    pub(crate) async fn load_turns(&self, session_key: &str, limit: usize) -> anyhow::Result<Vec<ConversationTurn>> {
+        match self
+            .memory
+            .session_transcript_rows(&self.principal, session_key, limit)
+            .await
+        {
+            Ok(rows) => Ok(rows.into_iter().map(turn_of_event).collect()),
+            Err(error) if error.is::<SessionTranscriptUnsupported>() => {
+                self.memory
+                    .list_console_conversation_turns(&self.principal, session_key, limit, 0)
+                    .await
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// The tool, attachment and message rows of the session. A failed read
@@ -45,5 +68,18 @@ impl<'a> Transcript<'a> {
     /// stored attachment, each reply preceded by the tool rounds of its run.
     pub(crate) async fn expand_turns(&self, turns: Vec<ConversationTurn>) -> History {
         self.replay_log().await.expand_turns(turns)
+    }
+}
+
+/// A stored message row as the turn the history expansion reads.
+fn turn_of_event(event: MessageEvent) -> ConversationTurn {
+    ConversationTurn {
+        id: event.id,
+        session_key: event.session_key.unwrap_or_default(),
+        role: event.role,
+        content: event.content,
+        timestamp: event.created_at,
+        message_id: Some(event.event_id.clone()),
+        message_event_id: Some(event.event_id),
     }
 }

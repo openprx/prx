@@ -2084,6 +2084,26 @@ pub trait Memory: Send + Sync {
         ))
     }
 
+    /// The user and assistant message rows of one session, oldest first, at
+    /// most the newest `limit`: the log the transcript builds model history
+    /// from. Filtered by owner, session key and agent partition only; the
+    /// row-visibility tiers of the session-context reads do not apply.
+    ///
+    /// These are the rows the session routes already show through the
+    /// `conversation_turns` projection, so the read exposes nothing new; it is
+    /// not a cross-session or cross-owner read. Only `context::transcript` calls
+    /// it. A backend without it reports `SessionTranscriptUnsupported`.
+    #[doc(hidden)]
+    async fn session_transcript_rows(
+        &self,
+        principal: &MemoryPrincipal,
+        session_key: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MessageEvent>> {
+        let _ = (principal, session_key, limit);
+        Err(crate::memory::session_transcript::SessionTranscriptUnsupported.into())
+    }
+
     /// Load recent turns per session for runtime history hydration.
     async fn load_recent_conversation_histories(
         &self,

@@ -31,6 +31,7 @@ mod rf_messages;
 mod sync_journal;
 mod sync_lifecycle;
 mod sync_woken;
+mod transcript_rows;
 mod sync_projection;
 mod sync_snapshot;
 mod write_log;

@@ -86,8 +86,8 @@ read their own state and move in a later step.
 
 ## Replayed history on the gateway session route
 
-The history of a Console or rf session turn is built from the stored
-conversation turns plus the durable log rows of role `tool`
+The history of a Console or rf session turn is built from the session's stored
+user and assistant rows (see "The transcript") plus the durable log rows of role `tool`
 (`src/context/transcript/replay.rs`). Each earlier user message is replayed with its
 stored attachment (the masked recall text before it and the date line after it,
 `message.attachment.recorded`), so its bytes do not change between turns. Each
@@ -150,15 +150,26 @@ the replay reader.
   rows; `expand_turns` turns stored conversation turns into model-facing
   `History` (each user message with its stored attachment, each reply preceded
   by the tool rounds of its run) with `History::fit` as the stub step.
-- What is not behind the transcript yet: the user and assistant message rows
-  (written by admission, the terminal commit and the chat events), the terminal
-  chat session JSON, the channel history map and the child session store. The
-  gateway session route, the mailbox-woken turn and the rf route still take
-  their user and assistant text from `conversation_turns` and only the tool
-  rounds and attachments from the log. A loader that reads the log alone needs
-  a session read that is not filtered by row visibility (see the design
-  question in the work package notes); until then `conversation_turns` stays
-  the source of the message text.
+- Message text. `Transcript::load_turns` reads the user and assistant turns of
+  a session from the log through `Memory::session_transcript_rows`: the session's
+  own `message.created` rows, filtered by owner, session key and agent partition
+  only, with none of the row-visibility tiers of the session-context reads. They
+  are the rows the session routes already show through the `conversation_turns`
+  projection, so the read exposes nothing new and is not a cross-session or
+  cross-owner read. Selection: a mailbox adoption row is present; a continuation
+  input (a user row whose `causation_event_id` names a `prx_mailbox` user row) is
+  not; a row whose display turn is deleted is not; the newest 500 by event time
+  with the row id as tie-break, oldest first. The Console and rf route and the
+  mailbox-woken turn take their history from it, then `expand_turns` adds the
+  stored attachments and tool rounds. A backend without the read (Postgres,
+  Lucid, the encrypted scope) answers from `list_console_conversation_turns`,
+  which is today's path. SQLite is the only backend that implements it.
+- What is not behind the transcript yet: the writers of the user and assistant
+  message rows (admission, the terminal commit and the chat events, all through
+  `MemoryFabric`), the terminal chat session JSON and the child session store.
+  Terminal chat keeps the session JSON as its history source (its handoff and
+  compaction state lives there), child continuation keeps its text-only seed
+  history, and the 500-turn bound is still a count, not the budget.
 
 ## Ownership
 

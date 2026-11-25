@@ -465,9 +465,8 @@ async fn submit_console_message(
     principal.agent_partition = Some(partition.clone());
     // MA-01b3: the turn's writers stamp from the envelope; reads keep the principal.
     let runtime_envelope = runtime_envelope.with_agent_partition(partition);
-    let turns = match state
-        .mem
-        .list_console_conversation_turns(&principal, &session_id, MAX_PAGE_LIMIT, 0)
+    let turns = match crate::context::transcript::Transcript::new(state.mem.as_ref(), principal)
+        .load_turns(&session_id, MAX_PAGE_LIMIT)
         .await
     {
         Ok(turns) => turns,
