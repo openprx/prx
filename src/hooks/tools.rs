@@ -126,7 +126,7 @@ impl HooksManageTool {
 }
 
 impl HooksManageTool {
-    fn execution_schema(&self) -> &'static std::sync::Arc<serde_json::Value> {
+    pub(super) fn execution_schema(&self) -> &'static std::sync::Arc<serde_json::Value> {
         static SCHEMA: std::sync::LazyLock<std::sync::Arc<serde_json::Value>> = std::sync::LazyLock::new(|| {
             std::sync::Arc::new({
                 crate::tools::schema::with_action_requirements(

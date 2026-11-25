@@ -177,19 +177,18 @@ fn shell_entrypoints_delegate_process_execution_to_shared_adapter() {
 }
 
 /// Every workspace command hook starts from the cleared launch environment
-/// in its dedicated directory, and only behind the operator's opt-in
-/// (HOOKS-ENV): the one runner clears the environment, builds it through the
-/// shared launch builder and pins the working directory, and `emit` checks
-/// the policy before running any action.
+/// in its dedicated directory (HOOKS-ENV): the one runner clears the
+/// environment, builds it through the shared launch builder and pins the
+/// working directory, and delivery checks the workspace policy.
 #[test]
-fn workspace_hooks_launch_through_the_shared_builder_behind_the_opt_in() {
+fn workspace_hooks_launch_through_the_shared_builder() {
     let source = fs::read_to_string(repository_root().join("src/hooks/launch.rs"))
         .unwrap_or_else(|error| panic!("read src/hooks/launch.rs: {error}"));
     let production = production_part(&source);
     let runner = function_body(&production, "run_action");
     for required in [
         "cmd.env_clear();",
-        "mcp_launch::workspace_launch_environment(",
+        "mcp_launch::hook_launch_environment(",
         "cmd.current_dir(&working_dir);",
         "mcp_launch::prepare_launch_directory(",
     ] {
@@ -201,13 +200,13 @@ fn workspace_hooks_launch_through_the_shared_builder_behind_the_opt_in() {
         "src/hooks/launch.rs builds a process command outside run_action"
     );
     // `emit` only queues; the background `deliver` runs the hooks and checks
-    // the opt-in at delivery time.
+    // the workspace policy at delivery time.
     let core_source = fs::read_to_string(repository_root().join("src/hooks/hook_core.rs"))
         .unwrap_or_else(|error| panic!("read src/hooks/hook_core.rs: {error}"));
     let deliver = function_body(&production_part(&core_source), "deliver");
     assert!(
         deliver.contains("self.workspace_policy()"),
-        "deliver must check the opt-in"
+        "deliver must check the workspace policy"
     );
 }
 
