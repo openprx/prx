@@ -1211,6 +1211,17 @@ impl Memory for SqliteMemory {
         self.load_session_context_before_impl(query, before_id).await
     }
 
+    async fn newest_session_events_of_type(
+        &self,
+        principal: &MemoryPrincipal,
+        session_key: &str,
+        event_type: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MessageEvent>> {
+        self.newest_session_events_of_type_impl(principal, session_key, event_type, limit)
+            .await
+    }
+
     async fn append_memory_event(&self, mut input: MemoryEventInput) -> anyhow::Result<MemoryEvent> {
         // The event describing a run's memory write carries that run.
         if let Some(provenance) = self.write_provenance.as_deref()

@@ -27,6 +27,14 @@ pub(crate) struct Transcript<'a> {
     principal: MemoryPrincipal,
 }
 
+/// The turns of one session as loaded, with whether they came from the log
+/// (`message_events`) or from the display projection, whose ids are not
+/// `message_events` ids.
+pub(crate) struct SessionTurns {
+    pub(crate) turns: Vec<ConversationTurn>,
+    from_log: bool,
+}
+
 impl<'a> Transcript<'a> {
     /// `principal` names the session and the visibility the reads run with.
     pub(crate) fn new(memory: &'a dyn Memory, principal: MemoryPrincipal) -> Self {
@@ -39,33 +47,42 @@ impl<'a> Transcript<'a> {
     /// adoption row is present, a continuation input is not, and a deleted turn
     /// is not. A backend without that read answers from the display projection
     /// (`list_console_conversation_turns`), which is the same selection.
-    pub(crate) async fn load_turns(&self, session_key: &str, limit: usize) -> anyhow::Result<Vec<ConversationTurn>> {
+    /// The user and assistant turns of `session_key`, oldest first, with the
+    /// fact that they came from the log (`session_transcript_rows`) rather than
+    /// from the display projection. The log read is the same selection as the
+    /// Console history (owner, session and agent partition only; a mailbox
+    /// adoption row is present, a continuation input and a deleted turn are not).
+    pub(crate) async fn load_session_turns(&self, session_key: &str, limit: usize) -> anyhow::Result<SessionTurns> {
         match self
             .memory
             .session_transcript_rows(&self.principal, session_key, limit)
             .await
         {
-            Ok(rows) => Ok(rows.into_iter().map(turn_of_event).collect()),
-            Err(error) if error.is::<SessionTranscriptUnsupported>() => {
-                self.memory
+            Ok(rows) => Ok(SessionTurns {
+                turns: rows.into_iter().map(turn_of_event).collect(),
+                from_log: true,
+            }),
+            Err(error) if error.is::<SessionTranscriptUnsupported>() => Ok(SessionTurns {
+                turns: self
+                    .memory
                     .list_console_conversation_turns(&self.principal, session_key, limit, 0)
-                    .await
-            }
+                    .await?,
+                from_log: false,
+            }),
             Err(error) => Err(error),
         }
     }
 
-    /// The turns a model history of `session_key` starts from: [`Self::load_turns`],
-    /// except that the newest valid context handoff of the session's log, when
-    /// there is one, comes first, with its stored bytes, followed by the loaded
-    /// turns after its row range. A failed handoff read leaves the turns as
-    /// [`Self::load_turns`] returns them.
-    pub(crate) async fn load_model_turns(
-        &self,
-        session_key: &str,
-        limit: usize,
-    ) -> anyhow::Result<Vec<ConversationTurn>> {
-        let turns = self.load_turns(session_key, limit).await?;
+    /// The model's view of a session loaded by [`Self::load_session_turns`]: its
+    /// turns, except that the newest valid context handoff of the session's log,
+    /// when there is one, comes first, with its stored bytes, followed by the
+    /// turns after its row range. Turns from the display projection are returned
+    /// unchanged, since their ids are not `message_events` ids. A failed handoff
+    /// read leaves the turns as loaded.
+    pub(crate) async fn model_turns_from(&self, session_key: &str, loaded: SessionTurns) -> Vec<ConversationTurn> {
+        if !loaded.from_log {
+            return loaded.turns;
+        }
         let found = match handoff::newest_valid_handoff(self.memory, &self.principal, session_key).await {
             Ok(found) => found,
             Err(error) => {
@@ -79,13 +96,23 @@ impl<'a> Transcript<'a> {
             }
         };
         let Some((event, handoff)) = found else {
-            return Ok(turns);
+            return loaded.turns;
         };
         let covered_through = handoff.last_row_id;
-        let mut model = Vec::with_capacity(turns.len() + 1);
+        let mut model = Vec::with_capacity(loaded.turns.len() + 1);
         model.push(turn_of_event(event));
-        model.extend(turns.into_iter().filter(|turn| turn.id > covered_through));
-        Ok(model)
+        model.extend(loaded.turns.into_iter().filter(|turn| turn.id > covered_through));
+        model
+    }
+
+    /// [`Self::load_session_turns`] followed by [`Self::model_turns_from`].
+    pub(crate) async fn load_model_turns(
+        &self,
+        session_key: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ConversationTurn>> {
+        let loaded = self.load_session_turns(session_key, limit).await?;
+        Ok(self.model_turns_from(session_key, loaded).await)
     }
 
     /// The tool, attachment and message rows of the session. A failed read

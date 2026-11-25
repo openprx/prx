@@ -252,12 +252,17 @@ async fn run(
         .source_message_event_id
         .clone()
         .ok_or_else(|| anyhow::anyhow!("mailbox adoption row is missing"))?;
-    let mut turns = crate::context::transcript::Transcript::new(state.mem.as_ref(), envelope.memory_principal())
-        .load_model_turns(&input.message.to.session, MAX_PAGE_LIMIT)
+    let transcript = crate::context::transcript::Transcript::new(state.mem.as_ref(), envelope.memory_principal());
+    let mut loaded = transcript
+        .load_session_turns(&input.message.to.session, MAX_PAGE_LIMIT)
         .await?;
-    let before = turns.len();
-    turns.retain(|turn| turn.message_event_id.as_deref() != Some(adopted.as_str()));
-    anyhow::ensure!(turns.len() < before, "mailbox adoption row is missing from history");
+    // The check runs on every loaded row, before a handoff may cover the adoption row.
+    let before = loaded.turns.len();
+    loaded
+        .turns
+        .retain(|turn| turn.message_event_id.as_deref() != Some(adopted.as_str()));
+    anyhow::ensure!(loaded.turns.len() < before, "mailbox adoption row is missing from history");
+    let turns = transcript.model_turns_from(&input.message.to.session, loaded).await;
     let cancellation = tokio_util::sync::CancellationToken::new();
     let stop = cancellation.clone();
     let _message_turn = runtime.hold_turn(&input, Arc::new(move || stop.cancel()))?;

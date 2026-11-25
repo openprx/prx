@@ -161,6 +161,10 @@ pub(crate) struct ToolLoopMemory {
     /// history carries no canonical history of its own (the console). Empty
     /// when the caller knows none.
     pub(super) history_event_ids: Vec<Option<String>>,
+    /// Whether an untracked caller's stored context handoffs are shown in their
+    /// compact form, with the stored bytes kept as the canonical history. Off
+    /// for every caller that reuses its history as its own canonical copy.
+    pub(super) rendered_stored_handoffs: bool,
 }
 
 impl ToolLoopMemory {
@@ -175,6 +179,7 @@ impl ToolLoopMemory {
             canonical_history: None,
             caller_rollover: false,
             history_event_ids: Vec::new(),
+            rendered_stored_handoffs: false,
         }
     }
 
@@ -215,6 +220,14 @@ impl ToolLoopMemory {
     /// index for index, so an evicted context page names the events it holds.
     pub(crate) fn with_history_event_ids(mut self, event_ids: Vec<Option<String>>) -> Self {
         self.history_event_ids = event_ids;
+        self
+    }
+
+    /// Show the stored context handoffs of the caller's view in their compact
+    /// form, keeping the stored bytes as the turn's canonical history
+    /// ([`crate::agent::turn_history::TurnHistory::open`]).
+    pub(crate) fn with_rendered_stored_handoffs(mut self) -> Self {
+        self.rendered_stored_handoffs = true;
         self
     }
 

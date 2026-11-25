@@ -1002,7 +1002,8 @@ async fn run_console_runtime_turn(
                     .with_event_recording(config_snapshot.memory.event_recording_config()),
             )
             .with_request_event_scope(turn_envelope.message_scope())
-            .with_history_event_ids(history_event_ids),
+            .with_history_event_ids(history_event_ids)
+            .with_rendered_stored_handoffs(),
         },
         crate::agent::turn_request::TurnDelivery {
             cancellation: Some(decision.cancellation.clone()),

@@ -785,17 +785,20 @@ impl TurnHistory {
     }
 
     /// [`Self::new`] for a turn that also gets the stored event of each message
-    /// of `view` ([`Self::with_history_event_ids`]). An untracked caller whose
-    /// view holds a stored context handoff takes its canonical copy now, from
-    /// the stored bytes, and the view then shows that handoff in its compact
-    /// form. The view keeps its length.
+    /// of `view` ([`Self::with_history_event_ids`]). Only when
+    /// `rendered_stored_handoffs` is set and the caller has no canonical
+    /// history, a view that holds a stored context handoff takes its canonical
+    /// copy now, from the stored bytes, and the view then shows that handoff
+    /// in its compact form. The view keeps its length.
     pub(crate) fn open(
         view: &mut Vec<ChatMessage>,
         canonical: Option<CanonicalHistory>,
         caller_rollover: bool,
         event_ids: Vec<Option<String>>,
+        rendered_stored_handoffs: bool,
     ) -> Self {
-        let holds_stored_handoff = canonical.is_none()
+        let holds_stored_handoff = rendered_stored_handoffs
+            && canonical.is_none()
             && view.iter().any(|message| {
                 matches!(
                     render_context_handoff_for_provider(&message.role, &message.content),

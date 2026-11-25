@@ -2615,6 +2615,24 @@ pub trait Memory: Send + Sync {
         ))
     }
 
+    /// The newest `limit` rows of `event_type` in the session of `session_key`,
+    /// newest first by row id, read with the visibility and agent partition
+    /// filters of `principal` as [`Memory::load_session_context_before`] reads
+    /// them. Backends without an ordered event log return the fail-fast error.
+    async fn newest_session_events_of_type(
+        &self,
+        principal: &MemoryPrincipal,
+        session_key: &str,
+        event_type: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MessageEvent>> {
+        let _ = (principal, session_key, event_type, limit);
+        Err(crate::memory::fabric::fail_fast(
+            self.name(),
+            "newest_session_events_of_type",
+        ))
+    }
+
     /// Append a memory outbox event.
     async fn append_memory_event(&self, input: MemoryEventInput) -> anyhow::Result<MemoryEvent> {
         let _ = input;
