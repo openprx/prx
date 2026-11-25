@@ -26,6 +26,9 @@ pub(crate) struct ScheduledAgentOrigin {
     card: Option<String>,
     /// Whether the run starts without the earlier runs of its session.
     fresh: bool,
+    /// The goal a Xin goal step belongs to; its session key is then the
+    /// goal's shared `xin:goal:{goal_id}`. `None` for every other run.
+    goal_id: Option<String>,
 }
 
 /// A read-only observation held by the scheduler, never a permission to replay
@@ -44,12 +47,18 @@ pub(super) fn current_card() -> Option<String> {
     SCHEDULED_ORIGIN.try_with(|origin| origin.card.clone()).ok().flatten()
 }
 
+/// The goal of the Xin goal step this call runs inside, if any.
+pub(super) fn current_goal_id() -> Option<String> {
+    SCHEDULED_ORIGIN
+        .try_with(|origin| origin.goal_id.clone())
+        .ok()
+        .flatten()
+}
+
 /// Whether the scheduled invocation this call runs inside starts without the
 /// earlier runs of its session.
 pub(super) fn current_fresh() -> bool {
-    SCHEDULED_ORIGIN
-        .try_with(|origin| origin.fresh)
-        .unwrap_or(false)
+    SCHEDULED_ORIGIN.try_with(|origin| origin.fresh).unwrap_or(false)
 }
 
 pub(super) fn begin_decision() -> Result<()> {
@@ -77,6 +86,7 @@ impl ScheduledAgentOrigin {
             retry_boundary: ScheduledRetryBoundary::default(),
             card: None,
             fresh: false,
+            goal_id: None,
         }
     }
 
@@ -92,6 +102,16 @@ impl ScheduledAgentOrigin {
             retry_boundary: ScheduledRetryBoundary::default(),
             card: None,
             fresh: false,
+            goal_id: None,
+        }
+    }
+
+    /// Origin of one step of a Xin goal. The step's session is the goal's
+    /// shared session, so the envelope must carry `xin:goal:{goal_id}`.
+    pub(crate) fn from_xin_goal_step(task: &crate::xin::types::XinTask, goal_id: &str) -> Self {
+        Self {
+            goal_id: Some(goal_id.to_owned()),
+            ..Self::from_xin(task)
         }
     }
 
@@ -138,11 +158,16 @@ impl ScheduledAgentOrigin {
     }
 
     fn validate(&self, envelope: &RuntimeEnvelope, scheduled: Option<&ScheduledToolScope>) -> Result<()> {
+        let expected_session_key = match self.goal_id.as_deref() {
+            Some(goal_id) => format!("xin:goal:{goal_id}"),
+            None => format!("{}:{}", self.source.as_str(), self.task_id),
+        };
         anyhow::ensure!(
             !self.task_id.trim().is_empty()
+                && self.goal_id.as_deref().is_none_or(|goal_id| !goal_id.trim().is_empty())
                 && envelope.source == self.source
                 && envelope.task_id.as_deref() == Some(self.task_id.as_str())
-                && envelope.session_key == format!("{}:{}", self.source.as_str(), self.task_id)
+                && envelope.session_key == expected_session_key
                 && envelope.owner_id == self.owner_id
                 && envelope.topic_id == self.topic_id
                 && envelope.source_message_event_id == self.source_event_id

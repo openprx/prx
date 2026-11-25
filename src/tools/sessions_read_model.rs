@@ -274,7 +274,9 @@ impl SchedulerRunFacts<'_> {
     /// identity (`xin:{task}`, `cron:{job}`; `scheduled_source.rs`, local
     /// operator admission). A job created by a remote principal acts as that
     /// principal and an unattributed job carries its own channel, so neither
-    /// has this tuple; an owner-isolated origin is excluded.
+    /// has this tuple; an owner-isolated origin is excluded. A Xin goal step runs
+    /// in the goal's shared session (`xin:goal:{goal_id}`); it keeps the same
+    /// identity because its run id is still the step's own `xin:{task}:{epoch}`.
     fn is_scheduler_run(&self) -> bool {
         let Some(task) = self.task_id.filter(|task| !task.is_empty()) else {
             return false;
@@ -285,13 +287,21 @@ impl SchedulerRunFacts<'_> {
                 && self.sender == Some("agent")
                 && self.chat_id == Some("agent:local")
                 && self.chat_type == Some("private")
-                && self.session_key == Some(format!("{scheduler}:{task}").as_str())
+                && self.session_key.is_some_and(|key| {
+                    key == format!("{scheduler}:{task}") || (scheduler == "xin" && goal_step_session_key(key))
+                })
                 && self
                     .run_id
                     .is_some_and(|run| run.starts_with(&format!("{scheduler}:{task}:")))
                 && !self.owner_isolated
         })
     }
+}
+
+/// The shared session of a Xin goal's steps, `xin:goal:{goal_id}`, with a
+/// non-empty goal id.
+fn goal_step_session_key(key: &str) -> bool {
+    key.strip_prefix("xin:goal:").is_some_and(|goal_id| !goal_id.is_empty())
 }
 
 /// Whether the call belongs to a run this install's own scheduler (Xin, cron

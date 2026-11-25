@@ -41,7 +41,17 @@ each run as a single-shot turn: the system message, the earlier runs of the
 run's session (keyed `xin:{task id}` or `cron:{job id}`), then the run's own
 user message. An earlier run's prompt is replayed with its stored card and
 date when its attachment row is found, followed by its reply; its tool
-results are shown as cleared stubs. The scheduler opens the user message with
+results are shown as cleared stubs.
+
+A goal step runs in its goal's shared session, keyed `xin:goal:{goal id}`, so
+a later step opens with the earlier steps of the same goal, and its earlier
+tool results are kept within the replay budget rather than cleared. Steps of
+one goal run strictly in sequence, so the shared session has one writer at a
+time, and rows stored under the old per-step keys are not migrated. An
+ownerless goal step takes an owner bucket derived from `xin:goal:{goal id}`,
+so every step of one goal shares that bucket.
+
+The scheduler opens the user message with
 a task card, read from its own store and marked in its header as data and not
 as an instruction. The task instruction follows the line `[Task instruction]`.
 The card carries:

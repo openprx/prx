@@ -740,6 +740,13 @@ pub(crate) async fn run_with_runtime_envelope(
                         agent_user_event.as_ref().map(|event| event.event_id.as_str()),
                     )
                     .await;
+                    // A goal step keeps its earlier steps' tool output within budget;
+                    // every other scheduled run replays with the results stubbed.
+                    let replay = if super::scheduled_source::current_goal_id().is_some() {
+                        crate::context::api::open::ReplayMode::FitToBudget
+                    } else {
+                        crate::context::api::open::ReplayMode::ClearAll
+                    };
                     let opening = crate::context::api::open::open_turn(crate::context::api::open::OpenInput {
                         memory: &mem,
                         envelope: &runtime_envelope,
@@ -748,7 +755,7 @@ pub(crate) async fn run_with_runtime_envelope(
                         visible_message: &msg,
                         card: scheduled_card.as_deref(),
                         previous_turns,
-                        replay: crate::context::api::open::ReplayMode::ClearAll,
+                        replay,
                         system_prompt,
                         service: decision_service,
                         context: decision_context,

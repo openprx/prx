@@ -13,7 +13,7 @@ use crate::security::SecurityPolicy;
 #[cfg(test)]
 use crate::security::policy::ApprovalGrant;
 use crate::xin::builtin::BuiltinRegistry;
-use crate::xin::run_envelope::xin_task_runtime_envelope;
+use crate::xin::run_envelope::{scheduled_origin, xin_task_runtime_envelope};
 use crate::xin::store;
 use crate::xin::types::{ExecutionMode, GoalStatus, XinGoal, XinStep, XinTask, XinTickSummary, default_lease_ttl_secs};
 use anyhow::Result;
@@ -943,19 +943,14 @@ async fn run_agent(
 
     // Background xin runner: no cooperative shutdown signal of its own; the
     // runner drives this synchronously. See never_cancelled_shutdown docs.
-    let runtime_envelope = xin_task_runtime_envelope(config, task, authority);
+    let runtime_envelope = xin_task_runtime_envelope(config, task, authority, step.map(|(s, _)| s.goal_id.as_str()));
     // CRON-ORIGIN: the run's tool calls act as whoever created the task (or
     // goal). Only a task the local operator created keeps the local-operator CLI
     // context.
     let scheduled_tool_scope = task
         .origin
         .scheduled_tool_scope(runtime_envelope.clone(), config, level);
-    let card = match step {
-        Some((step, goal)) => crate::agent::scheduled_card::for_xin_step(config, step, goal),
-        None => crate::agent::scheduled_card::for_xin_task(task),
-    };
-    match crate::agent::scheduled_source::ScheduledAgentOrigin::from_xin(task)
-        .with_card(card)
+    match scheduled_origin(config, task, step)
         .scope(crate::agent::run_with_runtime_envelope(
             match (
                 CONFIG_GENERATION.try_with(Arc::clone),
@@ -1683,6 +1678,7 @@ mod tests {
                 epoch: 7,
                 expires_at: Utc::now() + chrono::Duration::minutes(1),
             }),
+            None,
         );
         assert_eq!(envelope.owner_id.as_deref(), Some("owner-runtime"));
         assert_eq!(envelope.topic_id.as_deref(), Some("topic-runtime"));

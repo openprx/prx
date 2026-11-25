@@ -259,10 +259,33 @@ impl RuntimeEnvelope {
     #[must_use]
     pub fn xin(workspace_id: impl Into<String>, task_id: impl Into<String>, lease_epoch: u64) -> Self {
         let task_id = task_id.into();
+        Self::xin_with_session_key(workspace_id, format!("xin:{task_id}"), task_id, lease_epoch)
+    }
+
+    /// `Xin` envelope for one step of a goal. Every step of the goal shares the
+    /// session key `xin:goal:{goal_id}`; run, attempt, lease and recipient stay
+    /// those of the step task, exactly as [`RuntimeEnvelope::xin`] derives them.
+    #[must_use]
+    pub fn xin_goal_step(
+        workspace_id: impl Into<String>,
+        goal_id: impl Into<String>,
+        step_task_id: impl Into<String>,
+        lease_epoch: u64,
+    ) -> Self {
+        let session_key = format!("xin:goal:{}", goal_id.into());
+        Self::xin_with_session_key(workspace_id, session_key, step_task_id.into(), lease_epoch)
+    }
+
+    fn xin_with_session_key(
+        workspace_id: impl Into<String>,
+        session_key: String,
+        task_id: String,
+        lease_epoch: u64,
+    ) -> Self {
         Self::new_internal(
             RuntimeSource::Xin,
             workspace_id,
-            format!("xin:{task_id}"),
+            session_key,
             MemoryVisibility::Workspace,
         )
         .with_run_id(format!("xin:{task_id}:{lease_epoch}"))
