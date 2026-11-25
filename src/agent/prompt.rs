@@ -3,7 +3,7 @@
 //! order is the layout in `crate::context::layout`; this module keeps the
 //! public builder API over them.
 use crate::context::layout::{Layout, Slot};
-use crate::context::sources::{CustomSection, DelegatedRoleSection};
+use crate::context::sources::{CustomSection, DelegatedRoleSection, RoleIdentitySection};
 use anyhow::Result;
 
 pub use crate::context::layout::{CompiledSystemPrompt, PromptInputs as PromptContext, PromptSectionFingerprint, prompt_sha256};
@@ -90,6 +90,14 @@ impl SystemPromptBuilder {
     #[must_use]
     pub(crate) fn with_delegated_role(mut self, role: &str) -> Self {
         self.layout = self.layout.place(Box::new(DelegatedRoleSection::new(role)));
+        self
+    }
+
+    /// The builder of a named agent: its own identity text takes the place of
+    /// the main persona, inside the standard sections.
+    #[must_use]
+    pub(crate) fn with_role_identity(mut self, identity: &str) -> Self {
+        self.layout = self.layout.place(Box::new(RoleIdentitySection::new(identity)));
         self
     }
 

@@ -54,6 +54,21 @@ pub(crate) fn build_delegated_system_prompt(
     build_runtime_system_prompt_with(builder, config, model_name, skills, native_tools)
 }
 
+/// The system prompt of a named agent: the standard sections at the agent's
+/// own effective `autonomy`, with the agent's composed identity text in the
+/// identity slot in place of the main persona.
+pub(crate) fn build_named_agent_system_prompt(
+    config: &Config,
+    autonomy: crate::security::AutonomyLevel,
+    model_name: &str,
+    skills: &[crate::skills::Skill],
+    native_tools: bool,
+    identity: &str,
+) -> String {
+    let builder = crate::agent::prompt::SystemPromptBuilder::with_defaults().with_role_identity(identity);
+    build_prompt_at_level(builder, config, autonomy, model_name, skills, native_tools)
+}
+
 /// The system prompt of an interactive chat session. In a build whose chat
 /// turns run through the reducer driver (`terminal-tui`), every assistant
 /// turn is replayed with its tool evidence, so the prompt states what the
@@ -85,6 +100,17 @@ fn build_runtime_system_prompt_with(
     skills: &[crate::skills::Skill],
     native_tools: bool,
 ) -> String {
+    build_prompt_at_level(builder, config, config.autonomy.level, model_name, skills, native_tools)
+}
+
+fn build_prompt_at_level(
+    builder: crate::agent::prompt::SystemPromptBuilder,
+    config: &Config,
+    autonomy: crate::security::AutonomyLevel,
+    model_name: &str,
+    skills: &[crate::skills::Skill],
+    native_tools: bool,
+) -> String {
     let bootstrap_max_chars = if config.agent.compact_context { Some(6000) } else { None };
     let skills = if crate::tools::capability::policy::core_dependency_is_available("skill_read", &config.tool_tiering) {
         skills
@@ -99,7 +125,7 @@ fn build_runtime_system_prompt_with(
         Some(&config.identity),
         bootstrap_max_chars,
         native_tools,
-        config.autonomy.level,
+        autonomy,
     )
 }
 

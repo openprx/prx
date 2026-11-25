@@ -807,13 +807,21 @@ async fn run_console_runtime_turn(
             },
         )
         .native_tool_calling;
+    let selected_skills = decision
+        .service
+        .agent_prompt_skills(decision.proof, &decision.context)?;
     let system_prompt = if let Some(target) = target {
-        // The target's own identity; never the main persona.
-        target.system_prompt.clone()
+        // The standard sections at the target's own level, with the target's
+        // own identity in place of the main persona.
+        crate::agent::runtime_prompt::build_named_agent_system_prompt(
+            &config_snapshot,
+            target.autonomy,
+            &turn_runtime.model,
+            &selected_skills,
+            native_tools,
+            &target.system_prompt,
+        )
     } else {
-        let selected_skills = decision
-            .service
-            .agent_prompt_skills(decision.proof, &decision.context)?;
         build_runtime_system_prompt(&config_snapshot, &turn_runtime.model, &selected_skills, native_tools)
     };
 
