@@ -338,6 +338,18 @@ async fn execute_single_task(
     };
 
     let started_at = Utc::now();
+    let schedule_run = crate::hooks::ScheduleRun::start(
+        config,
+        "xin",
+        &task_id,
+        match task.execution_mode {
+            ExecutionMode::Internal => "internal",
+            ExecutionMode::AgentSession => "agent_session",
+            ExecutionMode::Shell => "shell",
+        },
+        Some(&task.name),
+    )
+    .await;
     let heartbeat_secs = (lease_ttl_secs / 3).max(MIN_HEARTBEAT_SECS);
     let heartbeat_stop = CancellationToken::new();
     let heartbeat_stop_child = heartbeat_stop.clone();
@@ -436,15 +448,20 @@ async fn execute_single_task(
         let finished_at = Utc::now();
         let output = "task cancelled after lease revocation".to_string();
         match store::commit_task_cancellation(config, &task_id, started_at, finished_at, &output) {
-            Ok(true) => return (false, task_id, output),
+            Ok(true) => {
+                schedule_run.finish("cancelled", &output).await;
+                return (false, task_id, output);
+            }
             Ok(false) => {}
             Err(error) => {
                 tracing::warn!(target: "xin", task_id = %task_id, "failed to persist cancelled task run: {error}");
             }
         }
+        schedule_run.finish("cancelled", "task lost execution authority").await;
         return (false, task_id, "task lost execution authority".to_string());
     };
     if authority_lost {
+        schedule_run.finish("cancelled", "task lost execution authority").await;
         return (false, task_id, "task lost execution authority".to_string());
     }
     let lease = exact_lease.lock().clone();
@@ -473,6 +490,9 @@ async fn execute_single_task(
         }
     };
 
+    schedule_run
+        .finish(if success && committed { "success" } else { "failed" }, &output)
+        .await;
     (success && committed, task_id, output)
 }
 

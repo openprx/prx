@@ -1624,16 +1624,61 @@ Event-driven hooks let you extend agent behavior without modifying core code. Ho
 
 ### Events
 
-| Event | When it fires |
-|-------|--------------|
-| `agent_start` | Agent loop begins a new turn |
-| `agent_end` | Agent loop completes a turn |
-| `llm_request` | Before sending a request to the LLM |
-| `llm_response` | After receiving an LLM response |
-| `tool_call_start` | Before a tool is executed |
-| `tool_call` | After a tool completes |
-| `turn_complete` | Full turn (LLM + tools) finished |
-| `error` | Any error in the agent loop |
+Every event is delivered in one versioned envelope (below). The event's own
+fields are in `data`. All events are observe-and-notify: queued, delivered in
+order by a background worker, never awaited by a turn.
+
+| Event | Emitted | Surfaces | `data` fields |
+|-------|---------|----------|---------------|
+| `agent_start` | Terminal chat start-up; single-shot and scheduled agent entry (`src/chat/run.rs`, `src/agent/entry/section_2.rs`) | terminal, single-shot, scheduled agent entry | `provider`, `model` |
+| `agent_end` | Single-shot and scheduled agent entry (`src/agent/entry/section_2.rs`) | single-shot, scheduled agent entry | `duration_ms`, `tokens_used` (null) |
+| `session_opened` | A terminal chat session opened or resumed (`src/chat/run.rs`); a Console session created (`src/gateway/api/sessions/section_1.rs`); a caller-keyed session claimed (`src/gateway/api/sessions/rf_message.rs`) | terminal, Console, keyed (rf) | `resumed`, `surface`, `title` |
+| `session_ended` | A terminal chat session exits (`src/chat/run.rs`) | terminal | `reason`, `turns`, `duration_ms` |
+| `turn_opened` | The turn engine starts a turn (`src/agent/turn_engine.rs`, `run_turn`) | every surface, including children | `input_chars`, `surface` |
+| `llm_request` | Each model round (`turn_engine.rs`) | every surface | `provider`, `model`, `messages_count`, `system_prompt_sha256`, `system_prompt_chars`, `tool_snapshot_sha256`, `tool_count` |
+| `llm_response` | Each model round | every surface | `provider`, `model`, `duration_ms`, `success`, `error_message` |
+| `tool_call_start` | Before each tool call | every surface | `tool`, `arguments` (sensitive keys redacted) |
+| `tool_call` | After each tool call | every surface | `tool`, `success`, `output` |
+| `approval_requested` | A tool call waits for an approval (`src/tools/execution/approval_route.rs`, `section_3.rs`); only where an approval is configured | every surface | `tool`, `call_id` |
+| `approval_decided` | The approval was answered | every surface | `tool`, `call_id`, `decision` (`approved`, `denied`, `cancelled`), `cause` |
+| `child_started` | A delegate or a task-mode `sessions_spawn` run begins its turn (`src/tools/delegate.rs`, `src/tools/sessions_spawn/task_mode.rs`); the identity is the launching turn's | delegate, task-mode child | `child_session`, `child_run`, `mode`, `agent`, `brief_chars` |
+| `child_finished` | The child's turn returned | delegate, task-mode child | `child_session`, `child_run`, `mode`, `status`, `duration_ms`, `result_chars` |
+| `child_failed` | The child's turn failed or was cancelled | delegate, task-mode child | `child_session`, `child_run`, `mode`, `status` (`failed`, `cancelled`), `duration_ms`, `error` (masked, 200 characters) |
+| `reduction_finished` | A durable compaction replaced history (`turn_engine.rs`, `report_durable_compaction`) | surfaces whose turn adopts durable compactions | `step` (`compaction`), `tokens_before`, `tokens_after`, `turns_before`, `turns_after` |
+| `schedule_run_started` | A cron job run (`src/cron/scheduler.rs`, `run_claimed_job`) or a Xin task run (`src/xin/runner.rs`, `execute_single_task`) was claimed | cron, Xin | `mode` (`agent_session`, `shell`, `internal`), `name` |
+| `schedule_run_finished` | The run's result was committed | cron, Xin | `mode`, `name`, `status` (`success`, `failed`, `cancelled`), `duration_ms`, `output_excerpt` (masked, 200 characters) |
+| `turn_complete` | The turn engine finished a turn (`turn_engine.rs`, `run_turn`); one event per turn on every surface | every surface, including children | `mode` (`chat`, `single`, or the origin), `response_chars`, `status` (`completed`, `failed`, `cancelled`, `refused`), `awaiting_approval`, `rounds`, `duration_ms`, `input_tokens`, `output_tokens` (null when the provider reported none) |
+| `error` | Provider, tool and tool-refresh failures | every surface | `component`, `message` |
+
+The scheduled run events carry the job or task id in `schedule.id`, a run id of
+their own in `run` and no session (a scheduled agent turn then opens its own
+session and emits its own `turn_opened`). They are delivered by a manager the
+scheduler builds from its configuration, so their order against the turn's own
+events is not defined.
+
+### Envelope
+
+```json
+{ "v": 1, "event": "turn_complete", "id": "<event id>", "ts": "<RFC 3339>",
+  "workspace": "<path>", "owner": "...", "session": "...", "run": "...",
+  "turn": "...", "round": 3, "agent": "...",
+  "origin": "terminal|gateway|channel|schedule|child",
+  "parent": { "session": "...", "run": "..." },
+  "schedule": { "kind": "cron|xin", "id": "..." },
+  "data": { }
+}
+```
+
+Fields that are not known for an event are `null`; `parent` appears only for a
+child session and `schedule` only for a scheduled run. `v` is raised only for a
+breaking change. The same JSON is the stdin of a command hook, the content of
+`ZERO_HOOK_PAYLOAD` (up to 8 KiB, else empty with `ZERO_HOOK_PAYLOAD_TRUNCATED=1`)
+and `ZERO_HOOK_PAYLOAD_FILE`, the payload of a WASM hook and the payload of the
+`prx.lifecycle.<event>` event-bus topic. A command hook also receives
+`ZERO_HOOK_EVENT` and, when known, `PRX_HOOK_SESSION`, `PRX_HOOK_RUN` and
+`PRX_HOOK_ORIGIN`. Before the envelope, the payload was the `data` object
+itself; a script or plugin that read fields at the top level reads them from
+`data` now.
 
 ### Configuration
 

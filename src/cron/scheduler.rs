@@ -449,6 +449,17 @@ async fn run_claimed_job(
     mode: ClaimedRunMode,
 ) -> (bool, String) {
     let started_at = Utc::now();
+    let schedule_run = crate::hooks::ScheduleRun::start(
+        config,
+        "cron",
+        &job.id,
+        match job.job_type {
+            JobType::Agent => "agent_session",
+            JobType::Shell => "shell",
+        },
+        job.name.as_deref(),
+    )
+    .await;
     let renew_every = Duration::from_secs((config.scheduler.claim_lease_secs / 3).max(1));
     let mut renewal = time::interval_at(time::Instant::now() + renew_every, renew_every);
     let claim_state = Arc::new(parking_lot::Mutex::new(claim));
@@ -502,6 +513,7 @@ async fn run_claimed_job(
             // authority had been lost.
             let CommittedRun { committed, mut success } = committed;
             if !committed {
+                schedule_run.finish("failed", &output).await;
                 return (false, output);
             }
             match deliver_if_configured(config, security, job, &output).await {
@@ -518,17 +530,22 @@ async fn run_claimed_job(
                     }
                 }
             }
+            schedule_run.finish(if success { "success" } else { "failed" }, &output).await;
             (success, output)
         }
         LeaseDriveResult::Lost {
             claim,
             detected_at,
             reason,
-        } => after_workflow_drop(workflow, || {
-            record_lost_claim_best_effort(config, job, &claim, detected_at, reason);
-            tracing::warn!(job_id = %job.id, attempt_id = %claim.attempt_id, reason, "cron claim authority lost; cancelling workflow");
-            (false, "cron claim authority was lost; execution cancelled".to_string())
-        }),
+        } => {
+            let lost = after_workflow_drop(workflow, || {
+                record_lost_claim_best_effort(config, job, &claim, detected_at, reason);
+                tracing::warn!(job_id = %job.id, attempt_id = %claim.attempt_id, reason, "cron claim authority lost; cancelling workflow");
+                (false, "cron claim authority was lost; execution cancelled".to_string())
+            });
+            schedule_run.finish("cancelled", &lost.1).await;
+            lost
+        }
     }
 }
 

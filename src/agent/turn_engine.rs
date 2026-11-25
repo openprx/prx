@@ -2462,10 +2462,24 @@ async fn report_durable_compaction(
     compacted: &CanonicalHistory,
     config: &crate::config::AgentCompactionConfig,
 ) -> Result<()> {
-    let Some(source_history) = before.filter(|_| runtime_adapter.events.is_some()) else {
+    let Some(source_history) = before else {
         return Ok(());
     };
     if source_history == *compacted {
+        return Ok(());
+    }
+    let skipped_system = |messages: &[ChatMessage]| usize::from(messages.first().is_some_and(|m| m.role == "system"));
+    crate::hooks::notify(
+        HookEvent::ReductionFinished,
+        serde_json::json!({
+            "step": "compaction",
+            "tokens_before": estimate_history_tokens(source_history.messages()),
+            "tokens_after": estimate_history_tokens(compacted.messages()),
+            "turns_before": source_history.len().saturating_sub(skipped_system(source_history.messages())),
+            "turns_after": compacted.messages().len().saturating_sub(skipped_system(compacted.messages())),
+        }),
+    );
+    if runtime_adapter.events.is_none() {
         return Ok(());
     }
     let guard = source_history

@@ -326,9 +326,11 @@ pub(super) async fn run_sub_agent_task(
             crate::runtime::turn_cleanup::CleanupScope::new(cleanup_parent.as_ref(), CancellationToken::new())?
                 .with_acknowledgement(Some(cleanup_ack));
         let spawn_context_owned = SPAWN_EXECUTION_CONTEXT.try_with(Clone::clone).ok();
+        // The child's lifecycle events are the launching turn's events.
+        let hook_identity = crate::hooks::current_identity();
         let mut loop_handle = spawn_scoped(crate::agent::idle::scope_beat(
             Some(run_beat),
-            with_spawn_context(spawn_context_owned, async move {
+            crate::hooks::identity_scope_optional(hook_identity, with_spawn_context(spawn_context_owned, async move {
                 // Carry the segment proof across the spawn boundary explicitly.
                 let child_source = child_source_owned;
                 let child_service = child_service_owned;
@@ -403,6 +405,13 @@ pub(super) async fn run_sub_agent_task(
                             .analyze_turn(routing.runtime, &cancel_token_owned)
                             .await
                     };
+                    let child_events = crate::hooks::ChildRun::started(
+                        &envelope.session_key,
+                        envelope.run_id.as_deref(),
+                        "sessions_spawn",
+                        envelope.agent_id.as_deref(),
+                        task_history.last().map_or(0, |message| message.content.chars().count()),
+                    );
                     let loop_outcome = loop_cleanup
                         .run(crate::agent::turn_engine::run_turn(
                             &mut task_history,
@@ -457,6 +466,20 @@ pub(super) async fn run_sub_agent_task(
                             },
                         ))
                         .await;
+                    match &loop_outcome {
+                        Ok((outcome, _)) => child_events.finished(match outcome {
+                            crate::agent::turn_contracts::ToolLoopOutcome::Text(text) => text.chars().count(),
+                            crate::agent::turn_contracts::ToolLoopOutcome::AwaitingApproval { reply } => {
+                                reply.chars().count()
+                            }
+                            crate::agent::turn_contracts::ToolLoopOutcome::Silent { .. } => 0,
+                        }),
+                        Err(error) => child_events.failed(
+                            cancel_token_owned.is_cancelled()
+                                || crate::agent::turn_contracts::is_tool_loop_cancelled(error),
+                            &error.to_string(),
+                        ),
+                    }
                     let (outcome, trace) = match loop_outcome {
                         Ok(result) => result,
                         Err(error) => {
@@ -486,7 +509,7 @@ pub(super) async fn run_sub_agent_task(
                 }
                 .await;
                 (task_history, result)
-            }),
+            })),
         ));
         let _loop_abort = AbortLoopOnDrop(loop_handle.abort_handle());
 

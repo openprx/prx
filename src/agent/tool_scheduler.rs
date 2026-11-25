@@ -463,6 +463,7 @@ fn spawn_delegation_tool(
     let approval = crate::agent::channel_approval::current_installed();
     let memory = crate::memory::active_view::current();
     let provenance = crate::memory::write_provenance::installed();
+    let hook_identity = crate::hooks::current_identity();
     let spawn_context = crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
         .try_with(Clone::clone)
         .ok();
@@ -493,6 +494,14 @@ fn spawn_delegation_tool(
                             .scope(spawn_context, execute)
                             .await
                     }
+                    None => execute.await,
+                }
+            };
+            // The child's lifecycle events are the parent turn's events: the
+            // spawned task carries the parent's hook identity.
+            let execute = async move {
+                match hook_identity {
+                    Some(identity) => crate::hooks::identity_scope(identity, execute).await,
                     None => execute.await,
                 }
             };

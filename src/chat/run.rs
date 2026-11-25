@@ -364,6 +364,19 @@ async fn run_internal(
                 native_tools,
             );
             super::message_inbox::pin_epoch(&config, &chat_session_key).await?;
+            // The terminal session is open: a script learns its key here.
+            let session_opened_at = std::time::Instant::now();
+            hooks
+                .emit_for(
+                    &crate::hooks::HookIdentity::for_session_key(chat_session_key.clone(), "terminal"),
+                    HookEvent::SessionOpened,
+                    serde_json::json!({
+                        "resumed": session_id.is_some(),
+                        "surface": "terminal",
+                        "title": initial_session.title,
+                    }),
+                )
+                .await;
 
             #[cfg(feature = "terminal-tui")]
             let (initial_saved_session_entries, chat_mirror) =
@@ -1060,6 +1073,17 @@ async fn run_internal(
                     &session_turns_to_history(&chat_dispatcher.session_reader().acked().session),
                 )
             });
+            hooks
+                .emit_for(
+                    &crate::hooks::HookIdentity::for_session_key(chat_session_key.clone(), "terminal"),
+                    HookEvent::SessionEnded,
+                    serde_json::json!({
+                        "reason": "exit",
+                        "turns": chat_dispatcher.session_reader().acked().session.turns.len(),
+                        "duration_ms": u64::try_from(session_opened_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    }),
+                )
+                .await;
             let finished = startup::finish_chat_session(
                 &shutdown,
                 &dispatcher_stop,

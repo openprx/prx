@@ -1449,6 +1449,13 @@ impl DelegateLoopResources {
                 .analyze_turn(routing.runtime, &cancellation)
                 .await
         };
+        let child_events = crate::hooks::ChildRun::started(
+            &envelope.session_key,
+            envelope.run_id.as_deref(),
+            "delegate",
+            Some(agent_name),
+            history.last().map_or(0, |message| message.content.chars().count()),
+        );
         let result = loop_cleanup
             .run(Box::pin(crate::agent::turn_engine::run_turn(
                 &mut history,
@@ -1501,6 +1508,17 @@ impl DelegateLoopResources {
                 },
             )))
             .await;
+        match &result {
+            Ok((outcome, _)) => child_events.finished(match outcome {
+                crate::agent::turn_contracts::ToolLoopOutcome::Text(text) => text.chars().count(),
+                crate::agent::turn_contracts::ToolLoopOutcome::AwaitingApproval { reply } => reply.chars().count(),
+                crate::agent::turn_contracts::ToolLoopOutcome::Silent { .. } => 0,
+            }),
+            Err(error) => child_events.failed(
+                cancellation.is_cancelled() || crate::agent::turn_contracts::is_tool_loop_cancelled(error),
+                &error.to_string(),
+            ),
+        }
         let result = match result {
             Ok((outcome, trace)) => {
                 child_turn.project_history(history.len());

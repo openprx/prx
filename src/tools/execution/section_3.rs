@@ -496,7 +496,29 @@ impl ToolExecutionService {
                 &command.arguments,
                 &approval_channel,
             ));
+            crate::hooks::notify(
+                crate::hooks::HookEvent::ApprovalRequested,
+                serde_json::json!({"tool": descriptor.public_name, "call_id": command.operation_id}),
+            );
             let resolved = approval_resolution.await;
+            crate::hooks::notify(
+                crate::hooks::HookEvent::ApprovalDecided,
+                serde_json::json!({
+                    "tool": descriptor.public_name,
+                    "call_id": command.operation_id,
+                    "decision": if matches!(
+                        resolved,
+                        Some(
+                            crate::agent::turn_contracts::ApprovalDecision::Grant
+                                | crate::agent::turn_contracts::ApprovalDecision::GrantForSession
+                        )
+                    ) {
+                        "approved"
+                    } else {
+                        "denied"
+                    },
+                }),
+            );
             if !matches!(
                 resolved,
                 Some(

@@ -1295,6 +1295,16 @@ pub async fn post_session(
         tracing::error!(%error, "Failed to create Console session");
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to create session");
     }
+    let mut identity = crate::hooks::HookIdentity::for_session_key(session_id.clone(), "gateway");
+    identity.owner = Some(principal.owner_id.clone());
+    state
+        .hooks
+        .emit_for(
+            &identity,
+            crate::hooks::HookEvent::SessionOpened,
+            serde_json::json!({"resumed": false, "surface": "console", "title": null}),
+        )
+        .await;
     (
         StatusCode::CREATED,
         Json(serde_json::json!({"session_id": session_id, "status":"empty", "message_count":0})),

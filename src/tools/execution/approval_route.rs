@@ -2,6 +2,26 @@
 use super::{ToolApprovalDecision, ToolApprovalRequest, ToolExecutionService};
 impl ToolExecutionService {
     pub(super) async fn resolve_ordinary_approval(&self, request: ToolApprovalRequest) -> (ToolApprovalDecision, bool) {
+        let tool = request.descriptor.public_name.clone();
+        let call_id = request.command.operation_id.clone();
+        crate::hooks::notify(
+            crate::hooks::HookEvent::ApprovalRequested,
+            serde_json::json!({"tool": tool, "call_id": call_id}),
+        );
+        let resolved = self.resolve_ordinary_approval_inner(request).await;
+        let (decision, cause) = match &resolved.0 {
+            ToolApprovalDecision::Approved { .. } => ("approved", None),
+            ToolApprovalDecision::Denied { cause, .. } => ("denied", Some(cause.as_str())),
+            ToolApprovalDecision::Cancelled { .. } => ("cancelled", None),
+        };
+        crate::hooks::notify(
+            crate::hooks::HookEvent::ApprovalDecided,
+            serde_json::json!({"tool": tool, "call_id": call_id, "decision": decision, "cause": cause}),
+        );
+        resolved
+    }
+
+    async fn resolve_ordinary_approval_inner(&self, request: ToolApprovalRequest) -> (ToolApprovalDecision, bool) {
         if let Some(live) = request.context.live_turn.clone() {
             return (live.0.approve(request).await, false);
         }

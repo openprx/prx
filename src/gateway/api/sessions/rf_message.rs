@@ -228,7 +228,24 @@ pub(super) async fn post_keyed_session(
     let Some(key) = key.as_str().filter(|key| is_caller_session_key(key)) else {
         return field_invalid(SESSION_KEY_RULE);
     };
-    match state.mem.claim_conversation_session(key, &principal.owner_id).await {
+    let claim = state.mem.claim_conversation_session(key, &principal.owner_id).await;
+    if let Ok(claimed @ (crate::memory::SessionClaim::Created | crate::memory::SessionClaim::Existing)) = &claim {
+        let mut identity = crate::hooks::HookIdentity::for_session_key(key.to_string(), "gateway");
+        identity.owner = Some(principal.owner_id.clone());
+        state
+            .hooks
+            .emit_for(
+                &identity,
+                crate::hooks::HookEvent::SessionOpened,
+                serde_json::json!({
+                    "resumed": matches!(claimed, crate::memory::SessionClaim::Existing),
+                    "surface": "keyed",
+                    "title": null,
+                }),
+            )
+            .await;
+    }
+    match claim {
         Ok(crate::memory::SessionClaim::Created) => (
             StatusCode::CREATED,
             Json(KeyedSession {

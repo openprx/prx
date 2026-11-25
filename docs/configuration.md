@@ -2211,6 +2211,8 @@ them:
 workspace_hooks = "off"    # stop them
 ```
 
+The events, the JSON envelope each one is delivered in and the variables a
+script receives are listed under "Hooks System" in [tools.md](tools.md#hooks-system).
 The setting is read at every event, so turning it off stops hooks at once.
 Hooks run in the background, off the turn path (queued, delivered in order,
 dropped and counted when 1024 events are waiting). A child session
