@@ -231,7 +231,7 @@ impl SourceForms {
 /// The stored attachments of the session's own rows, by user event id, read
 /// with the principal the pool is read with. A failed read gives none (the
 /// reader logs it), so the match is then the plain-text match alone.
-async fn stored_attachments(mem: &dyn Memory, principal: &MemoryPrincipal) -> HashMap<String, Attachment> {
+pub(super) async fn stored_attachments(mem: &dyn Memory, principal: &MemoryPrincipal) -> HashMap<String, Attachment> {
     Transcript::new(mem, principal.clone())
         .replay_log()
         .await

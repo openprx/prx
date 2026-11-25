@@ -6,7 +6,9 @@ use super::handoff_note::{
     MAX_HANDOFF_MESSAGE_BYTES, context_handoff_lineage, format_context_handoff_message, validated_context_handoff_note,
 };
 use super::handoff_summary::summarize_cold_window;
-use super::provenance::{COMPACTION_PROVENANCE_EXACT_WITH_TOOL_ROUNDTRIPS, attach_compaction_event_provenance};
+use super::provenance::{
+    COMPACTION_PROVENANCE_EXACT_WITH_TOOL_ROUNDTRIPS, attach_compaction_event_provenance, stored_attachments,
+};
 use super::roundtrips::{
     RoundCompanions, compaction_boundary_without_orphan_tool_results, folded_tool_roundtrips,
     format_folded_tool_roundtrips_notice, switch_cold_window_end,
@@ -295,12 +297,24 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
             );
             return Ok(CompactionBuild::NotNeeded);
         }
+        // The stored attachments of the session's own rows (the same key the switch
+        // row is written to), so the summary reads each user message's own words. A
+        // failed read gives none, and the summary then reads the composed text.
+        let attachments = stored_attachments(
+            audit.memory.as_ref(),
+            &crate::memory::MemoryPrincipal {
+                legacy_session_key: None,
+                ..audit.memory_principal()
+            },
+        )
+        .await;
         // One model summary of the cold window, asked of this turn's own model. It
         // never fails the turn: a failed or empty call writes the note without one.
         let cold_summary = summarize_cold_window(
             provider,
             model,
             compacted_source_messages.unwrap_or_default(),
+            &attachments,
             config.max_context_tokens,
             &[],
             trigger,

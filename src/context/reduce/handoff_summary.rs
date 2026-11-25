@@ -13,8 +13,10 @@ use crate::agent::diagnostics::error_log_digest;
 use crate::agent::response_guard::strip_assistant_fabricated_tool_markers;
 use crate::agent::tool_evidence::strip_model_written_tool_evidence;
 use crate::agent::turn_contracts::TOOL_RESULTS_PREFIX;
+use crate::context::transcript::Attachment;
 use crate::providers::{ChatMessage, Provider};
 use crate::security::redaction::redact_secrets;
+use std::collections::HashMap;
 
 /// Lower bound of the source text the summary reads, in characters.
 const SOURCE_BUDGET_MIN_CHARS: usize = 4_000;
@@ -110,18 +112,21 @@ impl HandoffSummary {
 }
 
 /// Asks `provider` once, with `model`, for the summary of the cold window
-/// `cold`. `max_context_tokens` sizes the source text read; `extra_instructions`
-/// are appended to the system prompt, one per line. Never fails: a provider
-/// error is logged by its digest and reported as a failed summary.
+/// `cold`. `attachments` are the stored attachments of the session's rows, which
+/// let a user message be read as the user wrote it. `max_context_tokens` sizes
+/// the source text read; `extra_instructions` are appended to the system prompt,
+/// one per line. Never fails: a provider error is logged by its digest and
+/// reported as a failed summary.
 pub(crate) async fn summarize_cold_window(
     provider: &dyn Provider,
     model: &str,
     cold: &[ChatMessage],
+    attachments: &HashMap<String, Attachment>,
     max_context_tokens: usize,
     extra_instructions: &[String],
     trigger: &'static str,
 ) -> HandoffSummary {
-    let (source, source_cut) = build_cold_window_source(cold, source_budget_chars(max_context_tokens));
+    let (source, source_cut) = build_cold_window_source(cold, attachments, source_budget_chars(max_context_tokens));
     let source_chars = source.chars().count();
     let system = system_prompt(extra_instructions);
     let user = format!("Summarize the earlier conversation below so that the work can continue from it.\n\n{source}");
@@ -176,14 +181,21 @@ fn source_budget_chars(max_context_tokens: usize) -> usize {
 
 /// The cold window as `ROLE: text` blocks, one per message, bounded to
 /// `budget_chars` characters; with whether the bound cut it.
-fn build_cold_window_source(cold: &[ChatMessage], budget_chars: usize) -> (String, bool) {
-    let blocks: Vec<String> = cold.iter().map(render_cold_message).collect();
+fn build_cold_window_source(
+    cold: &[ChatMessage],
+    attachments: &HashMap<String, Attachment>,
+    budget_chars: usize,
+) -> (String, bool) {
+    let blocks: Vec<String> = cold
+        .iter()
+        .map(|message| render_cold_message(message, attachments))
+        .collect();
     let text = blocks.join("\n\n");
     let cut = text.chars().count() > budget_chars;
     (bound_chars(&text, budget_chars), cut)
 }
 
-fn render_cold_message(message: &ChatMessage) -> String {
+fn render_cold_message(message: &ChatMessage, attachments: &HashMap<String, Attachment>) -> String {
     if is_context_handoff_message(message) {
         return render_earlier_handoff(&message.content);
     }
@@ -206,7 +218,39 @@ fn render_cold_message(message: &ChatMessage) -> String {
     if message.role == "tool" || message.content.starts_with(TOOL_RESULTS_PREFIX) {
         return format!("TOOL: {}", cut_chars(message.content.trim(), TOOL_RESULT_MAX_CHARS));
     }
+    if message.role == "user" {
+        return format!("USER: {}", visible_user_text(&message.content, attachments).trim());
+    }
     format!("{}: {}", message.role.to_uppercase(), message.content.trim())
+}
+
+/// The text the user typed in a stored user message. The message was sent as
+/// `prefix + text + tail` with the attachment stored beside it, so the longest
+/// attachment whose prefix and tail both match is removed. No match leaves
+/// `content` unchanged. Prefix and tail match only at character boundaries, so
+/// the cut is always valid.
+fn visible_user_text<'a>(content: &'a str, attachments: &HashMap<String, Attachment>) -> &'a str {
+    let best = attachments
+        .values()
+        .filter(|attachment| !(attachment.prefix.is_empty() && attachment.tail.is_empty()))
+        .filter(|attachment| {
+            content.len() >= attachment.prefix.len() + attachment.tail.len()
+                && content.starts_with(attachment.prefix.as_str())
+                && content.ends_with(attachment.tail.as_str())
+        })
+        .max_by(|left, right| {
+            let left_len = left.prefix.len() + left.tail.len();
+            let right_len = right.prefix.len() + right.tail.len();
+            left_len
+                .cmp(&right_len)
+                .then_with(|| left.prefix.cmp(&right.prefix))
+                .then_with(|| left.tail.cmp(&right.tail))
+        });
+    let Some(attachment) = best else {
+        return content;
+    };
+    let end = content.len().saturating_sub(attachment.tail.len());
+    content.get(attachment.prefix.len()..end).unwrap_or(content)
 }
 
 /// An earlier handoff in the cold window: its summary when it has one, else its
