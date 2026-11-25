@@ -10,6 +10,8 @@ use super::roundtrips::{
     RoundCompanions, compaction_boundary_without_orphan_tool_results, folded_tool_roundtrips,
     format_folded_tool_roundtrips_notice, switch_cold_window_end,
 };
+#[cfg(test)]
+use super::summary::apply_compaction_patch_exact;
 use super::summary::{
     COMPACTION_MAX_SUMMARY_CHARS, MEMORY_FLUSH_MAX_CHARS, bounded_compaction_projection, build_compaction_audit_source,
     build_compaction_transcript, compaction_patch_guard_for, compaction_summary_fidelity_status,

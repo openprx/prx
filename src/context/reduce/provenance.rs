@@ -127,17 +127,17 @@ impl PoolRole {
 /// one durable source message. Its content is not kept.
 #[derive(Debug, Clone)]
 pub(crate) struct PoolRow {
-    id: i64,
-    event_id: String,
-    role: PoolRole,
+    pub(crate) id: i64,
+    pub(crate) event_id: String,
+    pub(crate) role: PoolRole,
     /// The row's run id when it is non-empty after trim.
-    run_id: Option<String>,
+    pub(crate) run_id: Option<String>,
     /// Indices of the durable source messages this row matches
     /// ([`persisted_forms`] of the same role).
-    matches: Vec<usize>,
+    pub(crate) matches: Vec<usize>,
     /// Position among every own user/assistant `message.created` row read, in
     /// id order: the store adjacency the contiguous seed is computed over.
-    store_rank: usize,
+    pub(crate) store_rank: usize,
 }
 
 /// One own `context.switch.created` row: the handoff messages it matches and
@@ -156,10 +156,10 @@ pub(crate) struct PoolSwitchRow {
 #[derive(Debug, Default)]
 pub(crate) struct CandidatePool {
     /// Matching `message.created` rows, sorted by id.
-    messages: Vec<PoolRow>,
-    switches: Vec<PoolSwitchRow>,
+    pub(crate) messages: Vec<PoolRow>,
+    pub(crate) switches: Vec<PoolSwitchRow>,
     /// Ids of every own user/assistant `message.created` row read.
-    message_ids: Vec<i64>,
+    pub(crate) message_ids: Vec<i64>,
 }
 
 /// The accepted persisted forms of every durable source message
@@ -170,7 +170,7 @@ pub(crate) struct SourceForms {
 }
 
 impl SourceForms {
-    fn new(messages: &[&ChatMessage]) -> Self {
+    pub(crate) fn new(messages: &[&ChatMessage]) -> Self {
         let mut by_role: HashMap<String, HashMap<String, Vec<usize>>> = HashMap::new();
         for (index, message) in messages.iter().enumerate() {
             let forms = by_role.entry(message.role.clone()).or_default();

@@ -25,8 +25,6 @@ use crate::agent::compaction::{
 #[cfg(test)]
 use crate::agent::context_budget::budgeted_request_tool_tokens;
 #[cfg(test)]
-use crate::agent::context_budget::trim_history_token_aware;
-#[cfg(test)]
 use crate::agent::context_budget::{APPENDED_SECTION_FRAMING_TOKENS, TOKEN_HEURISTIC_BUDGET_MULTIPLIER};
 use crate::agent::context_budget::{
     PRE_TURN_FLUSH_THRESHOLD, RequestToolSurfaceCounts, budgeted_tokens, estimate_budgeted_request_tokens,

@@ -6,22 +6,14 @@ use anyhow::Result;
 // The preflight phases live in `crate::context::reduce::preflight`; the unit
 // tests of this module reach them, and the items they use, through here.
 #[cfg(test)]
-use crate::agent::compaction::{
-    CompactionApply, apply_configurable_compaction_over_view, persist_context_switch_degradation,
-};
-#[cfg(test)]
-use crate::agent::context_budget::{
-    ContextBudgetSnapshot, budgeted_request_tool_tokens, budgeted_tokens, estimate_budgeted_request_tokens,
-    reserve_request_tool_surface, token_source_label, trim_history_to_context_budget,
-    trim_history_to_context_budget_preserving_compaction_replacement_with_floor,
-};
+use crate::agent::context_budget::ContextBudgetSnapshot;
 #[cfg(test)]
 use crate::agent::document_ingest::DocumentIngestRuntime;
 #[cfg(test)]
 use crate::agent::turn_history::TurnHistory;
 #[cfg(test)]
 pub(super) use crate::context::reduce::preflight::{
-    PreflightCompaction, preflight_config, preflight_durable_compaction, preflight_trim_projection,
+    preflight_config, preflight_durable_compaction, preflight_trim_projection,
 };
 #[cfg(test)]
 use crate::providers::Provider;
