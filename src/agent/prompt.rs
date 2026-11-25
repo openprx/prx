@@ -3,7 +3,7 @@
 //! order is the layout in `crate::context::layout`; this module keeps the
 //! public builder API over them.
 use crate::context::layout::{Layout, Slot};
-use crate::context::sources::CustomSection;
+use crate::context::sources::{CustomSection, DelegatedRoleSection};
 use anyhow::Result;
 
 pub use crate::context::layout::{CompiledSystemPrompt, PromptInputs as PromptContext, PromptSectionFingerprint, prompt_sha256};
@@ -82,6 +82,14 @@ impl SystemPromptBuilder {
         if !self.layout.has(Slot::ContextHandoff) {
             self.layout = self.layout.place(Box::new(ContextHandoffSection));
         }
+        self
+    }
+
+    /// The builder of a delegated child: the role and execution contract
+    /// follow the standard sections.
+    #[must_use]
+    pub(crate) fn with_delegated_role(mut self, role: &str) -> Self {
+        self.layout = self.layout.place(Box::new(DelegatedRoleSection::new(role)));
         self
     }
 

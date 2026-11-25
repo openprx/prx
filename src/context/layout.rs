@@ -28,8 +28,8 @@ pub struct PromptInputs<'a> {
 /// The place a segment takes in the system prompt. The declaration order is
 /// the layout order, and it is the order the prompt has always had: the
 /// fixed rule sections, then the skills index, the workspace line, the
-/// identity files, the time zone and the runtime line, then sections a caller
-/// adds.
+/// identity files, the time zone and the runtime line, then what a delegated
+/// role appends, then sections a caller adds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Slot {
     Task,
@@ -42,6 +42,7 @@ pub(crate) enum Slot {
     Identity,
     DateTime,
     Runtime,
+    DelegatedRole,
     Custom,
 }
 
@@ -59,6 +60,7 @@ impl Slot {
             Self::Identity => "identity",
             Self::DateTime => "datetime",
             Self::Runtime => "runtime",
+            Self::DelegatedRole => "delegated_role",
             Self::Custom => "custom",
         }
     }

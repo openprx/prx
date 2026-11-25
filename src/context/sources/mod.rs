@@ -3,6 +3,7 @@
 mod context_handoff;
 mod custom;
 mod datetime;
+mod delegated_role;
 mod identity;
 mod orchestration;
 mod runtime;
@@ -15,6 +16,7 @@ mod workspace;
 pub use context_handoff::ContextHandoffSection;
 pub(crate) use custom::CustomSection;
 pub use datetime::DateTimeSection;
+pub(crate) use delegated_role::DelegatedRoleSection;
 pub use identity::{BOOTSTRAP_MAX_CHARS, IdentitySection, build_identity_prompt};
 pub use orchestration::OrchestrationSection;
 pub use runtime::RuntimeSection;

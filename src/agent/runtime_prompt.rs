@@ -50,10 +50,8 @@ pub(crate) fn build_delegated_system_prompt(
     native_tools: bool,
     delegated_prompt: &str,
 ) -> String {
-    let runtime_prompt = build_runtime_system_prompt(config, model_name, skills, native_tools);
-    format!(
-        "{runtime_prompt}\n\n## Delegated Agent Instructions\n\n{delegated_prompt}\n\n## Execution Integrity\n\nWhen the delegated task requires reading, writing, running, or verifying files, perform those operations with the provided tools before reporting completion. Never claim that a file, command, or check succeeded unless the corresponding tool actually produced the result."
-    )
+    let builder = crate::agent::prompt::SystemPromptBuilder::with_defaults().with_delegated_role(delegated_prompt);
+    build_runtime_system_prompt_with(builder, config, model_name, skills, native_tools)
 }
 
 /// The system prompt of an interactive chat session. In a build whose chat
