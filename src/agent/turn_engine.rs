@@ -699,6 +699,10 @@ async fn run_turn_unguarded(
         turn_history.mark_inbound_middleware_applied();
     }
 
+    // The request this turn answers, as the view holds it now: the anchor
+    // that tells the reducers which tool results belong to the turn.
+    turn_history.anchor_live_request(history);
+
     let mut consecutive_failures: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut unrecoverable_failures: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
     let mut tool_summary_retry_attempted = false;

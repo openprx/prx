@@ -363,8 +363,18 @@ shared removal primitive and by the aggressive trim), and one repair pass,
 ladder (also where there is no compaction config), after the full-screen chat
 trim, and removes what is left: results without a call, rounds with a missing
 result or in the wrong place, and opening assistant text that is not a
-compaction note. It never removes a user message, is idempotent, scans once and
-allocates nothing for a valid list. When it changes anything it logs one info
+compaction note. A tool-call message that follows assistant text is removed
+wherever it stands (the loop writes assistant text only as the last message of
+a turn). It never removes a user message and is idempotent. On a valid list it
+makes one pass over the roles, parses each tool-call message once (its call
+ids, in a small vector) and counts the results behind it; tool results are
+parsed only when a round has more results than calls. A trim that took the
+turn's own request leaves its rounds, and the restore puts the request back
+directly after the system prompt and the notes a compaction wrote, so a
+surviving round follows a user message and never a note. After a replacing
+compaction the request returns at the tail, or in front of a tool round that
+heads what the compaction left. With as many results as calls the pass does not
+check that a result carries its call's id. When it changes anything it logs one info
 line with counts (`request repaired for the tool-call protocol`). The gateway
 replay does not replay the tool rounds of an assistant reply whose user message
 fell outside the 500-row read.
@@ -375,14 +385,19 @@ threshold of the budget (the one the handoff compaction also keys on), it
 replaces the oldest tool results of the view by the one-line stub, oldest
 first, and stops as soon as the request is under it. It never touches the
 results of the current turn (after the latest real user message) or of the
-newest three tool rounds before it (`KEEP_RECENT_TOOL_ROUNDS`; the
+newest three tool rounds before it (the turn starts at the request the loop
+recorded when it opened, or at the latest real user message when that is
+earlier; `KEEP_RECENT_TOOL_ROUNDS`; the
 `keep_recent_messages` setting counts messages, not rounds), nor a result that
 is already a stub. A stub keeps its message and call id, so the round stays
 whole; the stored rows are not modified. The stub names the tool, a status
 (`error` when the result text starts with `Error`, else `ok`), the size and how
 to get the output back: the stored document and `document_get_chunk` when the
 output was stored at record time, else a rerun of the tool. The wording is one
-function, `cleared_result_text`, shared with the terminal replay stub. A step
+function, `cleared_result_text`, shared with the terminal replay stub; it
+repeats a tool name only in the tool-name charset (at most 64 bytes) and a
+document id only as `tool-output:<tool>:<16 hex>` read from the result's
+trailing reference block, else the stub says the output is not kept. A step
 that clears emits `reduction_finished` with `step = "clear_tool_results"`.
 
 Steps that still run outside the ladder: the overflow retry (compaction, then a

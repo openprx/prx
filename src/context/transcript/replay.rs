@@ -272,11 +272,13 @@ impl ReplayLog {
             let event_id = turn.message_event_id.clone();
             // The rows are read newest first up to a cap, so the oldest turn
             // can be an assistant reply whose user message was cut: its tool
-            // rounds would open the history without a question.
+            // rounds would open the history without a question. The run is
+            // marked replayed either way, so a later reply of the same run
+            // does not replay the rounds out of their place.
             if turn.role == "assistant"
-                && !out.messages.is_empty()
                 && let Some(run_id) = event_id.as_deref().and_then(|id| self.run_of_event.get(id))
                 && replayed_runs.insert(run_id.as_str())
+                && !out.messages.is_empty()
                 && let Some(replay) = self.replay_of_run(run_id)
             {
                 out.push_replay(&replay);

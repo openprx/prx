@@ -742,6 +742,9 @@ pub(crate) struct TurnHistory {
     absorbed_view_len: usize,
     /// See [`Self::caller_rollover_current`].
     caller_rollover_current: bool,
+    /// The turn's own request as the view held it when the loop opened
+    /// ([`Self::anchor_live_request`]).
+    live_request: Option<ChatMessage>,
     /// The stored event of each message of the view the turn started on, when
     /// the caller knows them (see [`Self::with_history_event_ids`]).
     history_event_ids: Vec<Option<String>>,
@@ -771,12 +774,38 @@ impl TurnHistory {
         projection.keep_stored_handoffs = canonical.is_none();
         Self {
             caller_rollover_current: caller_rollover && canonical.is_some(),
+            live_request: newest_request(view),
             canonical,
             absorbed_view_len: view.len(),
             history_event_ids: Vec::new(),
             projection,
             #[cfg(feature = "wasm-plugins")]
             inbound_middleware_applied: false,
+        }
+    }
+
+    /// Record the request the turn answers as `view` holds it now. The loop
+    /// calls this once it opens, after the inbound middleware, so the anchor
+    /// is the request exactly as the provider view shows it.
+    pub(crate) fn anchor_live_request(&mut self, view: &[ChatMessage]) {
+        self.live_request =
+            crate::agent::history::latest_user_query_index(view).and_then(|index| view.get(index).cloned());
+    }
+
+    /// Where the turn's own request stands in `view`: the newest message equal
+    /// to the request recorded at loop open, or the latest real user message
+    /// ([`crate::agent::history::latest_user_query_index`]) when that is
+    /// older, so a user-role message a later step appended never moves the
+    /// start of the turn forward. `None` when the view holds neither.
+    pub(crate) fn current_turn_start(&self, view: &[ChatMessage]) -> Option<usize> {
+        let by_request = self.live_request.as_ref().and_then(|live| {
+            view.iter()
+                .rposition(|message| message.role == live.role && message.content == live.content)
+        });
+        let by_marker = crate::agent::history::latest_user_query_index(view);
+        match (by_request, by_marker) {
+            (Some(request), Some(marker)) => Some(request.min(marker)),
+            (request, marker) => request.or(marker),
         }
     }
 

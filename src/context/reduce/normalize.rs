@@ -27,8 +27,11 @@
 //! summary or handoff a compaction wrote is assistant text that opens the view
 //! by design and is kept.
 //!
-//! The scan is linear, allocates nothing when the list is valid, and a second
-//! run over its own output changes nothing.
+//! The scan is linear and a second run over its own output changes nothing. On
+//! a valid list its cost is one pass over the roles, one JSON parse of each
+//! tool-call message (its ids, in a small vector) and a count of the results
+//! behind it. Tool results are not parsed unless a round has more results than
+//! calls.
 
 use super::handoff_note::is_context_handoff_message;
 use crate::agent::turn_history::TurnHistory;
@@ -109,11 +112,21 @@ fn results_end(messages: &[ChatMessage], from: usize) -> usize {
 }
 
 /// Remove the tool-call message at `from` together with the tool results that
-/// follow it, as one unit, for as long as the message at `from` is one. A trim
-/// that took the user message in front of a round calls this so the round does
-/// not become the first message of the view without its question.
+/// follow it, as one unit, for as long as the message at `from` is one and a
+/// user message still lies later in the view. A trim that took the user
+/// message in front of a round calls this so the round does not become the
+/// first message of the view without its question.
+///
+/// When no user message is left, the cut took the turn's own request, and the
+/// caller puts it back above what is left (`restore_current_turn_request`):
+/// the rounds stay, because they are the work the turn has done.
 pub(crate) fn drop_leading_round_at(history: &mut Vec<ChatMessage>, from: usize) {
-    while history.get(from).is_some_and(is_tool_call_envelope) {
+    while history.get(from).is_some_and(is_tool_call_envelope)
+        && history
+            .iter()
+            .rposition(|message| message.role == "user")
+            .is_some_and(|user| user > from)
+    {
         let end = results_end(history, from.saturating_add(1));
         history.drain(from..end);
     }
@@ -121,7 +134,7 @@ pub(crate) fn drop_leading_round_at(history: &mut Vec<ChatMessage>, from: usize)
 
 /// Assistant text a compaction wrote to stand at the head of the view: the
 /// handoff note, the summary, the compaction note and the memory flush note.
-fn is_compaction_note(message: &ChatMessage) -> bool {
+pub(crate) fn is_compaction_note(message: &ChatMessage) -> bool {
     message.role == "assistant"
         && (is_context_handoff_message(message)
             || message.content.starts_with("[Compaction summary]")
@@ -140,34 +153,61 @@ enum Previous {
     Other,
 }
 
-/// Whether a round's results answer exactly its calls. A call or a result
-/// without an id cannot be matched: such a round is judged on having results
-/// at all.
-fn round_matches(messages: &[ChatMessage], results: &Range<usize>, calls: &[Option<String>]) -> RoundMatch {
-    if results.is_empty() {
-        return RoundMatch::Missing;
-    }
-    let mut result_ids: Vec<Option<String>> = Vec::with_capacity(results.len());
-    for message in messages.get(results.clone()).unwrap_or_default() {
-        result_ids.push(result_call_id(message));
-    }
-    if calls.iter().any(Option::is_none) || result_ids.iter().any(Option::is_none) {
-        return RoundMatch::Unverifiable;
-    }
-    if calls.iter().all(|call| result_ids.contains(call)) {
-        RoundMatch::Complete(result_ids)
-    } else {
-        RoundMatch::Missing
-    }
+/// What the results that follow a tool-call message say about its round.
+enum RoundMatch {
+    /// A call has no result, or the call ids repeat: the round goes.
+    Broken,
+    /// The round stands; these offsets (from the first result) are results
+    /// beyond what the calls need and go.
+    Whole(Vec<usize>),
 }
 
-enum RoundMatch {
-    /// A result is missing.
-    Missing,
-    /// Ids are absent on a side; the round is left as it is.
-    Unverifiable,
-    /// Every call is answered; the ids of the results, in order.
-    Complete(Vec<Option<String>>),
+/// Judge a round by what is cheap first. The number of results is compared
+/// with the number of calls, and a round with as many results as calls stands
+/// without a result being parsed: every reduction removes a message together
+/// with the results that follow it, so results of another call cannot take the
+/// place of a missing one. Only a surplus makes the ids of the results
+/// matter: with ids on both sides the results that answer no call go, without
+/// them the surplus at the end goes. Call ids that repeat make the round
+/// broken, since a result cannot say which call it answers.
+///
+/// What this cannot see: with as many results as calls, a result that carries
+/// another call's id, or no id, is not noticed.
+fn judge_round(messages: &[ChatMessage], results: &Range<usize>, calls: &[Option<String>]) -> RoundMatch {
+    let count = results.len();
+    if count < calls.len() {
+        return RoundMatch::Broken;
+    }
+    let has_repeat = calls
+        .iter()
+        .enumerate()
+        .any(|(at, id)| id.is_some() && calls.iter().skip(at.saturating_add(1)).any(|other| other == id));
+    if has_repeat {
+        return RoundMatch::Broken;
+    }
+    if count == calls.len() {
+        return RoundMatch::Whole(Vec::new());
+    }
+    let result_ids: Vec<Option<String>> = messages
+        .get(results.clone())
+        .unwrap_or_default()
+        .iter()
+        .map(result_call_id)
+        .collect();
+    if calls.iter().any(Option::is_none) || result_ids.iter().any(Option::is_none) {
+        return RoundMatch::Whole((calls.len()..count).collect());
+    }
+    if !calls.iter().all(|call| result_ids.contains(call)) {
+        return RoundMatch::Broken;
+    }
+    RoundMatch::Whole(
+        result_ids
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| !calls.contains(id))
+            .map(|(offset, _)| offset)
+            .collect(),
+    )
 }
 
 /// Scan `messages` and return the ranges to remove and what they are.
@@ -209,23 +249,29 @@ fn plan(messages: &[ChatMessage]) -> (Vec<Range<usize>>, Repair) {
                 };
                 let end = results_end(messages, next);
                 let results = next..end;
-                let answered = round_matches(messages, &results, &calls);
-                let misplaced = matches!(previous, Previous::Start | Previous::Assistant)
-                    && last_user.is_some_and(|user| user > index);
-                if matches!(answered, RoundMatch::Missing) || misplaced {
-                    remove.push(index..end);
-                    repair.broken_rounds = repair.broken_rounds.saturating_add(1);
-                } else {
-                    if let RoundMatch::Complete(result_ids) = answered {
-                        for (offset, id) in result_ids.iter().enumerate() {
-                            if id.as_ref().is_some_and(|id| calls.iter().all(|call| call.as_ref() != Some(id))) {
-                                let at = next.saturating_add(offset);
-                                remove.push(at..at.saturating_add(1));
-                                repair.orphan_results = repair.orphan_results.saturating_add(1);
-                            }
+                let judged = judge_round(messages, &results, &calls);
+                // A call follows a user message or tool results. After text,
+                // it is dropped wherever it stands: the loop writes assistant
+                // text only as the last message of a turn, so no live round
+                // follows one. At the head it needs a user message after it.
+                let misplaced = match previous {
+                    Previous::Assistant => true,
+                    Previous::Start => last_user.is_some_and(|user| user > index),
+                    Previous::User | Previous::ToolResult | Previous::Other => false,
+                };
+                match judged {
+                    RoundMatch::Whole(surplus) if !misplaced => {
+                        for offset in surplus {
+                            let at = next.saturating_add(offset);
+                            remove.push(at..at.saturating_add(1));
+                            repair.orphan_results = repair.orphan_results.saturating_add(1);
                         }
+                        previous = Previous::ToolResult;
                     }
-                    previous = Previous::ToolResult;
+                    RoundMatch::Whole(_) | RoundMatch::Broken => {
+                        remove.push(index..end);
+                        repair.broken_rounds = repair.broken_rounds.saturating_add(1);
+                    }
                 }
                 index = end;
             }

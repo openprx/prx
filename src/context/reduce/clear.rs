@@ -6,8 +6,9 @@
 //!
 //! What is never cleared:
 //!
-//! - the results of the current turn (everything after the latest real user
-//!   message), which the model is still working with;
+//! - the results of the current turn (everything from the turn's own request
+//!   on: [`TurnHistory::current_turn_start`]), which the model is still
+//!   working with;
 //! - the results of the newest [`KEEP_RECENT_TOOL_ROUNDS`] rounds before it.
 //!   A round is one assistant tool-call message and all its results. The
 //!   existing `keep_recent_messages` setting counts messages a handoff keeps
@@ -22,7 +23,6 @@ use super::normalize::is_tool_call_envelope;
 use super::preflight::preflight_config;
 use super::{Outcome, Reason, Reducer, Removed, Tier};
 use crate::agent::context_budget::{PRE_TURN_FLUSH_THRESHOLD, estimate_history_tokens, plan_context_budget};
-use crate::agent::history::latest_user_query_index;
 use crate::agent::turn_history::TurnHistory;
 use crate::hooks::HookEvent;
 use crate::providers::ChatMessage;
@@ -38,13 +38,54 @@ pub(crate) const KEEP_RECENT_TOOL_ROUNDS: usize = 3;
 /// The start of every stub. A result that holds it is already cleared.
 const CLEARED_PREFIX: &str = "[tool result cleared:";
 
-/// The one-line text a cleared result is replaced by, on every surface.
+/// The longest tool name a stub repeats.
+const MAX_STUB_TOOL_NAME_BYTES: usize = 64;
+
+/// A tool name as a stub may repeat it: the characters tool names are made of,
+/// at most [`MAX_STUB_TOOL_NAME_BYTES`]. Anything else is the model's or a
+/// tool's text and does not enter the next request.
+fn stub_tool_name(name: &str) -> Option<&str> {
+    let valid = !name.is_empty()
+        && name.len() <= MAX_STUB_TOOL_NAME_BYTES
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'));
+    valid.then_some(name)
+}
+
+/// A stored-document id as `tool_output_document_id` writes it:
+/// `tool-output:<tool name>:<16 lowercase hex digits>`, the tool name the one
+/// the stub names.
+fn is_tool_output_document_id(id: &str, tool: &str) -> bool {
+    let Some(rest) = id.strip_prefix("tool-output:") else {
+        return false;
+    };
+    let Some((name, digest)) = rest.rsplit_once(':') else {
+        return false;
+    };
+    name == tool
+        && digest.len() == 16
+        && digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// The one-line text a cleared result is replaced by, on every surface. The
+/// tool name and the document id are repeated only when they have the shape
+/// PRX writes them in; otherwise the name is `unknown` and the output is said
+/// not to be kept.
 pub(crate) fn cleared_result_text(tool: &str, status: &str, bytes: u64, document_id: Option<&str>) -> String {
-    let lookup = document_id.map_or_else(
-        || "the output is not kept in view; run the tool again if it is needed".to_owned(),
-        |id| format!("full output stored as document {id}, read it with document_get_chunk"),
-    );
-    format!("{CLEARED_PREFIX} tool {tool}, status {status}, {bytes} bytes; {lookup}]")
+    let tool = stub_tool_name(tool);
+    let status = if status == "error" { "error" } else { "ok" };
+    let lookup = document_id
+        .zip(tool)
+        .filter(|(id, tool)| is_tool_output_document_id(id, tool))
+        .map_or_else(
+            || "the output is not kept in view; run the tool again if it is needed".to_owned(),
+            |(id, _)| format!("full output stored as document {id}, read it with document_get_chunk"),
+        );
+    format!(
+        "{CLEARED_PREFIX} tool {}, status {status}, {bytes} bytes; {lookup}]",
+        tool.unwrap_or("unknown")
+    )
 }
 
 #[derive(Deserialize)]
@@ -80,18 +121,22 @@ fn tool_name_of(envelope: &ChatMessage, call_id: &str) -> Option<String> {
 }
 
 /// The id of the stored document a result points at, when its output was
-/// stored at record time.
+/// stored at record time: the reference block PRX appends as the last thing of
+/// the result. A block the tool's own output holds earlier is not read. The
+/// stub validates the id's shape.
 fn document_id_of(content: &str) -> Option<&str> {
-    let (_, rest) = content.split_once("[document_ingest_ref]")?;
-    let (_, rest) = rest.split_once("document_id: ")?;
-    let id = rest.lines().next()?.trim();
-    (!id.is_empty()).then_some(id)
+    let body = content.trim_end().strip_suffix("[/document_ingest_ref]")?;
+    let (_, block) = body.rsplit_once("[document_ingest_ref]")?;
+    block
+        .lines()
+        .find_map(|line| line.strip_prefix("document_id: "))
+        .map(str::trim)
 }
 
 /// The tool results the step may clear, oldest first, as (round envelope
 /// index, result index).
-fn candidates(view: &[ChatMessage]) -> Vec<(usize, usize)> {
-    let Some(current) = latest_user_query_index(view) else {
+fn candidates(view: &[ChatMessage], turn_history: &TurnHistory) -> Vec<(usize, usize)> {
+    let Some(current) = turn_history.current_turn_start(view) else {
         return Vec::new();
     };
     let mut rounds: Vec<(usize, Range<usize>)> = Vec::new();
@@ -153,7 +198,7 @@ fn clear_old_results(
     }
     let mut excess = budget.used_tokens.saturating_sub(budget.warning_threshold_tokens);
     let mut replacements: Vec<(usize, ChatMessage)> = Vec::new();
-    for (envelope, result) in candidates(view) {
+    for (envelope, result) in candidates(view, turn_history) {
         if excess == 0 {
             break;
         }
@@ -202,8 +247,8 @@ fn clear_old_results(
 
 /// Whether the view holds a tool result the step could clear. A cheap scan:
 /// the budget is only measured when this holds.
-fn has_candidates(view: &[ChatMessage]) -> bool {
-    view.iter().any(|message| message.role == "tool") && !candidates(view).is_empty()
+fn has_candidates(view: &[ChatMessage], turn_history: &TurnHistory) -> bool {
+    view.iter().any(|message| message.role == "tool") && !candidates(view, turn_history).is_empty()
 }
 
 /// Clear old tool results on every surface that runs the engine: before the
@@ -221,7 +266,7 @@ impl<'a> Reducer<PreTurn<'a>> for ClearOldResults {
     }
 
     fn applies(&self, state: &PreTurn<'a>) -> bool {
-        has_candidates(state.history)
+        has_candidates(state.history, state.turn_history)
     }
 
     async fn apply(&self, state: &mut PreTurn<'a>) -> Result<Outcome> {
@@ -241,7 +286,7 @@ impl<'a> Reducer<Round<'a>> for ClearOldResults {
     }
 
     fn applies(&self, state: &Round<'a>) -> bool {
-        has_candidates(state.history)
+        has_candidates(state.history, state.turn_history)
     }
 
     async fn apply(&self, state: &mut Round<'a>) -> Result<Outcome> {

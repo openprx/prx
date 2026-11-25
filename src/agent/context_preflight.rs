@@ -261,7 +261,20 @@ pub(crate) fn restore_current_turn_request(
     );
     let message = captured.restore_message.unwrap_or(captured.message);
     match position {
-        RestoredRequestPosition::Tail => history.push(message),
+        RestoredRequestPosition::Tail => {
+            // At the tail, unless a tool round heads what the compaction left
+            // after its notes: the request then goes in front of that round,
+            // so the round follows a user message.
+            let index = after_leading_compaction_notes(history);
+            if history
+                .get(index)
+                .is_some_and(crate::context::reduce::normalize::is_tool_call_envelope)
+            {
+                history.insert(index, message);
+            } else {
+                history.push(message);
+            }
+        }
         RestoredRequestPosition::AboveEverythingLeftStanding => {
             // `history_non_system_start` inspects `history[0]` only, so "the
             // front of the non-system region" is exact for the leading system
@@ -273,11 +286,33 @@ pub(crate) fn restore_current_turn_request(
             // prepared copy before the request is serialized — without that
             // pass this insert would hand a strict template a system message
             // that is not the first transcript item.
-            let index = history_non_system_start(history).min(history.len());
+            //
+            // The notes a compaction wrote stay above the request: a tool
+            // round that survived follows the request, never the note (a
+            // function call after a model text turn is rejected by strict
+            // providers).
+            let index = after_leading_compaction_notes(history).min(history.len());
             history.insert(index, message);
         }
     }
     true
+}
+
+/// The position right after the system prompt and the notes a compaction wrote
+/// at the head of the view (the handoff, summary or compaction note, and the
+/// refresh aside).
+fn after_leading_compaction_notes(history: &[ChatMessage]) -> usize {
+    let mut index = history_non_system_start(history);
+    while history.get(index).is_some_and(|message| {
+        crate::context::reduce::normalize::is_compaction_note(message)
+            || (message.role == "user"
+                && message
+                    .content
+                    .starts_with(crate::agent::turn_contracts::POST_COMPACTION_REFRESH_MARKER))
+    }) {
+        index = index.saturating_add(1);
+    }
+    index
 }
 
 /// Reject a request that cannot fit even after removing every older turn.
