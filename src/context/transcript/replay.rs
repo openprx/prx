@@ -482,14 +482,13 @@ pub(crate) fn stub_replayed_results(
     fit_results(view, &found, &[], std::slice::from_ref(request), config)
 }
 
-/// The one-line text a cleared result is replaced by.
+/// The one-line text a cleared result is replaced by; one wording on every
+/// surface (see `context::reduce::clear`).
 fn stub_text(result: &ReplayedResult) -> String {
-    let lookup = result.document_id.as_ref().map_or_else(
-        || "the output is not kept in view; run the tool again if it is needed".to_owned(),
-        |id| format!("full output stored as document {id}, read it with document_get_chunk"),
-    );
-    format!(
-        "[tool result cleared: tool {}, status {}, {} bytes; {lookup}]",
-        result.tool, result.status, result.bytes
+    crate::context::reduce::clear::cleared_result_text(
+        &result.tool,
+        &result.status,
+        result.bytes,
+        result.document_id.as_deref(),
     )
 }

@@ -314,3 +314,30 @@ a `turn.appended` user-role row whose text starts with
 `[message from spawn:<run id>/<agent>]`, followed by the woken turn's events.
 No configuration change or schema migration is needed.
 
+## Old tool results are cleared first on every surface, and trims keep tool rounds whole
+
+Before this change only terminal line-mode chat replaced old replayed tool
+results by a one-line stub (`[tool result cleared: tool <name>, status
+<status>, <n> bytes; ...]`) ahead of compaction. Every surface that runs the
+engine with a compaction config now does it: the Console, the gateway and rf
+sessions, channels, scheduled runs, task and process children, `prx agent` and
+full-screen chat. At the start of a turn and on each provider round, while the
+request is over the warning threshold, the oldest tool results of the request
+are stubbed, oldest first, until it fits; the results of the current turn and of
+the newest three tool rounds are never stubbed. The effect on those surfaces: a
+request that used to go to a handoff compaction or a lossy trim stays whole
+more often, and a stubbed result tells the model how to read it again (the
+stored document, or a rerun of the tool). Stored rows are unchanged; only the
+request differs. `reduction_finished` is emitted with `step =
+"clear_tool_results"`.
+
+A trim that cuts the request now removes a tool round (the assistant tool-call
+message and its results) as one unit, and a repair pass runs once per provider
+round after the reduction steps. A request that used to open on an assistant
+tool-call message, or hold a round without its results, which strict providers
+(the Gemini family) rejected with `function call turn comes immediately after a
+user turn or after a function response turn`, is repaired and logged
+(`request repaired for the tool-call protocol`). The gateway replay no longer
+replays the tool rounds of the oldest assistant reply when its user message is
+outside the 500 rows read.
+

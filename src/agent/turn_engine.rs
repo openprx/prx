@@ -78,6 +78,7 @@ use crate::agent::turn_contracts::{
 };
 use crate::agent::turn_history::{TurnHistory, same_messages};
 use crate::agent::turn_request::{ToolLoopMemory, TurnDecision, TurnDelivery, TurnRequest, TurnSchedule, TurnServices};
+use crate::context::reduce::clear::ClearOldResults;
 use crate::context::reduce::compact::{PreTurnCompact, RoundCompact};
 use crate::context::reduce::engine::{
     AfterTools, PreTurn, Round, Services, history_before_change, report_durable_compaction,
@@ -672,7 +673,7 @@ async fn run_turn_unguarded(
                 rederive: rederive_boxed,
             },
         };
-        Box::pin(ladder(&[&PreTurnCompact], &mut pre_turn)).await?;
+        Box::pin(ladder(&[&ClearOldResults, &PreTurnCompact], &mut pre_turn)).await?;
     }
 
     // One inbound middleware pass per user turn. Every TUI, CLI, gateway, and
@@ -930,7 +931,7 @@ async fn run_turn_unguarded(
                 compaction: PreflightCompaction::default(),
                 budget: None,
             };
-            Box::pin(ladder(&[&RoundCompact, &RoundTrim], &mut round)).await?;
+            Box::pin(ladder(&[&ClearOldResults, &RoundCompact, &RoundTrim], &mut round)).await?;
             round.budget.map(|budget| {
                 (
                     budget.used_tokens,

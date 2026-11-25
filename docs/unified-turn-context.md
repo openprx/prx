@@ -315,7 +315,7 @@ each surface lists the reducers it runs.
 
 | Tier | Meaning | Reducers today |
 |---|---|---|
-| `Clear` | replace replayed tool results in the view by a stub; the log is untouched | `StubReplayed` |
+| `Clear` | replace old tool results in the view by a stub; the log is untouched | `StubReplayed` (terminal line mode, replayed results), `ClearOldResults` (every surface that runs the engine) |
 | `Handoff` | move old turns out of the window behind a handoff note or summary | `PreTurnCompact`, `RoundCompact` |
 | `Trim` | drop messages from this request's view; the last resort | `RoundTrim`, `MidTurnTrim` |
 
@@ -323,7 +323,7 @@ Offloading an oversized tool result to a stored document happens once, when the
 result is recorded (`src/agent/tool_result_recording.rs`), and is not a step of
 the ladder.
 
-Files: `mod.rs` (trait, tiers, report, `ladder`), `stub_replayed.rs`,
+Files: `mod.rs` (trait, tiers, report, `ladder`), `stub_replayed.rs`, `clear.rs`, `normalize.rs`,
 `compact.rs`, `trim.rs`, `engine.rs` (the loop's step states and the report of a
 durable compaction), `preflight.rs` (the durable and the projection phase of the
 provider preflight), and the former `agent::compaction` code split by
@@ -335,7 +335,7 @@ Which surface runs which step, in order (the order is today's behaviour):
 
 | Surface | Before the loop | Each provider round | After a round's tool results |
 |---|---|---|---|
-| Console, rf, channels, scheduled runs, task and process children, `prx agent` | `PreTurnCompact` | `RoundCompact`, `RoundTrim` | `MidTurnTrim` |
+| Console, rf, channels, scheduled runs, task and process children, `prx agent` | `ClearOldResults`, `PreTurnCompact` | `ClearOldResults`, `RoundCompact`, `RoundTrim`, then the protocol repair | `MidTurnTrim` |
 | Terminal chat, line mode | `StubReplayed`, then the chat preflight compaction (not yet a reducer) | as above, inside the engine | as above |
 | Terminal chat, full-screen | the dispatcher rollover and trim (not yet a reducer) | as above, inside the engine | as above |
 
@@ -368,6 +368,22 @@ allocates nothing for a valid list. When it changes anything it logs one info
 line with counts (`request repaired for the tool-call protocol`). The gateway
 replay does not replay the tool rounds of an assistant reply whose user message
 fell outside the 500-row read.
+
+`ClearOldResults` (`clear.rs`) is the first step on every surface that runs the
+engine and has a compaction config. While the request is over the warning
+threshold of the budget (the one the handoff compaction also keys on), it
+replaces the oldest tool results of the view by the one-line stub, oldest
+first, and stops as soon as the request is under it. It never touches the
+results of the current turn (after the latest real user message) or of the
+newest three tool rounds before it (`KEEP_RECENT_TOOL_ROUNDS`; the
+`keep_recent_messages` setting counts messages, not rounds), nor a result that
+is already a stub. A stub keeps its message and call id, so the round stays
+whole; the stored rows are not modified. The stub names the tool, a status
+(`error` when the result text starts with `Error`, else `ok`), the size and how
+to get the output back: the stored document and `document_get_chunk` when the
+output was stored at record time, else a rerun of the tool. The wording is one
+function, `cleared_result_text`, shared with the terminal replay stub. A step
+that clears emits `reduction_finished` with `step = "clear_tool_results"`.
 
 Steps that still run outside the ladder: the overflow retry (compaction, then a
 budget trim or an aggressive trim), the OS-paging eviction, the dispatcher

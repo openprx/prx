@@ -16,6 +16,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 pub(crate) mod audit;
+pub(crate) mod clear;
 pub(crate) mod compact;
 pub(crate) mod engine;
 pub(crate) mod handoff_note;
