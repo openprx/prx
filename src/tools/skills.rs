@@ -1434,7 +1434,7 @@ impl SkillExecuteTool {
                 .await;
         }
 
-        let prefix = Self::environment_prefix(&arguments);
+        let prefix = self.with_call_location(Self::environment_prefix(&arguments));
         let command = if tool.kind.eq_ignore_ascii_case("shell") {
             if prefix.is_empty() {
                 tool.command.clone()

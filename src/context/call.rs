@@ -112,3 +112,11 @@ pub(crate) fn owner_id() -> Option<Arc<str>> {
         .ok()
         .flatten()
 }
+
+/// The workspace root of the current call, when a call context is set.
+pub(crate) fn workspace_root() -> Option<PathBuf> {
+    CURRENT
+        .try_with(|call| call.as_ref().map(|call| call.place.workspace_root.clone()))
+        .ok()
+        .flatten()
+}

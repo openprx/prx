@@ -202,6 +202,10 @@ off after the upgrade, set it to `false` again once the reset has run. No databa
 
 Runs started by the install's own schedulers (Xin, cron and the heartbeat tasks) for the local operator now count as the configured `[skills_lifecycle] owner_scope` for the skill lifecycle store: `skills_manage` status and list actions and `skill_execute` of a managed skill work in those runs. Jobs created by remote principals and owner-isolated origins keep the owner-mismatch refusal. No configuration change is needed.
 
+## Skill processes know the call's directory
+
+Shell-kind and script-kind skill processes now get `PRX_WORKDIR` (the working directory of the calling agent) and `PRX_WORKSPACE` (its workspace root) as absolute paths. A skill that never reads them is unaffected, and the process working directory is unchanged. A managed skill call by a named agent whose level differs from the main agent's is now judged at the named agent's level for its tool grant and run identity. No configuration change is needed.
+
 ## A changed tool registry no longer fails a running turn
 
 When the live tool registry changes during a turn (for example `skills_manage` imports an executable skill), the turn now completes on its pinned tool surface instead of failing with `catalog and execution registry differ`. The next turn is published from the live registry, so the new skill is offered and runnable then. Worker-process and child parity checks are unchanged. No configuration change is needed.

@@ -382,6 +382,14 @@ SL11 adds reviewed executable revisions: a bundle with scripts or declared
   evaluation sandbox) the script instead gets the environment of the Full shell
   tool: every variable except the stripped secrets, with the real `HOME`.
   Unmanaged shell callers are unchanged.
+- **Call location.** Every shell-kind and script-kind skill process, managed
+  or not, finds two absolute paths exported at the start of its command:
+  `PRX_WORKDIR`, the working directory of the call that started it (the
+  agent's working directory, `[runtime] workdir` when set), and
+  `PRX_WORKSPACE`, the workspace root of that call. Without a call context
+  (operator and job dispatch) both are the workspace the tool was built with.
+  The process itself still starts in its skill root, or in the staged run
+  directory of a managed run. The two values are paths only.
 - **Process containment.** The call uses the existing shell/HTTP adapters.
   Managed shell/script runs have a five-minute deadline and joined cleanup:
   the process group is ended when the leader exits, times out or is cancelled;

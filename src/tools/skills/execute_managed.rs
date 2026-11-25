@@ -47,6 +47,22 @@ pub(super) fn checked_run_owner(site: &'static str, args: &serde_json::Value) ->
 }
 
 impl SkillExecuteTool {
+    /// `exports` followed by the call's location for the skill process:
+    /// `PRX_WORKDIR` (the call's working directory) and `PRX_WORKSPACE` (its
+    /// workspace root), both absolute. Without a call context they are the
+    /// workspace this tool was built with. Paths only; nothing from the
+    /// parent environment enters here.
+    pub(super) fn with_call_location(&self, exports: String) -> String {
+        let absolute = |path: PathBuf| std::path::absolute(&path).unwrap_or(path);
+        let workdir = absolute(crate::context::call::working_dir().unwrap_or_else(|| self.workspace_dir.clone()));
+        let workspace = absolute(crate::context::call::workspace_root().unwrap_or_else(|| self.workspace_dir.clone()));
+        format!(
+            "export PRX_WORKDIR={} PRX_WORKSPACE={}; {exports}",
+            Self::shell_quote(&workdir.display().to_string()),
+            Self::shell_quote(&workspace.display().to_string()),
+        )
+    }
+
     /// Refuses a call that would take the legacy path for a skill the
     /// lifecycle manages in the configured owner's store: only a skill that is
     /// not managed at all may run unpinned. A store that cannot be read is a
