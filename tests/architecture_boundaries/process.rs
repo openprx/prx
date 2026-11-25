@@ -183,8 +183,8 @@ fn shell_entrypoints_delegate_process_execution_to_shared_adapter() {
 /// the policy before running any action.
 #[test]
 fn workspace_hooks_launch_through_the_shared_builder_behind_the_opt_in() {
-    let source = fs::read_to_string(repository_root().join("src/hooks/mod.rs"))
-        .unwrap_or_else(|error| panic!("read src/hooks/mod.rs: {error}"));
+    let source = fs::read_to_string(repository_root().join("src/hooks/launch.rs"))
+        .unwrap_or_else(|error| panic!("read src/hooks/launch.rs: {error}"));
     let production = production_part(&source);
     let runner = function_body(&production, "run_action");
     for required in [
@@ -198,11 +198,13 @@ fn workspace_hooks_launch_through_the_shared_builder_behind_the_opt_in() {
     assert_eq!(
         production.matches("Command::new(").count(),
         1,
-        "src/hooks/mod.rs builds a process command outside run_action"
+        "src/hooks/launch.rs builds a process command outside run_action"
     );
     // `emit` only queues; the background `deliver` runs the hooks and checks
     // the opt-in at delivery time.
-    let deliver = function_body(&production, "deliver");
+    let core_source = fs::read_to_string(repository_root().join("src/hooks/hook_core.rs"))
+        .unwrap_or_else(|error| panic!("read src/hooks/hook_core.rs: {error}"));
+    let deliver = function_body(&production_part(&core_source), "deliver");
     assert!(
         deliver.contains("self.workspace_policy()"),
         "deliver must check the opt-in"
@@ -274,7 +276,7 @@ const ALLOWED_PROCESS_COMMANDS: &[&str] = &[
     "src/chat/terminal_proto.rs::copy_to_tmux_buffer::let mut child = Command::new(\"tmux\")",
     "src/doctor/mod.rs::check_command_available::match std::process::Command::new(cmd)",
     "src/doctor/mod.rs::disk_available_mb::let output = std::process::Command::new(\"df\").arg(\"-m\").arg(path).output().ok()?;",
-    "src/hooks/mod.rs::run_action::let mut cmd = Command::new(&program);",
+    "src/hooks/launch.rs::run_action::let mut cmd = Command::new(&program);",
     "src/media/mod.rs::run_command_bounded::let mut child = tokio::process::Command::new(command)",
     "src/memory/lucid.rs::run_lucid_command_raw::let mut cmd = Command::new(lucid_cmd);",
     "src/nodes/server.rs::execute_shell_command::let mut cmd = Command::new(&parsed_command.program);",
