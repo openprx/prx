@@ -279,3 +279,24 @@ the text of the deleted message (at least 12 characters, first 64 compared,
 same session only). Attachments that quote only a memory that still exists are
 not touched by a plain delete. No schema migration, no sync-stream change and
 no change to the session routes' JSON.
+
+## A process child no longer fails after a configuration write
+
+On a running gateway or chat, `prx config apply` (and any other write of the
+configuration files) left every later process-mode child failing at start,
+with an empty worker log, until the parent was restarted. The parent compared
+the disk revision of the configuration (including its write counter) with the
+revision its active generation was activated from; a write that did not change
+the effective values, such as restoring the same bytes, advanced the first and
+not the second. The comparison is replaced by the check that carries the
+integrity: the worker must reproduce the parent's sealed effective
+configuration. A change on disk that the parent has not activated (a field that
+needs a restart) still refuses the child, now with the code `config_changed`.
+
+A worker that refuses to start now says why: the refusal is one of
+`manifest_invalid`, `protocol_version_mismatch`, `config_generation_mismatch`,
+`config_changed` or `config_source_mismatch`; it leads the run's failure text,
+is a `reason` field in the worker's and the parent's log lines, and is written
+to the worker log (`logs/workers/<run id>.log`) even when the parent itself
+refuses the launch after the spawn. The previous text `configuration_changed`
+is now `config_changed`. No configuration change or schema migration is needed.

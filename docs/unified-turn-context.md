@@ -131,6 +131,30 @@ worker of different builds refuse each other with a "protocol version
 mismatch" error naming both versions, instead of reading a manifest they do not
 share. A manifest without a call context is refused the same way.
 
+Configuration binding: the manifest seals the parent's effective configuration
+(keyed digest over the whole effective value, its working root and its source
+revision). The worker loads the configuration from disk and accepts it only
+when that value reproduces the seal; the disk revision (file digest and write
+counter) is not compared with the parent's recorded revision, because it moves
+on with every configuration write while the parent's active generation keeps
+the revision it was activated from when the effective value did not change.
+The digest of the configuration files that the parent computes at spawn is
+still compared with what the worker reads at start and after loading
+(`config_generation_mismatch`), so a file changed between the spawn and the
+worker's load is refused. A forged or altered seal is refused as before.
+
+Refusal reasons: a worker (or the parent on its behalf) that refuses a launch
+reports a short code instead of free text only: `manifest_invalid`,
+`protocol_version_mismatch`, `config_generation_mismatch`, `config_changed`
+and `config_source_mismatch`. The code leads the worker's reported error (so it
+leads the run's failure text that the model reads), is a `reason` field on the
+worker's own stderr line and on the parent's `sub-agent process ended with an
+error` / `sub-agent process worker refused to start` lines, and is written to
+the worker log by the parent when the parent itself refuses after the spawn
+(`[parent] launch refused before the worker started: reason=...`). Capture of
+the worker's stderr starts before the manifest is written, and a worker that
+has already closed its stdin is classified from its own output.
+
 Worker logs: the worker installs a tracing subscriber that writes to stderr
 (stdout is the IPC channel and stays clean; `RUST_LOG` applies, default
 `info`). The parent keeps what the worker writes to stderr, line by line and

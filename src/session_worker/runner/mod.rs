@@ -21,6 +21,7 @@ use self::steering::spawn_stdin_control_reader;
 use self::validate::{validate_worker_cli_overrides, validate_worker_manifest_with_capability_env};
 use crate::config::Config;
 use crate::session_worker::protocol::{WorkerManifest, WorkerResult};
+use crate::session_worker::refusal::{self, WorkerRefusalReason};
 use crate::tools::sessions_spawn::STEER_CHANNEL_CAPACITY;
 use anyhow::{Context, Result};
 use std::sync::Arc;
@@ -50,7 +51,7 @@ async fn run_manifest(
     // so it cannot leak to any grandchild process or be re-read after boot.
     let validation = validate_worker_manifest_with_capability_env(&manifest, env_capability.as_deref());
     scrub_capability_env();
-    let transport = validation?;
+    let transport = validation.map_err(refusal::tag(WorkerRefusalReason::ManifestInvalid))?;
     #[cfg(feature = "test-mock")]
     super::mailbox_harness::install_worker_model(&manifest)?;
     let (mailbox_tx, mailbox_rx) = if read_stdin_control_frames {
@@ -186,14 +187,19 @@ pub async fn run_from_stdin(
     let manifest: WorkerManifest = match parse_worker_manifest_line(raw.trim()) {
         Ok(value) => value,
         Err(error) => {
-            tracing::error!(error = %crate::agent::diagnostics::error_class(&error), "session worker refused its manifest");
+            let reason: WorkerRefusalReason = refusal::reason_of(&error).unwrap_or(WorkerRefusalReason::ManifestInvalid);
+            tracing::error!(
+                reason = %reason,
+                error = %crate::agent::diagnostics::error_class(&error),
+                "session worker refused its manifest"
+            );
             let result = WorkerResult {
                 denials: Vec::new(),
                 ordinary_completion: None,
                 operator_completion: None,
                 success: false,
                 output: String::new(),
-                error: Some(format!("Invalid worker manifest JSON: {error:#}")),
+                error: Some(format!("{}: Invalid worker manifest JSON: {error:#}", reason.code())),
                 tokens_used: None,
                 cancelled: false,
             };
@@ -215,14 +221,20 @@ pub async fn run_from_stdin(
         parsed_tools.as_deref(),
         explicit_config_dir.as_deref(),
     ) {
-        tracing::error!(error = %crate::agent::diagnostics::error_class(&error), "session worker refused its overrides");
+        let error = refusal::tag(WorkerRefusalReason::ManifestInvalid)(error);
+        let reason: WorkerRefusalReason = refusal::classify(&error);
+        tracing::error!(
+            reason = %reason,
+            error = %crate::agent::diagnostics::error_class(&error),
+            "session worker refused its overrides"
+        );
         let result = WorkerResult {
             denials: Vec::new(),
             ordinary_completion: None,
             operator_completion: None,
             success: false,
             output: String::new(),
-            error: Some(format!("{error:#}")),
+            error: Some(refusal::describe(&error)),
             tokens_used: None,
             cancelled: false,
         };
@@ -233,7 +245,12 @@ pub async fn run_from_stdin(
     let result = match run_manifest(manifest, true, explicit_config_dir.as_deref()).await {
         Ok(result) => result,
         Err(error) => {
-            tracing::error!(error = %crate::agent::diagnostics::error_class(&error), "session worker failed");
+            let reason: WorkerRefusalReason = refusal::classify(&error);
+            tracing::error!(
+                reason = %reason,
+                error = %crate::agent::diagnostics::error_class(&error),
+                "session worker failed"
+            );
             if let Some(failure) = error.downcast_ref::<super::startup_failure::AuthenticatedStartupFailure>() {
                 return write_worker_result(failure.envelope());
             }
@@ -243,7 +260,7 @@ pub async fn run_from_stdin(
                 operator_completion: None,
                 success: false,
                 output: String::new(),
-                error: Some(format!("{error:#}")),
+                error: Some(refusal::describe(&error)),
                 tokens_used: None,
                 cancelled: false,
             }

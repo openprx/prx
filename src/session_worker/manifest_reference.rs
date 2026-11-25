@@ -207,12 +207,16 @@ pub(crate) fn restore(
     let envelope: Envelope = serde_json::from_value(value)?;
     let reference = envelope.worker_manifest_reference;
     let body = &reference.body;
-    anyhow::ensure!(
-        body.version == REFERENCE_VERSION,
-        "session-worker protocol version mismatch: manifest reference version {} (this build requires {REFERENCE_VERSION}); \
-         parent and worker must be the same build",
-        body.version
-    );
+    if body.version != REFERENCE_VERSION {
+        return Err(crate::session_worker::refusal::refusal(
+            crate::session_worker::refusal::WorkerRefusalReason::ProtocolVersionMismatch,
+            format!(
+                "session-worker protocol version mismatch: manifest reference version {} (this build requires {REFERENCE_VERSION}); \
+                 parent and worker must be the same build",
+                body.version
+            ),
+        ));
+    }
     hmac::verify(key, &signing_bytes(body)?, &reference.seal)
         .map_err(|_| anyhow::anyhow!("worker manifest reference signature is invalid"))?;
     // The existing process channel binds this reference to this launch. No

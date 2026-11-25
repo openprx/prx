@@ -479,30 +479,46 @@ pub(super) async fn run_sub_agent_process(
         process_group.protocol_diagnostic = Some(Arc::clone(&control.diagnostic));
     }
     let owned_phase = async {
-        if let Some(generation) = &ordinary_generation {
-            process_terminal::ordinary::launch::persist(
-                source_fabric.context("ordinary launch source storage missing")?,
-                &manifest,
-                generation,
-                source_transport_key
-                    .as_ref()
-                    .context("ordinary launch transport key missing")?,
-                child.id().context("ordinary worker PID unavailable before launch")?,
-                batch_id,
-            )
-            .await?;
+        // Anything that refuses the launch after the spawn leaves its reason in
+        // the worker's log before the worker is torn down: there is no worker
+        // output to capture then, and an empty log would say nothing.
+        let mut worker_log = worker_log;
+        let launch_recorded: anyhow::Result<()> = async {
+            if let Some(generation) = &ordinary_generation {
+                process_terminal::ordinary::launch::persist(
+                    source_fabric.context("ordinary launch source storage missing")?,
+                    &manifest,
+                    generation,
+                    source_transport_key
+                        .as_ref()
+                        .context("ordinary launch transport key missing")?,
+                    child.id().context("ordinary worker PID unavailable before launch")?,
+                    batch_id,
+                )
+                .await?;
+            }
+            if let Some(generation) = &operator_generation {
+                process_terminal::operator::launch::persist(
+                    source_fabric.context("operator launch source storage missing")?,
+                    &manifest,
+                    generation,
+                    source_transport_key
+                        .as_ref()
+                        .context("operator launch transport key missing")?,
+                    child.id().context("operator worker PID unavailable before launch")?,
+                )
+                .await?;
+            }
+            Ok(())
         }
-        if let Some(generation) = &operator_generation {
-            process_terminal::operator::launch::persist(
-                source_fabric.context("operator launch source storage missing")?,
-                &manifest,
-                generation,
-                source_transport_key
-                    .as_ref()
-                    .context("operator launch transport key missing")?,
-                child.id().context("operator worker PID unavailable before launch")?,
-            )
-            .await?;
+        .await;
+        if let Err(error) = launch_recorded {
+            if let Some(log) = worker_log.as_mut() {
+                let reason = crate::session_worker::refusal::reason_of(&error)
+                    .map_or("launch_record_failed", crate::session_worker::refusal::WorkerRefusalReason::code);
+                log.note(&format!("launch refused before the worker started: reason={reason}")).await;
+            }
+            return Err(error);
         }
         #[cfg(test)]
         if let Some(control) = protocol {

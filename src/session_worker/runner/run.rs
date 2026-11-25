@@ -26,6 +26,7 @@ use crate::runtime::child_source::completion::ChildCompletionPort;
 use crate::security::policy::ResourceRiskLevel;
 use crate::security::{SecurityPolicy, SideEffectGate};
 use crate::session_worker::protocol::{WorkerManifest, WorkerResult, config_source_generation};
+use crate::session_worker::refusal::{self, WorkerRefusalReason};
 use crate::tools;
 use crate::tools::sessions_spawn::steering_instruction;
 use anyhow::{Context, Result};
@@ -319,7 +320,8 @@ async fn run_owned_manifest(
     transport
         .as_ref()
         .context("worker source requires authenticated transport")?
-        .verify_manifest(&manifest)?;
+        .verify_manifest(&manifest)
+        .map_err(refusal::tag(WorkerRefusalReason::ManifestInvalid))?;
     anyhow::ensure!(
         manifest
             .temperature_override
@@ -337,7 +339,10 @@ async fn run_owned_manifest(
         .filter(|value| !value.is_empty())
         .context("session-worker requires the parent --config-dir")?;
     if Path::new(explicit_config_dir) != manifest.config_dir {
-        anyhow::bail!("session-worker config source does not match sealed manifest");
+        return Err(refusal::refusal(
+            WorkerRefusalReason::ConfigSourceMismatch,
+            "session-worker config source does not match sealed manifest",
+        ));
     }
 
     let generation_before = match config_source_generation(&manifest.config_dir) {
@@ -356,11 +361,13 @@ async fn run_owned_manifest(
         Err(error) => return Err(error),
     };
     if generation_before != manifest.config_generation {
-        anyhow::bail!(
-            "session-worker config generation mismatch before load: expected {}, found {}",
-            manifest.config_generation,
-            generation_before
-        );
+        return Err(refusal::refusal(
+            WorkerRefusalReason::ConfigGenerationMismatch,
+            format!(
+                "session-worker config generation mismatch before load: expected {}, found {}",
+                manifest.config_generation, generation_before
+            ),
+        ));
     }
     let mut config = Config::load_existing_read_only_with_config_dir(Some(explicit_config_dir)).await?;
     // The worker is a separate process and never reaches `runtime::mode::dispatch`,
@@ -369,11 +376,13 @@ async fn run_owned_manifest(
     crate::agent::idle::install(config.runtime.idle_hang_secs);
     let generation_after = config_source_generation(&manifest.config_dir)?;
     if generation_after != manifest.config_generation {
-        anyhow::bail!(
-            "session-worker config generation changed during load: expected {}, found {}",
-            manifest.config_generation,
-            generation_after
-        );
+        return Err(refusal::refusal(
+            WorkerRefusalReason::ConfigGenerationMismatch,
+            format!(
+                "session-worker config generation changed during load: expected {}, found {}",
+                manifest.config_generation, generation_after
+            ),
+        ));
     }
     // Config loading resolves relative paths from the worker's physical
     // config directory. Restore the authenticated parent's spelling before

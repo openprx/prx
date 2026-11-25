@@ -4,6 +4,7 @@ pub(crate) mod denials;
 #[cfg(unix)]
 pub(crate) mod manifest_reference;
 pub mod protocol;
+pub(crate) mod refusal;
 pub mod runner;
 pub(crate) mod startup_failure;
 pub(crate) mod transport_key;

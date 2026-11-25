@@ -973,24 +973,24 @@ mod pinned_parent_process_binding_tests {
     }
 
     #[test]
-    fn pinned_parent_binding_survives_removed_source_but_child_restore_rejects() -> anyhow::Result<()> {
+    fn pinned_parent_binding_and_child_restore_survive_removed_source() -> anyhow::Result<()> {
         let (_home, generation, key) = fixture()?;
         let binding = generation.bind_process(&key)?;
         generation.verify_pinned_process_binding(&binding, &key)?;
         ConfigGeneration::restore_process(generation.effective.as_ref().clone(), &binding, &key)?;
         std::fs::remove_file(&generation.effective.config_path)?;
         generation.verify_pinned_process_binding(&binding, &key)?;
-        assert!(ConfigGeneration::restore_process(generation.effective.as_ref().clone(), &binding, &key).is_err());
+        ConfigGeneration::restore_process(generation.effective.as_ref().clone(), &binding, &key)?;
         Ok(())
     }
 
     #[test]
-    fn pinned_parent_binding_survives_changed_source_but_child_restore_rejects() -> anyhow::Result<()> {
+    fn pinned_parent_binding_and_child_restore_survive_moved_on_source() -> anyhow::Result<()> {
         let (_home, generation, key) = fixture()?;
         let binding = generation.bind_process(&key)?;
         std::fs::write(&generation.effective.config_path, "default_temperature = 0.25\n")?;
         generation.verify_pinned_process_binding(&binding, &key)?;
-        assert!(ConfigGeneration::restore_process(generation.effective.as_ref().clone(), &binding, &key).is_err());
+        ConfigGeneration::restore_process(generation.effective.as_ref().clone(), &binding, &key)?;
         Ok(())
     }
 

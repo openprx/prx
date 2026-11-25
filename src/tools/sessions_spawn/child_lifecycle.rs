@@ -161,6 +161,27 @@ where
     Ok(buffer)
 }
 
+/// Write the manifest as line 1 of the worker's stdin. `Ok(false)` when the
+/// pipe is already closed (the worker exited before reading it): the run is
+/// then settled from the worker's exit and output, not from this write.
+async fn write_manifest_line(stdin: &mut tokio::process::ChildStdin, payload: &str) -> anyhow::Result<bool> {
+    use tokio::io::AsyncWriteExt;
+    let written = async {
+        stdin.write_all(payload.as_bytes()).await?;
+        stdin.write_all(b"\n").await?;
+        stdin.flush().await
+    }
+    .await;
+    match written {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {
+            tracing::warn!("session-worker closed its stdin before reading the manifest");
+            Ok(false)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 pub(super) async fn run_spawned_child_lifecycle(
     child: &mut tokio::process::Child,
     process_group: &mut OwnedProcessGroup,
@@ -172,6 +193,7 @@ pub(super) async fn run_spawned_child_lifecycle(
     #[cfg(test)] panic_before_wait: bool,
     #[cfg(test)] protocol: Option<&TestWorkerProtocolControl>,
 ) -> anyhow::Result<OwnedProcessPhase> {
+    #[cfg(test)]
     use tokio::io::AsyncWriteExt;
 
     let frame_auth = steer
@@ -181,6 +203,32 @@ pub(super) async fn run_spawned_child_lifecycle(
     let frame_outputs = steer
         .as_ref()
         .and_then(|pipe| pipe.frames.as_ref().map(|frames| frames.outputs.clone()));
+    // Capture starts before the manifest is written: a worker that dies before
+    // reading it (or refuses it at once) has already said why on stderr, and
+    // a failed stdin write must not lose that output.
+    let stdout_stream = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("session-worker stdout pipe was not configured"))?;
+    let stderr_stream = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("session-worker stderr pipe was not configured"))?;
+
+    let stdout_task = tokio::spawn(crate::session_worker::frames::read_worker_frames_authenticated(
+        stdout_stream,
+        frame_outputs,
+        progress.as_ref().map(Arc::clone),
+        MAX_SUBPROCESS_OUTPUT,
+        frame_auth,
+    ));
+    let stderr_task = tokio::spawn(drain_worker_stream(
+        stderr_stream,
+        "stderr",
+        progress.as_ref().map(Arc::clone),
+        stderr_log,
+    ));
+
     // The manifest is line 1 of the worker's stdin. Unlike before, the pipe is
     // then kept open for the life of the run so steer frames can follow it.
     #[cfg(test)]
@@ -209,61 +257,44 @@ pub(super) async fn run_spawned_child_lifecycle(
         }
         None
     } else if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(payload.as_bytes()).await?;
-        stdin.write_all(b"\n").await?;
-        stdin.flush().await?;
-        steer.map(|steer| {
-            AbortOnDrop(tokio::spawn(pump_worker_control_frames(
-                stdin,
-                steer.steer_rx,
-                steer.frames.map(|frames| frames.controls),
-                steer.history,
-                steer.run_id,
-            )))
-        })
+        // A worker that already exited has closed its stdin: its own account
+        // (stdout result, stderr log) is what the run is classified from.
+        if write_manifest_line(&mut stdin, payload).await? {
+            steer.map(|steer| {
+                AbortOnDrop(tokio::spawn(pump_worker_control_frames(
+                    stdin,
+                    steer.steer_rx,
+                    steer.frames.map(|frames| frames.controls),
+                    steer.history,
+                    steer.run_id,
+                )))
+            })
+        } else {
+            None
+        }
     } else {
         None
     };
     #[cfg(not(test))]
     let mut steer_pump = if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(payload.as_bytes()).await?;
-        stdin.write_all(b"\n").await?;
-        stdin.flush().await?;
-        steer.map(|steer| {
-            AbortOnDrop(tokio::spawn(pump_worker_control_frames(
-                stdin,
-                steer.steer_rx,
-                steer.frames.map(|frames| frames.controls),
-                steer.history,
-                steer.run_id,
-            )))
-        })
+        // A worker that already exited has closed its stdin: its own account
+        // (stdout result, stderr log) is what the run is classified from.
+        if write_manifest_line(&mut stdin, payload).await? {
+            steer.map(|steer| {
+                AbortOnDrop(tokio::spawn(pump_worker_control_frames(
+                    stdin,
+                    steer.steer_rx,
+                    steer.frames.map(|frames| frames.controls),
+                    steer.history,
+                    steer.run_id,
+                )))
+            })
+        } else {
+            None
+        }
     } else {
         None
     };
-
-    let stdout_stream = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("session-worker stdout pipe was not configured"))?;
-    let stderr_stream = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("session-worker stderr pipe was not configured"))?;
-
-    let stdout_task = tokio::spawn(crate::session_worker::frames::read_worker_frames_authenticated(
-        stdout_stream,
-        frame_outputs,
-        progress.as_ref().map(Arc::clone),
-        MAX_SUBPROCESS_OUTPUT,
-        frame_auth,
-    ));
-    let stderr_task = tokio::spawn(drain_worker_stream(
-        stderr_stream,
-        "stderr",
-        progress.as_ref().map(Arc::clone),
-        stderr_log,
-    ));
 
     #[cfg(test)]
     assert!(!panic_before_wait, "injected owned-child lifecycle panic");

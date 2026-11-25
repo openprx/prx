@@ -144,6 +144,14 @@ impl WorkerLog {
         self.flush().await;
     }
 
+    /// Record a line the parent itself has to say about this run (a launch it
+    /// refused after the worker was spawned, before any worker output exists).
+    /// The caller passes a typed code, never payload text.
+    pub(super) async fn note(&mut self, line: &str) {
+        self.write_line(format!("[parent] {line}\n").as_bytes()).await;
+        self.flush().await;
+    }
+
     /// Write out what is left at the end of the stream.
     pub(super) async fn finish(&mut self) {
         if !self.closed && !self.pending.is_empty() {

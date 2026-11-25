@@ -2086,8 +2086,13 @@ Terminal chats use the durable mailbox session key `chat:terminal:local-user:<ch
 The startup banner prints the complete session key and owner. Child focus accepts
 follow-up text after completion and starts another turn in the same child session.
 `/msg #1 <text>` addresses that child's logical session, including after completion.
-If a process child reports `configuration_changed`, restart its parent chat before
-retrying; a newer disk configuration cannot execute under the parent's old seal.
+A process child runs on the effective configuration its parent turn sealed. A
+configuration write after the parent started (even one that restores the same
+bytes) does not stop a child: the worker takes the configuration it loads from
+disk only if it reproduces the parent's sealed effective configuration. If a
+process child reports `config_changed`, the disk holds a change the parent turn
+has not activated (for example one that needs a restart); restart the parent
+chat or gateway before retrying.
 
 A local `sessions_send` target may name `agent`. Omitted or `main` addresses the
 session's main agent as before. Any other name is the receiver the sender asked

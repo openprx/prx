@@ -118,9 +118,12 @@ pub struct ConfigGeneration {
 #[error("worker working root differs from signed parent configuration")]
 pub(crate) struct ProcessWorkingRootMismatch;
 
-/// A worker must not execute a newer disk configuration under an older parent seal.
+/// The configuration a worker loaded from disk is not the effective
+/// configuration its parent turn runs on and sealed (a change that has not been
+/// activated in the parent yet). The worker never runs under a seal its own
+/// configuration does not reproduce.
 #[derive(Debug, thiserror::Error)]
-#[error("configuration_changed: process configuration changed since this chat started; restart the parent chat and retry the process child")]
+#[error("config_changed: the configuration on disk differs from the effective configuration this parent turn runs on; restart the parent chat and retry the process child")]
 pub(crate) struct ProcessConfigurationChanged;
 
 /// Metadata, a working root override and a keyed effective snapshot digest.
@@ -268,8 +271,10 @@ impl ConfigGeneration {
         Ok(())
     }
 
-    /// Restore only an exact snapshot. A newer disk revision or a configuration
-    /// with different effective values cannot borrow the parent's generation id.
+    /// Restore only an exact snapshot. A configuration with different effective
+    /// values, a forged seal or another working root cannot borrow the parent's
+    /// generation id; a disk revision that moved on without changing the
+    /// effective values can.
     pub(crate) fn restore_process(
         config: Config,
         binding: &ProcessGenerationBinding,
@@ -278,17 +283,20 @@ impl ConfigGeneration {
         if config.runtime.workdir != binding.working_root {
             return Err(ProcessWorkingRootMismatch.into());
         }
-        anyhow::ensure!(
-            ConfigSourceRevision::from_config(&config)? == binding.source_revision,
-            ProcessConfigurationChanged
-        );
+        // The keyed seal binds the parent's complete effective configuration
+        // together with its source revision, so it is the comparison that
+        // carries the integrity. The revision on disk is deliberately not
+        // compared: it moves on every configuration write (its generation
+        // counter advances even when the bytes are restored identically),
+        // while the parent's active generation keeps the revision it was
+        // activated from whenever the effective configuration did not change.
         anyhow::ensure!(
             key.verify_hmac(
                 crate::security::runtime_key::KeyDomain::StateFingerprint,
                 &[b"process-effective-config-v1", &binding.signing_payload(&config)?],
                 &binding.seal
             ),
-            "process effective configuration differs from parent generation"
+            ProcessConfigurationChanged
         );
         Ok(Arc::new(Self {
             id: binding.id,

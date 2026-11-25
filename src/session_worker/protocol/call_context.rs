@@ -142,18 +142,24 @@ impl WorkerCallContext {
 /// The call context of a worker manifest, or the protocol-version error of a
 /// pair whose parent does not seal one (or seals another version).
 pub fn require_call_context(manifest: &WorkerManifest) -> anyhow::Result<&WorkerCallContext> {
+    let mismatch = |message: String| {
+        crate::session_worker::refusal::refusal(
+            crate::session_worker::refusal::WorkerRefusalReason::ProtocolVersionMismatch,
+            message,
+        )
+    };
     let call = manifest.call_context.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
+        mismatch(format!(
             "session-worker protocol version mismatch: the manifest carries no call context (this worker requires \
              call context version {WORKER_CALL_CONTEXT_VERSION}); parent and worker must be the same build"
-        )
+        ))
     })?;
-    anyhow::ensure!(
-        call.version == WORKER_CALL_CONTEXT_VERSION,
-        "session-worker protocol version mismatch: call context version {} (this worker requires {}); parent and \
-         worker must be the same build",
-        call.version,
-        WORKER_CALL_CONTEXT_VERSION
-    );
+    if call.version != WORKER_CALL_CONTEXT_VERSION {
+        return Err(mismatch(format!(
+            "session-worker protocol version mismatch: call context version {} (this worker requires {}); parent and \
+             worker must be the same build",
+            call.version, WORKER_CALL_CONTEXT_VERSION
+        )));
+    }
     Ok(call)
 }

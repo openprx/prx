@@ -477,6 +477,13 @@ impl SessionsSpawnTool {
                             Ok(ProcessWorkerOutcome::Finished(result)) => {
                                 worker_cancelled = result.cancelled;
                                 let error = result.error.unwrap_or_else(|| "worker failed".to_string());
+                                if let Some(reason) = crate::session_worker::refusal::reason_of_report(&error) {
+                                    tracing::warn!(
+                                        run_id = %rid,
+                                        reason = %reason,
+                                        "sub-agent process worker refused to start"
+                                    );
+                                }
                                 let msg = format!("Sub-agent error: {error}");
                                 // `result.error` is a field of the JSON the
                                 // worker itself printed, so it is the run's
@@ -546,13 +553,18 @@ impl SessionsSpawnTool {
                                 // failure is final rather than left to recovery.
                                 let launch_refused =
                                     error.downcast_ref::<super::process_mode::WorkerLaunchRefused>().is_some();
+                                let reason: crate::session_worker::refusal::WorkerRefusalReason =
+                                    crate::session_worker::refusal::classify(&error);
                                 tracing::warn!(
                                     run_id = %rid,
                                     launch_refused,
+                                    reason = %reason,
                                     error = %crate::agent::diagnostics::error_class(&error),
                                     "sub-agent process ended with an error"
                                 );
-                                let detail = super::failure::llm_visible_error(&format!("{error:#}"));
+                                let detail = super::failure::llm_visible_error(
+                                    &crate::session_worker::refusal::describe(&error),
+                                );
                                 let msg = format!("Sub-agent process error: {detail}");
                                 (
                                     SubAgentStatus::Failed(detail),
