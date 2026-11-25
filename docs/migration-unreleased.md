@@ -205,3 +205,14 @@ Runs started by the install's own schedulers (Xin, cron and the heartbeat tasks)
 ## A changed tool registry no longer fails a running turn
 
 When the live tool registry changes during a turn (for example `skills_manage` imports an executable skill), the turn now completes on its pinned tool surface instead of failing with `catalog and execution registry differ`. The next turn is published from the live registry, so the new skill is offered and runnable then. Worker-process and child parity checks are unchanged. No configuration change is needed.
+
+## Webhook hook actions
+
+A `hooks.json` action may name a `url` instead of a `command`: PRX POSTs the
+hook envelope as JSON to it (optional `headers`, `timeout_ms` and
+`signing_secret`; one retry; `X-Webhook-Signature` and `X-Webhook-Timestamp`
+when signed). Existing hook files parse unchanged; an action with both
+`command` and `url`, or neither key, is invalid. `hooks_status` gains
+`webhook_count` and `webhook_urls`, the proxy service key `hook.webhook`
+(selector `hook.*`) is new, and the Gateway hooks API keeps webhook fields
+when it rewrites `hooks.json`. No database schema migration is introduced.

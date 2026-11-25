@@ -2266,6 +2266,57 @@ keeps its value; to keep hooks from running, write `workspace_hooks = "off"`.
 `prx init` never wrote the key, so no stored value is reset. A hook that
 carried a `cwd` field is now accepted and starts there.
 
+#### Webhook hooks
+
+An action with `url` instead of `command` is a webhook: for each matching
+event PRX POSTs the same versioned envelope JSON (`v`, `event`, identity,
+`data`) that a command hook receives on stdin, with
+`content-type: application/json`. It is delivered on the same queued path, so
+a slow or failing endpoint never delays or fails a turn, and the same
+`security.workspace_hooks` switch governs it. A webhook only observes: its
+response is discarded and cannot block, alter or veto anything.
+
+```json
+{
+  "hooks": {
+    "turn_complete": [
+      {
+        "url": "https://hooks.example.com/prx",
+        "headers": {"authorization": "Bearer example-token"},
+        "timeout_ms": 5000,
+        "signing_secret": "enc2:..."
+      }
+    ]
+  }
+}
+```
+
+- `url` (required): an `http` or `https` URL. A webhook action has `url` and
+  no `command`.
+- `headers` (optional): static request headers, sent as written. They come
+  only from the action; nothing from PRX's environment is sent. Header values
+  and the secret are never logged or shown.
+- `timeout_ms` (optional): bounds the whole delivery, including the retry;
+  default is the file's `timeout_ms` (5000), range 1-300000.
+- `signing_secret` (optional): a plain value or an `enc2:` value of the
+  encrypted store (the key beside `config.toml`). With it, the request carries
+  `X-Webhook-Signature: sha256=<hex>`, an HMAC-SHA256 of the raw body, the
+  form the inbound `[webhook]` handler verifies, plus `X-Webhook-Timestamp`
+  (Unix seconds; not part of the signed bytes, so use the envelope `ts` and
+  `id` for replay checks). If the secret cannot be read the delivery is
+  skipped rather than sent unsigned.
+- One retry, after 500 ms, for a connection failure, a 5xx or a 429, inside the
+  same timeout. A failure is logged as a warning with the event, an error
+  class and a status class only (never the URL, a header or the body).
+- Requests use the runtime proxy settings under the service key
+  `hook.webhook` (selector `hook.*`).
+- The envelope is the one command hooks get: provider labels are redacted and
+  it carries no key, token or pairing code. Text fields of some events (a tool
+  call's `output`) are the tool's own text.
+- `prx doctor` and `hooks_status` list webhooks (`webhook_count`,
+  `webhook_urls`: scheme, host and path only, no credentials or query) and
+  count them among the actions.
+
 ### WASM plugins
 
 `[plugins] enabled` (default `false`, read at process start) is the only switch.

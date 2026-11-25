@@ -1705,6 +1705,7 @@ Create `hooks.json` in the workspace directory:
 ```
 
 - `command` + `args` — executed directly, not via shell (no injection risk)
+- `url` (instead of `command`) — a webhook action: the envelope is POSTed as JSON, with optional `headers`, `timeout_ms` and `signing_secret` (see "Webhook hooks" in [configuration.md](configuration.md#webhook-hooks))
 - `timeout_ms` — per-hook timeout, default 5000ms; valid range 1–300000ms
 - `cwd` (optional) — the directory the hook starts in: absolute, or relative to the workspace; without it a hook starts in its dedicated `hooks/` directory beside `config.toml`. `env` is passed as written on top of a cleared launch environment, so no provider key of PRX reaches a hook unless `env` names it
 - hooks are observe-only and run off the turn path: an event is queued and a background worker per hook manager delivers it (command hooks in file order, then WASM hooks and the plugin event bus), in emit order. A slow hook never delays a turn; each hook keeps its own timeout, and all delivery for one event shares a 300-second bound. The queue holds 1024 events; when it is full the new event is dropped, counted and logged (first drop, then every 100th). At gateway shutdown queued events are given up to 3 seconds to finish
@@ -1717,7 +1718,7 @@ Create `hooks.json` in the workspace directory:
   event names are accepted in manifests.
 
 `hooks_status` reports the live config path, validity, timeout, event coverage,
-and action count. `hooks_manage` supports `status`, `refresh`, `validate`,
+action count, and the webhook count and endpoints (`webhook_count`, `webhook_urls`, no credentials or query). `hooks_manage` supports `status`, `refresh`, `validate`,
 `replace`, `remove`, and `test`. Replacement is validated and atomically
 published; removal moves the previous file to `.hooks-trash` and reports the
 recovery path. Unknown or duplicate normalized event names are rejected. The

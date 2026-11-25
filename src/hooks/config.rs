@@ -7,9 +7,12 @@ use std::path::Path;
 use super::event::{HookEvent, normalize_event_name};
 use super::{DEFAULT_TIMEOUT_MS, HOOKS_JSON_FILE, MAX_ACTIONS, MAX_ARGS_PER_ACTION, MAX_ENV_PER_ACTION, MAX_HOOKS_FILE_BYTES, MAX_TIMEOUT_MS};
 
-#[derive(Debug, Clone, Deserialize)]
+/// One hook action: a command (`command`) or a webhook (`url`), never both.
+#[derive(Clone, Deserialize)]
 pub(super) struct HookAction {
-    pub(super) command: String,
+    /// The program of a command action.
+    #[serde(default)]
+    pub(super) command: Option<String>,
     #[serde(default)]
     pub(super) args: Vec<String>,
     #[serde(default)]
@@ -20,6 +23,32 @@ pub(super) struct HookAction {
     pub(super) timeout_ms: Option<u64>,
     #[serde(default = "default_stdin_json")]
     pub(super) stdin_json: bool,
+    /// The endpoint of a webhook action: PRX POSTs the envelope to it.
+    #[serde(default)]
+    pub(super) url: Option<String>,
+    /// Static request headers of a webhook action.
+    #[serde(default)]
+    pub(super) headers: BTreeMap<String, String>,
+    /// Signing secret of a webhook action: a plain value or an `enc2:` value
+    /// of the encrypted store.
+    #[serde(default)]
+    pub(super) signing_secret: Option<String>,
+}
+
+// Header values and the signing secret are credentials: never printed.
+impl std::fmt::Debug for HookAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HookAction")
+            .field("command", &self.command)
+            .field("webhook", &self.url.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl HookAction {
+    pub(super) const fn is_webhook(&self) -> bool {
+        self.url.is_some()
+    }
 }
 
 const fn default_stdin_json() -> bool {
@@ -62,6 +91,10 @@ pub struct HookDiagnostics {
     pub config_path: String,
     pub timeout_ms: u64,
     pub action_count: usize,
+    /// How many of the actions are webhooks.
+    pub webhook_count: usize,
+    /// The webhook endpoints, without credentials, query or fragment.
+    pub webhook_urls: Vec<String>,
     pub events: BTreeMap<String, usize>,
     /// Private catalog identity for the effective hooks file. Not returned
     /// through doctor/API diagnostics.
@@ -78,18 +111,32 @@ pub struct HookDiagnostics {
 /// The one line that allows workspace command hooks.
 pub const WORKSPACE_HOOKS_OPT_IN: &str = "[security] workspace_hooks = \"on\"";
 
-/// How many command hooks the workspace `hooks.json` under
-/// `workspace_dir` defines; `None` without one. Reads and validates the
-/// file only (for `prx doctor`).
+/// How many hooks the workspace `hooks.json` under `workspace_dir` defines,
+/// and the webhook endpoints among them (credentials, query and fragment
+/// removed); `None` without a file. Reads and validates the file only (for
+/// `prx doctor`).
 ///
 /// # Errors
 ///
 /// An unreadable, oversized or invalid `hooks.json`.
-pub fn workspace_hook_actions(workspace_dir: &Path) -> anyhow::Result<Option<usize>> {
+pub fn workspace_hook_counts(workspace_dir: &Path) -> anyhow::Result<Option<(usize, Vec<String>)>> {
     let Some(raw) = read_bounded_file(&workspace_dir.join(HOOKS_JSON_FILE), MAX_HOOKS_FILE_BYTES)? else {
         return Ok(None);
     };
-    Ok(Some(parse_hook_config(&raw)?.hooks.values().map(Vec::len).sum()))
+    let config = parse_hook_config(&raw)?;
+    Ok(Some((config.hooks.values().map(Vec::len).sum(), webhook_urls(&config.hooks))))
+}
+
+/// The endpoints of the webhook actions, sorted, as safe to show.
+pub(super) fn webhook_urls(hooks: &HashMap<String, Vec<HookAction>>) -> Vec<String> {
+    let mut urls: Vec<String> = hooks
+        .values()
+        .flatten()
+        .filter_map(|action| action.url.as_deref())
+        .map(super::webhook::display_url)
+        .collect();
+    urls.sort();
+    urls
 }
 
 /// Why the command hooks of a `hooks.json` holding `actions` actions do not
@@ -98,7 +145,7 @@ pub fn workspace_hook_actions(workspace_dir: &Path) -> anyhow::Result<Option<usi
 pub fn blocked_hooks_note(actions: usize) -> Option<String> {
     (actions > 0).then(|| {
         format!(
-            "{actions} workspace command hook(s) in hooks.json are not run: `security.workspace_hooks` is off. To \
+            "{actions} workspace hook(s) in hooks.json are not run: `security.workspace_hooks` is off. To \
              run them, add `{WORKSPACE_HOOKS_OPT_IN}` to config.toml"
         )
     })
@@ -166,6 +213,12 @@ fn validate_hooks_file(file: &HooksFile) -> anyhow::Result<()> {
     }
     for actions in file.hooks.values() {
         for action in actions {
+            match (&action.command, &action.url) {
+                (Some(_), Some(_)) => anyhow::bail!("a hook action has either `command` or `url`, not both"),
+                (None, None) => anyhow::bail!("a hook action needs `command` or `url`"),
+                (None, Some(url)) => super::webhook::validate_action(url, &action.headers, action.signing_secret.as_deref())?,
+                (Some(_), None) => {}
+            }
             if action.args.len() > MAX_ARGS_PER_ACTION {
                 anyhow::bail!("hook action has too many arguments");
             }

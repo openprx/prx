@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::config::{HookDiagnostics, RuntimeState, blocked_hooks_note, parse_hook_config, read_bounded_file};
+use super::config::{HookDiagnostics, RuntimeState, blocked_hooks_note, parse_hook_config, read_bounded_file, webhook_urls};
 use super::event::HookEvent;
 #[cfg(feature = "wasm-plugins")]
 use super::event::redacted_hook_payload;
@@ -128,12 +128,15 @@ impl HookCore {
             .collect::<BTreeMap<_, _>>();
         let action_count = events.values().sum();
         let runs = self.workspace_policy().0;
+        let webhook_urls = webhook_urls(&state.config.hooks);
         HookDiagnostics {
             configured: self.hooks_json_path.is_file(),
             valid: error.is_none(),
             config_path: self.hooks_json_path.display().to_string(),
             timeout_ms: state.config.timeout_ms,
             action_count,
+            webhook_count: webhook_urls.len(),
+            webhook_urls,
             events,
             catalog_digest: state.hooks_json_digest,
             error,
@@ -154,12 +157,15 @@ impl HookCore {
             .collect::<BTreeMap<_, _>>();
         let action_count = events.values().sum();
         let runs = self.workspace_policy().0;
+        let webhook_urls = webhook_urls(&config.hooks);
         Ok(HookDiagnostics {
             configured: false,
             valid: true,
             config_path: self.hooks_json_path.display().to_string(),
             timeout_ms: config.timeout_ms,
             action_count,
+            webhook_count: webhook_urls.len(),
+            webhook_urls,
             events,
             catalog_digest: Some(Sha256::digest(content.as_bytes()).into()),
             error: None,
@@ -242,7 +248,7 @@ impl HookCore {
                 tracing::warn!(
                     event = event.as_str(),
                     actions = actions.len(),
-                    "workspace command hooks are not run: security.workspace_hooks is off; add `{}` to \
+                    "workspace hooks are not run: security.workspace_hooks is off; add `{}` to \
                      config.toml to run them",
                     WORKSPACE_HOOKS_OPT_IN
                 );
@@ -250,10 +256,20 @@ impl HookCore {
                 // Progress lets the event bound say how many actions it cut off.
                 total.store(actions.len(), std::sync::atomic::Ordering::Relaxed);
                 for action in actions {
-                    if let Err(err) = self.run_action(event, payload, timeout_ms, &action).await {
+                    if action.is_webhook() {
+                        if let Err(err) = self.run_webhook(event, payload, timeout_ms, &action).await {
+                            // Typed metadata only: never the URL, a header or the body.
+                            tracing::warn!(
+                                event = event.as_str(),
+                                error_class = err.class(),
+                                status_class = err.status_class(),
+                                "webhook hook delivery failed"
+                            );
+                        }
+                    } else if let Err(err) = self.run_action(event, payload, timeout_ms, &action).await {
                         tracing::warn!(
                             event = event.as_str(),
-                            command = action.command,
+                            command = action.command.as_deref().unwrap_or_default(),
                             error = %err,
                             "hook execution failed"
                         );

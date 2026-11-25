@@ -27,7 +27,8 @@ const VALID_HOOK_EVENTS: &[&str] = &[
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HookActionEntry {
-    command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    command: Option<String>,
     #[serde(default)]
     args: Vec<String>,
     #[serde(default)]
@@ -38,6 +39,13 @@ struct HookActionEntry {
     timeout_ms: Option<u64>,
     #[serde(default = "default_stdin_json")]
     stdin_json: bool,
+    // Webhook actions: kept as written when the file is rewritten here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    headers: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signing_secret: Option<String>,
 }
 
 const fn default_stdin_json() -> bool {
@@ -59,6 +67,9 @@ struct HookItem {
     id: String,
     event: String,
     command: String,
+    /// The endpoint of a webhook action, without credentials or query.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
     timeout_ms: u64,
 }
 
@@ -193,7 +204,8 @@ fn hooks_file_to_items(file: &HooksFile) -> Vec<HookItem> {
             items.push(HookItem {
                 id,
                 event: event.clone(),
-                command: action.command.clone(),
+                command: action.command.clone().unwrap_or_default(),
+                url: action.url.as_deref().map(crate::hooks::webhook_display_url),
                 timeout_ms: action.timeout_ms.unwrap_or(global_timeout),
             });
         }
@@ -233,12 +245,15 @@ pub async fn create_hook(
     let command = validate_hook_command(&req.command)?;
     let timeout_ms = validate_hook_timeout(req.timeout_ms)?;
     let action = HookActionEntry {
-        command,
+        command: Some(command),
         args: req.args,
         env: HashMap::new(),
         cwd: None,
         timeout_ms,
         stdin_json: true,
+        url: None,
+        headers: std::collections::BTreeMap::new(),
+        signing_secret: None,
     };
     super::authorize_resource_mutation(&state, "gateway_api:hooks:create", HookChange::Command.risk())?;
     file.hooks.entry(event.clone()).or_default().push(action);
@@ -277,7 +292,7 @@ pub async fn update_hook(
     })?;
 
     if let Some(command) = req.command {
-        action.command = validate_hook_command(&command)?;
+        action.command = Some(validate_hook_command(&command)?);
     }
     if let Some(args) = req.args {
         action.args = args;

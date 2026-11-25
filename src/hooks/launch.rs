@@ -18,7 +18,7 @@ impl HookCore {
         default_timeout_ms: u64,
         action: &HookAction,
     ) -> anyhow::Result<()> {
-        let command = action.command.trim();
+        let command = action.command.as_deref().unwrap_or_default().trim();
         if command.is_empty() {
             anyhow::bail!("hook command is empty");
         }

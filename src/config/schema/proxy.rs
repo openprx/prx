@@ -26,6 +26,7 @@ pub(super) const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "memory.embeddings",
     "tunnel.custom",
     "decision.compatible_http",
+    "hook.webhook",
 ];
 
 /// Selectors of removed channels. An old config may still name them: they are
@@ -40,6 +41,7 @@ pub(super) const SUPPORTED_PROXY_SERVICE_SELECTORS: &[&str] = &[
     "memory.*",
     "tunnel.*",
     "decision.*",
+    "hook.*",
 ];
 
 pub(super) static RUNTIME_PROXY_CONFIG: OnceLock<RwLock<ProxyConfig>> = OnceLock::new();

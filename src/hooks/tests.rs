@@ -299,12 +299,15 @@ async fn run_action_empty_command_fails() {
     let temp = TempDir::new().unwrap();
     let manager = allowed_manager(&temp);
     let action = HookAction {
-        command: "".into(),
+        command: Some("".into()),
         args: vec![],
         env: HashMap::new(),
         cwd: None,
         timeout_ms: Some(1000),
         stdin_json: false,
+        url: None,
+        headers: Default::default(),
+        signing_secret: None,
     };
     let result = manager.run_action(HookEvent::ToolCall, &json!({}), 1000, &action).await;
     assert!(result.is_err());
@@ -316,12 +319,15 @@ async fn run_action_success() {
     let temp = TempDir::new().unwrap();
     let manager = allowed_manager(&temp);
     let action = HookAction {
-        command: "true".into(),
+        command: Some("true".into()),
         args: vec![],
         env: HashMap::new(),
         cwd: None,
         timeout_ms: Some(2000),
         stdin_json: false,
+        url: None,
+        headers: Default::default(),
+        signing_secret: None,
     };
     let result = manager
         .run_action(HookEvent::AgentStart, &json!({"msg": "hi"}), 2000, &action)
@@ -334,12 +340,15 @@ async fn run_action_failure_exit_code() {
     let temp = TempDir::new().unwrap();
     let manager = allowed_manager(&temp);
     let action = HookAction {
-        command: "false".into(),
+        command: Some("false".into()),
         args: vec![],
         env: HashMap::new(),
         cwd: None,
         timeout_ms: Some(2000),
         stdin_json: false,
+        url: None,
+        headers: Default::default(),
+        signing_secret: None,
     };
     let result = manager.run_action(HookEvent::Error, &json!({}), 2000, &action).await;
     assert!(result.is_err());
@@ -351,12 +360,15 @@ async fn run_action_timeout() {
     let temp = TempDir::new().unwrap();
     let manager = allowed_manager(&temp);
     let action = HookAction {
-        command: "sleep".into(),
+        command: Some("sleep".into()),
         args: vec!["10".into()],
         env: HashMap::new(),
         cwd: None,
         timeout_ms: Some(100),
         stdin_json: false,
+        url: None,
+        headers: Default::default(),
+        signing_secret: None,
     };
     let result = manager.run_action(HookEvent::ToolCall, &json!({}), 100, &action).await;
     assert!(result.is_err());
@@ -370,7 +382,7 @@ async fn run_action_timeout_kills_reaps_and_removes_payload_file() {
     let manager = allowed_manager(&temp);
     let out = temp.path().display().to_string();
     let action = HookAction {
-        command: "sh".into(),
+        command: Some("sh".into()),
         args: vec![
             "-c".into(),
             format!(
@@ -382,6 +394,9 @@ async fn run_action_timeout_kills_reaps_and_removes_payload_file() {
         cwd: None,
         timeout_ms: Some(250),
         stdin_json: false,
+        url: None,
+        headers: Default::default(),
+        signing_secret: None,
     };
 
     let result = manager.run_action(HookEvent::ToolCall, &json!({}), 250, &action).await;
@@ -472,7 +487,7 @@ async fn a_hook_starts_in_a_cleared_environment_and_its_dedicated_directory() {
     let out = temp.path().join("seen");
     let manager = allowed_manager(&temp);
     let action = HookAction {
-        command: "sh".into(),
+        command: Some("sh".into()),
         args: vec![
             "-c".into(),
             format!("env > '{0}.env'; pwd -P > '{0}.cwd'", out.display()),
@@ -485,6 +500,9 @@ async fn a_hook_starts_in_a_cleared_environment_and_its_dedicated_directory() {
         cwd: None,
         timeout_ms: Some(5_000),
         stdin_json: false,
+        url: None,
+        headers: Default::default(),
+        signing_secret: None,
     };
     manager
         .run_action(HookEvent::TurnComplete, &json!({}), 5_000, &action)
@@ -526,12 +544,15 @@ async fn a_hook_without_a_launch_root_is_refused() {
         launch_root: None,
     };
     let action = HookAction {
-        command: "true".into(),
+        command: Some("true".into()),
         args: vec![],
         env: HashMap::new(),
         cwd: None,
         timeout_ms: Some(1_000),
         stdin_json: false,
+        url: None,
+        headers: Default::default(),
+        signing_secret: None,
     };
     let refused = manager
         .run_action(HookEvent::TurnComplete, &json!({}), 1_000, &action)
@@ -556,7 +577,7 @@ async fn run_action_large_payload_uses_file_and_stdin_without_env_overflow() {
     let manager = allowed_manager(&temp);
 
     let action = HookAction {
-        command: "sh".to_string(),
+        command: Some("sh".to_string()),
         args: vec![
             "-c".to_string(),
             "test -n \"$ZERO_HOOK_PAYLOAD_FILE\" && test -f \"$ZERO_HOOK_PAYLOAD_FILE\"".to_string(),
@@ -565,6 +586,9 @@ async fn run_action_large_payload_uses_file_and_stdin_without_env_overflow() {
         cwd: None,
         timeout_ms: Some(5_000),
         stdin_json: true,
+        url: None,
+        headers: Default::default(),
+        signing_secret: None,
     };
 
     let payload = json!({ "blob": "x".repeat(3_000_000) });
@@ -586,7 +610,7 @@ async fn a_hook_payload_names_the_provider_without_url_userinfo() {
     let manager = allowed_manager(&temp);
     let seen_path = temp.path().join("payload.json");
     let action = HookAction {
-        command: "sh".into(),
+        command: Some("sh".into()),
         args: vec![
             "-c".into(),
             format!("cat \"$ZERO_HOOK_PAYLOAD_FILE\" > '{}'", seen_path.display()),
@@ -595,6 +619,9 @@ async fn a_hook_payload_names_the_provider_without_url_userinfo() {
         cwd: None,
         timeout_ms: Some(5_000),
         stdin_json: false,
+        url: None,
+        headers: Default::default(),
+        signing_secret: None,
     };
     let label = "custom:http://u:SECRET-fixture-pw@127.0.0.1:1/v1";
     let payloads = [

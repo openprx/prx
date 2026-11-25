@@ -218,18 +218,23 @@ pub fn diagnose_memory(config: &Config) -> DoctorReport {
 /// line that allows them. Reads the file only.
 fn check_workspace_hooks(config: &Config, items: &mut Vec<DiagItem>) {
     let category = "hooks";
-    match crate::hooks::workspace_hook_actions(&config.workspace_dir) {
-        Ok(None | Some(0)) => items.push(DiagItem::healthy(category, "no workspace command hooks")),
-        Ok(Some(actions)) if config.security.workspace_hooks == crate::config::WorkspaceHooks::On => {
+    match crate::hooks::workspace_hook_counts(&config.workspace_dir) {
+        Ok(None | Some((0, _))) => items.push(DiagItem::healthy(category, "no workspace hooks")),
+        Ok(Some((actions, webhooks))) if config.security.workspace_hooks == crate::config::WorkspaceHooks::On => {
+            let webhook_note = if webhooks.is_empty() {
+                String::new()
+            } else {
+                format!("; {} webhook(s): {}", webhooks.len(), webhooks.join(", "))
+            };
             items.push(DiagItem::ok(
                 category,
                 format!(
-                    "{actions} workspace command hook(s) run (security.workspace_hooks = \"on\"), in a cleared \
-                     environment and a dedicated directory beside config.toml"
+                    "{actions} workspace hook(s) run (security.workspace_hooks = \"on\"); command hooks in a \
+                     cleared environment and a dedicated directory beside config.toml{webhook_note}"
                 ),
             ))
         }
-        Ok(Some(actions)) => {
+        Ok(Some((actions, _))) => {
             if let Some(note) = crate::hooks::blocked_hooks_note(actions) {
                 items.push(DiagItem::warn(category, note));
             }
