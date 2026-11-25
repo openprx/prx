@@ -171,11 +171,54 @@ the replay reader.
   compaction state lives there), child continuation keeps its text-only seed
   history, and the 500-turn bound is still a count, not the budget.
 
+## System prompt layout and sources
+
+Every surface builds its system prompt through one builder,
+`src/context/layout.rs`. Each segment of the prompt is produced by a `Source`
+(`src/context/sources/`, one file per source) that declares a slot. A source
+cannot choose a position: the builder places stable sources first and volatile
+sources last, and inside each group in slot order. One source fills one slot,
+except caller sections added through `SystemPromptBuilder::add_section`, which
+share the last slot and keep their insertion order. A source that renders
+nothing is recorded in the section provenance and left out of the text.
+
+The slot order is the order the prompt has always had:
+
+| Slot | Source | Content | Stable within a session |
+|---|---|---|---|
+| `task` | `TaskSection` | task rules; one wording per native-tool mode | yes |
+| `tool_evidence` | `ToolEvidenceSection` | the evidence-marker rule (terminal chat only) | yes |
+| `context_handoff` | `ContextHandoffSection` | the handoff and lookup rule | yes |
+| `safety` | `SafetySection` | the safety paragraph for the effective level | yes |
+| `orchestration` | `OrchestrationSection` | orchestration guidance | yes |
+| `skills` | `SkillsSection` | the skills index (metadata only) | changes when a skill is installed or removed |
+| `workspace` | `WorkspaceSection` | the working directory | yes |
+| `identity` | `IdentitySection`, or `RoleIdentitySection` for a named agent | identity files | changes when an identity file changes |
+| `datetime` | `DateTimeSection` | the time zone; never the date, which is in the tail of the live user message | yes |
+| `runtime` | `RuntimeSection` | host, operating system and model | yes |
+| `delegated_role` | `DelegatedRoleSection` | the role and execution contract of a delegated child | yes |
+| `custom` | `CustomSection` | sections added by embedded callers | caller's choice |
+
+Where each surface gets its prompt:
+
+| Surface | Sources |
+|---|---|
+| Terminal chat | the standard sources plus `tool_evidence` |
+| Console and rf sessions, webhooks, single-shot and unnamed scheduled runs | the standard sources |
+| Named agent (Console target, named cron or Xin job) | the standard sources with the agent's own identity in the `identity` slot instead of the main persona |
+| Task child, inline `delegate` child, worker-process child | the standard sources plus `delegated_role` |
+| Channels | the standard sources, then the channel sections appended by `src/channels/turn.rs` |
+
+The system prompt hash recorded per request (`system_prompt_sha256`) is
+computed over the assembled prompt together with the request-local tool
+capability text that `src/agent/turn_context.rs` appends to it each round.
+
 ## Ownership
 
 | Concern | Owner | Rule |
 |---|---|---|
-| Stable agent prompt sections | `src/agent/prompt.rs` | Entrypoints supply `PromptContext`; they do not concatenate their own copies |
+| System prompt segments | `src/context/sources/` (one source per slot), placed by `src/context/layout.rs` | Entrypoints supply `PromptContext`; they do not concatenate their own copies |
+| Public prompt builder | `src/agent/prompt.rs` (`SystemPromptBuilder`) | A facade over the layout; embedded callers add sections through it |
 | Per-turn capability snapshot | `src/agent/turn_context.rs` | The only bridge from selected `ToolSpec`s to provider representation and execution allowlist |
 | Prompt-guided tool syntax | `src/tools/prompt.rs` | One renderer; do not copy the protocol into an entrypoint or provider |
 | Tool schemas and availability | canonical tool registry/catalog | Do not maintain a parallel description array for model exposure |
