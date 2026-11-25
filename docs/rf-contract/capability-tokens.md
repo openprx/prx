@@ -426,7 +426,12 @@ mark; no length, tool name, title or other derivative of the content remains.
 Copies PRX derived from the deleted rows go in the same transaction:
 embedding-cache entries of their text, retrieval traces of the run,
 compaction summaries and handoff notes built from them, and memories, drafts
-and links PRX recorded with a deleted row as their source. Deleted rows never
+and links PRX recorded with a deleted row as their source. The rows of the
+run's tool rounds and its attachment row (`message.attachment.recorded`,
+`tool.call.recorded`, `tool.result.recorded`, `turn.decision.claimed`) are
+tombstoned like its messages, and the stored tool-output documents of the run
+go with them (a document that a tool result of a surviving run still quotes
+stays). Deleted rows never
 enter a later model context of the agent, recall, a handoff lookup or the
 session tools. `GET /api/sessions/{session_id}/messages` returns a deleted
 row as exactly `{"message_id","agent","deleted":true,"timestamp"}`.

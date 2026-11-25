@@ -280,7 +280,7 @@ pub(super) fn forget_family(
 
 /// FTS5 keeps a deleted row's terms in its segments until a merge; a rebuild
 /// drops them as well as their tombstones.
-fn rebuild_indexes(tx: &Connection, memories: bool, documents: bool) -> anyhow::Result<()> {
+pub(super) fn rebuild_indexes(tx: &Connection, memories: bool, documents: bool) -> anyhow::Result<()> {
     if memories {
         tx.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')", [])?;
     }

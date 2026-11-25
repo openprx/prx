@@ -10,7 +10,9 @@
 //! agent stamp and timestamp, and gets `deleted_at`. Copies derived from the
 //! deleted rows go in the same transaction: embedding-cache entries keyed by
 //! their text, retrieval traces of the run, memories, drafts and links that
-//! name a deleted event as their source, and compaction summaries and handoff
+//! name a deleted event as their source, the stored tool-output documents of
+//! the run (unless a tool result of a surviving run still quotes them), and
+//! compaction summaries and handoff
 //! notes built from a deleted event. The attempt rows keep their key and get
 //! the deleted mark; a message delete also clears the request digest, the
 //! only derivative of the message the record held.
@@ -422,12 +424,21 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
     let sql = match side {
         Side::Message => {
             "SELECT event_id, role IN ('user', 'assistant'), content FROM message_events
-             WHERE workspace_id = ?1 AND owner_id = ?2 AND (event_id = ?3 OR (?4 IS NOT NULL AND run_id = ?4))
+             WHERE workspace_id = ?1 AND owner_id = ?2
+               AND (event_id = ?3 OR (?4 IS NOT NULL AND run_id = ?4)
+                    OR (event_type IN ('message.attachment.recorded', 'tool.call.recorded',
+                                       'tool.result.recorded', 'turn.decision.claimed')
+                        AND (causation_event_id = ?3
+                             OR (json_valid(raw_payload_json)
+                                 AND json_extract(raw_payload_json, '$.user_event_id') = ?3))))
                AND event_type NOT IN ('turn.deleted', 'usage.settled', 'message.deleted')"
         }
         Side::Reply => {
             "SELECT event_id, role IN ('user', 'assistant'), content FROM message_events
-             WHERE workspace_id = ?1 AND owner_id = ?2 AND run_id = ?4 AND event_id <> ?3
+             WHERE workspace_id = ?1 AND owner_id = ?2 AND event_id <> ?3
+               AND (run_id = ?4
+                    OR (event_type IN ('tool.call.recorded', 'tool.result.recorded', 'turn.decision.claimed')
+                        AND causation_event_id = ?3))
                AND event_type NOT IN ('turn.deleted', 'usage.settled', 'message.deleted')
                AND event_type NOT LIKE 'turn.ingress.%'"
         }
@@ -533,6 +544,9 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
         ids.extend(notes);
     }
     let all = serde_json::to_string(&ids)?;
+    // Read before the rewrite: the payload of a tool result names the stored
+    // document that holds its large output.
+    let output_documents = tool_output_document_ids(tx, target, &all)?;
     tx.execute(
         "UPDATE message_events SET content = '', content_hash = NULL, source_ref_json = NULL,
              subject_ref_json = NULL,
@@ -545,7 +559,67 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
          WHERE workspace_id = ?1 AND event_id IN (SELECT value FROM json_each(?2))",
         params![target.workspace_id, all, target.now],
     )?;
+    erase_tool_output_documents(tx, &attempt.input_event_id, &output_documents)?;
     tombstone_turns(tx, &ids, target.now)
+}
+
+/// The document kinds a run's tool outputs are stored as: the oversized
+/// `tool_output` document and the verbatim `untrusted_external` copy.
+const TOOL_OUTPUT_KINDS: &str = "('tool_output', 'untrusted_external')";
+
+/// The ids of the stored tool-output documents that the `tool.result.recorded`
+/// rows among `event_ids` (a JSON array) reference, with the verbatim copy
+/// each may have (`untrusted:<id>`).
+fn tool_output_document_ids(tx: &Connection, target: &Target<'_>, event_ids: &str) -> anyhow::Result<Vec<String>> {
+    let mut statement = tx.prepare(
+        "SELECT DISTINCT json_extract(raw_payload_json, '$.document.document_id') FROM message_events
+         WHERE workspace_id = ?1 AND event_type = 'tool.result.recorded' AND json_valid(raw_payload_json)
+           AND event_id IN (SELECT value FROM json_each(?2))",
+    )?;
+    let ids = statement
+        .query_map(params![target.workspace_id, event_ids], |row| row.get::<_, Option<String>>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(ids
+        .into_iter()
+        .flatten()
+        .flat_map(|id| [format!("untrusted:{id}"), id])
+        .collect())
+}
+
+/// Delete the stored tool-output documents of a deleted run: those its tool
+/// result rows referenced and those stored with its input event as source.
+/// A document is content-addressed, so one that a tool result row of a
+/// surviving run still references stays (that row quotes it by id).
+fn erase_tool_output_documents(tx: &Connection, input_event_id: &str, referenced: &[String]) -> anyhow::Result<()> {
+    let mut ids = referenced.to_vec();
+    {
+        let mut statement = tx.prepare(&format!(
+            "SELECT document_id FROM documents WHERE source_message_event_id = ?1 AND source_kind IN {TOOL_OUTPUT_KINDS}"
+        ))?;
+        let sourced = statement
+            .query_map(params![input_event_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ids.extend(sourced);
+    }
+    let mut deleted = false;
+    for id in ids {
+        let kind_ok: bool = tx.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM documents WHERE document_id = ?1 AND source_kind IN {TOOL_OUTPUT_KINDS})"),
+            params![id],
+            |row| row.get(0),
+        )?;
+        let quoted: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM message_events
+                 WHERE event_type = 'tool.result.recorded' AND json_valid(raw_payload_json)
+                   AND json_extract(raw_payload_json, '$.document.document_id') IN (?1, replace(?1, 'untrusted:', '')))",
+            params![id],
+            |row| row.get(0),
+        )?;
+        if kind_ok && !quoted {
+            deleted |= rf_forget::delete_document(tx, &id, true)?;
+        }
+    }
+    rf_forget::rebuild_indexes(tx, false, deleted)
 }
 
 /// Compaction summaries built from a deleted event: the summary text, its
