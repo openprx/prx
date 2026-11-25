@@ -347,27 +347,33 @@ pub(super) fn session_turns_to_history(session: &session::ChatSession) -> Vec<Ch
 }
 
 /// The provider view of `session`'s stored turns: [`session_turns_to_history`]
-/// with every context handoff in its compact form and every assistant reply
-/// rendered with its tool evidence, each by its one renderer, so a resumed or
+/// with every context handoff in its compact form, every user message in the
+/// form it was sent and every assistant reply with its tool evidence, each by
+/// its one renderer, so a resumed or
 /// switched view holds the bytes the turn had in-process.
 pub(super) fn session_turns_to_provider_view(session: &session::ChatSession) -> Vec<ChatMessage> {
-    let mut view = session_turns_to_history(session);
+    let history = session_turns_to_history(session);
     let stored_turns = session
         .turns
         .iter()
         .filter(|turn| turn.role == "user" || turn.role == "assistant");
-    for (message, turn) in view.iter_mut().zip(stored_turns) {
+    let mut view = Vec::with_capacity(history.len());
+    for (mut message, turn) in history.into_iter().zip(stored_turns) {
         if let std::borrow::Cow::Owned(rendered) =
             crate::agent::compaction::render_context_handoff_for_provider(&message.role, &message.content)
         {
             message.content = rendered;
         }
-        if message.role == "assistant"
-            && let std::borrow::Cow::Owned(rendered) =
-                crate::agent::tool_evidence::render_assistant_content(&message.content, turn.tool_evidence.as_ref())
-        {
+        let evidence = turn.tool_evidence.as_ref();
+        let rendered = if message.role == "assistant" {
+            crate::agent::tool_evidence::render_assistant_content(&message.content, evidence)
+        } else {
+            crate::agent::tool_evidence::render_user_content(&message.content, evidence)
+        };
+        if let std::borrow::Cow::Owned(rendered) = rendered {
             message.content = rendered;
         }
+        view.push(message);
     }
     view
 }

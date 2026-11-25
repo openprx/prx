@@ -38,12 +38,21 @@ pub(crate) const ATTACHMENT_EVENT_TYPE: &str = "message.attachment.recorded";
 const REPLAY_ROW_LIMIT: usize = 500;
 
 /// What was put around a user message when it was sent.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct Attachment {
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Attachment {
     /// Text placed before the user's text (recalled memory).
+    #[serde(default)]
     pub prefix: String,
-    /// Text placed after it (the date line).
+    /// Text placed after it (attached file text, the date line).
+    #[serde(default)]
     pub tail: String,
+}
+
+impl Attachment {
+    /// The message as it was sent: `text` between the prefix and the tail.
+    pub(crate) fn compose(&self, text: &str) -> String {
+        format!("{}{text}{}", self.prefix, self.tail)
+    }
 }
 
 #[derive(Debug, Clone)]

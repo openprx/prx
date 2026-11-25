@@ -831,6 +831,14 @@ fn export_session_json(session: &session::ChatSession) -> Result<String> {
     let mut value = serde_json::to_value(session).map_err(|e| anyhow::anyhow!("JSON serialize: {e}"))?;
     let usage =
         serde_json::to_value(export_usage_metadata(session)).map_err(|e| anyhow::anyhow!("usage serialize: {e}"))?;
+    // An export carries the typed text of each turn, not what was put around it.
+    if let Some(turns) = value.get_mut("turns").and_then(serde_json::Value::as_array_mut) {
+        for evidence in turns.iter_mut().filter_map(|turn| turn.get_mut("tool_evidence")) {
+            if let Some(evidence) = evidence.as_object_mut() {
+                evidence.remove("sent");
+            }
+        }
+    }
     let Some(object) = value.as_object_mut() else {
         anyhow::bail!("session JSON root was not an object");
     };

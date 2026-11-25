@@ -106,6 +106,12 @@ pub struct TurnToolEvidence {
     pub groups: Vec<ToolEvidenceGroup>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub omitted_calls: u32,
+    /// What was put around a `user` turn's text when it was sent (recalled
+    /// memory before it, the date line after it). Only a user turn carries
+    /// it; it is replayed with the turn so the message keeps its bytes. The
+    /// turn's own text stays what the user typed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent: Option<crate::agent::tool_replay::Attachment>,
 }
 
 /// Serde's `skip_serializing_if` callback, which receives a reference.
@@ -200,6 +206,16 @@ pub(crate) fn render_assistant_content<'a>(content: &'a str, evidence: Option<&T
         rendered.push_str(&suffix);
         Cow::Owned(rendered)
     })
+}
+
+/// The one renderer of an acknowledged user message in a provider view:
+/// `content` between the text that was put before and after it when it was
+/// sent, borrowed when the turn has no such record.
+pub(crate) fn render_user_content<'a>(content: &'a str, evidence: Option<&TurnToolEvidence>) -> Cow<'a, str> {
+    let Some(sent) = evidence.and_then(|evidence| evidence.sent.as_ref()) else {
+        return Cow::Borrowed(content);
+    };
+    Cow::Owned(crate::agent::turn_contracts::neutralize_reserved_markers(&sent.compose(content)).into_owned())
 }
 
 /// The body of `line` when it is a whole evidence line: its trim starts with

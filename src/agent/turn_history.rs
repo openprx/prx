@@ -29,7 +29,7 @@
 use crate::agent::compaction::render_context_handoff_for_provider;
 use crate::agent::context_paging::inject_recalled_context;
 use crate::agent::page_sources::MessageSources;
-use crate::agent::tool_evidence::{TurnToolEvidence, render_assistant_content};
+use crate::agent::tool_evidence::{TurnToolEvidence, render_assistant_content, render_user_content};
 use crate::agent::turn_contracts::{inbound_user_message, stored_turn_message};
 use crate::providers::ChatMessage;
 use std::sync::Arc;
@@ -95,7 +95,7 @@ pub(crate) struct CanonicalHistory {
     /// One origin per message, index for index.
     origins: Vec<MessageOrigin>,
     /// One evidence slot per message, index for index; only an acknowledged
-    /// assistant message's slot can be filled.
+    /// message's slot can be filled.
     evidence: Vec<Option<Arc<TurnToolEvidence>>>,
     /// One set of source event ids per message, index for index; an evicted
     /// context page records the union over its messages.
@@ -137,8 +137,8 @@ impl CanonicalHistory {
         )
     }
 
-    /// As [`Self::from_acknowledged`], with each stored turn's tool evidence:
-    /// an `assistant` turn keeps it, every other turn's is ignored.
+    /// As [`Self::from_acknowledged`], with each stored turn's runtime record
+    /// (tool evidence of a reply, sent form of a request).
     pub(crate) fn from_acknowledged_turns<'a, I>(leading_system: Option<&str>, turns: I) -> Self
     where
         I: IntoIterator<Item = (&'a str, &'a str, Option<&'a TurnToolEvidence>)>,
@@ -147,8 +147,8 @@ impl CanonicalHistory {
     }
 
     /// A snapshot that holds the turn's admitted request at `request_turn`
-    /// (see `from_acknowledged_with_request`), with each stored turn's tool
-    /// evidence (kept on `assistant` turns only).
+    /// (see `from_acknowledged_with_request`), with each stored turn's
+    /// runtime record.
     pub(crate) fn from_acknowledged_turns_with_request<'a, I>(
         leading_system: Option<&str>,
         turns: I,
@@ -209,7 +209,7 @@ impl CanonicalHistory {
             };
             messages.push(stored_turn_message(role.to_owned(), content.to_owned()));
             origins.push(origin);
-            evidence.push(turn_evidence.filter(|_| role == "assistant"));
+            evidence.push(turn_evidence);
             sources.push(if origin == MessageOrigin::Request {
                 MessageSources::turn_round()
             } else {
@@ -596,12 +596,9 @@ fn shared_evidence<'a, I>(turns: I) -> impl Iterator<Item = (&'a str, &'a str, O
 where
     I: IntoIterator<Item = (&'a str, &'a str, Option<&'a TurnToolEvidence>)>,
 {
-    turns.into_iter().map(|(role, content, evidence)| {
-        let evidence = evidence
-            .filter(|_| role == "assistant")
-            .map(|evidence| Arc::new(evidence.clone()));
-        (role, content, evidence)
-    })
+    turns
+        .into_iter()
+        .map(|(role, content, evidence)| (role, content, evidence.map(|evidence| Arc::new(evidence.clone()))))
 }
 
 /// The refresh aside a durable compaction appends after its replacement, and
@@ -677,13 +674,16 @@ pub(crate) fn project(canonical: &CanonicalHistory, inputs: &ProjectionInputs) -
             }
         }
     }
-    // Each acknowledged assistant reply is shown with its tool evidence, by
-    // the one renderer, before anything is inserted (indices still align).
+    // Each acknowledged reply is shown with its tool evidence and each
+    // acknowledged request in the form it was sent, by the one renderer of
+    // each, before anything is inserted (indices still align).
     for (message, evidence) in messages.iter_mut().zip(&canonical.evidence) {
-        if let Some(evidence) = evidence.as_deref()
-            && message.role == "assistant"
-            && let std::borrow::Cow::Owned(rendered) = render_assistant_content(&message.content, Some(evidence))
-        {
+        let rendered = match message.role.as_str() {
+            "assistant" => render_assistant_content(&message.content, evidence.as_deref()),
+            "user" => render_user_content(&message.content, evidence.as_deref()),
+            _ => continue,
+        };
+        if let std::borrow::Cow::Owned(rendered) = rendered {
             message.content = rendered;
         }
     }

@@ -1437,6 +1437,7 @@ impl ChatState {
             Action::SessionSwitched { id } => self.reduce_session_switched(id),
             Action::RecordUserTurn(content) => self.reduce_record_user_turn(content),
             Action::UserTurnAdmitted { admission, content } => self.reduce_user_turn_admitted(admission, content),
+            Action::TurnRecordsAttached { user_text, sent } => self.reduce_turn_records_attached(&user_text, sent),
             Action::RecordAssistantTurn { task_id, content } => self.reduce_record_assistant_turn(task_id, content),
             Action::RecordSystemMessage { content } => self.reduce_record_system_message(content),
             Action::SetLeadingSystemPrompt { content } => self.reduce_set_leading_system_prompt(content),
@@ -1562,6 +1563,7 @@ const fn ui_dirty_for(action: &Action) -> bool {
         // `ContextWindowUpdated`, so the history patch itself is not snapshot-dirty.
         Action::RecordUserTurn(_)
         | Action::UserTurnAdmitted { .. }
+        | Action::TurnRecordsAttached { .. }
         | Action::RecordAssistantTurn { .. }
         | Action::RecordSystemMessage { .. }
         | Action::SetLeadingSystemPrompt { .. }

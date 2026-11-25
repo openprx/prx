@@ -104,6 +104,7 @@ mod session_store;
 mod session_switch;
 mod terminal;
 mod terminal_approval;
+mod turn_replay;
 mod tui_loop;
 mod views;
 

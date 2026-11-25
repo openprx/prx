@@ -1081,6 +1081,7 @@ fn provider_turn_finalizer_n3_out_of_order_releases_ordered_persistence_actions(
                 draft_updater: None,
                 tool_event_forwarder: None,
                 user_input: user_input.to_string(),
+                sent: None,
                 turn_run_id: format!("test-run-{}", task_id.get()),
                 route_scope: crate::memory::MessageEventScope::new("chat", crate::memory::MemoryVisibility::Workspace),
                 route_decision: RouteDecision::single_candidate("mock", "mock"),

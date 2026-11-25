@@ -75,7 +75,23 @@ is not replayed. Replayed tool messages have no event id, so the compaction
 provenance folds them into their round by shape. When the request is over the
 warning threshold, the oldest replayed results become one-line stubs first.
 The rows are not on the sync stream, and `conversation_turns` is unchanged.
-Terminal chat, channels, scheduled turns and children are not covered yet.
+Channels, scheduled turns and children are not covered yet.
+
+## Replayed history in terminal chat
+
+`prx chat` (TUI and `--plain`) replays the form each earlier request was sent
+in. A user turn keeps what was put around its text when it was sent (the masked
+recall text before it, attached `@path` text and the date line after it) in the
+optional `sent` field of its runtime record (`TurnToolEvidence` in
+`src/agent/tool_evidence.rs`), set by the action `TurnRecordsAttached` after the
+commit. The field is saved with the session JSON (`schema_version` stays 1; an
+older reader ignores the unknown optional field and an older file loads with no
+sent form). The provider view is rendered by `turn_history::project`, which
+replays `prefix + text + tail`, so the first message has the same bytes in every
+request, after `/resume` and after a restart; the canonical history, the
+compaction guard and the reducer form still hold the typed text only. The TUI,
+`/history`, the session list and exports show the typed text; the JSON export
+drops the field.
 
 ## Ownership
 

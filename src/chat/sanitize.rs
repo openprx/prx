@@ -126,6 +126,11 @@ pub fn sanitize_session_content(session: &super::session::ChatSession) -> super:
     sanitized.title = sanitize_for_persistence(&sanitized.title);
     for turn in &mut sanitized.turns {
         turn.content = sanitize_turn_content(turn);
+        // What was put around a request is stored masked, like its text.
+        if let Some(sent) = turn.tool_evidence.as_mut().and_then(|evidence| evidence.sent.as_mut()) {
+            sent.prefix = redact_secrets(&sent.prefix);
+            sent.tail = redact_secrets(&sent.tail);
+        }
         for tool_call in &mut turn.tool_calls {
             tool_call.args_preview = sanitize_text_or_json(&tool_call.args_preview);
         }

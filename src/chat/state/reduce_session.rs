@@ -345,6 +345,29 @@ impl ChatState {
         effects
     }
 
+    /// `Action::TurnRecordsAttached` — keep, beside the turn a commit just
+    /// recorded, the form its request was sent in (saved with the session).
+    /// Nothing is attached to a turn that is not exactly the one the action
+    /// names; the stored text of a turn never changes.
+    pub(super) fn reduce_turn_records_attached(
+        &mut self,
+        user_text: &str,
+        sent: Option<crate::agent::tool_replay::Attachment>,
+    ) -> Vec<Effect> {
+        let user_text = crate::agent::turn_contracts::neutralize_reserved_markers(user_text);
+        if let Some(sent) = sent
+            && let Some(turn) = self.session.turns.iter_mut().rev().find(|turn| {
+                turn.role == "user"
+                    && turn.content == user_text
+                    && turn.tool_evidence.as_ref().is_none_or(|evidence| evidence.sent.is_none())
+            })
+        {
+            turn.tool_evidence.get_or_insert_with(Default::default).sent = Some(sent);
+            return vec![Effect::SaveSession(self.session_commit())];
+        }
+        Vec::new()
+    }
+
     /// `Action::RecordAssistantTurn` — persist an assistant turn into the session record and LLM history.
     ///
     /// Matches `session.add_assistant_turn` semantics:

@@ -78,6 +78,8 @@ pub(super) struct PerTurnContext {
     pub(super) draft_updater: Option<tokio::task::JoinHandle<()>>,
     pub(super) tool_event_forwarder: Option<tokio::task::JoinHandle<()>>,
     pub(super) user_input: String,
+    /// The form the request was sent in (see [`crate::chat::turn_replay`]).
+    pub(super) sent: Option<crate::agent::tool_replay::Attachment>,
     pub(super) turn_run_id: String,
     pub(super) route_scope: MessageEventScope,
     pub(super) route_decision: RouteDecision,
@@ -1244,6 +1246,13 @@ async fn commit_completed_provider_turn(
         if let Some(guard) = pending.assignment.as_mut() {
             guard.failed("The turn finished without reply text.");
         }
+        crate::chat::turn_replay::attach_turn_records(
+            chat_dispatcher,
+            turn_signal,
+            &pending.user_input,
+            pending.sent.as_ref(),
+        )
+        .await;
         adopt_committed_turn(history, chat_dispatcher, &pending, None);
         surface_turn_elapsed_message(
             chat_dispatcher,
@@ -1299,6 +1308,13 @@ async fn commit_completed_provider_turn(
         );
         return false;
     }
+    crate::chat::turn_replay::attach_turn_records(
+        chat_dispatcher,
+        turn_signal,
+        &pending.user_input,
+        pending.sent.as_ref(),
+    )
+    .await;
     adopt_committed_turn(history, chat_dispatcher, &pending, Some(&final_text));
     if let Err(e) = terminal.finalize_draft("user", &pending.draft_id, &final_text).await {
         tracing::warn!(error = %crate::agent::diagnostics::error_class(&e), "Redux driver: finalize_draft failed");
@@ -1333,9 +1349,9 @@ async fn commit_completed_provider_turn(
 /// it equals the view rebuilt from the committed snapshot
 /// ([`super::compaction::provider_view_from_acked`]). Without a compaction
 /// since the turn copied its view, the committed request and reply are
-/// appended; the request is the plain stored text, never the enriched form
-/// the turn sent (only a request still being sent carries its recalled
-/// context and attached files). After a worker compaction the view is rebuilt
+/// appended; the request is in the form it was sent (recalled context, attached
+/// files and date line kept beside the turn). After a worker compaction the
+/// view is rebuilt
 /// from the committed snapshot instead: appending to the pre-compaction view
 /// would resend the replaced cold prefix and force another rollover or a lossy
 /// fallback on the next turn.
@@ -1358,7 +1374,11 @@ fn adopt_committed_turn(
         *history = view;
         return;
     }
-    history.push(crate::agent::turn_contracts::inbound_user_message(&pending.user_input));
+    // The request in the form it was sent, which the snapshot's view holds too.
+    history.push(crate::agent::turn_contracts::inbound_user_message(&pending.sent.as_ref().map_or_else(
+        || pending.user_input.clone(),
+        |sent| sent.compose(&pending.user_input),
+    )));
     if let Some(reply) = reply {
         history.push(committed_reply_message(&acked, reply));
     }

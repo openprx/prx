@@ -560,6 +560,13 @@ pub enum Action {
     /// inline path). The admission stays open until the turn commits; a
     /// failed or cancelled turn removes exactly this request, once.
     UserTurnAdmitted { admission: AdmissionId, content: String },
+    /// After a turn's commit: attach the form the user's request was sent in
+    /// (`sent`) to the newest user turn holding `user_text` that has none, so
+    /// the provider view replays the request as it was sent.
+    TurnRecordsAttached {
+        user_text: String,
+        sent: Option<crate::agent::tool_replay::Attachment>,
+    },
     /// Ask the reducer to persist the assistant turn (writes session.turns + LLM history)
     RecordAssistantTurn {
         task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
@@ -765,6 +772,7 @@ impl Action {
             Self::SessionSwitched { .. } => "SessionSwitched",
             Self::RecordUserTurn(_) => "RecordUserTurn",
             Self::UserTurnAdmitted { .. } => "UserTurnAdmitted",
+            Self::TurnRecordsAttached { .. } => "TurnRecordsAttached",
             Self::RecordAssistantTurn { .. } => "RecordAssistantTurn",
             Self::RecordSystemMessage { .. } => "RecordSystemMessage",
             Self::SetLeadingSystemPrompt { .. } => "SetLeadingSystemPrompt",

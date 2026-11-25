@@ -141,13 +141,14 @@
         #[cfg(feature = "terminal-tui")]
         let routing_input = admitted_binding.routing_input().to_owned();
         let mem_context = admitted_binding.recalled_context(mem.as_ref()).await;
-        let context = mem_context.preamble.clone();
-        let mut enriched = if context.is_empty() {
-            user_input_for_prompt.clone()
-        } else {
-            format!("{context}{user_input_for_prompt}")
-        };
-        crate::agent::turn_contracts::push_current_time_tail(&mut enriched);
+        // What is put around the typed text is kept with the turn, so a later
+        // turn's view replays this request with the same bytes.
+        let (enriched, sent_form) = super::turn_replay::sent_request(
+            &mem_context.preamble,
+            &user_input,
+            &user_input_for_prompt,
+            crate::agent::turn_contracts::current_time_tail(),
+        );
 
         // Build system prompt with skill selection
         let selected_skills = admitted_binding.prompt_skills()?;
@@ -677,6 +678,7 @@
                             draft_updater,
                             tool_event_forwarder: Some(tool_event_forwarder),
                             user_input: user_input.clone(),
+                            sent: sent_form.clone(),
                             turn_run_id: turn_run_id.clone(),
                             route_scope: route_scope.clone(),
                             route_decision: route_decision.clone(),
@@ -1612,6 +1614,7 @@
             {
                 anyhow::bail!("Chat stopped after an unconfirmed history commit: {error}");
             }
+            super::turn_replay::attach_turn_records(&chat_dispatcher, &turn_signal, &user_input, sent_form.as_ref()).await;
             super::compaction::reconcile_inline_turn(&mut history, &chat_dispatcher);
             if let Some(ref d_id) = draft_id
                 && let Err(e) = terminal.cancel_draft("user", d_id).await
@@ -1729,6 +1732,7 @@
         {
             anyhow::bail!("Chat stopped after an unconfirmed history commit: {error}");
         }
+        super::turn_replay::attach_turn_records(&chat_dispatcher, &turn_signal, &user_input, sent_form.as_ref()).await;
         super::compaction::reconcile_inline_turn(&mut history, &chat_dispatcher);
         #[cfg(feature = "terminal-tui")]
         if let Some(tx) = redraw_tx_for_main.as_ref() {
