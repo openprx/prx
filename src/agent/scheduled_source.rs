@@ -24,6 +24,8 @@ pub(crate) struct ScheduledAgentOrigin {
     retry_boundary: ScheduledRetryBoundary,
     /// Task card text built by the scheduler from its own store.
     card: Option<String>,
+    /// Whether the run starts without the earlier runs of its session.
+    fresh: bool,
 }
 
 /// A read-only observation held by the scheduler, never a permission to replay
@@ -40,6 +42,14 @@ impl ScheduledRetryBoundary {
 /// The task card of the scheduled invocation this call runs inside, if any.
 pub(super) fn current_card() -> Option<String> {
     SCHEDULED_ORIGIN.try_with(|origin| origin.card.clone()).ok().flatten()
+}
+
+/// Whether the scheduled invocation this call runs inside starts without the
+/// earlier runs of its session.
+pub(super) fn current_fresh() -> bool {
+    SCHEDULED_ORIGIN
+        .try_with(|origin| origin.fresh)
+        .unwrap_or(false)
 }
 
 pub(super) fn begin_decision() -> Result<()> {
@@ -66,6 +76,7 @@ impl ScheduledAgentOrigin {
             claimed_attempt: claim.map(|claim| claim.attempt_id.clone()),
             retry_boundary: ScheduledRetryBoundary::default(),
             card: None,
+            fresh: false,
         }
     }
 
@@ -80,6 +91,7 @@ impl ScheduledAgentOrigin {
             claimed_attempt: None,
             retry_boundary: ScheduledRetryBoundary::default(),
             card: None,
+            fresh: false,
         }
     }
 

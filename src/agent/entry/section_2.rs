@@ -741,19 +741,57 @@ pub(crate) async fn run_with_runtime_envelope(
                     crate::agent::context_recall::RECALL_CONTEXT_BUDGET,
                 )
                 .await;
-                let context = mem_context.preamble.clone();
-                let card = scheduled_card.as_deref().unwrap_or_default();
-                let mut enriched = if context.is_empty() && card.is_empty() {
-                    msg.clone()
+                // A scheduled run opens from its session's earlier runs; a plain run
+                // keeps the single-message request it always had.
+                let scheduled_turn = scheduled_admission.is_some();
+                let (mut history, history_event_ids) = if scheduled_turn {
+                    let previous_turns = scheduled_previous_turns(
+                        &mem,
+                        &runtime_envelope,
+                        agent_user_event.as_ref().map(|event| event.event_id.as_str()),
+                    )
+                    .await;
+                    let opening = crate::context::api::open::open_turn(crate::context::api::open::OpenInput {
+                        memory: &mem,
+                        envelope: &runtime_envelope,
+                        memory_config: &config.memory,
+                        chat_type: "private",
+                        visible_message: &msg,
+                        card: scheduled_card.as_deref(),
+                        previous_turns,
+                        replay: crate::context::api::open::ReplayMode::ClearAll,
+                        system_prompt,
+                        service: decision_service,
+                        context: decision_context,
+                        provider_label: provider_name,
+                        model: model_name,
+                    })
+                    .await;
+                    (opening.history, opening.history_event_ids)
                 } else {
-                    format!("{context}{card}{msg}")
+                    let context = mem_context.preamble.clone();
+                    let card = scheduled_card.as_deref().unwrap_or_default();
+                    let mut enriched = if context.is_empty() && card.is_empty() {
+                        msg.clone()
+                    } else {
+                        format!("{context}{card}{msg}")
+                    };
+                    crate::agent::turn_contracts::push_current_time_tail(&mut enriched);
+                    (
+                        vec![
+                            ChatMessage::system(&system_prompt),
+                            crate::agent::turn_contracts::inbound_user_message(&enriched),
+                        ],
+                        Vec::new(),
+                    )
                 };
-                crate::agent::turn_contracts::push_current_time_tail(&mut enriched);
-
-                let mut history = vec![
-                    ChatMessage::system(&system_prompt),
-                    crate::agent::turn_contracts::inbound_user_message(&enriched),
-                ];
+                let memory_runtime = if scheduled_turn {
+                    memory_runtime
+                        .with_history_event_ids(history_event_ids)
+                        .with_rendered_stored_handoffs()
+                } else {
+                    memory_runtime
+                };
 
                 // D8-4: seed a turn-root spawn context so a sub-agent spawned from this
                 // single-shot agent turn inherits parent_run_id = the per-turn run_id.
@@ -1027,6 +1065,43 @@ pub(crate) async fn run_with_runtime_envelope(
     // The process may exit right after this run: deliver the queued hook events first.
     ctx.hooks.drain_for_shutdown().await;
     result
+}
+
+/// How many stored turns of a scheduled run's session are replayed at most.
+const SCHEDULED_REPLAY_TURN_LIMIT: usize = 500;
+
+/// The earlier runs of a scheduled run's session, oldest first. The run's own
+/// input is already stored, so that row is left out. A fresh run has none, and
+/// a failed read starts the run without them.
+async fn scheduled_previous_turns(
+    memory: &std::sync::Arc<dyn crate::memory::Memory>,
+    envelope: &RuntimeEnvelope,
+    input_event_id: Option<&str>,
+) -> Vec<crate::memory::ConversationTurn> {
+    if super::scheduled_source::current_fresh() {
+        return Vec::new();
+    }
+    let transcript = crate::context::transcript::Transcript::new(memory.as_ref(), envelope.memory_principal());
+    match transcript
+        .load_model_turns(&envelope.session_key, SCHEDULED_REPLAY_TURN_LIMIT)
+        .await
+    {
+        Ok(mut turns) => {
+            if let Some(input_event_id) = input_event_id {
+                turns.retain(|turn| turn.message_event_id.as_deref() != Some(input_event_id));
+            }
+            turns
+        }
+        Err(error) => {
+            let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+            tracing::warn!(
+                error_len,
+                error_sha256,
+                "scheduled run could not read its session's earlier runs; starting without them"
+            );
+            Vec::new()
+        }
+    }
 }
 
 // This invocation state preserves all captures across the boxed work boundary.

@@ -37,10 +37,12 @@ optional component owned by Xin.
 ## What a scheduled agent run is told
 
 An `agent_session` task, a goal step, a heartbeat item and an agent cron job
-each run as a single-shot turn: the system message plus one user message. The
-run has no transcript of earlier runs. The scheduler therefore opens the user
-message with a task card, read from its own store and marked in its header as
-data and not as an instruction. The task instruction follows the line
+each run as a single-shot turn: the system message, the earlier runs of its
+session (under the key `xin:{task id}` or `cron:{job id}`), then the run's own
+user message. Each earlier run replays its stored prompt and reply, with its
+tool results cleared to stubs; a run flagged fresh starts without them. The
+scheduler opens the user message with a task card, read from its own store and
+marked in its header as data and not as an instruction. The task instruction follows the line
 `[Task instruction]`. The card carries:
 
 - the kind of run (Xin task, goal step, heartbeat item or cron job), the id and
@@ -56,7 +58,9 @@ data and not as an instruction. The task instruction follows the line
   previous attempt's output.
 
 The card is redacted with the persistence redaction before it enters the
-request. It is not stored with the message and is not part of recall. The
+request. It is stored as the attachment prefix of the run's input, beside the
+message and not in it, so later runs replay it with the same bytes; it is not
+part of recall. The
 stored Xin run output is cut at 16 KiB and the cut ends with a `...[truncated]`
 line. A named agent's job still gets that agent's identity text as its system
 prompt, not the full interactive prompt.

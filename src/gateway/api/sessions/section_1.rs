@@ -840,6 +840,7 @@ async fn run_console_runtime_turn(
         visible_message,
         card: None,
         previous_turns,
+        replay: crate::context::api::open::ReplayMode::FitToBudget,
         system_prompt,
         service: &decision.service,
         context: &decision.context,

@@ -409,6 +409,20 @@ impl History {
             config,
         )
     }
+
+    /// Replace every replayed tool result by its stub, whatever the budget.
+    /// Returns how many results were stubbed.
+    pub(crate) fn stub_all_results(&mut self) -> usize {
+        let mut stubbed = 0;
+        for result in &self.results {
+            let Some(message) = self.messages.get_mut(result.index) else {
+                continue;
+            };
+            *message = result_message(&result.wire_id, &stub_text(result));
+            stubbed += 1;
+        }
+        stubbed
+    }
 }
 
 /// Replace the oldest of `results` (in `messages`) by a stub until

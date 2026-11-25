@@ -14,6 +14,16 @@ use crate::runtime::envelope::RuntimeEnvelope;
 use crate::runtime::turn_context::OpenedTurn;
 use crate::runtime::turn_publication::TurnRuntimeService;
 
+/// How the replayed tool results of the earlier turns are shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplayMode {
+    /// Keep the results in full; the oldest become stubs only when the request
+    /// would be over its budget.
+    FitToBudget,
+    /// Replace every replayed result by its stub, then fit as usual.
+    ClearAll,
+}
+
 /// What a turn opening reads, borrowed from the caller's turn state.
 pub(crate) struct OpenInput<'a> {
     /// The memory the recall reads and the attachment row is written to.
@@ -29,6 +39,8 @@ pub(crate) struct OpenInput<'a> {
     pub(crate) card: Option<&'a str>,
     /// The stored turns of the session, oldest first.
     pub(crate) previous_turns: Vec<ConversationTurn>,
+    /// How the replayed tool results of `previous_turns` are shown.
+    pub(crate) replay: ReplayMode,
     /// The system prompt of the turn, passed through untouched.
     pub(crate) system_prompt: String,
     /// The compaction of the turn is resolved from these, for the provider
@@ -61,6 +73,7 @@ pub(crate) async fn open_turn(input: OpenInput<'_>) -> TurnOpening {
         visible_message,
         card,
         previous_turns,
+        replay,
         system_prompt,
         service,
         context,
@@ -76,11 +89,12 @@ pub(crate) async fn open_turn(input: OpenInput<'_>) -> TurnOpening {
     )
     .await;
     // What is put around the message is stored beside it and replayed on later
-    // turns, so the message keeps its bytes. It is stored (and sent) masked.
-    let mut prefix = crate::security::redaction::redact_secrets(&mem_context.preamble);
-    if let Some(card) = card {
-        prefix.push_str(card);
-    }
+    // turns, so the message keeps its bytes. It is stored (and sent) masked,
+    // the task card included.
+    let prefix = match card {
+        Some(card) => crate::security::redaction::redact_secrets(&format!("{}{card}", mem_context.preamble)),
+        None => crate::security::redaction::redact_secrets(&mem_context.preamble),
+    };
     let attachment = Attachment {
         prefix,
         tail: crate::agent::turn_contracts::current_time_tail(),
@@ -115,6 +129,9 @@ pub(crate) async fn open_turn(input: OpenInput<'_>) -> TurnOpening {
     // message, index for index: none for the system prompt or a tool message,
     // each stored turn's event, then the request's own event.
     let mut replayed = transcript.expand_turns(previous_turns).await;
+    if replay == ReplayMode::ClearAll {
+        replayed.stub_all_results();
+    }
     note_live_attachment(LiveAttachment {
         run_id: envelope.run_id.clone(),
         prefix_chars: Some(attachment.prefix.chars().count()),
