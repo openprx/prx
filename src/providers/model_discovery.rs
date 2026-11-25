@@ -798,11 +798,15 @@ pub fn run_models_list(config: &Config, provider_override: Option<&str>) -> Resu
 }
 
 pub fn run_models_refresh(config: &Config, provider_override: Option<&str>, force: bool) -> Result<()> {
-    let provider_name = provider_override
+    let Some(provider_name) = provider_override
         .or(config.default_provider.as_deref())
-        .unwrap_or("openrouter")
-        .trim()
-        .to_string();
+        .map(|name| name.trim().to_string())
+    else {
+        // No provider is configured and none was named: contact nobody.
+        println!("No provider is configured and none was named; nothing was refreshed.");
+        println!("Tip: run `prx models refresh --provider <provider>` or set `default_provider` first.");
+        return Ok(());
+    };
 
     if provider_name.is_empty() {
         anyhow::bail!("Provider name cannot be empty");
@@ -887,7 +891,7 @@ pub fn run_models_probe_read_only_with_env(
 ) -> Result<()> {
     let provider_name = provider_override
         .or(config.default_provider.as_deref())
-        .unwrap_or("openrouter")
+        .ok_or_else(|| anyhow::anyhow!("No provider is configured and none was named"))?
         .trim()
         .to_string();
     if provider_name.is_empty() {
