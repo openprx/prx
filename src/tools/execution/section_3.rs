@@ -168,7 +168,7 @@ impl ToolExecutionService {
             let verified = (context.execution_trace.as_ref().is_some_and(|trace| !trace.is_sealed()))
                 .then_some(binding)
                 .ok_or(super::capability::execution_binding::ToolExecutionError::StaleCapability)
-                .and_then(|binding| binding.verify_admitted_descriptor(self, &context.envelope, &descriptor));
+                .and_then(|binding| binding.verify_admitted_descriptor(&context.envelope, &descriptor));
             if let Err(error) = verified {
                 let error = error.to_string();
                 return self
@@ -830,7 +830,7 @@ impl ToolExecutionService {
             let verified = (context.execution_trace.as_ref().is_some_and(|trace| !trace.is_sealed()))
                 .then_some(binding)
                 .ok_or(super::capability::execution_binding::ToolExecutionError::StaleCapability)
-                .and_then(|binding| binding.verify_admitted_descriptor(self, &context.envelope, &descriptor));
+                .and_then(|binding| binding.verify_admitted_descriptor(&context.envelope, &descriptor));
             if let Err(error) = verified {
                 let abandonment = self
                     .abandon_idempotent_execution(idempotency_lease.as_ref(), &context)

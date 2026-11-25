@@ -9,7 +9,7 @@ pub(crate) use dispatch::{scope_dispatch_binding, verify_current_dispatch};
 use super::catalog::{CapabilityCatalog, CapabilityEntry};
 use crate::runtime::envelope::RuntimeEnvelope;
 use crate::tools::capability::contract::CapabilityRef;
-use crate::tools::execution::{ToolDescriptor, ToolExecutionService};
+use crate::tools::execution::ToolDescriptor;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
@@ -80,7 +80,6 @@ impl ExecutionBinding {
     /// remains on the gateway-issued admitted binding (MCP compat) that 02c never sees.
     pub(crate) fn verify_admitted_descriptor(
         &self,
-        service: &ToolExecutionService,
         scope: &RuntimeEnvelope,
         descriptor: &ToolDescriptor,
     ) -> Result<(), ToolExecutionError> {
@@ -88,7 +87,9 @@ impl ExecutionBinding {
         if scope != &self.scope {
             return Err(refuse());
         }
-        self.catalog.check_parity(service).map_err(|_| refuse())?;
+        // The live registry may have moved on since the catalog was pinned:
+        // the call runs against the live tool, which validates its own
+        // arguments. Identity, scope and backend stay exact.
         let entry = self
             .catalog
             .entry_for_public_name(&descriptor.public_name)
@@ -97,11 +98,6 @@ impl ExecutionBinding {
             || entry.generation != self.capability.generation
             || entry.root != descriptor.backend_name
             || entry.fingerprint != self.capability.fingerprint
-            || super::fingerprint::tool_spec_fingerprint(
-                &descriptor.public_name,
-                &descriptor.description,
-                &descriptor.parameters,
-            ) != self.capability.fingerprint
         {
             return Err(refuse());
         }

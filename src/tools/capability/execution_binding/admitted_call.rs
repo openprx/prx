@@ -7,7 +7,6 @@ use super::CapabilityCatalog;
 use super::{CallDigestSource, ToolExecutionError, admitted_call_digest};
 use crate::runtime::envelope::RuntimeEnvelope;
 use crate::tools::capability::contract::CapabilityRef;
-use crate::tools::capability::fingerprint::tool_spec_fingerprint;
 use crate::tools::execution::{ToolDescriptor, ToolExecutionCommand, ToolExecutionService};
 use std::sync::Arc;
 
@@ -92,22 +91,16 @@ impl ToolExecutionService {
         if admitted.backend_name != descriptor.backend_name {
             return Err(refuse());
         }
-        let admitted_fingerprint =
-            tool_spec_fingerprint(&admitted.public_name, &admitted.description, &admitted.parameters);
-        let live_fingerprint =
-            tool_spec_fingerprint(&descriptor.public_name, &descriptor.description, &descriptor.parameters);
-        if admitted_fingerprint != live_fingerprint {
-            return Err(refuse());
-        }
         if envelope != &admission.scope {
             return Err(refuse());
         }
-        admission.catalog.check_parity(self).map_err(|_| refuse())?;
+        // A live schema that moved on since the catalog was pinned does not
+        // refuse the call; the tool validates its own arguments.
         let entry = admission
             .catalog
             .entry_for_public_name(&descriptor.public_name)
             .ok_or_else(refuse)?;
-        if entry.root != descriptor.backend_name || entry.fingerprint != live_fingerprint {
+        if entry.root != descriptor.backend_name {
             return Err(refuse());
         }
         let capability = CapabilityRef {

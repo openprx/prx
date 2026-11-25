@@ -31,6 +31,15 @@ use crate::tools::capability::child::VerifiedChildScope;
 use crate::tools::capability::turn_state::{TurnBudgets, TurnSurfaceKind};
 use crate::tools::execution::ToolExecutionService;
 
+/// How a root publication's pinned catalog compares with the live registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiveRegistry {
+    Current,
+    /// The live registry differs from the pinned catalog; the turn keeps its
+    /// pinned surface and the owner publishes again at its next turn.
+    Drifted,
+}
+
 /// Borrowed publication-scoped inputs of the model, limits and parity rules.
 pub(crate) struct PublicationScope<'a> {
     pub(crate) generation: &'a ConfigGeneration,
@@ -177,6 +186,17 @@ impl<'a> PublicationScope<'a> {
     /// registry schema or binding has changed. Call before candidate exposure
     /// and again immediately before committing a directive.
     pub(crate) fn check_live_parity(&self) -> Result<(), ParityError> {
+        match self.check_live()? {
+            LiveRegistry::Current => Ok(()),
+            LiveRegistry::Drifted => Err(ParityError),
+        }
+    }
+
+    /// [`Self::check_live_parity`] with the registry-content comparison of a
+    /// root publication reported as a state instead of an error. Authority
+    /// and child checks stay errors: a child, worker or operator publication
+    /// is compared against its sealed scope exactly as before.
+    pub(crate) fn check_live(&self) -> Result<LiveRegistry, ParityError> {
         if let Some(parent) = self.ordinary_parent {
             parent.verify_live().map_err(|_| ParityError)?;
         }
@@ -189,20 +209,32 @@ impl<'a> PublicationScope<'a> {
         if let Some(process) = self.operator_process {
             process.verify().map_err(|_| ParityError)?;
             // A worker serves only the backends its executor registers.
-            return self.catalog.check_published_parity(
-                self.execution,
-                &self
-                    .catalog
-                    .served_references(self.execution, process.snapshots().publication.allowed()),
-            );
+            return self
+                .catalog
+                .check_published_parity(
+                    self.execution,
+                    &self
+                        .catalog
+                        .served_references(self.execution, process.snapshots().publication.allowed()),
+                )
+                .map(|()| LiveRegistry::Current);
         }
         if let Some(process) = self.ordinary_process {
             process.verify().map_err(|_| ParityError)?;
         }
-        self.child_scope().map_or_else(
-            || self.catalog.check_parity(self.execution),
-            |scope| self.catalog.check_child_parity(self.execution, scope),
-        )
+        match self.child_scope() {
+            Some(scope) => self
+                .catalog
+                .check_child_parity(self.execution, scope)
+                .map(|()| LiveRegistry::Current),
+            // A root publication whose live registry moved on (a skill was
+            // imported, an MCP server refreshed) is drift, not corruption.
+            None => Ok(if self.catalog.check_parity(self.execution).is_ok() {
+                LiveRegistry::Current
+            } else {
+                LiveRegistry::Drifted
+            }),
+        }
     }
 
     pub(crate) fn child_scope(&self) -> Option<&'a Arc<VerifiedChildScope>> {

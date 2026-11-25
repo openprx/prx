@@ -423,3 +423,4 @@ pub(crate) mod publication_scope;
 pub(crate) mod surface_binding;
 
 pub(crate) use opened_turn::OpenedTurn;
+pub(crate) use publication_scope::LiveRegistry;

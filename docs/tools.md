@@ -1763,7 +1763,14 @@ clarification rather than a successful tool action. Existing pending receipts
 keep their verification format. New readers verify old terminal records; older
 readers may refuse verification of the new declined-collection terminal binding.
 
-Catalog parity checks still apply. After an operation changes the skill catalog,
+Catalog parity checks still apply at publication, at every turn boundary and
+across the worker-process boundary. When the live registry of a root
+publication moves on during a turn, for example after a skill import, the turn
+is not failed: it keeps its pinned surface, calls run against the live tools,
+a tool the live registry no longer has returns the ordinary unknown-tool
+result, and the owner publishes the new registry before the next turn (chat,
+gateway sessions and channels check this at the turn boundary; each scheduled
+run publishes its own service). After an operation changes the skill catalog,
 chat waits for existing model turns to finish, then publishes the current catalog
 before admitting the next model turn. A fresh chat is not required. Existing
 turns retain their sealed catalog; consumed or stale approvals are not refreshed

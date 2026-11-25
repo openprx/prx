@@ -26,9 +26,18 @@ pub(crate) struct OpenedTurn {
     pub(in crate::runtime) tool_surface_tokens: usize,
     /// The logical deadline of this turn, fixed at opening from its budget.
     pub(in crate::runtime) deadline: Instant,
+    /// Set once the turn has logged that the live registry drifted from its
+    /// pinned catalog, so the line appears once per turn.
+    pub(in crate::runtime) registry_drift_noted: std::sync::atomic::AtomicBool,
 }
 
 impl OpenedTurn {
+    /// Record that the registry drift was logged; returns whether it already was.
+    pub(in crate::runtime) fn note_registry_drift(&self) -> bool {
+        self.registry_drift_noted
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+    }
+
     pub(crate) fn source_channel(&self) -> &str {
         &self.source_actor.0
     }

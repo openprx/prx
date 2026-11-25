@@ -44,23 +44,18 @@ pub(crate) fn execution_specs(
     let mut roots = BTreeSet::new();
     let mut specs = Vec::with_capacity(entries.len());
     for entry in entries {
-        let descriptor = port
-            .execution()
-            .current_descriptor(&entry.public_name)
-            .context("selected executable capability is missing")?;
+        // A capability the live registry no longer has is left out of the
+        // surface, so a call to it gets the ordinary unknown-tool result. A
+        // live schema that moved on since the catalog was pinned is offered
+        // as it is now.
+        let Some(descriptor) = port.execution().current_descriptor(&entry.public_name) else {
+            continue;
+        };
         let spec = ToolSpec {
             name: descriptor.public_name,
             description: descriptor.description,
             parameters: descriptor.parameters,
         };
-        anyhow::ensure!(
-            crate::tools::capability::fingerprint::tool_spec_fingerprint(
-                &spec.name,
-                &spec.description,
-                &spec.parameters
-            ) == entry.fingerprint,
-            "selected executable schema changed"
-        );
         roots.insert(entry.root.clone());
         specs.push(spec);
     }

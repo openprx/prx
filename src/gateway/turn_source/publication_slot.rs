@@ -81,7 +81,7 @@ impl GatewayPublicationSlot {
         }
         let mut published = self.service.lock().await;
         if let Some(service) = published.as_ref()
-            && !service.skills_changed()
+            && !service.needs_republish()
         {
             return Ok(Arc::clone(service));
         }

@@ -39,7 +39,15 @@ impl TurnSurfacePort for TurnSurfaceBinding<'_> {
             "execution decision belongs to another ingress actor"
         );
         let model = service.resolve_agent_model(proof)?;
-        service.check_live_parity()?;
+        // Authority and child checks stay errors. A root publication whose
+        // registry moved during the turn keeps its pinned surface: the turn
+        // continues and the owner republishes at its next turn boundary.
+        if service.registry_drifted()? && !context.note_registry_drift() {
+            tracing::info!(
+                catalog_generation = %hex::encode(service.catalog_view().generation().0),
+                "live tool registry differs from the pinned catalog; the turn continues on its pinned surface"
+            );
+        }
         let catalog = service.catalog_view();
         let model_ref = format!("{}:{}", model.provider_label(), model.model());
         let exclusions = super::opening::effective_agent_exclusions(

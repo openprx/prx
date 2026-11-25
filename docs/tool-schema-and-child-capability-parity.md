@@ -182,6 +182,23 @@ values.
 Future multi-action tools must declare action requirements in the same change
 that introduces executor branches.
 
+### 4.x Registry drift during a root turn
+
+The catalog a root publication pins is a snapshot, while some tools publish
+live specs (`skill_execute` lists the installed skills, MCP refreshes). When the
+live registry differs from the pinned catalog during a turn, the turn continues
+on its pinned surface and its one service: nothing is rebuilt mid-turn and the
+budget, recovery and trace state are untouched. One info line per turn records
+the catalog generation. A call to a tool that still exists runs against the live
+tool, which validates its own arguments; a call to a name the live registry no
+longer has returns the ordinary unknown-tool result. The service is not reused
+for the next turn: the chat, gateway and channel owners compare the live
+registry at the turn boundary and publish again, and each scheduled run builds
+its own service. The checks that stay exact are the service and actor identity of
+a turn, every check across the worker-process boundary (manifest verification
+and child parity), child publication, and the check made right after a catalog is
+built.
+
 ## 5. Capability inheritance design
 
 ### 5.1 Task mode

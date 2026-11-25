@@ -200,3 +200,7 @@ off after the upgrade, set it to `false` again once the reset has run. No databa
 ## Scheduled runs use the install's managed skills
 
 Runs started by the install's own schedulers (Xin, cron and the heartbeat tasks) for the local operator now count as the configured `[skills_lifecycle] owner_scope` for the skill lifecycle store: `skills_manage` status and list actions and `skill_execute` of a managed skill work in those runs. Jobs created by remote principals and owner-isolated origins keep the owner-mismatch refusal. No configuration change is needed.
+
+## A changed tool registry no longer fails a running turn
+
+When the live tool registry changes during a turn (for example `skills_manage` imports an executable skill), the turn now completes on its pinned tool surface instead of failing with `catalog and execution registry differ`. The next turn is published from the live registry, so the new skill is offered and runnable then. Worker-process and child parity checks are unchanged. No configuration change is needed.

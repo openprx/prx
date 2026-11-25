@@ -417,6 +417,19 @@ impl TurnRuntimeService {
         self.publication_scope().check_live_parity()
     }
 
+    /// Whether this root publication's pinned catalog still matches the live
+    /// registry. A service that fails this is republished by its owner at the
+    /// next turn boundary; an open turn keeps running on its pinned surface.
+    pub(crate) fn registry_drifted(&self) -> Result<bool, ParityError> {
+        Ok(self.publication_scope().check_live()? == crate::runtime::turn_context::LiveRegistry::Drifted)
+    }
+
+    /// The owner should publish a fresh service before its next turn: the
+    /// installed skills or the live registry moved since this one was pinned.
+    pub(crate) fn needs_republish(&self) -> bool {
+        self.skills_changed() || self.registry_drifted().unwrap_or(true)
+    }
+
     pub(in crate::runtime) fn child_scope(&self) -> Option<&Arc<crate::tools::capability::child::VerifiedChildScope>> {
         self.publication_scope().child_scope()
     }

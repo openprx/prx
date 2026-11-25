@@ -305,6 +305,7 @@ impl TurnRuntimeService {
             main_compaction: budget.main_compaction,
             tool_surface_tokens,
             deadline,
+            registry_drift_noted: AtomicBool::new(false),
         }))
     }
 
