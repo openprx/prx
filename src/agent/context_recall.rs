@@ -173,6 +173,29 @@ pub(crate) async fn scoped_recall(
     query: &str,
     budget: usize,
 ) -> RecalledMemoryContext {
+    recall_with_session(memory, scope, query, budget, true).await
+}
+
+/// Recall for a surface that replays the session's own rows as history. The
+/// current-session block is left out because those rows are already in the
+/// replayed history; the shared events, semantic memory and document evidence
+/// are recalled as in [`scoped_recall`]. The budget rules are the same.
+pub(crate) async fn replayed_session_recall(
+    memory: &dyn Memory,
+    scope: &RecallScope,
+    query: &str,
+    budget: usize,
+) -> RecalledMemoryContext {
+    recall_with_session(memory, scope, query, budget, false).await
+}
+
+async fn recall_with_session(
+    memory: &dyn Memory,
+    scope: &RecallScope,
+    query: &str,
+    budget: usize,
+    include_current_session: bool,
+) -> RecalledMemoryContext {
     // Historical user text must not be reintroduced when recording is off.
     if budget == 0 {
         return RecalledMemoryContext {
@@ -197,6 +220,7 @@ pub(crate) async fn scoped_recall(
         Some(scope.record_user_messages),
         (scope.current_input_key.as_deref(), scope.current_input_event.as_deref()),
         scope.child_task.as_deref(),
+        include_current_session,
     )
     .await;
     let semantic_start = bundle.current_session_context.len() + bundle.recent_shared_context.len();
@@ -881,6 +905,7 @@ pub(crate) async fn build_agent_context_with_semantic_scope(
         None,
         (None, None),
         None,
+        true,
     )
     .await
 }
@@ -895,6 +920,7 @@ async fn build_agent_context(
     record_user_messages: Option<bool>,
     exclusion: (Option<&str>, Option<&str>),
     child_task: Option<&str>,
+    include_current_session: bool,
 ) -> AgentContextBundle {
     let (excluded_key, excluded_event) = exclusion;
     let gate = child_task.map(|task_id| ChildRecallGate {
@@ -927,21 +953,24 @@ async fn build_agent_context(
     // while unrelated runs stay isolated.
     // Conversation turns carry no source provenance, so a child never reads them.
     let mut current_session_turns = match principal.session_key.as_deref() {
-        Some(session_key) if child_task.is_none() => mem
+        Some(session_key) if child_task.is_none() && include_current_session => mem
             .list_conversation_turns(&principal, session_key, 12, 0)
             .await
             .unwrap_or_default(),
         _ => Vec::new(),
     };
-    let mut current_session_events = mem
-        .load_recent_session_context(SessionContextQuery {
+    let mut current_session_events = if include_current_session {
+        mem.load_recent_session_context(SessionContextQuery {
             principal: principal.clone(),
             since_event_id: None,
             limit: 24,
             include_roles: vec!["user".to_string(), "assistant".to_string(), "event".to_string()],
         })
         .await
-        .unwrap_or_default();
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let mut shared_events = mem
         .load_recent_shared_context(SharedContextQuery {
             principal: principal.clone(),
@@ -991,9 +1020,14 @@ async fn build_agent_context(
         &dropped_document_items,
     )
     .await;
-    let (current_session_context, mut source_events) =
+    // A replayed session's rows are already in the request history, so the
+    // block is not built and its ids are not recorded.
+    let (current_session_context, mut source_events) = if include_current_session {
         build_current_session_events_preamble_sourced(&principal, &current_session_events, live_input)
-            .unwrap_or_else(|| build_current_session_preamble_sourced(&current_session_turns, live_input));
+            .unwrap_or_else(|| build_current_session_preamble_sourced(&current_session_turns, live_input))
+    } else {
+        (String::new(), Vec::new())
+    };
     let (recent_shared_context, shared_event_ids) = build_shared_events_preamble_sourced(&principal, &shared_events);
     source_events.extend(shared_event_ids);
     let source_documents = selected_document_items

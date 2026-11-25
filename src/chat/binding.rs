@@ -875,7 +875,7 @@ impl ChatTurnBinding {
         &self,
         memory: &dyn Memory,
     ) -> crate::agent::context_recall::RecalledMemoryContext {
-        crate::agent::context_recall::scoped_recall(
+        crate::agent::context_recall::replayed_session_recall(
             memory,
             &crate::agent::context_recall::RecallScope::from_envelope(
                 &self.envelope,

@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use crate::agent::context_recall::{RECALL_CONTEXT_BUDGET, RecallScope, scoped_recall};
+use crate::agent::context_recall::{RECALL_CONTEXT_BUDGET, RecallScope, replayed_session_recall};
 use crate::config::{AgentCompactionConfig, MemoryConfig};
 use crate::context::request_provenance::{LiveAttachment, note_live_attachment};
 use crate::context::transcript::{Attachment, Transcript, append_attachment};
@@ -13,6 +13,10 @@ use crate::providers::ChatMessage;
 use crate::runtime::envelope::RuntimeEnvelope;
 use crate::runtime::turn_context::OpenedTurn;
 use crate::runtime::turn_publication::TurnRuntimeService;
+
+/// Smallest recall budget of a replaying turn, in bytes. A window of 0 maps
+/// here, because a budget of 0 switches the recall off.
+const REPLAYED_RECALL_BUDGET_FLOOR: usize = 1_024;
 
 /// How the replayed tool results of the earlier turns are shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,11 +87,23 @@ pub(crate) async fn open_turn(input: OpenInput<'_>) -> TurnOpening {
         model,
     } = input;
 
-    let mem_context = scoped_recall(
+    // OQ-23 / R5: budget on the *effective* window of the model this turn
+    // serves (the operator/discovery/catalog model limits and
+    // `reserved_output_tokens`), with the same arguments the CLI, TUI and
+    // webhook resolve with, so one request is trimmed the same way on every
+    // surface of this process.
+    let mut effective_compaction = service.effective_compaction(provider_label, model);
+    effective_compaction.config = context.main_compaction().clone();
+    crate::providers::context_window::trace_effective_compaction_resolution(&effective_compaction);
+    // The session's own rows are replayed below, so the recall carries no copy
+    // of them, and its shared part is at most half the window of this model.
+    let recall_budget =
+        (effective_compaction.config.max_context_tokens / 2).clamp(REPLAYED_RECALL_BUDGET_FLOOR, RECALL_CONTEXT_BUDGET);
+    let mem_context = replayed_session_recall(
         memory.as_ref(),
         &RecallScope::from_envelope(envelope, memory_config, chat_type),
         visible_message,
-        RECALL_CONTEXT_BUDGET,
+        recall_budget,
     )
     .await;
     // What is put around the message is stored beside it and replayed on later
@@ -116,14 +132,6 @@ pub(crate) async fn open_turn(input: OpenInput<'_>) -> TurnOpening {
     }
     let transcript = Transcript::new(memory.as_ref(), envelope.memory_principal());
 
-    // OQ-23 / R5: budget on the *effective* window of the model this turn
-    // serves (the operator/discovery/catalog model limits and
-    // `reserved_output_tokens`), with the same arguments the CLI, TUI and
-    // webhook resolve with, so one request is trimmed the same way on every
-    // surface of this process.
-    let mut effective_compaction = service.effective_compaction(provider_label, model);
-    effective_compaction.config = context.main_compaction().clone();
-    crate::providers::context_window::trace_effective_compaction_resolution(&effective_compaction);
     let system_message = ChatMessage::system(system_prompt);
     let request_message = crate::agent::turn_contracts::inbound_user_message(&enriched_message);
     // Earlier turns with their tool rounds; the oldest results become stubs

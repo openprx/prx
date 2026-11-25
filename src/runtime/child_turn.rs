@@ -101,7 +101,7 @@ impl ChildSegmentTurn {
             cancellation,
         )?;
         {
-            turn.recalled_context = crate::agent::context_recall::scoped_recall(
+            turn.recalled_context = crate::agent::context_recall::replayed_session_recall(
                 recall_memory.as_ref(),
                 &recall_scope,
                 turn.proof.routing_input(),
