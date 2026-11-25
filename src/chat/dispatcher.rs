@@ -3179,7 +3179,7 @@ async fn drive_start_turn_stream(
     let tools = tools_registry.unwrap_or_else(|| Arc::new(Vec::new()));
 
     let multimodal = crate::config::MultimodalConfig::default();
-    let work = crate::agent::turn_engine::run_turn(
+    let work = Box::pin(crate::agent::turn_engine::run_turn(
         &mut history,
         crate::agent::turn_request::TurnRequest {
             advice: binding.decision_advice(),
@@ -3227,7 +3227,7 @@ async fn drive_start_turn_stream(
             on_delta: None,
             on_tool_call: None,
         },
-    );
+    ));
     // Child cleanup must settle before reducer terminal actions can publish
     // completion or permit the ordered history commit.
     let result = if let Some(owner) = crate::runtime::turn_cleanup::current_tracker() {

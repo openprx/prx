@@ -1136,7 +1136,7 @@ async fn run_owned_manifest(
                     let loop_result = cleanup
                         .run(crate::providers::model_settings::with_temperature(
                             temperature_override,
-                            run_turn(
+                            Box::pin(run_turn(
                                 &mut segment_history,
                                 crate::agent::turn_request::TurnRequest {
                                     advice,
@@ -1196,7 +1196,7 @@ async fn run_owned_manifest(
                                     on_delta: None,
                                     on_tool_call: None,
                                 },
-                            ),
+                            )),
                         ))
                         .await;
                     if let (Some(turn), Some(segments)) = (child_turn.as_ref(), child_segments.as_ref()) {

@@ -328,9 +328,10 @@ pub(super) async fn run_sub_agent_task(
         let spawn_context_owned = SPAWN_EXECUTION_CONTEXT.try_with(Clone::clone).ok();
         // The child's lifecycle events are the launching turn's events.
         let hook_identity = crate::hooks::current_identity();
-        let mut loop_handle = spawn_scoped(crate::agent::idle::scope_beat(
-            Some(run_beat),
-            crate::hooks::identity_scope_optional(hook_identity, with_spawn_context(spawn_context_owned, async move {
+        // The child loop is boxed where it is built, so only a pointer moves
+        // through the scope wrappers below; each wrapper would otherwise hold
+        // another copy of this very large state machine on the poll stack.
+        let child_loop = Box::pin(async move {
                 // Carry the segment proof across the spawn boundary explicitly.
                 let child_source = child_source_owned;
                 let child_service = child_service_owned;
@@ -413,7 +414,7 @@ pub(super) async fn run_sub_agent_task(
                         task_history.last().map_or(0, |message| message.content.chars().count()),
                     );
                     let loop_outcome = loop_cleanup
-                        .run(crate::agent::turn_engine::run_turn(
+                        .run(Box::pin(crate::agent::turn_engine::run_turn(
                             &mut task_history,
                             crate::agent::turn_request::TurnRequest {
                                 advice,
@@ -464,7 +465,7 @@ pub(super) async fn run_sub_agent_task(
                                 on_delta: on_delta_iter,
                                 on_tool_call: on_tool_call_iter,
                             },
-                        ))
+                        )))
                         .await;
                     match &loop_outcome {
                         Ok((outcome, _)) => child_events.finished(match outcome {
@@ -509,7 +510,10 @@ pub(super) async fn run_sub_agent_task(
                 }
                 .await;
                 (task_history, result)
-            })),
+        });
+        let mut loop_handle = spawn_scoped(crate::agent::idle::scope_beat(
+            Some(run_beat),
+            crate::hooks::identity_scope_optional(hook_identity, with_spawn_context(spawn_context_owned, child_loop)),
         ));
         let _loop_abort = AbortLoopOnDrop(loop_handle.abort_handle());
 

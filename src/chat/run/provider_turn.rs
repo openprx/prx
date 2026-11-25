@@ -1225,7 +1225,7 @@
                 .scope(
                     turn_message_send_ctx.clone(),
                     crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT.scope(turn_spawn_ctx.clone(), async {
-                        run_turn(
+                        Box::pin(run_turn(
                             &mut history,
                             crate::agent::turn_request::TurnRequest {
                                 advice: admitted_binding.decision_advice(),
@@ -1277,7 +1277,7 @@
                                 on_delta: Some(delta_tx.clone()),
                                 on_tool_call: Some(tool_event_tx.clone()),
                             },
-                        )
+                        ))
                         .await
                         .map(|(outcome, trace)| (outcome.into_text(), trace))
                     }),

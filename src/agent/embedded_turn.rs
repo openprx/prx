@@ -509,7 +509,7 @@ async fn run_work(
         .with_event_fabric(source.fabric().clone())
         .with_request_event_scope(source.envelope().message_scope());
     let result = child_cleanup
-        .run(crate::agent::turn_engine::run_turn(
+        .run(Box::pin(crate::agent::turn_engine::run_turn(
             &mut history.wire,
             crate::agent::turn_request::TurnRequest {
                 advice: service.advisory().analyze_turn(decision.runtime(), cancellation).await,
@@ -563,7 +563,7 @@ async fn run_work(
                 on_delta: None,
                 on_tool_call: None,
             },
-        ))
+        )))
         .await;
     // Preserve interrupted tool history even if the terminal reports failure.
     history.finish(agent.tool_dispatcher.as_ref());
