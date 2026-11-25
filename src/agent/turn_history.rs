@@ -784,6 +784,39 @@ impl TurnHistory {
         }
     }
 
+    /// [`Self::new`] for a turn that also gets the stored event of each message
+    /// of `view` ([`Self::with_history_event_ids`]). An untracked caller whose
+    /// view holds a stored context handoff takes its canonical copy now, from
+    /// the stored bytes, and the view then shows that handoff in its compact
+    /// form. The view keeps its length.
+    pub(crate) fn open(
+        view: &mut Vec<ChatMessage>,
+        canonical: Option<CanonicalHistory>,
+        caller_rollover: bool,
+        event_ids: Vec<Option<String>>,
+    ) -> Self {
+        let holds_stored_handoff = canonical.is_none()
+            && view.iter().any(|message| {
+                matches!(
+                    render_context_handoff_for_provider(&message.role, &message.content),
+                    std::borrow::Cow::Owned(_)
+                )
+            });
+        if !holds_stored_handoff {
+            return Self::new(view.as_slice(), canonical, caller_rollover).with_history_event_ids(event_ids);
+        }
+        let canonical = CanonicalHistory::of_caller_with_event_ids(view.as_slice(), view.len(), &event_ids);
+        for message in view.iter_mut() {
+            let rendered = render_context_handoff_for_provider(&message.role, &message.content);
+            if let std::borrow::Cow::Owned(rendered) = rendered {
+                message.content = rendered;
+            }
+        }
+        // A canonical history makes `new` show the stored handoffs as the
+        // compact rendering; no caller rollover was current before this turn.
+        Self::new(view.as_slice(), Some(canonical), false).with_history_event_ids(event_ids)
+    }
+
     /// Record the request the turn answers as `view` holds it now. The loop
     /// calls this once it opens, after the inbound middleware, so the anchor
     /// is the request exactly as the provider view shows it.

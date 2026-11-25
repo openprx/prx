@@ -253,7 +253,7 @@ async fn run(
         .clone()
         .ok_or_else(|| anyhow::anyhow!("mailbox adoption row is missing"))?;
     let mut turns = crate::context::transcript::Transcript::new(state.mem.as_ref(), envelope.memory_principal())
-        .load_turns(&input.message.to.session, MAX_PAGE_LIMIT)
+        .load_model_turns(&input.message.to.session, MAX_PAGE_LIMIT)
         .await?;
     let before = turns.len();
     turns.retain(|turn| turn.message_event_id.as_deref() != Some(adopted.as_str()));

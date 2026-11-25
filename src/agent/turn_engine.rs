@@ -544,8 +544,7 @@ async fn run_turn_unguarded(
     );
     // The canonical history every durable compaction of this turn is built
     // from; `history` is the provider view projected from it.
-    let mut turn_history =
-        TurnHistory::new(history, canonical_history, caller_rollover).with_history_event_ids(history_event_ids);
+    let mut turn_history = TurnHistory::open(history, canonical_history, caller_rollover, history_event_ids);
     anyhow::ensure!(
         Arc::ptr_eq(turn_runtime, context.runtime()),
         "turn runtime context differs from the opened decision context"

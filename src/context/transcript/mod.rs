@@ -9,6 +9,7 @@
 //! `conversation_turns` stays a display projection; it is only an input to
 //! [`Transcript::expand_turns`] until the loader reads the log itself.
 
+mod handoff;
 mod replay;
 mod sources;
 mod tool_rows;
@@ -52,6 +53,39 @@ impl<'a> Transcript<'a> {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// The turns a model history of `session_key` starts from: [`Self::load_turns`],
+    /// except that the newest valid context handoff of the session's log, when
+    /// there is one, comes first, with its stored bytes, followed by the loaded
+    /// turns after its row range. A failed handoff read leaves the turns as
+    /// [`Self::load_turns`] returns them.
+    pub(crate) async fn load_model_turns(
+        &self,
+        session_key: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ConversationTurn>> {
+        let turns = self.load_turns(session_key, limit).await?;
+        let found = match handoff::newest_valid_handoff(self.memory, &self.principal, session_key).await {
+            Ok(found) => found,
+            Err(error) => {
+                let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+                tracing::warn!(
+                    error_len,
+                    error_sha256,
+                    "transcript could not read the session's context handoff; loading all turns"
+                );
+                None
+            }
+        };
+        let Some((event, handoff)) = found else {
+            return Ok(turns);
+        };
+        let covered_through = handoff.last_row_id;
+        let mut model = Vec::with_capacity(turns.len() + 1);
+        model.push(turn_of_event(event));
+        model.extend(turns.into_iter().filter(|turn| turn.id > covered_through));
+        Ok(model)
     }
 
     /// The tool, attachment and message rows of the session. A failed read
