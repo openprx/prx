@@ -252,33 +252,70 @@ pub(crate) fn effective_run_owner_from_context(context: &crate::tools::ToolExecu
     )
 }
 
+/// The runtime-authored facts of a call that decide whether it belongs to a
+/// run this install's own scheduler started (see
+/// [`is_install_scheduler_caller`]).
+struct SchedulerRunFacts<'a> {
+    source: &'a str,
+    channel: Option<&'a str>,
+    sender: Option<&'a str>,
+    chat_id: Option<&'a str>,
+    chat_type: Option<&'a str>,
+    session_key: Option<&'a str>,
+    run_id: Option<&'a str>,
+    task_id: Option<&'a str>,
+    owner_isolated: bool,
+}
+
+impl SchedulerRunFacts<'_> {
+    /// A run of a job the local operator created acts through the operator's
+    /// CLI tuple (chat source, `cli` channel, `agent` sender, `agent:local`
+    /// chat) while keeping the scheduler's own session key, task and run
+    /// identity (`xin:{task}`, `cron:{job}`; `scheduled_source.rs`, local
+    /// operator admission). A job created by a remote principal acts as that
+    /// principal and an unattributed job carries its own channel, so neither
+    /// has this tuple; an owner-isolated origin is excluded.
+    fn is_scheduler_run(&self) -> bool {
+        let Some(task) = self.task_id.filter(|task| !task.is_empty()) else {
+            return false;
+        };
+        ["xin", "cron"].into_iter().any(|scheduler| {
+            self.source == "chat"
+                && self.channel == Some("cli")
+                && self.sender == Some("agent")
+                && self.chat_id == Some("agent:local")
+                && self.chat_type == Some("private")
+                && self.session_key == Some(format!("{scheduler}:{task}").as_str())
+                && self
+                    .run_id
+                    .is_some_and(|run| run.starts_with(&format!("{scheduler}:{task}:")))
+                && !self.owner_isolated
+        })
+    }
+}
+
 /// Whether the call belongs to a run this install's own scheduler (Xin, cron
-/// or the heartbeat tasks Xin hosts) started for the local operator.
+/// or the heartbeat tasks Xin hosts) started for the local operator, whether
+/// from `prx xin run`, `prx cron run` or the daemon.
 ///
-/// Read only from the runtime-authored envelope or `_zc_scope` (the `_zc_`
-/// prefix is stripped from caller input): the run source is `cron` or `xin`,
-/// the channel and sender are that scheduler's own tuple, the run has no owner
-/// of its own and is not owner-isolated. A job created by a remote principal
-/// acts as its creator (that principal's channel, sender and owner), an
-/// unattributed job carries a derived owner, and an owner-isolated origin is
-/// excluded, so none of them match.
+/// Read only from the runtime-authored context or `_zc_scope` (the `_zc_`
+/// prefix is stripped from caller input); see [`SchedulerRunFacts`].
 pub(crate) fn is_install_scheduler_caller(args: &Value) -> bool {
-    let scheduler = |source: &str, channel: Option<&str>, sender: Option<&str>, owner: Option<&str>, isolated: bool| {
-        matches!(source, "cron" | "xin")
-            && channel == Some(source)
-            && sender == Some(source)
-            && owner.is_none_or(|owner| owner.trim().is_empty())
-            && !isolated
-    };
     if let Some(context) = crate::tools::execution::current_child_call_context() {
-        let envelope = &context.context().envelope;
-        return scheduler(
-            envelope.source.as_str(),
-            envelope.channel.as_deref(),
-            envelope.sender.as_deref(),
-            envelope.owner_id.as_deref(),
-            envelope.owner_isolated,
-        );
+        let context = context.context();
+        let envelope = &context.envelope;
+        return SchedulerRunFacts {
+            source: envelope.source.as_str(),
+            channel: envelope.channel.as_deref(),
+            sender: envelope.sender.as_deref(),
+            chat_id: Some(context.chat_id.as_str()),
+            chat_type: Some(context.chat_type.as_str()),
+            session_key: Some(envelope.session_key.as_str()),
+            run_id: envelope.run_id.as_deref(),
+            task_id: envelope.task_id.as_deref(),
+            owner_isolated: envelope.owner_isolated,
+        }
+        .is_scheduler_run();
     }
     if !args.get("_zc_scope_trusted").and_then(Value::as_bool).unwrap_or(false) {
         return false;
@@ -287,13 +324,18 @@ pub(crate) fn is_install_scheduler_caller(args: &Value) -> bool {
         return false;
     };
     let text = |key: &str| scope.get(key).and_then(Value::as_str);
-    scheduler(
-        text("runtime_source").unwrap_or_default(),
-        text("channel"),
-        text("sender"),
-        text("owner_id"),
-        scope.get("owner_isolated").and_then(Value::as_bool) == Some(true),
-    )
+    SchedulerRunFacts {
+        source: text("runtime_source").unwrap_or_default(),
+        channel: text("channel"),
+        sender: text("sender"),
+        chat_id: text("chat_id"),
+        chat_type: text("chat_type"),
+        session_key: text("session_key"),
+        run_id: text("run_id"),
+        task_id: text("task_id"),
+        owner_isolated: scope.get("owner_isolated").and_then(Value::as_bool) == Some(true),
+    }
+    .is_scheduler_run()
 }
 
 impl RunOwnerScope {
