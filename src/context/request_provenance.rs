@@ -34,6 +34,8 @@ const STUB_MARKER: &str = "[tool result cleared:";
 const STUB_WINDOW: usize = 160;
 
 struct RegisteredPrompt {
+    /// The task that compiled the prompt: the same task that sends it.
+    owner: TaskKey,
     sha256: String,
     chars: usize,
     content: Arc<str>,
@@ -49,17 +51,16 @@ pub(crate) fn register_prompt(compiled: &CompiledSystemPrompt) {
     if compiled.content.is_empty() {
         return;
     }
+    let owner = TaskKey::current();
     let mut prompts = PROMPTS.lock();
     if let Some(at) = prompts.iter().position(|entry| entry.sha256 == compiled.sha256) {
-        if let Some(entry) = prompts.remove(at) {
-            prompts.push_back(entry);
-        }
-        return;
+        prompts.remove(at);
     }
     if prompts.len() >= MAX_PROMPTS {
         prompts.pop_front();
     }
     prompts.push_back(Arc::new(RegisteredPrompt {
+        owner,
         sha256: compiled.sha256.clone(),
         chars: compiled.chars,
         content: Arc::from(compiled.content.as_str()),
@@ -83,10 +84,13 @@ fn find_prompt(system: &str, system_sha256: Option<&str>) -> Option<(Arc<Registe
     {
         return Some((Arc::clone(entry), SystemMatch::Exact));
     }
+    // An appended text: only a prompt this task compiled, and the longest of
+    // them, so another session's shorter prompt is never taken for it.
+    let owner = TaskKey::current();
     prompts
         .iter()
-        .rev()
-        .find(|entry| system.starts_with(&*entry.content))
+        .filter(|entry| entry.owner == owner && system.starts_with(&*entry.content))
+        .max_by_key(|entry| entry.content.len())
         .map(|entry| (Arc::clone(entry), SystemMatch::Prefix))
 }
 
@@ -146,8 +150,10 @@ impl ReducerNote {
 /// What a surface put around the live user message, as counts. `request_chars`
 /// is the character count of the message as the surface built it; the record
 /// uses the note only when the message that is sent still has that size.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct LiveAttachment {
+    /// The run the message belongs to.
+    pub(crate) run_id: Option<String>,
     pub(crate) request_chars: usize,
     pub(crate) prefix_chars: Option<usize>,
     pub(crate) tail_chars: Option<usize>,
@@ -173,6 +179,8 @@ impl LiveAttachment {
 
 #[derive(Default)]
 struct TaskNotes {
+    /// The run the notes below belong to.
+    run_id: Option<String>,
     reducers: Vec<ReducerNote>,
     live: Option<LiveAttachment>,
 }
@@ -213,27 +221,46 @@ pub(crate) fn note_reducers(notes: Vec<ReducerNote>) {
     }
 }
 
-/// Record the attachment of this task's live user message.
+/// Start the notes of run `run_id` on this task. Notes of another run, or of
+/// an unknown one, are dropped; the notes of the same run stay (a surface
+/// notes its attachment and runs its first ladder before the engine opens).
+pub(crate) fn open_turn(run_id: Option<&str>) {
+    let mut all = NOTES.lock();
+    let task = all.of(TaskKey::current());
+    if run_id.is_none() || task.run_id.as_deref() != run_id {
+        *task = TaskNotes {
+            run_id: run_id.map(str::to_owned),
+            ..TaskNotes::default()
+        };
+    }
+}
+
+/// Record the attachment of this task's live user message, which opens its run.
 pub(crate) fn note_live_attachment(note: LiveAttachment) {
+    open_turn(note.run_id.clone().as_deref());
     NOTES.lock().of(TaskKey::current()).live = Some(note);
 }
 
-fn take_reducers() -> Vec<ReducerNote> {
+/// Take what the round's ladders ran and the live note of `run_id`. Notes of
+/// another run are never returned. The reducer notes are cleared; the live
+/// note stays for the later rounds of the same run.
+fn take_notes(run_id: Option<&str>) -> (Vec<ReducerNote>, Option<LiveAttachment>) {
     let mut all = NOTES.lock();
-    all.tasks
-        .get_mut(&TaskKey::current())
-        .map(|task| std::mem::take(&mut task.reducers))
-        .unwrap_or_default()
-}
-
-fn live_attachment() -> Option<LiveAttachment> {
-    NOTES.lock().tasks.get(&TaskKey::current()).and_then(|task| task.live)
+    let Some(task) = all.tasks.get_mut(&TaskKey::current()) else {
+        return (Vec::new(), None);
+    };
+    if run_id.is_none() || task.run_id.as_deref() != run_id {
+        return (Vec::new(), None);
+    }
+    (std::mem::take(&mut task.reducers), task.live.clone())
 }
 
 /// The facts of one request that the engine already holds.
 pub(crate) struct RequestFacts<'a> {
     /// The messages as they are sent.
     pub(crate) messages: &'a [ChatMessage],
+    /// The run the request belongs to; notes of another run are not used.
+    pub(crate) run_id: Option<&'a str>,
     /// Hash and character count of the system message that is sent.
     pub(crate) system_sha256: Option<&'a str>,
     pub(crate) system_chars: usize,
@@ -320,10 +347,10 @@ pub(crate) fn request_provenance(facts: &RequestFacts<'_>) -> Value {
         previous_was_tool = message.role == "tool";
     }
 
-    let note = live_attachment();
+    let (reducer_notes, note) = take_notes(facts.run_id);
     let live = live_at.and_then(|index| facts.messages.get(index)).map_or(Value::Null, |message| {
         let chars = message.content.chars().count();
-        let attachment = note.filter(|note| note.request_chars == chars);
+        let attachment = note.as_ref().filter(|note| note.request_chars == chars);
         json!({
             "chars": chars,
             "bytes": message.content.len(),
@@ -351,13 +378,13 @@ pub(crate) fn request_provenance(facts: &RequestFacts<'_>) -> Value {
             "messages": by_role,
             "tool_rounds": rounds,
             "stubbed_results": stubbed,
-            "attachments_replayed": note.and_then(|note| note.attachments_replayed),
+            "attachments_replayed": note.as_ref().and_then(|note| note.attachments_replayed),
             "chars": history_chars,
             "bytes": history_bytes,
             "after_live": { "messages": turn_messages, "chars": turn_chars },
         },
         "live": live,
-        "reducers": take_reducers().into_iter().map(ReducerNote::to_json).collect::<Vec<_>>(),
+        "reducers": reducer_notes.into_iter().map(ReducerNote::to_json).collect::<Vec<_>>(),
         "hooks": [],
     })
 }

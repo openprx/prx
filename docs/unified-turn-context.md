@@ -428,11 +428,22 @@ prompt text, no message text, no file path and no memory key. Code:
 The segment hashes are computed once per compile of the system prompt (the
 fingerprints the layout always kept); history is counted, not hashed. The
 manifest travels beside the prompt text, which is byte-identical to before. It
-reaches the engine through a small process-local table keyed by the prompt's
-hash, so the terminal chat, the gateway, scheduled runs, task children and the
-process worker (which builds its prompt in its own process) all report it.
-Reducer notes and the live attachment are filed per task and read by the next
-request row of that task.
+reaches the engine through a small process-local table (32 prompts), so the
+terminal chat, the gateway, scheduled runs, task children and the process
+worker (which builds its prompt in its own process) all report it. The lookup
+takes a prompt whose hash equals the sent system message's hash; failing that,
+and only among prompts compiled by the same task, the longest one the message
+starts with (`segments_match: prefix`). Another task's manifest is never used;
+a request that matches neither records `segments: null`.
+
+Reducer notes and the live attachment are filed per task and stamped with the
+run id. The engine opens the task's notes at the start of a turn and drops
+those of any other run (or of an unknown run), a request row reads only the
+notes of its own run, and it clears the reducer notes it read, so a ladder that
+ran with no row after it cannot show on a later turn. The live note stays for
+the later rounds of the same run. The notes of at most 128 tasks are kept; when
+a new task evicts the oldest one, that task's notes are lost and its next rows
+show empty `reducers` and a null `live.attachment`: a diagnostic loss only.
 
 To read it, with sqlite:
 

@@ -151,6 +151,7 @@
         );
 
         crate::context::request_provenance::note_live_attachment(crate::context::request_provenance::LiveAttachment {
+            run_id: runtime_envelope.run_id.clone(),
             prefix_chars: sent_form.as_ref().map(|sent| sent.prefix.chars().count()),
             tail_chars: sent_form.as_ref().map(|sent| sent.tail.chars().count()),
             ..crate::context::request_provenance::LiveAttachment::new(

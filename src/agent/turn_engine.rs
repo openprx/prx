@@ -556,6 +556,14 @@ async fn run_turn_unguarded(
         })
     });
 
+    // The request provenance of this turn starts from empty notes.
+    crate::context::request_provenance::open_turn(
+        request_event_scope
+            .as_ref()
+            .and_then(|scope| scope.run_id.as_deref())
+            .or(runtime_adapter.tool_execution_context.envelope.run_id.as_deref()),
+    );
+
     // FIX-P0-30/31: attribution of the final returning turn. Each provider call
     // overwrites this with that turn's real serving provider/model + attempts;
     // the value at the returning turn is handed back to the caller.
@@ -1325,6 +1333,10 @@ async fn run_turn_unguarded(
                     "provenance": crate::context::request_provenance::request_provenance(
                         &crate::context::request_provenance::RequestFacts {
                             messages: &prepared_messages.messages,
+                            run_id: request_event_scope
+                                .as_ref()
+                                .and_then(|scope| scope.run_id.as_deref())
+                                .or(execution_adapter.tool_execution_context.envelope.run_id.as_deref()),
                             system_sha256: system_prompt_sha256.as_deref(),
                             system_chars: system_prompt_chars,
                             tool_surface_sha256: &tool_snapshot.sha256,

@@ -871,6 +871,7 @@ async fn run_console_runtime_turn(
     // each stored turn's event, then the request's own event.
     let mut replayed = transcript.expand_turns(previous_turns).await;
     crate::context::request_provenance::note_live_attachment(crate::context::request_provenance::LiveAttachment {
+        run_id: turn_envelope.run_id.clone(),
         prefix_chars: Some(attachment.prefix.chars().count()),
         tail_chars: Some(attachment.tail.chars().count()),
         attachments_replayed: Some(replayed.attachments),
