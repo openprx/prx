@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 
 pub mod discovery;
+mod catalog_stamp;
 mod publication;
 pub(crate) use publication::publish_staged_skill_inactive;
 pub mod lifecycle;
@@ -43,7 +44,7 @@ struct CatalogKey {
     openclaw_skills_dir: Option<PathBuf>,
 }
 
-static SKILL_CATALOGS: LazyLock<Mutex<HashMap<CatalogKey, Arc<Vec<Skill>>>>> =
+static SKILL_CATALOGS: LazyLock<Mutex<HashMap<CatalogKey, (u64, Arc<Vec<Skill>>)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static SKILL_EMBEDDINGS: LazyLock<Mutex<HashMap<String, Vec<f32>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static SKILL_HYDRATION_LOCKS: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
@@ -285,8 +286,23 @@ pub fn load_skills_with_config(workspace_dir: &Path, config: &crate::config::Con
         open_skills_dir: config.skills.open_skills_dir.as_deref().map(PathBuf::from),
         openclaw_skills_dir: config.skills.openclaw_skills_dir.as_deref().map(PathBuf::from),
     };
+    // The snapshot is reused only while the directories it was read from are
+    // unchanged, so a skill installed or removed by another process shows up.
+    let open_root = resolve_open_skills_dir(config.skills.open_skills_dir.as_deref());
+    let openclaw_root = resolve_openclaw_skills_dir(config.skills.openclaw_skills_dir.as_deref())
+        .map(|root| root.join("skills"));
+    let workspace_root = workspace_dir.join("skills");
+    let disabled_root = workspace_root.join(DISABLED_SKILL_MARKER);
+    let roots: Vec<&Path> = [Some(&workspace_root), Some(&disabled_root), open_root.as_ref(), openclaw_root.as_ref()]
+        .into_iter()
+        .flatten()
+        .map(PathBuf::as_path)
+        .collect();
+    let stamp = catalog_stamp::stamp_of(&roots);
     let mut catalogs = SKILL_CATALOGS.lock();
-    if let Some(skills) = catalogs.get(&key) {
+    if let Some((cached_stamp, skills)) = catalogs.get(&key)
+        && *cached_stamp == stamp
+    {
         return skills.as_ref().clone();
     }
 
@@ -300,11 +316,8 @@ pub fn load_skills_with_config(workspace_dir: &Path, config: &crate::config::Con
     if catalogs.len() >= MAX_CATALOGS {
         catalogs.clear();
     }
-    catalogs
-        .entry(key)
-        .or_insert_with(|| Arc::clone(&loaded))
-        .as_ref()
-        .clone()
+    catalogs.insert(key, (stamp, Arc::clone(&loaded)));
+    loaded.as_ref().clone()
 }
 
 fn normalized_path(path: &Path) -> PathBuf {
@@ -2315,7 +2328,7 @@ command = "echo hello"
     }
 
     #[tokio::test]
-    async fn catalog_snapshot_changes_only_after_explicit_invalidation() {
+    async fn catalog_snapshot_follows_the_skill_directories() {
         // Other parallel fixtures can fill the bounded process-wide cache and
         // evict this snapshot. Exercise invalidation with a private process cache.
         const ISOLATED: &str = "PRX_TEST_SKILL_CATALOG_ISOLATED";
@@ -2324,7 +2337,7 @@ command = "echo hello"
             command
                 .args([
                     "--exact",
-                    "skills::tests::catalog_snapshot_changes_only_after_explicit_invalidation",
+                    "skills::tests::catalog_snapshot_follows_the_skill_directories",
                     "--nocapture",
                 ])
                 .env(ISOLATED, "1");
@@ -2356,7 +2369,8 @@ command = "echo hello"
         let beta = workspace_dir.join("skills").join("beta");
         fs::create_dir_all(&beta).unwrap();
         fs::write(beta.join("SKILL.md"), "# Beta\nSecond.\n").unwrap();
-        assert_eq!(load_skills_with_config(&workspace_dir, &config).len(), 1);
+        // A skill added by another process is seen without an invalidation.
+        assert_eq!(load_skills_with_config(&workspace_dir, &config).len(), 2);
 
         invalidate_skill_catalog(&workspace_dir);
         let skills = load_skills_with_config(&workspace_dir, &config);
