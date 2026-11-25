@@ -115,6 +115,7 @@ pub mod chat;
 pub mod cli_tracing;
 pub mod compliance;
 pub mod config;
+pub(crate) mod context;
 pub mod cost;
 pub mod cron;
 pub mod daemon;

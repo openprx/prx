@@ -190,6 +190,9 @@ pub(crate) struct TurnRuntimeContext {
     pub(crate) catalog: Arc<CapabilityCatalog>,
     pub(crate) publication_policy: SurfacePolicy,
     pub(crate) catalog_generation: CatalogGeneration,
+    /// The call context computed once at opening and carried to every tool
+    /// call of the turn.
+    pub(crate) call: Arc<crate::context::call::TurnCallContext>,
     pub(crate) admission: PublicationFacts,
     /// The surface published at opening by the execution rules (R28):
     /// publication authority only, rechecked at binding and dispatch.

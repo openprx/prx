@@ -626,6 +626,8 @@ pub(super) fn native_working_root_selection_sites_are_explicit() {
             "src/tools/mod.rs::default_tools_with_runtime::effective_root=1",
             "src/tools/mod.rs::all_tools_with_runtime_ext_and_extensions::effective_root=1",
             "src/tools/mod.rs::all_tools_with_runtime_ext_and_extensions::.workdir=1",
+            "src/runtime/turn_context/opening.rs::call_context::effective_root=1",
+            "src/runtime/turn_context/opening.rs::call_context::.workdir=1",
         ],
     );
 }

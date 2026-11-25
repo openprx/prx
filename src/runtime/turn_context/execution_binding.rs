@@ -67,6 +67,7 @@ impl TurnRuntimeService {
         );
         // Approval routing belongs to the ingress builder, including an explicit None.
         execution_context.owner_filesystem = context.owner_filesystem.clone();
+        execution_context.call = Some(Arc::clone(&context.runtime().call));
         execution_context.set_h2_origin(proof.h2_entry_origin().cloned());
         if let Some(case) = execution_context.controlled_case().cloned() {
             case.verify_config(&self.generation.effective)?;

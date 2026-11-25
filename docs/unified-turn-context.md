@@ -60,6 +60,30 @@ skill when `skill_read` is excluded by global or model-specific configuration.
 `skill_read` is a core prompt dependency; skill execution aliases remain
 subject to normal selection and exposure rules.
 
+## The call context
+
+`TurnCallContext` (`src/context/call.rs`) is computed once per turn in
+`TurnRuntimeService::open_turn_context_observed` and stored on the turn's
+runtime context. The execution binding copies it into
+`ToolExecutionContext::call`, and the execution service makes it the current
+call context (a task-local, `crate::context::call::current`) around the
+precheck and the backend invocation of every model-turn tool call.
+
+It carries identity (owner, session key, run id, named agent, surface,
+channel, task id), authority (the effective level and why it was derived:
+sealed child scope or service policy), place (workspace root and working
+directory), the model (provider, model, window, tool-calling), the catalog
+generation and the memory partition.
+
+Precedence: when a call context is present its level is the call's level
+(`effective_autonomy::current` reads it first), and the shell, `file_read`,
+`file_write` and `file_edit` tools take their working directory from it and
+fall back to the directory they were built with only when no call context is
+set (tests, operator and job dispatch). Tools do not re-read configuration
+for the level or the directory. The budget handle, published surface and
+control handles are not carried yet. MCP dispatch and skill execution still
+read their own state and move in a later step.
+
 ## Replayed history on the gateway session route
 
 The history of a Console or rf session turn is built from the stored

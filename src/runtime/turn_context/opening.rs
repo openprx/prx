@@ -272,6 +272,13 @@ impl TurnRuntimeService {
         // The turn's one accounting scope, created at opening. Without the
         // prediction hop nothing has been charged to it yet.
         let accounting = accounting_scope(self, proof, budgets, deadline);
+        let call = Arc::new(self.call_context(
+            proof,
+            &model,
+            budget.main_compaction.max_context_tokens,
+            facts.model_can_call_tools,
+            catalog.generation(),
+        ));
         let runtime = Arc::new(TurnRuntimeContext {
             decision_id,
             trusted,
@@ -285,6 +292,7 @@ impl TurnRuntimeService {
             catalog: Arc::clone(&self.catalog),
             publication_policy: self.publication_policy.clone(),
             catalog_generation: catalog.generation(),
+            call,
             admission: facts,
             published,
             discovery: crate::tools::capability::search_tool::DiscoveryState::default(),
@@ -307,6 +315,68 @@ impl TurnRuntimeService {
             deadline,
             registry_drift_noted: AtomicBool::new(false),
         }))
+    }
+
+    /// The turn's call context: identity, level, place and model, computed
+    /// once here from the same inputs the opening already used.
+    fn call_context(
+        &self,
+        proof: &dyn TurnSourceProof,
+        model: &crate::providers::catalog::ResolvedModel,
+        window_tokens: usize,
+        can_call_tools: bool,
+        catalog_generation: crate::tools::capability::contract::CatalogGeneration,
+    ) -> crate::context::call::TurnCallContext {
+        use crate::context::call::{
+            CallAuthority, CallIdentity, CallModel, CallPlace, LevelReason, TurnCallContext,
+        };
+        let memory_partition = proof
+            .memory_scope()
+            .agent_partition
+            .as_ref()
+            .map(|partition| partition.key.clone());
+        let agent_id = match &memory_partition {
+            Some(crate::memory::PartitionKey::Named { name, .. }) => Some(Arc::from(name.as_str())),
+            Some(crate::memory::PartitionKey::Main) | None => None,
+        };
+        let reason = if proof.child_scope().is_some() {
+            LevelReason::ChildScope
+        } else {
+            LevelReason::ServicePolicy
+        };
+        let workspace_root = self.security.workspace_dir.clone();
+        let working_dir = crate::security::path_policy::effective_root(
+            self.generation.effective.runtime.workdir.as_deref(),
+            &self.security,
+        )
+        .to_path_buf();
+        TurnCallContext {
+            identity: CallIdentity {
+                owner_id: Arc::from(proof.owner_id()),
+                session_key: Arc::from(proof.session_key()),
+                run_id: Arc::from(proof.run_id()),
+                agent_id,
+                surface: proof.surface(),
+                channel: Arc::from(proof.policy_channel()),
+                task_id: proof.task_id().map(Arc::from),
+            },
+            authority: CallAuthority {
+                level: turn_level(&self.security, proof),
+                reason,
+            },
+            place: CallPlace {
+                workspace_root,
+                working_dir,
+            },
+            model: CallModel {
+                provider: Arc::from(model.provider_label()),
+                model: Arc::from(model.model()),
+                window_tokens,
+                can_call_tools,
+            },
+            catalog_generation,
+            memory_partition,
+        }
     }
 
     pub(crate) async fn open_issued_turn_context(
