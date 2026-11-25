@@ -372,10 +372,9 @@ pub(super) fn admit_called_tokens(
     };
     let remaining = budget.remaining();
     if tokens > remaining {
-        return Err((
-            ToolExecutionStatus::Denied,
-            format!("tool '{name}' estimates {tokens} tokens but {remaining} remain"),
-        ));
+        // A full window is the context reducer's job, not a reason to refuse the
+        // call: the schema is already in the request (owner rule, PRX unrestricted).
+        tracing::warn!(tool = name, tokens, remaining, "tool call estimate exceeds the remaining call budget; running it");
     }
     Ok(())
 }
