@@ -1150,6 +1150,8 @@ impl SkillsManageTool {
                 let configured = service.owner_scope().as_str();
                 let refusal = match Self::lifecycle_caller_owner(&args) {
                     Some(caller) if caller == configured => None,
+                    // This install's own scheduler acts as the install owner.
+                    _ if super::sessions_read_model::is_install_scheduler_caller(&args) => None,
                     Some(caller) => Some((
                         "wrong_owner",
                         format!(

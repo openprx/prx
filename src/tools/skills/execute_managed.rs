@@ -89,7 +89,13 @@ impl SkillExecuteTool {
         cancellation: Option<CancellationToken>,
     ) -> anyhow::Result<Option<ToolResult>> {
         use crate::skills::lifecycle;
-        let Some(owner) = crate::tools::sessions_read_model::effective_run_owner(args)
+        // A run this install's own scheduler started acts as the configured
+        // install owner; every other caller is its own derived owner.
+        let scheduler_owner = crate::tools::sessions_read_model::is_install_scheduler_caller(args)
+            .then(|| self.config.skills_lifecycle.owner_scope.clone())
+            .flatten();
+        let Some(owner) = scheduler_owner
+            .or_else(|| crate::tools::sessions_read_model::effective_run_owner(args))
             .and_then(|owner_id| lifecycle::OwnerScope::new(&owner_id).ok())
         else {
             // No trusted owner this call could be pinned for. A skill the

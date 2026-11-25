@@ -158,6 +158,8 @@ names both scopes. Set the old scope back, or move `self/skill-lifecycle`
 aside to start a new store. Nothing is migrated between owners. A configured suite entry registers an already frozen suite;
 it is not a command to generate or import evaluation cases.
 
+Runs that this install's own schedulers (Xin, cron and the heartbeat tasks Xin hosts) start for the local operator act as the configured `owner_scope`: they may read lifecycle status and lists and execute managed skills. The scheduler origin is authored by the runtime and cannot be supplied by a caller. A job created by a remote principal acts as that principal, and an owner-isolated origin never matches, so both keep the owner-mismatch refusal.
+
 | Mode | Allowed work |
 | --- | --- |
 | `draft_only` | Drafts and source review; no evaluation or publication |

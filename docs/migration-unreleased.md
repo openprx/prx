@@ -196,3 +196,7 @@ the handoff match ignore them, and the gateway sync stream carries nothing for
 them. Older generated templates wrote `record_tool_events = false` explicitly, so the
 one-time reset above also changes that exact value to `true`; to keep recording
 off after the upgrade, set it to `false` again once the reset has run. No database schema migration is introduced.
+
+## Scheduled runs use the install's managed skills
+
+Runs started by the install's own schedulers (Xin, cron and the heartbeat tasks) for the local operator now count as the configured `[skills_lifecycle] owner_scope` for the skill lifecycle store: `skills_manage` status and list actions and `skill_execute` of a managed skill work in those runs. Jobs created by remote principals and owner-isolated origins keep the owner-mismatch refusal. No configuration change is needed.
