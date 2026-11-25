@@ -206,6 +206,10 @@ Runs started by the install's own schedulers (Xin, cron and the heartbeat tasks)
 
 Shell-kind and script-kind skill processes now get `PRX_WORKDIR` (the working directory of the calling agent) and `PRX_WORKSPACE` (its workspace root) as absolute paths. A skill that never reads them is unaffected, and the process working directory is unchanged. A managed skill call by a named agent whose level differs from the main agent's is now judged at the named agent's level for its tool grant and run identity. No configuration change is needed.
 
+## Unmanaged skill scripts no longer inherit provider keys
+
+The shell and script tools of a skill that is not managed by the lifecycle used to start with PRX's whole environment, provider API keys included. They now get the same environment as the `shell` tool: at an effective Full level every variable except the stripped secrets (provider credentials, `OPENPRX_*`, cloud and source-host tokens), below Full the baseline plus `[runtime] shell_env_allowlist`. A skill script that read a provider key from its environment no longer finds it; keep the credential in the skill's own configuration or, below Full, add the exact variable name to `[runtime] shell_env_allowlist`. At Full a stripped secret cannot be passed through the environment. Managed skills already ran this way.
+
 ## A changed tool registry no longer fails a running turn
 
 When the live tool registry changes during a turn (for example `skills_manage` imports an executable skill), the turn now completes on its pinned tool surface instead of failing with `catalog and execution registry differ`. The next turn is published from the live registry, so the new skill is offered and runnable then. Worker-process and child parity checks are unchanged. No configuration change is needed.

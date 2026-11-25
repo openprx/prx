@@ -129,6 +129,27 @@ charges, make consumed grants reusable or authorize re-execution. Preserve the
 prior revision, decision data, authenticated source/approval/terminal evidence
 and cost journals.
 
+## Child process environment
+
+Secret protection for the processes PRX starts is a property of the launch, not
+of the autonomy level. Provider credentials, `OPENPRX_*` variables and the
+other stripped secrets (`shell_secret_environment` in
+`src/runtime/shell_process.rs`) never reach a child that runs a command line:
+
+- The `shell` tool and the skill processes of unmanaged skills get the filtered
+  environment. At an effective Full level that is every variable except the
+  stripped secrets; below Full it is the baseline plus the names in
+  `[runtime] shell_env_allowlist`. On the docker runtime only the allow-listed
+  names enter the container.
+- A lifecycle-managed skill script gets the contained environment (`PATH`,
+  `LANG`, `LC_*`, `TZ`, its own `HOME` and `TMPDIR`), or at Full the Full shell
+  environment.
+- Hook commands, MCP stdio servers and remote-node commands start from a cleared
+  environment plus the entries their own configuration names.
+
+Cron and Xin shell jobs, the external editor, media helper commands and the
+`/shell` session of `prx chat` start with the parent environment.
+
 ## Evidence and privacy
 
 Configuration, endpoint labels and inspection output must use the existing

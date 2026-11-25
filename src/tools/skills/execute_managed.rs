@@ -47,6 +47,22 @@ pub(super) fn checked_run_owner(site: &'static str, args: &serde_json::Value) ->
 }
 
 impl SkillExecuteTool {
+    /// The process adapter of skill scripts. Like the `shell` tool's adapter
+    /// it selects the filtered environment (everything but the stripped
+    /// secrets at an effective Full level, the baseline plus the operator's
+    /// `[runtime] shell_env_allowlist` below it), so a legacy skill process
+    /// does not inherit provider keys. A lifecycle-managed run
+    /// uses the joined launch, which builds its own environment and ignores
+    /// this selection.
+    pub(super) fn process_adapter(
+        runtime: Arc<dyn crate::runtime::RuntimeAdapter>,
+        runtime_config: &crate::config::RuntimeConfig,
+    ) -> crate::runtime::shell_process::ShellProcessAdapter {
+        crate::runtime::shell_process::ShellProcessAdapter::new(runtime)
+            .with_cgroup_root(runtime_config.managed_cgroup_root.clone())
+            .with_environment_allowlist(runtime_config.shell_env_allowlist.clone())
+    }
+
     /// `exports` followed by the call's location for the skill process:
     /// `PRX_WORKDIR` (the call's working directory) and `PRX_WORKSPACE` (its
     /// workspace root), both absolute. Without a call context they are the

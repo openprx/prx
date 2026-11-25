@@ -1257,7 +1257,7 @@ impl SkillExecuteTool {
         http_config: &crate::config::HttpRequestConfig,
     ) -> Self {
         let runtime_name = runtime.name().to_string();
-        let shell = ShellProcessAdapter::new(runtime).with_cgroup_root(config.runtime.managed_cgroup_root.clone());
+        let shell = Self::process_adapter(runtime, &config.runtime);
         Self {
             workspace_dir,
             config,
