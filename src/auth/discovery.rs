@@ -5,6 +5,7 @@
 //!
 //! Priority:
 //! 1. Explicit `--key` parameter + prefix-based provider inference
+//!    (`sk-ant-`, `sk-or-`, `sk-`; any other prefix needs `--provider`)
 //! 2. `auth-profiles.json` (managed by `prx auth`)
 //! 3. `~/.openprx/config.toml` `api_key` field
 //! 4. `~/.claude/.credentials.json` (Claude Code OAuth)
@@ -24,9 +25,15 @@ pub fn detect_credentials(
 ) -> Result<(String, String, String)> {
     // ── 1. Explicit key ────────────────────────────────────────────
     if let Some(key) = explicit_key.map(str::trim).filter(|k| !k.is_empty()) {
-        let provider = explicit_provider
-            .map(ToString::to_string)
-            .unwrap_or_else(|| infer_provider_from_key(key));
+        let provider = match explicit_provider {
+            Some(provider) => provider.to_string(),
+            None => infer_provider_from_key(key).map(str::to_string).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "The API key prefix is not recognised, so it was not sent anywhere. \
+                     Name the provider with: prx go -p <provider> -k <your-api-key>"
+                )
+            })?,
+        };
         let model = explicit_model
             .map(ToString::to_string)
             .unwrap_or_else(|| default_model_for_provider(&provider));
@@ -123,14 +130,17 @@ fn bind_detected_provider(explicit_provider: Option<&str>, detected_provider: &s
     )
 }
 
-/// Infer provider from the API key prefix.
-fn infer_provider_from_key(key: &str) -> String {
+/// Infer the provider from the key's explicit prefix. A key with no known
+/// prefix names no provider: it is never guessed onto a third-party endpoint.
+fn infer_provider_from_key(key: &str) -> Option<&'static str> {
     if key.starts_with("sk-ant-") {
-        "anthropic".to_string()
+        Some("anthropic")
+    } else if key.starts_with("sk-or-") {
+        Some("openrouter")
     } else if key.starts_with("sk-") {
-        "openai".to_string()
+        Some("openai")
     } else {
-        "openrouter".to_string()
+        None
     }
 }
 
@@ -379,17 +389,17 @@ mod tests {
 
     #[test]
     fn infer_anthropic_from_sk_ant_prefix() {
-        assert_eq!(infer_provider_from_key("sk-ant-api03-xyz"), "anthropic");
+        assert_eq!(infer_provider_from_key("sk-ant-api03-xyz"), Some("anthropic"));
     }
 
     #[test]
     fn infer_openai_from_sk_prefix() {
-        assert_eq!(infer_provider_from_key("sk-proj-abc123"), "openai");
+        assert_eq!(infer_provider_from_key("sk-proj-abc123"), Some("openai"));
     }
 
     #[test]
     fn infer_openrouter_from_unknown_prefix() {
-        assert_eq!(infer_provider_from_key("or-v1-something"), "openrouter");
+        assert_eq!(infer_provider_from_key("or-v1-something"), None);
     }
 
     #[test]

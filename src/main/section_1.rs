@@ -422,7 +422,7 @@ Examples:
         #[arg(long, conflicts_with_all = ["api_key", "from_env"])]
         from_stdin: bool,
 
-        /// Provider (auto-detected from key prefix if omitted)
+        /// Provider (auto-detected from the key prefix sk-ant-, sk-or- or sk-; any other key needs --provider)
         #[arg(short = 'p', long)]
         provider: Option<String>,
 
