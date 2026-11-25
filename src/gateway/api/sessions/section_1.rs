@@ -824,28 +824,55 @@ async fn run_console_runtime_turn(
         crate::agent::context_recall::RECALL_CONTEXT_BUDGET,
     )
     .await;
-    let mut enriched_message = if mem_context.preamble.is_empty() {
-        visible_message.to_string()
-    } else {
-        format!("{}{}", mem_context.preamble, visible_message)
+    // What is put around the message is stored beside it and replayed on later
+    // turns, so the message keeps its bytes. It is stored (and sent) masked.
+    let attachment = crate::agent::tool_replay::Attachment {
+        prefix: crate::security::redaction::redact_secrets(&mem_context.preamble),
+        tail: crate::agent::turn_contracts::current_time_tail(),
     };
-    crate::agent::turn_contracts::push_current_time_tail(&mut enriched_message);
+    let enriched_message = format!("{}{visible_message}{}", attachment.prefix, attachment.tail);
+    let replay_fabric = MemoryFabric::new(state.mem.clone(), turn_envelope.workspace_id.clone())
+        .with_event_recording(config_snapshot.memory.event_recording_config());
+    if let Some(user_event_id) = turn_envelope.source_message_event_id.as_deref() {
+        crate::agent::tool_replay::record_attachment(
+            &replay_fabric,
+            turn_envelope.message_scope(),
+            user_event_id,
+            &attachment,
+        )
+        .await;
+    }
+    let replay_log = crate::agent::tool_replay::ReplayLog::load(state.mem.as_ref(), &turn_envelope.memory_principal()).await;
 
-    // The stored event of each history message, index for index: none for the
-    // system prompt, each stored turn's event, then the request's own event.
+    // OQ-23 / R5: budget on the *effective* window of the model this turn
+    // serves (the operator/discovery/catalog model limits and
+    // `reserved_output_tokens`), with the same arguments the CLI, TUI and
+    // webhook resolve with, so one request is trimmed the same way on every
+    // surface of this process.
+    let mut effective_compaction = decision
+        .service
+        .effective_compaction(&provider_label, &turn_runtime.model);
+    effective_compaction.config = decision.context.main_compaction().clone();
+    crate::providers::context_window::trace_effective_compaction_resolution(&effective_compaction);
+    let system_message = ChatMessage::system(system_prompt);
+    let request_message = crate::agent::turn_contracts::inbound_user_message(&enriched_message);
+    // Earlier turns with their tool rounds; the oldest results become stubs
+    // when the request would be over budget. The stored event of each history
+    // message, index for index: none for the system prompt or a tool message,
+    // each stored turn's event, then the request's own event.
+    let mut replayed = replay_log.expand_turns(previous_turns);
+    let stubbed = replayed.fit(&system_message, &request_message, &effective_compaction.config);
+    if stubbed > 0 {
+        tracing::info!(stubbed, "oldest replayed tool results were replaced by stubs to fit the request");
+    }
     let history_event_ids: Vec<Option<String>> = std::iter::once(None)
-        .chain(previous_turns.iter().map(|turn| turn.message_event_id.clone()))
+        .chain(replayed.event_ids)
         .chain(std::iter::once(turn_envelope.source_message_event_id.clone()))
         .collect();
-    let mut history = Vec::with_capacity(previous_turns.len() + 2);
-    history.push(ChatMessage::system(system_prompt));
-    // stored console turns are neutralised like fresh input
-    history.extend(
-        previous_turns
-            .into_iter()
-            .map(|turn| crate::agent::turn_contracts::stored_turn_message(turn.role, turn.content)),
-    );
-    history.push(crate::agent::turn_contracts::inbound_user_message(&enriched_message));
+    let mut history = Vec::with_capacity(replayed.messages.len() + 2);
+    history.push(system_message);
+    history.extend(replayed.messages);
+    history.push(request_message);
 
     // D2 / FIX-P1-31: build via the shared `build_security_policy` helper so this
     // per-turn gateway authz site cannot drift from (or forget) the audit-config
@@ -876,16 +903,6 @@ async fn run_console_runtime_turn(
         Some((_, route)) => route.as_ref().clone(),
         None => console_route_decision(&turn_runtime, &turn_envelope, visible_message)?,
     };
-    // OQ-23 / R5: budget on the *effective* window of the model this turn
-    // serves (the operator/discovery/catalog model limits and
-    // `reserved_output_tokens`), with the same arguments the CLI, TUI and
-    // webhook resolve with, so one request is trimmed the same way on every
-    // surface of this process.
-    let mut effective_compaction = decision
-        .service
-        .effective_compaction(&provider_label, &turn_runtime.model);
-    effective_compaction.config = decision.context.main_compaction().clone();
-    crate::providers::context_window::trace_effective_compaction_resolution(&effective_compaction);
     let provider_started_at = chrono::Utc::now();
     let loop_result = run_turn(
         &mut history,

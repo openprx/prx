@@ -234,12 +234,15 @@ pub(crate) fn inbound_user_message(text: &str) -> ChatMessage {
 /// bytes stay identical between turns; the clock rides in the one message that
 /// is new every turn.
 pub(crate) fn push_current_time_tail(content: &mut String) {
-    use std::fmt::Write as _;
-    let _ = write!(
-        content,
+    content.push_str(&current_time_tail());
+}
+
+/// The text [`push_current_time_tail`] appends.
+pub(crate) fn current_time_tail() -> String {
+    format!(
         "\n\n[Current date and time: {}]",
         chrono::Local::now().format("%A, %Y-%m-%d %H:%M %:z")
-    );
+    )
 }
 
 /// Fresh inbound text already owned by the caller. Preserve its allocation

@@ -34,6 +34,7 @@ pub mod terminal;
 pub(crate) mod tool_call_parser;
 pub(crate) mod tool_event_recording;
 pub(crate) mod tool_evidence;
+pub(crate) mod tool_replay;
 pub(crate) mod tool_result_recording;
 pub(crate) mod tool_scheduler;
 pub(crate) mod turn_context;

@@ -60,6 +60,23 @@ skill when `skill_read` is excluded by global or model-specific configuration.
 `skill_read` is a core prompt dependency; skill execution aliases remain
 subject to normal selection and exposure rules.
 
+## Replayed history on the gateway session route
+
+The history of a Console or rf session turn is built from the stored
+conversation turns plus the durable log rows of role `tool`
+(`src/agent/tool_replay.rs`). Each earlier user message is replayed with its
+stored attachment (the masked recall text before it and the date line after it,
+`message.attachment.recorded`), so its bytes do not change between turns. Each
+earlier assistant reply is preceded by the tool rounds of its run
+(`tool.call.recorded` / `tool.result.recorded`), in the native envelope form the
+turn loop uses in-turn. A call with no stored result is paired with a stub
+result; a result with no stored call is dropped; a run without a stored reply
+is not replayed. Replayed tool messages have no event id, so the compaction
+provenance folds them into their round by shape. When the request is over the
+warning threshold, the oldest replayed results become one-line stubs first.
+The rows are not on the sync stream, and `conversation_turns` is unchanged.
+Terminal chat, channels, scheduled turns and children are not covered yet.
+
 ## Ownership
 
 | Concern | Owner | Rule |
