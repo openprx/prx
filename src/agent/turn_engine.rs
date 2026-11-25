@@ -83,6 +83,7 @@ use crate::context::reduce::engine::{
     AfterTools, PreTurn, Round, Services, history_before_change, report_durable_compaction,
 };
 use crate::context::reduce::ladder;
+use crate::context::reduce::normalize::repair_view;
 use crate::context::reduce::preflight::PreflightCompaction;
 use crate::context::reduce::trim::{MidTurnTrim, RoundTrim};
 use crate::context::transcript::{RoundLog, call_id_for};
@@ -939,6 +940,11 @@ async fn run_turn_unguarded(
         } else {
             None
         };
+        // The end of the reduction: whatever step cut the view, the request
+        // that leaves for the provider follows the tool-call protocol. Runs on
+        // the entrypoints without a compaction config too, whose overflow
+        // retry trims the view.
+        repair_view(&mut turn_history, history, "pre_provider_call");
 
         // Evaluated after the preflight: a `switch` rollover performed there is
         // what puts the handoff into history, and the iteration that receives

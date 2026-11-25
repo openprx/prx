@@ -339,6 +339,36 @@ Which surface runs which step, in order (the order is today's behaviour):
 | Terminal chat, line mode | `StubReplayed`, then the chat preflight compaction (not yet a reducer) | as above, inside the engine | as above |
 | Terminal chat, full-screen | the dispatcher rollover and trim (not yet a reducer) | as above, inside the engine | as above |
 
+### The tool-call protocol after a reduction
+
+Every trim removes from the front of the view and stops where the request
+fits, so it can leave a shape strict providers reject: the assistant message
+that called a tool as the first message (its user message was the one removed),
+a round cut from its results, or a result without its call. The Gemini family,
+reached natively or through a gateway, answers with `function call turn comes
+immediately after a user turn or after a function response turn`. A provider-bound
+list therefore holds these invariants after any reduction:
+
+1. The first non-system message is a user message, or the handoff or summary a
+   compaction wrote.
+2. An assistant tool-call message is followed at once by the tool results for
+   exactly its call ids.
+3. No tool result stands without its call.
+4. An assistant tool-call message follows a user message or tool results.
+5. The live user message is never removed.
+
+The trims cut a round as one unit (`drop_leading_round_at`, called by the
+shared removal primitive and by the aggressive trim), and one repair pass,
+`src/context/reduce/normalize.rs`, runs once per provider round right after the
+ladder (also where there is no compaction config), after the full-screen chat
+trim, and removes what is left: results without a call, rounds with a missing
+result or in the wrong place, and opening assistant text that is not a
+compaction note. It never removes a user message, is idempotent, scans once and
+allocates nothing for a valid list. When it changes anything it logs one info
+line with counts (`request repaired for the tool-call protocol`). The gateway
+replay does not replay the tool rounds of an assistant reply whose user message
+fell outside the 500-row read.
+
 Steps that still run outside the ladder: the overflow retry (compaction, then a
 budget trim or an aggressive trim), the OS-paging eviction, the dispatcher
 rollover, the line-mode chat preflight compaction, the manual `/compact`, and

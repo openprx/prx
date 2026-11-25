@@ -94,6 +94,9 @@ impl ProtectedHandoff {
         }
         history.remove(index);
         drop_orphan_tool_results_at(history, index);
+        // A round is cut as one unit: when the removed message was the user
+        // message in front of one, the round does not stay as the head.
+        crate::context::reduce::normalize::drop_leading_round_at(history, index);
         let removed = before.saturating_sub(history.len());
         self.0 = match self.0 {
             Some(protected) if protected == index => None,
@@ -135,6 +138,7 @@ fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
     }
     history.drain(start..end);
     drop_orphan_tool_results_at(history, start);
+    crate::context::reduce::normalize::drop_leading_round_at(history, start);
 }
 
 /// Aggressive trim fallback: keep only the most recent non-system messages.

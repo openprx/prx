@@ -19,6 +19,7 @@ pub(crate) mod audit;
 pub(crate) mod compact;
 pub(crate) mod engine;
 pub(crate) mod handoff_note;
+pub(crate) mod normalize;
 pub(crate) mod patch;
 pub(crate) mod preflight;
 pub(crate) mod provenance;

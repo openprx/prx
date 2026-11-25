@@ -2609,6 +2609,7 @@ fn trim_redux_driver_context_budget_after_rollover(
             crate::agent::context_preflight::RestoredRequestPosition::AboveEverythingLeftStanding
         },
     );
+    crate::context::reduce::normalize::repair_messages(history, "redux_preflight");
     if histories_matched_before_trim {
         *compaction_guard_history = history.clone();
     }
