@@ -243,17 +243,6 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
         // substance of an agentic window — is gone with nothing naming it.
         let folded = folded_tool_roundtrips(compacted_source_messages.unwrap_or_default(), compacted_companions);
         let folded_notice = format_folded_tool_roundtrips_notice(&folded);
-        // One model summary of the cold window, asked of this turn's own model. It
-        // never fails the turn: a failed or empty call writes the note without one.
-        let cold_summary = summarize_cold_window(
-            provider,
-            model,
-            compacted_source_messages.unwrap_or_default(),
-            config.max_context_tokens,
-            &[],
-            trigger,
-        )
-        .await;
         let build_note = |summary_status: &'static str, summary: Option<&str>| {
             let mut note = serde_json::json!({
                 "schema_version": 1,
@@ -291,13 +280,42 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
             }
             note
         };
+        // The smallest note this handoff can be has no summary; `omitted_size` is
+        // the longest status such a note carries. When that does not validate, the
+        // handoff is refused before the model is asked anything.
+        let no_summary_message =
+            format_context_handoff_message(&serde_json::to_string(&build_note("omitted_size", None))?);
+        if validated_context_handoff_note(&no_summary_message).is_none() {
+            tracing::warn!(
+                trigger,
+                handoff_bytes = no_summary_message.len(),
+                limit = MAX_HANDOFF_MESSAGE_BYTES,
+                referenced_events = source.source_event_ids.len(),
+                "context switch skipped because the handoff note is oversized or does not validate"
+            );
+            return Ok(CompactionBuild::NotNeeded);
+        }
+        // One model summary of the cold window, asked of this turn's own model. It
+        // never fails the turn: a failed or empty call writes the note without one.
+        let cold_summary = summarize_cold_window(
+            provider,
+            model,
+            compacted_source_messages.unwrap_or_default(),
+            config.max_context_tokens,
+            &[],
+            trigger,
+        )
+        .await;
         let mut note_json = serde_json::to_string(&build_note(cold_summary.status(), cold_summary.text()))?;
         let mut handoff_message = format_context_handoff_message(&note_json);
+        let mut final_status = cold_summary.status();
         // A summary that pushes the note past its bound is dropped; the handoff is kept.
         if cold_summary.text().is_some() && validated_context_handoff_note(&handoff_message).is_none() {
-            note_json = serde_json::to_string(&build_note("omitted_size", None))?;
+            final_status = "omitted_size";
+            note_json = serde_json::to_string(&build_note(final_status, None))?;
             handoff_message = format_context_handoff_message(&note_json);
         }
+        cold_summary.log(trigger, final_status);
         // Every applied handoff is one a later load can validate, within its
         // size bound; anything else is refused before it is written.
         if validated_context_handoff_note(&handoff_message).is_none() {

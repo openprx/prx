@@ -22,12 +22,19 @@ const SOURCE_BUDGET_MIN_CHARS: usize = 4_000;
 const SOURCE_BUDGET_MAX_CHARS: usize = 60_000;
 /// Characters of one tool result the summary reads.
 const TOOL_RESULT_MAX_CHARS: usize = 2_000;
+/// Characters of an assistant envelope's own text the summary reads.
+const ENVELOPE_TEXT_MAX_CHARS: usize = 2_000;
 /// Bytes of one tool call's arguments the summary reads.
 const TOOL_ARGUMENTS_MAX_BYTES: usize = 500;
+/// Bytes of a compact earlier handoff line the source text keeps; a real
+/// rendering is never longer.
+const EARLIER_HANDOFF_MAX_BYTES: usize = 6_600;
 /// Temperature of the summary call.
 const SUMMARY_TEMPERATURE: f64 = 0.2;
 /// What replaces a reserved marker the model wrote into its summary.
 const MARKER_REPLACEMENT: &str = "(marker removed)";
+/// Appended to a summary cut to fit the stored bound, so the cut is visible.
+const CUT_MARKER: &str = "\n[summary cut]";
 /// The markers a stored summary may not contain (see the note validator).
 const FORBIDDEN_MARKERS: [&str; 4] = [
     CONTEXT_HANDOFF_START,
@@ -40,18 +47,27 @@ const SYSTEM_PROMPT: &str = "You write the summary of a conversation that is bei
     model's context window, so that the same assistant can continue the work from it. Write the summary \
     for your own continuation, under exactly these headings, in this order:\n\
     ## Goal and constraints\n\
+    ## Open items and next step\n\
     ## Decisions\n\
     ## State of the work\n\
-    ## Open items and next step\n\
     ## Files and artifacts\n\
     ## Tools and skills used\n\
     Under each heading write short bullet points, or the word none when nothing applies. Copy identifiers, \
     paths, numbers and names exactly as they appear in the conversation. Do not invent facts. Keep the whole \
-    summary at most 600 words. Start directly with the first heading, with no preamble.";
+    summary at most 600 words and at most 5,000 bytes. Start directly with the first heading, with no preamble.";
 
-/// The outcome of the summary call for one handoff.
+/// What the summary call produced, with the size of the source it read.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum HandoffSummary {
+pub(crate) struct HandoffSummary {
+    outcome: SummaryOutcome,
+    /// Characters of the source text after bounding.
+    source_chars: usize,
+    /// Whether the source text was cut to fit its budget.
+    source_cut: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SummaryOutcome {
     /// The cleaned, bounded summary text.
     Written(String),
     /// The call failed; nothing was stored from it.
@@ -63,26 +79,40 @@ pub(crate) enum HandoffSummary {
 impl HandoffSummary {
     /// The `summary_status` value the note records.
     pub(crate) fn status(&self) -> &'static str {
-        match self {
-            Self::Written(_) => "written",
-            Self::Failed => "failed",
-            Self::Empty => "empty",
+        match self.outcome {
+            SummaryOutcome::Written(_) => "written",
+            SummaryOutcome::Failed => "failed",
+            SummaryOutcome::Empty => "empty",
         }
     }
 
     /// The summary text, present exactly when the status is `written`.
     pub(crate) fn text(&self) -> Option<&str> {
-        match self {
-            Self::Written(text) => Some(text),
-            Self::Failed | Self::Empty => None,
+        match &self.outcome {
+            SummaryOutcome::Written(text) => Some(text),
+            SummaryOutcome::Failed | SummaryOutcome::Empty => None,
         }
+    }
+
+    /// The one info line a handoff summary leaves: its trigger, its final
+    /// `status`, the source size and the summary size. Never any text.
+    pub(crate) fn log(&self, trigger: &'static str, status: &'static str) {
+        let summary_bytes = self.text().map_or(0, str::len);
+        tracing::info!(
+            trigger,
+            status,
+            source_chars = self.source_chars,
+            summary_bytes,
+            source_cut = self.source_cut,
+            "handoff summary recorded"
+        );
     }
 }
 
 /// Asks `provider` once, with `model`, for the summary of the cold window
 /// `cold`. `max_context_tokens` sizes the source text read; `extra_instructions`
 /// are appended to the system prompt, one per line. Never fails: a provider
-/// error is logged by its digest and reported as [`HandoffSummary::Failed`].
+/// error is logged by its digest and reported as a failed summary.
 pub(crate) async fn summarize_cold_window(
     provider: &dyn Provider,
     model: &str,
@@ -91,19 +121,24 @@ pub(crate) async fn summarize_cold_window(
     extra_instructions: &[String],
     trigger: &'static str,
 ) -> HandoffSummary {
-    let source = build_cold_window_source(cold, source_budget_chars(max_context_tokens));
+    let (source, source_cut) = build_cold_window_source(cold, source_budget_chars(max_context_tokens));
+    let source_chars = source.chars().count();
     let system = system_prompt(extra_instructions);
     let user = format!("Summarize the earlier conversation below so that the work can continue from it.\n\n{source}");
-    match provider
+    // The provider call may be slow: progress is recorded before and after it,
+    // so a configured idle window does not cancel the turn during it.
+    crate::agent::idle::beat(crate::agent::idle::ProgressKind::Compaction);
+    let reply = provider
         .chat_with_system(Some(system.as_str()), &user, model, SUMMARY_TEMPERATURE)
-        .await
-    {
+        .await;
+    crate::agent::idle::beat(crate::agent::idle::ProgressKind::Compaction);
+    let outcome = match reply {
         Ok(raw) => {
             let cleaned = clean_summary(&raw);
             if cleaned.is_empty() {
-                HandoffSummary::Empty
+                SummaryOutcome::Empty
             } else {
-                HandoffSummary::Written(cleaned)
+                SummaryOutcome::Written(cleaned)
             }
         }
         Err(error) => {
@@ -114,8 +149,13 @@ pub(crate) async fn summarize_cold_window(
                 error_sha256,
                 "handoff summary failed; the handoff is written without a summary"
             );
-            HandoffSummary::Failed
+            SummaryOutcome::Failed
         }
+    };
+    HandoffSummary {
+        outcome,
+        source_chars,
+        source_cut,
     }
 }
 
@@ -135,10 +175,12 @@ fn source_budget_chars(max_context_tokens: usize) -> usize {
 }
 
 /// The cold window as `ROLE: text` blocks, one per message, bounded to
-/// `budget_chars` characters.
-fn build_cold_window_source(cold: &[ChatMessage], budget_chars: usize) -> String {
+/// `budget_chars` characters; with whether the bound cut it.
+fn build_cold_window_source(cold: &[ChatMessage], budget_chars: usize) -> (String, bool) {
     let blocks: Vec<String> = cold.iter().map(render_cold_message).collect();
-    bound_chars(&blocks.join("\n\n"), budget_chars)
+    let text = blocks.join("\n\n");
+    let cut = text.chars().count() > budget_chars;
+    (bound_chars(&text, budget_chars), cut)
 }
 
 fn render_cold_message(message: &ChatMessage) -> String {
@@ -146,18 +188,20 @@ fn render_cold_message(message: &ChatMessage) -> String {
         return render_earlier_handoff(&message.content);
     }
     if message.role == "assistant"
-        && let Some(calls) = tool_calls_of(&message.content)
+        && let Some(envelope) = tool_envelope(&message.content)
     {
-        return calls
-            .iter()
-            .map(|(name, arguments)| {
-                format!(
-                    "ASSISTANT (tool calls): {name}({})",
-                    cut_bytes(arguments, TOOL_ARGUMENTS_MAX_BYTES)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        // The model's stated plan comes first, then the calls it made.
+        let mut lines = Vec::new();
+        if let Some(text) = envelope.text {
+            lines.push(format!("ASSISTANT: {}", cut_chars(&text, ENVELOPE_TEXT_MAX_CHARS)));
+        }
+        lines.extend(envelope.calls.iter().map(|(name, arguments)| {
+            format!(
+                "ASSISTANT (tool calls): {name}({})",
+                cut_bytes(arguments, TOOL_ARGUMENTS_MAX_BYTES)
+            )
+        }));
+        return lines.join("\n");
     }
     if message.role == "tool" || message.content.starts_with(TOOL_RESULTS_PREFIX) {
         return format!("TOOL: {}", cut_chars(message.content.trim(), TOOL_RESULT_MAX_CHARS));
@@ -175,14 +219,21 @@ fn render_earlier_handoff(content: &str) -> String {
         };
     }
     if is_compact_context_handoff(content) {
-        return content.trim().to_string();
+        return cut_bytes(content.trim(), EARLIER_HANDOFF_MAX_BYTES).to_string();
     }
     "[an earlier context handoff that does not validate is omitted]".to_string()
 }
 
-/// The `(name, arguments)` of each call of an assistant tool-call envelope, in
-/// call order; `None` when `content` is not one with at least one call.
-fn tool_calls_of(content: &str) -> Option<Vec<(String, String)>> {
+/// A tool-call envelope: the text the model wrote with its calls (when not
+/// empty) and each call as `(name, arguments)`, in call order.
+struct ToolEnvelope {
+    text: Option<String>,
+    calls: Vec<(String, String)>,
+}
+
+/// The envelope `content` is, when it is an assistant message with at least one
+/// tool call; `None` otherwise.
+fn tool_envelope(content: &str) -> Option<ToolEnvelope> {
     if !content.starts_with('{') || !content.contains("\"tool_calls\"") {
         return None;
     }
@@ -191,29 +242,34 @@ fn tool_calls_of(content: &str) -> Option<Vec<(String, String)>> {
     if calls.is_empty() {
         return None;
     }
-    Some(
-        calls
-            .iter()
-            .map(|call| {
-                let function = call.get("function");
-                let name = call
-                    .get("name")
-                    .or_else(|| function.and_then(|function| function.get("name")))
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_string();
-                let arguments = match call
-                    .get("arguments")
-                    .or_else(|| function.and_then(|function| function.get("arguments")))
-                {
-                    Some(serde_json::Value::String(text)) => text.clone(),
-                    Some(other) => other.to_string(),
-                    None => String::new(),
-                };
-                (name, arguments)
-            })
-            .collect(),
-    )
+    let text = value
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string);
+    let calls = calls
+        .iter()
+        .map(|call| {
+            let function = call.get("function");
+            let name = call
+                .get("name")
+                .or_else(|| function.and_then(|function| function.get("name")))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            let arguments = match call
+                .get("arguments")
+                .or_else(|| function.and_then(|function| function.get("arguments")))
+            {
+                Some(serde_json::Value::String(text)) => text.clone(),
+                Some(other) => other.to_string(),
+                None => String::new(),
+            };
+            (name, arguments)
+        })
+        .collect();
+    Some(ToolEnvelope { text, calls })
 }
 
 /// Keeps the first 20% and the last 80% of `budget` characters of `text` with a
@@ -243,7 +299,8 @@ fn bound_chars(text: &str, budget: usize) -> String {
 
 /// The model's text made safe to store: the fabricated tool markers, the tool
 /// evidence lines and the secrets removed, the reserved markers replaced, the
-/// text trimmed and cut to [`HANDOFF_SUMMARY_MAX_BYTES`].
+/// control characters other than newline and tab removed, the text trimmed and
+/// bounded to [`HANDOFF_SUMMARY_MAX_BYTES`] bytes including the cut marker.
 fn clean_summary(raw: &str) -> String {
     let stripped = strip_assistant_fabricated_tool_markers(raw);
     let stripped = strip_model_written_tool_evidence(&stripped);
@@ -251,7 +308,16 @@ fn clean_summary(raw: &str) -> String {
     for marker in FORBIDDEN_MARKERS {
         text = text.replace(marker, MARKER_REPLACEMENT);
     }
-    cut_bytes(text.trim(), HANDOFF_SUMMARY_MAX_BYTES).to_string()
+    let text: String = text
+        .chars()
+        .filter(|character| !character.is_control() || *character == '\n' || *character == '\t')
+        .collect();
+    let text = text.trim();
+    if text.len() <= HANDOFF_SUMMARY_MAX_BYTES {
+        return text.to_string();
+    }
+    let body = cut_bytes(text, HANDOFF_SUMMARY_MAX_BYTES - CUT_MARKER.len());
+    format!("{body}{CUT_MARKER}")
 }
 
 /// The first `max` characters of `text`.

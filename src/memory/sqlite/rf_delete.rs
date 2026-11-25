@@ -519,6 +519,7 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
         &contents,
     )?;
     let texts: Vec<String> = contents.iter().map(|text| (*text).to_owned()).collect();
+    let direct_event_ids: Vec<String> = rows.iter().map(|row| row.event_id.clone()).collect();
     let mut ids = rows.into_iter().map(|row| row.event_id).collect::<Vec<_>>();
     let mut forgotten = tx.execute(
         "DELETE FROM memories WHERE source_event_id IN (SELECT value FROM json_each(?1))",
@@ -536,21 +537,43 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
         // a rebuild drops them as well as their tombstones.
         tx.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')", [])?;
     }
-    {
-        let mut statement = tx.prepare(
-            "SELECT event_id FROM message_events
-             WHERE workspace_id = ?1 AND session_key = ?2 AND event_type = 'context.switch.created'
-               AND (causation_event_id IN (SELECT value FROM json_each(?3))
-                    OR correlation_id IN (SELECT value FROM json_each(?3))
-                    OR EXISTS(SELECT 1 FROM json_each(?3) j WHERE instr(content, j.value) > 0))",
-        )?;
-        let notes = statement
-            .query_map(params![target.workspace_id, target.session_key, direct], |row| {
-                row.get::<_, String>(0)
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        ids.extend(notes);
+    // Switch notes derive from the messages they cover, and a later handoff is
+    // built from an earlier one (its summary, and `parent_handoff_event_id` as
+    // text), so a note can hold a deleted event's content without naming its id.
+    // A note's `event_id` is its `handoff_event_id`. Each pass matches the
+    // directly deleted ids plus the handoff ids of the notes found so far, and
+    // keeps only the notes no earlier pass found. The session has finitely many
+    // switch rows, so the loop ends when a pass finds none new.
+    let mut frontier: Vec<String> = direct_event_ids;
+    let mut notes: Vec<String> = Vec::new();
+    loop {
+        let matched = {
+            let mut statement = tx.prepare(
+                "SELECT event_id FROM message_events
+                 WHERE workspace_id = ?1 AND session_key = ?2 AND event_type = 'context.switch.created'
+                   AND (causation_event_id IN (SELECT value FROM json_each(?3))
+                        OR correlation_id IN (SELECT value FROM json_each(?3))
+                        OR EXISTS(SELECT 1 FROM json_each(?3) j WHERE instr(content, j.value) > 0))",
+            )?;
+            statement
+                .query_map(
+                    params![
+                        target.workspace_id,
+                        target.session_key,
+                        serde_json::to_string(&frontier)?
+                    ],
+                    |row| row.get::<_, String>(0),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let fresh: Vec<String> = matched.into_iter().filter(|id| !notes.contains(id)).collect();
+        if fresh.is_empty() {
+            break;
+        }
+        frontier.extend(fresh.iter().cloned());
+        notes.extend(fresh);
     }
+    ids.extend(notes);
     let all = serde_json::to_string(&ids)?;
     // Read before the rewrite: the payload of a tool result names the stored
     // document that holds its large output.
