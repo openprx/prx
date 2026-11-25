@@ -138,11 +138,16 @@ impl ReplayLog {
         };
         match (tool_rows, message_rows) {
             (Ok(mut tool_rows), Ok(message_rows)) => {
-                if with_messages {
-                    // Attachment rows share the tool window with the calls and results
-                    // of many runs, so the newest ones are read on their own.
-                    let extra = Self::attachment_rows_outside(mem, principal, &tool_rows).await;
-                    tool_rows.extend(extra);
+                // Attachment rows share the tool window with the calls and results
+                // of many runs; a full window may have pushed older ones out, so
+                // they are read on their own. They come newest first and are all
+                // older than the window, so they go in front, oldest first: the
+                // newest attachment of a message still wins.
+                if with_messages && tool_rows.len() >= REPLAY_ROW_LIMIT {
+                    let mut rows = Self::attachment_rows_outside(mem, principal, &tool_rows).await;
+                    rows.reverse();
+                    rows.append(&mut tool_rows);
+                    tool_rows = rows;
                 }
                 Self::from_rows(&tool_rows, &message_rows)
             }
