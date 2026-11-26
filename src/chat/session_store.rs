@@ -68,6 +68,10 @@ pub(super) struct ChatMessageEventProjection {
     pub(super) session: session::ChatSession,
     pub(super) turns_from_events: bool,
     pub(super) usage_from_events: bool,
+    /// Index for index with `session.turns`: the event id of each turn that
+    /// was paired with a stored `message.created` event. All `None` unless
+    /// `turns_from_events`.
+    pub(super) turn_event_ids: Vec<Option<String>>,
 }
 
 /// Read the backend's session-key-filtered replay window. The query hard-filters
@@ -121,6 +125,7 @@ fn apply_chat_message_event_projection(
                 .get(*index)
                 .is_some_and(|turn| event.role == turn.role && event.content == turn.content)
         });
+    let mut turn_event_ids = vec![None; snapshot.turns.len()];
     if turns_from_events {
         for (event, index) in message_events.iter().zip(snapshot_turn_indices) {
             // MessageEvent owns replay role/content. Blob-only timestamp and
@@ -129,6 +134,9 @@ fn apply_chat_message_event_projection(
             if let Some(turn) = snapshot.turns.get_mut(index) {
                 turn.role.clone_from(&event.role);
                 turn.content.clone_from(&event.content);
+            }
+            if let Some(slot) = turn_event_ids.get_mut(index) {
+                *slot = Some(event.event_id.clone());
             }
         }
     }
@@ -188,6 +196,7 @@ fn apply_chat_message_event_projection(
         session: snapshot,
         turns_from_events,
         usage_from_events,
+        turn_event_ids,
     }
 }
 
@@ -213,6 +222,7 @@ pub(super) async fn project_chat_session_from_message_events(
                 session: snapshot,
                 turns_from_events: false,
                 usage_from_events: false,
+                turn_event_ids: Vec::new(),
             };
         }
     };
