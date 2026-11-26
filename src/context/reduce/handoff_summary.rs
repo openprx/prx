@@ -193,12 +193,16 @@ fn has_summary_shape(text: &str) -> bool {
     }
     let mut headings = SUMMARY_HEADINGS.iter().copied();
     let mut pending = headings.next();
+    let mut found = 0_usize;
     for line in text.lines() {
         if pending.is_some_and(|heading| line.trim() == heading) {
             pending = headings.next();
+            found = found.saturating_add(1);
         }
     }
-    pending.is_none()
+    // A summary cut at the byte bound keeps its first sections; Goal and Open
+    // items are what the continuation needs, so a cut one that kept both stands.
+    pending.is_none() || (text.ends_with(CUT_MARKER) && found >= 2)
 }
 
 fn system_prompt(extra_instructions: &[String]) -> String {
