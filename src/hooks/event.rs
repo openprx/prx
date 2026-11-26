@@ -19,9 +19,11 @@ pub enum HookEvent {
     ChildFinished,
     ChildFailed,
     ReductionFinished,
+    ReductionStarted,
     ScheduleRunStarted,
     ScheduleRunFinished,
     BudgetWarning,
+    HookFailed,
 }
 
 impl HookEvent {
@@ -44,9 +46,11 @@ impl HookEvent {
             Self::ChildFinished => "child_finished",
             Self::ChildFailed => "child_failed",
             Self::ReductionFinished => "reduction_finished",
+            Self::ReductionStarted => "reduction_started",
             Self::ScheduleRunStarted => "schedule_run_started",
             Self::ScheduleRunFinished => "schedule_run_finished",
             Self::BudgetWarning => "budget_warning",
+            Self::HookFailed => "hook_failed",
         }
     }
 
@@ -59,7 +63,7 @@ impl HookEvent {
         }
     }
 
-    pub(super) const ALL: [Self; 20] = [
+    pub(super) const ALL: [Self; 22] = [
         Self::AgentStart,
         Self::AgentEnd,
         Self::LlmRequest,
@@ -77,9 +81,11 @@ impl HookEvent {
         Self::ChildFinished,
         Self::ChildFailed,
         Self::ReductionFinished,
+        Self::ReductionStarted,
         Self::ScheduleRunStarted,
         Self::ScheduleRunFinished,
         Self::BudgetWarning,
+        Self::HookFailed,
     ];
 
     pub(super) fn from_name(name: &str) -> Option<Self> {

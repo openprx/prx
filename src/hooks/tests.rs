@@ -309,7 +309,7 @@ async fn run_action_empty_command_fails() {
         headers: Default::default(),
         signing_secret: None,
     };
-    let result = manager.run_action(HookEvent::ToolCall, &json!({}), 1000, &action).await;
+    let result = manager.run_action(HookEvent::ToolCall, &json!({}), 1000, &action, false).await;
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("empty"));
 }
@@ -330,7 +330,7 @@ async fn run_action_success() {
         signing_secret: None,
     };
     let result = manager
-        .run_action(HookEvent::AgentStart, &json!({"msg": "hi"}), 2000, &action)
+        .run_action(HookEvent::AgentStart, &json!({"msg": "hi"}), 2000, &action, false)
         .await;
     assert!(result.is_ok());
 }
@@ -350,7 +350,7 @@ async fn run_action_failure_exit_code() {
         headers: Default::default(),
         signing_secret: None,
     };
-    let result = manager.run_action(HookEvent::Error, &json!({}), 2000, &action).await;
+    let result = manager.run_action(HookEvent::Error, &json!({}), 2000, &action, false).await;
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("exited with status"));
 }
@@ -370,7 +370,7 @@ async fn run_action_timeout() {
         headers: Default::default(),
         signing_secret: None,
     };
-    let result = manager.run_action(HookEvent::ToolCall, &json!({}), 100, &action).await;
+    let result = manager.run_action(HookEvent::ToolCall, &json!({}), 100, &action, false).await;
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("timed out"));
 }
@@ -399,7 +399,7 @@ async fn run_action_timeout_kills_reaps_and_removes_payload_file() {
         signing_secret: None,
     };
 
-    let result = manager.run_action(HookEvent::ToolCall, &json!({}), 250, &action).await;
+    let result = manager.run_action(HookEvent::ToolCall, &json!({}), 250, &action, false).await;
     assert!(result.unwrap_err().to_string().contains("timed out"));
 
     let pid = std::fs::read_to_string(temp.path().join("hook.pid"))
@@ -505,7 +505,7 @@ async fn a_hook_starts_in_a_cleared_environment_and_its_dedicated_directory() {
         signing_secret: None,
     };
     manager
-        .run_action(HookEvent::TurnComplete, &json!({}), 5_000, &action)
+        .run_action(HookEvent::TurnComplete, &json!({}), 5_000, &action, false)
         .await
         .expect("test: the hook runs");
 
@@ -555,7 +555,7 @@ async fn a_hook_without_a_launch_root_is_refused() {
         signing_secret: None,
     };
     let refused = manager
-        .run_action(HookEvent::TurnComplete, &json!({}), 1_000, &action)
+        .run_action(HookEvent::TurnComplete, &json!({}), 1_000, &action, false)
         .await
         .expect_err("test: refused");
     assert!(refused.to_string().contains("no launch directory"), "{refused}");
@@ -593,7 +593,7 @@ async fn run_action_large_payload_uses_file_and_stdin_without_env_overflow() {
 
     let payload = json!({ "blob": "x".repeat(3_000_000) });
     let result = manager
-        .run_action(HookEvent::ToolCallStart, &payload, 5_000, &action)
+        .run_action(HookEvent::ToolCallStart, &payload, 5_000, &action, false)
         .await;
     assert!(
         result.is_ok(),
@@ -631,7 +631,7 @@ async fn a_hook_payload_names_the_provider_without_url_userinfo() {
     ];
     for payload in payloads {
         manager
-            .run_action(HookEvent::LlmResponse, &payload, 5_000, &action)
+            .run_action(HookEvent::LlmResponse, &payload, 5_000, &action, false)
             .await
             .expect("test: the hook runs");
         let seen = std::fs::read_to_string(&seen_path).expect("test: payload written");

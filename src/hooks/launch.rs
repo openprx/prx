@@ -5,19 +5,52 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 use super::config::{HookAction, bounded_timeout};
+use super::context::MAX_CONTEXT_STDOUT_BYTES;
 use super::envelope::identity_variables;
 use super::hook_core::HookCore;
 use super::event::{HookEvent, redacted_hook_payload};
 use super::{MAX_PAYLOAD_BYTES, MAX_STDERR_BYTES, MAX_STDERR_CHARS};
 
+/// A hook run that failed, with the class the context path reports
+/// (`timeout`, `exit_status`, `stdout_over_limit`). Any other failure of a
+/// run is an ordinary error and is classed as `spawn`.
+#[derive(Debug)]
+pub(super) struct HookRunError {
+    class: &'static str,
+    message: String,
+}
+
+impl HookRunError {
+    fn fail(class: &'static str, message: String) -> anyhow::Error {
+        Self { class, message }.into()
+    }
+
+    pub(super) const fn class(&self) -> &'static str {
+        self.class
+    }
+}
+
+impl std::fmt::Display for HookRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for HookRunError {}
+
 impl HookCore {
+    /// Run a command action. Notify callers pass `capture_stdout: false`:
+    /// nothing is read from its stdout. With `true` its stdout is read
+    /// concurrently, at most `MAX_CONTEXT_STDOUT_BYTES + 1` bytes, and
+    /// returned; over the cap is an error.
     pub(super) async fn run_action(
         &self,
         event: HookEvent,
         payload: &serde_json::Value,
         default_timeout_ms: u64,
         action: &HookAction,
-    ) -> anyhow::Result<()> {
+        capture_stdout: bool,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
         let command = action.command.as_deref().unwrap_or_default().trim();
         if command.is_empty() {
             anyhow::bail!("hook command is empty");
@@ -106,14 +139,32 @@ impl HookCore {
         if action.stdin_json {
             cmd.stdin(std::process::Stdio::piped());
         }
-        cmd.stdout(std::process::Stdio::null());
+        if capture_stdout {
+            cmd.stdout(std::process::Stdio::piped());
+        } else {
+            cmd.stdout(std::process::Stdio::null());
+        }
         cmd.stderr(std::process::Stdio::piped());
 
         let mut child = crate::runtime::shell_process::spawn_managed_shell_child(cmd)?;
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
 
+        // Stdout is `null` unless captured, so its reader then reads nothing.
+        let stdout = child.take_stdout();
+        let mut stdout_reader = tokio::spawn(async move {
+            let Some(stdout) = stdout else {
+                return std::io::Result::Ok(Vec::new());
+            };
+            let mut bytes = Vec::new();
+            stdout
+                .take(MAX_CONTEXT_STDOUT_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .await?;
+            Ok(bytes)
+        });
+
         let stderr = child.take_stderr();
-        let stderr_reader = tokio::spawn(async move {
+        let mut stderr_reader = tokio::spawn(async move {
             let Some(stderr) = stderr else {
                 return std::io::Result::Ok(Vec::new());
             };
@@ -128,12 +179,15 @@ impl HookCore {
                 match write_result {
                     Err(_) => {
                         let _ = child.terminate_and_reap().await;
-                        let _ = stderr_reader.await;
-                        anyhow::bail!("hook timed out while writing stdin");
+                        settle_readers(&mut stdout_reader, &mut stderr_reader).await;
+                        return Err(HookRunError::fail(
+                            "timeout",
+                            "hook timed out while writing stdin".to_string(),
+                        ));
                     }
                     Ok(Err(error)) if error.kind() != std::io::ErrorKind::BrokenPipe => {
                         let _ = child.terminate_and_reap().await;
-                        let _ = stderr_reader.await;
+                        settle_readers(&mut stdout_reader, &mut stderr_reader).await;
                         return Err(error.into());
                     }
                     Ok(_) => {}
@@ -145,13 +199,25 @@ impl HookCore {
             Ok(Ok(status)) => status,
             Ok(Err(error)) => {
                 let _ = child.terminate_and_reap().await;
-                let _ = stderr_reader.await;
+                settle_readers(&mut stdout_reader, &mut stderr_reader).await;
                 return Err(error.into());
             }
             Err(_) => {
                 let _ = child.terminate_and_reap().await;
-                let _ = stderr_reader.await;
-                anyhow::bail!("hook timed out after {timeout_ms} ms");
+                settle_readers(&mut stdout_reader, &mut stderr_reader).await;
+                return Err(HookRunError::fail(
+                    "timeout",
+                    format!("hook timed out after {timeout_ms} ms"),
+                ));
+            }
+        };
+        let stdout = match settle_reader(&mut stdout_reader).await {
+            Some(bytes) => bytes?,
+            None => {
+                return Err(HookRunError::fail(
+                    "timeout",
+                    format!("hook output did not close within {READER_SETTLE_MS} ms"),
+                ));
             }
         };
         let mut stderr = stderr_reader.await??;
@@ -159,25 +225,61 @@ impl HookCore {
         let stderr_truncated = stderr.len() > MAX_STDERR_BYTES as usize;
         stderr.truncate(MAX_STDERR_BYTES as usize);
 
-        if status.success() {
-            return Ok(());
-        }
-
-        let stderr = String::from_utf8_lossy(&stderr);
-        let mut stderr = truncate_for_log(stderr.as_ref(), MAX_STDERR_CHARS);
-        if stderr_truncated {
-            stderr.push_str(" [truncated]");
-        }
-        anyhow::bail!(
-            "hook exited with status {}{}",
-            status,
-            if stderr.is_empty() {
-                String::new()
-            } else {
-                format!(", stderr: {stderr}")
+        if !status.success() {
+            let stderr = String::from_utf8_lossy(&stderr);
+            let mut stderr = truncate_for_log(stderr.as_ref(), MAX_STDERR_CHARS);
+            if stderr_truncated {
+                stderr.push_str(" [truncated]");
             }
-        )
+            return Err(HookRunError::fail(
+                "exit_status",
+                format!(
+                    "hook exited with status {}{}",
+                    status,
+                    if stderr.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", stderr: {stderr}")
+                    }
+                ),
+            ));
+        }
+        if !capture_stdout {
+            return Ok(None);
+        }
+        if stdout.len() > MAX_CONTEXT_STDOUT_BYTES {
+            return Err(HookRunError::fail(
+                "stdout_over_limit",
+                format!("hook stdout is over {MAX_CONTEXT_STDOUT_BYTES} bytes"),
+            ));
+        }
+        Ok(Some(stdout))
     }
+}
+
+/// How long the output readers may take to finish once the hook has ended
+/// or been killed. A grandchild that keeps a pipe open cannot hold a turn
+/// past this.
+const READER_SETTLE_MS: u64 = 1_000;
+
+type OutputReader = tokio::task::JoinHandle<std::io::Result<Vec<u8>>>;
+
+/// Wait up to `READER_SETTLE_MS` for one output reader. On expiry the
+/// reader is aborted and `None` is returned.
+async fn settle_reader(reader: &mut OutputReader) -> Option<std::io::Result<Vec<u8>>> {
+    match tokio::time::timeout(Duration::from_millis(READER_SETTLE_MS), &mut *reader).await {
+        Ok(joined) => Some(joined.unwrap_or_else(|error| Err(std::io::Error::other(error)))),
+        Err(_) => {
+            reader.abort();
+            None
+        }
+    }
+}
+
+/// Settle both readers after a kill; their results are discarded.
+async fn settle_readers(stdout: &mut OutputReader, stderr: &mut OutputReader) {
+    let _ = settle_reader(stdout).await;
+    let _ = settle_reader(stderr).await;
 }
 
 pub(super) fn truncate_for_log(input: &str, max_chars: usize) -> String {

@@ -48,6 +48,7 @@ pub(crate) fn sources(generation: &ConfigGeneration, config: &crate::config::Con
         timeout_ms: 0,
         action_count: 0,
         webhook_count: 0,
+        context_count: 0,
         webhook_urls: Vec::new(),
         events: BTreeMap::new(),
         catalog_digest: None,

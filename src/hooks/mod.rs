@@ -3,6 +3,7 @@
 
 mod child;
 mod config;
+mod context;
 mod envelope;
 mod event;
 mod hook_core;
@@ -16,6 +17,7 @@ mod webhook;
 #[cfg(test)]
 mod tests;
 
+pub use context::{ContextPoint, ContributionKind, HookContribution};
 pub use config::{
     HookChange, HookDiagnostics, WORKSPACE_HOOKS_OPT_IN, blocked_hooks_note, workspace_hook_counts,
 };

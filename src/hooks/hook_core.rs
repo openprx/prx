@@ -5,7 +5,10 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::config::{HookDiagnostics, RuntimeState, blocked_hooks_note, parse_hook_config, read_bounded_file, webhook_urls};
+use super::config::{
+    HookDiagnostics, HookMode, RuntimeState, blocked_hooks_note, context_action_count, parse_hook_config, read_bounded_file,
+    webhook_urls,
+};
 use super::event::HookEvent;
 #[cfg(feature = "wasm-plugins")]
 use super::event::redacted_hook_payload;
@@ -136,6 +139,7 @@ impl HookCore {
             timeout_ms: state.config.timeout_ms,
             action_count,
             webhook_count: webhook_urls.len(),
+            context_count: context_action_count(&state.config.hooks),
             webhook_urls,
             events,
             catalog_digest: state.hooks_json_digest,
@@ -165,6 +169,7 @@ impl HookCore {
             timeout_ms: config.timeout_ms,
             action_count,
             webhook_count: webhook_urls.len(),
+            context_count: context_action_count(&config.hooks),
             webhook_urls,
             events,
             catalog_digest: Some(Sha256::digest(content.as_bytes()).into()),
@@ -245,7 +250,18 @@ impl HookCore {
                 let state = self.state.read();
                 (
                     state.config.timeout_ms,
-                    state.config.hooks.get(event.as_str()).cloned().unwrap_or_default(),
+                    state
+                        .config
+                        .hooks
+                        .get(event.as_str())
+                        .map(|actions| {
+                            actions
+                                .iter()
+                                .filter(|action| action.mode != HookMode::Context)
+                                .cloned()
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default(),
                 )
             };
 
@@ -272,7 +288,7 @@ impl HookCore {
                                 "webhook hook delivery failed"
                             );
                         }
-                    } else if let Err(err) = self.run_action(event, payload, timeout_ms, &action).await {
+                    } else if let Err(err) = self.run_action(event, payload, timeout_ms, &action, false).await {
                         tracing::warn!(
                             event = event.as_str(),
                             command = action.command.as_deref().unwrap_or_default(),

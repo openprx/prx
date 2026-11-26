@@ -7,12 +7,40 @@ use std::path::Path;
 use super::event::{HookEvent, normalize_event_name};
 use super::{DEFAULT_TIMEOUT_MS, HOOKS_JSON_FILE, MAX_ACTIONS, MAX_ARGS_PER_ACTION, MAX_ENV_PER_ACTION, MAX_HOOKS_FILE_BYTES, MAX_TIMEOUT_MS};
 
+/// How a command action runs: `notify` (the default) on the queued path,
+/// or `context` when a caller awaits its contribution (see `context.rs`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum HookMode {
+    #[default]
+    Notify,
+    Context,
+}
+
+/// The events a context action may sit under.
+const CONTEXT_EVENTS: [&str; 5] = [
+    "session_opened",
+    "turn_opened",
+    "tool_call",
+    "reduction_started",
+    "child_started",
+];
+
 /// One hook action: a command (`command`) or a webhook (`url`), never both.
 #[derive(Clone, Deserialize)]
 pub(super) struct HookAction {
     /// The program of a command action.
     #[serde(default)]
     pub(super) command: Option<String>,
+    /// `notify` (default) or `context`.
+    #[serde(default)]
+    pub(super) mode: HookMode,
+    /// Context actions run highest first; ties sort by `name`.
+    #[serde(default)]
+    pub(super) priority: i32,
+    /// The label of the action; defaults to its `command`.
+    #[serde(default)]
+    pub(super) name: Option<String>,
     #[serde(default)]
     pub(super) args: Vec<String>,
     #[serde(default)]
@@ -48,6 +76,11 @@ impl std::fmt::Debug for HookAction {
 impl HookAction {
     pub(super) const fn is_webhook(&self) -> bool {
         self.url.is_some()
+    }
+
+    /// The label a context action is known by: `name`, else its `command`.
+    pub(super) fn label(&self) -> &str {
+        self.name.as_deref().or(self.command.as_deref()).unwrap_or_default()
     }
 }
 
@@ -97,6 +130,8 @@ pub struct HookDiagnostics {
     pub action_count: usize,
     /// How many of the actions are webhooks.
     pub webhook_count: usize,
+    /// How many of the actions are context actions (`mode: "context"`).
+    pub context_count: usize,
     /// The webhook endpoints, without credentials, query or fragment.
     pub webhook_urls: Vec<String>,
     pub events: BTreeMap<String, usize>,
@@ -129,6 +164,15 @@ pub fn workspace_hook_counts(workspace_dir: &Path) -> anyhow::Result<Option<(usi
     };
     let config = parse_hook_config(&raw)?;
     Ok(Some((config.hooks.values().map(Vec::len).sum(), webhook_urls(&config.hooks))))
+}
+
+/// How many of the actions are context actions (`mode: "context"`).
+pub(super) fn context_action_count(hooks: &HashMap<String, Vec<HookAction>>) -> usize {
+    hooks
+        .values()
+        .flatten()
+        .filter(|action| action.mode == HookMode::Context)
+        .count()
 }
 
 /// The endpoints of the webhook actions, sorted, as safe to show.
@@ -215,13 +259,24 @@ fn validate_hooks_file(file: &HooksFile) -> anyhow::Result<()> {
             anyhow::bail!("duplicate hook event after normalization: '{event}'");
         }
     }
-    for actions in file.hooks.values() {
+    for (event, actions) in &file.hooks {
         for action in actions {
             match (&action.command, &action.url) {
                 (Some(_), Some(_)) => anyhow::bail!("a hook action has either `command` or `url`, not both"),
                 (None, None) => anyhow::bail!("a hook action needs `command` or `url`"),
                 (None, Some(url)) => super::webhook::validate_action(url, &action.headers, action.signing_secret.as_deref())?,
                 (Some(_), None) => {}
+            }
+            if action.mode == HookMode::Context {
+                if action.is_webhook() {
+                    anyhow::bail!("a context hook action on '{event}' must be a `command`, not a `url`");
+                }
+                if !CONTEXT_EVENTS.contains(&normalize_event_name(event).as_str()) {
+                    anyhow::bail!(
+                        "a context hook action is not allowed on '{event}': context actions run on session_opened, \
+                         turn_opened, tool_call, reduction_started or child_started"
+                    );
+                }
             }
             if action.args.len() > MAX_ARGS_PER_ACTION {
                 anyhow::bail!("hook action has too many arguments");

@@ -460,6 +460,7 @@ async fn admit_chat_fixture_with_mode(
         timeout_ms: 0,
         action_count: 0,
         webhook_count: 0,
+        context_count: 0,
         webhook_urls: Vec::new(),
         events: std::collections::BTreeMap::new(),
         catalog_digest: None,

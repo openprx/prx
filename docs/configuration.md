@@ -2314,6 +2314,72 @@ keeps its value; to keep hooks from running, write `workspace_hooks = "off"`.
 `prx init` never wrote the key, so no stored value is reset. A hook that
 carried a `cwd` field is now accepted and starts there.
 
+#### Context hooks
+
+A command action may set `"mode": "context"`. Such an action is not run by
+the queue: a caller that asks for context awaits it, and the program's stdout
+is read as the contribution. Command actions default to `"mode": "notify"`,
+which runs them on the queue exactly as before, so an existing `hooks.json`
+behaves as it did. Each action also takes:
+
+- `priority` (integer, default `0`): context actions run highest first.
+  Actions with equal priority run in order of `name`.
+- `name` (string, default: the `command`): the label used in `hook_failed`
+  events and ordering.
+
+A context action must be a `command` (not a `url`) and must sit under one of
+`session_opened`, `turn_opened`, `tool_call`, `reduction_started` or
+`child_started`. Any other event makes the file invalid, and the error names
+that event. The actions of one point run concurrently, so the wait is bounded
+by the slowest one's timeout, not the sum of them.
+
+```json
+{
+  "hooks": {
+    "turn_opened": [
+      {
+        "command": "./scripts/brief.sh",
+        "mode": "context",
+        "priority": 10,
+        "name": "brief",
+        "timeout_ms": 2000
+      }
+    ]
+  }
+}
+```
+
+A context action receives the same envelope on stdin and the same environment
+as a command hook (see above). Its stdout is a JSON object that carries one
+accepted key with a string value. Empty stdout contributes nothing and is not
+a failure.
+
+| Point (event) | Accepted key | Contribution kind |
+|---|---|---|
+| `session_opened`, `turn_opened`, `child_started` | `add_context` | add context |
+| `tool_call` (tool result) | `replace_output`, else `note` | replace output, or note |
+| `reduction_started` (before a handoff) | `summary_instructions` | summary instructions |
+
+On `tool_call`, `replace_output` wins when both keys are present. Any other
+stdout is a failure: stdout that is not a JSON object, a key that holds
+something other than a string, or an object with none of the accepted keys.
+
+Bounds: stdout is read up to 64 KiB, and more than that is a failure. Each
+contribution is redacted for secrets and then cut to 8,000 characters, with
+the suffix ` [truncated by PRX]`. A context action has no veto: no key stops
+a turn or a tool call.
+
+A context action that times out (its `timeout_ms`, default the file's
+`timeout_ms`, then 5,000 ms), exits non-zero, writes invalid output or cannot
+start contributes nothing and never fails the turn. It is recorded as a
+`hook_failed` event, queued like any other event, whose payload carries the
+hook `name`, the `point`, and an `error` class: `timeout`, `exit_status`,
+`invalid_output`, `stdout_over_limit` or `spawn`. Neither the contributed
+text nor the stderr of the program is logged or put in the event. A context
+hook can still slow a turn by up to its timeout; it can never stop one.
+
+The hook diagnostics carry the number of context actions as `context_count`.
+
 #### Webhook hooks
 
 An action with `url` instead of `command` is a webhook: for each matching
