@@ -1,102 +1,24 @@
 //! The provider call of one round: the request hook, the admitted send, the
 //! streamed or buffered call, and the parsing of its answer.
 
-use crate::hooks::{HookEvent, HookManager, payload_error};
+use crate::hooks::{HookEvent, payload_error};
 use crate::llm::route_decision::TokenUsage;
-use crate::multimodal;
-use crate::observability::{Observer, ObserverEvent};
-use crate::providers;
-use crate::providers::{ChatMessage, ChatRequest, ProviderCapabilityError};
-use crate::tools::Tool;
-use crate::util::truncate_with_ellipsis;
+use crate::observability::ObserverEvent;
+use crate::providers::{ChatMessage, ChatRequest};
 use anyhow::Result;
 use std::borrow::Cow;
-use std::fmt::Write;
-use std::io::Write as _;
-use std::sync::Arc;
 use std::time::Instant;
-use tokio_util::sync::CancellationToken;
 
-#[cfg(test)]
-use crate::agent::compaction::is_tool_roundtrip_companion;
-use crate::agent::compaction::{
-    COMPACTION_KEEP_RECENT_MESSAGES, CompactionBuild, build_configurable_compaction_patch_with_source_history,
-    persist_context_switch_degradation,
-};
-#[cfg(test)]
-use crate::agent::context_budget::budgeted_request_tool_tokens;
-#[cfg(test)]
-use crate::agent::context_budget::{APPENDED_SECTION_FRAMING_TOKENS, TOKEN_HEURISTIC_BUDGET_MULTIPLIER};
-use crate::agent::context_budget::{
-    PRE_TURN_FLUSH_THRESHOLD, RequestToolSurfaceCounts, budgeted_tokens, estimate_history_tokens,
-    estimate_history_tokens_with_source, estimate_request_tokens, plan_context_budget, reserve_request_tool_surface,
-    token_source_label, trim_history_to_context_budget,
-    trim_history_to_context_budget_preserving_compaction_replacement_with_floor,
-};
-use crate::agent::context_paging::{
-    context_mode_uses_os_paging, inject_recalled_context, plan_os_paging, recall_context_pages,
-};
-use crate::agent::context_preflight::{
-    RestoredRequestPosition, capture_current_turn_request, restore_current_turn_request,
-};
-use crate::agent::diagnostics::{redact_sensitive_json_keys, scrub_credentials, tool_parse_log_digest};
-#[cfg(test)]
-use crate::agent::document_ingest::drop_untrusted_external_results;
-use crate::agent::document_ingest::{persist_tool_output_document, persist_untrusted_external_copy};
-use crate::agent::execution_policy::{AgentToolRuntimeInputs, build_agent_tool_runtime_adapter};
-use crate::agent::history::{
-    apply_aggressive_trim, build_native_assistant_history, coalesce_system_messages_at_front, latest_user_query,
-};
-use crate::agent::provider_round::{is_stream_failure_after_model_output, run_streaming_provider_turn};
-#[cfg(test)]
-use crate::agent::response_guard::{
-    CORRECTIVE_ASIDE_PREFIX, contains_fabricated_tool_marker, strip_fabricated_tool_markers,
-};
-use crate::agent::response_guard::{
-    EMPTY_ASSISTANT_RESPONSE_RETRY_MESSAGE, TOOL_SUMMARY_ONLY_RESPONSE_MESSAGE, UNEXECUTED_TOOL_CLAIM_NOTICE,
-    append_corrective_aside, contains_assistant_fabricated_tool_marker, is_empty_assistant_response,
-    is_tool_summary_only_response, strip_assistant_fabricated_tool_markers,
-};
-use crate::agent::sanitize::{known_tool_names, sanitize_stream_chunk};
-use crate::agent::stream_buffer::StreamBoundaryBuffer;
+use crate::agent::diagnostics::tool_parse_log_digest;
+use crate::agent::history::build_native_assistant_history;
+use crate::agent::provider_round::run_streaming_provider_turn;
+use crate::agent::response_guard::strip_assistant_fabricated_tool_markers;
 use crate::agent::tool_call_parser::{
     looks_like_unparsed_tool_call_syntax, parse_structured_tool_calls, parse_tool_calls,
 };
-use crate::agent::tool_evidence::{claims_tool_evidence, strip_model_written_tool_evidence};
-#[cfg(test)]
-use crate::agent::tool_result_recording::INTERRUPTED_TOOL_RESULT;
-use crate::agent::tool_result_recording::{
-    ExecutedToolRecords, ToolResultRecorder, compact_tool_result_for_history_with_status,
-    tool_result_inline_budget_for_history,
-};
-use crate::agent::tool_scheduler::{
-    ReadOnlyToolScheduleConfig, execute_tools_with_service, shared_unrecoverable_tool_error,
-};
-#[cfg(test)]
-use crate::agent::turn_contracts::ChatMode;
-use crate::agent::turn_contracts::{
-    ToolCallNotification, ToolLoopCancelled, ToolLoopEvent, ToolLoopOutcome, ToolLoopTrace, emit_tool_loop_event,
-};
-use crate::agent::turn_history::{TurnHistory, same_messages};
-use crate::agent::turn_request::{ToolLoopMemory, TurnDecision, TurnDelivery, TurnRequest, TurnSchedule, TurnServices};
-use crate::context::budget::anchor::{self, RequestBudget};
-use crate::context::budget::record::{plan_round, settle_round};
-use crate::context::reduce::clear::ClearOldResults;
-use crate::context::reduce::compact::{PreTurnCompact, RoundCompact};
-use crate::context::reduce::engine::{
-    AfterTools, PreTurn, Round, Services, history_before_change, report_durable_compaction,
-};
-use crate::context::reduce::ladder;
-use crate::context::reduce::normalize::repair_view;
-use crate::context::reduce::preflight::PreflightCompaction;
-use crate::context::reduce::trim::{MidTurnTrim, RoundTrim};
-use crate::context::transcript::{RoundLog, call_id_for};
-#[cfg(test)]
-use crate::memory::{DocumentSearchResult, MemoryPrincipal};
-#[cfg(test)]
-use crate::providers::Provider;
-#[cfg(all(test, feature = "wasm-plugins"))]
-use std::path::Path;
+use crate::agent::tool_evidence::strip_model_written_tool_evidence;
+use crate::agent::turn_contracts::{ToolLoopCancelled, ToolLoopTrace};
+use crate::context::budget::record::settle_round;
 
 use crate::agent::tool_call_parser::ParsedToolCall;
 use crate::providers::ToolCall;
