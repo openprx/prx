@@ -3,7 +3,7 @@ use rusqlite::Connection;
 
 use crate::config::Config;
 
-use super::deliver_pending_cron_event_outbox;
+use super::rows::deliver_pending_cron_event_outbox;
 
 fn add_column_if_missing(conn: &Connection, table: &str, name: &str, sql_type: &str) -> Result<()> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
