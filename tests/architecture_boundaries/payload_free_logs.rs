@@ -1328,11 +1328,11 @@ const REVIEWED_LOG_SITES: &[(&str, &str)] = &[
         "a hex SHA-256 digest of the tool schema",
     ),
     (
-        "src/agent/turn_engine.rs::run_turn_unguarded `decision_brief_sha256 = brief_hash`",
+        "src/agent/turn_engine/request.rs::prepare_request `decision_brief_sha256 = brief_hash`",
         "a hex SHA-256 digest of the decision brief",
     ),
     (
-        "src/agent/turn_engine.rs::run_turn_unguarded `system_prompt_sha256 = system_prompt_sha256.as_deref()`",
+        "src/agent/turn_engine/request.rs::prepare_request `system_prompt_sha256 = system_prompt_sha256.as_deref()`",
         "a hex SHA-256 digest of the final system prompt (`prompt_sha256`)",
     ),
     (

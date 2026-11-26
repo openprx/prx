@@ -73,6 +73,18 @@ pub(super) struct RoundBudget {
     pub(super) budgeted_totals: Option<(usize, usize)>,
 }
 
+/// The tool surface of one round: the tools it may expose, their specs and the
+/// measures of the request they make up.
+pub(super) struct RoundSurface<'t> {
+    pub(super) selected_tools: Vec<&'t dyn crate::tools::Tool>,
+    pub(super) tool_specs: Vec<crate::tools::ToolSpec>,
+    pub(super) appended_names: std::collections::BTreeSet<String>,
+    pub(super) decision_fingerprints:
+        std::collections::BTreeMap<String, crate::tools::capability::contract::SchemaFingerprint>,
+    pub(super) tool_surface: crate::agent::turn_context::RequestToolMeasurement,
+    pub(super) tool_surface_counts: crate::agent::context_budget::RequestToolSurfaceCounts,
+}
+
 /// Values the rounds of one turn carry forward and change.
 pub(super) struct TurnState {
     /// The round counter; the first round is 1.
