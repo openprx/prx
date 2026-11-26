@@ -3690,7 +3690,9 @@ then reports pairing ACTIVE and accepts that bearer instead of offering a new
 one-time pairing code. Keep and use the issued file; do not remove valid
 paired credentials just to request a second pairing. A token added to or
 removed from `gateway.paired_tokens` takes effect on the running gateway after
-the config reload, with no restart needed.
+the config reload, with no restart needed. After removing a token, check that
+the reload succeeded: an invalid field anywhere in the file blocks the whole
+reload, and the token stays valid until a reload succeeds.
 
 For mTLS messaging, run `prx a2a init`, then `prx a2a bind 127.0.0.1:16832`.
 Initialization prints the terminal-chat owner alongside the public SPIFFE identity
