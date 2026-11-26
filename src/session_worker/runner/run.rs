@@ -966,6 +966,9 @@ async fn run_owned_manifest(
         // authenticated, and the stdin reader that carries decisions is running.
         let approval_relay =
             manifest.approval_relay && crate::session_worker::stdout::is_authenticated() && steer_rx.is_some();
+        // K-C3: the first input of a child segment is opened through `open_turn`
+        // with the seed, once; the first segment call carries no steer.
+        let mut first_open = Some(manifest.seed_history.clone());
         let (history, loop_result) = run_segments_with_controls(
             initial_history,
             &mut steer_rx,
@@ -978,6 +981,7 @@ async fn run_owned_manifest(
                 let request_event_fabric = child_segments
                     .as_ref()
                     .map_or_else(|| memory_fabric_ref.clone(), |segments| segments.fabric.clone());
+                let open_seed = if raw_steer.is_none() { first_open.take() } else { None };
                 async move {
                     let parent = crate::runtime::turn_cleanup::current_tracker();
                     let mut cleanup = match crate::runtime::turn_cleanup::CleanupScope::new(
@@ -1024,41 +1028,67 @@ async fn run_owned_manifest(
                     } else {
                         None
                     };
-                    if let Some(prompt) = selected_prompt {
-                        if let Some(system) = segment_history.first_mut().filter(|message| message.role == "system") {
-                            *system = ChatMessage::system(prompt);
-                        } else {
-                            segment_history.insert(0, ChatMessage::system(prompt));
+                    let open_first = match (child_turn.as_ref(), child_segments.as_ref(), open_seed) {
+                        (Some(turn), Some(segments), Some(seed)) => Some((turn, segments, seed)),
+                        _ => None,
+                    };
+                    if let Some((turn, segments, seed)) = open_first {
+                        let opened = match selected_prompt {
+                            Some(prompt) => turn.open_first_input(seed, prompt).await,
+                            None => Err(anyhow::anyhow!("worker opening prompt missing")),
+                        };
+                        match opened {
+                            Ok(opened_history) => segment_history = opened_history,
+                            Err(error) => {
+                                let result = cleanup.run(async { Err::<(), _>(error) }).await;
+                                let error = result.err().unwrap_or_else(|| anyhow::anyhow!("worker opening failed"));
+                                if let Err(settlement) =
+                                    segments.completion.fail(turn, &error, cancel.is_cancelled()).await
+                                {
+                                    return (segment_history, Err(settlement));
+                                }
+                                return (segment_history, Err(error));
+                            }
                         }
-                    }
-                    if initial_input {
-                        let mut user_task = if child_turn.is_some() {
-                            raw_task.to_owned()
-                        } else {
-                            let shared_context =
-                                load_worker_shared_context(manifest_ref, config_ref, memory.as_ref()).await;
-                            if shared_context.trim().is_empty() {
+                    } else {
+                        if let Some(prompt) = selected_prompt {
+                            if let Some(system) = segment_history.first_mut().filter(|message| message.role == "system")
+                            {
+                                *system = ChatMessage::system(prompt);
+                            } else {
+                                segment_history.insert(0, ChatMessage::system(prompt));
+                            }
+                        }
+                        if initial_input {
+                            let mut user_task = if child_turn.is_some() {
                                 raw_task.to_owned()
                             } else {
-                                format!("{shared_context}{raw_task}")
+                                let shared_context =
+                                    load_worker_shared_context(manifest_ref, config_ref, memory.as_ref()).await;
+                                if shared_context.trim().is_empty() {
+                                    raw_task.to_owned()
+                                } else {
+                                    format!("{shared_context}{raw_task}")
+                                }
+                            };
+                            if child_turn.is_none() {
+                                crate::agent::turn_contracts::push_current_time_tail(&mut user_task);
                             }
-                        };
-                        if child_turn.is_none() {
-                            crate::agent::turn_contracts::push_current_time_tail(&mut user_task);
+                            segment_history.push(crate::agent::turn_contracts::inbound_user_message(&user_task));
                         }
-                        segment_history.push(crate::agent::turn_contracts::inbound_user_message(&user_task));
-                    }
-                    if let (Some(turn), Some(segments)) = (child_turn.as_ref(), child_segments.as_ref()) {
-                        if let Err(error) = turn.enrich_input(&mut segment_history).await {
-                            let result = cleanup.run(async { Err::<(), _>(error) }).await;
-                            let error = result
-                                .err()
-                                .unwrap_or_else(|| anyhow::anyhow!("worker enrichment failed"));
-                            if let Err(settlement) = segments.completion.fail(turn, &error, cancel.is_cancelled()).await
-                            {
-                                return (segment_history, Err(settlement));
+                        if let (Some(turn), Some(segments)) = (child_turn.as_ref(), child_segments.as_ref()) {
+                            if let Err(error) = turn.enrich_input(&mut segment_history).await {
+                                let result = cleanup.run(async { Err::<(), _>(error) }).await;
+                                let error = result
+                                    .err()
+                                    .unwrap_or_else(|| anyhow::anyhow!("worker enrichment failed"));
+                                if let Err(settlement) =
+                                    segments.completion.fail(turn, &error, cancel.is_cancelled()).await
+                                {
+                                    return (segment_history, Err(settlement));
+                                }
+                                return (segment_history, Err(error));
                             }
-                            return (segment_history, Err(error));
                         }
                     }
                     let Some(admitted_turn) = child_turn.as_ref() else {
