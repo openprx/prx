@@ -1,11 +1,16 @@
-//! The context hook points of the tool result and the handoff: the
-//! contributions that change what a tool result carries and what a summary
-//! handoff is asked for. The child-open point joins here later.
+//! The context hook points of the tool result, the handoff and the child
+//! open: the contributions that change what a tool result carries, what a
+//! summary handoff is asked for, and what a child's first input carries.
 
 use std::fmt::Write as _;
+use std::sync::Arc;
 
+use super::tail::TurnTailInput;
+use crate::context::transcript::append_hook_contributions;
 use crate::hooks::context::{ContextPoint, ContributionKind, HookContribution};
-use crate::hooks::{HookEvent, HookManager};
+use crate::hooks::{HookEvent, HookIdentity, HookManager};
+use crate::memory::MemoryFabric;
+use crate::runtime::envelope::RuntimeSource;
 
 /// One tool call of a round: its name, its call id, whether it succeeded and
 /// its raw output.
@@ -78,5 +83,54 @@ pub(crate) async fn summary_instructions(trigger: &str, cold_messages: usize) ->
     contributions
         .into_iter()
         .map(|contribution| contribution.text)
+        .collect()
+}
+
+/// Whether a turn opened from `source` is a child's first input: the sources
+/// of the sessions_spawn task and the session-worker process. A child takes
+/// the child-open contribution in place of the turn-open and session-open
+/// points.
+pub(crate) const fn is_child_open(source: RuntimeSource) -> bool {
+    matches!(source, RuntimeSource::SessionWorker | RuntimeSource::SessionsSpawn)
+}
+
+/// The child-open contributions of a child's first input, rendered as the
+/// stored attachment tail: one `[Hook context: <hook>]` block per
+/// `child_started` contribution, each with one audit row under the child's
+/// key. Empty without a manager (the child then has no hook).
+pub(crate) async fn child_open_tail(input: TurnTailInput<'_>) -> String {
+    let TurnTailInput {
+        memory,
+        envelope,
+        memory_config,
+        visible_message,
+        hooks,
+    } = input;
+    let Some(hooks) = hooks else {
+        return String::new();
+    };
+    let mode = match envelope.source {
+        RuntimeSource::SessionWorker => "process",
+        _ => "task",
+    };
+    let data = serde_json::json!({
+        "child_session": envelope.session_key,
+        "mode": mode,
+        "brief_chars": visible_message.chars().count(),
+    });
+    let contributions = crate::hooks::identity_scope(
+        HookIdentity::for_session(envelope),
+        hooks.contribute(ContextPoint::ChildStarted, data),
+    )
+    .await;
+    if contributions.is_empty() {
+        return String::new();
+    }
+    let fabric = MemoryFabric::new(Arc::clone(memory), envelope.workspace_id.clone())
+        .with_event_recording(memory_config.event_recording_config());
+    append_hook_contributions(&fabric, &envelope.message_scope(), &contributions).await;
+    contributions
+        .iter()
+        .map(|contribution| format!("\n\n[Hook context: {}]\n{}", contribution.hook, contribution.text))
         .collect()
 }

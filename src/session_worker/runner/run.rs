@@ -1034,7 +1034,7 @@ async fn run_owned_manifest(
                     };
                     if let Some((turn, segments, seed)) = open_first {
                         let opened = match selected_prompt {
-                            Some(prompt) => turn.open_first_input(seed, prompt).await,
+                            Some(prompt) => turn.open_first_input(seed, prompt, Some(hooks_ref)).await,
                             None => Err(anyhow::anyhow!("worker opening prompt missing")),
                         };
                         match opened {

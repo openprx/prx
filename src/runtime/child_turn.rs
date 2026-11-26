@@ -258,6 +258,7 @@ impl ChildSegmentTurn {
         &self,
         previous: Vec<crate::memory::child_sessions::ChildTurn>,
         system_prompt: String,
+        hooks: Option<&crate::hooks::HookManager>,
     ) -> anyhow::Result<Vec<crate::providers::ChatMessage>> {
         let previous_turns = previous
             .into_iter()
@@ -285,7 +286,7 @@ impl ChildSegmentTurn {
             current_input_key: None,
             excluded_session: None,
             system_prompt,
-            hooks: None,
+            hooks,
             service: &self.service,
             context: &self.decision,
             provider_label: model.provider_label(),

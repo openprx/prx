@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use super::hook_points;
 use super::prefix::{SessionPrefixInput, session_prefix};
 use super::tail::{TurnTailInput, turn_tail};
 use crate::agent::context_recall::{RECALL_CONTEXT_BUDGET, RecallScope, replayed_session_recall, scoped_recall};
@@ -150,14 +151,28 @@ pub(crate) async fn open_turn(input: OpenInput<'_>) -> TurnOpening {
         Some(card) => crate::security::redaction::redact_secrets(&format!("{}{card}", mem_context.preamble)),
         None => crate::security::redaction::redact_secrets(&mem_context.preamble),
     };
-    let hook_tail = turn_tail(TurnTailInput {
-        memory,
-        envelope,
-        memory_config,
-        visible_message,
-        hooks,
-    })
-    .await;
+    // K-H3: a child's first input takes the child-open contributions and runs
+    // no turn-open or session-open hook; every other surface is unchanged.
+    let child = hook_points::is_child_open(envelope.source);
+    let hook_tail = if child {
+        hook_points::child_open_tail(TurnTailInput {
+            memory,
+            envelope,
+            memory_config,
+            visible_message,
+            hooks,
+        })
+        .await
+    } else {
+        turn_tail(TurnTailInput {
+            memory,
+            envelope,
+            memory_config,
+            visible_message,
+            hooks,
+        })
+        .await
+    };
     let attachment = Attachment {
         prefix,
         tail: format!("{}{}", hook_tail, crate::agent::turn_contracts::current_time_tail()),
@@ -183,7 +198,7 @@ pub(crate) async fn open_turn(input: OpenInput<'_>) -> TurnOpening {
         envelope,
         memory_config,
         compact,
-        hooks,
+        hooks: if child { None } else { hooks },
     })
     .await;
     let system_prompt = if prefix_text.is_empty() {

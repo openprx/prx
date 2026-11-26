@@ -395,7 +395,9 @@ pub(super) async fn run_sub_agent_task(
 
                     if let Some(seed) = open_seed {
                         let system = child_turn.system_prompt(&child_config_owned, &system_prompt_owned)?;
-                        task_history = child_turn.open_first_input(seed, system).await?;
+                        task_history = child_turn
+                            .open_first_input(seed, system, crate::hooks::current_manager().as_ref())
+                            .await?;
                     } else {
                         if let Some(system) = initial_system {
                             let system = child_turn.system_prompt(&child_config_owned, &system)?;
