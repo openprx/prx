@@ -777,7 +777,7 @@ impl ConfigGenerationManager {
             tracing::warn!("{warning}");
         }
         let active = old_generation.effective.as_ref();
-        let adopted = adopt_live_pairing_tokens(active, &desired, trigger);
+        let adopted = adopt_live_pairing_tokens(active, &desired);
         let old = adopted.as_ref().unwrap_or(active);
         let changed = changed_top_level_fields(old, &desired)?;
         let participants = {
@@ -1098,23 +1098,21 @@ fn changed_top_level_fields(old: &Config, desired: &Config) -> anyhow::Result<Ve
         .collect())
 }
 
-/// The active configuration with the persisted `gateway.paired_tokens`
-/// adopted, when `trigger` is the pairing persistence and the list differs.
+/// The active configuration with the desired `gateway.paired_tokens` adopted,
+/// when the list differs.
 ///
-/// `gateway` is a process-restart-only field, and its token list is too for
-/// every other writer: a token added by hand is not accepted until restart.
-/// The one exception is `/pair`: the running pairing guard already holds the
-/// token it issued, and the reload that persists it is triggered with
-/// [`ConfigReloadTrigger::PairingPersistence`]. Keeping the old list active
-/// after that reload made every later reload find `gateway` changed again, so
-/// even a save of `agent.compact_context` reported
-/// `restart_required: ["gateway"]` (CONSOLE-OBS-3), and a supervised gateway
-/// restart would have been built from the list without the token. Only the
-/// token list is adopted; any other `gateway` change stays deferred.
-fn adopt_live_pairing_tokens(active: &Config, desired: &Config, trigger: ConfigReloadTrigger) -> Option<Config> {
-    if trigger != ConfigReloadTrigger::PairingPersistence
-        || active.gateway.paired_tokens == desired.gateway.paired_tokens
-    {
+/// The running pairing guard reads its accepted tokens from the active
+/// generation, so a token list changed by any writer (`/pair`, `prx token
+/// issue`, a hand edit picked up by the watcher) takes effect at the next
+/// request. Only the token list is adopted; any other `gateway` change stays
+/// deferred until restart. A reload that fails validation returns before this
+/// point, so an invalid file keeps the previous list.
+///
+/// Adopting the list also keeps later reloads from reporting `gateway` as
+/// changed again (CONSOLE-OBS-3): without it, every save after a pairing
+/// reported `restart_required: ["gateway"]`.
+fn adopt_live_pairing_tokens(active: &Config, desired: &Config) -> Option<Config> {
+    if active.gateway.paired_tokens == desired.gateway.paired_tokens {
         return None;
     }
     let mut adopted = active.clone();
