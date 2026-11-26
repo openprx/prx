@@ -8,15 +8,22 @@
 //! already holds that text. The row has role `tool`, so it stays off the sync
 //! stream and out of every history loader, like the other tool rows.
 
+use std::collections::HashSet;
+
 use serde_json::Value;
 
-use crate::memory::{MemoryFabric, MessageEventScope};
+use crate::context::reduce::handoff_note::{HANDOFF_SKILL_NAME_MAX_BYTES, HANDOFF_SKILLS_MAX_COUNT};
+use crate::memory::erasure::Unsupported;
+use crate::memory::{Memory, MemoryFabric, MemoryPrincipal, MessageEventScope};
 use crate::tools::ToolExecutionStatus;
 
 pub(crate) const SKILL_LOAD_EVENT_TYPE: &str = "skill.load.recorded";
 
 /// Backend of the root `skill_read` tool and of every per-skill alias of it.
 const SKILL_READ_BACKEND: &str = "skill_read";
+
+/// Skill-load rows read per handoff, newest first.
+const SKILL_LOAD_READ_ROWS: usize = 64;
 
 /// One successful skill instruction load, as recognised from its tool outcome.
 #[derive(Debug, Clone)]
@@ -90,4 +97,64 @@ pub(super) async fn append_skill_load(
         let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
         tracing::warn!(error_len, error_sha256, "Failed to persist skill load");
     }
+}
+
+/// The skill names of `session_key` a handoff note can list, newest first, at
+/// most [`HANDOFF_SKILLS_MAX_COUNT`].
+///
+/// Names that the note validator would refuse are skipped, so the note never
+/// fails validation because of them. Duplicates are removed case-insensitively
+/// and the newest spelling is kept. A read error gives an empty list and is
+/// logged with its digest and not with the names; a handoff is never refused
+/// because of it.
+pub(crate) async fn skills_in_use(memory: &dyn Memory, principal: &MemoryPrincipal, session_key: &str) -> Vec<String> {
+    let rows = match memory
+        .newest_session_events_of_type(principal, session_key, SKILL_LOAD_EVENT_TYPE, SKILL_LOAD_READ_ROWS)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error) if error.is::<Unsupported>() => return Vec::new(),
+        Err(error) => {
+            let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+            tracing::warn!(
+                error_len,
+                error_sha256,
+                "Failed to read skill loads for the handoff note; the note lists none"
+            );
+            return Vec::new();
+        }
+    };
+    let mut seen = HashSet::new();
+    let mut names = Vec::new();
+    for event in rows {
+        if event.session_key.as_deref() != Some(session_key) {
+            continue;
+        }
+        let Some(name) = event
+            .raw_payload_json
+            .as_deref()
+            .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
+            .and_then(|payload| payload.get("skill").and_then(Value::as_str).map(str::to_owned))
+        else {
+            continue;
+        };
+        if !is_listable_name(&name) || !seen.insert(name.to_lowercase()) {
+            continue;
+        }
+        names.push(name);
+        if names.len() == HANDOFF_SKILLS_MAX_COUNT {
+            break;
+        }
+    }
+    names
+}
+
+/// The per-name rule the handoff note validator applies to `skills_in_use`:
+/// non-empty, bounded, and free of control characters, `[` and `]`.
+fn is_listable_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= HANDOFF_SKILL_NAME_MAX_BYTES
+        && !name
+            .chars()
+            .any(|character| character.is_control() || character == '[' || character == ']')
 }

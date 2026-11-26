@@ -337,6 +337,22 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
         // substance of an agentic window — is gone with nothing naming it.
         let folded = folded_tool_roundtrips(compacted_source_messages.unwrap_or_default(), compacted_companions);
         let folded_notice = format_folded_tool_roundtrips_notice(&folded);
+        // The skills this session loaded, newest first, so the note can ask the model to
+        // re-read them. A session without a key, or a failed read, lists none.
+        let skills = match audit.session_key.as_deref() {
+            Some(session_key) => {
+                crate::context::transcript::skills_in_use(
+                    audit.memory.as_ref(),
+                    &crate::memory::MemoryPrincipal {
+                        legacy_session_key: None,
+                        ..audit.memory_principal()
+                    },
+                    session_key,
+                )
+                .await
+            }
+            None => Vec::new(),
+        };
         let build_note = |summary_status: &'static str, summary: Option<&str>| {
             let mut note = serde_json::json!({
                 "schema_version": 1,
@@ -371,6 +387,12 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
             });
             if let (Some(object), Some(text)) = (note.as_object_mut(), summary) {
                 object.insert("summary".to_string(), serde_json::Value::String(text.to_string()));
+            }
+            // Omitted when empty, so a handoff without loaded skills is byte-identical.
+            if !skills.is_empty()
+                && let Some(object) = note.as_object_mut()
+            {
+                object.insert("skills_in_use".to_string(), serde_json::json!(skills));
             }
             note
         };

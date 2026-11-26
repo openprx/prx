@@ -17,7 +17,7 @@ mod sources;
 mod tool_rows;
 
 pub(crate) use replay::{Attachment, History, ReplayLog, TurnReplay, stub_replayed_results};
-pub(crate) use skill_rows::{SkillLoad, skill_load_of};
+pub(crate) use skill_rows::{SkillLoad, skill_load_of, skills_in_use};
 pub(crate) use sources::AttachmentSources;
 pub(crate) use tool_rows::{RoundLog, append_attachment, call_id_for};
 
