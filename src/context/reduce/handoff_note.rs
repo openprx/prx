@@ -120,6 +120,7 @@ pub(crate) enum HandoffSummaryStatus {
     Written,
     Failed,
     Empty,
+    InvalidShape,
     OmittedSize,
 }
 

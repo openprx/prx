@@ -764,7 +764,7 @@ A note may also carry three optional fields (`schema_version` stays 1; a note
 without them validates and renders exactly as above). `skills_in_use` lists up
 to 8 skill names the session had loaded before the handoff (each 1 to 128
 bytes, no control characters, no `[` or `]`). `summary_status` is one of
-`written`, `failed`, `empty` or `omitted_size`; `summary` must be present
+`written`, `failed`, `empty`, `invalid_shape` or `omitted_size`; `summary` must be present
 exactly when the status is `written`, and then holds 1 to 6000 bytes that
 contain none of the markers `[context_handoff]`, `[/context_handoff]`,
 `[document_ingest_ref]` or `[/document_ingest_ref]`. A note that breaks any of
@@ -780,7 +780,11 @@ temperature 0.2, for a summary of the cold window under six fixed headings (at
 most 600 words and 5,000 bytes). The reply is cleaned and cut to at most 6000
 bytes, a longer one ending in a `[summary cut]` line, and stored as `summary`
 with status `written`; a failed call or an empty reply stores status `failed`
-or `empty` instead. The note without a summary is checked first, so the model
+or `empty` instead. A reply is a summary only when, after the clean-up, it
+opens with the first heading and carries the six headings as whole lines in
+order; a cut reply that lost a later heading is not a summary. Any other reply
+stores status `invalid_shape`, with no `summary`. The request fences the cold
+window as material to summarize, not as a request to answer. The note without a summary is checked first, so the model
 is asked only for a handoff that will be written: no call is made for a
 suppressed or refused switch or for a note that cannot validate, and a summary
 that would push the note past its bound is dropped with status `omitted_size`.
