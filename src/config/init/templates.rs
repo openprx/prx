@@ -362,7 +362,7 @@ pub(super) fn agent_template(spec: Spec) -> String {
 # OS-paging (non-destructive history eviction + semantic recall) on by default so
 # the agent "remembers" long conversations instead of hard-dropping old messages.
 [agent.compaction]
-mode = "switch"                        # exact transcript refs; off | switch | safeguard | aggressive
+mode = "switch"                        # exact transcript refs; off | switch
 [agent.compaction.os_paging]
 max_recalled_pages = 10
 "#
@@ -373,7 +373,7 @@ max_recalled_pages = 10
 # Context retention follows the model-aware token budget.
 
 [agent.compaction]
-mode = "switch"                        # exact transcript refs; off | switch | safeguard | aggressive
+mode = "switch"                        # exact transcript refs; off | switch
 # max_context_tokens = 128000          # optional explicit override; omitted means derive from model metadata
 # OS-paging: non-destructive eviction + semantic recall of paged-out history.
 [agent.compaction.os_paging]
@@ -401,7 +401,7 @@ min_coverage = 0.60
 
 # Context compaction to manage long conversations.
 [agent.compaction]
-mode = "switch"                       # exact transcript refs; off | switch | safeguard | aggressive
+mode = "switch"                       # exact transcript refs; off | switch
 # max_context_tokens = 128000         # optional explicit override; omitted means derive from model metadata
 # OS-paging: non-destructive eviction + semantic recall of paged-out history.
 [agent.compaction.os_paging]
