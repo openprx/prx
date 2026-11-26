@@ -132,6 +132,21 @@ fn leading_count_covering(weights: &[usize], needed: usize) -> Option<usize> {
     (covered >= needed).then_some(weights.len())
 }
 
+/// `excess` tokens of the planning total, expressed in provider weight units.
+/// The weights are budgeted tokens of the provider view while the excess is
+/// measured on the planning total, so the excess is scaled by their ratio.
+fn excess_in_weight_units(excess: usize, planning_total: usize, weights: &[usize]) -> usize {
+    if planning_total == 0 {
+        return excess;
+    }
+    let weight_total = weights.iter().fold(0u128, |sum, weight| {
+        sum.saturating_add(u128::try_from(*weight).unwrap_or(u128::MAX))
+    });
+    let scaled = u128::try_from(excess).unwrap_or(u128::MAX).saturating_mul(weight_total)
+        / u128::try_from(planning_total).unwrap_or(u128::MAX);
+    usize::try_from(scaled).unwrap_or(usize::MAX)
+}
+
 #[cfg(test)]
 pub(crate) async fn build_configurable_compaction_patch(
     history: &[ChatMessage],
@@ -202,28 +217,32 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
         crate::agent::budget_inputs::keep_recent_cap(config, non_system.len()),
         config,
     );
-    // An automatic switch folds at least enough oldest messages to bring the
-    // request under the limit with room for the handoff note. The fold stops at
-    // the live turn; when that cannot free enough, nothing is folded. A manual
-    // `/compact` keeps the keep-recent count alone.
-    let fit_count = if automatic_switch {
-        let live_start = source_history
-            .iter()
-            .rposition(|message| message.role == "user")
-            .filter(|&index| index > start)
-            .unwrap_or(source_history.len().saturating_sub(1))
-            .max(start);
-        let excess = planning_history_tokens(budget_history)
+    // The live request is never folded: the fold ends at the latest user query
+    // (`fold_end`). An automatic switch folds at least enough of the oldest
+    // messages before it to bring the request under the limit, with room for the
+    // handoff note; when that region cannot cover the excess, all of it folds. A
+    // manual `/compact` keeps the keep-recent count alone.
+    let (fit_count, fold_end) = if automatic_switch {
+        let live_start = crate::agent::history::latest_user_query_index(source_history)
+            .filter(|&index| index >= start)
+            .unwrap_or(start);
+        let region = provider_weights.get(start..live_start).unwrap_or_default();
+        let planning_total = planning_history_tokens(budget_history);
+        let excess = planning_total
             .saturating_sub(limit)
             .saturating_add(HANDOFF_NOTE_ALLOWANCE_TOKENS);
-        match leading_count_covering(provider_weights.get(start..live_start).unwrap_or_default(), excess) {
-            Some(count) => count,
-            None => return Ok(CompactionBuild::NotNeeded(NotNeededReason::NothingFoldable)),
-        }
+        let excess = excess_in_weight_units(excess, planning_total, &provider_weights);
+        (
+            leading_count_covering(region, excess).unwrap_or(region.len()),
+            live_start,
+        )
     } else {
-        0
+        (0, usize::MAX)
     };
-    let requested_compact_count = non_system_count.saturating_sub(requested_keep_recent).max(fit_count);
+    let requested_compact_count = non_system_count
+        .saturating_sub(requested_keep_recent)
+        .max(fit_count)
+        .min(fold_end.saturating_sub(start));
     if requested_compact_count == 0 {
         return Ok(CompactionBuild::NotNeeded(NotNeededReason::NothingFoldable));
     }
@@ -237,6 +256,10 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
         requested_end
     };
     let compact_end = compaction_boundary_without_orphan_tool_results(&companions, start, requested_end);
+    if compact_end > fold_end {
+        // The orphan walk moved forward past the live request: nothing may fold.
+        return Ok(CompactionBuild::NotNeeded(NotNeededReason::NothingFoldable));
+    }
     let compact_count = compact_end.saturating_sub(start);
     if compact_count == 0 {
         return Ok(CompactionBuild::NotNeeded(NotNeededReason::NothingFoldable));

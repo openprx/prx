@@ -750,6 +750,15 @@ check and the engine preflight both derive that budget from one function
 current request cannot be folded, so a window that cannot hold them still ends
 in a per-request trim.
 
+A threshold or overflow switch also folds at least enough of the oldest messages
+to bring the request under the limit, with 600 tokens left for the handoff note.
+The fold ends before the latest user request; when the messages before it cannot
+cover that, all of them fold. A manual `/compact` keeps the count above. A switch
+that is not built records its reason on the degradation: `nothing_foldable`
+(nothing before the live request could be folded), `below_limit` (the request
+already fits), or `handoff_unavailable` (provenance, the audit scope or the note
+size refused the switch). The turn then continues on a lossy trim.
+
 The provider view renders each note as one line (plus the optional lines
 described below when the note carries them): `[context_handoff]
 handoff_event_id=<id> -- <n> earlier user and assistant messages were moved out
