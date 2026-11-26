@@ -293,12 +293,6 @@ pub(super) fn config_writes_route_through_the_transaction_layer() {
         ),
         (
             "src/gateway/mod.rs",
-            ".save()",
-            1,
-            "not yet migrated: pairing-token persistence",
-        ),
-        (
-            "src/gateway/mod.rs",
             "reload_from_disk(",
             1,
             "not yet migrated: pairing-token persistence",

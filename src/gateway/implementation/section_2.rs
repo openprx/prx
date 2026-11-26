@@ -877,23 +877,67 @@ fn merge_paired_tokens(configured: &[String], live: &[String]) -> Vec<String> {
     merged
 }
 
-async fn persist_pairing_tokens(config: &crate::config::SharedConfig, pairing: &PairingGuard) -> Result<()> {
-    let paired_tokens = pairing.tokens();
-    let mut updated_cfg = (*config.desired().config).clone();
-    updated_cfg.gateway.paired_tokens = merge_paired_tokens(&updated_cfg.gateway.paired_tokens, &paired_tokens);
-    updated_cfg
-        .save()
-        .await
-        .context("Failed to persist paired tokens to config.toml")?;
-    // Saved: a reload that completes after this point and still leaves a token
-    // out means the operator removed it, so the guard stops accepting it.
-    pairing.mark_saved(&paired_tokens, config.successful_reload_count());
+/// Attempts at the revision-guarded write before `/pair` gives up on a config
+/// file that keeps changing under it.
+const PAIRING_PERSIST_ATTEMPTS: usize = 3;
+
+/// Reload the configuration file this process runs from.
+async fn reload_after_pairing_persist(config: &crate::config::SharedConfig) -> Result<()> {
     let manager = Arc::clone(config);
     crate::runtime::blocking::spawn_blocking(move || {
         manager.reload_from_disk(crate::config::ConfigReloadTrigger::PairingPersistence)
     })
     .await
     .context("Pairing config reload worker failed")??;
+    Ok(())
+}
+
+async fn persist_pairing_tokens(config: &crate::config::SharedConfig, pairing: &PairingGuard) -> Result<()> {
+    use crate::config::manage::{ApplyOptions, ConfigActor, ConfigChange, ConfigTransactionError, ConfigTransactions};
+
+    let paired_tokens = pairing.tokens();
+    for attempt in 1..=PAIRING_PERSIST_ATTEMPTS {
+        // The change is built from the desired configuration and guarded by the
+        // revision that configuration was loaded at, read before the clone. A
+        // file written since (a manual revoke, `prx config`) is a conflict, never
+        // an overwrite, so a revoked token cannot be written back.
+        let desired = config.desired();
+        let base = ConfigTransactions::base_revision(&desired);
+        let mut updated = (*desired.config).clone();
+        updated.gateway.paired_tokens = merge_paired_tokens(&updated.gateway.paired_tokens, &paired_tokens);
+        let tx = ConfigTransactions::new(Arc::clone(config)).deferring_activation();
+        let plan = tx
+            .plan(ConfigChange::Structured(Box::new(updated)))
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let expected = base.or_else(|| plan.planned_revision().map(str::to_owned));
+        let applied = tx
+            .apply(
+                plan,
+                ConfigActor::GatewayCredential,
+                ApplyOptions {
+                    expected_revision: expected.as_deref(),
+                    confirm_high_risk: true,
+                    confirmed_revision: expected.as_deref(),
+                },
+            )
+            .await;
+        match applied {
+            Ok(_) => break,
+            Err(ConfigTransactionError::Conflict(_)) if attempt < PAIRING_PERSIST_ATTEMPTS => {
+                // Another writer changed the file: adopt its content, so the next
+                // attempt is built from it and a revoked token is no longer listed.
+                reload_after_pairing_persist(config).await?;
+            }
+            Err(error) => {
+                return Err(anyhow::Error::from(error).context("Failed to persist paired tokens to config.toml"));
+            }
+        }
+    }
+    // Saved: a reload that completes after this point and still leaves a token
+    // out means the operator removed it, so the guard stops accepting it.
+    pairing.mark_saved(&paired_tokens, config.successful_reload_count());
+    reload_after_pairing_persist(config).await?;
     // Only after the reload succeeded: the saved list is live, so these
     // issued tokens are checked against the list alone from now on.
     pairing.forget_issued(&paired_tokens);
