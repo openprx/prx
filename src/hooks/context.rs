@@ -152,6 +152,26 @@ impl HookManager {
     }
 }
 
+impl HookManager {
+    /// Whether any context action is configured for `point` in the workspace
+    /// `hooks.json` as it is now. It refreshes the file the same way
+    /// [`HookManager::contribute`] does, so an edit is seen by the next call,
+    /// and it then reads the loaded config only. A caller that has no action
+    /// to ask skips building the payload and the contribution work entirely.
+    #[must_use]
+    pub fn has_context_actions(&self, point: ContextPoint) -> bool {
+        if self.refresh_if_changed().is_err() || !self.workspace_policy().0 {
+            return false;
+        }
+        self.state
+            .read()
+            .config
+            .hooks
+            .get(point.as_str())
+            .is_some_and(|actions| actions.iter().any(|action| action.mode == HookMode::Context))
+    }
+}
+
 /// The class of a failed run, as the `hook_failed` event names it.
 fn failure_class(error: &anyhow::Error) -> &'static str {
     if let Some(run) = error.downcast_ref::<HookRunError>() {

@@ -143,6 +143,12 @@ status: {status}\n\
 pub(super) const INTERRUPTED_TOOL_RESULT: &str =
     "Error: this tool call was interrupted before it ran; it may be retried.";
 
+/// Text the recorder holds for a call while its tool-result context hooks are
+/// still running (K-H3). The raw output is not kept there during that await, so
+/// an interruption in that window persists this placeholder, never the raw text
+/// a hook may be redacting.
+pub(super) const CONTEXT_HOOK_HELD_RESULT: &str = "[tool output held back until context hooks finish]";
+
 /// Per-call tool output, captured the instant each call returns.
 ///
 /// # Why this is not just the returned `Vec<String>`

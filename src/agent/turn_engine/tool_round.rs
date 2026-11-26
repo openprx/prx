@@ -1,5 +1,6 @@
 //! Tool-call screening and execution for one round of the turn engine.
 
+use crate::hooks::context::ContextPoint;
 use crate::hooks::{HookEvent, payload_error};
 use crate::providers::ChatMessage;
 use crate::util::truncate_with_ellipsis;
@@ -13,8 +14,8 @@ use crate::agent::context_budget::reserve_request_tool_surface;
 use crate::agent::diagnostics::{redact_sensitive_json_keys, scrub_credentials, tool_parse_log_digest};
 use crate::agent::document_ingest::{persist_tool_output_document, persist_untrusted_external_copy};
 use crate::agent::tool_result_recording::{
-    ExecutedToolRecords, ObservedToolResult, ToolResultRecorder, compact_tool_result_for_history_with_status,
-    tool_result_inline_budget_for_history,
+    CONTEXT_HOOK_HELD_RESULT, ExecutedToolRecords, ObservedToolResult, ToolResultRecorder,
+    compact_tool_result_for_history_with_status, tool_result_inline_budget_for_history,
 };
 use crate::agent::tool_scheduler::{execute_tools_with_service, shared_unrecoverable_tool_error};
 use crate::agent::turn_contracts::{ToolCallNotification, ToolLoopCancelled, ToolLoopOutcome};
@@ -268,21 +269,39 @@ pub(super) async fn run_tools(
 
     // K-H3: the tool-result context hooks may replace the text the model reads
     // back or add a note. The notify event and the failure counters keep the raw
-    // output; every model-reachable copy below uses the effective text.
-    let raw_calls: Vec<(&str, String, bool, &str)> = tool_calls
-        .iter()
-        .zip(individual_results.iter())
-        .enumerate()
-        .map(|(index, (call, outcome))| {
-            (
-                call.name.as_str(),
-                call_id_for(&call.name, index, &native_tool_calls),
-                outcome.succeeded(),
-                outcome.content.as_str(),
-            )
-        })
-        .collect();
-    let (effective_texts, contributions) = hook_points::tool_result_texts(hooks, &raw_calls).await;
+    // output; every model-reachable copy below uses the effective text. With no
+    // such action configured nothing is built and every text stays as it was.
+    let (effective_texts, contributions) = if hooks.has_context_actions(ContextPoint::ToolResult) {
+        // The hooks run under an await: until they answer, the recorder holds a
+        // placeholder, so an interrupted batch never persists the raw output.
+        for index in 0..individual_results.len() {
+            recorder.record(index, CONTEXT_HOOK_HELD_RESULT);
+        }
+        let raw_calls: Vec<(&str, String, bool, &str)> = tool_calls
+            .iter()
+            .zip(individual_results.iter())
+            .enumerate()
+            .map(|(index, (call, outcome))| {
+                (
+                    call.name.as_str(),
+                    call_id_for(&call.name, index, &native_tool_calls),
+                    outcome.succeeded(),
+                    outcome.content.as_str(),
+                )
+            })
+            .collect();
+        let (texts, contributions) = hook_points::tool_result_texts(hooks, &raw_calls).await;
+        for (index, outcome) in individual_results.iter().enumerate() {
+            let effective = texts
+                .get(index)
+                .and_then(Option::as_ref)
+                .map_or(outcome.content.as_str(), String::as_str);
+            recorder.record(index, effective);
+        }
+        (texts, contributions)
+    } else {
+        (Vec::new(), Vec::new())
+    };
     if let Some(fabric) = event_fabric.as_ref() {
         append_hook_contributions(fabric, &tool_event_scope, &contributions).await;
     }

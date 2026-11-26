@@ -358,6 +358,10 @@ pub(crate) fn drop_untrusted_external_results(results: &mut Vec<DocumentSearchRe
 /// tamper-evident reference for the originally retrieved bytes. Backends without
 /// durable document ingest (NoneMemory / MarkdownMemory) skip silently; ingest
 /// failures are logged and never surfaced as a tool error (best-effort sink).
+///
+/// `content` is the text the model sees for the call: when a `tool_call`
+/// context hook replaced the output (K-H3), the stored copy is that replaced
+/// text, not the raw output the hook was given.
 pub(crate) async fn persist_untrusted_external_copy(
     runtime: Option<&DocumentIngestRuntime>,
     tool_name: &str,
