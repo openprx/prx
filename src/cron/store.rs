@@ -337,7 +337,7 @@ pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
                     expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
                     terminal_state, approval_grant_json, claim_owner, attempt_id, claimed_at, claim_expires_at,
-                    creator_sender, creator_channel, creator_chat_type, origin
+                    creator_sender, creator_channel, creator_chat_type, origin, context
              FROM cron_jobs ORDER BY next_run ASC",
         )?;
 
@@ -361,7 +361,7 @@ pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
                     expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
                     terminal_state, approval_grant_json, claim_owner, attempt_id, claimed_at, claim_expires_at,
-                    creator_sender, creator_channel, creator_chat_type, origin
+                    creator_sender, creator_channel, creator_chat_type, origin, context
              FROM cron_jobs WHERE id = ?1",
         )?;
 
@@ -944,7 +944,7 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
                     expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
                     terminal_state, approval_grant_json, claim_owner, attempt_id, claimed_at, claim_expires_at,
-                    creator_sender, creator_channel, creator_chat_type, origin
+                    creator_sender, creator_channel, creator_chat_type, origin, context
              FROM cron_jobs
              WHERE enabled = 1 AND terminal_state IS NULL AND next_run <= ?1
                AND (
@@ -1042,6 +1042,9 @@ pub fn update_job_at(config: &Config, job_id: &str, patch: CronJobPatch, now: Da
     if let Some(delete_after_run) = patch.delete_after_run {
         job.delete_after_run = delete_after_run;
     }
+    if let Some(context) = patch.context {
+        job.context = context;
+    }
 
     if let Some(rearm_terminal_at) = schedule_changed {
         job.next_run = next_run_for_schedule(&job.schedule, now)?;
@@ -1066,7 +1069,8 @@ pub fn update_job_at(config: &Config, job_id: &str, patch: CronJobPatch, now: Da
                  creator_sender = ?31, creator_channel = ?32, creator_chat_type = ?33,
                  created_via = COALESCE(?34, created_via),
                  creator_level = CASE WHEN ?35 AND COALESCE(substr(creator_agent,1,2),'')<>'n:' THEN ?36 ELSE creator_level END,
-                 creator_agent = CASE WHEN ?35 AND COALESCE(substr(creator_agent,1,2),'')<>'n:' THEN ?37 ELSE creator_agent END
+                 creator_agent = CASE WHEN ?35 AND COALESCE(substr(creator_agent,1,2),'')<>'n:' THEN ?37 ELSE creator_agent END,
+                 context = ?38
              WHERE id = ?22 AND next_run = ?23
                AND (schedule = ?24 OR (schedule IS NULL AND expression = ?25))
                AND last_status IS ?26
@@ -1109,6 +1113,7 @@ pub fn update_job_at(config: &Config, job_id: &str, patch: CronJobPatch, now: Da
                     rewritten_creator.is_some(),
                     rewritten_creator.as_ref().and_then(CreatorStamp::level_column),
                     rewritten_creator.as_ref().and_then(|creator| creator.agent.as_deref()),
+                    job.context.as_str(),
                 ],
             )
             .context("Failed to update cron job")?;

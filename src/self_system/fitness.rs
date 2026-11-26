@@ -767,6 +767,7 @@ mod tests {
             approval_grant_json: None,
             delivery_principal: cron::DeliveryPrincipal::default(),
             origin: cron::JobOrigin::default(),
+            context: cron::ScheduledContext::Task,
         }
     }
 

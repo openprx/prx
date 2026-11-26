@@ -179,6 +179,9 @@ pub(super) fn with_connection<T>(config: &Config, f: impl FnOnce(&mut Connection
     // without them runs at Main's level.
     add_column_if_missing(&conn, "cron_jobs", "creator_level", "TEXT")?;
     add_column_if_missing(&conn, "cron_jobs", "creator_agent", "TEXT")?;
+    // Whether a scheduled run replays its session's earlier runs. Every
+    // existing row reads `task`, the behaviour before this column.
+    add_column_if_missing(&conn, "cron_jobs", "context", "TEXT NOT NULL DEFAULT 'task'")?;
     add_column_if_missing(&conn, "cron_runs", "attempt_id", "TEXT")?;
     add_column_if_missing(&conn, "cron_runs", "worker_id", "TEXT")?;
     add_column_if_missing(&conn, "cron_job_events", "source_message_event_id", "TEXT")?;

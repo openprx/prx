@@ -53,6 +53,34 @@ impl SessionTarget {
     }
 }
 
+/// How a scheduled run treats the earlier runs of its own session.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ScheduledContext {
+    /// Replay the earlier runs of the job's or task's session (default).
+    #[default]
+    Task,
+    /// Start every run without the earlier runs.
+    Fresh,
+}
+
+impl ScheduledContext {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Task => "task",
+            Self::Fresh => "fresh",
+        }
+    }
+
+    pub(crate) fn parse(raw: &str) -> Self {
+        if raw.eq_ignore_ascii_case("fresh") {
+            Self::Fresh
+        } else {
+            Self::Task
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Schedule {
@@ -258,6 +286,9 @@ pub struct CronJob {
     /// the column existed reads as [`JobOrigin::Unattributed`].
     #[serde(default)]
     pub origin: JobOrigin,
+    /// Whether a scheduled run replays the earlier runs of this job's session.
+    #[serde(default)]
+    pub context: ScheduledContext,
 }
 
 /// Which surface created a job: decides whether its runs use the operator
@@ -356,6 +387,7 @@ pub struct CronJobPatch {
     pub model: Option<String>,
     pub session_target: Option<SessionTarget>,
     pub delete_after_run: Option<bool>,
+    pub context: Option<ScheduledContext>,
     #[serde(skip)]
     pub approval_grant_json: Option<String>,
     /// Re-anchor the delivery principal, set only by the runtime.

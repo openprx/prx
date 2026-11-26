@@ -286,6 +286,7 @@ fn test_job(command: &str) -> CronJob {
         approval_grant_json: None,
         delivery_principal: crate::cron::DeliveryPrincipal::default(),
         origin: crate::cron::JobOrigin::default(),
+        context: crate::cron::ScheduledContext::Task,
     }
 }
 
