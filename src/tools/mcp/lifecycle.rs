@@ -30,11 +30,14 @@ pub(super) enum McpEra {
 /// The era to try on a second attempt after a first attempt with `first` failed
 /// with `error`, or `None` when the failure is final.
 ///
-/// - A kept era that fails is dropped and the server is probed afresh.
-/// - A probe whose `server/discover` reply is not a valid `DiscoverResult`
-///   (rmcp reports it as `ExpectedInitResult`) falls back to the legacy
-///   handshake (2025-11-25), so a legacy server that answers unknown methods
-///   with a plain result is still reachable.
+/// - A kept era (`first` is `Some`) is retried once with a fresh probe (`None`),
+///   for any error.
+/// - First contact (`first` is `None`) retries with the legacy handshake
+///   (2025-11-25) only on three typed handshake errors: `ExpectedInitResult`
+///   (a `server/discover` reply that is not a valid `DiscoverResult`),
+///   `UncorrelatedErrorResponse` and `ConflictInitResponseId` (a stale reply
+///   to the probe, seen when a slow legacy server answers after `initialize`
+///   has been sent on the same pipe).
 ///
 /// Transport, timeout and authentication failures are never retried here.
 pub(super) fn retry_era(first: Option<McpEra>, error: &anyhow::Error) -> Option<Option<McpEra>> {
@@ -42,7 +45,11 @@ pub(super) fn retry_era(first: Option<McpEra>, error: &anyhow::Error) -> Option<
         Some(_) => Some(None),
         None if matches!(
             error.downcast_ref::<ClientInitializeError>(),
-            Some(ClientInitializeError::ExpectedInitResult(_))
+            Some(
+                ClientInitializeError::ExpectedInitResult(_)
+                    | ClientInitializeError::UncorrelatedErrorResponse { .. }
+                    | ClientInitializeError::ConflictInitResponseId(..)
+            )
         ) =>
         {
             Some(Some(McpEra::Legacy))

@@ -217,7 +217,8 @@ legacy `initialize` handshake. The version a server answered with is kept in mem
 that server until the next MCP refresh, so later connections skip the probe; a connection
 that fails with the kept version is retried once with a fresh probe. The version is not a
 configuration key. A server whose reply to `server/discover` is not a modern result
-(for example a plain `{}`) is retried once with the legacy handshake.
+(for example a plain `{}`), or whose late reply conflicts with the handshake, is retried
+once with the legacy handshake. A connection that fails drops the kept version.
 
 ## Tool behavior
 

@@ -157,8 +157,16 @@ impl McpTool {
         Self::validate_http_target(url, full)?;
 
         let request_timeout = Duration::from_millis(server.request_timeout_ms);
+        // A connect that fails (after its one retry) drops the kept era, so the
+        // next call probes the server again; the caller writes `era` back.
         let (client, learnt) =
-            Self::connect_http_retrying(server_name, url, server.startup_timeout_ms, full, *era).await?;
+            match Self::connect_http_retrying(server_name, url, server.startup_timeout_ms, full, *era).await {
+                Ok(connected) => connected,
+                Err(error) => {
+                    *era = None;
+                    return Err(error);
+                }
+            };
         *era = Some(learnt);
 
         let result = tokio::time::timeout(
