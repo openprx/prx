@@ -79,14 +79,14 @@ pub(super) fn pass(tx: &Connection, cutoff: &str) -> anyhow::Result<PassCopies> 
     })
 }
 
-/// Tool-output documents older than the cutoff that no surviving tool result
+/// Tool-output documents (not untrusted external ones) older than the cutoff that no surviving tool result
 /// row still quotes (by id, or by id without the `untrusted:` prefix). The
 /// quoted set is read once for the pass.
 fn documents(tx: &Connection, cutoff: &str) -> anyhow::Result<usize> {
     let candidates = {
         let mut statement = tx.prepare(
             "SELECT document_id FROM documents
-             WHERE source_kind IN ('tool_output', 'untrusted_external')
+             WHERE source_kind = 'tool_output'
                AND julianday(created_at) < julianday(?1)
              ORDER BY id",
         )?;
