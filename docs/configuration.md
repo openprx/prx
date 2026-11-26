@@ -97,7 +97,7 @@ and the module-gate family are absorbed on load; they are not live switches.
 | `[self_system]` | `fitness_interval_hours = 24` (accepted, unused for scheduling); `evolution_interval_hours = 24`; `evolution_config_path` unset; `evolution_debug_raw = false`; `evolution_judge_timeout_secs = 180`; `evolution_model_max_tokens = 16384`; `evolution_model_max_micro_usd = 0` |
 | `[self_system.fitness]` | `auto_run = true`; `timezone = "UTC"`; `run_at = "00:10"`; `retention_days = 180`; `max_backfill_days = 7`; `min_samples = 5`; `min_coverage = 0.60` |
 | `[skills]` | `open_skills_dir` unset (`$HOME/open-skills` when used); `openclaw_skills_dir` unset (`$HOME/.openprx/openclaw-skills/` when used); `github_token` unset (unauthenticated discovery); `sync_repositories = ["https://github.com/besoeasy/open-skills", "https://github.com/openclaw/openclaw"]` |
-| `[skill_rag]` | no keys (`top_k` was removed; see Removed Configuration Keys) |
+| `[skill_rag]` | `top_k` is removed (accepted with a warning and ignored); no other keys |
 | `[plugins]` | `enabled = false` |
 | `[skills_lifecycle]` | `enabled = false`; `mode = "draft_only"`; `owner_scope` required when enabled; `storage_dir = "self/skill-lifecycle"`; `require_holdout = true`; `min_cases_floor = 3`; `max_concurrent_evaluations = 1`; `max_proposals_per_cycle = 1`; `max_edit_tokens = 300`; `max_edit_fraction = 0.20`; `allow_executable_proposals = false`; `suites = []` |
 | `[[model_routes]]` | `hint`, `provider`, `model` required; `api_key`/`credential_ref` unset; flattened model settings |
@@ -1713,7 +1713,9 @@ The pass runs at the start of each process that builds the memory backend
 (at most 2 batches), and hourly in the gateway (at most 20 batches, reading the
 live configuration each hour). A pass that ran less than 55 minutes ago is
 skipped, and a pass is skipped while an rf snapshot is open. It is never called from
-a turn, and a turn waits at most for one batch. Deletion is permanent; setting
+a turn, and a turn waits at most for one batch. A pass's first transaction (the
+journal prune and, on the very first pass, index creation) can hold the writer
+longer than one batch. Deletion is permanent; setting
 the key back to `0` does not restore deleted rows.
 
 `memory.saved_session_retention_days` (default `0` = off) deletes saved terminal
