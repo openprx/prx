@@ -11,6 +11,7 @@
 
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::config::{Config, SharedConfig};
+use crate::cron::ScheduledContext;
 use crate::security::SecurityPolicy;
 use crate::security::policy::{ApprovalGrant, PERSISTED_APPROVAL_GRANT_TTL_SECS};
 use crate::xin::store;
@@ -189,6 +190,16 @@ fn tool_error(message: impl Into<String>) -> ToolResult {
     }
 }
 
+/// Parses the optional `context` argument. An unknown value is refused before any write.
+fn parse_context_arg(args: &serde_json::Value) -> Result<Option<ScheduledContext>, ToolResult> {
+    match args.get("context") {
+        None => Ok(None),
+        Some(value) => serde_json::from_value::<ScheduledContext>(value.clone())
+            .map(Some)
+            .map_err(|_| tool_error("Invalid context: use 'task' or 'fresh'")),
+    }
+}
+
 fn format_task_line(task: &XinTask) -> String {
     let enabled_marker = if task.enabled { "●" } else { "○" };
     format!(
@@ -231,6 +242,7 @@ fn format_task_detail(task: &XinTask) -> String {
     if task.recurring {
         lines.push(format!("Interval:    {}s", task.interval_secs));
     }
+    lines.push(format!("Context:     {}", task.context.as_str()));
     lines.push(format!("Enabled:     {}", task.enabled));
     lines.push(format!("Runs:        {}", task.run_count));
     lines.push(format!("Failures:    {}", task.fail_count));
@@ -463,6 +475,11 @@ impl XinTool {
                                     "type": "integer",
                                     "description": "Repeat interval in seconds (recurring only); also one of the fields 'update' may change."
                                 },
+                                "context": {
+                                    "type": "string",
+                                    "enum": ["task", "fresh"],
+                                    "description": "'task' (default) replays the earlier runs of this task's session; 'fresh' starts every run without them. Accepted by 'add' and 'update'; goal steps always use their goal's shared session."
+                                },
                                 "limit": {
                                     "type": "integer",
                                     "description": "Max run-history entries (1-50, default 20)."
@@ -590,6 +607,7 @@ impl XinTool {
                         &["task_id", "priority"],
                         &["task_id", "payload"],
                         &["task_id", "interval_secs"],
+                        &["task_id", "context"],
                     ],
                 )
             })
@@ -1031,6 +1049,10 @@ impl Tool for XinTool {
                 let recurring = args.get("recurring").and_then(|v| v.as_bool()).unwrap_or(false);
                 let interval_secs = args.get("interval_secs").and_then(|v| v.as_u64()).unwrap_or(0);
                 let lineage_scope = parse_xin_lineage_scope(&cfg, &args);
+                let context = match parse_context_arg(&args) {
+                    Ok(context) => context.unwrap_or_default(),
+                    Err(refused) => return Ok(refused),
+                };
 
                 // Prevent busy-loop: recurring tasks must have ≥60s interval.
                 if recurring && interval_secs < 60 {
@@ -1067,11 +1089,30 @@ impl Tool for XinTool {
                     crate::cron::JobCreator::AgentTool,
                     &creator,
                 ) {
-                    Ok(task) => Ok(ToolResult {
-                        success: true,
-                        output: format!("Created xin task: {} ({})", task.id, task.name),
-                        error: None,
-                    }),
+                    Ok(task) => {
+                        // `fresh` is stored by a patch after the create (X5): a failed
+                        // patch removes the task just created.
+                        let context_note = if context == ScheduledContext::Fresh {
+                            let patch = XinTaskPatch {
+                                context: Some(ScheduledContext::Fresh),
+                                ..XinTaskPatch::default()
+                            };
+                            if let Err(error) = store::update_task(&cfg, &task.id, &patch) {
+                                if store::remove_task(&cfg, &task.id).is_err() {
+                                    tracing::warn!(task_id = %task.id, "xin task removal after a failed context patch failed");
+                                }
+                                return Ok(tool_error(error.to_string()));
+                            }
+                            ", context: fresh"
+                        } else {
+                            ""
+                        };
+                        Ok(ToolResult {
+                            success: true,
+                            output: format!("Created xin task: {} ({}){}", task.id, task.name, context_note),
+                            error: None,
+                        })
+                    }
                     Err(e) => Ok(ToolResult {
                         success: false,
                         output: String::new(),
@@ -1094,6 +1135,10 @@ impl Tool for XinTool {
                 let existing = match store::get_task(&cfg, task_id) {
                     Ok(task) => task,
                     Err(error) => return Ok(tool_error(error.to_string())),
+                };
+                let context = match parse_context_arg(&args) {
+                    Ok(context) => context,
+                    Err(refused) => return Ok(refused),
                 };
                 let payload = args
                     .get("payload")
@@ -1124,6 +1169,7 @@ impl Tool for XinTool {
                         .map(TaskPriority::from_str_lossy),
                     payload,
                     interval_secs: args.get("interval_secs").and_then(serde_json::Value::as_u64),
+                    context,
                     approval_grant_json,
                     // A payload rewrite re-records this call's level and agent.
                     creator: Some(crate::tools::execution::creator_stamp_from_trusted_args(&args)),
@@ -1134,9 +1180,10 @@ impl Tool for XinTool {
                     && patch.priority.is_none()
                     && patch.payload.is_none()
                     && patch.interval_secs.is_none()
+                    && patch.context.is_none()
                 {
                     return Ok(tool_error(
-                        "At least one of name, description, priority, payload, or interval_secs is required",
+                        "At least one of name, description, priority, payload, interval_secs, or context is required",
                     ));
                 }
                 if existing.recurring && patch.interval_secs.is_some_and(|interval| interval < 60) {
