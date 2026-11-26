@@ -18,6 +18,9 @@ use crate::memory::{Memory, MemoryFabric, MemoryPrincipal, MessageEvent, Message
 
 /// The event type of the seen mark.
 pub(crate) const SCHEDULE_SEEN_EVENT_TYPE: &str = "schedule.result.seen";
+/// Seen-mark rows read per turn, newest first. The mark is the largest
+/// `through_id` among them, so a late writer cannot move it back.
+const SEEN_ROWS_READ: usize = 50;
 /// Result rows read per turn, newest first.
 const RESULT_ROWS_READ: usize = 50;
 /// Lines shown in the note at most; the rest are covered by the mark.
@@ -27,29 +30,32 @@ const NOTE_MAX_AGE_DAYS: i64 = 7;
 /// Characters of a reply excerpt shown on one line.
 const NOTE_EXCERPT_CHARS: usize = 200;
 
-/// The note for the owner's unseen scheduled results, and the newest row id it
-/// covers. `None` when the owner has no result after the seen mark or the read
-/// fails (logged by digest). The text is empty when every row read is too old
-/// or superseded; the caller still moves the mark to the returned id.
+/// The note for the owner's unseen scheduled results, and the mark to write.
+/// `None` when there is no result after the seen mark or the read fails (logged
+/// by digest). The mark is `Some(id)` only when `id` is above the largest seen
+/// mark already stored. The text is empty when every row read is too old or
+/// superseded; the mark is still written then.
 pub(crate) async fn unseen_results_note(
     memory: &dyn Memory,
     principal: &MemoryPrincipal,
     now: DateTime<Utc>,
-) -> Option<(String, i64)> {
-    let seen = read_rows(memory, principal, SCHEDULE_SEEN_EVENT_TYPE, None, 1).await?;
-    let through_id = seen
-        .first()
-        .and_then(payload_of)
-        .and_then(|payload| payload.get("through_id").and_then(Value::as_i64));
+) -> Option<(String, Option<i64>)> {
+    let seen = read_rows(memory, principal, SCHEDULE_SEEN_EVENT_TYPE, None, SEEN_ROWS_READ).await?;
+    let seen_through = seen
+        .iter()
+        .filter_map(payload_of)
+        .filter_map(|payload| payload.get("through_id").and_then(Value::as_i64))
+        .max();
     let rows = read_rows(
         memory,
         principal,
         SCHEDULE_RESULT_EVENT_TYPE,
-        through_id,
+        seen_through,
         RESULT_ROWS_READ,
     )
     .await?;
     let through = rows.iter().map(|row| row.id).max()?;
+    let mark = seen_through.map_or(Some(through), |seen| (through > seen).then_some(through));
     let max_age = Duration::days(NOTE_MAX_AGE_DAYS);
     let mut groups: Vec<Group> = Vec::new();
     for row in &rows {
@@ -90,7 +96,7 @@ pub(crate) async fn unseen_results_note(
     } else {
         format!("\n\n[Scheduled results]\n{}", lines.join("\n"))
     };
-    Some((text, through))
+    Some((text, mark))
 }
 
 /// Writes the seen mark: one tool-round row in the owner's turn scope, naming
@@ -157,21 +163,20 @@ impl Group {
     /// `- <finished, to the minute> <name or id> <status>: <excerpt or error class> (transcript <session>)`
     fn line(&self) -> String {
         let payload = &self.newest;
-        let text = |field: &str| payload.get(field).and_then(Value::as_str).unwrap_or_default();
-        let finished: String = text("finished_at").chars().take(16).collect();
-        let name = match text("name") {
-            "" => text("id"),
-            name => name,
+        let field = |name: &str| payload.get(name).and_then(Value::as_str).unwrap_or_default();
+        let finished: String = flatten(field("finished_at")).chars().take(16).collect();
+        let name = match field("name") {
+            "" => flatten(field("id")),
+            name => flatten(name),
         };
-        let status = text("status");
-        let detail = if status == "ok" {
-            text("excerpt")
+        let status = flatten(field("status"));
+        let detail = if field("status") == "ok" {
+            flatten(field("excerpt"))
                 .chars()
                 .take(NOTE_EXCERPT_CHARS)
-                .map(|ch| if ch == '\n' || ch == '\r' { ' ' } else { ch })
                 .collect::<String>()
         } else {
-            text("error_class").to_owned()
+            flatten(field("error_class"))
         };
         let earlier = if self.earlier > 0 {
             format!(" (+{} earlier)", self.earlier)
@@ -180,7 +185,18 @@ impl Group {
         };
         format!(
             "- {finished} {name} {status}: {detail} (transcript {}){earlier}",
-            self.key
+            flatten(&self.key)
         )
     }
+}
+
+/// Replaces every line break and line or paragraph separator with a space, so
+/// a field of a stored row cannot start a new line of the note.
+fn flatten(text: &str) -> String {
+    text.chars()
+        .map(|ch| match ch {
+            '\r' | '\n' | '\t' | '\u{2028}' | '\u{2029}' | '\u{85}' => ' ',
+            other => other,
+        })
+        .collect()
 }

@@ -36,10 +36,13 @@ pub(crate) async fn turn_tail(input: TurnTailInput<'_>) -> String {
         return tail;
     }
     let principal = envelope.memory_principal();
-    let Some((note, through_id)) = unseen_results_note(memory.as_ref(), &principal, chrono::Utc::now()).await else {
+    let Some((note, mark)) = unseen_results_note(memory.as_ref(), &principal, chrono::Utc::now()).await else {
         return tail;
     };
     tail.push_str(&note);
+    let Some(through_id) = mark else {
+        return tail;
+    };
     let fabric = MemoryFabric::new(Arc::clone(memory), envelope.workspace_id.clone())
         .with_event_recording(memory_config.event_recording_config());
     mark_results_seen(&fabric, envelope.message_scope(), through_id).await;
