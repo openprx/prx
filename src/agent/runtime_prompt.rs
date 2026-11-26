@@ -112,7 +112,10 @@ fn build_prompt_at_level(
     native_tools: bool,
 ) -> String {
     let bootstrap_max_chars = if config.agent.compact_context { Some(6000) } else { None };
-    let skills = if crate::tools::capability::policy::core_dependency_is_available("skill_read", &config.tool_tiering) {
+    let tiering = config
+        .tool_tiering
+        .at_level(autonomy, config.autonomy.evaluation_sandbox);
+    let skills = if crate::tools::capability::policy::core_dependency_is_available("skill_read", &tiering) {
         skills
     } else {
         &[]

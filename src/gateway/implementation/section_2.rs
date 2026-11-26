@@ -1348,16 +1348,20 @@ async fn run_gateway_chat_with_multimodal(
             // the gateway surface's own hidden tool names. The gateway is not an IM
             // channel, so it has no `channel_exclude` list of its own: it publishes
             // `config_snapshot.tool_tiering` rather than `for_channel_surface()`. The
-            // boundary a child must therefore inherit is exactly `always_exclude` — the
-            // gateway's own tool set minus what the operator hid from it — so a spawn can
-            // never be a way to get back a tool the gateway itself may not call.
+            // child inherits the gateway's exclusions at the turn's level: none at Full
+            // outside an evaluation sandbox, where `at_level` drops them, and the
+            // `always_exclude` list below everywhere else, so a spawn can never be a way
+            // to get back a tool the gateway itself may not call at that level.
             let loop_result = within_gateway_turn_spawn_context(
                 runtime_envelope
                     .run_id
                     .clone()
                     .unwrap_or_else(|| Uuid::new_v4().to_string()),
                 fabric_ctx,
-                &config_snapshot.tool_tiering,
+                &config_snapshot.tool_tiering.at_level(
+                    config_snapshot.autonomy.level,
+                    config_snapshot.autonomy.evaluation_sandbox,
+                ),
                 crate::tools::message_send::with_outbound_origin_channel(fabric_ctx.channel.as_str(), async {
                     run_turn(
                         &mut history,
