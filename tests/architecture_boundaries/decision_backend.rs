@@ -1,6 +1,6 @@
 use super::helpers::identifier_count;
 use super::helpers::{
-    blank_comments_and_literals, is_ident_char, read_source, relative_path, repository_root, rust_source_files,
+    blank_comments_and_literals, is_ident_char, production_source_files, read_source, relative_path, repository_root,
     strip_cfg_test_items,
 };
 use super::tool_scanner::contains_identifier;
@@ -40,7 +40,7 @@ fn identifier_count_in_use_declarations(compact: &str, name: &str) -> usize {
 pub(super) fn only_the_factory_validates_answers_with_the_builtin_or_builds_a_backend() {
     const FACTORY: &str = "src/decision_engine/prediction/factory.rs";
     let mut violations = Vec::new();
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         if relative == FACTORY {
             continue;
@@ -152,7 +152,7 @@ pub(super) fn loopback_is_decided_only_by_the_shared_predicate() {
         ),
     ];
     let mut violations = Vec::new();
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         if !relative.starts_with("src/decision_engine/prediction/")
             && !relative.starts_with("src/config/schema/decision_engine")
@@ -207,7 +207,7 @@ pub(super) fn decision_http_clients_come_only_from_the_pinned_builder() {
             violations.push(format!("{HTTP}: no {call}"));
         }
     }
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         if !relative.starts_with("src/decision_engine/prediction/") {
             continue;
@@ -246,7 +246,7 @@ pub(super) fn no_production_file_opens_a_legacy_decision_database() {
         .collect();
     assert_eq!(databases.len(), 2, "the store and the journal are both checked");
     let mut violations = Vec::new();
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         if !relative.starts_with("src/") || relative == WARNING {
             continue;

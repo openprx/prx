@@ -148,6 +148,10 @@ pub(super) const TEST_INCLUSIVE_TREE_SCANNERS: &[(&str, &str)] = &[
         "the English-only rule covers tests and fixtures",
     ),
     (
+        "production_source_files_excludes_modules_loaded_only_under_cfg_test",
+        "a unit test of the production-file helper: it plants its own parent and test-module fixture and prohibits nothing in the tree",
+    ),
+    (
         "compaction_none_spellings_and_test_module_files_are_exact",
         "not a guard: it checks the test-module classifier against the real tree",
     ),

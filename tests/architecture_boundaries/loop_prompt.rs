@@ -1,11 +1,11 @@
 use super::helpers::{
-    blank_comments_and_literals, function_body, read_source, relative_path, repository_root, rust_source_files,
+    blank_comments_and_literals, function_body, production_source_files, read_source, relative_path, repository_root,
     strip_cfg_test_items,
 };
 use std::fs;
 #[test]
 pub(super) fn prompt_guided_tool_protocol_has_one_production_owner() {
-    let owners = rust_source_files()
+    let owners = production_source_files()
         .into_iter()
         .filter_map(|path| {
             let relative = relative_path(&path);
@@ -101,7 +101,7 @@ pub(super) fn runtime_prompt_has_no_parallel_tool_description_catalog() {
         "src/session_worker/runner/validate.rs",
     ];
     let mut scanned = Vec::new();
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         if !relative.starts_with("src/agent/") && !BUILDERS_OUTSIDE_AGENT.contains(&relative.as_str()) {
             continue;
@@ -123,7 +123,7 @@ pub(super) fn runtime_prompt_has_no_parallel_tool_description_catalog() {
 
 #[test]
 pub(super) fn compiled_request_context_event_has_one_production_owner() {
-    let owners = rust_source_files()
+    let owners = production_source_files()
         .into_iter()
         .filter_map(|path| {
             let relative = relative_path(&path);
@@ -160,7 +160,7 @@ pub(super) fn compiled_request_context_event_has_one_production_owner() {
 pub(super) fn outbound_middleware_has_one_production_owner() {
     let mut owners = Vec::new();
     let mut call_sites = 0usize;
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         let source = read_source(&path);
         let production = strip_cfg_test_items(&blank_comments_and_literals(&source));

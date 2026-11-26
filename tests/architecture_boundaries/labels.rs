@@ -1,8 +1,8 @@
 use super::helpers::braced_block;
 use super::helpers::log_macro_arguments;
 use super::helpers::{
-    assert_inventory, blank_comments_and_literals, enclosing_function, function_body, is_test_code_file, read_source,
-    relative_path, repository_root, rust_source_files, strip_cfg_test_items, test_module_files,
+    assert_inventory, blank_comments_and_literals, enclosing_function, function_body, is_test_code_file,
+    production_source_files, read_source, relative_path, repository_root, strip_cfg_test_items, test_module_files,
 };
 use super::scanner_probes::scanner_fails_with;
 use std::fs;
@@ -158,7 +158,7 @@ fn raw_label_log_arguments(relative: &str, production: &str) -> Vec<String> {
 pub(super) fn provider_labels_never_reach_a_log_field_raw() {
     let modules = test_module_files();
     let mut raw = Vec::new();
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         let scanned = LABEL_LOG_FILES.contains(&relative.as_str())
             || LABEL_LOG_ROOTS.iter().any(|root| relative.starts_with(root));

@@ -47,8 +47,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::helpers::{
-    assert_inventory, blank_comments_and_literals, enclosing_function, is_test_code_file, read_source, relative_path,
-    rust_source_files, strip_cfg_test_items, test_module_files,
+    assert_inventory, blank_comments_and_literals, enclosing_function, is_test_code_file, production_source_files,
+    read_source, relative_path, strip_cfg_test_items, test_module_files,
 };
 
 /// The session paths, plus the runtime terminal commit and cleanup every chat
@@ -1614,7 +1614,7 @@ fn payload_capable_log_arguments(relative: &str, raw_source: &str, index: &TypeI
 #[test]
 pub(super) fn log_lines_carry_only_typed_metadata() {
     let modules = test_module_files();
-    let production: Vec<(String, String)> = rust_source_files()
+    let production: Vec<(String, String)> = production_source_files()
         .iter()
         .map(|path| (relative_path(path), read_source(path)))
         .filter(|(relative, raw)| !is_test_code_file(relative, raw, &modules))

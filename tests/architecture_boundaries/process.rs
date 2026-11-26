@@ -1,6 +1,6 @@
 use super::helpers::{
-    assert_inventory, enclosing_function, function_body, normalize_line, production_part, read_source, relative_path,
-    repository_root, rust_source_files,
+    assert_inventory, enclosing_function, function_body, normalize_line, production_part, production_source_files,
+    read_source, relative_path, repository_root, rust_source_files,
 };
 use std::fs;
 const ALLOWED_RAW_CHILD_PROCESS_SPAWNS: &[&str] = &[
@@ -395,7 +395,7 @@ fn names_git_program(literal: &str) -> bool {
 #[test]
 pub(super) fn git_is_named_only_in_the_reviewed_places() {
     let mut actual = Vec::new();
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         let production = production_part(&read_source(&path));
         let lines = production.lines().collect::<Vec<_>>();
@@ -418,7 +418,7 @@ pub(super) fn git_is_named_only_in_the_reviewed_places() {
 #[test]
 pub(super) fn every_production_process_command_is_inventoried() {
     let mut actual = Vec::new();
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         let production = production_part(&read_source(&path));
         let lines = production.lines().collect::<Vec<_>>();
@@ -449,7 +449,7 @@ pub(super) fn every_production_process_command_is_inventoried() {
 #[test]
 pub(super) fn process_command_types_are_never_aliased() {
     let mut actual = Vec::new();
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         let production = production_part(&read_source(&path));
         let lines = production.lines().collect::<Vec<_>>();
@@ -500,7 +500,7 @@ fn native_tools_read_the_per_call_level() {
 pub(super) fn git_runs_only_through_the_hardened_launch() {
     const LAUNCH: &str = "src/security/git_launch.rs";
     let mut outside = Vec::new();
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         let production = production_part(&read_source(&path));
         let count = production.matches("Command::new(\"git\")").count();
@@ -574,7 +574,7 @@ fn stdio_mcp_launches_start_from_a_cleared_environment() {
 #[test]
 pub(super) fn native_working_root_selection_sites_are_explicit() {
     let mut counts = std::collections::BTreeMap::<String, usize>::new();
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         if !["src/tools/", "src/security/", "src/runtime/turn_context/"]
             .iter()

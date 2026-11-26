@@ -1,6 +1,6 @@
 use super::helpers::{
-    assert_inventory, blank_comments_and_literals, enclosing_function, function_body, is_test_only_file,
-    normalize_line, read_source, relative_path, repository_root, rust_source_and_test_files, rust_source_files,
+    assert_inventory, blank_comments_and_literals, enclosing_function, function_body, normalize_line,
+    production_source_files, read_source, relative_path, repository_root, rust_source_and_test_files,
     strip_cfg_test_items,
 };
 use super::loop_requests::{compact_rust_tokens, is_identifier_byte, top_level_arguments};
@@ -19,7 +19,7 @@ use std::path::PathBuf;
 /// MUTATION GUARD: rename the field back to `tools_count` and this fails.
 #[test]
 pub(super) fn chat_route_decision_names_the_registry_root_count() {
-    let chat_files = rust_source_files()
+    let chat_files = production_source_files()
         .into_iter()
         .filter(|path| relative_path(path).starts_with("src/chat/"));
     let mut misleading = Vec::new();
@@ -52,16 +52,15 @@ pub(super) fn chat_route_decision_names_the_registry_root_count() {
 
 #[test]
 pub(super) fn context_handoff_has_one_production_owner_and_exact_lookup_is_registered() {
-    let owners = rust_source_files()
+    let owners = production_source_files()
         .into_iter()
         .filter_map(|path| {
             let relative = relative_path(&path);
             let source = read_source(&path);
-            // The whole text of every file that is not test-only by its
-            // `#![cfg(test)]` marker: a test that asserts on the marker in a
-            // production file makes that file an owner, as it always did, so
-            // no stripping error can hide a second producer.
-            (!is_test_only_file(&source) && source.contains("[context_handoff]")).then_some(relative)
+            // The whole text of every production file: a test that asserts on
+            // the marker in a production file makes that file an owner, as it
+            // always did, so no stripping error can hide a second producer.
+            source.contains("[context_handoff]").then_some(relative)
         })
         .collect::<Vec<_>>();
     assert_eq!(owners, vec!["src/context/reduce/handoff_note.rs"]);
@@ -237,7 +236,7 @@ pub(super) fn the_loop_engine_has_one_typed_entry() {
     const MAX_ENGINE_PARAMETERS: usize = 6;
     let old_entries = ["run_tool_call_loop", "agent_turn"];
     let mut revived = Vec::new();
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         let source = read_source(&path);
         let production = strip_cfg_test_items(&blank_comments_and_literals(&source));
@@ -315,7 +314,7 @@ pub(super) fn the_loop_engine_has_one_typed_entry() {
 #[test]
 pub(super) fn user_text_enters_histories_only_neutralized() {
     let mut sites = Vec::new();
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         // test files are exempt by their `#![cfg(test)]` marker (the stripper
         // empties them), never by their name
@@ -458,7 +457,7 @@ const USER_MESSAGE_CONSTRUCTION_SITES: &[&str] = &[
 #[test]
 pub(super) fn loop_note_names_are_never_aliased_or_variant_imported() {
     let mut offenders = Vec::new();
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         if relative.starts_with("src/providers/") {
             continue;
@@ -556,7 +555,7 @@ pub(super) fn middleware_history_rebuilds_neutralize_user_messages() {
     const REBUILD: &str = "from_value::<Vec<ChatMessage>>(";
     let mut neutralised = Vec::new();
     let mut offenders = Vec::new();
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         let production = strip_cfg_test_items(&blank_comments_and_literals(&read_source(&path)));
         let mut search = 0usize;
@@ -607,7 +606,7 @@ pub(super) fn middleware_history_rebuilds_neutralize_user_messages() {
 pub(super) fn chat_message_constructors_are_pinned() {
     let mut constructors = Vec::new();
     let mut other_builders = Vec::new();
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         if !relative.starts_with("src/providers/") {
             continue;

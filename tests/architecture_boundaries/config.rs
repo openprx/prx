@@ -1,6 +1,6 @@
 use super::helpers::{
-    assert_inventory, blank_comments_and_literals, enclosing_function, is_ident_char, production_part, read_source,
-    relative_path, repository_root, rust_source_files, strip_cfg_test_items,
+    assert_inventory, blank_comments_and_literals, enclosing_function, is_ident_char, production_part,
+    production_source_files, read_source, relative_path, repository_root, rust_source_files, strip_cfg_test_items,
 };
 use std::collections::BTreeSet;
 use std::fs;
@@ -341,7 +341,7 @@ pub(super) fn config_writes_route_through_the_transaction_layer() {
         ),
     ];
     let mut violations = Vec::new();
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         let source = read_source(&path);
         let compact = production_part(&source)
@@ -533,7 +533,7 @@ fn calls_identifier(line: &str, name: &str) -> bool {
 #[test]
 pub(super) fn the_home_directory_is_resolved_only_by_the_config_resolver() {
     let mut actual = BTreeSet::new();
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         let source = read_source(&path);
         let production = strip_cfg_test_items(&blank_comments_and_literals(&source));

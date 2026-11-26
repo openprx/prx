@@ -1,7 +1,7 @@
 use super::helpers::braced_block;
 use super::helpers::{
-    assert_inventory, blank_comments_and_literals, enclosing_function, function_body, read_source, relative_path,
-    repository_root, rust_source_files, strip_cfg_test_items,
+    assert_inventory, blank_comments_and_literals, enclosing_function, function_body, production_source_files,
+    read_source, relative_path, repository_root, strip_cfg_test_items,
 };
 use super::helpers::{is_test_code_file, test_module_files};
 use super::loop_requests::{
@@ -290,7 +290,7 @@ pub(super) fn sub_agent_tools_resolve_compaction_from_the_whole_configuration() 
     let mut constructor_sites = Vec::new();
     let mut admitted_resolution_sites = Vec::new();
     let test_modules = test_module_files();
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         let source = read_source(&path);
         if is_test_code_file(&relative, &source, &test_modules) {
@@ -549,7 +549,7 @@ pub(super) fn production_turns_budget_on_the_effective_context_window() {
     let mut base = Vec::new();
     let mut forwarded = Vec::new();
     let test_modules = test_module_files();
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         let source = read_source(&path);
         if is_test_code_file(&relative, &source, &test_modules) {

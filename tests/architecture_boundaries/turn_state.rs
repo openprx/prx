@@ -2,7 +2,7 @@
 //! constructors.
 
 use super::helpers::{
-    blank_comments_and_literals, identifier_count, is_ident_char, read_source, relative_path, rust_source_files,
+    blank_comments_and_literals, identifier_count, is_ident_char, production_source_files, read_source, relative_path,
     strip_cfg_test_items,
 };
 
@@ -54,7 +54,7 @@ const TRUST_BEARING_REUSERS: [(&str, &str); 1] = [("from_runtime", "src/runtime/
 #[test]
 pub(super) fn trust_bearing_turn_state_is_built_only_by_the_turn_opening() {
     let mut violations = Vec::new();
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         if TRUST_BEARING_CALLERS.contains(&relative.as_str()) {
             continue;

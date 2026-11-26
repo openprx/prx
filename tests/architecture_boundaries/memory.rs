@@ -1,6 +1,6 @@
 use super::helpers::{
     assert_inventory, blank_comments_and_literals, enclosing_function, function_body, is_ident_char, normalize_line,
-    read_source, relative_path, repository_root, rust_source_files, strip_cfg_test_items,
+    production_source_files, read_source, relative_path, repository_root, rust_source_files, strip_cfg_test_items,
 };
 use std::fs;
 const ALLOWED_BRAIN_DB_OPENS_OUTSIDE_SQLITE_REPOSITORY: &[&str] = &[
@@ -524,7 +524,7 @@ fn count_constructor_occurrences(haystack: &str, needle: &str) -> usize {
 /// literals and `#[cfg(test)]` items removed. Blanking runs first so the brace
 /// matching below cannot be thrown off by a brace inside a SQL `format!`.
 fn memory_production_sources() -> Vec<(String, String)> {
-    rust_source_files()
+    production_source_files()
         .into_iter()
         .filter(|path| relative_path(path).starts_with("src/memory/"))
         .map(|path| {

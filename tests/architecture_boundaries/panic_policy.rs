@@ -1,6 +1,6 @@
 use super::helpers::{
-    assert_inventory, blank_comments_and_literals, close_of_group, is_test_code_file, read_source, relative_path,
-    rust_source_files, strip_cfg_test_items, test_module_files,
+    assert_inventory, blank_comments_and_literals, close_of_group, is_test_code_file, production_source_files,
+    read_source, relative_path, rust_source_files, strip_cfg_test_items, test_module_files,
 };
 
 fn violations(source: &str) -> Vec<String> {
@@ -173,7 +173,7 @@ fn production_text(masked: &str) -> String {
 pub(super) fn production_has_no_panic_shortcuts() {
     let modules = test_module_files();
     let mut actual = Vec::new();
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         let raw = read_source(&path);
         if is_test_code_file(&relative, &raw, &modules) {
@@ -200,7 +200,7 @@ fn catches_unwind(source: &str) -> bool {
 pub(super) fn production_has_no_catch_unwind() {
     let modules = test_module_files();
     let mut actual = Vec::new();
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         let raw = read_source(&path);
         if is_test_code_file(&relative, &raw, &modules) {

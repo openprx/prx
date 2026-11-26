@@ -1,6 +1,7 @@
 use super::helpers::{
-    assert_inventory, blank_comments_and_literals, enclosing_function, function_body, is_test_code_file, read_source,
-    relative_path, repository_root, rust_source_files, strip_cfg_test_items, test_module_files, test_module_files_of,
+    assert_inventory, blank_comments_and_literals, enclosing_function, function_body, is_test_code_file,
+    production_source_files, read_source, relative_path, repository_root, strip_cfg_test_items, test_module_files,
+    test_module_files_of,
 };
 use super::loop_prompt::REVIEWED_DECISION_HANDOFFS;
 use std::collections::BTreeMap;
@@ -15,7 +16,7 @@ pub(super) fn compact_rust_tokens(expression: &str) -> String {
 #[test]
 pub(super) fn every_loop_engine_call_receives_an_opened_turn() {
     let mut actual = BTreeMap::new();
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         let production = strip_cfg_test_items(&blank_comments_and_literals(&read_source(&path)));
         for (_, request) in engine_turn_requests(&production) {
@@ -468,7 +469,7 @@ fn compaction_none_spellings_and_test_module_files_are_exact() {
 pub(super) fn production_turns_pass_a_context_budget_to_the_loop_engine() {
     let mut unbudgeted = Vec::new();
     let test_modules = test_module_files();
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         let source = read_source(&path);
         // Test modules (loaded only under `#[cfg(test)]`) drive the engine

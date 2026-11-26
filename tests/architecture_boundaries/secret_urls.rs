@@ -1,6 +1,6 @@
 use super::helpers::{
     assert_inventory, blank_comments, blank_comments_and_literals, byte_aligned_structure, enclosing_function,
-    is_test_code_file, log_macro_arguments, normalize_line, read_source, relative_path, rust_source_files,
+    is_test_code_file, log_macro_arguments, normalize_line, production_source_files, read_source, relative_path,
     strip_cfg_test_items, test_module_files,
 };
 
@@ -80,7 +80,7 @@ const BUILDERS: &[&str] = &[
 pub(super) fn secret_url_builders_are_inventoried() {
     let mut actual = Vec::new();
     let test_modules = test_module_files();
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         let raw = read_source(&path);
         if is_test_code_file(&relative, &raw, &test_modules) {
@@ -165,7 +165,7 @@ fn carrier_offenders(relative: &str, source: &str) -> Vec<String> {
 pub(super) fn secret_url_carriers_strip_request_urls() {
     let mut offenders = Vec::new();
     let test_modules = test_module_files();
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         let raw = read_source(&path);
         if is_test_code_file(&relative, &raw, &test_modules) {
@@ -186,7 +186,7 @@ pub(super) fn stream_http_errors_have_one_constructor() {
     let mut constructors = Vec::new();
     let mut offenders = Vec::new();
     let tests = test_module_files();
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         let raw = read_source(&path);
         if is_test_code_file(&relative, &raw, &tests) {
@@ -294,7 +294,7 @@ fn raw_url_logs(relative: &str, source: &str) -> Vec<String> {
 pub(super) fn server_url_logs_are_redacted() {
     let mut offenders = Vec::new();
     let tests = test_module_files();
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         if !relative.starts_with("src/channels/") {
             continue;

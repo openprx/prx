@@ -1,6 +1,7 @@
 use super::helpers::crate_rooted_paths;
 use super::helpers::{
-    blank_comments_and_literals, is_ident_char, read_source, relative_path, rust_source_files, strip_cfg_test_items,
+    blank_comments_and_literals, is_ident_char, production_source_files, read_source, relative_path,
+    strip_cfg_test_items,
 };
 use super::helpers::{is_test_code_file, test_module_files};
 use super::tool_scanner::contains_identifier;
@@ -68,7 +69,7 @@ const CAUSAL_CONFIG_TYPES: [&str; 3] = ["DecisionEngineConfig", "DecisionBackend
 pub(super) fn causal_policy_is_written_only_by_the_mutation_service() {
     let mut violations = Vec::new();
     let test_modules = test_module_files();
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         if CAUSAL_POLICY_WRITERS.contains(&relative.as_str()) {
             continue;
@@ -253,7 +254,7 @@ pub(super) fn decision_code_never_uses_a_chat_provider() {
         "create_routed_provider_with_options",
     ];
     let mut violations = Vec::new();
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         if !relative.starts_with("src/decision_engine/prediction/") {
             continue;

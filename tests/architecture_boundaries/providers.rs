@@ -1,6 +1,6 @@
 use super::helpers::{
-    blank_comments_and_literals, enclosing_function, function_body, production_part, read_source, relative_path,
-    repository_root, rust_source_files, strip_cfg_test_items,
+    blank_comments_and_literals, enclosing_function, function_body, production_part, production_source_files,
+    read_source, relative_path, repository_root, strip_cfg_test_items,
 };
 use super::loop_requests::{compact_rust_tokens, is_identifier_byte, top_level_arguments};
 use std::collections::BTreeSet;
@@ -59,7 +59,7 @@ fn provider_factory_calls(production: &str) -> Vec<(usize, String, Vec<String>)>
 #[test]
 pub(super) fn agent_entries_reach_provider_factories_only_through_the_scoped_selection() {
     let mut sites = Vec::new();
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         if !relative.starts_with("src/agent/") {
             continue;
@@ -182,7 +182,7 @@ fn config_destructuring_is_recognised_on_the_left_hand_side_only() {
 #[test]
 pub(super) fn session_worker_credentials_are_decided_in_one_scoped_place() {
     let mut factory_sites = Vec::new();
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         if !relative.starts_with("src/session_worker/") {
             continue;
@@ -332,7 +332,7 @@ const PROVIDER_CONSTRUCTOR_TYPES: [&str; 11] = [
 #[test]
 pub(super) fn provider_construction_outside_the_provider_module_is_pinned() {
     let mut factory_sites = BTreeSet::new();
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         let source = read_source(&path);
         let production = strip_cfg_test_items(&blank_comments_and_literals(&source));
@@ -545,7 +545,7 @@ pub(super) fn agent_loop_entries_resolve_the_model_once() {
 #[test]
 pub(super) fn no_label_keyed_or_folded_tool_schema_dialect_remains() {
     let mut hits = Vec::new();
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let production = production_part(&read_source(&path));
         // `::for_provider(` also catches a call through an aliased import
         // (`use crate::tools::ToolSchemaDialect as D; D::for_provider(…)`).

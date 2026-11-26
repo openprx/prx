@@ -4,7 +4,8 @@
 
 use super::helpers::{
     blank_comments_and_literals, compact_rust_path_text, is_ident_char, is_test_code_file, module_resolved_paths,
-    module_segments, read_source, relative_path, rust_source_files, strip_cfg_test_items, test_module_files,
+    module_segments, production_source_files, read_source, relative_path, rust_source_files, strip_cfg_test_items,
+    test_module_files,
 };
 
 /// The neutral homes (R15-R17, R52, OV-14). There is no exception for
@@ -77,7 +78,7 @@ pub(super) fn shared_types_are_not_engine_owned() {
     let test_modules = test_module_files();
     let mut violations = Vec::new();
     let mut scanned = 0_usize;
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         if !NEUTRAL_HOMES.iter().any(|home| relative.starts_with(home)) {
             continue;
@@ -130,7 +131,7 @@ pub(super) fn decision_engine_never_imports_agent_or_tool_execution() {
     let test_modules = test_module_files();
     let mut violations = Vec::new();
     let mut scanned = 0_usize;
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         if !relative.starts_with("src/decision_engine/") {
             continue;

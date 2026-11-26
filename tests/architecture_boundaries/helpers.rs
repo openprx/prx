@@ -550,6 +550,24 @@ pub(super) fn test_module_files_of(files: &[(String, String)]) -> BTreeSet<Strin
     }
 }
 
+/// The production source files: every file under `src/` that
+/// [`test_module_files`] does not classify as test code, that is, neither
+/// `#![cfg(test)]` nor loaded only by `#[cfg(test)]` module declarations.
+/// Every scanner that checks production behaviour walks this list, so a test
+/// module moved into its own file (`#[cfg(test)] mod tests;`) stays test code.
+/// A scanner that deliberately inventories tests as well uses
+/// [`rust_source_files`] and is declared in `TEST_INCLUSIVE_TREE_SCANNERS`.
+///
+/// Callers that also need the per-file classification of a subset must keep
+/// the full list: [`test_module_files_of`] reads loader edges from every file.
+pub(super) fn production_source_files() -> Vec<PathBuf> {
+    let test_modules = test_module_files();
+    rust_source_files()
+        .into_iter()
+        .filter(|path| !test_modules.contains(&relative_path(path)))
+        .collect()
+}
+
 /// Resolve declarations in their actual inline module namespace. In
 /// `host.rs`, `mod tests { mod child; }` loads `host/tests/child.rs`, not
 /// `host/child.rs`. A #[path] at file scope is relative to the containing
@@ -1191,4 +1209,25 @@ pub(super) fn byte_aligned_structure(source: &str) -> String {
         }
     }
     output
+}
+
+#[test]
+fn production_source_files_excludes_modules_loaded_only_under_cfg_test() {
+    let parent = "src/zz_probe/parent.rs";
+    let child = "src/zz_probe/parent/tests.rs";
+    let planted = vec![
+        (
+            parent.to_string(),
+            "#[cfg(test)]\nmod tests;\npub fn production() {}\n".to_string(),
+        ),
+        (child.to_string(), "#[test]\nfn only_a_test() {}\n".to_string()),
+    ];
+    let previous = PLANTED_SOURCES.with_borrow_mut(|sources| std::mem::replace(sources, planted));
+    let production: Vec<String> = production_source_files()
+        .iter()
+        .map(|path| relative_path(path))
+        .collect();
+    PLANTED_SOURCES.with_borrow_mut(|sources| *sources = previous);
+    assert!(production.contains(&parent.to_string()), "{production:?}");
+    assert!(!production.contains(&child.to_string()), "{production:?}");
 }

@@ -1,6 +1,6 @@
 use super::helpers::{
-    blank_comments_and_literals, enclosing_function, is_ident_char, normalize_line, read_source, relative_path,
-    rust_source_files, strip_cfg_test_items,
+    blank_comments_and_literals, enclosing_function, is_ident_char, normalize_line, production_source_files,
+    read_source, relative_path, strip_cfg_test_items,
 };
 use super::helpers::{is_test_code_file, test_module_files};
 use super::tool_tables::{
@@ -860,7 +860,7 @@ pub(super) fn direct_tool_execution_sites<'a>(
 pub(super) fn scan_repository_tool_executions() -> ToolExecutionScan {
     let mut combined = ToolExecutionScan::default();
     let test_modules = test_module_files();
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let relative = relative_path(&path);
         let source = read_source(&path);
         if is_test_code_file(&relative, &source, &test_modules) {

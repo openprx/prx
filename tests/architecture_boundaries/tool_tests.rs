@@ -1,6 +1,6 @@
 use super::helpers::{
-    assert_inventory, blank_comments_and_literals, function_body, is_ident_char, normalize_line, read_source,
-    relative_path, repository_root, rust_source_files, strip_cfg_test_items,
+    assert_inventory, blank_comments_and_literals, function_body, is_ident_char, normalize_line,
+    production_source_files, read_source, relative_path, repository_root, strip_cfg_test_items,
 };
 use super::loop_requests::compact_rust_tokens;
 use super::tool_scanner::{
@@ -598,7 +598,7 @@ pub(super) fn every_non_tool_execute_call_site_shows_its_type_evidence() {
 #[test]
 pub(super) fn non_tool_closure_providers_match_their_definitions() {
     let mut sources = Vec::new();
-    for path in rust_source_files() {
+    for path in production_source_files() {
         let source = read_source(&path);
         sources.push((
             relative_path(&path),
