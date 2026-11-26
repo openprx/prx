@@ -78,14 +78,6 @@ const fn enforced_read_mode(context: Option<&MemoryWriteContext>, requested: Mem
     }
 }
 
-/// Marks FTS5 `snippet()` puts around matched words in a transcript excerpt (the
-/// FTS path of `search_transcripts`). Private-use characters: normal text does
-/// not contain them and redaction patterns do not treat them specially.
-/// Readers strip both marks before redacting or displaying an excerpt.
-pub const TRANSCRIPT_MATCH_OPEN: char = '\u{E000}';
-/// Closing mark of [`TRANSCRIPT_MATCH_OPEN`].
-pub const TRANSCRIPT_MATCH_CLOSE: char = '\u{E001}';
-
 /// Core memory trait — implement for any persistence backend
 #[async_trait]
 pub trait Memory: Send + Sync {
@@ -1294,7 +1286,9 @@ pub trait Memory: Send + Sync {
     /// query has a word of 3 or more characters; the newest first when every
     /// word is shorter. Only user and assistant messages are searched. `query`
     /// is free text: every word must occur, and each word is matched as a
-    /// literal. Backends without a transcript index return no hits.
+    /// literal. Each hit carries the raw, unredacted row text (see
+    /// [`TranscriptHit::excerpt`]); callers redact it before showing any of
+    /// it. Backends without a transcript index return no hits.
     async fn search_transcripts(
         &self,
         principal: &MemoryPrincipal,

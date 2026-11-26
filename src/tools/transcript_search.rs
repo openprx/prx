@@ -5,7 +5,7 @@ use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use super::transcript_history_lookup::TranscriptHistoryLookupTool;
 use crate::agent::diagnostics::error_class;
 use crate::memory::Memory;
-use crate::memory::traits::{TRANSCRIPT_MATCH_CLOSE, TRANSCRIPT_MATCH_OPEN, TranscriptHit};
+use crate::memory::traits::TranscriptHit;
 use crate::security::redaction::redact_secrets;
 use async_trait::async_trait;
 use serde_json::json;
@@ -16,6 +16,10 @@ pub const TRANSCRIPT_SEARCH_TOOL_NAME: &str = "transcript_search";
 const DEFAULT_LIMIT: usize = 10;
 const MAX_LIMIT: usize = 50;
 const NO_MATCH: &str = "No earlier conversation matched.";
+/// Characters of an excerpt.
+const EXCERPT_CHARS: usize = 200;
+/// Characters of an excerpt before the anchor's first match.
+const EXCERPT_LEAD_CHARS: usize = 80;
 
 /// Set once the warm-up has been started in this process.
 static WARM_STARTED: AtomicBool = AtomicBool::new(false);
@@ -51,28 +55,54 @@ pub(crate) fn warm_index_in_background(memory: Arc<dyn Memory>) {
     });
 }
 
-/// The excerpt as shown: the FTS match marks removed, then secrets redacted on
-/// the clean text, so no mark can split a secret, then line breaks flattened.
-/// The marks are not replaced by brackets, so a highlighted hit shows no
-/// highlight here.
-fn clean_excerpt(excerpt: &str) -> String {
-    let stripped: String = excerpt
+/// The excerpt as shown. Secrets are redacted on the whole row text the store
+/// returned, before anything is cut, so the cut can never remove the prefix or
+/// label a redaction pattern needs. The excerpt is then [`EXCERPT_CHARS`]
+/// characters of the redacted text, starting [`EXCERPT_LEAD_CHARS`] before the
+/// first case-insensitive occurrence of `anchor`, or at the start when the
+/// redacted text does not contain it (for example when the match was inside a
+/// redacted secret). Line breaks are flattened to spaces.
+fn excerpt(content: &str, anchor: &str) -> String {
+    let redacted = redact_secrets(content);
+    let start = find_ignoring_case(&redacted, anchor).map_or(0, |at| at.saturating_sub(EXCERPT_LEAD_CHARS));
+    redacted
         .chars()
-        .filter(|ch| *ch != TRANSCRIPT_MATCH_OPEN && *ch != TRANSCRIPT_MATCH_CLOSE)
-        .collect();
-    redact_secrets(&stripped).replace(['\r', '\n'], " ")
+        .skip(start)
+        .take(EXCERPT_CHARS)
+        .map(|ch| if matches!(ch, '\r' | '\n') { ' ' } else { ch })
+        .collect()
 }
 
-/// One line per hit: the time, the session, the role and the clean excerpt.
-fn render_hits(hits: &[TranscriptHit]) -> String {
+/// Character index in `haystack` of the first occurrence of `needle`, both
+/// compared in lowercase. Linear: the haystack is folded once, with the
+/// character index each folded character came from.
+fn find_ignoring_case(haystack: &str, needle: &str) -> Option<usize> {
+    let needle: String = needle.chars().flat_map(char::to_lowercase).collect();
+    if needle.is_empty() {
+        return None;
+    }
+    let mut folded = String::with_capacity(haystack.len());
+    let mut origins = Vec::with_capacity(haystack.len());
+    for (index, ch) in haystack.chars().enumerate() {
+        origins.push((folded.len(), index));
+        folded.extend(ch.to_lowercase());
+    }
+    let byte = folded.find(&needle)?;
+    let after = origins.partition_point(|(offset, _)| *offset <= byte);
+    origins.get(after.checked_sub(1)?).map(|(_, index)| *index)
+}
+
+/// One line per hit: the time, the session, the role and the excerpt around
+/// `anchor`, the first word of the query.
+fn render_hits(hits: &[TranscriptHit], anchor: &str) -> String {
     hits.iter()
         .map(|hit| {
-            let excerpt = clean_excerpt(&hit.excerpt);
             format!(
-                "{} {} {}: {excerpt}",
+                "{} {} {}: {}",
                 hit.created_at,
                 hit.session_key.as_deref().unwrap_or("-"),
-                hit.role
+                hit.role,
+                excerpt(&hit.excerpt, anchor)
             )
         })
         .collect::<Vec<_>>()
@@ -139,7 +169,7 @@ impl Tool for TranscriptSearchTool {
             }),
             Ok(hits) => Ok(ToolResult {
                 success: true,
-                output: render_hits(&hits),
+                output: render_hits(&hits, query.split_whitespace().next().unwrap_or_default()),
                 error: None,
             }),
             Err(error) => Ok(ToolResult {

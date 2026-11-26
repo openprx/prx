@@ -1878,16 +1878,19 @@ Parameters:
 Matching: words of 3 or more characters are matched through the full-text index,
 and the best match comes first. Shorter words are matched as substrings of the
 message, on the hits of the longer words. When every word is shorter than 3
-characters, the newest matches come first, and the excerpt starts 80 characters
-before the first word.
+characters, the newest matches come first.
 
 The index is built on the first search, or at process start by a background
 warm-up, so a search does not pay for building it. Each hit prints its time,
-session, role and an excerpt. Excerpts are redacted for secrets after the match
-highlight is removed, so a hit that matches part of a secret shows it redacted.
-An excerpt is at most about 200 characters and may be cut at its edge, so a
-secret that spans the edge can appear cut rather than redacted. No match returns
-`No earlier conversation matched.`
+session, role and an excerpt. Excerpts are cut from redacted text: secrets are
+redacted on the whole message first, and only then is the excerpt cut, so the
+cut cannot hide the prefix or label that identifies a secret. An excerpt is 200
+characters starting 80 characters before the first word of the query, or the
+start of the message when the first word only occurred inside a redacted
+secret. It has no match highlight. For a message longer than 65,536 characters,
+redaction runs on the 4,096 characters on each side of the first match only, so
+a secret that spans that region's edge can appear cut rather than redacted. No
+match returns `No earlier conversation matched.`
 
 ## Flat built-in tool schemas
 

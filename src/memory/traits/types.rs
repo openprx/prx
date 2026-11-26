@@ -738,11 +738,11 @@ pub struct TranscriptHit {
     pub event_id: String,
     pub role: String,
     pub created_at: String,
-    /// Matched text. With a word of 3 or more characters: FTS5 `snippet()` with
-    /// each matched word wrapped in `TRANSCRIPT_MATCH_OPEN` and
-    /// `TRANSCRIPT_MATCH_CLOSE` (private-use characters); the text may be cut
-    /// at the snippet edge. Otherwise: up to 200 characters, starting 80
-    /// characters before the first word's first match, without markers. Readers
-    /// strip the markers before redaction.
+    /// The matched row's raw content, unredacted and without markers: the whole
+    /// row up to 65,536 characters; for a longer row, the region of 4,096
+    /// characters on each side of the query's first word's first match (ASCII
+    /// case-insensitive), or from the row start when that match is not found.
+    /// Readers redact secrets on this whole text before cutting or showing an
+    /// excerpt of it.
     pub excerpt: String,
 }

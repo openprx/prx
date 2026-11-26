@@ -17,7 +17,7 @@
 use super::SqliteMemory;
 use super::erasure_pool::MemoryPool;
 use super::events::{MA_SCOPE_COLUMN, numbered_placeholders, partition_conjunct};
-use crate::memory::traits::{MemoryPrincipal, TRANSCRIPT_MATCH_CLOSE, TRANSCRIPT_MATCH_OPEN, TranscriptHit};
+use crate::memory::traits::{MemoryPrincipal, TranscriptHit};
 use crate::memory::{AgentPartition, PartitionKey};
 use crate::runtime::sqlite_pool::begin_immediate;
 use rusqlite::Connection;
@@ -29,6 +29,13 @@ const INDEX_TABLE: &str = "message_events_fts";
 /// Shortest term (in characters) the trigram tokenizer can match. Shorter terms
 /// are matched with `LIKE` instead.
 const TRIGRAM_MIN_CHARS: usize = 3;
+
+/// Rows up to this many characters are returned whole.
+const WHOLE_ROW_MAX_CHARS: usize = 65_536;
+
+/// For a longer row, the characters returned on each side of the anchor's
+/// first match (the region starts at the row start when no match is found).
+const REGION_SIDE_CHARS: usize = 4_096;
 
 /// Index objects and their initial fill, run once in one write transaction.
 ///
@@ -68,14 +75,22 @@ const CREATE_INDEX_SQL: &str = "
     INSERT INTO message_events_fts(message_events_fts, rank) VALUES ('secure-delete', 1);
     INSERT INTO message_events_fts(message_events_fts) VALUES ('rebuild');";
 
+/// The query terms and how they are matched against `message_events.content`.
+struct QueryMatch {
+    /// The first word of the query; it occurs in every hit. A row longer than
+    /// [`WHOLE_ROW_MAX_CHARS`] is returned as the region around it.
+    anchor: String,
+    terms: TermMatch,
+}
+
 /// How the query terms are matched against `message_events.content`.
 enum TermMatch {
     /// One FTS5 `MATCH` over the quoted long terms, ANDed, and a `LIKE` filter
     /// per short term.
     Fts { match_text: String, short: Vec<String> },
     /// `LIKE` per term, ANDed, when no term is long enough for the trigram
-    /// index. The excerpt is centred on `anchor`, the first term.
-    Like { anchor: String, terms: Vec<String> },
+    /// index.
+    Like { terms: Vec<String> },
 }
 
 impl SqliteMemory {
@@ -115,7 +130,8 @@ impl SqliteMemory {
             let reader = pool.read()?;
             let conn = reader.connection()?;
             let mut values: Vec<rusqlite::types::Value> = Vec::new();
-            let (from_sql, term_sql, excerpt_sql, order_sql) = match matcher {
+            let QueryMatch { anchor, terms } = matcher;
+            let (from_sql, term_sql, order_sql) = match terms {
                 TermMatch::Fts { match_text, short } => {
                     values.push(rusqlite::types::Value::from(match_text));
                     let mut conditions = vec![format!("{INDEX_TABLE} MATCH ?1")];
@@ -126,31 +142,35 @@ impl SqliteMemory {
                     (
                         format!("{INDEX_TABLE} JOIN message_events e ON e.id = {INDEX_TABLE}.rowid"),
                         conditions.join(" AND "),
-                        format!(
-                            "snippet({INDEX_TABLE}, 0, '{TRANSCRIPT_MATCH_OPEN}', '{TRANSCRIPT_MATCH_CLOSE}', '...', 24)"
-                        ),
                         format!("bm25({INDEX_TABLE})"),
                     )
                 }
-                TermMatch::Like { anchor, terms } => {
+                TermMatch::Like { terms } => {
                     let mut conditions = Vec::with_capacity(terms.len());
                     for term in terms {
                         values.push(like_pattern(&term));
                         conditions.push(like_condition(values.len()));
                     }
-                    // The excerpt starts 80 characters before the anchor's first match.
-                    values.push(rusqlite::types::Value::from(anchor));
-                    let anchor_marker = values.len();
                     (
                         "message_events e".to_owned(),
                         conditions.join(" AND "),
-                        format!(
-                            "substr(e.content, max(1, instr(lower(e.content), lower(?{anchor_marker})) - 80), 200)"
-                        ),
                         "e.id DESC".to_owned(),
                     )
                 }
             };
+            // The raw row, unredacted: the reader redacts it before cutting an
+            // excerpt. A row longer than WHOLE_ROW_MAX_CHARS is cut to the
+            // region of REGION_SIDE_CHARS on each side of the anchor's first
+            // match (ASCII case-insensitive, as `lower` is), so a hit reads a
+            // bounded amount of text.
+            values.push(rusqlite::types::Value::from(anchor));
+            let anchor_marker = values.len();
+            let content_sql = format!(
+                "CASE WHEN length(e.content) <= {WHOLE_ROW_MAX_CHARS} THEN e.content
+                      ELSE substr(e.content,
+                                  max(1, instr(lower(e.content), lower(?{anchor_marker})) - {REGION_SIDE_CHARS}),
+                                  2 * {REGION_SIDE_CHARS} + length(?{anchor_marker})) END"
+            );
             // Placeholders after the term values: workspace, owner, session key
             // (NULL for any session), the partition, then the limit.
             let first = values.len() + 1;
@@ -158,7 +178,7 @@ impl SqliteMemory {
                 partition_conjunct(MA_SCOPE_COLUMN, Some(&partition), numbered_placeholders(first + 3));
             let limit_marker = first + 3 + partition_values.len();
             let sql = format!(
-                "SELECT e.session_key, e.event_id, e.role, e.created_at, {excerpt_sql}
+                "SELECT e.session_key, e.event_id, e.role, e.created_at, {content_sql}
                  FROM {from_sql}
                  WHERE {term_sql}
                    AND e.workspace_id = ?{first}
@@ -211,15 +231,17 @@ impl SqliteMemory {
 /// characters go to FTS5 as double-quoted strings (embedded quotes doubled), so
 /// FTS5 operators, column filters, `*`, `NEAR(...)` and parentheses in the input
 /// are literal words. Shorter words are `LIKE` post-filters on that match. When
-/// no word is long enough, every word is matched with `LIKE` and the first word
-/// anchors the excerpt. `None` when the input has no word.
-fn term_match(query: &str) -> Option<TermMatch> {
+/// no word is long enough, every word is matched with `LIKE`. The first word is
+/// the anchor. `None` when the input has no word.
+fn term_match(query: &str) -> Option<QueryMatch> {
     let words = distinct_words(query);
     let anchor = (*words.first()?).to_owned();
     if !words.iter().any(|word| is_long_term(word)) {
-        return Some(TermMatch::Like {
+        return Some(QueryMatch {
             anchor,
-            terms: words.into_iter().map(str::to_owned).collect(),
+            terms: TermMatch::Like {
+                terms: words.into_iter().map(str::to_owned).collect(),
+            },
         });
     }
     let match_text = words
@@ -233,7 +255,10 @@ fn term_match(query: &str) -> Option<TermMatch> {
         .filter(|word| !is_long_term(word))
         .map(|word| (*word).to_owned())
         .collect();
-    Some(TermMatch::Fts { match_text, short })
+    Some(QueryMatch {
+        anchor,
+        terms: TermMatch::Fts { match_text, short },
+    })
 }
 
 /// Whether a word is long enough for the trigram index.
