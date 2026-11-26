@@ -35,6 +35,28 @@ pub(super) fn seed_turns() -> Vec<ChildTurn> {
     current().map_or_else(Vec::new, |seed| seed.history)
 }
 
+/// The owner and parent session of the caller: the operator source when one is
+/// set, otherwise the admitted child call context.
+pub(super) fn caller_owner_and_parent() -> anyhow::Result<(String, String)> {
+    let operator = crate::runtime::operator_spawn::current();
+    let caller = crate::tools::execution::current_child_call_context();
+    if let Some(operator) = &operator {
+        operator.verify_live()?;
+        Ok((
+            operator.proof().owner_id().to_owned(),
+            operator.proof().session_key().to_owned(),
+        ))
+    } else if let Some(caller) = &caller {
+        caller.verify_tool("sessions_spawn")?;
+        Ok((
+            caller.context().envelope.resolved_owner_id(),
+            caller.context().envelope.session_key.clone(),
+        ))
+    } else {
+        anyhow::bail!("child continuation requires an admitted parent or operator source");
+    }
+}
+
 pub(super) fn register(runs: &mut Vec<SubAgentRun>, run: SubAgentRun) -> anyhow::Result<()> {
     if let Some(previous) = runs
         .iter_mut()
@@ -60,22 +82,7 @@ impl SessionsSpawnTool {
     pub(super) async fn execute_continue(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
         let fabric = self.memory_fabric().context("child sessions require durable storage")?;
         let operator = crate::runtime::operator_spawn::current();
-        let caller = crate::tools::execution::current_child_call_context();
-        let (owner, parent) = if let Some(operator) = &operator {
-            operator.verify_live()?;
-            (
-                operator.proof().owner_id().to_owned(),
-                operator.proof().session_key().to_owned(),
-            )
-        } else if let Some(caller) = &caller {
-            caller.verify_tool("sessions_spawn")?;
-            (
-                caller.context().envelope.resolved_owner_id(),
-                caller.context().envelope.session_key.clone(),
-            )
-        } else {
-            anyhow::bail!("child continuation requires an admitted parent or operator source");
-        };
+        let (owner, parent) = caller_owner_and_parent()?;
         let target = args
             .get("session_key")
             .or_else(|| args.get("run_id"))
