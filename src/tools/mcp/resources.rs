@@ -22,12 +22,18 @@ use rmcp::service::{Peer, ServiceError};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::RwLockReadGuard;
 
 /// A live peer and the session it belongs to, so a failure resets exactly
 /// that session and no newer replacement.
-pub(super) struct AttachedPeer {
+///
+/// It also holds the lifecycle read guard until the request and any reset on
+/// failure are done, as `validate_and_call` does for a tool call. A retirement
+/// or refresh therefore waits for the request instead of racing it.
+pub(super) struct AttachedPeer<'a> {
     peer: Peer<RoleClient>,
     attachment: Attachment,
+    _lifecycle: RwLockReadGuard<'a, ()>,
 }
 
 enum Attachment {
@@ -87,8 +93,8 @@ impl McpTool {
     /// A live peer for `server`, starting its stdio session or HTTP connection
     /// when none is running. It never calls a tool. Refusals and SSRF checks
     /// match `validate_and_call` and `call_http`.
-    pub(super) async fn attach_peer(&self, server: &str) -> anyhow::Result<AttachedPeer> {
-        let _lifecycle = self.lifecycle.read().await;
+    pub(super) async fn attach_peer(&self, server: &str) -> anyhow::Result<AttachedPeer<'_>> {
+        let lifecycle = self.lifecycle.read().await;
         if self.retired.lock().contains(server) {
             bail!(
                 "MCP server '{}' was removed or narrowed by a configuration change; it is no longer started",
@@ -103,9 +109,15 @@ impl McpTool {
         match config.transport {
             McpTransport::Stdio => {
                 self.call_stdio(server, &config, ATTACH_ONLY, None).await?;
-                self.stdio_attachment(server)
+                let (peer, attachment) = self
+                    .stdio_attachment(server)
                     .await
-                    .ok_or_else(|| anyhow::anyhow!("MCP stdio session for '{server}' is not running"))
+                    .ok_or_else(|| anyhow::anyhow!("MCP stdio session for '{server}' is not running"))?;
+                Ok(AttachedPeer {
+                    peer,
+                    attachment,
+                    _lifecycle: lifecycle,
+                })
             }
             McpTransport::Http => {
                 let url = config
@@ -123,6 +135,7 @@ impl McpTool {
                         Ok(AttachedPeer {
                             peer: client.peer().clone(),
                             attachment: Attachment::Http { slot, client },
+                            _lifecycle: lifecycle,
                         })
                     }
                     Err(error) => {
@@ -135,17 +148,14 @@ impl McpTool {
     }
 
     /// The peer and generation of the running stdio session of `server`, if any.
-    async fn stdio_attachment(&self, server: &str) -> Option<AttachedPeer> {
+    async fn stdio_attachment(&self, server: &str) -> Option<(Peer<RoleClient>, Attachment)> {
         let slot = self.stdio_sessions.lock().get(server).cloned()?;
         let (peer, generation) = {
             let session = slot.lock().await;
             let active = session.as_ref()?;
             (active.client.peer().clone(), active.generation)
         };
-        Some(AttachedPeer {
-            peer,
-            attachment: Attachment::Stdio { slot, generation },
-        })
+        Some((peer, Attachment::Stdio { slot, generation }))
     }
 }
 
@@ -153,7 +163,7 @@ impl McpTool {
 /// that is the connection (`reset_if_current`); for stdio it is the session
 /// of the same generation. A newer replacement in the slot is left alone.
 /// The slot lock is held only for the check and the take, never across a read.
-async fn reset_attached(attached: &AttachedPeer) {
+async fn reset_attached(attached: &AttachedPeer<'_>) {
     match &attached.attachment {
         Attachment::Http { slot, client } => http_session::reset_if_current(slot, client).await,
         Attachment::Stdio { slot, generation } => {
@@ -173,14 +183,18 @@ async fn reset_attached(attached: &AttachedPeer) {
 
 /// Reset after a failed request if the failure means the transport is gone
 /// or stuck. Application-level errors keep the session.
-async fn reset_after_failure(attached: &AttachedPeer, error: &ServiceError) {
+async fn reset_after_failure(attached: &AttachedPeer<'_>, error: &ServiceError) {
     if http_session::is_transport_failure(error) {
         reset_attached(attached).await;
     }
 }
 
 /// Resources and templates as compact JSON, under the request timeout.
-async fn list_resources(attached: &AttachedPeer, server: &str, request_timeout: Duration) -> anyhow::Result<String> {
+async fn list_resources(
+    attached: &AttachedPeer<'_>,
+    server: &str,
+    request_timeout: Duration,
+) -> anyhow::Result<String> {
     let (resources, templates) = match tokio::time::timeout(request_timeout, list_items(&attached.peer)).await {
         Ok(Ok(items)) => items,
         Ok(Err(error)) => {
@@ -207,7 +221,7 @@ async fn list_resources(attached: &AttachedPeer, server: &str, request_timeout: 
 /// a blob is a placeholder with its size and no base64 payload. A not-found
 /// answer names the URI and keeps the session.
 async fn read_resource(
-    attached: &AttachedPeer,
+    attached: &AttachedPeer<'_>,
     server: &str,
     uri: &str,
     request_timeout: Duration,
@@ -218,7 +232,7 @@ async fn read_resource(
         Ok(Err(error)) => {
             reset_after_failure(attached, &error).await;
             return Err(match error {
-                ServiceError::McpError(ref data) if data.code.0 == -32602 || data.code.0 == -32002 => {
+                ServiceError::McpError(ref data) if data.code.0 == -32002 => {
                     anyhow::anyhow!("resource not found: {uri}")
                 }
                 other => request_error(server, attached, other.into()),
@@ -261,7 +275,7 @@ async fn list_items(peer: &Peer<RoleClient>) -> Result<(Vec<Resource>, Vec<Resou
 
 /// The error returned to the model for a failed request. HTTP failures get the
 /// same authorization hint as the call path.
-fn request_error(server: &str, attached: &AttachedPeer, error: anyhow::Error) -> anyhow::Error {
+fn request_error(server: &str, attached: &AttachedPeer<'_>, error: anyhow::Error) -> anyhow::Error {
     match attached.attachment {
         Attachment::Http { .. } => http_session::with_authorization_hint(server, error),
         Attachment::Stdio { .. } => error,
