@@ -1,7 +1,7 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use crate::hooks::{HookEvent, HookManager, payload_error};
-use crate::llm::route_decision::{ProviderUsageAccumulator, TokenUsage};
+use crate::llm::route_decision::TokenUsage;
 use crate::multimodal;
 use crate::observability::{Observer, ObserverEvent};
 use crate::providers;
@@ -15,6 +15,9 @@ use std::io::Write as _;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
+
+mod state;
+use state::{TurnInputs, TurnState};
 
 #[cfg(test)]
 use crate::agent::compaction::is_tool_roundtrip_companion;
@@ -489,7 +492,7 @@ async fn run_turn_unguarded(
         runtime_adapter,
         memory: memory_runtime,
     } = services;
-    let mut decision_brief = advice
+    let decision_brief = advice
         .as_ref()
         .map(|analysis| {
             let config = service.advisory().config();
@@ -509,9 +512,6 @@ async fn run_turn_unguarded(
             }
             fits
         });
-    let mut decision_brief_sha256 = decision_brief.as_deref().map(crate::agent::prompt::prompt_sha256);
-    // The analysis is recorded once, with the brief the first send carries.
-    let mut analysis_recorded = false;
     let cache_series = super::prompt_cache_metrics::Series::for_turn(scope_ctx, &memory_runtime);
     let TurnDelivery {
         cancellation: cancellation_token,
@@ -571,18 +571,6 @@ async fn run_turn_unguarded(
             .and_then(|scope| scope.run_id.as_deref())
             .or(runtime_adapter.tool_execution_context.envelope.run_id.as_deref()),
     );
-
-    // FIX-P0-30/31: attribution of the final returning turn. Each provider call
-    // overwrites this with that turn's real serving provider/model + attempts;
-    // the value at the returning turn is handed back to the caller.
-    let mut last_turn_trace = ToolLoopTrace::default();
-    let mut usage_accumulator = ProviderUsageAccumulator::new();
-    // FIX #2: sticky cross-turn fallback flag. `last_turn_trace` is overwritten
-    // every turn, so a fallback on an intermediate (tool-call) turn would be lost
-    // if a later clean turn produced the answer. Accumulate it separately and
-    // fold it into the returned trace so the recorded status reflects the whole
-    // user turn, not just its final iteration.
-    let mut any_turn_had_fallback = false;
 
     let read_only_schedule = ReadOnlyToolScheduleConfig {
         concurrency_window: read_only_tool_concurrency_window.max(1),
@@ -719,23 +707,6 @@ async fn run_turn_unguarded(
     // that tells the reducers which tool results belong to the turn.
     turn_history.anchor_live_request(history);
 
-    let mut consecutive_failures: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut unrecoverable_failures: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
-    let mut tool_summary_retry_attempted = false;
-    let mut inject_tool_summary_retry_instruction = false;
-    // Whether this turn ever really dispatched a tool batch. A response that
-    // claims tool use (`[Used tools: ...]`) while this is still false is a
-    // fabrication, and the only case worth spending a corrective retry on.
-    let mut executed_any_tool_call = false;
-    let mut overflow_recovery_passes: usize = 0;
-    let mut empty_response_retry_attempted = false;
-    let mut inject_empty_response_retry_instruction = false;
-
-    // Rebuilt every iteration so dynamic backends cannot go stale, but the
-    // snapshot is normally identical across a turn's iterations: memoize its
-    // rendered prompt sections and fingerprint instead of recomputing one JSON
-    // serialization plus two SHA-256 digests per tool each time.
-    let mut tool_snapshot_render_cache = crate::agent::turn_context::ToolSnapshotRenderCache::default();
     // Same reasoning for the request-size accounting: measuring the published
     // tool surface means serializing and tokenizing every schema and rendering
     // and tokenizing the prompt sections, so the result is reused for as long
@@ -743,7 +714,7 @@ async fn run_turn_unguarded(
     // The payload is measured as the provider's dialect puts it on the wire
     // (C2b-3): a cleaning dialect inlines `$ref` and can be larger than the
     // published document.
-    let mut request_tool_surface_cache =
+    let request_tool_surface_cache =
         crate::agent::turn_context::RequestToolSurfaceCache::for_dialect(provider.tool_schema_dialect_for(model));
     // A sub-agent inherits the hidden surface of the turn that spawned it.
     // Sub-agent loops deliberately run without tool tiering, so without this a
@@ -766,14 +737,84 @@ async fn run_turn_unguarded(
             tool_calls_allowed: service.model_can_call_tools(proof),
         },
     ));
-    let mut iteration = 0usize;
+    let turn = TurnInputs {
+        advice,
+        channel_name,
+        chat_mode,
+        silent,
+        expose_stay_silent,
+        multimodal_config,
+        compaction_config,
+        service,
+        context,
+        proof,
+        provider,
+        provider_name,
+        model,
+        temperature,
+        tools_registry,
+        observer,
+        hooks,
+        runtime_adapter,
+        document_ingest,
+        event_fabric,
+        request_event_scope,
+        tool_surface_reserve,
+        cancellation_token,
+        on_delta,
+        on_tool_call,
+        usage_anchors,
+        parameter_capture,
+        cache_series,
+        read_only_schedule,
+        mode_capabilities,
+        inherited_exclusions,
+        safety_surface,
+    };
+    let mut state = TurnState::new(decision_brief, request_tool_surface_cache);
+    let TurnInputs {
+        ref advice,
+        channel_name,
+        chat_mode,
+        silent,
+        expose_stay_silent,
+        multimodal_config,
+        compaction_config,
+        service,
+        context,
+        proof,
+        provider,
+        provider_name,
+        model,
+        temperature,
+        ref tools_registry,
+        observer,
+        hooks,
+        ref runtime_adapter,
+        ref document_ingest,
+        ref event_fabric,
+        ref request_event_scope,
+        ref tool_surface_reserve,
+        ref cancellation_token,
+        ref on_delta,
+        ref on_tool_call,
+        ref usage_anchors,
+        ref parameter_capture,
+        cache_series,
+        ref read_only_schedule,
+        ref mode_capabilities,
+        ref inherited_exclusions,
+        ref safety_surface,
+    } = turn;
     loop {
-        iteration = iteration.saturating_add(1);
-        crate::hooks::set_round(iteration);
+        state.iteration = state.iteration.saturating_add(1);
+        crate::hooks::set_round(state.iteration);
         // Notify progress for multi-iteration tool loops (skip the first iteration).
-        if iteration > 1 {
-            if let Some(ref tx) = on_tool_call {
-                let _ = tx.try_send(ToolCallNotification::Progress { iteration });
+        if state.iteration > 1 {
+            if let Some(tx) = on_tool_call {
+                let _ = tx.try_send(ToolCallNotification::Progress {
+                    iteration: state.iteration,
+                });
             }
         }
 
@@ -914,7 +955,9 @@ async fn run_turn_unguarded(
                 .collect::<std::collections::BTreeMap<_, _>>()
         };
         crate::tools::filter_tool_specs_for_exposure(&mut tool_specs, expose_stay_silent);
-        let mut tool_surface = request_tool_surface_cache.measure(mode_capabilities.native_tool_calling, &tool_specs);
+        let mut tool_surface = state
+            .request_tool_surface_cache
+            .measure(mode_capabilities.native_tool_calling, &tool_specs);
         if let Some(reserve) = tool_surface_reserve.as_ref() {
             reserve.record(tool_surface);
         }
@@ -956,7 +999,11 @@ async fn run_turn_unguarded(
                 budget: None,
             };
             let planning = probe.planning(tool_surface);
-            anchor::scoped(planning, Box::pin(ladder(&[&ClearOldResults, &RoundCompact, &RoundTrim], &mut round))).await?;
+            anchor::scoped(
+                planning,
+                Box::pin(ladder(&[&ClearOldResults, &RoundCompact, &RoundTrim], &mut round)),
+            )
+            .await?;
             request_budget = round
                 .budget
                 .map(|budget| plan_round(&usage_anchors, probe, config, budget, tool_surface));
@@ -1012,7 +1059,9 @@ async fn run_turn_unguarded(
             // this iteration's window is short by exactly what that one spec
             // adds — its schema and its line in the capability snapshot. The
             // next iteration budgets the full set.
-            tool_surface = request_tool_surface_cache.measure(mode_capabilities.native_tool_calling, &tool_specs);
+            tool_surface = state
+                .request_tool_surface_cache
+                .measure(mode_capabilities.native_tool_calling, &tool_specs);
             tool_surface_counts = RequestToolSurfaceCounts::measure(
                 tools_registry.len(),
                 selected_tools.len(),
@@ -1063,13 +1112,13 @@ async fn run_turn_unguarded(
         // any text renders; the rendered text then equals the persisted reply.
         let guarded_delivery =
             runtime_adapter.guarded_delivery && !chat_mode.intercepts_writes() && !tool_specs.is_empty();
-        if inject_tool_summary_retry_instruction {
+        if state.inject_tool_summary_retry_instruction {
             append_corrective_aside(&mut prepared_messages.messages, TOOL_SUMMARY_ONLY_RESPONSE_MESSAGE);
-            inject_tool_summary_retry_instruction = false;
+            state.inject_tool_summary_retry_instruction = false;
         }
-        if inject_empty_response_retry_instruction {
+        if state.inject_empty_response_retry_instruction {
             append_corrective_aside(&mut prepared_messages.messages, EMPTY_ASSISTANT_RESPONSE_RETRY_MESSAGE);
-            inject_empty_response_retry_instruction = false;
+            state.inject_empty_response_retry_instruction = false;
         }
         let required_lookup_spec = context_lookup_required
             .then(|| {
@@ -1146,7 +1195,9 @@ async fn run_turn_unguarded(
         // actually be sent. Only the rewrite pays for it.
         #[cfg(feature = "wasm-plugins")]
         if tool_specs_rewritten {
-            tool_surface = request_tool_surface_cache.measure(mode_capabilities.native_tool_calling, &tool_specs);
+            tool_surface = state
+                .request_tool_surface_cache
+                .measure(mode_capabilities.native_tool_calling, &tool_specs);
         }
         tool_specs.retain(|spec| safety_surface.contains(&spec.name));
         let (core_specs, appended_specs) = if appended_names.is_empty() {
@@ -1160,7 +1211,7 @@ async fn run_turn_unguarded(
             mode_capabilities.native_tool_calling,
             core_specs,
             appended_specs,
-            &mut tool_snapshot_render_cache,
+            &mut state.tool_snapshot_render_cache,
         );
         compiled_tool_context.apply_to_messages(&mut prepared_messages.messages);
         let mut execution_adapter = runtime_adapter.clone();
@@ -1201,7 +1252,7 @@ async fn run_turn_unguarded(
         // prompt cost would fail this send's token or money admission is
         // dropped for the rest of the turn; the send is then admitted (or
         // refused) exactly as with the engine off.
-        if let Some(brief) = decision_brief.as_deref() {
+        if let Some(brief) = state.decision_brief.as_deref() {
             let mut with_brief = prepared_messages.messages.clone();
             crate::decision_engine::turn::append_brief(&mut with_brief, Some(brief));
             coalesce_system_messages_at_front(&mut with_brief);
@@ -1216,17 +1267,17 @@ async fn run_turn_unguarded(
             .is_err()
             {
                 tracing::debug!("decision brief dropped: the send would not be admitted with it");
-                decision_brief = None;
-                decision_brief_sha256 = None;
+                state.decision_brief = None;
+                state.decision_brief_sha256 = None;
             }
         }
-        if let (Some(analysis), Some(brief)) = (advice.as_ref(), decision_brief.as_deref())
-            && !analysis_recorded
+        if let (Some(analysis), Some(brief)) = (advice.as_ref(), state.decision_brief.as_deref())
+            && !state.analysis_recorded
         {
             service.advisory().record_analysis(analysis, brief);
-            analysis_recorded = true;
+            state.analysis_recorded = true;
         }
-        crate::decision_engine::turn::append_brief(&mut prepared_messages.messages, decision_brief.as_deref());
+        crate::decision_engine::turn::append_brief(&mut prepared_messages.messages, state.decision_brief.as_deref());
         coalesce_system_messages_at_front(&mut prepared_messages.messages);
         let final_system_prompt = prepared_messages
             .messages
@@ -1235,10 +1286,10 @@ async fn run_turn_unguarded(
         let system_prompt_sha256 =
             final_system_prompt.map(|message| crate::agent::prompt::prompt_sha256(&message.content));
         let system_prompt_chars: usize = final_system_prompt.map_or(0, |message| message.content.chars().count());
-        if let Some(brief_hash) = decision_brief_sha256.as_deref() {
+        if let Some(brief_hash) = state.decision_brief_sha256.as_deref() {
             tracing::debug!(
                 system_prompt_sha256 = system_prompt_sha256.as_deref(),
-                decision_brief_sha256 = brief_hash,
+                state.decision_brief_sha256 = brief_hash,
                 "advisory request prepared"
             );
         }
@@ -1286,8 +1337,8 @@ async fn run_turn_unguarded(
                 system_prompt_chars,
                 tool_snapshot_sha256 = %tool_snapshot.sha256,
                 tool_count = tool_snapshot.count,
-                tool_snapshot_render_hits = tool_snapshot_render_cache.hits(),
-                tool_snapshot_render_misses = tool_snapshot_render_cache.misses(),
+                tool_snapshot_render_hits = state.tool_snapshot_render_cache.hits(),
+                tool_snapshot_render_misses = state.tool_snapshot_render_cache.misses(),
                 messages_bytes,
                 messages_chars,
                 messages_tokens,
@@ -1308,7 +1359,7 @@ async fn run_turn_unguarded(
             if let Some(fabric) = event_fabric.as_ref() {
                 let request_context_payload = serde_json::json!({
                     "schema_version": 1,
-                    "iteration": iteration,
+                    "iteration": state.iteration,
                     // Durable: a `custom:` URL may carry `user:password@`.
                     "provider": providers::redact_endpoint_userinfo(provider_name),
                     "model": model,
@@ -1320,8 +1371,8 @@ async fn run_turn_unguarded(
                     "tool_snapshot": &tool_snapshot,
                     "tool_surface": tool_surface_counts.to_json(),
                     "tool_snapshot_render": {
-                        "hits": tool_snapshot_render_cache.hits(),
-                        "misses": tool_snapshot_render_cache.misses(),
+                        "hits": state.tool_snapshot_render_cache.hits(),
+                        "misses": state.tool_snapshot_render_cache.misses(),
                     },
                     "budget": request_budget
                         .as_ref()
@@ -1361,7 +1412,8 @@ async fn run_turn_unguarded(
                 let content = format!(
                     "system_prompt_sha256={} tool_snapshot_sha256={} iteration={iteration}",
                     system_prompt_sha256.as_deref().unwrap_or("none"),
-                    tool_snapshot.sha256
+                    tool_snapshot.sha256,
+                    iteration = state.iteration
                 );
                 if let Err(error) = fabric
                     .record_runtime_event(
@@ -1396,7 +1448,7 @@ async fn run_turn_unguarded(
                         "tool_snapshot_sha256": tool_snapshot.sha256,
                         "tool_count": tool_snapshot.count,
                     }),
-                    decision_brief_sha256.as_deref(),
+                    state.decision_brief_sha256.as_deref(),
                 ),
             )
             .await;
@@ -1489,8 +1541,8 @@ async fn run_turn_unguarded(
                 chat_future.await
             }
         };
-        let prepared = parameter_capture.snapshot_from(last_turn_trace.prepared_parameters.len());
-        last_turn_trace.prepared_parameters.extend(prepared);
+        let prepared = parameter_capture.snapshot_from(state.last_turn_trace.prepared_parameters.len());
+        state.last_turn_trace.prepared_parameters.extend(prepared);
 
         if let Some(observation) = provider_observation {
             observation.finish(chat_result.as_ref().ok().map(|trace| trace.attempts.as_slice()));
@@ -1528,9 +1580,9 @@ async fn run_turn_unguarded(
                 let turn_had_fallback =
                     trace.attempts.len() > 1 || trace.final_provider != provider_name || trace.final_model != model;
                 if turn_had_fallback {
-                    any_turn_had_fallback = true;
+                    state.any_turn_had_fallback = true;
                 }
-                usage_accumulator.record(trace.tokens_used.clone());
+                state.usage_accumulator.record(trace.tokens_used.clone());
                 if let Some(planned) = request_budget.as_ref() {
                     let sink = event_fabric.as_ref().map(|fabric| {
                         let scope = request_event_scope
@@ -1539,7 +1591,14 @@ async fn run_turn_unguarded(
                             .with_recipient(format!("{provider_name}/{model}"));
                         (fabric, scope)
                     });
-                    settle_round(&usage_anchors, planned, &trace, (iteration, provider_name, model), sink).await;
+                    settle_round(
+                        &usage_anchors,
+                        planned,
+                        &trace,
+                        (state.iteration, provider_name, model),
+                        sink,
+                    )
+                    .await;
                 }
                 // Record this turn's real attribution. Overwritten each turn;
                 // the value at the returning turn is what the caller receives.
@@ -1552,8 +1611,8 @@ async fn run_turn_unguarded(
                         &trace.final_model,
                     )
                     .unwrap_or_else(|| provider.tool_schema_dialect_for(&trace.final_model));
-                last_turn_trace = ToolLoopTrace {
-                    prepared_parameters: std::mem::take(&mut last_turn_trace.prepared_parameters),
+                state.last_turn_trace = ToolLoopTrace {
+                    prepared_parameters: std::mem::take(&mut state.last_turn_trace.prepared_parameters),
                     final_provider: Some(trace.final_provider),
                     final_model: Some(trace.final_model),
                     attempts: trace.attempts,
@@ -1564,9 +1623,9 @@ async fn run_turn_unguarded(
                 };
                 if let Some(retained) = &runtime_adapter.provider_trace {
                     retained.completed(
-                        &last_turn_trace,
-                        usage_accumulator.finish(),
-                        any_turn_had_fallback,
+                        &state.last_turn_trace,
+                        state.usage_accumulator.finish(),
+                        state.any_turn_had_fallback,
                         trace.tokens_used.is_reported() && trace.tokens_used.has_any_tokens(),
                     );
                 }
@@ -1722,14 +1781,14 @@ async fn run_turn_unguarded(
                     if crate::recovery::overflow::is_context_overflow_error(e)
                         && !is_stream_failure_after_model_output(e) =>
                 {
-                    if overflow_recovery_passes >= crate::agent::turn_contracts::MAX_OVERFLOW_RECOVERY_PASSES {
+                    if state.overflow_recovery_passes >= crate::agent::turn_contracts::MAX_OVERFLOW_RECOVERY_PASSES {
                         return Err(crate::agent::turn_contracts::ContextCapacityError::RecoveryPassLimit {
                             limit: crate::agent::turn_contracts::MAX_OVERFLOW_RECOVERY_PASSES,
                             provider_context: crate::providers::sanitize_api_error(&format!("{e:#}")),
                         }
                         .into());
                     }
-                    overflow_recovery_passes += 1;
+                    state.overflow_recovery_passes += 1;
                     usage_anchors.invalidate();
                     let messages_before_compaction = history.len();
                     let tokens_before_compaction = estimate_history_tokens(history);
@@ -1923,7 +1982,7 @@ async fn run_turn_unguarded(
         if tool_calls.is_empty() {
             // No tool calls — this is the final response.
             if is_tool_summary_only_response(&response_text) {
-                if tool_summary_retry_attempted {
+                if state.tool_summary_retry_attempted {
                     anyhow::bail!("model returned a tool-summary-only response after one corrective retry");
                 }
                 tracing::warn!(
@@ -1931,12 +1990,12 @@ async fn run_turn_unguarded(
                     model = %crate::security::redaction::redact_provider_text(model),
                     "model returned a tool-summary-only response; retrying once with a corrective instruction"
                 );
-                tool_summary_retry_attempted = true;
-                inject_tool_summary_retry_instruction = true;
+                state.tool_summary_retry_attempted = true;
+                state.inject_tool_summary_retry_instruction = true;
                 continue;
             }
             if is_empty_assistant_response(&response_text, false) {
-                if empty_response_retry_attempted {
+                if state.empty_response_retry_attempted {
                     anyhow::bail!("model returned an empty response after one corrective retry");
                 }
                 tracing::warn!(
@@ -1944,8 +2003,8 @@ async fn run_turn_unguarded(
                     model = %crate::security::redaction::redact_provider_text(model),
                     "model returned empty assistant response; retrying once with a corrective instruction"
                 );
-                empty_response_retry_attempted = true;
-                inject_empty_response_retry_instruction = true;
+                state.empty_response_retry_attempted = true;
+                state.inject_empty_response_retry_instruction = true;
                 continue;
             }
             // Fabricated tool-use marker guard. A `[Used tools: ...]` line the
@@ -1959,18 +2018,18 @@ async fn run_turn_unguarded(
                 || contains_assistant_fabricated_tool_marker(&display_text)
                 || claims_tool_evidence(&response_text)
                 || claims_tool_evidence(&display_text);
-            if fabricated_marker && !executed_any_tool_call && !tool_summary_retry_attempted {
+            if fabricated_marker && !state.executed_any_tool_call && !state.tool_summary_retry_attempted {
                 tracing::warn!(
                     provider = %crate::security::redaction::redact_provider_text(provider_name),
                     model = %crate::security::redaction::redact_provider_text(model),
                     "model claimed tool use without executing any tool; retrying once with a corrective instruction"
                 );
-                tool_summary_retry_attempted = true;
-                inject_tool_summary_retry_instruction = true;
+                state.tool_summary_retry_attempted = true;
+                state.inject_tool_summary_retry_instruction = true;
                 continue;
             }
             if fabricated_marker {
-                if executed_any_tool_call {
+                if state.executed_any_tool_call {
                     // A tool really ran: keep whatever the model actually
                     // answered and drop only the marker lines, so the
                     // fabrication never reaches the user, the history, or the
@@ -2039,7 +2098,7 @@ async fn run_turn_unguarded(
             if runtime_adapter.stream_provider && guarded_delivery {
                 emit_tool_loop_event(&runtime_adapter, ToolLoopEvent::TextDelta(display_text.clone())).await?;
             }
-            if let Some(ref tx) = on_delta {
+            if let Some(tx) = on_delta {
                 // Semantic-boundary chunking: only flush after closed XML tags
                 // (`<...>`) or closed JSON objects/arrays. See
                 // `stream_buffer::StreamBoundaryBuffer` for the state machine.
@@ -2085,9 +2144,7 @@ async fn run_turn_unguarded(
             // provider attribution alongside the final answer.
             // FIX #2: fold the cross-turn fallback flag into the returned trace so
             // a fallback on any earlier turn is reflected in the recorded status.
-            last_turn_trace.any_turn_had_fallback = any_turn_had_fallback;
-            last_turn_trace.tokens_used = usage_accumulator.finish();
-            last_turn_trace.execution_trace = Some(context.terminal_execution_trace());
+            let last_turn_trace = state.returned_trace(context);
             return Ok((ToolLoopOutcome::Text(display_text), last_turn_trace));
         }
 
@@ -2121,10 +2178,7 @@ async fn run_turn_unguarded(
                     return Err(ToolLoopCancelled.into());
                 }
                 service.record_agent_silence(proof, context, &compiled_tool_context)?;
-                last_turn_trace.any_turn_had_fallback = any_turn_had_fallback;
-                last_turn_trace.tokens_used = usage_accumulator.finish();
-                last_turn_trace.execution_trace = Some(context.terminal_execution_trace());
-                return Ok((ToolLoopOutcome::Silent { reason }, last_turn_trace));
+                return Ok((ToolLoopOutcome::Silent { reason }, state.returned_trace(context)));
             }
         }
 
@@ -2203,7 +2257,7 @@ async fn run_turn_unguarded(
                     }),
                 )
                 .await;
-            if let Some(ref tx) = on_tool_call {
+            if let Some(tx) = on_tool_call {
                 let args_str = scrub_credentials(&call.arguments.to_string());
                 let args_summary = truncate_with_ellipsis(&args_str, 80);
                 let id = native_tool_calls
@@ -2232,7 +2286,7 @@ async fn run_turn_unguarded(
         let tool_event_scope = request_event_scope
             .clone()
             .unwrap_or_else(|| execution_adapter.tool_execution_context.envelope.message_scope());
-        let round_log = RoundLog::new(event_fabric.as_ref(), &tool_event_scope, iteration);
+        let round_log = RoundLog::new(event_fabric.as_ref(), &tool_event_scope, state.iteration);
         if let Some(log) = round_log.as_ref() {
             log.append_calls(&tool_calls, &native_tool_calls).await;
         }
@@ -2256,14 +2310,11 @@ async fn run_turn_unguarded(
                     // Dropping the recorder guard retains completed calls and
                     // explicit cancellation placeholders for unexecuted siblings.
                     drop(executed);
-                    last_turn_trace.any_turn_had_fallback = any_turn_had_fallback;
-                    last_turn_trace.tokens_used = usage_accumulator.finish();
-                    last_turn_trace.execution_trace = Some(context.terminal_execution_trace());
                     return Ok((
                         ToolLoopOutcome::AwaitingApproval {
                             reply: pending.reply.clone(),
                         },
-                        last_turn_trace,
+                        state.returned_trace(context),
                     ));
                 }
                 return Err(error);
@@ -2277,7 +2328,7 @@ async fn run_turn_unguarded(
         // `[Used tools: ...]` line is still provably fabricated and still worth
         // the one corrective retry.
         if individual_results.iter().any(|result| result.executed) {
-            executed_any_tool_call = true;
+            state.executed_any_tool_call = true;
         }
 
         // FIX-P2-02: persistence (untrusted external copy + oversized tool_output
@@ -2305,7 +2356,7 @@ async fn run_turn_unguarded(
                     }),
                 )
                 .await;
-            if let Some(ref tx) = on_tool_call {
+            if let Some(tx) = on_tool_call {
                 let id = native_tool_calls
                     .get(index)
                     .map(|native| native.id.clone())
@@ -2324,7 +2375,7 @@ async fn run_turn_unguarded(
                 hooks.emit(HookEvent::Error, payload_error("tool", result)).await;
                 if shared_unrecoverable_tool_error(result) {
                     let signature = format!("{}:{}", call.name, result.to_ascii_lowercase());
-                    let count = unrecoverable_failures.entry(signature).or_insert(0);
+                    let count = state.unrecoverable_failures.entry(signature).or_insert(0);
                     *count = count.saturating_add(1);
                     if *count >= 2 {
                         repeated_unrecoverable = Some(call.name.clone());
@@ -2334,10 +2385,10 @@ async fn run_turn_unguarded(
 
             // Track consecutive failures per tool for repeated-failure hints.
             let repeated_hint = if success {
-                consecutive_failures.remove(&call.name);
+                state.consecutive_failures.remove(&call.name);
                 String::new()
             } else {
-                let count = consecutive_failures.entry(call.name.clone()).or_insert(0);
+                let count = state.consecutive_failures.entry(call.name.clone()).or_insert(0);
                 *count += 1;
                 if *count >= 2 {
                     format!(
