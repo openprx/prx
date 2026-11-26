@@ -1265,6 +1265,11 @@ impl McpTool {
         tool_name: String,
         arguments: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> anyhow::Result<(bool, String)> {
+        // No MCP tool can have an empty name. Refusing it here keeps an empty
+        // name from reaching a server or the stdio session start.
+        if tool_name.trim().is_empty() {
+            bail!("tool name must not be empty");
+        }
         let _lifecycle = self.lifecycle.read().await;
         if self.retired.lock().contains(&server_name) {
             bail!(
