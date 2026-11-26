@@ -125,6 +125,10 @@ contact no host and print one line that says so and names the ways to set one
 up (`prx init --provider <name> --from-stdin`, `prx auth login --provider
 <name>`); the exit status is success.
 
+A `custom:<url>` endpoint counts as configured, but `prx doctor models` does
+not probe it: it reports that live model discovery is not supported for that
+provider.
+
 On a fresh `prx init` install, `prx status` and `prx doctor` (without
 `models`) contact no host (`doctor` makes a local TCP connect to the gateway
 bind address, loopback by default), and a chat turn fails locally with a

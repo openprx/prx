@@ -848,7 +848,8 @@ agentic = true
 allowed_tools = ["web_search", "file_read"]
 # Targeted turns (`agent` on POST /api/sessions/{id}/message, needs
 # [gateway] targeted_agents, default true): `enabled = false` answers 409
-# `agent_disabled`; `autonomy` is capped at the main agent's level.
+# `agent_disabled`; the agent's own `autonomy` applies (it is not capped at
+# the main agent's level).
 # History is a named partition, not Main's. Names must match
 # ^[a-z][a-z0-9_-]{0,63}$ and cannot be `main`.
 # enabled = true

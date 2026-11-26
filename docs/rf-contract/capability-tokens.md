@@ -566,6 +566,12 @@ A Console session keeps its previous body (no `agent` field, no filter).
 install owner's sessions, so no preview shows another owner's content. With
 pairing off the listing is unchanged.
 
+**Default.** `gateway.targeted_agents` defaults to `true`, so `targeted_agents_v1`
+is advertised on a fresh install. An explicit `targeted_agents = false` written
+before the one-time defaults reset (a config directory with no
+`.defaults-migration` marker) is reset to `true` on the first start; set it to
+`false` after that start, and restart, to refuse named targets again.
+
 ## Tokens
 
 | Token | Meaning | Status |
