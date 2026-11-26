@@ -28,6 +28,7 @@ pub(crate) mod response_guard;
 pub(crate) mod runtime_prompt;
 pub mod sanitize;
 pub(crate) mod scheduled_card;
+pub(crate) mod scheduled_result;
 pub(crate) mod scheduled_source;
 pub(crate) mod send_admission;
 pub mod stream_buffer;

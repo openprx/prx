@@ -399,6 +399,8 @@ pub(crate) async fn run_with_runtime_envelope(
         }
     }
 
+    // The result row of a scheduled run is written from this copy once the run ends.
+    let result_envelope = runtime_envelope_override.clone();
     // Capture invocation state without constructing the large async work yet.
     let work = CliWork {
         ctx: &ctx,
@@ -1053,6 +1055,10 @@ pub(crate) async fn run_with_runtime_envelope(
         Some(cleanup) => cleanup.run(work).await,
         None => work.await,
     };
+    // A scheduled run records its result in its own session; a failure there never fails the run.
+    if let (Some(envelope), Some(memory)) = (result_envelope.as_ref(), ctx.memory.as_ref()) {
+        super::scheduled_result::record(memory, &ctx.config, envelope, &result).await;
+    }
     if scheduled_admission.is_none() {
         if let Some(service) = &ctx.turn_service {
             service

@@ -29,6 +29,27 @@ pub(crate) struct ScheduledAgentOrigin {
     /// The goal a Xin goal step belongs to; its session key is then the
     /// goal's shared `xin:goal:{goal_id}`. `None` for every other run.
     goal_id: Option<String>,
+    /// The job or task name and its deliver mode, for the result row.
+    name: Option<String>,
+    deliver: crate::cron::ScheduledDeliver,
+}
+
+/// What the result row of a scheduled run needs from its origin.
+pub(crate) struct ScheduledResultMeta {
+    pub(crate) task_id: String,
+    pub(crate) name: Option<String>,
+    pub(crate) deliver: crate::cron::ScheduledDeliver,
+}
+
+/// The result-row metadata of the scheduled invocation this call runs inside.
+pub(crate) fn current_result_meta() -> Option<ScheduledResultMeta> {
+    SCHEDULED_ORIGIN
+        .try_with(|origin| ScheduledResultMeta {
+            task_id: origin.task_id.clone(),
+            name: origin.name.clone(),
+            deliver: origin.deliver,
+        })
+        .ok()
 }
 
 /// A read-only observation held by the scheduler, never a permission to replay
@@ -87,6 +108,8 @@ impl ScheduledAgentOrigin {
             card: None,
             fresh: job.context == crate::cron::ScheduledContext::Fresh,
             goal_id: None,
+            name: job.name.clone(),
+            deliver: job.deliver,
         }
     }
 
@@ -103,6 +126,8 @@ impl ScheduledAgentOrigin {
             card: None,
             fresh: task.context == crate::cron::ScheduledContext::Fresh,
             goal_id: None,
+            name: Some(task.name.clone()),
+            deliver: task.deliver,
         }
     }
 
