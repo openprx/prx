@@ -126,6 +126,11 @@ pub struct MemoryConfig {
     /// For sqlite backend: prune daily rows older than this many days
     #[serde(default = "default_daily_retention_days")]
     pub daily_retention_days: u32,
+    /// Delete saved terminal sessions (`chat_session:*`) not updated for this
+    /// many days. 0 (default) keeps them forever. The message log
+    /// (`message_events`) is never deleted by this setting.
+    #[serde(default)]
+    pub saved_session_retention_days: u32,
     /// Embedding provider: "local" | "none" | "openai" | "custom:URL"
     #[serde(default = "default_embedding_provider")]
     pub embedding_provider: String,
@@ -330,6 +335,7 @@ impl Default for MemoryConfig {
             purge_after_days: default_purge_after_days(),
             conversation_retention_days: default_conversation_retention_days(),
             daily_retention_days: default_daily_retention_days(),
+            saved_session_retention_days: 0,
             embedding_provider: default_embedding_provider(),
             embedding_provider_explicit: false,
             embedding_model: default_embedding_model(),
