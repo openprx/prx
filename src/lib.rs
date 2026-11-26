@@ -564,8 +564,8 @@ pub enum CronCommands {
         name: Option<String>,
     },
     /// Mark a scheduled task as the operator's own (created before PRX
-    /// recorded who creates jobs): its shell command may then run git,
-    /// hardened. Jobs the agent created stay refused.
+    /// recorded who creates jobs): its runs are then treated as operator
+    /// work and run at Main's autonomy level.
     MarkOperator {
         /// Task ID
         id: String,
@@ -607,7 +607,8 @@ pub enum XinCommands {
         interval_secs: u64,
     },
     /// Mark a task as the operator's own (created before PRX recorded who
-    /// creates tasks): its shell command may then run git, hardened.
+    /// creates tasks): its runs are then treated as operator work and run
+    /// at Main's autonomy level.
     MarkOperator { id: String },
     /// Update editable task fields.
     Update {
