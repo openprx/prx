@@ -788,6 +788,7 @@ pub(crate) async fn run_with_runtime_envelope(
                     current_input_key: None,
                     excluded_session: None,
                     system_prompt,
+                    hooks: Some(hooks.as_ref()),
                     service: decision_service,
                     context: decision_context,
                     provider_label: provider_name,

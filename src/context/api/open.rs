@@ -5,11 +5,12 @@
 use std::sync::Arc;
 
 use super::prefix::{SessionPrefixInput, session_prefix};
-use super::tail::turn_tail;
+use super::tail::{TurnTailInput, turn_tail};
 use crate::agent::context_recall::{RECALL_CONTEXT_BUDGET, RecallScope, replayed_session_recall, scoped_recall};
 use crate::config::{AgentCompactionConfig, MemoryConfig};
 use crate::context::request_provenance::{LiveAttachment, note_live_attachment};
 use crate::context::transcript::{Attachment, History, Transcript, append_attachment};
+use crate::hooks::HookManager;
 use crate::memory::{ConversationTurn, Memory, MemoryFabric};
 use crate::providers::ChatMessage;
 use crate::runtime::envelope::RuntimeEnvelope;
@@ -75,6 +76,9 @@ pub(crate) struct OpenInput<'a> {
     pub(crate) excluded_session: Option<&'a str>,
     /// The system prompt of the turn, passed through untouched.
     pub(crate) system_prompt: String,
+    /// The surface's hook manager, for the session-open and turn-open context
+    /// hooks. `None` runs no context hook (child turns).
+    pub(crate) hooks: Option<&'a HookManager>,
     /// The compaction of the turn is resolved from these, for the provider
     /// and model the turn serves.
     pub(crate) service: &'a TurnRuntimeService,
@@ -112,6 +116,7 @@ pub(crate) async fn open_turn(input: OpenInput<'_>) -> TurnOpening {
         current_input_key,
         excluded_session,
         system_prompt,
+        hooks,
         service,
         context,
         provider_label,
@@ -145,13 +150,17 @@ pub(crate) async fn open_turn(input: OpenInput<'_>) -> TurnOpening {
         Some(card) => crate::security::redaction::redact_secrets(&format!("{}{card}", mem_context.preamble)),
         None => crate::security::redaction::redact_secrets(&mem_context.preamble),
     };
+    let hook_tail = turn_tail(TurnTailInput {
+        memory,
+        envelope,
+        memory_config,
+        visible_message,
+        hooks,
+    })
+    .await;
     let attachment = Attachment {
         prefix,
-        tail: format!(
-            "{}{}",
-            turn_tail(envelope, visible_message),
-            crate::agent::turn_contracts::current_time_tail()
-        ),
+        tail: format!("{}{}", hook_tail, crate::agent::turn_contracts::current_time_tail()),
     };
     let enriched_message = attachment.compose(visible_message);
     let replay_fabric = MemoryFabric::new(Arc::clone(memory), envelope.workspace_id.clone())

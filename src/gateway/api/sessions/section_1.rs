@@ -849,6 +849,7 @@ async fn run_console_runtime_turn(
         current_input_key: None,
         excluded_session: woken_sender.as_deref(),
         system_prompt,
+        hooks: Some(state.hooks.as_ref()),
         service: &decision.service,
         context: &decision.context,
         provider_label: &provider_label,

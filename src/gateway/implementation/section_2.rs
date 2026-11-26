@@ -1326,6 +1326,7 @@ async fn run_gateway_chat_with_multimodal(
                 current_input_key: autosave_key,
                 excluded_session: None,
                 system_prompt,
+                hooks: Some(state.hooks.as_ref()),
                 service,
                 context: &context,
                 provider_label,

@@ -285,6 +285,7 @@ impl ChildSegmentTurn {
             current_input_key: None,
             excluded_session: None,
             system_prompt,
+            hooks: None,
             service: &self.service,
             context: &self.decision,
             provider_label: model.provider_label(),
