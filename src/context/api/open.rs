@@ -18,6 +18,13 @@ use crate::runtime::turn_publication::TurnRuntimeService;
 /// here, because a budget of 0 switches the recall off.
 const REPLAYED_RECALL_BUDGET_FLOOR: usize = 1_024;
 
+/// The recall budget, in bytes, of every surface that replays the session's
+/// own rows: half the window of the model, clamped to the floor and to the
+/// context ceiling. The floor keeps a window of 0 from switching recall off.
+pub(crate) fn replayed_recall_budget(max_context_tokens: usize) -> usize {
+    (max_context_tokens / 2).clamp(REPLAYED_RECALL_BUDGET_FLOOR, RECALL_CONTEXT_BUDGET)
+}
+
 /// How the replayed tool results of the earlier turns are shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReplayMode {
@@ -101,8 +108,7 @@ pub(crate) async fn open_turn(input: OpenInput<'_>) -> TurnOpening {
     crate::providers::context_window::trace_effective_compaction_resolution(&effective_compaction);
     // The session's own rows are replayed below, so the recall carries no copy
     // of them, and its shared part is at most half the window of this model.
-    let recall_budget =
-        (effective_compaction.config.max_context_tokens / 2).clamp(REPLAYED_RECALL_BUDGET_FLOOR, RECALL_CONTEXT_BUDGET);
+    let recall_budget = replayed_recall_budget(effective_compaction.config.max_context_tokens);
     let mem_context = replayed_session_recall(
         memory.as_ref(),
         &RecallScope::from_envelope(envelope, memory_config, chat_type).with_excluded_session(excluded_session),

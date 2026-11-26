@@ -875,19 +875,13 @@ impl ChatTurnBinding {
         &self,
         memory: &dyn Memory,
     ) -> crate::agent::context_recall::RecalledMemoryContext {
-        // The gateway's recall budget (`src/context/api/open.rs`): half the
-        // window of the model, clamped. The floor mirrors that file's
-        // `REPLAYED_RECALL_BUDGET_FLOOR`. Before a decision exists there is no
-        // window, so the full budget applies.
-        const REPLAYED_RECALL_BUDGET_FLOOR: usize = 1_024;
-        let recall_budget =
-            self.main_compaction()
-                .map_or(crate::agent::context_recall::RECALL_CONTEXT_BUDGET, |config| {
-                    (config.max_context_tokens / 2).clamp(
-                        REPLAYED_RECALL_BUDGET_FLOOR,
-                        crate::agent::context_recall::RECALL_CONTEXT_BUDGET,
-                    )
-                });
+        // The session's replay budget of the model window. Before a decision
+        // exists there is no window, so the full budget applies.
+        let recall_budget = self
+            .main_compaction()
+            .map_or(crate::agent::context_recall::RECALL_CONTEXT_BUDGET, |config| {
+                crate::context::api::open::replayed_recall_budget(config.max_context_tokens)
+            });
         crate::agent::context_recall::replayed_session_recall(
             memory,
             &crate::agent::context_recall::RecallScope::from_envelope(
