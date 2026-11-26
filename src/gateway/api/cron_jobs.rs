@@ -11,7 +11,9 @@
 //! scheduler does not apply that command policy when the job later runs.
 
 use super::{ApiPrincipal, AppState};
-use crate::cron::{self, CronJob, CronJobEvent, CronJobLineage, CronJobPatch, CronRun, Schedule, ScheduledContext};
+use crate::cron::{
+    self, CronJob, CronJobEvent, CronJobLineage, CronJobPatch, CronRun, Schedule, ScheduledContext, ScheduledDeliver,
+};
 use crate::security::SideEffectGate;
 use crate::security::policy::{ResourceRiskLevel, SecurityPolicy};
 use axum::Json;
@@ -47,6 +49,8 @@ struct JobWrite {
     name: Option<String>,
     #[serde(default)]
     context: Option<ScheduledContext>,
+    #[serde(default)]
+    deliver: Option<ScheduledDeliver>,
 }
 
 #[derive(Deserialize)]
@@ -555,12 +559,18 @@ pub(super) async fn create_job(
     };
     match created {
         Ok(job) => {
-            let job = match write.context {
-                Some(ScheduledContext::Fresh) => match apply_fresh_context(&config, job) {
+            let stored = CronJobPatch {
+                context: write.context.filter(|context| *context == ScheduledContext::Fresh),
+                deliver: write.deliver.filter(|deliver| *deliver != ScheduledDeliver::Note),
+                ..CronJobPatch::default()
+            };
+            let job = if stored.context.is_some() || stored.deliver.is_some() {
+                match apply_stored_fields(&config, job, stored) {
                     Ok(job) => job,
                     Err(response) => return response,
-                },
-                _ => job,
+                }
+            } else {
+                job
             };
             match redact_job(&config, &job) {
                 Ok(value) => (StatusCode::OK, Json(value)),
@@ -571,13 +581,14 @@ pub(super) async fn create_job(
     }
 }
 
-/// Stores `context = "fresh"` on a job the route has just created (X5). A failed patch
-/// removes that job, so the caller is never left with a job it was told failed.
-fn apply_fresh_context(config: &crate::config::Config, job: CronJob) -> Result<CronJob, ApiResponse> {
-    let patch = CronJobPatch {
-        context: Some(ScheduledContext::Fresh),
-        ..CronJobPatch::default()
-    };
+/// Stores `context = "fresh"` and a non-note `deliver` on a job the route has just
+/// created (X5). A failed patch removes that job, so the caller is never left with a
+/// job it was told failed.
+fn apply_stored_fields(
+    config: &crate::config::Config,
+    job: CronJob,
+    patch: CronJobPatch,
+) -> Result<CronJob, ApiResponse> {
     match cron::update_job(config, &job.id, patch) {
         Ok(updated) => Ok(updated),
         Err(error) => {
@@ -625,8 +636,8 @@ pub(super) async fn patch_job(
         None => None,
     };
     let name = write.name.as_deref().map(|name| name.trim().to_string());
-    if schedule.is_none() && command.is_none() && name.is_none() && write.context.is_none() {
-        return bad_request("update requires a schedule, command, name, or context");
+    if schedule.is_none() && command.is_none() && name.is_none() && write.context.is_none() && write.deliver.is_none() {
+        return bad_request("update requires a schedule, command, name, context, or deliver");
     }
     if let Err(response) = authorize_cron(
         &state,
@@ -670,6 +681,7 @@ pub(super) async fn patch_job(
         name,
         created_via: command.is_some().then(|| route_creator(&state, &headers)),
         context: write.context,
+        deliver: write.deliver,
         ..CronJobPatch::default()
     };
     match cron::update_job(&config, id, patch) {
