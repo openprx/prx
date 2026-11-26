@@ -810,7 +810,16 @@ impl McpTool {
         }
 
         let raw = std::fs::read_to_string(&self.mcp_json_path)?;
-        let parsed: McpJsonRoot = serde_json::from_str(&raw)?;
+        // A serde message can echo the offending value (`invalid type: string
+        // "Bearer ..."`), so only its position and category are reported.
+        let parsed: McpJsonRoot = serde_json::from_str(&raw).map_err(|error| {
+            anyhow::anyhow!(
+                "workspace mcp.json is not valid MCP configuration (line {}, column {}, {:?})",
+                error.line(),
+                error.column(),
+                error.classify()
+            )
+        })?;
 
         let mut cfg = self.base_config.clone();
         let mut notes = Vec::new();

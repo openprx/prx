@@ -4,16 +4,20 @@
 //! tool calls. The tools it lists fill the client's `x-mcp-header` cache, so
 //! the calls that follow mirror those parameters into `Mcp-Param-*` headers.
 //!
-//! A session is reused while its URL and its configured headers are unchanged
-//! and its transport is open. The key holds a SHA-256 digest of the headers,
-//! so a credential change opens a new connection and the old one is closed.
-//! Header values stay in memory and in the encrypted configuration; nothing in
-//! this module formats them.
+//! A session is reused while its URL, its configured headers and its
+//! autonomy level (`full`, which selects the HTTP client's address resolver)
+//! are unchanged and its transport is open. The headers are keyed by a
+//! SHA-256 digest, so a credential change opens a new connection. The level is
+//! part of the key, so a client built for Full is never used by a call below
+//! Full.
+//!
+//! The slot lock is held only to get or create the client. Calls then run on
+//! the shared `Arc` client concurrently. Header values stay in memory and in
+//! the encrypted configuration; nothing in this module formats them.
 
 use super::lifecycle::McpEra;
 use super::{McpClient, McpTool};
 use crate::config::McpServerConfig;
-use anyhow::bail;
 use parking_lot::Mutex;
 use reqwest013::header::{HeaderName, HeaderValue};
 use rmcp::model::Tool;
@@ -26,22 +30,26 @@ use std::sync::Arc;
 pub(super) struct HttpSession {
     pub(super) url: String,
     pub(super) headers_digest: [u8; 32],
+    /// The autonomy level the client was built for; part of the reuse key.
+    pub(super) full: bool,
     /// The protocol era the server answered with on connect; kept for the
     /// session's lifetime so a reconnect does not probe again.
     pub(super) era: McpEra,
-    pub(super) client: McpClient,
+    pub(super) client: Arc<McpClient>,
 }
 
-/// The session slot of one server. The lock is held for the whole of a
-/// connect or a call, so calls to one server run one at a time.
+/// The session slot of one server. Its lock is held only to read or replace
+/// the session, never across a call.
 pub(super) type HttpSessionSlot = Arc<tokio::sync::Mutex<Option<HttpSession>>>;
 
 /// The slots of every HTTP server of one `McpTool`, by server name.
 pub(super) type HttpSessions = Mutex<HashMap<String, HttpSessionSlot>>;
 
-impl HttpSession {
-    pub(super) async fn close(self) {
-        let _ = self.client.cancel().await;
+/// Cancel a client when this is its last reference. A client still held by a
+/// call in flight is released when that call ends.
+async fn close_shared(client: Arc<McpClient>) {
+    if let Ok(client) = Arc::try_unwrap(client) {
+        let _ = client.cancel().await;
     }
 }
 
@@ -59,8 +67,10 @@ pub(super) fn headers_digest(headers: &BTreeMap<String, String>) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// The configured headers as transport headers. An invalid name or value is
-/// refused with an error that names the header, never its value.
+/// The configured headers as transport headers. Every value is marked
+/// sensitive, so the HTTP layer keeps it out of its own debug output. An
+/// invalid name or value is refused with an error that names the header,
+/// never its value.
 fn transport_headers(
     server_name: &str,
     headers: &BTreeMap<String, String>,
@@ -74,12 +84,13 @@ fn transport_headers(
                 name.escape_default()
             )
         })?;
-        let header_value = HeaderValue::from_str(value).map_err(|_| {
+        let mut header_value = HeaderValue::from_str(value).map_err(|_| {
             anyhow::anyhow!(
                 "MCP server '{server}': the value of header '{}' is not a valid HTTP header value",
                 name.escape_default()
             )
         })?;
+        header_value.set_sensitive(true);
         out.insert(header, header_value);
     }
     Ok(out)
@@ -116,40 +127,44 @@ pub(super) fn slot_for(sessions: &HttpSessions, server_name: &str) -> HttpSessio
 /// next [`acquire`] connects anew (discovery starts from a fresh connection).
 pub(super) async fn fresh_slot(sessions: &HttpSessions, server_name: &str) -> HttpSessionSlot {
     let previous = sessions.lock().remove(server_name);
-    if let Some(slot) = previous
-        && let Some(session) = slot.lock().await.take()
-    {
-        session.close().await;
+    if let Some(slot) = previous {
+        let taken = slot.lock().await.take();
+        if let Some(session) = taken {
+            close_shared(session.client).await;
+        }
     }
     slot_for(sessions, server_name)
 }
 
-/// Make `slot` hold a live session to `url` with `server`'s headers and return
-/// it locked. A session that matches and whose transport is open is reused;
-/// otherwise the old one is closed and a new one is connected, with its tools
-/// listed once so the `x-mcp-header` cache is filled. The listed tools are
-/// returned only for a new connection.
-pub(super) async fn acquire<'a>(
-    slot: &'a HttpSessionSlot,
+/// The client to talk to `url` with `server`'s headers at autonomy `full`.
+///
+/// A session that matches on URL, headers digest and level, and whose
+/// transport is open, is reused. Otherwise the old session is replaced by a
+/// new connection whose tools are listed once, so the `x-mcp-header` cache is
+/// filled; those tools are returned only for a new connection. The slot lock
+/// is held while connecting, so concurrent first calls share one connection.
+/// Returns the client, the era it answered with and the listed tools.
+pub(super) async fn acquire(
+    slot: &HttpSessionSlot,
     server_name: &str,
     url: &str,
     server: &McpServerConfig,
     full: bool,
     era: Option<McpEra>,
-) -> anyhow::Result<(tokio::sync::MutexGuard<'a, Option<HttpSession>>, Option<Vec<Tool>>)> {
+) -> anyhow::Result<(Arc<McpClient>, McpEra, Option<Vec<Tool>>)> {
     let digest = headers_digest(&server.headers);
     let mut guard = slot.lock().await;
-    let reusable = guard.as_ref().is_some_and(|session| {
-        session.url == url
-            && session.headers_digest == digest
-            && !session.client.is_closed()
-            && !session.client.is_transport_closed()
-    });
-    if reusable {
-        return Ok((guard, None));
+    if let Some(session) = guard.as_ref()
+        && session.url == url
+        && session.headers_digest == digest
+        && session.full == full
+        && !session.client.is_closed()
+        && !session.client.is_transport_closed()
+    {
+        return Ok((Arc::clone(&session.client), session.era, None));
     }
     if let Some(stale) = guard.take() {
-        stale.close().await;
+        close_shared(stale.client).await;
     }
     let headers = transport_headers(server_name, &server.headers)?;
     let (client, learnt) =
@@ -163,18 +178,35 @@ pub(super) async fn acquire<'a>(
             return Err(with_authorization_hint(server_name, error.into()));
         }
     };
+    let client = Arc::new(client);
     *guard = Some(HttpSession {
         url: url.to_string(),
         headers_digest: digest,
+        full,
         era: learnt,
-        client,
+        client: Arc::clone(&client),
     });
-    Ok((guard, Some(tools)))
+    Ok((client, learnt, Some(tools)))
+}
+
+/// Drop the session of `slot` only if it still holds `client`. A transport
+/// failure of one call must not tear down a fresh replacement made by another.
+pub(super) async fn reset_if_current(slot: &HttpSessionSlot, client: &Arc<McpClient>) {
+    let taken = {
+        let mut guard = slot.lock().await;
+        match guard.as_ref() {
+            Some(session) if Arc::ptr_eq(&session.client, client) => guard.take(),
+            _ => None,
+        }
+    };
+    if let Some(session) = taken {
+        close_shared(session.client).await;
+    }
 }
 
 /// Close and remove the sessions of `names` (every session when `None`).
-/// Returns how many running sessions were closed. Waits for a call in flight
-/// on a slot, so the caller holds the lifecycle lock that keeps calls out.
+/// Returns how many running sessions were closed. The caller holds the
+/// lifecycle lock, so no call is in flight through this tool.
 pub(super) async fn close_sessions(sessions: &HttpSessions, names: Option<&[String]>) -> usize {
     let slots: Vec<HttpSessionSlot> = {
         let mut map = sessions.lock();
@@ -187,15 +219,15 @@ pub(super) async fn close_sessions(sessions: &HttpSessions, names: Option<&[Stri
     for slot in slots {
         let session = slot.lock().await.take();
         if let Some(session) = session {
-            session.close().await;
+            close_shared(session.client).await;
             closed += 1;
         }
     }
     closed
 }
 
-/// Refuse a transport-level failure of a call: the session is dropped so the
-/// next call connects anew. Application-level errors keep the session.
+/// Whether a failed call means the transport is gone or stuck, so its session
+/// must be reset. Application-level errors keep the session.
 pub(super) fn is_transport_failure(error: &ServiceError) -> bool {
     matches!(
         error,
@@ -204,12 +236,4 @@ pub(super) fn is_transport_failure(error: &ServiceError) -> bool {
             | ServiceError::Cancelled { .. }
             | ServiceError::Timeout { .. }
     )
-}
-
-/// The session's kept era, or an error when the slot is empty.
-pub(super) fn era_of(server_name: &str, session: Option<&HttpSession>) -> anyhow::Result<McpEra> {
-    match session {
-        Some(session) => Ok(session.era),
-        None => bail!("MCP HTTP session for '{server_name}' was not initialized"),
-    }
 }

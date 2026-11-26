@@ -134,11 +134,10 @@ impl McpTool {
         Self::validate_http_target(url, full)?;
 
         let slot = http_session::fresh_slot(sessions, server_name).await;
-        let (session, listed) = http_session::acquire(&slot, server_name, url, server, full, era).await?;
+        let (_client, learnt, listed) = http_session::acquire(&slot, server_name, url, server, full, era).await?;
         let Some(listed) = listed else {
             bail!("MCP HTTP session for '{server_name}' listed no tools on connect");
         };
-        let learnt = http_session::era_of(server_name, session.as_ref())?;
 
         let tools = listed
             .into_iter()
@@ -173,37 +172,32 @@ impl McpTool {
         Self::validate_http_target(url, full)?;
 
         let request_timeout = Duration::from_millis(server.request_timeout_ms);
-        let (mut session, _) = match http_session::acquire(slot, server_name, url, server, full, *era).await {
+        // The slot lock is released inside `acquire`; the call runs on the
+        // shared client, so concurrent calls to one server do not queue.
+        let (client, learnt, _) = match http_session::acquire(slot, server_name, url, server, full, *era).await {
             Ok(connected) => connected,
             Err(error) => {
                 *era = None;
                 return Err(error);
             }
         };
-        *era = Some(http_session::era_of(server_name, session.as_ref())?);
-        let Some(active) = session.as_ref() else {
-            bail!("MCP HTTP session for '{server_name}' was not initialized");
-        };
+        *era = Some(learnt);
 
         let outcome = tokio::time::timeout(
             request_timeout,
-            active.client.call_tool(Self::call_tool_params(tool_name, arguments)),
+            client.call_tool(Self::call_tool_params(tool_name, arguments)),
         )
         .await;
         let result = match outcome {
             Ok(Ok(result)) => result,
             Ok(Err(error)) => {
-                if http_session::is_transport_failure(&error)
-                    && let Some(failed) = session.take()
-                {
-                    failed.close().await;
+                if http_session::is_transport_failure(&error) {
+                    http_session::reset_if_current(slot, &client).await;
                 }
                 return Err(http_session::with_authorization_hint(server_name, error.into()));
             }
             Err(_) => {
-                if let Some(failed) = session.take() {
-                    failed.close().await;
-                }
+                http_session::reset_if_current(slot, &client).await;
                 bail!(
                     "MCP call timed out after {} ms; HTTP session was reset and the call was not replayed",
                     server.request_timeout_ms
