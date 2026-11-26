@@ -1,0 +1,1911 @@
+use std::time::{Duration, Instant};
+mod persistence;
+mod restart;
+mod terminal_scope;
+use super::*;
+use crate::llm::route_decision::RouteDecision;
+use crate::memory::{Memory, MemoryPrincipal, MemoryVisibility, SqliteMemory};
+use std::sync::Arc;
+
+pub(crate) fn completed_commit(terminal_id: &str) -> TurnTerminalDraft {
+    let started_at = chrono::Utc::now();
+    TurnTerminalDraft {
+        binding: None,
+        terminal_id: terminal_id.to_string(),
+        scope: MessageEventScope::new("agent", MemoryVisibility::Workspace)
+            .with_channel("test")
+            .with_session_key(terminal_id)
+            .with_run_id(terminal_id),
+        status: TurnTerminalStatus::Completed,
+        history: Some(TurnHistoryProjection {
+            assistant_content: "done".to_string(),
+            history_commit_len: 2,
+        }),
+        history_scope: None,
+        provider_outcome: Some(ProviderExecutionOutcome::success_for_decision_with_usage(
+            &RouteDecision::single_candidate("ollama", "prx-local-model"),
+            started_at,
+            crate::llm::route_decision::TokenUsage::reported(Some(10), Some(5), Some(15)),
+        )),
+        telemetry: TurnTerminalTelemetry {
+            summary: "test completed".to_string(),
+            started_at,
+            finished_at: chrono::Utc::now(),
+        },
+        delivery_intent: TurnDeliveryIntent::ReturnToCaller,
+    }
+}
+
+fn boxed_terminal_fixture_turn<'a>(
+    history: &'a mut Vec<crate::providers::ChatMessage>,
+    request: crate::agent::turn_request::TurnRequest<'a>,
+    services: crate::agent::turn_request::TurnServices<'a>,
+    delivery: crate::agent::turn_request::TurnDelivery,
+) -> std::pin::Pin<
+    Box<
+        impl std::future::Future<
+            Output = anyhow::Result<(
+                crate::agent::turn_contracts::ToolLoopOutcome,
+                crate::agent::turn_contracts::ToolLoopTrace,
+            )>,
+        > + 'a,
+    >,
+> {
+    Box::pin(crate::agent::turn_engine::run_turn(
+        history, request, services, delivery,
+    ))
+}
+
+struct TerminalFixtureProvider {
+    outcome: ProviderExecutionOutcome,
+    text: String,
+    silent: bool,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl crate::providers::Provider for TerminalFixtureProvider {
+    async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+        anyhow::bail!("terminal fixture requires the actual traced provider path")
+    }
+    fn supports_native_tools(&self) -> bool {
+        true
+    }
+    async fn chat_traced(
+        &self,
+        request: crate::providers::ChatRequest<'_>,
+        model: &str,
+        _: f64,
+    ) -> anyhow::Result<crate::providers::traits::ChatTrace> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(model, self.outcome.final_model);
+        if self.silent {
+            assert!(request.tools.is_some_and(|tools| {
+                tools
+                    .iter()
+                    .any(|spec| spec.name == crate::tools::STAY_SILENT_TOOL_NAME)
+            }));
+        }
+        Ok(crate::providers::traits::ChatTrace {
+            response: crate::providers::ChatResponse {
+                text: (!self.silent).then(|| self.text.clone()),
+                tool_calls: if self.silent {
+                    vec![crate::providers::ToolCall {
+                        id: "prx_silent_call".into(),
+                        name: crate::tools::STAY_SILENT_TOOL_NAME.into(),
+                        arguments: serde_json::json!({"reason": "no group response needed"}).to_string(),
+                    }]
+                } else {
+                    Vec::new()
+                },
+                reasoning_content: None,
+            },
+            attempts: self.outcome.attempts.clone(),
+            final_provider: self.outcome.final_provider.clone(),
+            final_model: self.outcome.final_model.clone(),
+            served_member: None,
+            tokens_used: self.outcome.tokens_used.clone(),
+        })
+    }
+}
+
+// Issue actual source authority, seed only that authenticated memory scope,
+// and let the production decision/turn loop produce its observations.
+// Fixture setup must be constructed on its own frame: embedding its large
+// future in each recovery scenario inflates the aggregate poll stack.
+#[inline(never)]
+fn boxed_terminal_fixture_setup<F, Fut>(make_work: F) -> std::pin::Pin<Box<Fut>>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Arc<crate::runtime::turn_publication::TurnRuntimeService>>,
+{
+    Box::pin(make_work())
+}
+
+pub(crate) async fn bind_terminal_fixture(
+    workspace: &Path,
+    memory: Arc<dyn Memory>,
+    draft: &mut TurnTerminalDraft,
+    cost_config: &CostConfig,
+) -> Arc<crate::runtime::turn_publication::TurnRuntimeService> {
+    bind_terminal_fixture_mode(workspace, memory, draft, cost_config, true, None).await
+}
+
+pub(crate) async fn bind_terminal_fixture_mode(
+    workspace: &Path,
+    memory: Arc<dyn Memory>,
+    draft: &mut TurnTerminalDraft,
+    cost_config: &CostConfig,
+    recording: bool,
+    ingress_memory: Option<Arc<dyn Memory>>,
+) -> Arc<crate::runtime::turn_publication::TurnRuntimeService> {
+    bind_terminal_fixture_with_capture(workspace, memory, draft, cost_config, recording, ingress_memory, false)
+        .await
+}
+
+pub(crate) async fn bind_terminal_parameter_fixture(
+    workspace: &Path,
+    memory: Arc<dyn Memory>,
+    draft: &mut TurnTerminalDraft,
+    cost_config: &CostConfig,
+) -> Arc<crate::runtime::turn_publication::TurnRuntimeService> {
+    bind_terminal_fixture_with_capture(workspace, memory, draft, cost_config, true, None, true).await
+}
+
+async fn bind_terminal_fixture_with_capture(
+    workspace: &Path,
+    memory: Arc<dyn Memory>,
+    draft: &mut TurnTerminalDraft,
+    cost_config: &CostConfig,
+    recording: bool,
+    ingress_memory: Option<Arc<dyn Memory>>,
+    capture_parameters: bool,
+) -> Arc<crate::runtime::turn_publication::TurnRuntimeService> {
+    boxed_terminal_fixture_setup(move || async move {
+        let scoped_retrieval = !memory.requires_scoped_execution() && memory.name() != "postgres";
+        let input = if scoped_retrieval {
+            "Use memory_search to explain the saved expression `2 + 2`."
+        } else {
+            "Give a brief greeting."
+        };
+        let selection = draft
+            .provider_outcome
+            .as_ref()
+            .map_or(("ollama", "prx-local-model"), |outcome| {
+                (outcome.final_provider.as_str(), outcome.final_model.as_str())
+            });
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.to_path_buf();
+        config.config_path = workspace.join("config.toml");
+        config.decision_engine.backend.get_or_insert_with(Default::default).kind =
+            crate::config::schema::decision_engine::BackendSelection::Fixed(
+                crate::config::schema::decision_engine::BackendKind::Builtin,
+            );
+        config
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .remote_enabled = false;
+        // OV-13: an unrecorded terminal has user-message recording off.
+        config.memory.events.record_user_messages = recording;
+        config.cost = cost_config.clone();
+        config
+            .providers
+            .models
+            .push(crate::config::schema::ProviderModelConfig {
+                provider: selection.0.to_owned(),
+                model: Some(selection.1.to_owned()),
+                operations: Some(vec![crate::config::schema::ModelOperationSetting::Chat]),
+                native_tools: Some(true),
+                vision_input: None,
+                streaming: None,
+                structured_output: None,
+                tool_schema_dialect: None,
+                tool_call_dialect: None,
+                context_window: None,
+            });
+        let generation = crate::config::new_shared(config).pin();
+        let registry: Arc<Vec<Box<dyn crate::tools::Tool>>> = Arc::new(vec![
+            Box::new(crate::tools::MemorySearchTool::new(
+                workspace.to_path_buf(),
+                Arc::clone(&memory),
+                true,
+            )),
+            Box::new(crate::tools::StaySilentTool::new()),
+        ]);
+        let observer = Arc::new(crate::observability::NoopObserver {});
+        let hooks = Arc::new(crate::hooks::HookManager::new(workspace.to_path_buf()));
+        let service = crate::runtime::turn_publication::TurnPublication {
+            generation: Arc::clone(&generation),
+            registry: Arc::clone(&registry),
+            mcp_tool: None,
+            security: Arc::new(crate::security::SecurityPolicy::from_config(
+                &generation.effective.autonomy,
+                workspace,
+            )),
+            observer: observer.clone(),
+            hooks: Arc::clone(&hooks),
+            memory: Arc::clone(&memory),
+            plugin_generation: 0,
+        }
+        .publish(crate::tools::capability::turn_state::TurnSurfaceKind::AgentLoop)
+        .await
+        .unwrap();
+        let proof = match ingress_memory {
+            Some(ingress_memory) => {
+                crate::agent::entry::test_recovery_cli_agent_turn_proof_with_selection(
+                    &generation,
+                    ingress_memory,
+                    input,
+                    &draft.terminal_id,
+                    selection,
+                )
+                .await
+            }
+            None => {
+                crate::agent::entry::test_recorded_cli_agent_turn_proof_with_selection(
+                    &generation,
+                    Arc::clone(&memory),
+                    input,
+                    &draft.terminal_id,
+                    selection,
+                )
+                .await
+            }
+        };
+        assert!(
+            service.model_can_call_tools(&proof),
+            "fixture's actual traced provider supports verified native tools"
+        );
+        // With user-message recording off the inbound receipt is
+        // synthetic: the proof carries no source event (OV-13).
+        let source = match proof.source_event_id() {
+            Some(event_id) => {
+                let source = memory
+                    .find_owned_message_event(&workspace.to_string_lossy(), proof.owner_id(), event_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(source.content, input);
+                assert_eq!(source.owner_id.as_deref(), Some(proof.owner_id()));
+                assert_eq!(source.session_key.as_deref(), Some(proof.session_key()));
+                Some(source)
+            }
+            None => {
+                assert!(!recording, "a recorded turn carries its inbound source event");
+                None
+            }
+        };
+        if scoped_retrieval {
+            let mut write_scope = proof.memory_scope().clone();
+            write_scope.owner_id = Some(proof.owner_id().to_owned());
+            write_scope.require_owner_match = true;
+            memory
+                .store_with_context_and_metadata(
+                    "prx_terminal_fixture_note",
+                    "Use memory_search to explain the saved expression `2 + 2`. The expression adds two integers.",
+                    crate::memory::MemoryCategory::Core,
+                    Some(proof.session_key()),
+                    Some(&write_scope),
+                    crate::memory::MemoryStoreMetadata {
+                        workspace_id: Some(workspace.to_string_lossy().into_owned()),
+                        owner_id: Some(proof.owner_id().to_owned()),
+                        channel: source.as_ref().and_then(|source| source.channel.clone()),
+                        source_event_id: source.as_ref().map(|source| source.event_id.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        // Exclude preemption from the logical decision budget while
+        // retaining a real wall bound on fixture I/O.
+        let context = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::runtime::logical_clock::scope(
+                crate::runtime::logical_clock::ManualClock::new(),
+                service.open_issued_turn_context(
+                    &proof,
+                    crate::runtime::turn_context::AgentTurnKind::Repl,
+                    &cancellation,
+                ),
+            ),
+        )
+        .await
+        .expect("test: terminal fixture admission must complete its real I/O")
+        .expect("test: bind_terminal_fixture_mode fixture operation");
+        if capture_parameters {
+            context.runtime().capture_main_parameters(true);
+        }
+
+        if draft.status == TurnTerminalStatus::Silent {
+            let mut spec = service
+                .agent_runtime_dependency_spec(&proof, &context, crate::tools::STAY_SILENT_TOOL_NAME)
+                .unwrap();
+            let mut cache = crate::agent::turn_context::ToolSnapshotRenderCache::default();
+            spec.description.push_str(" changed fixture schema");
+            let changed =
+                crate::agent::turn_context::CompiledToolContext::compile(true, vec![spec], Vec::new(), &mut cache);
+            let error = service.record_agent_silence(&proof, &context, &changed).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("silence dependency changed after provider request")
+            );
+            let foreign = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_selection(
+                &generation,
+                Arc::clone(&memory),
+                input,
+                &format!("{}-foreign", draft.terminal_id),
+                selection,
+            )
+            .await;
+            let spec = service
+                .agent_runtime_dependency_spec(&proof, &context, crate::tools::STAY_SILENT_TOOL_NAME)
+                .unwrap();
+            let offered =
+                crate::agent::turn_context::CompiledToolContext::compile(true, vec![spec], Vec::new(), &mut cache);
+            let error = service.record_agent_silence(&foreign, &context, &offered).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("turn origin does not match the pinned decision service")
+            );
+        }
+        if matches!(draft.status, TurnTerminalStatus::Completed | TurnTerminalStatus::Silent) {
+            let provider = TerminalFixtureProvider {
+                outcome: draft
+                    .provider_outcome
+                    .clone()
+                    .expect("fixture actual provider response"),
+                text: draft
+                    .history
+                    .as_ref()
+                    .map_or_else(|| "done".to_owned(), |history| history.assistant_content.clone()),
+                silent: draft.status == TurnTerminalStatus::Silent,
+                calls: Default::default(),
+            };
+            let mut history = vec![crate::providers::ChatMessage::user(input)];
+            let result = boxed_terminal_fixture_turn(
+                &mut history,
+                crate::agent::turn_request::TurnRequest {
+                    advice: None,
+                    channel_name: "cli",
+                    scope: None,
+                    mode: Default::default(),
+                    silent: true,
+                    expose_stay_silent: provider.silent,
+                    multimodal: &generation.effective.multimodal,
+                    schedule: crate::agent::turn_request::TurnSchedule {
+                        read_only_tool_concurrency_window: 1,
+                        priority_scheduling_enabled: false,
+                        low_priority_tool_names: Vec::new(),
+                    },
+                    compaction: None,
+                    decision: crate::agent::turn_request::TurnDecision {
+                        service: &service,
+                        context: &context,
+                        runtime: context.runtime(),
+                        proof: &proof,
+                    },
+                },
+                crate::agent::turn_request::TurnServices {
+                    provider: &provider,
+                    provider_name: proof.provider_name(),
+                    model: proof.model_name(),
+                    temperature: 0.0,
+                    tools_registry: registry,
+                    observer: observer.as_ref(),
+                    hooks: hooks.as_ref(),
+                    approval: None,
+                    approval_resolver: None,
+                    runtime_adapter: Some(crate::agent::turn_contracts::ToolLoopRuntimeAdapter {
+                        live_frames: None,
+                        guarded_delivery: false,
+                        provider_trace: None,
+                        events: None,
+                        stream_provider: false,
+                        tool_execution_service: None,
+                        tool_execution_context: crate::tools::ToolExecutionContext::new(
+                            {
+                                let envelope = crate::runtime::envelope::RuntimeEnvelope::agent(
+                                    workspace.to_string_lossy(),
+                                    proof.run_id(),
+                                )
+                                .with_config_generation(&generation);
+                                match proof.source_event_id() {
+                                    Some(event_id) => envelope.with_source_message_event_id(event_id),
+                                    None => envelope,
+                                }
+                            },
+                            "private",
+                        ),
+                        allowed_tool_names: None,
+                    }),
+                    memory: crate::agent::turn_request::ToolLoopMemory::new(&memory, workspace, None),
+                },
+                crate::agent::turn_request::TurnDelivery {
+                    cancellation: Some(cancellation),
+                    on_delta: None,
+                    on_tool_call: None,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(
+                matches!(result.0, crate::agent::turn_contracts::ToolLoopOutcome::Silent { .. }),
+                provider.silent
+            );
+            let original = draft.provider_outcome.as_ref().unwrap();
+            assert_eq!(
+                result.1.tokens_used, original.tokens_used,
+                "real silent/text loop must retain complete reported usage"
+            );
+            let route = RouteDecision::single_candidate(&original.final_provider, &original.final_model);
+            let mut actual = provider_outcome_from_trace(&route, original.started_at, result.1);
+            // The upstream fixture's reason remains a redaction probe; execution
+            // status, attempts, serving tuple and usage all come from run_turn.
+            actual.fallback_reason.clone_from(&original.fallback_reason);
+            draft.provider_outcome = Some(actual);
+        }
+        let binding = service.terminal_binding(&context).unwrap();
+        draft.scope = MessageEventScope::new("agent", MemoryVisibility::Session)
+            .with_owner_id(proof.owner_id())
+            .with_channel("cli")
+            .with_session_key(proof.session_key())
+            .with_run_id(proof.run_id());
+        draft.scope.causation_event_id = proof.source_event_id().map(str::to_owned);
+        draft.binding = Some(binding);
+        // The decision writer can enqueue causal events after its own commit.
+        // Establish fixture baselines only after both queues acknowledge.
+        assert!(service.drain_writes(Instant::now() + Duration::from_secs(5)).await);
+        service
+    })
+    .await
+}
+
+#[tokio::test]
+async fn skill_awaiting_approval_reads_ledger_state() {
+    let temp = tempfile::tempdir().expect("test: skill_awaiting_approval_reads_ledger_state fixture operation");
+    let memory: Arc<dyn Memory> = Arc::new(
+        SqliteMemory::new(temp.path()).expect("test: skill_awaiting_approval_reads_ledger_state fixture operation"),
+    );
+    let mut draft = completed_commit("prx_awaiting_ledger");
+    let _service =
+        bind_terminal_fixture(temp.path(), Arc::clone(&memory), &mut draft, &CostConfig::default()).await;
+    let binding = draft.binding.expect("test: fixture binding");
+    assert!(
+        !skill_awaiting_approval(binding.runtime()),
+        "an ordinary completed turn is not awaiting approval"
+    );
+}
+
+fn terminal_fixture_principal(workspace: &Path, scope: &MessageEventScope) -> MemoryPrincipal {
+    MemoryPrincipal {
+        require_owner_match: true,
+        workspace_id: workspace.to_string_lossy().into_owned(),
+        agent_id: None,
+        persona_id: None,
+        session_key: scope.session_key.clone(),
+        channel: scope.channel.clone(),
+        sender: None,
+        owner_id: scope.owner_id.clone(),
+        legacy_session_key: None,
+        agent_partition: None,
+    }
+}
+
+#[tokio::test]
+async fn inconsistent_silent_status_is_rejected_before_writes_in_recorded_and_disabled_modes() {
+    for enabled in [true, false] {
+        for issued_silent in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
+            // Disabled mode is user-message recording off (OV-13): the
+            // terminal fabric and the proof both see it.
+            let fabric = MemoryFabric::new(Arc::clone(&memory), temp.path().to_string_lossy())
+                .with_event_recording(crate::memory::MemoryEventRecording {
+                    record_user_messages: enabled,
+                    ..crate::memory::MemoryEventRecording::default()
+                });
+            let mut draft = completed_commit("prx_silent_consistency");
+            if issued_silent {
+                draft.status = TurnTerminalStatus::Silent;
+                draft.delivery_intent = TurnDeliveryIntent::None;
+            }
+            let service = bind_terminal_fixture_mode(
+                temp.path(),
+                Arc::clone(&memory),
+                &mut draft,
+                &CostConfig::default(),
+                enabled,
+                None,
+            )
+            .await;
+            let principal = terminal_fixture_principal(temp.path(), &draft.scope);
+            let before = memory.list_message_events_since(&principal, 0, 128).await.unwrap();
+            assert_eq!(
+                before
+                    .iter()
+                    .any(|event| event.role == "user" && event.event_type == "message.created"),
+                enabled,
+                "only a recorded turn persists its inbound user message"
+            );
+            draft.status = if issued_silent {
+                TurnTerminalStatus::Completed
+            } else {
+                TurnTerminalStatus::Silent
+            };
+            let error = finalize_turn(&fabric, draft, &CostConfig::default(), temp.path())
+                .await
+                .unwrap_err();
+            let expected = if issued_silent {
+                "authorized silence cannot be relabeled"
+            } else {
+                "silent terminal lacks confirmed runtime execution facts"
+            };
+            assert!(error.to_string().contains(expected), "{error:#}");
+            assert!(service.drain_writes(Instant::now() + Duration::from_secs(5)).await);
+            let after = memory.list_message_events_since(&principal, 0, 128).await.unwrap();
+            assert_eq!(
+                before.iter().map(|event| &event.event_id).collect::<Vec<_>>(),
+                after.iter().map(|event| &event.event_id).collect::<Vec<_>>(),
+                "before event metadata: {:?}; after event metadata: {:?}",
+                before
+                    .iter()
+                    .map(|event| (&event.event_id, &event.event_type, &event.role))
+                    .collect::<Vec<_>>(),
+                after
+                    .iter()
+                    .map(|event| (&event.event_id, &event.event_type, &event.role))
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                !after
+                    .iter()
+                    .any(|event| event.event_type == "turn.finalized" || event.event_type == "usage.settled")
+            );
+            assert!(!temp.path().join("state/costs.jsonl").exists());
+            service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn foreign_fabric_workspace_cannot_redirect_issued_cost_settlement() {
+    let temp = tempfile::tempdir().unwrap();
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
+    let cost_config = CostConfig::default();
+    let mut commit = completed_commit("foreign-workspace-run");
+    let service = bind_terminal_fixture(temp.path(), Arc::clone(&memory), &mut commit, &cost_config).await;
+    let principal = terminal_fixture_principal(temp.path(), &commit.scope);
+    let before = memory.list_message_events_since(&principal, 0, 32).await.unwrap();
+    assert!(
+        before
+            .iter()
+            .any(|event| event.role == "user" && event.event_type == "message.created")
+    );
+    // Change only the fabric namespace. The real issued scope, backend,
+    // physical settlement directory and cost configuration remain intact.
+    let fabric = MemoryFabric::new(Arc::clone(&memory), "foreign-logical-workspace");
+    let error = finalize_turn(&fabric, commit, &cost_config, temp.path())
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("decision terminal workspace does not match the pinned turn")
+    );
+    assert!(service.drain_writes(Instant::now() + Duration::from_secs(5)).await);
+    let after = memory.list_message_events_since(&principal, 0, 32).await.unwrap();
+    assert_eq!(
+        after.iter().map(|event| &event.event_id).collect::<Vec<_>>(),
+        before.iter().map(|event| &event.event_id).collect::<Vec<_>>(),
+        "before event metadata: {:?}; after event metadata: {:?}",
+        before
+            .iter()
+            .map(|event| (&event.event_id, &event.event_type, &event.role))
+            .collect::<Vec<_>>(),
+        after
+            .iter()
+            .map(|event| (&event.event_id, &event.event_type, &event.role))
+            .collect::<Vec<_>>()
+    );
+    let mut foreign = principal;
+    foreign.workspace_id = "foreign-logical-workspace".to_owned();
+    assert!(
+        memory
+            .list_message_events_since(&foreign, 0, 32)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!temp.path().join("state/costs.jsonl").exists());
+    service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+}
+
+#[tokio::test]
+async fn occupied_cost_state_directory_is_recorded_in_terminal_projection() {
+    let temp = tempfile::tempdir().unwrap();
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
+    let fabric = MemoryFabric::new(memory.clone(), temp.path().to_string_lossy());
+    let cost_config = priced_cost_config();
+
+    let mut commit = completed_commit("preflight-failure-run");
+    let service = bind_terminal_fixture(temp.path(), Arc::clone(&memory), &mut commit, &cost_config).await;
+    let principal = terminal_fixture_principal(temp.path(), &commit.scope);
+    std::fs::write(temp.path().join("state"), "occupied").unwrap();
+    let receipt = finalize_turn(&fabric, commit, &cost_config, temp.path()).await.unwrap();
+
+    assert!(matches!(
+        receipt.cost_settlement,
+        Some(CostSettlement::ProjectionPending)
+    ));
+    let events = memory.list_message_events_since(&principal, 0, 32).await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "usage.settled")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "turn.finalized")
+            .count(),
+        1
+    );
+    let terminal_payload: serde_json::Value = serde_json::from_str(
+        events
+            .iter()
+            .find(|event| event.event_type == "turn.finalized")
+            .and_then(|event| event.raw_payload_json.as_deref())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        terminal_payload
+            .pointer("/cost_settlement/status")
+            .and_then(serde_json::Value::as_str),
+        Some("projection_pending")
+    );
+    service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+}
+
+#[tokio::test]
+async fn lost_runtime_authority_fails_before_terminal_or_cost_projection() {
+    let temp = tempfile::tempdir().unwrap();
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
+    let fabric = MemoryFabric::new(memory.clone(), temp.path().to_string_lossy());
+    let mut commit = completed_commit("lost-authority-run");
+    let service =
+        bind_terminal_fixture(temp.path(), Arc::clone(&memory), &mut commit, &CostConfig::default()).await;
+    let principal = terminal_fixture_principal(temp.path(), &commit.scope);
+    let before = memory.list_message_events_since(&principal, 0, 32).await.unwrap();
+    assert!(
+        before
+            .iter()
+            .any(|event| event.role == "user" && event.event_type == "message.created")
+    );
+    commit.scope.authority_guard = Some(crate::memory::RuntimeAuthorityGuard::new("lost-authority", || {
+        Ok(false)
+    }));
+    let cost_config = CostConfig::default();
+
+    let error = finalize_turn(&fabric, commit, &cost_config, temp.path())
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("runtime execution authority was lost"));
+    assert!(service.drain_writes(Instant::now() + Duration::from_secs(5)).await);
+    let events = memory.list_message_events_since(&principal, 0, 32).await.unwrap();
+    assert_eq!(
+        events.iter().map(|event| &event.event_id).collect::<Vec<_>>(),
+        before.iter().map(|event| &event.event_id).collect::<Vec<_>>(),
+        "before event metadata: {:?}; after event metadata: {:?}",
+        before
+            .iter()
+            .map(|event| (&event.event_id, &event.event_type, &event.role))
+            .collect::<Vec<_>>(),
+        events
+            .iter()
+            .map(|event| (&event.event_id, &event.event_type, &event.role))
+            .collect::<Vec<_>>()
+    );
+    assert!(!temp.path().join("state").join("costs.jsonl").exists());
+    service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+}
+
+#[tokio::test]
+async fn authority_lost_during_projection_never_writes_stale_terminal_or_assistant() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let temp = tempfile::tempdir().unwrap();
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
+    let fabric = MemoryFabric::new(memory.clone(), temp.path().to_string_lossy());
+    let validations = Arc::new(AtomicUsize::new(0));
+    let mut commit = completed_commit("mid-finalize-authority-loss");
+    let service =
+        bind_terminal_fixture(temp.path(), Arc::clone(&memory), &mut commit, &CostConfig::default()).await;
+    let principal = terminal_fixture_principal(temp.path(), &commit.scope);
+    commit.scope.authority_guard = Some(crate::memory::RuntimeAuthorityGuard::new(
+        "authority-lost-before-terminal-commit",
+        {
+            let validations = Arc::clone(&validations);
+            move || Ok(validations.fetch_add(1, Ordering::SeqCst) == 0)
+        },
+    ));
+
+    let error = finalize_turn(&fabric, commit, &CostConfig::default(), temp.path())
+        .await
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("runtime execution authority was lost during terminal finalization phase projection")
+    );
+    assert_eq!(validations.load(Ordering::SeqCst), 2);
+    let events = memory.list_message_events_since(&principal, 0, 32).await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "usage.settled")
+            .count(),
+        0
+    );
+    assert!(crate::memory::sqlite::fixture_readback::outbox_rows(temp.path()).is_empty());
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "turn.finalized")
+            .count(),
+        0
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "message.created" && event.role == "assistant")
+            .count(),
+        0
+    );
+    service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+}
+
+pub(crate) fn priced_cost_config() -> CostConfig {
+    let mut cost_config = CostConfig::default();
+    cost_config.prices.insert(
+        "ollama/prx-local-model".to_string(),
+        crate::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 0.0,
+            cache_read: 0.0,
+        },
+    );
+    cost_config
+}
+
+fn ledger_lines_for(workspace: &Path, terminal_id: &str) -> usize {
+    std::fs::read_to_string(workspace.join("state").join("costs.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains(terminal_id))
+        .count()
+}
+
+/// Finding 85: the first finalization stores `Recorded`; replaying the same
+/// priced settlement over the committed marker yields `Replayed`. The replay
+/// must succeed with the same receipt and must not charge a second time.
+#[tokio::test]
+async fn priced_completed_finalization_replays_over_its_committed_marker() {
+    let temp = tempfile::tempdir().unwrap();
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
+    let fabric = MemoryFabric::new(memory.clone(), temp.path().to_string_lossy());
+    let cost_config = priced_cost_config();
+    let terminal_id = "priced-replay-run";
+    let mut commit = completed_commit(terminal_id);
+    let service = bind_terminal_fixture(temp.path(), Arc::clone(&memory), &mut commit, &cost_config).await;
+
+    let first = finalize_turn(&fabric, commit.clone(), &cost_config, temp.path())
+        .await
+        .unwrap();
+    assert!(matches!(first.cost_settlement, Some(CostSettlement::ProjectionPending)));
+    let charged = ledger_lines_for(temp.path(), terminal_id);
+    assert_eq!(charged, 1, "the first finalization charges exactly once");
+
+    let second = finalize_turn(&fabric, commit, &cost_config, temp.path())
+        .await
+        .expect("a priced replay over the committed marker must finalize");
+    assert!(matches!(
+        second.cost_settlement,
+        Some(CostSettlement::ProjectionPending)
+    ));
+    assert_eq!(first.terminal_event.event_id, second.terminal_event.event_id);
+    assert_eq!(first.usage_settlement, second.usage_settlement);
+    assert_eq!(ledger_lines_for(temp.path(), terminal_id), charged, "no second charge");
+    service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+}
+
+/// A replay that carries a genuinely different settlement (other token
+/// counts, hence another amount) is rejected, leaving the ledger untouched.
+/// The provider outcome is part of the terminal decision claim, so the
+/// claim fingerprint refuses it before any cost-settlement comparison runs.
+#[tokio::test]
+async fn priced_replay_with_a_different_settlement_is_rejected() {
+    let temp = tempfile::tempdir().unwrap();
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
+    let fabric = MemoryFabric::new(memory.clone(), temp.path().to_string_lossy());
+    let cost_config = priced_cost_config();
+    let terminal_id = "priced-replay-mismatch-run";
+    let mut commit = completed_commit(terminal_id);
+    let service = bind_terminal_fixture(temp.path(), Arc::clone(&memory), &mut commit, &cost_config).await;
+
+    finalize_turn(&fabric, commit.clone(), &cost_config, temp.path())
+        .await
+        .unwrap();
+    let charged = ledger_lines_for(temp.path(), terminal_id);
+    assert_eq!(charged, 1);
+
+    let mut different = commit;
+    different.provider_outcome = Some(ProviderExecutionOutcome::success_for_decision_with_usage(
+        &RouteDecision::single_candidate("ollama", "prx-local-model"),
+        different.telemetry.started_at,
+        crate::llm::route_decision::TokenUsage::reported(Some(1000), Some(500), Some(1500)),
+    ));
+    let error = finalize_turn(&fabric, different, &cost_config, temp.path()).await;
+    let error = error.expect_err("a different settlement must not replay over the marker");
+    let text = error.to_string();
+    assert!(
+        text.contains("terminal decision claim conflicts with the pinned decision or scope")
+            || text.contains("recovery terminal commit conflict"),
+        "unexpected rejection: {error:#}"
+    );
+    assert_eq!(
+        ledger_lines_for(temp.path(), terminal_id),
+        charged,
+        "the ledger is unchanged"
+    );
+    service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unwritable_cost_ledger_is_recorded_in_terminal_projection() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let cost_path = state_dir.join("costs.jsonl");
+    std::fs::write(&cost_path, "").unwrap();
+    std::fs::set_permissions(&cost_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
+    let fabric = MemoryFabric::new(memory.clone(), temp.path().to_string_lossy());
+    let mut cost_config = CostConfig::default();
+    cost_config.prices.insert(
+        "ollama/prx-local-model".to_string(),
+        crate::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 0.0,
+            cache_read: 0.0,
+        },
+    );
+
+    let mut commit = completed_commit("cost-write-failure-run");
+    let service = bind_terminal_fixture(temp.path(), Arc::clone(&memory), &mut commit, &cost_config).await;
+    let principal = terminal_fixture_principal(temp.path(), &commit.scope);
+    let receipt = finalize_turn(&fabric, commit, &cost_config, temp.path()).await.unwrap();
+
+    assert!(matches!(
+        receipt.cost_settlement,
+        Some(CostSettlement::ProjectionPending)
+    ));
+    let events = memory.list_message_events_since(&principal, 0, 32).await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "usage.settled")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "turn.finalized")
+            .count(),
+        1
+    );
+    service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cost_lock_wait_does_not_block_runtime_and_usage_precedes_projection() {
+    let temp = tempfile::tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let cost_path = state_dir.join("costs.jsonl");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(cost_path.with_extension("jsonl.lock"))
+        .unwrap();
+
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
+    let fabric = MemoryFabric::new(memory.clone(), temp.path().to_string_lossy());
+    let mut cost_config = CostConfig::default();
+    cost_config.prices.insert(
+        "ollama/prx-local-model".to_string(),
+        crate::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 0.0,
+            cache_read: 0.0,
+        },
+    );
+    let mut commit = completed_commit("cost-lock-liveness");
+    let service = bind_terminal_fixture(temp.path(), Arc::clone(&memory), &mut commit, &cost_config).await;
+    let principal = terminal_fixture_principal(temp.path(), &commit.scope);
+    lock_file.lock().unwrap();
+    let workspace_dir = temp.path().to_path_buf();
+    let task = tokio::spawn({
+        let fabric = fabric.clone();
+        async move { finalize_turn(&fabric, commit, &cost_config, &workspace_dir).await }
+    });
+
+    // Wait for the actual durable event, not an assumed scheduler/SQLite
+    // latency. The ledger lock remains held throughout this observation.
+    let events = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let events = memory.list_message_events_since(&principal, 0, 32).await.unwrap();
+            if events.iter().any(|event| event.event_type == "usage.settled") {
+                break events;
+            }
+            assert!(!task.is_finished(), "finalization ended before usage was settled");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("usage must settle while the cost ledger is locked");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "usage.settled")
+            .count(),
+        1
+    );
+    // A timer must still run on this single-thread runtime while the cost
+    // projection waits for the lock in the blocking pool.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(!cost_path.exists());
+    assert!(!task.is_finished());
+
+    drop(lock_file);
+    let receipt = task.await.unwrap().unwrap();
+    assert!(matches!(
+        receipt.cost_settlement,
+        Some(CostSettlement::ProjectionPending)
+    ));
+    assert_eq!(
+        std::fs::read_to_string(&cost_path)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count(),
+        1
+    );
+    service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+}
+
+#[tokio::test]
+async fn repeated_finalize_writes_one_terminal_one_assistant_and_one_usage_settlement() {
+    let temp = tempfile::tempdir().unwrap();
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
+    let fabric = MemoryFabric::new(memory.clone(), temp.path().to_string_lossy());
+    let scope = MessageEventScope::new("agent", MemoryVisibility::Workspace)
+        .with_channel("test")
+        .with_session_key("session-a")
+        .with_run_id("run-a");
+    let started_at = chrono::Utc::now();
+    let outcome = ProviderExecutionOutcome::success_for_decision_with_usage(
+        &RouteDecision::single_candidate("ollama", "prx-local-model"),
+        started_at,
+        crate::llm::route_decision::TokenUsage::reported(Some(10), Some(5), Some(15)),
+    );
+    let mut commit = TurnTerminalDraft {
+        binding: None,
+        terminal_id: "run-a".to_string(),
+        scope,
+        status: TurnTerminalStatus::Completed,
+        history: Some(TurnHistoryProjection {
+            assistant_content: "done".to_string(),
+            history_commit_len: 2,
+        }),
+        history_scope: None,
+        provider_outcome: Some(outcome),
+        telemetry: TurnTerminalTelemetry {
+            summary: "test completed".to_string(),
+            started_at,
+            finished_at: chrono::Utc::now(),
+        },
+        delivery_intent: TurnDeliveryIntent::ReturnToCaller,
+    };
+
+    let service =
+        bind_terminal_fixture(temp.path(), Arc::clone(&memory), &mut commit, &CostConfig::default()).await;
+    let principal = terminal_fixture_principal(temp.path(), &commit.scope);
+
+    let first = finalize_turn(&fabric, commit.clone(), &CostConfig::default(), temp.path())
+        .await
+        .unwrap();
+    let second = finalize_turn(&fabric, commit, &CostConfig::default(), temp.path())
+        .await
+        .unwrap();
+
+    assert_eq!(first.terminal_event.event_id, second.terminal_event.event_id);
+    assert_eq!(
+        first
+            .usage_settlement
+            .as_ref()
+            .and_then(|usage| usage.settlement_id.as_deref()),
+        Some("run-a")
+    );
+    assert_eq!(first.cost_settlement, Some(CostSettlement::UnknownPricing));
+
+    let events = memory.list_message_events_since(&principal, 0, 32).await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "turn.finalized")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "usage.settled")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "message.created" && event.role == "assistant")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "provider.final_outcome")
+            .count(),
+        1
+    );
+    service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+}
+
+#[tokio::test]
+async fn non_reply_terminal_states_replay_once_without_assistant_projection() {
+    for (index, status) in [
+        TurnTerminalStatus::Silent,
+        TurnTerminalStatus::Failed,
+        TurnTerminalStatus::Cancelled,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
+        let fabric = MemoryFabric::new(memory.clone(), temp.path().to_string_lossy());
+        let session_key = format!("non-reply-{index}");
+        let terminal_id = format!("terminal-{index}");
+        let scope = MessageEventScope::new("agent", MemoryVisibility::Workspace)
+            .with_channel("test")
+            .with_session_key(session_key.clone())
+            .with_run_id(terminal_id.clone());
+        let started_at = chrono::Utc::now();
+        let provider_outcome = (status == TurnTerminalStatus::Silent).then(|| {
+            ProviderExecutionOutcome::success_for_decision_with_usage(
+                &RouteDecision::single_candidate("ollama", "prx-local-model"),
+                started_at,
+                crate::llm::route_decision::TokenUsage::reported(Some(4), Some(2), Some(6)),
+            )
+        });
+        let mut commit = TurnTerminalDraft {
+            binding: None,
+            terminal_id: terminal_id.clone(),
+            scope,
+            status,
+            // A defensive history projection on a non-completed status must
+            // never create an assistant message.
+            history: Some(TurnHistoryProjection {
+                assistant_content: "must not be projected".to_string(),
+                history_commit_len: 2,
+            }),
+            history_scope: None,
+            provider_outcome,
+            telemetry: TurnTerminalTelemetry {
+                summary: format!("{status:?}"),
+                started_at,
+                finished_at: chrono::Utc::now(),
+            },
+            delivery_intent: TurnDeliveryIntent::None,
+        };
+
+        let service =
+            bind_terminal_fixture(temp.path(), Arc::clone(&memory), &mut commit, &CostConfig::default()).await;
+        let principal = terminal_fixture_principal(temp.path(), &commit.scope);
+
+        let first = finalize_turn(&fabric, commit.clone(), &CostConfig::default(), temp.path())
+            .await
+            .unwrap();
+        let second = finalize_turn(&fabric, commit, &CostConfig::default(), temp.path())
+            .await
+            .unwrap();
+        assert_eq!(first.terminal_event.event_id, second.terminal_event.event_id);
+        for receipt in [&first, &second] {
+            let payload: serde_json::Value =
+                serde_json::from_str(receipt.terminal_event.raw_payload_json.as_deref().unwrap()).unwrap();
+            assert_eq!(payload.get("status"), Some(&serde_json::to_value(status).unwrap()));
+        }
+        assert!(first.assistant_event.is_none());
+        assert_eq!(first.usage_settlement.is_some(), status == TurnTerminalStatus::Silent);
+        let events = memory.list_message_events_since(&principal, 0, 128).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.event_type == "turn.finalized" && event.content.contains(terminal_id.as_str())
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "message.created" && event.role == "assistant")
+                .count(),
+            0
+        );
+        service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+    }
+}
+
+#[tokio::test]
+async fn unissued_entrypoint_label_drafts_are_rejected_before_side_effects() {
+    const ENTRYPOINTS: [&str; 8] = [
+        "chat",
+        "agent",
+        "gateway_webhook",
+        "channel",
+        "gateway_console",
+        "session_worker",
+        "sessions_spawn",
+        "delegate",
+    ];
+    let temp = tempfile::tempdir().unwrap();
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
+    let fabric = MemoryFabric::new(memory.clone(), "workspace-a");
+
+    for entrypoint in ENTRYPOINTS {
+        let terminal_id = format!("{entrypoint}-run");
+        let scope = MessageEventScope::new(entrypoint, MemoryVisibility::Workspace)
+            .with_channel(entrypoint)
+            .with_session_key(terminal_id.clone())
+            .with_run_id(terminal_id.clone());
+        let started_at = chrono::Utc::now();
+        let outcome = ProviderExecutionOutcome::success_for_decision_with_usage(
+            &RouteDecision::single_candidate("ollama", "prx-local-model"),
+            started_at,
+            crate::llm::route_decision::TokenUsage::reported(Some(3), Some(2), Some(5)),
+        );
+        let error = finalize_turn(
+            &fabric,
+            TurnTerminalDraft {
+                binding: None,
+                terminal_id: terminal_id.clone(),
+                scope,
+                status: TurnTerminalStatus::Completed,
+                history: Some(TurnHistoryProjection {
+                    assistant_content: format!("{entrypoint} done"),
+                    history_commit_len: 2,
+                }),
+                history_scope: None,
+                provider_outcome: Some(outcome),
+                telemetry: TurnTerminalTelemetry {
+                    summary: format!("{entrypoint} completed"),
+                    started_at,
+                    finished_at: chrono::Utc::now(),
+                },
+                delivery_intent: TurnDeliveryIntent::ReturnToCaller,
+            },
+            &CostConfig::default(),
+            temp.path(),
+        )
+        .await
+        .unwrap_err();
+        // R29: the terminal binding is checked first, so an unissued
+        // draft is refused for its missing binding.
+        assert_eq!(error.to_string(), "terminal draft has no terminal binding");
+
+        let principal = MemoryPrincipal {
+            require_owner_match: false,
+            workspace_id: "workspace-a".to_string(),
+            agent_id: None,
+            persona_id: None,
+            session_key: Some(terminal_id.clone()),
+            channel: Some(entrypoint.to_string()),
+            sender: None,
+            owner_id: None,
+            legacy_session_key: None,
+            agent_partition: None,
+        };
+        let events = memory.list_message_events_since(&principal, 0, 128).await.unwrap();
+        assert!(events.is_empty(), "unissued {entrypoint} must not persist any event");
+        assert!(!temp.path().join("state/costs.jsonl").exists());
+        assert!(!temp.path().join("self/causal_tree/decisions.db").exists());
+    }
+}
+
+/// R-C2BU F-6: persisted outcomes name the provider redacted, but the
+/// spend of a password-URL provider must still be priced and recorded
+/// against a `[cost].prices` entry keyed by the configured label.
+/// D-054: the usage settlement a surface records when its terminal commit
+/// failed names the serving provider without URL userinfo.
+#[test]
+fn a_fallback_usage_settlement_names_no_url_password() {
+    let outcome = ProviderExecutionOutcome::success_for_decision_with_usage(
+        &RouteDecision::single_candidate("custom:http://u:USAGE-SECRET-pw@127.0.0.1:1/v1", "prx-local-model"),
+        chrono::Utc::now(),
+        crate::llm::route_decision::TokenUsage::reported(Some(10), Some(5), Some(15)),
+    );
+    let record = usage_settlement("run-fallback", &outcome, &CostConfig::default()).expect("test: usage settles");
+    assert!(!format!("{record:?}").contains("USAGE-SECRET-pw"), "{record:?}");
+    assert_eq!(record.settlement_id.as_deref(), Some("run-fallback"));
+}
+
+#[tokio::test]
+async fn spend_through_a_password_url_provider_is_still_priced_and_recorded() {
+    let temp = tempfile::tempdir().unwrap();
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
+    let fabric = MemoryFabric::new(memory.clone(), temp.path().to_string_lossy());
+    let label = "custom:http://u:SECRET-fixture-pw@127.0.0.1:1/v1";
+    let mut cost_config = CostConfig::default();
+    cost_config.prices.insert(
+        format!("{label}/prx-local-model"),
+        crate::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 0.0,
+            cache_read: 0.0,
+        },
+    );
+    let scope = MessageEventScope::new("agent", MemoryVisibility::Workspace)
+        .with_channel("test")
+        .with_session_key("session-priced")
+        .with_run_id("run-priced");
+    let started_at = chrono::Utc::now();
+    let outcome = ProviderExecutionOutcome::success_for_decision_with_usage(
+        &RouteDecision::single_candidate(label, "prx-local-model"),
+        started_at,
+        crate::llm::route_decision::TokenUsage::reported(Some(10), Some(5), Some(15)),
+    );
+    let mut commit = TurnTerminalDraft {
+        binding: None,
+        terminal_id: "run-priced".to_string(),
+        scope,
+        status: TurnTerminalStatus::Completed,
+        history: Some(TurnHistoryProjection {
+            assistant_content: "done".to_string(),
+            history_commit_len: 2,
+        }),
+        history_scope: None,
+        provider_outcome: Some(outcome),
+        telemetry: TurnTerminalTelemetry {
+            summary: "test completed".to_string(),
+            started_at,
+            finished_at: chrono::Utc::now(),
+        },
+        delivery_intent: TurnDeliveryIntent::ReturnToCaller,
+    };
+    let service = bind_terminal_fixture(temp.path(), Arc::clone(&memory), &mut commit, &cost_config).await;
+    let receipt = finalize_turn(&fabric, commit, &cost_config, temp.path()).await.unwrap();
+    let usage = receipt.usage_settlement.as_ref().expect("test: usage settled");
+    assert!(
+        usage.cost_usd.is_some(),
+        "the configured price no longer matches: {usage:?}"
+    );
+    assert!(
+        matches!(receipt.cost_settlement, Some(CostSettlement::ProjectionPending)),
+        "the spend was not recorded against the budget: {:?}",
+        receipt.cost_settlement
+    );
+    assert!(!format!("{usage:?}").contains("SECRET-fixture-pw"));
+    service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+}
+
+use super::persistence_probe::PROBE_SECRET;
+
+/// Every event `finalize_turn` wrote for `session_key`, content and raw
+/// payload, with the secret nowhere in them.
+async fn assert_no_event_persists_the_probe_secret(memory: &Arc<dyn Memory>, principal: &MemoryPrincipal) {
+    let events = memory
+        .list_message_events_since(principal, 0, 64)
+        .await
+        .expect("test: list the session's events");
+    assert!(
+        events.iter().any(|event| event.event_type == "turn.finalized"),
+        "the probe must reach the terminal marker: {events:?}"
+    );
+    for event in &events {
+        assert!(
+            !event.content.contains(PROBE_SECRET),
+            "{} persisted the secret in its content: {}",
+            event.event_type,
+            event.content
+        );
+        let payload = event.raw_payload_json.as_deref().unwrap_or_default();
+        assert!(
+            !payload.contains(PROBE_SECRET),
+            "{} persisted the secret in its payload: {payload}",
+            event.event_type
+        );
+    }
+}
+
+/// D-053 / REDACT-TURN: every surface finalizes through `finalize_turn`, so
+/// it redacts what it persists. A completed turn whose reply, provider
+/// attempt error, fallback reason and telemetry summary carry a secret, and
+/// a failed turn whose provider error, summary and suppression reason carry
+/// one, persist it in no event: not the assistant `message.created`, the
+/// provider attempt and outcome events, `usage.settled`, nor the
+/// `turn.finalized` marker.
+#[tokio::test]
+async fn finalize_turn_persists_no_secret_from_the_reply_or_the_outcome() {
+    let temp = tempfile::tempdir().expect("test: tempdir");
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).expect("test: sqlite memory"));
+    let fabric = MemoryFabric::new(memory.clone(), temp.path().to_string_lossy());
+    let cost_config = CostConfig::default();
+    let leaked = format!("upstream said: key {PROBE_SECRET} rejected");
+
+    let mut completed = completed_commit("run-redact-completed");
+    if let Some(history) = completed.history.as_mut() {
+        history.assistant_content = format!("Your key is {PROBE_SECRET}.");
+    }
+    if let Some(outcome) = completed.provider_outcome.as_mut() {
+        outcome.fallback_reason = Some(leaked.clone());
+        for attempt in &mut outcome.attempts {
+            attempt.error_message = Some(leaked.clone());
+        }
+    }
+    completed.telemetry.summary = leaked.clone();
+    let completed_service =
+        bind_terminal_fixture(temp.path(), Arc::clone(&memory), &mut completed, &cost_config).await;
+    let completed_principal = terminal_fixture_principal(temp.path(), &completed.scope);
+    let receipt = finalize_turn(&fabric, completed, &cost_config, temp.path())
+        .await
+        .expect("test: finalize the completed turn");
+    let assistant = receipt.assistant_event.expect("test: the reply is projected");
+    assert!(
+        assistant.content.contains("[REDACTED]"),
+        "the reply is redacted, not dropped: {}",
+        assistant.content
+    );
+    assert_no_event_persists_the_probe_secret(&memory, &completed_principal).await;
+
+    let started_at = chrono::Utc::now();
+    let mut failed = completed_commit("run-redact-failed");
+    failed.status = TurnTerminalStatus::Failed;
+    failed.history = None;
+    failed.provider_outcome = Some(ProviderExecutionOutcome::failed_for_decision(
+        &RouteDecision::single_candidate("ollama", "prx-local-model"),
+        started_at,
+        &anyhow::anyhow!("{leaked}"),
+    ));
+    failed.telemetry.summary = leaked.clone();
+    failed.delivery_intent = TurnDeliveryIntent::Suppress { reason: leaked };
+    completed_service
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await;
+    let service = bind_terminal_fixture(temp.path(), Arc::clone(&memory), &mut failed, &cost_config).await;
+    let failed_principal = terminal_fixture_principal(temp.path(), &failed.scope);
+    finalize_turn(&fabric, failed, &cost_config, temp.path())
+        .await
+        .expect("test: finalize the failed turn");
+    assert_no_event_persists_the_probe_secret(&memory, &failed_principal).await;
+    // and nothing else the finalizer wrote (the cost ledger included)
+    super::persistence_probe::assert_nothing_under_persists_the_probe_secret(temp.path());
+    service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+}
+
+/// R-C2BUf F-6 / D-027: prices keyed by two credentialed spellings of one
+/// endpoint and model are ambiguous once redacted. The rule is
+/// deterministic: an exact key wins; otherwise the unique redacted match,
+/// and an ambiguous match (which validation refuses) charges the highest
+/// matching price.
+#[test]
+fn a_redacted_price_match_is_used_only_when_it_is_unique() {
+    let pricing = |input: f64| crate::config::schema::ModelPricing {
+        input,
+        output: 0.0,
+        cache_write: 0.0,
+        cache_read: 0.0,
+    };
+    let usage = crate::llm::route_decision::TokenUsage::reported(Some(1_000_000), Some(0), Some(1_000_000));
+    let redacted = "custom:http://[redacted]@127.0.0.1:1/v1";
+
+    let mut one = CostConfig::default();
+    one.prices
+        .insert("custom:http://a:x@127.0.0.1:1/v1/m".into(), pricing(3.0));
+    let record = crate::llm::route_decision::MeteredTokenUsageRecord::from_parts(redacted, "m", &usage, &one)
+        .expect("test: usage");
+    assert_eq!(record.cost_usd, Some(3.0));
+
+    let mut two = one.clone();
+    two.prices
+        .insert("custom:http://b:y@127.0.0.1:1/v1/m".into(), pricing(7.0));
+    // D-027: validation refuses such a pair; if it is ever reached at
+    // runtime, the highest matching price is charged, never none.
+    for _ in 0..8 {
+        let record = crate::llm::route_decision::MeteredTokenUsageRecord::from_parts(redacted, "m", &usage, &two)
+            .expect("test: usage");
+        assert_eq!(
+            record.cost_usd,
+            Some(7.0),
+            "an ambiguous match charges the highest price"
+        );
+    }
+
+    let mut exact = two.clone();
+    exact.prices.insert(format!("{redacted}/m"), pricing(5.0));
+    let record = crate::llm::route_decision::MeteredTokenUsageRecord::from_parts(redacted, "m", &usage, &exact)
+        .expect("test: usage");
+    assert_eq!(record.cost_usd, Some(5.0), "an exact key wins");
+}
+
+/// Lifecycle store with one bound skill in `workspace`; returns a pin of it.
+fn skill_fixture(
+    workspace: &Path,
+    owner: &str,
+) -> (
+    crate::skills::lifecycle::SkillLifecycleStore,
+    crate::skills::lifecycle::SkillId,
+    crate::skills::lifecycle::PinnedSkillRevision,
+) {
+    use crate::skills::lifecycle::{Bundle, BundleEntry, OwnerScope, SkillId, SkillLifecycleStore, SourceKind};
+    let store = SkillLifecycleStore::open(workspace, OwnerScope::new(owner).unwrap()).unwrap();
+    let skill = SkillId::parse("terminal-skill").unwrap();
+    let bundle = Bundle::from_entries(vec![BundleEntry {
+        path: "SKILL.md".into(),
+        bytes: b"---\nname: terminal skill\ndescription: d\n---\nbody\n".to_vec(),
+        executable: false,
+    }])
+    .unwrap();
+    crate::skills::lifecycle::test_support::publish_revision(&store, &skill, SourceKind::Operator, &bundle, 0);
+    let pin = store.pin_active(&skill).unwrap().unwrap();
+    (store, skill, pin)
+}
+
+/// Whether `task` currently holds a pin for the fixture skill.
+fn holds_pin(owner: &str, task: &str, skill: &crate::skills::lifecycle::SkillId) -> bool {
+    let owner = crate::skills::lifecycle::OwnerScope::new(owner).unwrap();
+    let mut issued = false;
+    crate::skills::lifecycle::task_pin(&owner, task, skill, || {
+        issued = true;
+        Ok(None)
+    })
+    .unwrap();
+    !issued
+}
+
+fn pin_for(
+    owner: &str,
+    task: &str,
+    skill: &crate::skills::lifecycle::SkillId,
+    pin: &crate::skills::lifecycle::PinnedSkillRevision,
+) {
+    let owner = crate::skills::lifecycle::OwnerScope::new(owner).unwrap();
+    crate::skills::lifecycle::task_pin(&owner, task, skill, || Ok(Some(pin.clone()))).unwrap();
+}
+
+async fn terminal_fixture(
+    temp: &Path,
+    terminal_id: &str,
+    status: TurnTerminalStatus,
+) -> (
+    MemoryFabric,
+    CostConfig,
+    TurnTerminalDraft,
+    Arc<crate::runtime::turn_publication::TurnRuntimeService>,
+) {
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp).unwrap());
+    let fabric = MemoryFabric::new(memory.clone(), temp.to_string_lossy());
+    let mut cost_config = CostConfig::default();
+    cost_config.prices.insert(
+        "ollama/prx-local-model".to_string(),
+        crate::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 0.0,
+            cache_read: 0.0,
+        },
+    );
+    let mut commit = completed_commit(terminal_id);
+    if status != TurnTerminalStatus::Completed {
+        commit.status = status;
+        commit.provider_outcome = None;
+        commit.delivery_intent = TurnDeliveryIntent::None;
+    }
+    let service = bind_terminal_fixture(temp, memory, &mut commit, &cost_config).await;
+    (fabric, cost_config, commit, service)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn the_terminal_joins_the_skill_experience_and_releases_pins() {
+    use crate::skills::lifecycle::{Correlation, ExperienceOutcome};
+    let temp = tempfile::tempdir().unwrap();
+    let (fabric, cost_config, commit, service) =
+        terminal_fixture(temp.path(), "skill-terminal-run", TurnTerminalStatus::Completed).await;
+    let owner = commit.scope.owner_id.clone().unwrap();
+    let task = commit.scope.run_id.clone().unwrap();
+    let (store, skill, pin) = skill_fixture(temp.path(), &owner);
+    pin_for(&owner, &task, &skill, &pin);
+    store
+        .record_hydration(&task, &pin, "SKILL.md", b"x", &Correlation::default())
+        .unwrap();
+    assert!(holds_pin(&owner, &task, &skill));
+
+    finalize_turn(&fabric, commit, &cost_config, temp.path()).await.unwrap();
+
+    assert!(
+        !holds_pin(&owner, &task, &skill),
+        "the terminal releases the task's pins"
+    );
+    let experience = store.read_experience(&task).unwrap().unwrap();
+    assert_eq!(experience.outcome, ExperienceOutcome::Success);
+    assert_eq!(experience.terminal.unwrap().terminal_receipt_id, "skill-terminal-run");
+    service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn the_early_return_after_the_marker_still_joins_and_releases() {
+    use crate::skills::lifecycle::{Correlation, ExperienceOutcome};
+    let temp = tempfile::tempdir().unwrap();
+    let (fabric, cost_config, commit, service) =
+        terminal_fixture(temp.path(), "skill-marker-run", TurnTerminalStatus::Completed).await;
+    let owner = commit.scope.owner_id.clone().unwrap();
+    let task = commit.scope.run_id.clone().unwrap();
+    let (store, skill, pin) = skill_fixture(temp.path(), &owner);
+    pin_for(&owner, &task, &skill, &pin);
+    store
+        .record_hydration(&task, &pin, "SKILL.md", b"x", &Correlation::default())
+        .unwrap();
+
+    // The process stops right after the durable marker (the early-return path).
+    finalize_turn(&fabric, commit, &cost_config, temp.path()).await.unwrap();
+    assert!(!holds_pin(&owner, &task, &skill));
+    assert_eq!(
+        store.read_experience(&task).unwrap().unwrap().outcome,
+        ExperienceOutcome::Success
+    );
+    service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_replayed_finalization_joins_idempotently_and_releases_again() {
+    use crate::skills::lifecycle::{Correlation, ExperienceOutcome};
+    let temp = tempfile::tempdir().unwrap();
+    let (fabric, cost_config, commit, service) =
+        terminal_fixture(temp.path(), "skill-replay-run", TurnTerminalStatus::Failed).await;
+    let owner = commit.scope.owner_id.clone().unwrap();
+    let task = commit.scope.run_id.clone().unwrap();
+    let (store, skill, pin) = skill_fixture(temp.path(), &owner);
+    pin_for(&owner, &task, &skill, &pin);
+    store
+        .record_hydration(&task, &pin, "SKILL.md", b"x", &Correlation::default())
+        .unwrap();
+
+    finalize_turn(&fabric, commit.clone(), &cost_config, temp.path())
+        .await
+        .unwrap();
+    assert!(!holds_pin(&owner, &task, &skill));
+
+    // The retry replays the same finalization: the join is idempotent and
+    // pins taken in between are released again.
+    pin_for(&owner, &task, &skill, &pin);
+    finalize_turn(&fabric, commit, &cost_config, temp.path()).await.unwrap();
+    assert!(!holds_pin(&owner, &task, &skill));
+    let experience = store.read_experience(&task).unwrap().unwrap();
+    assert_eq!(experience.outcome, ExperienceOutcome::Failure);
+    assert_eq!(experience.late_evidence, 0);
+    service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_silent_turn_releases_pins_but_is_not_credited() {
+    let temp = tempfile::tempdir().unwrap();
+    let owner = "owner:ws:cli:alice";
+    let (store, skill, pin) = skill_fixture(temp.path(), owner);
+    store
+        .record_hydration(
+            "silent-run",
+            &pin,
+            "SKILL.md",
+            b"x",
+            &crate::skills::lifecycle::Correlation::default(),
+        )
+        .unwrap();
+    pin_for(owner, "silent-run", &skill, &pin);
+
+    release_skill_lifecycle(
+        temp.path(),
+        Some(owner.to_string()),
+        Some("silent-run".to_string()),
+        "silent-term",
+        TurnTerminalStatus::Silent,
+        false,
+        true,
+        crate::skills::lifecycle::TerminalObservations::default(),
+    )
+    .await;
+
+    assert!(!holds_pin(owner, "silent-run", &skill));
+    let experience = store.read_experience("silent-run").unwrap().unwrap();
+    assert!(experience.terminal.is_none() && !experience.learning_eligible());
+    assert_eq!(
+        experience.outcome,
+        crate::skills::lifecycle::ExperienceOutcome::Incomplete
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_child_terminal_never_releases_the_parents_pins() {
+    let temp = tempfile::tempdir().unwrap();
+    let owner = "owner:ws:cli:alice";
+    let (_store, skill, pin) = skill_fixture(temp.path(), owner);
+    let parent = MessageEventScope::new("agent", MemoryVisibility::Workspace)
+        .with_owner_id(owner)
+        .with_run_id("run-parent");
+    let mut child = MessageEventScope::new("agent", MemoryVisibility::Workspace)
+        .with_owner_id(owner)
+        .with_run_id("run-child")
+        .with_parent_run_id("run-parent");
+    // Even a child that inherited the parent's task id is keyed by its own run.
+    child.subject = Some(crate::memory::MessageEventSubject::Task("run-parent".to_string()));
+    assert_eq!(skill_task_key(&parent).as_deref(), Some("run-parent"));
+    assert_eq!(skill_task_key(&child).as_deref(), Some("run-child"));
+
+    pin_for(owner, "run-parent", &skill, &pin);
+    pin_for(owner, "run-child", &skill, &pin);
+    release_skill_lifecycle(
+        temp.path(),
+        child.owner_id.clone(),
+        skill_task_key(&child),
+        "child-term",
+        TurnTerminalStatus::Completed,
+        false,
+        false,
+        crate::skills::lifecycle::TerminalObservations::default(),
+    )
+    .await;
+
+    assert!(!holds_pin(owner, "run-child", &skill));
+    assert!(holds_pin(owner, "run-parent", &skill), "the parent keeps its pins");
+    release_skill_lifecycle(
+        temp.path(),
+        parent.owner_id.clone(),
+        skill_task_key(&parent),
+        "parent-term",
+        TurnTerminalStatus::Failed,
+        false,
+        true,
+        crate::skills::lifecycle::TerminalObservations::default(),
+    )
+    .await;
+    assert!(!holds_pin(owner, "run-parent", &skill));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_turn_waiting_for_approval_is_blocked_not_success() {
+    use crate::skills::lifecycle::{Correlation, ExperienceOutcome};
+    let temp = tempfile::tempdir().unwrap();
+    let owner = "owner:ws:cli:alice";
+    let (store, skill, pin) = skill_fixture(temp.path(), owner);
+    store
+        .record_hydration("approval-run", &pin, "SKILL.md", b"x", &Correlation::default())
+        .unwrap();
+    pin_for(owner, "approval-run", &skill, &pin);
+
+    // Entrypoints report a turn that stopped for approval as Completed.
+    release_skill_lifecycle(
+        temp.path(),
+        Some(owner.to_string()),
+        Some("approval-run".to_string()),
+        "approval-term",
+        TurnTerminalStatus::Completed,
+        true,
+        true,
+        crate::skills::lifecycle::TerminalObservations::default(),
+    )
+    .await;
+
+    let experience = store.read_experience("approval-run").unwrap().unwrap();
+    assert_eq!(experience.outcome, ExperienceOutcome::Blocked);
+    assert!(!holds_pin(owner, "approval-run", &skill));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_finalization_that_fails_early_still_releases_pins() {
+    let temp = tempfile::tempdir().unwrap();
+    let (fabric, cost_config, mut commit, service) =
+        terminal_fixture(temp.path(), "skill-lost-authority", TurnTerminalStatus::Completed).await;
+    let owner = commit.scope.owner_id.clone().unwrap();
+    let task = commit.scope.run_id.clone().unwrap();
+    let (_store, skill, pin) = skill_fixture(temp.path(), &owner);
+    pin_for(&owner, &task, &skill, &pin);
+    commit.scope.authority_guard = Some(crate::memory::RuntimeAuthorityGuard::new("lost-authority", || {
+        Ok(false)
+    }));
+
+    let error = finalize_turn(&fabric, commit, &cost_config, temp.path())
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("runtime execution authority was lost"));
+    assert!(
+        !holds_pin(&owner, &task, &skill),
+        "a failed finalization must not leak pins"
+    );
+    service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+}
+
+/// The key contract the skill lifecycle depends on: the terminal derives the
+/// same key as `skill_read` does from the same envelope.
+#[test]
+fn the_terminal_key_matches_the_key_skill_read_derives_from_the_same_envelope() {
+    use crate::runtime::envelope::RuntimeEnvelope;
+    let scope_key = |envelope: &RuntimeEnvelope| skill_task_key(&envelope.message_scope());
+    // What `skill_read` sees: the runtime-authored scope fields.
+    let read_key = |envelope: &RuntimeEnvelope| {
+        crate::skills::lifecycle::task_key(
+            envelope.task_id.as_deref(),
+            envelope.run_id.as_deref(),
+            envelope.parent_run_id.as_deref(),
+        )
+    };
+    let plain = RuntimeEnvelope::cron("ws", "job-1", "attempt-1");
+    assert_eq!(scope_key(&plain), read_key(&plain));
+    assert_eq!(scope_key(&plain).as_deref(), plain.run_id.as_deref());
+    let child = plain.with_parent_run_id("run-parent");
+    assert_eq!(scope_key(&child), read_key(&child));
+    assert_eq!(scope_key(&child).as_deref(), child.run_id.as_deref());
+    let task_only = RuntimeEnvelope::cron("ws", "job-2", "attempt-2");
+    let mut task_only = task_only;
+    task_only.run_id = None;
+    assert_eq!(scope_key(&task_only).as_deref(), Some("job-2"));
+    assert_eq!(scope_key(&task_only), read_key(&task_only));
+}
+/// The runtime trace and provider outcome reach the skill lifecycle as plain
+/// observations: an unavailable provider, a refused call and the called tools.
+#[test]
+fn skill_observations_carry_the_trace_and_provider_facts() {
+    use crate::skills::lifecycle::{ObservedCallStatus, ProviderEnd};
+    use crate::tools::capability::execution_trace::ExecutionTraceSnapshot;
+    use crate::tools::capability::execution_trace::RecordedToolCall;
+    let call = |id: &str, status: &str| RecordedToolCall {
+        capability_id: id.to_string(),
+        status: status.to_string(),
+    };
+    let trace = ExecutionTraceSnapshot {
+        calls: vec![
+            call("native_tool:native:deploy_check", "success"),
+            call("filesystem:native:shell", "denied"),
+            call("native_tool:native:odd", "no-such-code"),
+        ],
+        denied_attempts: 1,
+        unavailable_attempts: Some(2),
+        ..ExecutionTraceSnapshot::default()
+    };
+    let down = ProviderExecutionOutcome::failed_for_decision(
+        &RouteDecision::single_candidate("ollama", "prx-local-model"),
+        chrono::Utc::now(),
+        &anyhow::anyhow!("request timed out"),
+    );
+    let seen = observations_from(&trace, Some(&down));
+    assert_eq!(seen.provider, ProviderEnd::Unavailable);
+    assert_eq!(seen.denied_attempts, 1);
+    assert_eq!(seen.unavailable_attempts, 2);
+    assert!(seen.complete);
+    assert_eq!(
+        seen.tool_calls.iter().map(|c| c.status).collect::<Vec<_>>(),
+        vec![ObservedCallStatus::Succeeded, ObservedCallStatus::Denied],
+        "a code the lifecycle does not know is dropped, not guessed"
+    );
+
+    // No outcome and no attempts: unknown, never served. An open trace is incomplete.
+    let open = ExecutionTraceSnapshot {
+        incomplete: true,
+        ..ExecutionTraceSnapshot::default()
+    };
+    let seen = observations_from(&open, None);
+    assert_eq!(seen.provider, ProviderEnd::Unknown);
+    assert!(!seen.complete);
+}
+/// `abort_commit` turns the retained trace of an earlier, served round into a
+/// success outcome even when a later round failed. The execution trace must
+/// overrule it: the run ended in an outage, not a served answer.
+#[test]
+fn a_retained_success_does_not_make_a_later_outage_served() {
+    use crate::agent::turn_contracts::{RetainedProviderTrace, ToolLoopTrace};
+    use crate::llm::route_decision::{AttemptStatus, ProviderAttempt};
+    use crate::skills::lifecycle::ProviderEnd;
+    use crate::tools::capability::execution_trace::ExecutionTrace;
+    let now = chrono::Utc::now();
+    let attempt = ProviderAttempt {
+        seq: 1,
+        provider: "ollama".to_string(),
+        model: "prx-local-model".to_string(),
+        started_at: now,
+        finished_at: now,
+        status: AttemptStatus::Success,
+        error_class: None,
+        error_message: None,
+    };
+    let loop_trace = ToolLoopTrace {
+        final_provider: Some("ollama".to_string()),
+        final_model: Some("prx-local-model".to_string()),
+        attempts: vec![attempt.clone()],
+        ..ToolLoopTrace::default()
+    };
+    let retained = RetainedProviderTrace::default();
+    retained.begin();
+    retained.completed(
+        &loop_trace,
+        crate::llm::route_decision::TokenUsage::default(),
+        false,
+        true,
+    );
+    retained.begin();
+    retained.failed();
+    let (trace, uncertain) = retained.snapshot();
+    assert!(uncertain, "the failed second round is flagged");
+    let outcome = provider_outcome_from_trace(
+        &RouteDecision::single_candidate("ollama", "prx-local-model"),
+        now,
+        trace.expect("test: the first round completed"),
+    );
+    assert!(matches!(
+        outcome.status,
+        crate::llm::route_decision::ExecutionStatus::Success
+            | crate::llm::route_decision::ExecutionStatus::FallbackSuccess
+    ));
+
+    // The execution trace saw round 1 served and round 2 fail without an attempt.
+    let execution = ExecutionTrace::default();
+    execution
+        .begin_provider()
+        .expect("test: begin")
+        .finish(Some(std::slice::from_ref(&attempt)));
+    assert_eq!(
+        observations_from(&execution.seal(), Some(&outcome)).provider,
+        ProviderEnd::Served,
+        "one served round with nothing else is served"
+    );
+    let execution = ExecutionTrace::default();
+    execution
+        .begin_provider()
+        .expect("test: begin")
+        .finish(Some(std::slice::from_ref(&attempt)));
+    execution.begin_provider().expect("test: begin").finish(None);
+    assert_eq!(
+        observations_from(&execution.seal(), Some(&outcome)).provider,
+        ProviderEnd::Unknown,
+        "the outage after the served round is not served"
+    );
+}
