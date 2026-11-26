@@ -260,14 +260,17 @@ fn is_valid_handoff_summary(status: Option<HandoffSummaryStatus>, summary: Optio
 /// [`HANDOFF_SKILLS_MAX_COUNT`] names, each non-empty, bounded, without control
 /// characters, `[` or `]`.
 fn is_valid_handoff_skills(skills: &[String]) -> bool {
-    skills.len() <= HANDOFF_SKILLS_MAX_COUNT
-        && skills.iter().all(|skill| {
-            !skill.is_empty()
-                && skill.len() <= HANDOFF_SKILL_NAME_MAX_BYTES
-                && !skill
-                    .chars()
-                    .any(|character| character.is_control() || character == '[' || character == ']')
-        })
+    skills.len() <= HANDOFF_SKILLS_MAX_COUNT && skills.iter().all(|skill| is_valid_handoff_skill_name(skill))
+}
+
+/// Whether one skill name may appear in `skills_in_use`: non-empty, at most
+/// [`HANDOFF_SKILL_NAME_MAX_BYTES`], without control characters, `[` or `]`.
+pub(crate) fn is_valid_handoff_skill_name(skill: &str) -> bool {
+    !skill.is_empty()
+        && skill.len() <= HANDOFF_SKILL_NAME_MAX_BYTES
+        && !skill
+            .chars()
+            .any(|character| character.is_control() || character == '[' || character == ']')
 }
 
 /// The note of `content` when it is a handoff the compaction code could have

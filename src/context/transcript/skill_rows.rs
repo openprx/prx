@@ -12,7 +12,7 @@ use std::collections::HashSet;
 
 use serde_json::Value;
 
-use crate::context::reduce::handoff_note::{HANDOFF_SKILL_NAME_MAX_BYTES, HANDOFF_SKILLS_MAX_COUNT};
+use crate::context::reduce::handoff_note::{HANDOFF_SKILLS_MAX_COUNT, is_valid_handoff_skill_name};
 use crate::memory::erasure::Unsupported;
 use crate::memory::{Memory, MemoryFabric, MemoryPrincipal, MessageEventScope};
 use crate::tools::ToolExecutionStatus;
@@ -138,7 +138,7 @@ pub(crate) async fn skills_in_use(memory: &dyn Memory, principal: &MemoryPrincip
         else {
             continue;
         };
-        if !is_listable_name(&name) || !seen.insert(name.to_lowercase()) {
+        if !is_valid_handoff_skill_name(&name) || !seen.insert(name.to_lowercase()) {
             continue;
         }
         names.push(name);
@@ -147,14 +147,4 @@ pub(crate) async fn skills_in_use(memory: &dyn Memory, principal: &MemoryPrincip
         }
     }
     names
-}
-
-/// The per-name rule the handoff note validator applies to `skills_in_use`:
-/// non-empty, bounded, and free of control characters, `[` and `]`.
-fn is_listable_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= HANDOFF_SKILL_NAME_MAX_BYTES
-        && !name
-            .chars()
-            .any(|character| character.is_control() || character == '[' || character == ']')
 }
