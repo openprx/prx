@@ -4,10 +4,7 @@
 //! nothing. The per-pass copies, the state row and the WAL scrub follow.
 mod copies;
 
-use super::{
-    SqliteMemory, mailbox_continuation::TASK_ECHO_PREDICATE_E, rf_delete, rf_messages::RESTART_INTERRUPTED,
-    sync_journal, sync_retained,
-};
+use super::{SqliteMemory, rf_delete, rf_messages::RESTART_INTERRUPTED, sync_journal, sync_retained};
 use crate::memory::sync::{MessageTrim, TrimSkipped};
 use crate::runtime::sqlite_pool::begin_immediate;
 use rusqlite::{Connection, OptionalExtension, named_params, params};
@@ -28,27 +25,40 @@ const INDEXES: &str = "
     CREATE INDEX IF NOT EXISTS idx_message_events_retention_cause
         ON message_events(causation_event_id) WHERE causation_event_id IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_message_events_retention_parent
-        ON message_events(workspace_id, parent_run_id) WHERE parent_run_id IS NOT NULL;";
+        ON message_events(workspace_id, parent_run_id) WHERE parent_run_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_message_events_retention_task_run
+        ON message_events(workspace_id, (CASE WHEN json_valid(raw_payload_json)
+            THEN json_extract(raw_payload_json, '$.task_run_id') END))
+        WHERE role = 'user';";
 
-/// Keep rules for the rows `r` of a unit (E1, E2, E4, E5 and, for a run, the
-/// task-echo rule). A row that matches any of them keeps its whole unit. A
-/// `created_at` that does not parse counts as newer (kept).
+/// Task-echo keep rule of a run unit, evaluated once per unit: a `user` row
+/// outside the unit restates one of the unit's `user` rows and names the unit's
+/// run as its `task_run_id` (the conditions of `TASK_ECHO_PREDICATE_E` with
+/// `p` in the unit). The `task_run_id` expression is the exact text of
+/// `idx_message_events_retention_task_run`, so the lookup uses that index; the
+/// `json_valid` guard makes a malformed payload a non-echo instead of an error.
+/// Mutual references between two units would keep both forever; an echo is
+/// written after the row it restates (`e.id > p.id`), so this does not occur.
+const ECHO_KEEP: &str = "EXISTS(SELECT 1 FROM message_events p
+                 JOIN message_events e
+                   ON e.workspace_id = :workspace AND e.role = 'user'
+                  AND (CASE WHEN json_valid(e.raw_payload_json)
+                       THEN json_extract(e.raw_payload_json, '$.task_run_id') END) = :run
+                 WHERE p.workspace_id = :workspace AND p.run_id = :run AND p.role = 'user'
+                   AND e.owner_id = p.owner_id AND e.session_key = p.session_key
+                   AND e.content_hash = p.content_hash AND e.id > p.id
+                   AND COALESCE(e.run_id, '') <> :run)";
+
+/// Keep rules for the rows `r` of a unit (E1, E2, E4, E5); a run also has
+/// [`ECHO_KEEP`]. A row that matches any of them keeps its whole unit. A
+/// `created_at` that does not parse counts as newer (kept). E5: mutual
+/// causation between two units would keep both forever; causation always
+/// points to an earlier event, so this does not occur.
 fn keep_row(run_unit: bool) -> String {
     let causes = if run_unit {
         "NOT (c.workspace_id = :workspace AND COALESCE(c.run_id, '') = :run)"
     } else {
         "c.id <> r.id"
-    };
-    let echo = if run_unit {
-        format!(
-            "OR EXISTS(SELECT 1 FROM message_events e
-                 WHERE e.workspace_id = r.workspace_id
-                   AND json_extract(e.raw_payload_json, '$.task_run_id') = r.run_id
-                   AND {TASK_ECHO_PREDICATE_E}
-                   AND NOT (e.workspace_id = :workspace AND COALESCE(e.run_id, '') = :run))"
-        )
-    } else {
-        String::new()
     };
     format!(
         "julianday(r.created_at) IS NULL OR julianday(r.created_at) >= julianday(:cutoff)
@@ -62,8 +72,7 @@ fn keep_row(run_unit: bool) -> String {
                    WHERE n.workspace_id = r.workspace_id AND n.session_key = r.session_key
                      AND n.id > r.id
                      AND (julianday(n.created_at) IS NULL OR julianday(n.created_at) >= julianday(:cutoff))))
-    OR EXISTS(SELECT 1 FROM message_events c WHERE c.causation_event_id = r.event_id AND {causes})
-    {echo}"
+    OR EXISTS(SELECT 1 FROM message_events c WHERE c.causation_event_id = r.event_id AND {causes})"
     )
 }
 
@@ -278,6 +287,7 @@ fn eligible(tx: &Connection, unit: &Unit, cutoff: &str) -> anyhow::Result<bool> 
             let sql = format!(
                 "SELECT NOT EXISTS(SELECT 1 FROM message_events r
                      WHERE r.workspace_id = :workspace AND r.run_id = :run AND ({keep}))
+                 AND NOT {ECHO_KEEP}
                  AND NOT EXISTS(SELECT 1 FROM rf_message_attempts a
                      WHERE a.workspace_id = :workspace AND a.run_id = :run AND (a.erase_pending = 1
                         OR (a.interrupted IN (0, {RESTART_INTERRUPTED}) AND NOT EXISTS(SELECT 1 FROM message_events t

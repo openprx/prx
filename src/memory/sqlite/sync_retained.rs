@@ -68,7 +68,8 @@ pub(super) fn notice_headers(conn: &Connection, event_ids: &[String]) -> anyhow:
             CASE WHEN e.role='assistant' OR e.idempotency_key LIKE 'turn:%:assistant'
             THEN (SELECT f.event_id FROM message_events f WHERE f.owner_id=e.owner_id AND f.workspace_id=e.workspace_id
                 AND f.run_id=e.run_id AND (
-                    (f.event_type='turn.finalized' AND json_extract(f.raw_payload_json,'$.assistant_event_id')=e.event_id)
+                    (f.event_type='turn.finalized' AND CASE WHEN json_valid(f.raw_payload_json)
+                        THEN json_extract(f.raw_payload_json,'$.assistant_event_id') END=e.event_id)
                     OR (e.idempotency_key='turn:'||e.run_id||':assistant' AND f.idempotency_key='turn:'||e.run_id||':final'))
                 ORDER BY f.id LIMIT 1) END AS final_marker
         FROM message_events e WHERE e.event_id IN(SELECT value FROM json_each(?1))) x

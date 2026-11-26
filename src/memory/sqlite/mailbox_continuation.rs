@@ -33,10 +33,11 @@ pub(super) fn is_continuation(conn: &Connection, event: &crate::memory::MessageE
 /// spawn request row (same session, role and content, and the spawn row's run
 /// is the segment's `task_run_id`). History hides it the same way
 /// (`child_turns::history`), so the journal and snapshot must not publish it.
+/// A payload that is not valid JSON is not an echo (no `malformed JSON` error).
 pub(super) const TASK_ECHO_PREDICATE_E: &str = "(e.role='user' AND EXISTS(SELECT 1 FROM message_events p \
      WHERE p.workspace_id=e.workspace_id AND p.owner_id=e.owner_id AND p.id<e.id \
      AND p.session_key=e.session_key AND p.role=e.role AND p.content_hash=e.content_hash \
-     AND json_extract(e.raw_payload_json,'$.task_run_id')=p.run_id))";
+     AND CASE WHEN json_valid(e.raw_payload_json) THEN json_extract(e.raw_payload_json,'$.task_run_id') END=p.run_id))";
 
 /// Whether the stored row `event_id` is a task echo (see [`TASK_ECHO_PREDICATE_E`]).
 pub(super) fn is_task_echo(conn: &Connection, event_id: &str) -> anyhow::Result<bool> {
