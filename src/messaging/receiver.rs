@@ -97,7 +97,7 @@ pub(crate) fn register_idle(
                                     crate::runtime::blocking::spawn_blocking(move || runtime.requeue(retained)).await;
                                 continue;
                             }
-                            tracing::warn!(error=%crate::agent::diagnostics::error_class(&error),"session mailbox turn refused");
+                            tracing::warn!(error=%crate::agent::diagnostics::error_class(&error),"session mailbox turn failed");
                         }
                     }
                 }

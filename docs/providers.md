@@ -355,6 +355,20 @@ they run and their cost is not tracked; add `[cost.prices."<model>"]` (see
 [`[cost.prices]` keys](configuration.md#costprices-keys)) to record cost, which
 is required once a cost limit is set.
 
+## Retries for rate limits and overload
+
+A failed attempt is retried in place on the same provider and model before the
+chain moves on. An HTTP 429 that is not a billing or quota error gets up to
+five retries, waiting 2, 6, 15, 30 and 30 seconds when the upstream sends no
+`Retry-After`, so a request can outlast a one-minute provider window (about
+83 seconds of waiting in all). A `Retry-After` up to 120 seconds is honored;
+a longer one ends that candidate at once. HTTP 503 and overloaded error bodies
+get two retries (2 and 6 seconds). Other retryable errors use the configured
+`max_retries`. With `max_retries = 0`, every kind gets one attempt. When all
+candidates fail, the error starts with "All providers/models failed" and says
+that the failure applies to that model request only; earlier requests in the
+same turn are not affected.
+
 ## Streaming failure rules
 
 A streamed reply is used only if it ended the way the provider's protocol says
