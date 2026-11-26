@@ -1427,6 +1427,8 @@ such as `max_actions_per_hourr` still stops the load with
 
 These files are automatically injected into the agent context at startup.
 
+When `MEMORY.md` is longer than the per-file cap (60,000 characters, or 6,000 with `agent.compact_context = true`), the prompt does not keep its head. It shows an index: a count line `[Memory index: newest first, N of M entries]`, then the newest generated entries (those written as `- [<stamp>] **<key>**:`) in reverse file order, each cut to 400 characters, and a footer counting the older entries that memory search or `memory_get` can read. Entries that the SQLite mirror has updated are moved to the end of the file, so they appear first. Any text before the first entry is kept only up to a quarter of the cap. A file under the cap, or one without generated entries, is injected unchanged. This is a system-prompt rendering only; who may write `MEMORY.md` is unchanged.
+
 ## Memory Backends
 
 | Backend | Description |
