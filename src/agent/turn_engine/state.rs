@@ -66,6 +66,13 @@ pub(super) enum TextReply {
     Deliver(String),
 }
 
+/// The budget one round was planned against: the request plan the provider
+/// answer settles, and the totals the request event reports.
+pub(super) struct RoundBudget {
+    pub(super) request_budget: Option<crate::context::budget::anchor::RequestBudget>,
+    pub(super) budgeted_totals: Option<(usize, usize)>,
+}
+
 /// Values the rounds of one turn carry forward and change.
 pub(super) struct TurnState {
     /// The round counter; the first round is 1.
