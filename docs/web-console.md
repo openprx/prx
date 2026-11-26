@@ -409,9 +409,9 @@ The Console plugin routes use that same owner:
 | `POST /api/plugins/{name}/enable` | `{}` | Low |
 | `POST /api/plugins/{name}/disable` | `{}` | Low |
 | `POST /api/plugins/refresh` | `{}` | Low. Rebuilds every eligible plugin. Not first discovery of one name. |
-| `POST /api/plugins/install` | `{source, sha256, manifest_sha256, permissions}` | High. Requires `?confirm_high_risk=true`. |
-| `POST /api/plugins/update` | same as install | High. Requires `?confirm_high_risk=true`. |
-| `DELETE /api/plugins/{name}` and `POST /api/plugins/{name}/remove` | POST body `{}` | High. Requires `?confirm_high_risk=true`. Revokes trust and returns `recoverable_backup`. |
+| `POST /api/plugins/install` | `{source, sha256, manifest_sha256, permissions}` | High. Requires `?confirm_high_risk=true` below Full. |
+| `POST /api/plugins/update` | same as install | High. Requires `?confirm_high_risk=true` below Full. |
+| `DELETE /api/plugins/{name}` and `POST /api/plugins/{name}/remove` | POST body `{}` | High. Requires `?confirm_high_risk=true` below Full. Revokes trust and returns `recoverable_backup`. |
 
 Install and update use one operator action (TRANSPORT-GAPS option A). The
 handler checks `sha256` and `manifest_sha256` against the workspace source

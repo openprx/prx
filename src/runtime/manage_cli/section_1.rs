@@ -303,7 +303,7 @@ async fn run_migrate(config: Config, apply: bool, write: &ApplyArgs, io: &mut Io
     }
     if !write.yes {
         let revision = plan.revision().unwrap_or("none");
-        if plan.summary().risk_reasons.is_empty() {
+        if plan.summary().risk_reasons.is_empty() || plan.applies_at_full() {
             writeln!(io.out, "Dry run: nothing was written. Apply it with --apply --yes")?;
         } else {
             writeln!(

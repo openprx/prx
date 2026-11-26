@@ -52,8 +52,8 @@ fn bad_request(error: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
 }
 
 #[cfg(feature = "wasm-plugins")]
-fn confirm_high_risk(confirmed: bool) -> Result<(), (StatusCode, Json<Value>)> {
-    if confirmed {
+fn confirm_high_risk(confirmed: bool, at_full: bool) -> Result<(), (StatusCode, Json<Value>)> {
+    if confirmed || at_full {
         Ok(())
     } else {
         Err((
@@ -94,9 +94,10 @@ fn tool_error_status(error: &str) -> StatusCode {
 
 /// Admit a console mutation that already passed `authorize_resource_mutation`.
 ///
-/// High-risk routes also required `confirm_high_risk` before this runs. This
-/// stage does not mint a runtime grant: the manage tool still demands one for
-/// medium and high operations when autonomy is supervised.
+/// High-risk routes required `confirm_high_risk` below `Full` before this runs;
+/// at `Full` the confirmation is not demanded. The hash review still runs.
+/// This stage does not mint a runtime grant: the manage tool still demands one
+/// for medium and high operations when autonomy is supervised.
 #[cfg(feature = "wasm-plugins")]
 struct ConsolePlaneApproval;
 
@@ -409,7 +410,8 @@ async fn remove_named(state: AppState, name: String, confirmed: bool) -> (Status
     #[cfg(feature = "wasm-plugins")]
     {
         if let Some(runtime) = state.plugin_runtime.clone() {
-            if let Err(error) = confirm_high_risk(confirmed) {
+            let at_full = state.config.load_full().autonomy.level == crate::security::AutonomyLevel::Full;
+            if let Err(error) = confirm_high_risk(confirmed, at_full) {
                 return error;
             }
             return match execute_manage(&state, &runtime, json!({"action": "remove", "name": name})).await {
@@ -442,7 +444,8 @@ async fn install_or_update(
     #[cfg(feature = "wasm-plugins")]
     {
         if let Some(runtime) = state.plugin_runtime.clone() {
-            if let Err(error) = confirm_high_risk(confirmed) {
+            let at_full = state.config.load_full().autonomy.level == crate::security::AutonomyLevel::Full;
+            if let Err(error) = confirm_high_risk(confirmed, at_full) {
                 return error;
             }
             if let Err(error) = review_hashes(&runtime, &body) {

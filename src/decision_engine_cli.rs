@@ -659,7 +659,7 @@ impl DecisionSetup {
             .map_err(|error| anyhow::anyhow!("{error}"))?;
         let text = plan.text();
         let revision = plan.revision().map(str::to_string);
-        if !self.confirms(&plan.summary().risk_reasons, hosted) {
+        if !plan.applies_at_full() && !self.confirms(&plan.summary().risk_reasons, hosted) {
             anyhow::bail!(
                 "the change is high risk beyond a local decision endpoint ({}), and setup never confirms it: review \
                  it with `prx decision-engine config set backend.kind {}`{}{} and apply it with `--yes \
