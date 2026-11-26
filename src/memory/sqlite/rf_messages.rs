@@ -13,7 +13,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 const INTERRUPTED: i64 = 1;
 // Startup publishes the interrupted outcome without spending the key's
 // restart opportunity. Admission changes this to INTERRUPTED atomically.
-const RESTART_INTERRUPTED: i64 = 2;
+pub(super) const RESTART_INTERRUPTED: i64 = 2;
 
 /// Idempotent DDL. Called from schema init.
 pub(super) fn init_schema(conn: &Connection) -> anyhow::Result<()> {

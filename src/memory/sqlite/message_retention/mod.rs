@@ -4,7 +4,10 @@
 //! nothing. The per-pass copies, the state row and the WAL scrub follow.
 mod copies;
 
-use super::{SqliteMemory, rf_delete, sync_journal, sync_retained};
+use super::{
+    SqliteMemory, mailbox_continuation::TASK_ECHO_PREDICATE_E, rf_delete, rf_messages::RESTART_INTERRUPTED,
+    sync_journal, sync_retained,
+};
 use crate::memory::sync::{MessageTrim, TrimSkipped};
 use crate::runtime::sqlite_pool::begin_immediate;
 use rusqlite::{Connection, OptionalExtension, named_params, params};
@@ -25,9 +28,28 @@ const INDEXES: &str = "
     CREATE INDEX IF NOT EXISTS idx_message_events_retention_parent
         ON message_events(workspace_id, parent_run_id) WHERE parent_run_id IS NOT NULL;";
 
-/// Rules E1, E2, E4 and E5 for the rows `r` of a unit. A row that matches any
-/// of them keeps its whole unit.
-const KEEP_ROW: &str = "julianday(r.created_at) >= julianday(:cutoff)
+/// Keep rules for the rows `r` of a unit (E1, E2, E4, E5 and, for a run, the
+/// task-echo rule). A row that matches any of them keeps its whole unit. A
+/// `created_at` that does not parse counts as newer (kept).
+fn keep_row(run_unit: bool) -> String {
+    let causes = if run_unit {
+        "NOT (c.workspace_id = :workspace AND COALESCE(c.run_id, '') = :run)"
+    } else {
+        "c.id <> r.id"
+    };
+    let echo = if run_unit {
+        format!(
+            "OR EXISTS(SELECT 1 FROM message_events e
+                 WHERE e.workspace_id = r.workspace_id
+                   AND json_extract(e.raw_payload_json, '$.task_run_id') = r.run_id
+                   AND {TASK_ECHO_PREDICATE_E}
+                   AND NOT (e.workspace_id = :workspace AND COALESCE(e.run_id, '') = :run))"
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "julianday(r.created_at) IS NULL OR julianday(r.created_at) >= julianday(:cutoff)
     OR EXISTS(SELECT 1 FROM agent_erase_fences f WHERE f.scope_id = r.ma_scope_id)
     OR (r.event_type IN ('context.switch.created', 'context.prefix.recorded')
         AND r.session_key IS NOT NULL
@@ -36,9 +58,12 @@ const KEEP_ROW: &str = "julianday(r.created_at) >= julianday(:cutoff)
                       AND s.event_type = r.event_type)
         AND EXISTS(SELECT 1 FROM message_events n
                    WHERE n.workspace_id = r.workspace_id AND n.session_key = r.session_key
-                     AND n.id > r.id AND julianday(n.created_at) >= julianday(:cutoff)))
-    OR EXISTS(SELECT 1 FROM message_events c
-              WHERE c.causation_event_id = r.event_id AND julianday(c.created_at) >= julianday(:cutoff))";
+                     AND n.id > r.id
+                     AND (julianday(n.created_at) IS NULL OR julianday(n.created_at) >= julianday(:cutoff))))
+    OR EXISTS(SELECT 1 FROM message_events c WHERE c.causation_event_id = r.event_id AND {causes})
+    {echo}"
+    )
+}
 
 /// One deletion unit: every row of a run, or a runless row.
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -242,12 +267,13 @@ fn batch(memory: &SqliteMemory, cutoff: &str, cursor: &mut i64, trim: &mut Messa
 fn eligible(tx: &Connection, unit: &Unit, cutoff: &str) -> anyhow::Result<bool> {
     let keep = match unit {
         Unit::Run { workspace, run } => {
+            let keep = keep_row(true);
             let sql = format!(
                 "SELECT NOT EXISTS(SELECT 1 FROM message_events r
-                     WHERE r.workspace_id = :workspace AND r.run_id = :run AND ({KEEP_ROW}))
+                     WHERE r.workspace_id = :workspace AND r.run_id = :run AND ({keep}))
                  AND NOT EXISTS(SELECT 1 FROM rf_message_attempts a
                      WHERE a.workspace_id = :workspace AND a.run_id = :run AND (a.erase_pending = 1
-                        OR (a.interrupted = 0 AND NOT EXISTS(SELECT 1 FROM message_events t
+                        OR (a.interrupted IN (0, {RESTART_INTERRUPTED}) AND NOT EXISTS(SELECT 1 FROM message_events t
                               WHERE t.workspace_id = a.workspace_id AND t.owner_id = a.owner_id
                                 AND t.idempotency_key IN ('turn:' || a.run_id || ':final',
                                                           'turn:' || a.run_id || ':admission-failed')))))
@@ -262,7 +288,8 @@ fn eligible(tx: &Connection, unit: &Unit, cutoff: &str) -> anyhow::Result<bool> 
             )?
         }
         Unit::Row { id, .. } => {
-            let sql = format!("SELECT NOT EXISTS(SELECT 1 FROM message_events r WHERE r.id = :id AND ({KEEP_ROW}))");
+            let keep = keep_row(false);
+            let sql = format!("SELECT NOT EXISTS(SELECT 1 FROM message_events r WHERE r.id = :id AND ({keep}))");
             tx.query_row(&sql, named_params! {":id": id, ":cutoff": cutoff}, |r| {
                 r.get::<_, bool>(0)
             })?
