@@ -26,6 +26,11 @@ use self::workspace_overlay::McpJsonServer;
 
 const MCP_JSON_FILE: &str = "mcp.json";
 const MCP_ROOT_NAME: &str = "mcp_call";
+/// In-band tool name that makes `call_stdio` start the session and return
+/// without calling a tool; only `resources::attach_peer` passes it. It cannot
+/// come from model input: `validate_and_call` refuses an empty tool name
+/// before any call reaches `call_stdio`.
+const ATTACH_ONLY: &str = "";
 const MCP_DISCOVERY_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 const MCP_STDIO_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -1054,6 +1059,9 @@ impl McpTool {
         let Some(active_session) = session.as_ref() else {
             bail!("MCP stdio session for '{server_name}' was not initialized");
         };
+        if tool_name == ATTACH_ONLY {
+            return Ok((true, String::new()));
+        }
         let client = &active_session.client;
 
         let result = match tokio::time::timeout(
@@ -1337,11 +1345,15 @@ impl McpTool {
                 // and schemas are supplied only by turn-scoped capability discovery.
                 let server_schema = json!({
                     "type": "string",
-                    "description": "Configured MCP server name; required for 'call'"
+                    "description": "Configured MCP server name; required for 'call', 'resources' and 'read'"
                 });
                 let tool_schema = json!({
                     "type": "string",
                     "description": "Remote MCP tool name to invoke; required for 'call'"
+                });
+                let uri_schema = json!({
+                    "type": "string",
+                    "description": "Resource URI for 'read'"
                 });
 
                 crate::tools::schema::with_default_action_requirements(
@@ -1350,12 +1362,13 @@ impl McpTool {
                         "properties": {
                             "action": {
                                 "type": "string",
-                                "enum": ["call", "list", "status", "refresh"],
+                                "enum": ["call", "list", "status", "refresh", "resources", "read"],
                                 "default": "call",
-                                "description": "'call' invokes a remote tool; 'list' and 'status' inspect discovery state and errors; 'refresh' forces rediscovery"
+                                "description": "'call' invokes a remote tool; 'list' and 'status' inspect discovery state and errors; 'refresh' forces rediscovery; 'resources' lists a server's resources and templates; 'read' returns one resource by uri"
                             },
                             "server": server_schema,
                             "tool": tool_schema,
+                            "uri": uri_schema,
                             "arguments": {
                                 "type": "object",
                                 "description": "Arguments object forwarded to MCP call_tool for 'call'",
@@ -1367,10 +1380,20 @@ impl McpTool {
                     }),
                     "action",
                     "call",
-                    &[crate::tools::schema::ActionRequirement {
-                        action: "call",
-                        required: &["server", "tool"],
-                    }],
+                    &[
+                        crate::tools::schema::ActionRequirement {
+                            action: "call",
+                            required: &["server", "tool"],
+                        },
+                        crate::tools::schema::ActionRequirement {
+                            action: "resources",
+                            required: &["server"],
+                        },
+                        crate::tools::schema::ActionRequirement {
+                            action: "read",
+                            required: &["server", "uri"],
+                        },
+                    ],
                 )
             })
         });
@@ -1386,7 +1409,8 @@ impl Tool for McpTool {
 
     fn description(&self) -> &str {
         "Call tools exposed by configured MCP servers: 'call' invokes a remote tool, \
-         'list' and 'status' report discovery results and errors, and 'refresh' forces rediscovery. \
+         'list' and 'status' report discovery results and errors, 'refresh' forces rediscovery, \
+         and 'resources' and 'read' list a server's resources or read one by uri. \
          Supports hot config reload from workspace/mcp.json and dynamic aliases."
     }
 
@@ -1475,6 +1499,9 @@ impl Tool for McpTool {
                 }))?,
                 error: None,
             });
+        }
+        if name == MCP_ROOT_NAME && matches!(action, "resources" | "read") {
+            return self.execute_resource_action(action, &args).await;
         }
         if action != "call" {
             return Ok(ToolResult {
@@ -1656,6 +1683,7 @@ mod http_session;
 pub(super) mod level_view;
 mod lifecycle;
 mod listen;
+mod resources;
 mod result;
 mod workspace_overlay;
 

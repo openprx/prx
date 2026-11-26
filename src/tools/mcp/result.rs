@@ -71,15 +71,7 @@ fn render_block(block: &ContentBlock) -> String {
             Some(mime) => format!("[resource link] {} {} ({mime})", link.name, link.uri),
             None => format!("[resource link] {} {}", link.name, link.uri),
         },
-        ContentBlock::Resource(embedded) => match &embedded.resource {
-            ResourceContents::TextResourceContents { uri, text, .. } => format!("[resource {uri}]\n{text}"),
-            ResourceContents::BlobResourceContents { uri, mime_type, blob, .. } => format!(
-                "[resource {uri}: {}, {} bytes base64]",
-                mime_type.as_deref().unwrap_or("unknown"),
-                blob.len()
-            ),
-            _ => "[unsupported embedded resource]".to_string(),
-        },
+        ContentBlock::Resource(embedded) => render_resource_contents(&embedded.resource),
         ContentBlock::Image(image) => format!(
             "[image: {}, {} bytes base64]",
             image.mime_type,
@@ -91,6 +83,20 @@ fn render_block(block: &ContentBlock) -> String {
             audio.data.len()
         ),
         _ => "[unsupported content block]".to_string(),
+    }
+}
+
+/// Render one resource content: text in full, a blob as a placeholder with its
+/// size and no base64 payload. Shared by embedded resources and `resources/read`.
+pub(super) fn render_resource_contents(contents: &ResourceContents) -> String {
+    match contents {
+        ResourceContents::TextResourceContents { uri, text, .. } => format!("[resource {uri}]\n{text}"),
+        ResourceContents::BlobResourceContents { uri, mime_type, blob, .. } => format!(
+            "[resource {uri}: {}, {} bytes base64]",
+            mime_type.as_deref().unwrap_or("unknown"),
+            blob.len()
+        ),
+        _ => "[unsupported embedded resource]".to_string(),
     }
 }
 
