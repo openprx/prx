@@ -814,18 +814,18 @@ impl ReliableProvider {
             .and_then(|admission| admission.refusal(provider, display_provider, model, requires_native_tools))
     }
 
+    /// The most in-place retries one candidate can take on the rate-limit
+    /// budget; `is_last` tells whether it is the last candidate of the chain.
+    fn max_candidate_retries(&self, is_last: bool) -> u32 {
+        retry_budget(self.max_retries, RetryKind::RateLimited, is_last)
+    }
+
     /// Emit rate-limit telemetry, publish the cool-down to the shared gate and
     /// sleep before the next attempt on the same candidate.
     ///
     /// Returns `false` when the upstream asked for longer than
     /// [`MAX_HONORED_RETRY_AFTER_MS`], meaning this candidate must be abandoned
     /// rather than retried after a truncated (and therefore useless) wait.
-    /// The most in-place retries one candidate can take: the rate-limit budget,
-    /// the largest of the per-kind budgets. Loops and attempt totals use it.
-    fn max_candidate_retries(&self) -> u32 {
-        retry_budget(self.max_retries, RetryKind::RateLimited)
-    }
-
     async fn wait_before_retry(&self, ctx: &RetryContext<'_>, backoff_ms: u64, err: &anyhow::Error) -> bool {
         let hint_ms = parse_retry_after_ms(err);
         if ctx.rate_limited {
@@ -842,7 +842,10 @@ impl ReliableProvider {
                 reason = ctx.failure_reason,
                 "Provider overloaded, retrying"
             );
-            notice_overload_retry(ctx.attempt, retry_budget(self.max_retries, RetryKind::Overload));
+            notice_overload_retry(
+                ctx.attempt,
+                retry_budget(self.max_retries, RetryKind::Overload, ctx.is_last),
+            );
             self.rate_limit_gate.note_rate_limited(ctx.gate_key, wait);
             tokio::time::sleep(Duration::from_millis(wait)).await;
             return true;
@@ -850,7 +853,8 @@ impl ReliableProvider {
         // A 429 without `Retry-After` follows the rate-limit schedule; with a
         // hint the hint decides, up to the honored ceiling.
         let plan = match (ctx.kind, hint_ms) {
-            (RetryKind::RateLimited, None) => RetryWait::Sleep(rate_limit_wait_ms(ctx.attempt)),
+            (RetryKind::RateLimited, None) if ctx.is_last => RetryWait::Sleep(rate_limit_wait_ms(ctx.attempt)),
+            (RetryKind::RateLimited, None) => RetryWait::Sleep(overload_wait_ms(ctx.attempt, None)),
             _ => plan_retry_wait(backoff_ms, err),
         };
         match plan {
@@ -881,7 +885,10 @@ impl ReliableProvider {
                     "Provider call failed, retrying"
                 );
                 if ctx.kind == RetryKind::RateLimited {
-                    notice_overload_retry(ctx.attempt, retry_budget(self.max_retries, RetryKind::RateLimited));
+                    notice_overload_retry(
+                        ctx.attempt,
+                        retry_budget(self.max_retries, RetryKind::RateLimited, ctx.is_last),
+                    );
                 }
                 if ctx.rate_limited {
                     self.rate_limit_gate.note_rate_limited(ctx.gate_key, wait);
@@ -930,6 +937,8 @@ struct RetryContext<'a> {
     rate_limited: bool,
     /// How the failure is retried; see [`RetryKind`].
     kind: RetryKind,
+    /// Whether this candidate is the last one of the chain.
+    is_last: bool,
 }
 
 /// Compute the (jittered) wait before retrying the same provider/model.
@@ -1111,13 +1120,16 @@ impl Provider for ReliableProvider {
         // Each iteration: attempt one (provider, model) call. On success, return
         // immediately. On non-retryable error, break to next provider. On
         // retryable error, sleep with exponential backoff and retry.
-        for current_model in &models {
-            for ChainMember {
-                name: provider_name,
-                key: member_key,
-                id: provider_id,
-                provider,
-            } in &self.providers
+        for (model_index, current_model) in models.iter().enumerate() {
+            for (
+                provider_index,
+                ChainMember {
+                    name: provider_name,
+                    key: member_key,
+                    id: provider_id,
+                    provider,
+                },
+            ) in self.providers.iter().enumerate()
             {
                 if !self.provider_model_compatible(provider_name, current_model, model) {
                     runtime_unavailable.push((
@@ -1136,7 +1148,8 @@ impl Provider for ReliableProvider {
                 // and give-up can be reported separately from ordinary errors.
                 let mut rate_limited_seen = false;
 
-                for attempt in 0..=self.max_candidate_retries() {
+                let is_last = model_index + 1 == models.len() && provider_index + 1 == self.providers.len();
+                for attempt in 0..=self.max_candidate_retries(is_last) {
                     let permit = match self.admit_circuit(member_key) {
                         Ok(permit) => permit,
                         Err(ms) => {
@@ -1179,12 +1192,13 @@ impl Provider for ReliableProvider {
                             let error_detail = compact_error_detail(&e);
                             rate_limited_seen = rate_limited_seen || (rate_limited && !non_retryable);
 
+                            let kind = retry_kind(&e);
                             push_failure(
                                 &mut failures,
                                 provider_name,
                                 current_model,
                                 attempt + 1,
-                                self.max_candidate_retries() + 1,
+                                retry_budget(self.max_retries, kind, is_last) + 1,
                                 failure_reason,
                                 &error_detail,
                             );
@@ -1207,9 +1221,7 @@ impl Provider for ReliableProvider {
                                 break;
                             }
 
-                            // Retry budget and schedule depend on the failure kind.
-                            let kind = retry_kind(&e);
-                            if may_retry(attempt, self.max_retries, kind) {
+                            if may_retry(attempt, self.max_retries, kind, is_last) {
                                 let ctx = RetryContext {
                                     provider_name,
                                     gate_key: member_key,
@@ -1219,6 +1231,7 @@ impl Provider for ReliableProvider {
                                     error_detail: &error_detail,
                                     rate_limited,
                                     kind,
+                                    is_last,
                                 };
                                 if !self.wait_before_retry(&ctx, backoff_ms, &e).await {
                                     break;
@@ -1248,7 +1261,7 @@ impl Provider for ReliableProvider {
                     tracing::error!(
                         provider = %redact_provider_text(provider_name),
                         model = *current_model,
-                        attempts = self.max_candidate_retries() + 1,
+                        attempts = self.max_candidate_retries(is_last) + 1,
                         "Provider rate limit outlasted the retry budget; abandoning this candidate"
                     );
                 }
@@ -1281,13 +1294,16 @@ impl Provider for ReliableProvider {
         let mut failures = Vec::new();
         let mut runtime_unavailable = Vec::new();
 
-        for current_model in &models {
-            for ChainMember {
-                name: provider_name,
-                key: member_key,
-                id: provider_id,
-                provider,
-            } in &self.providers
+        for (model_index, current_model) in models.iter().enumerate() {
+            for (
+                provider_index,
+                ChainMember {
+                    name: provider_name,
+                    key: member_key,
+                    id: provider_id,
+                    provider,
+                },
+            ) in self.providers.iter().enumerate()
             {
                 if !self.provider_model_compatible(provider_name, current_model, model) {
                     runtime_unavailable.push((
@@ -1306,7 +1322,8 @@ impl Provider for ReliableProvider {
                 // and give-up can be reported separately from ordinary errors.
                 let mut rate_limited_seen = false;
 
-                for attempt in 0..=self.max_candidate_retries() {
+                let is_last = model_index + 1 == models.len() && provider_index + 1 == self.providers.len();
+                for attempt in 0..=self.max_candidate_retries(is_last) {
                     let permit = match self.admit_circuit(member_key) {
                         Ok(permit) => permit,
                         Err(ms) => {
@@ -1346,12 +1363,13 @@ impl Provider for ReliableProvider {
                             let error_detail = compact_error_detail(&e);
                             rate_limited_seen = rate_limited_seen || (rate_limited && !non_retryable);
 
+                            let kind = retry_kind(&e);
                             push_failure(
                                 &mut failures,
                                 provider_name,
                                 current_model,
                                 attempt + 1,
-                                self.max_candidate_retries() + 1,
+                                retry_budget(self.max_retries, kind, is_last) + 1,
                                 failure_reason,
                                 &error_detail,
                             );
@@ -1374,9 +1392,7 @@ impl Provider for ReliableProvider {
                                 break;
                             }
 
-                            // Retry budget and schedule depend on the failure kind.
-                            let kind = retry_kind(&e);
-                            if may_retry(attempt, self.max_retries, kind) {
+                            if may_retry(attempt, self.max_retries, kind, is_last) {
                                 let ctx = RetryContext {
                                     provider_name,
                                     gate_key: member_key,
@@ -1386,6 +1402,7 @@ impl Provider for ReliableProvider {
                                     error_detail: &error_detail,
                                     rate_limited,
                                     kind,
+                                    is_last,
                                 };
                                 if !self.wait_before_retry(&ctx, backoff_ms, &e).await {
                                     break;
@@ -1415,7 +1432,7 @@ impl Provider for ReliableProvider {
                     tracing::error!(
                         provider = %redact_provider_text(provider_name),
                         model = *current_model,
-                        attempts = self.max_candidate_retries() + 1,
+                        attempts = self.max_candidate_retries(is_last) + 1,
                         "Provider rate limit outlasted the retry budget; abandoning this candidate"
                     );
                 }
@@ -1463,13 +1480,16 @@ impl Provider for ReliableProvider {
         let mut chain_refusal: Option<super::ToolSchemaRefusalError> = None;
         let mut every_failure_refused = true;
 
-        for current_model in &models {
-            for ChainMember {
-                name: provider_name,
-                key: member_key,
-                id: provider_id,
-                provider,
-            } in &self.providers
+        for (model_index, current_model) in models.iter().enumerate() {
+            for (
+                provider_index,
+                ChainMember {
+                    name: provider_name,
+                    key: member_key,
+                    id: provider_id,
+                    provider,
+                },
+            ) in self.providers.iter().enumerate()
             {
                 if !self.provider_model_compatible(provider_name, current_model, model) {
                     runtime_unavailable.push((
@@ -1496,7 +1516,8 @@ impl Provider for ReliableProvider {
                 // and give-up can be reported separately from ordinary errors.
                 let mut rate_limited_seen = false;
 
-                for attempt in 0..=self.max_candidate_retries() {
+                let is_last = model_index + 1 == models.len() && provider_index + 1 == self.providers.len();
+                for attempt in 0..=self.max_candidate_retries(is_last) {
                     super::attempt_accounting::ensure_supported(provider.as_ref())?;
                     let permit = match self.admit_circuit(member_key) {
                         Ok(permit) => permit,
@@ -1566,12 +1587,13 @@ impl Provider for ReliableProvider {
                                 None => every_failure_refused = false,
                             }
 
+                            let kind = retry_kind(&e);
                             push_failure(
                                 &mut failures,
                                 provider_name,
                                 current_model,
                                 attempt + 1,
-                                self.max_candidate_retries() + 1,
+                                retry_budget(self.max_retries, kind, is_last) + 1,
                                 failure_reason,
                                 &error_detail,
                             );
@@ -1607,9 +1629,7 @@ impl Provider for ReliableProvider {
                                 break;
                             }
 
-                            // Retry budget and schedule depend on the failure kind.
-                            let kind = retry_kind(&e);
-                            if may_retry(attempt, self.max_retries, kind) {
+                            if may_retry(attempt, self.max_retries, kind, is_last) {
                                 let ctx = RetryContext {
                                     provider_name,
                                     gate_key: member_key,
@@ -1619,6 +1639,7 @@ impl Provider for ReliableProvider {
                                     error_detail: &error_detail,
                                     rate_limited,
                                     kind,
+                                    is_last,
                                 };
                                 if !self.wait_before_retry(&ctx, backoff_ms, &e).await {
                                     break;
@@ -1648,7 +1669,7 @@ impl Provider for ReliableProvider {
                     tracing::error!(
                         provider = %redact_provider_text(provider_name),
                         model = *current_model,
-                        attempts = self.max_candidate_retries() + 1,
+                        attempts = self.max_candidate_retries(is_last) + 1,
                         "Provider rate limit outlasted the retry budget; abandoning this candidate"
                     );
                 }
@@ -1717,13 +1738,16 @@ impl Provider for ReliableProvider {
         let mut failures = Vec::new();
         let mut runtime_unavailable = Vec::new();
 
-        for current_model in &models {
-            for ChainMember {
-                name: provider_name,
-                key: member_key,
-                id: provider_id,
-                provider,
-            } in &self.providers
+        for (model_index, current_model) in models.iter().enumerate() {
+            for (
+                provider_index,
+                ChainMember {
+                    name: provider_name,
+                    key: member_key,
+                    id: provider_id,
+                    provider,
+                },
+            ) in self.providers.iter().enumerate()
             {
                 if !self.provider_model_compatible(provider_name, current_model, model) {
                     runtime_unavailable.push((
@@ -1744,7 +1768,8 @@ impl Provider for ReliableProvider {
                 // and give-up can be reported separately from ordinary errors.
                 let mut rate_limited_seen = false;
 
-                for attempt in 0..=self.max_candidate_retries() {
+                let is_last = model_index + 1 == models.len() && provider_index + 1 == self.providers.len();
+                for attempt in 0..=self.max_candidate_retries(is_last) {
                     let permit = match self.admit_circuit(member_key) {
                         Ok(permit) => permit,
                         Err(ms) => {
@@ -1787,12 +1812,13 @@ impl Provider for ReliableProvider {
                             let error_detail = compact_error_detail(&e);
                             rate_limited_seen = rate_limited_seen || (rate_limited && !non_retryable);
 
+                            let kind = retry_kind(&e);
                             push_failure(
                                 &mut failures,
                                 provider_name,
                                 current_model,
                                 attempt + 1,
-                                self.max_candidate_retries() + 1,
+                                retry_budget(self.max_retries, kind, is_last) + 1,
                                 failure_reason,
                                 &error_detail,
                             );
@@ -1815,9 +1841,7 @@ impl Provider for ReliableProvider {
                                 break;
                             }
 
-                            // Retry budget and schedule depend on the failure kind.
-                            let kind = retry_kind(&e);
-                            if may_retry(attempt, self.max_retries, kind) {
+                            if may_retry(attempt, self.max_retries, kind, is_last) {
                                 let ctx = RetryContext {
                                     provider_name,
                                     gate_key: member_key,
@@ -1827,6 +1851,7 @@ impl Provider for ReliableProvider {
                                     error_detail: &error_detail,
                                     rate_limited,
                                     kind,
+                                    is_last,
                                 };
                                 if !self.wait_before_retry(&ctx, backoff_ms, &e).await {
                                     break;
@@ -1856,7 +1881,7 @@ impl Provider for ReliableProvider {
                     tracing::error!(
                         provider = %redact_provider_text(provider_name),
                         model = *current_model,
-                        attempts = self.max_candidate_retries() + 1,
+                        attempts = self.max_candidate_retries(is_last) + 1,
                         "Provider rate limit outlasted the retry budget; abandoning this candidate"
                     );
                 }
@@ -2512,7 +2537,7 @@ where
                             let retry_in_place =
                                 matches!(class, StreamFailureClass::RateLimited | StreamFailureClass::Retryable)
                                     && !skips_in_place_retry(&err)
-                                    && may_retry(pre_content_retries, max_retries, kind);
+                                    && may_retry(pre_content_retries, max_retries, kind, is_last);
                             let retry = pre_content_retries + 1;
 
                             if retry_in_place && kind == RetryKind::Overload {
@@ -2525,7 +2550,7 @@ where
                                     retry_after_ms = hint_ms,
                                     "Provider overloaded before content; retrying same provider/model"
                                 );
-                                notice_overload_retry(retry, retry_budget(max_retries, RetryKind::Overload));
+                                notice_overload_retry(retry, retry_budget(max_retries, RetryKind::Overload, is_last));
                                 gate.note_rate_limited(&attempt.member_key, wait);
                                 // Cancelling the turn drops the receiver and ends the wait.
                                 tokio::select! {
@@ -2538,7 +2563,10 @@ where
                             }
                             if retry_in_place {
                                 let plan = match (kind, hint_ms) {
-                                    (RetryKind::RateLimited, None) => RetryWait::Sleep(rate_limit_wait_ms(retry)),
+                                    (RetryKind::RateLimited, None) if is_last => {
+                                        RetryWait::Sleep(rate_limit_wait_ms(retry))
+                                    }
+                                    (RetryKind::RateLimited, None) => RetryWait::Sleep(overload_wait_ms(retry, None)),
                                     _ => plan_wait_from_hint(backoff_ms, hint_ms),
                                 };
                                 match plan {
@@ -2555,7 +2583,7 @@ where
                                         if kind == RetryKind::RateLimited {
                                             notice_overload_retry(
                                                 retry,
-                                                retry_budget(max_retries, RetryKind::RateLimited),
+                                                retry_budget(max_retries, RetryKind::RateLimited, is_last),
                                             );
                                         }
                                         if rate_limited {

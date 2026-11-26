@@ -30,12 +30,15 @@ pub(super) enum RetryKind {
 }
 
 /// In-place retries one candidate may take after a failure of `kind`, given the
-/// chain's `max_retries`. A rate limit gets at least [`RATE_LIMIT_MAX_RETRIES`],
-/// unless the chain disables retries with `0`.
-pub(super) fn retry_budget(max_retries: u32, kind: RetryKind) -> u32 {
+/// chain's `max_retries`. A rate limit gets at least [`RATE_LIMIT_MAX_RETRIES`]
+/// only on the last candidate of the chain, unless the chain disables retries
+/// with `0`. On any earlier candidate a rate limit gets the overload budget, so
+/// the chain fails over instead of waiting out the long schedule.
+pub(super) fn retry_budget(max_retries: u32, kind: RetryKind, is_last: bool) -> u32 {
     match kind {
         RetryKind::Ordinary => max_retries,
         RetryKind::Overload => max_retries.min(OVERLOAD_MAX_RETRIES),
+        RetryKind::RateLimited if !is_last => max_retries.min(OVERLOAD_MAX_RETRIES),
         RetryKind::RateLimited if max_retries == 0 => 0,
         RetryKind::RateLimited => max_retries.max(RATE_LIMIT_MAX_RETRIES),
     }
@@ -43,8 +46,8 @@ pub(super) fn retry_budget(max_retries: u32, kind: RetryKind) -> u32 {
 
 /// Whether the failed attempt number `attempt` (0-based) of a candidate may be
 /// followed by another attempt on the same candidate.
-pub(super) fn may_retry(attempt: u32, max_retries: u32, kind: RetryKind) -> bool {
-    attempt < retry_budget(max_retries, kind)
+pub(super) fn may_retry(attempt: u32, max_retries: u32, kind: RetryKind, is_last: bool) -> bool {
+    attempt < retry_budget(max_retries, kind, is_last)
 }
 
 /// The fixed wait before rate-limit retry `retry` (1-based), used when the 429
