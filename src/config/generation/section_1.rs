@@ -790,6 +790,9 @@ impl ConfigGenerationManager {
         }
         let active = old_generation.effective.as_ref();
         let adopted = adopt_live_pairing_tokens(active, &desired);
+        let paired_token_change = adopted
+            .as_ref()
+            .map(|_| paired_token_counts(&active.gateway.paired_tokens, &desired.gateway.paired_tokens));
         let old = adopted.as_ref().unwrap_or(active);
         let changed = changed_top_level_fields(old, &desired)?;
         let participants = {
@@ -975,6 +978,16 @@ impl ConfigGenerationManager {
                 published.retain(|_, pinned| pinned.strong_count() > 0);
                 published.insert(generation.id, Arc::downgrade(&generation));
             }
+            // Counts only: the adopted token values never reach the event.
+            if let Some((added, removed)) = paired_token_change {
+                self.emit_audit(ConfigGenerationAuditEvent {
+                    event_type: "gateway.paired_tokens.adopted".to_string(),
+                    generation_id: Some(generation.id),
+                    source_revision: Some(generation.source_revision.clone()),
+                    trigger,
+                    payload: serde_json::json!({ "added": added, "removed": removed }),
+                });
+            }
             self.model_allowlist.refresh(&generation.effective);
             for update in &mut prepared {
                 update.finalize();
@@ -1133,6 +1146,25 @@ fn adopt_live_pairing_tokens(active: &Config, desired: &Config) -> Option<Config
     let mut adopted = active.clone();
     adopted.gateway.paired_tokens.clone_from(&desired.gateway.paired_tokens);
     Some(adopted)
+}
+
+/// How many token hashes the adopted list adds and removes against the
+/// active list, as `(added, removed)`. Entries are compared by hash, so a
+/// plaintext entry and its hash count as one token.
+fn paired_token_counts(active: &[String], desired: &[String]) -> (usize, usize) {
+    let hashes = |list: &[String]| -> BTreeSet<String> {
+        list.iter()
+            .map(|token| {
+                if crate::security::pairing::is_token_hash(token) {
+                    token.clone()
+                } else {
+                    crate::security::pairing::hash_token(token)
+                }
+            })
+            .collect()
+    };
+    let (active, desired) = (hashes(active), hashes(desired));
+    (desired.difference(&active).count(), active.difference(&desired).count())
 }
 
 pub(crate) fn is_process_restart_only(field: &str) -> bool {
