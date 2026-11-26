@@ -2057,7 +2057,8 @@ level. A process child's approval calls are relayed to the root approval surface
 
 `sessions_spawn` `spawn` and `continue` accept two optional arguments. Both are
 absent by default, and then the child's first message is the `task` text alone,
-exactly as before.
+exactly as before. A `brief` or `references` given as null, as a blank string
+or as an empty array counts as absent.
 
 - `brief`: an object with `objective`, `expected_output` and `boundaries`
   (strings, at most 4,000 characters each). Blank fields are omitted; unknown

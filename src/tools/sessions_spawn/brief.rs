@@ -45,7 +45,7 @@ pub(super) fn render_task(task: &str, args: &Value) -> Result<Option<String>, St
 }
 
 fn render_brief(value: Option<&Value>) -> Result<Vec<String>, String> {
-    let Some(value) = value.filter(|v| !v.is_null()) else {
+    let Some(value) = value.filter(|v| !is_absent(v)) else {
         return Ok(Vec::new());
     };
     let fields = value.as_object().ok_or("'brief' must be an object")?;
@@ -70,7 +70,7 @@ fn render_brief(value: Option<&Value>) -> Result<Vec<String>, String> {
 }
 
 fn render_references(value: Option<&Value>) -> Result<Vec<String>, String> {
-    let Some(value) = value.filter(|v| !v.is_null()) else {
+    let Some(value) = value.filter(|v| !is_absent(v)) else {
         return Ok(Vec::new());
     };
     let entries = value.as_array().ok_or("'references' must be an array")?;
@@ -115,6 +115,18 @@ fn render_reference(index: usize, entry: &Value) -> Result<String, String> {
             Ok(format!("{line} ({note})"))
         }
         None => Ok(line),
+    }
+}
+
+/// A top-level `brief` or `references` value that counts as not given: null,
+/// a blank string or an empty array. Such a value renders nothing and leaves the
+/// task unchanged; every other shape goes through the normal validation.
+fn is_absent(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(text) => text.trim().is_empty(),
+        Value::Array(entries) => entries.is_empty(),
+        _ => false,
     }
 }
 
