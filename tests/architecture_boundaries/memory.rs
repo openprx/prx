@@ -46,7 +46,7 @@ const ALLOWED_BRAIN_DB_OPENS_OUTSIDE_SQLITE_REPOSITORY: &[&str] = &[
     // deadline requires a second, non-pooled connection to hold the write lock.
     "src/cron/store.rs::cron_write_waits_past_the_old_five_second_deadline_and_warns::let conn = Connection::open(&db_path).expect(\"test: holder connection\");",
     "src/cron/store.rs::legacy_cron_schema_migrates_lineage_columns_and_events_table::let conn = Connection::open(&db_path).unwrap();",
-    "src/cron/store.rs::with_connection::Connection::open(&db_path).with_context(|| format!(\"Failed to open cron DB: {}\", db_path.display()))?;",
+    "src/cron/store/connection.rs::with_connection::Connection::open(&db_path).with_context(|| format!(\"Failed to open cron DB: {}\", db_path.display()))?;",
     // Read-only doctor probes must not initialize the memory repository merely
     // to count legacy rows in an existing database.
     "src/doctor/mod.rs::read_only_sqlite_key_prefix_count::let connection = rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;",
@@ -218,8 +218,8 @@ const ALLOWED_PERSISTED_EVENT_TABLES: &[&str] = &[
     "src/compliance/incident.rs::serious_incident_audit_events",
     "src/cron/postgres.rs::cron_job_events",
     "src/cron/postgres.rs::{qualified_memory_events_table}",
-    "src/cron/store.rs::cron_event_outbox",
-    "src/cron/store.rs::cron_job_events",
+    "src/cron/store/connection.rs::cron_event_outbox",
+    "src/cron/store/connection.rs::cron_job_events",
     "src/memory/postgres/schema.rs::{qualified_memory_events_table}",
     "src/memory/postgres/schema.rs::{qualified_message_events_table}",
     "src/memory/postgres/schema.rs::{schema_ident}.approval_grant_events",
