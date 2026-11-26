@@ -242,6 +242,12 @@ pub(crate) const DEPRECATED_CONFIG_KEYS: &[DeprecatedKey] = &[
         shape: DeprecatedShape::Field,
         reason: REASON_NEVER_ENFORCED,
     },
+    // ── [skill_rag]: the prompt publishes the skill catalog whole ─────────
+    DeprecatedKey {
+        path: &["skill_rag", "top_k"],
+        shape: DeprecatedShape::Field,
+        reason: "skills are published whole; top_k never limited the catalog, so the key has no effect",
+    },
 ];
 
 /// Where a retired key was found, so the warning can name a line to delete.
