@@ -9,7 +9,7 @@
     clippy::unreadable_literal
 )]
 use super::*;
-use crate::config::McpServerConfig;
+use crate::config::{McpServerConfig, WorkspaceMcpServers};
 
 // ── HTTP transport client (R-INT2BB1 M-2, D-060) ──────────
 
