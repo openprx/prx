@@ -202,7 +202,6 @@ pub(crate) fn catalog_skill_read_spec(skill: &crate::skills::SkillMetadata) -> T
                 "name": {"const": skill.name},
                 "resource_path": {"type": "string"}
             },
-            "required": ["name"],
             "additionalProperties": false
         }),
     }
