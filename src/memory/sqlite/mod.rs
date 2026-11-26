@@ -29,6 +29,7 @@ mod rf_attachments;
 mod rf_delete;
 mod rf_forget;
 mod rf_messages;
+mod owner_event_type;
 mod session_event_type;
 mod sync_journal;
 mod sync_lifecycle;

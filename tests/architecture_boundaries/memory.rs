@@ -167,6 +167,7 @@ const SQLITE_BACKEND_FILES: &[&str] = &[
     "rows.rs",
     "schema.rs",
     "transcript_search.rs",
+    "owner_event_type.rs",
 ];
 
 /// Older child modules that were never part of the exemption for the
@@ -401,6 +402,10 @@ fn runtime_and_message_events_preserve_typed_config_generation_columns() {
         ),
         ("memory_impl.rs", include_str!("../../src/memory/sqlite/memory_impl.rs")),
         ("mirror.rs", include_str!("../../src/memory/sqlite/mirror.rs")),
+        (
+            "owner_event_type.rs",
+            include_str!("../../src/memory/sqlite/owner_event_type.rs"),
+        ),
         ("recall.rs", include_str!("../../src/memory/sqlite/recall.rs")),
         ("remote_tree.rs", include_str!("../../src/memory/sqlite/remote_tree.rs")),
         ("rows.rs", include_str!("../../src/memory/sqlite/rows.rs")),

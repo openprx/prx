@@ -279,6 +279,18 @@ impl Memory for LucidMemory {
         self.local.recovery_repository()
     }
 
+    async fn newest_owner_events_of_type(
+        &self,
+        principal: &MemoryPrincipal,
+        event_type: &str,
+        after_id: Option<i64>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MessageEvent>> {
+        self.local
+            .newest_owner_events_of_type(principal, event_type, after_id, limit)
+            .await
+    }
+
     async fn search_transcripts(
         &self,
         principal: &MemoryPrincipal,

@@ -1314,6 +1314,17 @@ impl Memory for SqliteMemory {
             .await
     }
 
+    async fn newest_owner_events_of_type(
+        &self,
+        principal: &MemoryPrincipal,
+        event_type: &str,
+        after_id: Option<i64>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MessageEvent>> {
+        self.newest_owner_events_of_type_impl(principal, event_type, after_id, limit)
+            .await
+    }
+
     async fn search_transcripts(
         &self,
         principal: &MemoryPrincipal,

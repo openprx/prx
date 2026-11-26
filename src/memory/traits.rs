@@ -1280,6 +1280,22 @@ pub trait Memory: Send + Sync {
         ))
     }
 
+    /// The newest `limit` rows of `event_type` of the principal's owner and
+    /// workspace, in the agent partition of the principal (no partition means
+    /// Main), across every session, newest first by row id. Rows with an id at
+    /// or below `after_id` are left out, and so are rows of erased scopes and of
+    /// inactive incarnations. Backends without an ordered event log return none.
+    async fn newest_owner_events_of_type(
+        &self,
+        principal: &MemoryPrincipal,
+        event_type: &str,
+        after_id: Option<i64>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MessageEvent>> {
+        let _ = (principal, event_type, after_id, limit);
+        Ok(Vec::new())
+    }
+
     /// Full-text search over the transcript rows (`message_events`) of the
     /// principal's owner and workspace, in the agent partition of the principal
     /// (no partition means Main). The best match comes first (bm25) when the
