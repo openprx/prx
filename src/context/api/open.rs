@@ -7,7 +7,7 @@ use std::sync::Arc;
 use crate::agent::context_recall::{RECALL_CONTEXT_BUDGET, RecallScope, replayed_session_recall, scoped_recall};
 use crate::config::{AgentCompactionConfig, MemoryConfig};
 use crate::context::request_provenance::{LiveAttachment, note_live_attachment};
-use crate::context::transcript::{Attachment, Transcript, append_attachment};
+use crate::context::transcript::{Attachment, History, Transcript, append_attachment};
 use crate::memory::{ConversationTurn, Memory, MemoryFabric};
 use crate::providers::ChatMessage;
 use crate::runtime::envelope::RuntimeEnvelope;
@@ -160,15 +160,22 @@ pub(crate) async fn open_turn(input: OpenInput<'_>) -> TurnOpening {
         )
         .await;
     }
-    let transcript = Transcript::new(memory.as_ref(), envelope.memory_principal());
-
     let system_message = ChatMessage::system(system_prompt);
     let request_message = crate::agent::turn_contracts::inbound_user_message(&enriched_message);
     // Earlier turns with their tool rounds; the oldest results become stubs
     // when the request would be over budget. The stored event of each history
     // message, index for index: none for the system prompt or a tool message,
     // each stored turn's event, then the request's own event.
-    let mut replayed = transcript.expand_turns(previous_turns).await;
+    // A turn with no earlier turns replays nothing. `expand_turns` would still
+    // read the session's replay rows first, so the read is skipped and the
+    // empty history is the one `expand_turns` returns for zero turns.
+    let mut replayed = if previous_turns.is_empty() {
+        History::default()
+    } else {
+        Transcript::new(memory.as_ref(), envelope.memory_principal())
+            .expand_turns(previous_turns)
+            .await
+    };
     if replay == ReplayMode::ClearAll {
         replayed.stub_all_results();
     }

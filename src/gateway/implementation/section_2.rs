@@ -1255,7 +1255,8 @@ async fn run_gateway_chat_with_multimodal(
                 model: &turn_runtime.model,
             })
             .await;
-            let image_marker_count = crate::multimodal::count_image_markers(opening.history.get(1..).unwrap_or_default());
+            let image_marker_count =
+                crate::multimodal::count_image_markers(opening.history.get(1..).unwrap_or_default());
             if image_marker_count > 0 && !mode_capabilities.vision {
                 return Err(ProviderCapabilityError {
                     provider: providers::redact_endpoint_userinfo(provider_label).into_owned(),
