@@ -100,14 +100,14 @@ use crate::providers::ToolCall;
 #[cfg(all(test, feature = "wasm-plugins"))]
 use std::path::Path;
 
-use super::state::{PreparedRound, RoundBudget, TurnInputs, TurnState};
+use super::state::{PreparedRound, RoundBudget, RoundSurface, TurnInputs, TurnState};
 
 /// Records the request context event of one round when something reads it:
 /// the durable event, or an enabled prompt subscriber.
 pub(super) async fn record_request_context(
     turn: &TurnInputs<'_>,
     state: &TurnState,
-    tool_surface_counts: &RequestToolSurfaceCounts,
+    surface: &RoundSurface<'_>,
     budget: &RoundBudget,
     round: &PreparedRound,
 ) {
@@ -119,6 +119,7 @@ pub(super) async fn record_request_context(
         model,
         ..
     } = *turn;
+    let tool_surface_counts = &surface.tool_surface_counts;
     let tool_snapshot = round.compiled_tool_context.fingerprint();
     // How much of this request is prompt and how much is native tool
     // schema. Sizes, counts and estimates only: this is emitted into a
