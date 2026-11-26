@@ -81,6 +81,15 @@ the same path: the job runs as a single-shot turn under the session key
 `cron:{job_id}` and its result stays in the run history; `main` does not
 deliver anything to a main session.
 
+Scheduled jobs and Xin tasks store a `context`: `task` (default) or `fresh`.
+It is set by the cron and xin tools on `add` (cron also on `schedule`, and
+inside the `update` patch; xin on `update`) and by `POST` and `PATCH`
+`/api/cron/jobs`. `fresh` drops only the replay of earlier runs of the job's
+or task's session; recall from memory and the task card are unchanged. Goal
+steps always use their goal's shared session, whatever the task's `context`.
+The Postgres cron store refuses `fresh`, so a create with `fresh` fails and
+leaves no job behind.
+
 ## HEARTBEAT.md materialization
 
 Each trimmed line that starts with `-` followed by a space becomes a recurring
