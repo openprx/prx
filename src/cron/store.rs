@@ -1189,6 +1189,20 @@ pub fn reschedule_after_run(config: &Config, job: &CronJob, success: bool, outpu
     })
 }
 
+/// The persisted job revision, independent of claims and execution attempts.
+pub fn job_revision(config: &Config, id: &str) -> Result<u64> {
+    if let Some(store) = pg_store(config)? {
+        return store.job_revision(id);
+    }
+    with_connection(config, |conn| {
+        Ok(u64::try_from(conn.query_row(
+            "SELECT version FROM cron_jobs WHERE id=?1",
+            [id],
+            |r| r.get::<_, i64>(0),
+        )?)?)
+    })
+}
+
 #[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
@@ -2726,18 +2740,4 @@ mod tests {
         assert_eq!(updated.command, "git status");
         assert_eq!(job_creator(&config, &job.id).unwrap().0, JobCreator::AgentTool);
     }
-}
-
-/// The persisted job revision, independent of claims and execution attempts.
-pub fn job_revision(config: &Config, id: &str) -> Result<u64> {
-    if let Some(store) = pg_store(config)? {
-        return store.job_revision(id);
-    }
-    with_connection(config, |conn| {
-        Ok(u64::try_from(conn.query_row(
-            "SELECT version FROM cron_jobs WHERE id=?1",
-            [id],
-            |r| r.get::<_, i64>(0),
-        )?)?)
-    })
 }
