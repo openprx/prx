@@ -1,4 +1,5 @@
 //! The identity files: the AIEOS identity or the OpenClaw workspace files.
+use super::memory_index;
 use crate::context::layout::{PromptInputs, Segment, Slot, Source};
 use crate::identity;
 use anyhow::Result;
@@ -104,6 +105,14 @@ fn inject_workspace_file(prompt: &mut String, workspace_dir: &Path, filename: &s
     };
     let trimmed = content.trim();
     if trimmed.is_empty() {
+        return;
+    }
+    if filename == "MEMORY.md"
+        && let Some(index) = memory_index::render_memory_file(trimmed, max_chars)
+    {
+        let _ = writeln!(prompt, "### {filename}\n");
+        prompt.push_str(&index);
+        prompt.push_str("\n\n");
         return;
     }
     let _ = writeln!(prompt, "### {filename}\n");

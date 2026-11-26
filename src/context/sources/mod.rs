@@ -6,6 +6,7 @@ mod datetime;
 mod delegated_role;
 mod host_identity;
 mod identity;
+mod memory_index;
 mod orchestration;
 mod role_identity;
 mod runtime;
