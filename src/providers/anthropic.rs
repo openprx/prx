@@ -137,6 +137,40 @@ impl CacheControl {
     }
 }
 
+/// Indices, among the non-system messages, that carry a conversation cache
+/// breakpoint. The last message always carries one. When a live user message
+/// follows at least one earlier message, the message just before it (the end
+/// of the replayed history) carries one too. At most two indices, so a request
+/// with tools and a large system prompt stays within Anthropic's four markers.
+fn conversation_breakpoint_indices(roles: &[&str]) -> Vec<usize> {
+    let Some(last) = roles.len().checked_sub(1) else {
+        return Vec::new();
+    };
+    let mut indices = Vec::with_capacity(2);
+    if let Some(history_end) = roles
+        .iter()
+        .rposition(|role| *role == "user")
+        .and_then(|live| live.checked_sub(1))
+    {
+        indices.push(history_end);
+    }
+    indices.push(last);
+    indices
+}
+
+/// Set an ephemeral cache marker on the last content block of a message.
+/// `Image` blocks carry no marker field and are left unmarked.
+fn mark_last_block(message: &mut NativeMessage) {
+    match message.content.last_mut() {
+        Some(NativeContentOut::Text { cache_control, .. })
+        | Some(NativeContentOut::ToolUse { cache_control, .. })
+        | Some(NativeContentOut::ToolResult { cache_control, .. }) => {
+            *cache_control = Some(CacheControl::ephemeral());
+        }
+        Some(NativeContentOut::Image { .. }) | None => {}
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 enum SystemPrompt {
@@ -326,17 +360,21 @@ impl AnthropicProvider {
         messages.iter().filter(|m| m.role != "system").count() > 4
     }
 
-    /// Apply cache control to the last message content block
-    fn apply_cache_to_last_message(messages: &mut [NativeMessage]) {
-        if let Some(last_msg) = messages.last_mut() {
-            if let Some(last_content) = last_msg.content.last_mut() {
-                match last_content {
-                    NativeContentOut::Text { cache_control, .. }
-                    | NativeContentOut::ToolResult { cache_control, .. } => {
-                        *cache_control = Some(CacheControl::ephemeral());
-                    }
-                    NativeContentOut::ToolUse { .. } | NativeContentOut::Image { .. } => {}
-                }
+    /// Mark the conversation breakpoints from the layout: the end of the
+    /// replayed history and the last message. Native messages map one-to-one
+    /// onto the non-system chat messages, in order (`convert_messages`).
+    fn apply_conversation_breakpoints(messages: &[ChatMessage], native: &mut [NativeMessage]) {
+        if !Self::should_cache_conversation(messages) {
+            return;
+        }
+        let roles: Vec<&str> = messages
+            .iter()
+            .filter(|m| m.role != "system")
+            .map(|m| m.role.as_str())
+            .collect();
+        for index in conversation_breakpoint_indices(&roles) {
+            if let Some(message) = native.get_mut(index) {
+                mark_last_block(message);
             }
         }
     }
@@ -686,9 +724,7 @@ impl AnthropicProvider {
 
         let (system_prompt, mut messages) = Self::convert_messages(request.messages);
 
-        if Self::should_cache_conversation(request.messages) {
-            Self::apply_cache_to_last_message(&mut messages);
-        }
+        Self::apply_conversation_breakpoints(request.messages, &mut messages);
 
         let native_request = NativeChatRequest {
             model: model.to_string(),
@@ -1447,11 +1483,9 @@ impl Provider for AnthropicProvider {
             }
         };
         let (system_prompt, mut native_messages) = Self::convert_messages(messages);
-        // The same breakpoint the buffered path sets (STREAM-S3): with the
-        // system prompt and the last tool, at most three of Anthropic's four.
-        if Self::should_cache_conversation(messages) {
-            Self::apply_cache_to_last_message(&mut native_messages);
-        }
+        // The same breakpoints the buffered path sets: history end and last
+        // message. With the last tool and the system prompt, at most four.
+        Self::apply_conversation_breakpoints(messages, &mut native_messages);
 
         let url = format!("{}/v1/messages", self.base_url);
         let client = self.streaming_http_client();

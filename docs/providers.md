@@ -165,6 +165,13 @@ subscription marker and is then billed as a token price.
 - Anthropic uses native tool blocks and preserves thinking blocks across tool
   loops. See [extended thinking](https://platform.claude.com/docs/en/build-with-claude/extended-thinking).
   Both streaming and non-streaming requests carry tools.
+  Prompt caching places at most four `cache_control` breakpoints per request:
+  the last tool, the system prompt (when over 3 KB), the end of the replayed
+  history (the message before the live user message), and the last message.
+  The history-end breakpoint applies only when the conversation has more than
+  four non-system messages and a live user message follows at least one earlier
+  message. A prefix below the provider's minimum cacheable length is not cached
+  and adds no cost.
 - OpenAI (direct) sends native `tools` with `tool_choice: "auto"` and parses
   streamed `tool_calls` deltas. Both the system-prompt and full-history streaming
   entry points use this transport and retain the selected model settings.

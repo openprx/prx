@@ -443,7 +443,7 @@ fn apply_cache_to_last_message_text() {
         }],
     }];
 
-    AnthropicProvider::apply_cache_to_last_message(&mut messages);
+    mark_last_block(&mut messages[0]);
 
     match &messages[0].content[0] {
         NativeContentOut::Text { cache_control, .. } => {
@@ -464,7 +464,7 @@ fn apply_cache_to_last_message_tool_result() {
         }],
     }];
 
-    AnthropicProvider::apply_cache_to_last_message(&mut messages);
+    mark_last_block(&mut messages[0]);
 
     match &messages[0].content[0] {
         NativeContentOut::ToolResult { cache_control, .. } => {
@@ -475,32 +475,9 @@ fn apply_cache_to_last_message_tool_result() {
 }
 
 #[test]
-fn apply_cache_to_last_message_does_not_affect_tool_use() {
-    let mut messages = vec![NativeMessage {
-        role: "assistant".to_string(),
-        content: vec![NativeContentOut::ToolUse {
-            id: "tool_123".to_string(),
-            name: "get_weather".to_string(),
-            input: serde_json::json!({}),
-            cache_control: None,
-        }],
-    }];
-
-    AnthropicProvider::apply_cache_to_last_message(&mut messages);
-
-    // ToolUse should not be affected
-    match &messages[0].content[0] {
-        NativeContentOut::ToolUse { cache_control, .. } => {
-            assert!(cache_control.is_none());
-        }
-        _ => panic!("Expected ToolUse variant"),
-    }
-}
-
-#[test]
 fn apply_cache_empty_messages() {
     let mut messages = vec![];
-    AnthropicProvider::apply_cache_to_last_message(&mut messages);
+    AnthropicProvider::apply_conversation_breakpoints(&[], &mut messages);
     // Should not panic
     assert!(messages.is_empty());
 }
