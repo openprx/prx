@@ -89,17 +89,29 @@ pub(super) async fn attach_turn_records(
         .await;
 }
 
-/// A loaded session: attach to each assistant reply the tool rounds of the run
-/// that made it, read from the durable log. A reply is tied to its run by its
+/// A loaded session, projected from its MessageEvent rows: the sent form of
+/// each user turn and the tool rounds of each reply come from the durable log.
+/// `turn_event_ids` pairs each turn with its stored event (index for index with
+/// `session.turns`; empty or `None` when the turns were not projected from
+/// events). A paired user turn takes its stored attachment; a paired reply takes
+/// the rounds of its event's run. Any other reply is tied to its run by its
 /// text, from the newest back; a reply that does not match, and every older
 /// one, keeps its tool evidence line.
-pub(super) async fn attach_stored_replays(mem: &dyn Memory, workspace_id: &str, session: &mut ChatSession) {
-    if !session.turns.iter().any(|turn| turn.role == "assistant") {
+pub(super) async fn attach_stored_replays(
+    mem: &dyn Memory,
+    workspace_id: &str,
+    session: &mut ChatSession,
+    turn_event_ids: &[Option<String>],
+) {
+    let has_user_event = turn_event_ids.iter().flatten().next().is_some();
+    if !has_user_event && !session.turns.iter().any(|turn| turn.role == "assistant") {
         return;
     }
     let principal = chat_runtime_envelope(workspace_id, &session.id).memory_principal();
     let log = Transcript::new(mem, principal).replay_log().await;
-    let runs: Vec<Option<String>> = {
+    // The text match is the fallback for a reply without a stored event; it is
+    // computed over every reply, indexed by reply order.
+    let text_runs: Vec<Option<String>> = {
         let replies: Vec<&str> = session
             .turns
             .iter()
@@ -111,12 +123,45 @@ pub(super) async fn attach_stored_replays(mem: &dyn Memory, workspace_id: &str, 
             .map(|run| run.map(str::to_owned))
             .collect()
     };
-    let replies = session.turns.iter_mut().filter(|turn| turn.role == "assistant");
-    for (turn, run) in replies.zip(runs) {
-        if let Some(replay) = run.and_then(|run| log.replay_of_run(&run)) {
-            turn.tool_evidence.get_or_insert_with(Default::default).replay = Some(Arc::new(replay));
+    let (mut sent_from_log, mut replays_by_run, mut replays_by_text) = (0_usize, 0_usize, 0_usize);
+    let mut reply_ordinal = 0_usize;
+    for (index, turn) in session.turns.iter_mut().enumerate() {
+        let event_id = turn_event_ids.get(index).and_then(Option::as_deref);
+        match turn.role.as_str() {
+            "user" => {
+                let Some(attachment) = event_id.and_then(|event_id| log.attachment_of(event_id)) else {
+                    continue;
+                };
+                turn.tool_evidence.get_or_insert_with(Default::default).sent = Some(attachment.clone());
+                sent_from_log += 1;
+            }
+            "assistant" => {
+                let ordinal = reply_ordinal;
+                reply_ordinal += 1;
+                let by_event = event_id.and_then(|event_id| log.run_of_event(event_id));
+                let (run, by_run) = match (by_event, text_runs.get(ordinal).and_then(Option::as_deref)) {
+                    (Some(run), _) => (run, true),
+                    (None, Some(run)) => (run, false),
+                    (None, None) => continue,
+                };
+                if let Some(replay) = log.replay_of_run(run) {
+                    turn.tool_evidence.get_or_insert_with(Default::default).replay = Some(Arc::new(replay));
+                    if by_run {
+                        replays_by_run += 1;
+                    } else {
+                        replays_by_text += 1;
+                    }
+                }
+            }
+            _ => {}
         }
     }
+    tracing::debug!(
+        sent_from_log,
+        replays_by_run,
+        replays_by_text,
+        "attached stored replays"
+    );
 }
 
 /// Before a turn: replace the oldest replayed tool results held in `view` by a

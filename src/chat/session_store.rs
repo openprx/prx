@@ -228,7 +228,8 @@ pub(super) async fn project_chat_session_from_message_events(
     };
     let mut projection = apply_chat_message_event_projection(snapshot, &events, cost_config);
     // The tool rounds of each reply are read back from the durable log.
-    super::turn_replay::attach_stored_replays(mem, workspace_id, &mut projection.session).await;
+    super::turn_replay::attach_stored_replays(mem, workspace_id, &mut projection.session, &projection.turn_event_ids)
+        .await;
     tracing::debug!(
         session_id = %crate::agent::diagnostics::text_class(&session_id),
         turns_from_events = projection.turns_from_events,
