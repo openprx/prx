@@ -445,8 +445,8 @@ record for the sync stream (SYNC-1).
 rf-visible messages by age, it appends one `turn.deleted` journal entry per
 deleted message, in the same transaction as the deletion. Its `event_id` is
 `retained:<message_event_id>` and its source reference `retained:<side>:<message_event_id>`,
-with `side` `message` (a user input or a message tombstone) or `reply` (a final
-assistant row). The projected payload is `{"side","message_id","run_id"?,"reason":"retention"}`
+with `side` `message` (a user input, live or tombstoned) or `reply` (a final
+assistant row, live or tombstoned). The projected payload is `{"side","message_id","run_id"?,"reason":"retention"}`
 plus the standard frame fields; `message_id` is the message event id. A client
 handles it as a user delete of that message or reply (same `side`); ignoring
 `reason` is acceptable. The entry is idempotent: a repeat or an unknown

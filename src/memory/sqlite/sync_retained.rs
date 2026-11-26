@@ -62,7 +62,7 @@ pub(super) fn retained_since(conn: &Connection) -> anyhow::Result<Option<String>
 pub(super) fn notice_headers(conn: &Connection, event_ids: &[String]) -> anyhow::Result<Vec<Header>> {
     let ids = serde_json::to_string(event_ids)?;
     let mut q = conn.prepare(&format!(
-        "SELECT x.event_id,x.role,x.event_type FROM (
+        "SELECT x.event_id,x.role,x.event_type,x.idempotency_key FROM (
         SELECT e.id,e.event_id,e.owner_id,e.workspace_id,e.run_id,e.role,e.event_type,e.idempotency_key,
             CASE WHEN {CONTINUATION_PREDICATE_E} OR {TASK_ECHO_PREDICATE_E} THEN 1 ELSE 0 END AS continuation,
             CASE WHEN e.role='assistant' OR e.idempotency_key LIKE 'turn:%:assistant'
@@ -81,20 +81,28 @@ pub(super) fn notice_headers(conn: &Connection, event_ids: &[String]) -> anyhow:
         ORDER BY x.id"
     ))?;
     let rows = q.query_map([&ids], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, Option<String>>(3)?,
+        ))
     })?;
     let now = chrono::Utc::now().to_rfc3339();
     let mut headers = Vec::new();
     for row in rows {
-        let (event, role, event_type) = row?;
+        let (event, role, event_type, key) = row?;
         let Some(mut h) = event_header(conn, &event, "turn.deleted")? else {
             continue;
         };
-        let side = if role == "user" || event_type == "message.deleted" {
-            "message"
+        // A tombstone has role `event`; its assistant key (`turn:<run>:assistant`) keeps the side.
+        let reply = if event_type == "message.deleted" {
+            key.as_deref()
+                .is_some_and(|key| key.starts_with("turn:") && key.ends_with(":assistant"))
         } else {
-            "reply"
+            role != "user"
         };
+        let side = if reply { "reply" } else { "message" };
         h.event_id = format!("{REF_PREFIX}{event}");
         h.source_ref = format!("{REF_PREFIX}{side}:{event}");
         h.timestamp = now.clone();
