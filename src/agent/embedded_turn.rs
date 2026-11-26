@@ -421,17 +421,31 @@ async fn run_work(
     } else {
         history.insert(0, ChatMessage::system(prompt));
     }
-    let recalled = crate::agent::context_recall::scoped_recall(
-        agent.memory.as_ref(),
-        &crate::agent::context_recall::RecallScope::from_envelope(
-            source.envelope(),
-            &config.memory,
-            source.policy_chat_type(),
-        ),
-        input,
-        crate::agent::context_recall::RECALL_CONTEXT_BUDGET,
-    )
-    .await;
+    let recall_scope = crate::agent::context_recall::RecallScope::from_envelope(
+        source.envelope(),
+        &config.memory,
+        source.policy_chat_type(),
+    );
+    // A turn that replays the session's rows already carries them in the
+    // history, so the recall leaves the session block out. The first turn of a
+    // fresh Agent replays nothing: its session copy is its only session memory.
+    let recalled = if history.iter().any(|message| message.role != "system") {
+        crate::agent::context_recall::replayed_session_recall(
+            agent.memory.as_ref(),
+            &recall_scope,
+            input,
+            crate::context::api::open::replayed_recall_budget(decision.main_compaction().max_context_tokens),
+        )
+        .await
+    } else {
+        crate::agent::context_recall::scoped_recall(
+            agent.memory.as_ref(),
+            &recall_scope,
+            input,
+            crate::agent::context_recall::RECALL_CONTEXT_BUDGET,
+        )
+        .await
+    };
     let mut enriched = recalled.preamble;
     if let Some(formatter) = agent
         .selected_memory_formatter
