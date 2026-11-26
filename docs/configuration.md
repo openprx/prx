@@ -126,7 +126,7 @@ and the module-gate family are absorbed on load; they are not live switches.
 | `[channels_config.dingtalk]` | `client_id` and `client_secret` required; `allowed_users = []`; `mention_only = false` |
 | `[channels_config.qq]` | `app_id` and `app_secret` required; `allowed_users = []`; `mention_only = false` |
 | `[channels_config.ramflux]` | `socket_path` unset; `authorization_mode = "follow_rf"`; `max_in_flight_per_conversation = 1`; `on_new_message = "queue"`; `turn_wall_clock_secs = 120`; `encrypt_at_rest = true`; `surface_limits.max_blocks = 32`, `max_actions = 16`, `max_bytes = 65536`; `attachment_fetch.max_bytes = 5242880`, `max_per_turn = 4`; `allowed_block_types` the built-in surface set (Text, Markdown, Heading, KeyValue, Metric, List, TableFallback, Form, Input, Select, Progress, LogStream, Warning, Error, Success, Approval, ActionGroup, FilePreview, Fallback); `accounts = {}`. An account may set `system_prompt_file`, `model`, `provider`, `scope_profile`, `cross_conversation_retrieval` |
-| `[memory]` | `backend = "sqlite"`; `auto_save = true`; `acl_enabled = false`; `legacy_conversation_turns_visible = true`; `archive_after_days = 7`; `purge_after_days = 30`; `conversation_retention_days = 3`; `daily_retention_days = 7`; `embedding_provider = "local"`; `embedding_model = "prx-local-hash-v1"`; `embedding_dimensions = 384`; `vector_weight = 0.7`; `keyword_weight = 0.3`; `min_relevance_score = 0.4`; `embedding_cache_size = 10000`; `vector_candidate_cap = 2000`; `auto_hydrate = true`; `sqlite_open_timeout_secs` unset; `sqlite_read_pool_size` unset; `lucid_cmd` unset (`lucid`); `lucid_budget` unset (200); `lucid_recall_timeout_ms = 5000`; `lucid_store_timeout_ms = 3000`; `lucid_local_hit_threshold = 3`; `lucid_failure_cooldown_ms = 60000` |
+| `[memory]` | `backend = "sqlite"`; `auto_save = true`; `acl_enabled = false`; `legacy_conversation_turns_visible = true`; `archive_after_days = 7`; `purge_after_days = 30`; `conversation_retention_days = 3`; `daily_retention_days = 7`; `message_retention_days = 0`; `embedding_provider = "local"`; `embedding_model = "prx-local-hash-v1"`; `embedding_dimensions = 384`; `vector_weight = 0.7`; `keyword_weight = 0.3`; `min_relevance_score = 0.4`; `embedding_cache_size = 10000`; `vector_candidate_cap = 2000`; `auto_hydrate = true`; `sqlite_open_timeout_secs` unset; `sqlite_read_pool_size` unset; `lucid_cmd` unset (`lucid`); `lucid_budget` unset (200); `lucid_recall_timeout_ms = 5000`; `lucid_store_timeout_ms = 3000`; `lucid_local_hit_threshold = 3`; `lucid_failure_cooldown_ms = 60000` |
 | `[memory.events]` | `record_user_messages = true`; `record_assistant_messages = true`; `record_tool_events = true` |
 | `[memory.semantic]` | `auto_promote_user_messages = true`; `auto_promote_assistant_messages = false`; `min_chars = 30` |
 | `[[identity_bindings]]` | `user_id`, `channel`, `channel_account` required; `display_name` unset |
@@ -1692,6 +1692,43 @@ takes its insertion order as its starting sequence, and the candidate index is
 rebuilt to cover the new ordering key. No configuration change is needed, and
 the cap above is unrelated to this ordering — raising it widens the window,
 it does not decide which rows the window holds.
+
+### Message log retention
+
+`memory.message_retention_days` deletes old transcript rows. The default `0`
+keeps everything, and an absent key changes nothing. When it is `N > 0`, each
+message-log run whose rows are all older than `N` days (by their UTC
+`created_at`) is deleted together with its derived copies: conversation turns,
+the full-text index, run attempts, memory links, tool-output documents, traces
+and compaction runs. Deletion works run by run, for every event type, in short
+write batches. Each run is kept while any of these holds: its session is in use
+(its newest handoff summary and prefix stay), an rf message in it is not yet
+settled, it is under agent erasure, a newer row names it as its cause, or a
+child run still names it as its parent.
+
+Values `1` to `14` run as `15`, the effective minimum, because the rf sync
+journal keeps 14 days. The first such value logs one warning per process. No
+value is refused. The option applies to the SQLite backend only; on other
+backends it has no effect and logs one debug line.
+
+The pass runs at the start of each process that builds the memory backend
+(at most 2 batches), and hourly in the gateway (at most 20 batches, reading the
+live configuration each hour). A pass that ran less than 55 minutes ago is
+skipped, and a pass is skipped while an rf snapshot is open. It is never called from
+a turn, and a turn waits at most for one batch. Deletion is permanent; setting
+the key back to `0` does not restore deleted rows.
+
+What is not deleted by this setting: saved terminal sessions (their saved JSON
+copy is governed by `memory.saved_session_retention_days`, default `0`, which
+keeps them forever), owner memories, child session records, and the chat
+mailbox store. Logs carry counts and the effective cutoff only.
+
+Paired rf clients also delete the messages PRX deletes by age. For each deleted
+message PRX writes one `turn.deleted` notice with `reason: "retention"` to the
+sync journal. A client offline for longer than the journal window resynchronises
+and applies the snapshot's `retained_since`. Enable this option only after rf
+clients that support these notices are running, because a client without that
+support keeps copies that PRX has already removed.
 
 ### SQLite Connection Pool
 
