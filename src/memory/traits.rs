@@ -1282,9 +1282,11 @@ pub trait Memory: Send + Sync {
 
     /// Full-text search over the transcript rows (`message_events`) of the
     /// principal's owner and workspace, in the agent partition of the principal
-    /// (no partition means Main), best match first. Only user and assistant
-    /// messages are searched. `query` is free text: every word is matched as a
-    /// literal term. Backends without a transcript index return no hits.
+    /// (no partition means Main). The best match comes first (bm25) when the
+    /// query has a word of 3 or more characters; the newest first when every
+    /// word is shorter. Only user and assistant messages are searched. `query`
+    /// is free text: every word must occur, and each word is matched as a
+    /// literal. Backends without a transcript index return no hits.
     async fn search_transcripts(
         &self,
         principal: &MemoryPrincipal,
@@ -1294,6 +1296,12 @@ pub trait Memory: Send + Sync {
     ) -> anyhow::Result<Vec<TranscriptHit>> {
         let _ = (principal, query, session_key, limit);
         Ok(Vec::new())
+    }
+
+    /// Build the transcript index now, so the first search does not. Backends
+    /// without a transcript index do nothing.
+    async fn warm_transcript_index(&self) -> anyhow::Result<()> {
+        Ok(())
     }
 
     /// Append a memory outbox event.

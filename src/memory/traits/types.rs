@@ -738,6 +738,9 @@ pub struct TranscriptHit {
     pub event_id: String,
     pub role: String,
     pub created_at: String,
-    /// Matched text with the matched words in `[` and `]`, from FTS5 `snippet()`.
+    /// Matched text. With a word of 3 or more characters: FTS5 `snippet()` with
+    /// the matched words in `[` and `]`. Otherwise: up to 200 characters,
+    /// starting 80 characters before the first word's first match, without
+    /// markers.
     pub excerpt: String,
 }

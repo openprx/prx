@@ -1,9 +1,10 @@
 //! Full-text index over transcript rows (`message_events.content`) and the
 //! search over it.
 //!
-//! The FTS5 table and its three triggers are created on the first search, not
-//! in `schema.rs`, so a brain.db that never searches carries no index and the
-//! schema stamp is unchanged. The index is external-content: it stores no copy
+//! The FTS5 table and its three triggers are created on the first search or by
+//! the warm-up at process start, whichever comes first, not in `schema.rs`, so
+//! a brain.db that never searches carries no index and the schema stamp is
+//! unchanged. The index is external-content: it stores no copy
 //! of the text, only the FTS5 structures, and it indexes every row. It uses the
 //! trigram tokenizer, so Chinese and other scripts without spaces match as
 //! substrings. Filters (owner, workspace, agent partition, erased scopes,
@@ -18,6 +19,7 @@ use crate::memory::traits::{MemoryPrincipal, TranscriptHit};
 use crate::memory::{AgentPartition, PartitionKey};
 use crate::runtime::sqlite_pool::begin_immediate;
 use rusqlite::Connection;
+use std::collections::HashSet;
 
 /// Name of the FTS5 table over `message_events`.
 const INDEX_TABLE: &str = "message_events_fts";
@@ -39,7 +41,8 @@ const TRIGRAM_MIN_CHARS: usize = 3;
 /// The `rebuild` indexes the rows that exist when the index is created; its cost
 /// is proportional to the number of `message_events` rows. So the first search
 /// builds the index over all transcript rows of the database, under the write
-/// lock.
+/// lock. The first search or the process-start warm-up builds it, whichever
+/// comes first.
 ///
 /// `secure-delete` is FTS5's own option: a deleted or blanked row's terms are
 /// overwritten on disk instead of lingering in older segments. It is stored in
@@ -65,10 +68,12 @@ const CREATE_INDEX_SQL: &str = "
 
 /// How the query terms are matched against `message_events.content`.
 enum TermMatch {
-    /// One FTS5 `MATCH` over the quoted terms, ANDed.
-    Fts(String),
-    /// `LIKE` per term, ANDed, when some term is too short for the trigram index.
-    Like(Vec<String>),
+    /// One FTS5 `MATCH` over the quoted long terms, ANDed, and a `LIKE` filter
+    /// per short term.
+    Fts { match_text: String, short: Vec<String> },
+    /// `LIKE` per term, ANDed, when no term is long enough for the trigram
+    /// index. The excerpt is centred on `anchor`, the first term.
+    Like { anchor: String, terms: Vec<String> },
 }
 
 impl SqliteMemory {
@@ -107,27 +112,38 @@ impl SqliteMemory {
             ensure_index(&pool)?;
             let reader = pool.read()?;
             let conn = reader.connection()?;
-            let (from_sql, term_sql, excerpt_sql, order_sql, mut values) = match matcher {
-                TermMatch::Fts(match_text) => (
-                    format!("{INDEX_TABLE} JOIN message_events e ON e.id = {INDEX_TABLE}.rowid"),
-                    format!("{INDEX_TABLE} MATCH ?1"),
-                    format!("snippet({INDEX_TABLE}, 0, '[', ']', '...', 24)"),
-                    format!("bm25({INDEX_TABLE})"),
-                    vec![rusqlite::types::Value::from(match_text)],
-                ),
-                TermMatch::Like(terms) => {
-                    let mut conditions = Vec::with_capacity(terms.len());
-                    let mut values = Vec::with_capacity(terms.len());
-                    for term in terms {
-                        conditions.push(format!(r"e.content LIKE ?{} ESCAPE '\'", values.len() + 1));
-                        values.push(rusqlite::types::Value::from(format!("%{}%", escape_like(&term))));
+            let mut values: Vec<rusqlite::types::Value> = Vec::new();
+            let (from_sql, term_sql, excerpt_sql, order_sql) = match matcher {
+                TermMatch::Fts { match_text, short } => {
+                    values.push(rusqlite::types::Value::from(match_text));
+                    let mut conditions = vec![format!("{INDEX_TABLE} MATCH ?1")];
+                    for term in short {
+                        values.push(like_pattern(&term));
+                        conditions.push(like_condition(values.len()));
                     }
+                    (
+                        format!("{INDEX_TABLE} JOIN message_events e ON e.id = {INDEX_TABLE}.rowid"),
+                        conditions.join(" AND "),
+                        format!("snippet({INDEX_TABLE}, 0, '[', ']', '...', 24)"),
+                        format!("bm25({INDEX_TABLE})"),
+                    )
+                }
+                TermMatch::Like { anchor, terms } => {
+                    let mut conditions = Vec::with_capacity(terms.len());
+                    for term in terms {
+                        values.push(like_pattern(&term));
+                        conditions.push(like_condition(values.len()));
+                    }
+                    // The excerpt starts 80 characters before the anchor's first match.
+                    values.push(rusqlite::types::Value::from(anchor));
+                    let anchor_marker = values.len();
                     (
                         "message_events e".to_owned(),
                         conditions.join(" AND "),
-                        "substr(e.content, 1, 200)".to_owned(),
+                        format!(
+                            "substr(e.content, max(1, instr(lower(e.content), lower(?{anchor_marker})) - 80), 200)"
+                        ),
                         "e.id DESC".to_owned(),
-                        values,
                     )
                 }
             };
@@ -177,28 +193,69 @@ impl SqliteMemory {
         })
         .await?
     }
+
+    /// Build the index now, so the first search does not. Same creation and
+    /// fill as the first search; a no-op when the index exists.
+    pub(super) async fn warm_transcript_index_impl(&self) -> anyhow::Result<()> {
+        let pool = self.pool.clone();
+        crate::runtime::blocking::spawn_blocking(move || ensure_index(&pool)).await?
+    }
 }
 
-/// Matching for free user input: whitespace-separated words, ANDed. When every
-/// word has at least [`TRIGRAM_MIN_CHARS`] characters, the words go to FTS5 as
-/// double-quoted strings (embedded quotes doubled), so FTS5 operators, column
-/// filters, `*`, `NEAR(...)` and parentheses in the input are literal words.
-/// When any word is shorter, every word is matched with `LIKE` instead. `None`
-/// when the input has no word.
+/// Matching for free user input: whitespace-separated words, ANDed, each word
+/// once (see [`distinct_words`]). Words of at least [`TRIGRAM_MIN_CHARS`]
+/// characters go to FTS5 as double-quoted strings (embedded quotes doubled), so
+/// FTS5 operators, column filters, `*`, `NEAR(...)` and parentheses in the input
+/// are literal words. Shorter words are `LIKE` post-filters on that match. When
+/// no word is long enough, every word is matched with `LIKE` and the first word
+/// anchors the excerpt. `None` when the input has no word.
 fn term_match(query: &str) -> Option<TermMatch> {
-    let words: Vec<&str> = query.split_whitespace().collect();
-    if words.is_empty() {
-        return None;
+    let words = distinct_words(query);
+    let anchor = (*words.first()?).to_owned();
+    if !words.iter().any(|word| is_long_term(word)) {
+        return Some(TermMatch::Like {
+            anchor,
+            terms: words.into_iter().map(str::to_owned).collect(),
+        });
     }
-    if words.iter().all(|word| word.chars().count() >= TRIGRAM_MIN_CHARS) {
-        let terms: Vec<String> = words
-            .iter()
-            .map(|word| format!("\"{}\"", word.replace('"', "\"\"")))
-            .collect();
-        Some(TermMatch::Fts(terms.join(" ")))
-    } else {
-        Some(TermMatch::Like(words.into_iter().map(str::to_owned).collect()))
-    }
+    let match_text = words
+        .iter()
+        .filter(|word| is_long_term(word))
+        .map(|word| format!("\"{}\"", word.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let short = words
+        .iter()
+        .filter(|word| !is_long_term(word))
+        .map(|word| (*word).to_owned())
+        .collect();
+    Some(TermMatch::Fts { match_text, short })
+}
+
+/// Whether a word is long enough for the trigram index.
+fn is_long_term(word: &str) -> bool {
+    word.chars().count() >= TRIGRAM_MIN_CHARS
+}
+
+/// The query's whitespace-separated words, each once, in order. The first
+/// spelling of a word is kept; words are compared ignoring ASCII case. There is
+/// no cap on the number of words.
+fn distinct_words(query: &str) -> Vec<&str> {
+    let mut seen = HashSet::new();
+    query
+        .split_whitespace()
+        .filter(|word| seen.insert(word.to_ascii_lowercase()))
+        .collect()
+}
+
+/// The `LIKE` pattern of a term: the term, escaped, between two `%`.
+fn like_pattern(term: &str) -> rusqlite::types::Value {
+    rusqlite::types::Value::from(format!("%{}%", escape_like(term)))
+}
+
+/// The `LIKE` condition on the content with the pattern at placeholder `marker`.
+fn like_condition(marker: usize) -> String {
+    format!(r"e.content LIKE ?{marker} ESCAPE '\'")
 }
 
 /// Escape a term for a `LIKE` pattern whose escape character is `\`.

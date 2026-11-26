@@ -3,7 +3,7 @@ use super::traits::{
     CompactionRun, CompactionRunInput, DecisionMemoryHit, DocumentChunkRecord, DocumentIngestInput, DocumentRecord,
     DocumentSearchResult, Memory, MemoryCategory, MemoryEntry, MemoryEvent, MemoryEventInput, MemoryLink,
     MemoryLinkInput, MemoryPrincipal, MessageEvent, MessageEventInput, RetrievalTrace, RetrievalTraceInput,
-    SessionContextQuery, SharedContextQuery,
+    SessionContextQuery, SharedContextQuery, TranscriptHit,
 };
 use async_trait::async_trait;
 use chrono::Local;
@@ -277,6 +277,22 @@ impl LucidMemory {
 impl Memory for LucidMemory {
     fn recovery_repository(&self) -> Option<&dyn crate::memory::recovery_authority::RecoveryRepository> {
         self.local.recovery_repository()
+    }
+
+    async fn search_transcripts(
+        &self,
+        principal: &MemoryPrincipal,
+        query: &str,
+        session_key: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<TranscriptHit>> {
+        self.local
+            .search_transcripts(principal, query, session_key, limit)
+            .await
+    }
+
+    async fn warm_transcript_index(&self) -> anyhow::Result<()> {
+        self.local.warm_transcript_index().await
     }
 
     /// Never delegated: the mirror has no incarnation registry of its own.

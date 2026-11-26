@@ -1324,6 +1324,10 @@ impl Memory for SqliteMemory {
         self.search_transcripts_impl(principal, query, session_key, limit).await
     }
 
+    async fn warm_transcript_index(&self) -> anyhow::Result<()> {
+        self.warm_transcript_index_impl().await
+    }
+
     async fn append_memory_event(&self, mut input: MemoryEventInput) -> anyhow::Result<MemoryEvent> {
         // The event describing a run's memory write carries that run.
         if let Some(provenance) = self.write_provenance.as_deref()
