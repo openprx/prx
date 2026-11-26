@@ -244,9 +244,9 @@ pub(super) fn stream_http_errors_have_one_constructor() {
             "src/agent/provider_round.rs::streaming_error_is_context_overflow",
             "src/agent/provider_round.rs::streaming_error_is_network_timeout",
             "src/agent/provider_round.rs::run_streaming_provider_turn",
-            "src/providers/reliable.rs::classify_stream_error",
-            "src/providers/reliable.rs::classify_stream_error",
-            "src/providers/reliable.rs::stream_error_is_overload",
+            "src/providers/reliable/classify.rs::classify_stream_error",
+            "src/providers/reliable/classify.rs::classify_stream_error",
+            "src/providers/reliable/classify.rs::stream_error_is_overload",
             "src/chat/error.rs::from",
         ],
     );
