@@ -2429,8 +2429,9 @@ nothing runs and nothing is stored. When tool events are not recorded the
 prefix is not stored, so `session_opened` hooks run on every turn and a varying
 output changes the system prompt each turn.
 
-The points are called by `prx agent`, gateway sessions, channel and scheduled
-entries. `prx chat` (the terminal chat) does not call them yet.
+The points are called by `prx agent`, `prx chat` (the terminal chat), gateway
+sessions, channel and scheduled entries. Child turns call the child-open point
+described below instead of the session-open and turn-open points.
 
 The tool-result point (`tool_call`) runs once per tool call of a round. Its
 `replace_output` replaces the text the model reads back: the history message,
