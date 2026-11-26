@@ -11,7 +11,7 @@
 //! scheduler does not apply that command policy when the job later runs.
 
 use super::{ApiPrincipal, AppState};
-use crate::cron::{self, CronJob, CronJobEvent, CronJobLineage, CronJobPatch, CronRun, Schedule};
+use crate::cron::{self, CronJob, CronJobEvent, CronJobLineage, CronJobPatch, CronRun, Schedule, ScheduledContext};
 use crate::security::SideEffectGate;
 use crate::security::policy::{ResourceRiskLevel, SecurityPolicy};
 use axum::Json;
@@ -45,6 +45,8 @@ struct JobWrite {
     tz: Option<String>,
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    context: Option<ScheduledContext>,
 }
 
 #[derive(Deserialize)]
@@ -552,11 +554,38 @@ pub(super) async fn create_job(
         }
     };
     match created {
-        Ok(job) => match redact_job(&config, &job) {
-            Ok(value) => (StatusCode::OK, Json(value)),
-            Err(response) => response,
-        },
+        Ok(job) => {
+            let job = match write.context {
+                Some(ScheduledContext::Fresh) => match apply_fresh_context(&config, job) {
+                    Ok(job) => job,
+                    Err(response) => return response,
+                },
+                _ => job,
+            };
+            match redact_job(&config, &job) {
+                Ok(value) => (StatusCode::OK, Json(value)),
+                Err(response) => response,
+            }
+        }
         Err(error) => store_client_error(&error),
+    }
+}
+
+/// Stores `context = "fresh"` on a job the route has just created (X5). A failed patch
+/// removes that job, so the caller is never left with a job it was told failed.
+fn apply_fresh_context(config: &crate::config::Config, job: CronJob) -> Result<CronJob, ApiResponse> {
+    let patch = CronJobPatch {
+        context: Some(ScheduledContext::Fresh),
+        ..CronJobPatch::default()
+    };
+    match cron::update_job(config, &job.id, patch) {
+        Ok(updated) => Ok(updated),
+        Err(error) => {
+            if cron::remove_job(config, &job.id).is_err() {
+                tracing::warn!(job_id = %job.id, "cron job removal after a failed context patch failed");
+            }
+            Err(store_client_error(&error))
+        }
     }
 }
 
@@ -596,8 +625,8 @@ pub(super) async fn patch_job(
         None => None,
     };
     let name = write.name.as_deref().map(|name| name.trim().to_string());
-    if schedule.is_none() && command.is_none() && name.is_none() {
-        return bad_request("update requires a schedule, command, or name");
+    if schedule.is_none() && command.is_none() && name.is_none() && write.context.is_none() {
+        return bad_request("update requires a schedule, command, name, or context");
     }
     if let Err(response) = authorize_cron(
         &state,
@@ -640,6 +669,7 @@ pub(super) async fn patch_job(
         command: command.clone(),
         name,
         created_via: command.is_some().then(|| route_creator(&state, &headers)),
+        context: write.context,
         ..CronJobPatch::default()
     };
     match cron::update_job(&config, id, patch) {

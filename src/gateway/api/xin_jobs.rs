@@ -53,7 +53,7 @@ fn failure(error: &anyhow::Error, kind: Kind) -> Response {
 fn task_view(config: &Config, task: &XinTask) -> anyhow::Result<Value> {
     let (creator, version) = agent_jobs::metadata(config, &task.id, Kind::XinTask)?;
     Ok(
-        json!({"id":task.id,"kind":"xin_task","creator_agent":agent_jobs::creator_name(&creator),"schedule":if task.recurring {Some(format!("every {}s",task.interval_secs))} else {None},"next_run_at":task.next_run_at.to_rfc3339_opts(chrono::SecondsFormat::Secs,true),"enabled":task.enabled,"version":version}),
+        json!({"id":task.id,"kind":"xin_task","creator_agent":agent_jobs::creator_name(&creator),"schedule":if task.recurring {Some(format!("every {}s",task.interval_secs))} else {None},"next_run_at":task.next_run_at.to_rfc3339_opts(chrono::SecondsFormat::Secs,true),"enabled":task.enabled,"version":version,"context":task.context.as_str()}),
     )
 }
 fn goal_view(config: &Config, goal: &XinGoal) -> anyhow::Result<Value> {
