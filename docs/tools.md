@@ -216,7 +216,8 @@ protocol 2026-07-28 first and falls back to 2025-11-25 for servers that only spe
 legacy `initialize` handshake. The version a server answered with is kept in memory for
 that server until the next MCP refresh, so later connections skip the probe; a connection
 that fails with the kept version is retried once with a fresh probe. The version is not a
-configuration key.
+configuration key. A server whose reply to `server/discover` is not a modern result
+(for example a plain `{}`) is retried once with the legacy handshake.
 
 ## Tool behavior
 

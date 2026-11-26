@@ -88,6 +88,26 @@ impl McpTool {
         lifecycle::start(transport, era, Duration::from_millis(startup_timeout_ms)).await
     }
 
+    /// `connect_http` with at most one retry, as decided by [`lifecycle::retry_era`].
+    pub(super) async fn connect_http_retrying(
+        server_name: &str,
+        url: &str,
+        startup_timeout_ms: u64,
+        full: bool,
+        era: Option<McpEra>,
+    ) -> anyhow::Result<(McpClient, McpEra)> {
+        match Self::connect_http(url, startup_timeout_ms, full, era).await {
+            Ok(connected) => Ok(connected),
+            Err(error) => {
+                let Some(next) = lifecycle::retry_era(era, &error) else {
+                    return Err(error);
+                };
+                lifecycle::note_retry(server_name, next);
+                Self::connect_http(url, startup_timeout_ms, full, next).await
+            }
+        }
+    }
+
     pub(super) async fn discover_server_tools_http(
         server_name: &str,
         server: &McpServerConfig,
@@ -104,7 +124,8 @@ impl McpTool {
         // ── SSRF protection: block private/local addresses below Full ──
         Self::validate_http_target(url, full)?;
 
-        let (client, learnt) = Self::connect_http(url, server.startup_timeout_ms, full, era).await?;
+        let (client, learnt) =
+            Self::connect_http_retrying(server_name, url, server.startup_timeout_ms, full, era).await?;
 
         let list = client.peer().list_all_tools().await?;
         let _ = client.cancel().await;
@@ -136,18 +157,8 @@ impl McpTool {
         Self::validate_http_target(url, full)?;
 
         let request_timeout = Duration::from_millis(server.request_timeout_ms);
-        // A cached era that no longer fits the server (for example after the
-        // server was replaced) is dropped, and the connection is probed again.
-        // The error text is not logged: it can quote the URL with userinfo.
-        let (client, learnt) = match Self::connect_http(url, server.startup_timeout_ms, full, *era).await {
-            Ok(connected) => connected,
-            Err(_) if era.is_some() => {
-                tracing::warn!(server = server_name, "MCP cached protocol era failed; probing again");
-                *era = None;
-                Self::connect_http(url, server.startup_timeout_ms, full, None).await?
-            }
-            Err(error) => return Err(error),
-        };
+        let (client, learnt) =
+            Self::connect_http_retrying(server_name, url, server.startup_timeout_ms, full, *era).await?;
         *era = Some(learnt);
 
         let result = tokio::time::timeout(

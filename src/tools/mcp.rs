@@ -1189,16 +1189,32 @@ impl McpTool {
             .ok_or_else(|| anyhow::anyhow!("MCP server '{server_name}' uses stdio but command is missing"))?;
 
         let working_dir = Self::prepare_launch_directory(launch_root, server_name, server).await?;
-        let cmd = Self::stdio_command(server, command, &working_dir);
-
         let startup_timeout = Duration::from_millis(server.startup_timeout_ms);
-        // `TokioChildProcess::new` deliberately replaces the command's stderr
-        // with `inherit`, even if callers configured it beforehand. Use the
-        // builder override so package-manager notices cannot corrupt ratatui's
-        // alternate screen. MCP/transport failures still surface structurally.
-        let (transport, _stderr) = TokioChildProcess::builder(cmd).stderr(Stdio::null()).spawn()?;
-        let _registration = register_mcp_child(server_name, &transport);
-        let (client, learnt) = lifecycle::start(transport, era, startup_timeout).await?;
+        let mut era = era;
+        let mut retried = false;
+        let (client, learnt, _registration) = loop {
+            let cmd = Self::stdio_command(server, command, &working_dir);
+
+            // `TokioChildProcess::new` deliberately replaces the command's stderr
+            // with `inherit`, even if callers configured it beforehand. Use the
+            // builder override so package-manager notices cannot corrupt ratatui's
+            // alternate screen. MCP/transport failures still surface structurally.
+            let (transport, _stderr) = TokioChildProcess::builder(cmd).stderr(Stdio::null()).spawn()?;
+            let registration = register_mcp_child(server_name, &transport);
+            match lifecycle::start(transport, era, startup_timeout).await {
+                Ok((client, learnt)) => break (client, learnt, registration),
+                // At most one retry, in a freshly spawned process.
+                Err(error) if !retried => {
+                    let Some(next) = lifecycle::retry_era(era, &error) else {
+                        return Err(error);
+                    };
+                    lifecycle::note_retry(server_name, next);
+                    retried = true;
+                    era = next;
+                }
+                Err(error) => return Err(error),
+            }
+        };
 
         let list = client.peer().list_all_tools().await?;
         let _ = client.cancel().await;
@@ -1294,6 +1310,7 @@ impl McpTool {
         if session.is_none() {
             let working_dir = Self::prepare_launch_directory(self.launch_root.as_deref(), server_name, server).await?;
             let mut era = self.state.read().server_eras.get(server_name).copied();
+            let mut retried = false;
             let (client, learnt, registration) = loop {
                 let cmd = Self::stdio_command(server, command, &working_dir);
 
@@ -1303,11 +1320,14 @@ impl McpTool {
                 let registration = register_mcp_child(server_name, &transport);
                 match lifecycle::start(transport, era, startup_timeout).await {
                     Ok((client, learnt)) => break (client, learnt, registration),
-                    // A cached era that no longer fits the server is dropped
-                    // and the process is started once more with a fresh probe.
-                    Err(_) if era.is_some() => {
-                        tracing::warn!(server = server_name, "MCP cached protocol era failed; probing again");
-                        era = None;
+                    // At most one retry, in a freshly spawned process.
+                    Err(error) if !retried => {
+                        let Some(next) = lifecycle::retry_era(era, &error) else {
+                            return Err(error);
+                        };
+                        lifecycle::note_retry(server_name, next);
+                        retried = true;
+                        era = next;
                         self.record_server_era(server_name, None);
                     }
                     Err(error) => return Err(error),

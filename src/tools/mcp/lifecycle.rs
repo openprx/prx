@@ -10,7 +10,7 @@ use super::McpClient;
 use anyhow::Context;
 use rmcp::RoleClient;
 use rmcp::model::{ClientConfig, Implementation, ProtocolVersion};
-use rmcp::service::{ClientLifecycleMode, ClientServiceExt};
+use rmcp::service::{ClientInitializeError, ClientLifecycleMode, ClientServiceExt};
 use rmcp::transport::IntoTransport;
 use std::time::Duration;
 
@@ -25,6 +25,41 @@ const AUTO_PROBE_ALLOWANCE: Duration = Duration::from_secs(10);
 pub(super) enum McpEra {
     Modern,
     Legacy,
+}
+
+/// The era to try on a second attempt after a first attempt with `first` failed
+/// with `error`, or `None` when the failure is final.
+///
+/// - A kept era that fails is dropped and the server is probed afresh.
+/// - A probe whose `server/discover` reply is not a valid `DiscoverResult`
+///   (rmcp reports it as `ExpectedInitResult`) falls back to the legacy
+///   handshake (2025-11-25), so a legacy server that answers unknown methods
+///   with a plain result is still reachable.
+///
+/// Transport, timeout and authentication failures are never retried here.
+pub(super) fn retry_era(first: Option<McpEra>, error: &anyhow::Error) -> Option<Option<McpEra>> {
+    match first {
+        Some(_) => Some(None),
+        None if matches!(
+            error.downcast_ref::<ClientInitializeError>(),
+            Some(ClientInitializeError::ExpectedInitResult(_))
+        ) =>
+        {
+            Some(Some(McpEra::Legacy))
+        }
+        None => None,
+    }
+}
+
+/// Log a second attempt. Only the server name is logged, never the reply or URL.
+pub(super) fn note_retry(server_name: &str, next: Option<McpEra>) {
+    match next {
+        Some(McpEra::Legacy) => tracing::info!(
+            server = server_name,
+            "MCP server did not answer server/discover with a modern result; using the legacy handshake"
+        ),
+        _ => tracing::warn!(server = server_name, "MCP cached protocol era failed; probing again"),
+    }
 }
 
 /// The client identity PRX presents to every MCP server.
