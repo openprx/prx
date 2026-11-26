@@ -2062,7 +2062,7 @@ its TLS SPIFFE identity. Erasing the local copy cannot erase a remote copy.
 A child launched from a gateway session (Console, rf or webhook) announces its
 completion the same way: the gateway has no outbound channel, so the parent
 session receives one message from the child's own session
-(`[message from spawn:<run id>/<agent>] Sub-agent \`<run id>\` completed: <result>`,
+(`[message from spawn:<run id>/<agent>] Sub-agent \`<run id>\` has finished (completed|FAILED). This is an automatic completion notice for a run you already started, not a new request; ...` followed by `Result:` and the result,
 the result bounded to 16,000 characters), adopted like any other mailbox
 message. It wakes the parent session as a turn of its own; when a turn of that
 session is still running, the message waits and wakes the session once that
