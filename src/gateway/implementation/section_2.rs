@@ -896,6 +896,7 @@ async fn persist_pairing_tokens(config: &crate::config::SharedConfig, pairing: &
     use crate::config::manage::{ApplyOptions, ConfigActor, ConfigChange, ConfigTransactionError, ConfigTransactions};
 
     let paired_tokens = pairing.tokens();
+    let mut adopted_unloaded_file = false;
     for attempt in 1..=PAIRING_PERSIST_ATTEMPTS {
         // The change is built from the desired configuration and guarded by the
         // revision that configuration was loaded at, read before the clone. A
@@ -910,7 +911,25 @@ async fn persist_pairing_tokens(config: &crate::config::SharedConfig, pairing: &
             .plan(ConfigChange::Structured(Box::new(updated)))
             .await
             .map_err(|error| anyhow::anyhow!("{error}"))?;
-        let expected = base.or_else(|| plan.planned_revision().map(str::to_owned));
+        let expected = match base {
+            Some(revision) => Some(revision),
+            // No disk revision when the snapshot was loaded. A file that exists
+            // now was never loaded: writing over it with a fresh revision would
+            // drop its content, so adopt it and retry instead.
+            None => match plan.planned_revision() {
+                None => None,
+                Some(_) => {
+                    if adopted_unloaded_file || attempt == PAIRING_PERSIST_ATTEMPTS {
+                        return Err(anyhow::anyhow!(
+                            "Failed to persist paired tokens to config.toml: the config file was created after startup and could not be adopted"
+                        ));
+                    }
+                    adopted_unloaded_file = true;
+                    reload_after_pairing_persist(config).await?;
+                    continue;
+                }
+            },
+        };
         let applied = tx
             .apply(
                 plan,
