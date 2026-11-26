@@ -85,7 +85,7 @@ impl ScheduledAgentOrigin {
             claimed_attempt: claim.map(|claim| claim.attempt_id.clone()),
             retry_boundary: ScheduledRetryBoundary::default(),
             card: None,
-            fresh: false,
+            fresh: job.context == crate::cron::ScheduledContext::Fresh,
             goal_id: None,
         }
     }
@@ -101,16 +101,18 @@ impl ScheduledAgentOrigin {
             claimed_attempt: None,
             retry_boundary: ScheduledRetryBoundary::default(),
             card: None,
-            fresh: false,
+            fresh: task.context == crate::cron::ScheduledContext::Fresh,
             goal_id: None,
         }
     }
 
     /// Origin of one step of a Xin goal. The step's session is the goal's
-    /// shared session, so the envelope must carry `xin:goal:{goal_id}`.
+    /// shared session, so the envelope must carry `xin:goal:{goal_id}`, and a
+    /// goal step never starts fresh whatever the task's `context` says.
     pub(crate) fn from_xin_goal_step(task: &crate::xin::types::XinTask, goal_id: &str) -> Self {
         Self {
             goal_id: Some(goal_id.to_owned()),
+            fresh: false,
             ..Self::from_xin(task)
         }
     }

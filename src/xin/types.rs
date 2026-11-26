@@ -173,6 +173,9 @@ pub struct XinTask {
     /// executes under (CRON-ORIGIN). Fixed at creation.
     #[serde(default)]
     pub origin: JobOrigin,
+    /// Whether a scheduled run replays the earlier runs of this task's session.
+    #[serde(default)]
+    pub context: crate::cron::ScheduledContext,
 }
 
 /// Input for creating a new task.
@@ -204,6 +207,7 @@ pub struct XinTaskPatch {
     pub interval_secs: Option<u64>,
     pub enabled: Option<bool>,
     pub max_failures: Option<u32>,
+    pub context: Option<crate::cron::ScheduledContext>,
     #[serde(skip)]
     pub approval_grant_json: Option<String>,
     /// The rewriting call's level and agent, set only by the runtime. A

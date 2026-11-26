@@ -220,6 +220,9 @@ pub(super) fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) ->
     // without them runs at Main's level.
     add_column_if_missing(&conn, "xin_tasks", "creator_level", "TEXT")?;
     add_column_if_missing(&conn, "xin_tasks", "creator_agent", "TEXT")?;
+    // Whether a scheduled run replays its session's earlier runs. Every
+    // existing row reads `task`, the behaviour before this column.
+    add_column_if_missing(&conn, "xin_tasks", "context", "TEXT NOT NULL DEFAULT 'task'")?;
     add_column_if_missing(&conn, "xin_goals", "creator_level", "TEXT")?;
     add_column_if_missing(&conn, "xin_goals", "creator_agent", "TEXT")?;
     // Which surface created the goal, as on `xin_tasks`. Nullable with no
