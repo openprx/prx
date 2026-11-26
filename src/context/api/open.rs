@@ -183,6 +183,7 @@ pub(crate) async fn open_turn(input: OpenInput<'_>) -> TurnOpening {
         envelope,
         memory_config,
         compact,
+        hooks,
     })
     .await;
     let system_prompt = if prefix_text.is_empty() {

@@ -16,10 +16,18 @@ use crate::config::MemoryConfig;
 use crate::context::sources::memory_index::{
     STORE_INDEX_COMPACT_MAX_CHARS, STORE_INDEX_FETCH, STORE_INDEX_MAX_CHARS, render_store_index,
 };
-use crate::context::transcript::{MEMORY_INDEX_SOURCE, PrefixSection, append_session_prefix, newest_session_prefix};
+use crate::context::transcript::{
+    MEMORY_INDEX_SOURCE, PrefixSection, append_hook_contributions, append_session_prefix, newest_session_prefix,
+    render_prefix,
+};
+use crate::hooks::context::{ContextPoint, HookContribution};
+use crate::hooks::{HookIdentity, HookManager};
 use crate::memory::branch_copy::CONTEXT_SWITCH_EVENT_TYPE;
 use crate::memory::{Memory, MemoryEntry, MemoryFabric, MemoryPrincipal};
 use crate::runtime::envelope::RuntimeEnvelope;
+
+/// Source prefix of a context hook section; the hook's name follows it.
+const HOOK_SOURCE_PREFIX: &str = "hook:";
 
 /// What a session prefix reads, borrowed from the turn's state.
 pub(crate) struct SessionPrefixInput<'a> {
@@ -28,6 +36,9 @@ pub(crate) struct SessionPrefixInput<'a> {
     pub(crate) memory_config: &'a MemoryConfig,
     /// `agent.compact_context`: the index is rendered with the compact cap.
     pub(crate) compact: bool,
+    /// The surface's hook manager for the `session_opened` context hooks.
+    /// `None` runs none (child turns).
+    pub(crate) hooks: Option<&'a HookManager>,
 }
 
 /// The prefix text of the session: the frozen index, or a new one recorded
@@ -42,6 +53,7 @@ pub(crate) async fn session_prefix(input: SessionPrefixInput<'_>) -> String {
         envelope,
         memory_config,
         compact,
+        hooks,
     } = input;
     // Without a session there is no row to freeze the index in.
     if envelope.session_key.is_empty() {
@@ -65,6 +77,7 @@ pub(crate) async fn session_prefix(input: SessionPrefixInput<'_>) -> String {
             return String::new();
         }
     };
+    let resumed = recorded.is_some();
     if let Some((row_id, text)) = recorded
         && newest_switch.is_none_or(|switch| row_id > switch)
     {
@@ -89,26 +102,53 @@ pub(crate) async fn session_prefix(input: SessionPrefixInput<'_>) -> String {
         .map(|rendered| crate::security::redaction::redact_secrets(&rendered))
         .unwrap_or_default();
 
+    let mut sections = Vec::new();
+    if !text.is_empty() {
+        sections.push(PrefixSection {
+            source: MEMORY_INDEX_SOURCE.to_owned(),
+            text,
+        });
+    }
     let mut scope = envelope.message_scope();
     // The row belongs to the session, not to the turn that happens to open it.
     scope.run_id = None;
     scope.parent_run_id = None;
     let fabric = MemoryFabric::new(Arc::clone(memory), envelope.workspace_id.clone())
         .with_event_recording(memory_config.event_recording_config());
-    let sections = if text.is_empty() {
-        Vec::new()
-    } else {
-        vec![PrefixSection {
-            source: MEMORY_INDEX_SOURCE.to_owned(),
-            text: text.clone(),
-        }]
-    };
+    if let Some(hooks) = hooks {
+        let contributions = session_opened_contributions(hooks, envelope, resumed).await;
+        append_hook_contributions(&fabric, &scope, &contributions).await;
+        sections.extend(contributions.into_iter().map(|contribution| PrefixSection {
+            source: format!("{HOOK_SOURCE_PREFIX}{}", contribution.hook),
+            text: contribution.text,
+        }));
+    }
+    let rendered = render_prefix(&sections);
     if let Some(row_id) = append_session_prefix(&fabric, scope, &sections).await
         && !entries.is_empty()
     {
         verify_recorded(store, &principal, &entries, row_id).await;
     }
-    text
+    rendered
+}
+
+/// The `session_opened` context contributions, taken once per prefix render
+/// under the session's identity. `resumed` says a prefix row existed before
+/// this render (a handoff or a memory change re-renders it).
+async fn session_opened_contributions(
+    hooks: &HookManager,
+    envelope: &RuntimeEnvelope,
+    resumed: bool,
+) -> Vec<HookContribution> {
+    let data = serde_json::json!({
+        "surface": HookIdentity::origin_of(envelope.source),
+        "resumed": resumed,
+    });
+    crate::hooks::identity_scope(
+        HookIdentity::for_session(envelope),
+        hooks.contribute(ContextPoint::SessionOpened, data),
+    )
+    .await
 }
 
 /// Check, after the row was recorded, that every memory it was rendered from is
