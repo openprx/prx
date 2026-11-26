@@ -364,9 +364,12 @@ seconds when the upstream sends no `Retry-After`, so a request can outlast a
 one-minute provider window (about 83 seconds of waiting in all). On any earlier
 candidate a 429 gets two retries (2 and 6 seconds) and then fails over. A
 `Retry-After` up to 120 seconds is honored on either; a longer one ends that
-candidate at once. HTTP 503 and overloaded error bodies get two retries (2 and
-6 seconds). Other retryable errors use the configured `max_retries`. With
-`max_retries = 0`, every kind gets one attempt. When all
+candidate at once. HTTP 502, 503 and 504 and overloaded error bodies are
+overloads and get two retries (2 and 6 seconds). Other retryable errors use the
+configured `max_retries`. Each kind has its own retry budget on a candidate, so
+a 502 after several 429s still gets its overload retries, and a candidate makes
+at most one attempt plus the budget of each kind. With `max_retries = 0`, every
+kind gets one attempt. When all
 candidates fail, the error starts with "All providers/models failed" and says
 that the failure applies to that model request only; earlier requests in the
 same turn are not affected.
@@ -1104,14 +1107,16 @@ explicit signal from the upstream.
   `Retry-After: 60`, so the previous 30 s cap truncated the delay and guaranteed
   a second 429. A hint above the ceiling is *not* truncated — the candidate is
   abandoned and the requested delay is reported in the aggregated error.
-- **Retries never depend on the header.** A 429/503 without `Retry-After` is
+- **Retries never depend on the header.** A 429 or 5xx without `Retry-After` is
   still retried on the same provider/model up to `reliability.provider_retries`,
   on both the streaming and the non-streaming path, before any failover.
-- **Overload responses have their own schedule.** An HTTP 429 or 503, or an
-  error body whose type/code says overloaded or rate limited (for example
+- **Overload responses have their own schedule.** An HTTP 429, 502, 503 or 504,
+  or an error body whose type/code says overloaded or rate limited (for example
   `engine_overloaded`), received before any content was streamed is retried
   on the same provider/model at most 2 times (fewer if
-  `reliability.provider_retries` is lower), waiting 2 s and then 6 s. A
+  `reliability.provider_retries` is lower), waiting 2 s and then 6 s. Overload
+  retries and rate-limit retries are counted separately, each against its own
+  budget. A
   `Retry-After` replaces that wait, capped at 30 s per wait. Each retry prints
   one operator notice, `Provider overloaded; retrying (<n>/2).` (the `2` is the
   lower of 2 and `provider_retries`), on stderr in
