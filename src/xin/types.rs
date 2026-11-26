@@ -176,6 +176,9 @@ pub struct XinTask {
     /// Whether a scheduled run replays the earlier runs of this task's session.
     #[serde(default)]
     pub context: crate::cron::ScheduledContext,
+    /// Where this task's finished result is surfaced to the owner.
+    #[serde(default)]
+    pub deliver: crate::cron::ScheduledDeliver,
 }
 
 /// Input for creating a new task.
@@ -208,6 +211,10 @@ pub struct XinTaskPatch {
     pub enabled: Option<bool>,
     pub max_failures: Option<u32>,
     pub context: Option<crate::cron::ScheduledContext>,
+    /// Not accepted from a model-written patch yet: the tool and route fields
+    /// that set it come with K-R3, so the serde path stays closed until then.
+    #[serde(skip)]
+    pub deliver: Option<crate::cron::ScheduledDeliver>,
     #[serde(skip)]
     pub approval_grant_json: Option<String>,
     /// The rewriting call's level and agent, set only by the runtime. A

@@ -17,7 +17,7 @@ use crate::config::Config;
 use crate::cron::store::{decode_delivery, decode_schedule, format_claim_time, stored_cron_output};
 use crate::cron::types::{
     CronClaim, CronJob, CronJobEvent, CronJobLineage, CronJobPatch, CronJobTerminalState, CronRun, DeliveryConfig,
-    DeliveryPrincipal, JobCreator, JobOrigin, JobType, Schedule, ScheduledContext, SessionTarget,
+    DeliveryPrincipal, JobCreator, JobOrigin, JobType, Schedule, ScheduledContext, ScheduledDeliver, SessionTarget,
 };
 use crate::cron::{next_run_for_schedule, schedule_cron_expression, validate_schedule};
 use crate::memory::postgres::PostgresConnectionPool;
@@ -856,6 +856,12 @@ impl PostgresCronStore {
         if patch.context == Some(ScheduledContext::Fresh) {
             anyhow::bail!("context = \"fresh\" is not supported by the Postgres cron store");
         }
+        if let Some(deliver) = patch.deliver.filter(|deliver| *deliver != ScheduledDeliver::Note) {
+            anyhow::bail!(
+                "deliver = \"{}\" is not supported by the Postgres cron store",
+                deliver.as_str()
+            );
+        }
         let mut job = self.get_job(job_id)?;
         let was_enabled = job.enabled;
         let expected_schedule_json = serde_json::to_string(&job.schedule)?;
@@ -1598,6 +1604,7 @@ fn map_cron_job_row(row: &Row) -> Result<CronJob> {
         delivery_principal: DeliveryPrincipal::new(row.try_get(27)?, row.try_get(28)?, row.try_get(29)?),
         origin: JobOrigin::from_stored(row.try_get::<_, Option<String>>(30)?.as_deref()),
         context: ScheduledContext::Task,
+        deliver: ScheduledDeliver::Note,
     })
 }
 

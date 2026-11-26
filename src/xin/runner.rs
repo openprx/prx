@@ -900,6 +900,7 @@ fn step_as_task(step: &XinStep, goal: &XinGoal) -> XinTask {
         approval_grant_json: step.approval_grant_json.clone(),
         origin: goal.origin.clone(),
         context: crate::cron::ScheduledContext::Task,
+        deliver: crate::cron::ScheduledDeliver::Note,
     }
 }
 

@@ -14,7 +14,7 @@ pub(super) const SELECT_ALL_COLUMNS: &str = "SELECT id, owner_id, topic_id, pare
             name, description, kind, status, priority, execution_mode,
             payload, recurring, interval_secs, created_at, updated_at,
             last_run_at, next_run_at, last_status, last_output,
-            run_count, fail_count, max_failures, enabled, approval_grant_json, origin, context
+            run_count, fail_count, max_failures, enabled, approval_grant_json, origin, context, deliver
      FROM xin_tasks WHERE id = ?1";
 
 /// Redact and bound a task's output before the store persists it.
@@ -291,6 +291,7 @@ pub(super) fn map_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<XinTask>
         approval_grant_json: row.get(24)?,
         origin: stored_origin(row.get::<_, Option<String>>(25)?.as_deref(), &kind),
         context: ScheduledContext::parse(&row.get::<_, String>(26)?),
+        deliver: crate::cron::ScheduledDeliver::parse(&row.get::<_, String>(27)?),
     })
 }
 

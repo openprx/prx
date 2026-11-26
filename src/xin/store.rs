@@ -195,7 +195,7 @@ pub fn list_tasks(config: &Config) -> Result<Vec<XinTask>> {
                     name, description, kind, status, priority, execution_mode,
                     payload, recurring, interval_secs, created_at, updated_at,
                     last_run_at, next_run_at, last_status, last_output,
-                    run_count, fail_count, max_failures, enabled, approval_grant_json, origin, context
+                    run_count, fail_count, max_failures, enabled, approval_grant_json, origin, context, deliver
              FROM xin_tasks
              ORDER BY priority DESC, next_run_at ASC",
         )?;
@@ -218,7 +218,7 @@ pub fn due_tasks(config: &Config, now: DateTime<Utc>) -> Result<Vec<XinTask>> {
                     name, description, kind, status, priority, execution_mode,
                     payload, recurring, interval_secs, created_at, updated_at,
                     last_run_at, next_run_at, last_status, last_output,
-                    run_count, fail_count, max_failures, enabled, approval_grant_json, origin, context
+                    run_count, fail_count, max_failures, enabled, approval_grant_json, origin, context, deliver
              FROM xin_tasks
              WHERE enabled = 1
                AND status IN ('pending', 'stale')
@@ -317,6 +317,9 @@ pub fn update_task(config: &Config, task_id: &str, patch: &XinTaskPatch) -> Resu
     if let Some(context) = patch.context {
         task.context = context;
     }
+    if let Some(deliver) = patch.deliver {
+        task.deliver = deliver;
+    }
     // A payload rewrite re-records the rewriter (V7).
     let rewritten_creator = patch
         .payload
@@ -335,7 +338,7 @@ pub fn update_task(config: &Config, task_id: &str, patch: &XinTaskPatch) -> Resu
                  created_via = COALESCE(?12, created_via),
                  creator_level = CASE WHEN ?13 AND COALESCE(substr(creator_agent,1,2),'')<>'n:' THEN ?14 ELSE creator_level END,
                  creator_agent = CASE WHEN ?13 AND COALESCE(substr(creator_agent,1,2),'')<>'n:' THEN ?15 ELSE creator_agent END,
-                 context = ?16
+                 context = ?16, deliver = ?17
              WHERE id = ?10 AND updated_at = ?11",
                 params![
                     task.name,
@@ -357,6 +360,7 @@ pub fn update_task(config: &Config, task_id: &str, patch: &XinTaskPatch) -> Resu
                     rewritten_creator.as_ref().and_then(CreatorStamp::level_column),
                     rewritten_creator.as_ref().and_then(|creator| creator.agent.as_deref()),
                     task.context.as_str(),
+                    task.deliver.as_str(),
                 ],
             )
             .context("Failed to update xin task")?;

@@ -6,7 +6,7 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::cron::{
     CronClaim, CronJob, CronJobEvent, CronJobTerminalState, DeliveryConfig, DeliveryPrincipal, JobOrigin, JobType,
-    Schedule, ScheduledContext, SessionTarget,
+    Schedule, ScheduledContext, ScheduledDeliver, SessionTarget,
 };
 use crate::runtime::sqlite_pool::in_write_scope;
 
@@ -68,6 +68,7 @@ pub(super) fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Cron
         delivery_principal: DeliveryPrincipal::new(row.get(27)?, row.get(28)?, row.get(29)?),
         origin: JobOrigin::from_stored(row.get::<_, Option<String>>(30)?.as_deref()),
         context: ScheduledContext::parse(&row.get::<_, String>(31)?),
+        deliver: ScheduledDeliver::parse(&row.get::<_, String>(32)?),
     })
 }
 

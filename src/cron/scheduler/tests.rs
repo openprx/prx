@@ -287,6 +287,7 @@ fn test_job(command: &str) -> CronJob {
         delivery_principal: crate::cron::DeliveryPrincipal::default(),
         origin: crate::cron::JobOrigin::default(),
         context: crate::cron::ScheduledContext::Task,
+        deliver: crate::cron::ScheduledDeliver::Note,
     }
 }
 

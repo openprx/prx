@@ -81,6 +81,40 @@ impl ScheduledContext {
     }
 }
 
+/// Where a finished scheduled run's result is surfaced to the owner.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ScheduledDeliver {
+    /// A one-line notice at the owner's next interactive turn (default).
+    #[default]
+    Note,
+    /// A real message into the creating session.
+    Message,
+    /// No notice and no result row.
+    None,
+}
+
+impl ScheduledDeliver {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Note => "note",
+            Self::Message => "message",
+            Self::None => "none",
+        }
+    }
+
+    /// Unknown stored values read as the default, `note`.
+    pub(crate) fn parse(raw: &str) -> Self {
+        if raw.eq_ignore_ascii_case("message") {
+            Self::Message
+        } else if raw.eq_ignore_ascii_case("none") {
+            Self::None
+        } else {
+            Self::Note
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Schedule {
@@ -289,6 +323,9 @@ pub struct CronJob {
     /// Whether a scheduled run replays the earlier runs of this job's session.
     #[serde(default)]
     pub context: ScheduledContext,
+    /// Where this job's finished result is surfaced to the owner.
+    #[serde(default)]
+    pub deliver: ScheduledDeliver,
 }
 
 /// Which surface created a job: decides whether its runs use the operator
@@ -388,6 +425,10 @@ pub struct CronJobPatch {
     pub session_target: Option<SessionTarget>,
     pub delete_after_run: Option<bool>,
     pub context: Option<ScheduledContext>,
+    /// Not accepted from a model-written patch yet: the tool and route fields
+    /// that set it come with K-R3, so the serde path stays closed until then.
+    #[serde(skip)]
+    pub deliver: Option<ScheduledDeliver>,
     #[serde(skip)]
     pub approval_grant_json: Option<String>,
     /// Re-anchor the delivery principal, set only by the runtime.

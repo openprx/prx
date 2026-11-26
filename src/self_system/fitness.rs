@@ -768,6 +768,7 @@ mod tests {
             delivery_principal: cron::DeliveryPrincipal::default(),
             origin: cron::JobOrigin::default(),
             context: cron::ScheduledContext::Task,
+            deliver: cron::ScheduledDeliver::Note,
         }
     }
 

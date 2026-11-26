@@ -29,7 +29,7 @@ pub use store::{
 pub(crate) use store::{finish_claimed_run_preserving_schedule, mark_run_finalizing};
 pub use types::{
     CronClaim, CronJob, CronJobEvent, CronJobLineage, CronJobPatch, CronJobTerminalState, CronRun, DeliveryConfig,
-    DeliveryPrincipal, JobCreator, JobOrigin, JobType, Schedule, ScheduledContext, SessionTarget,
+    DeliveryPrincipal, JobCreator, JobOrigin, JobType, Schedule, ScheduledContext, ScheduledDeliver, SessionTarget,
 };
 
 #[allow(clippy::needless_pass_by_value)]
