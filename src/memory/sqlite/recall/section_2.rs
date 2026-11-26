@@ -997,6 +997,11 @@ impl SqliteMemory {
                 return Ok(false);
             };
 
+            crate::memory::sqlite::rf_forget::drop_prefix_rows_of(
+                &conn,
+                "SELECT DISTINCT workspace_id, owner_id FROM memories WHERE id = ?1",
+                params![memory_id],
+            )?;
             let affected = conn.execute("DELETE FROM memories WHERE id = ?1", params![memory_id])?;
             log_access(
                 &conn,

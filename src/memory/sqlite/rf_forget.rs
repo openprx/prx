@@ -304,6 +304,35 @@ fn evict_embeddings(tx: &Connection, scope: Option<&str>, text: &str) -> anyhow:
     Ok(())
 }
 
+/// Delete the session prefix rows (`context.prefix.recorded`) of every
+/// (workspace, owner) pair that the memory rows selected by `owners_sql` belong
+/// to, in every partition. The prefix row keeps the memory index text of a
+/// session, so a forgotten memory must not survive in it; the next turn of such
+/// a session renders a fresh index. `owners_sql` selects
+/// `workspace_id, owner_id` and is a constant statement with bound values.
+/// Returns the number of rows deleted.
+pub(super) fn drop_prefix_rows_of(
+    tx: &Connection,
+    owners_sql: &str,
+    values: impl rusqlite::Params,
+) -> anyhow::Result<usize> {
+    let owners: Vec<(Option<String>, Option<String>)> = {
+        let mut statement = tx.prepare(owners_sql)?;
+        statement
+            .query_map(values, |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut deleted: usize = 0;
+    for (workspace, owner) in owners {
+        deleted = deleted.saturating_add(tx.execute(
+            "DELETE FROM message_events
+             WHERE event_type = 'context.prefix.recorded' AND workspace_id IS ?1 AND owner_id IS ?2",
+            params![workspace, owner],
+        )?);
+    }
+    Ok(deleted)
+}
+
 /// Delete one memory by its stable id with its derived copies; `false` when
 /// it is already gone.
 pub(super) fn delete_memory(tx: &Connection, memory_id: &str) -> anyhow::Result<bool> {
@@ -317,6 +346,11 @@ pub(super) fn delete_memory(tx: &Connection, memory_id: &str) -> anyhow::Result<
     let Some((key, content, scope, topic_id)) = row else {
         return Ok(false);
     };
+    drop_prefix_rows_of(
+        tx,
+        "SELECT DISTINCT workspace_id, owner_id FROM memories WHERE id = ?1",
+        params![memory_id],
+    )?;
     evict_embeddings(tx, scope.as_deref(), &content)?;
     for statement in [
         "DELETE FROM memory_trash WHERE memory_key = ?1",

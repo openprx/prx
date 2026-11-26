@@ -374,6 +374,13 @@ impl ErasureStore for MemoryPool {
         let rebuild_fts = rows.iter().any(|(table, _)| table == "memories");
         for (table, rowid) in rows {
             anyhow::ensure!(TABLES.contains(&table.as_str()), "invalid erase index table");
+            if table == "memories" {
+                super::rf_forget::drop_prefix_rows_of(
+                    &tx,
+                    "SELECT DISTINCT workspace_id, owner_id FROM memories WHERE rowid = ?1",
+                    [rowid],
+                )?;
+            }
             tx.execute(&format!("DELETE FROM {table} WHERE rowid=?1"), [rowid])?;
         }
         if rebuild_fts {

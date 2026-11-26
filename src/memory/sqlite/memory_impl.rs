@@ -482,6 +482,11 @@ impl Memory for SqliteMemory {
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<bool> {
             let conn = pool.write();
+            super::rf_forget::drop_prefix_rows_of(
+                &conn,
+                "SELECT DISTINCT workspace_id, owner_id FROM memories WHERE key = ?1",
+                params![key],
+            )?;
             let affected = conn.execute("DELETE FROM memories WHERE key = ?1", params![key])?;
             Ok(affected > 0)
         })

@@ -521,6 +521,11 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
     let texts: Vec<String> = contents.iter().map(|text| (*text).to_owned()).collect();
     let direct_event_ids: Vec<String> = rows.iter().map(|row| row.event_id.clone()).collect();
     let mut ids = rows.into_iter().map(|row| row.event_id).collect::<Vec<_>>();
+    rf_forget::drop_prefix_rows_of(
+        tx,
+        "SELECT DISTINCT workspace_id, owner_id FROM memories WHERE source_event_id IN (SELECT value FROM json_each(?1))",
+        params![direct],
+    )?;
     let mut forgotten = tx.execute(
         "DELETE FROM memories WHERE source_event_id IN (SELECT value FROM json_each(?1))",
         params![direct],
@@ -706,6 +711,11 @@ fn erase_compactions(
             params![target.workspace_id, run_id],
         )?;
         if let Some(key) = memory_key {
+            rf_forget::drop_prefix_rows_of(
+                tx,
+                "SELECT DISTINCT workspace_id, owner_id FROM memories WHERE key = ?1",
+                params![key],
+            )?;
             *forgotten = forgotten.saturating_add(tx.execute("DELETE FROM memories WHERE key = ?1", params![key])?);
         }
         summaries.extend(summary_event);

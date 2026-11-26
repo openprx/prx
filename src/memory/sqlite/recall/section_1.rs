@@ -209,6 +209,11 @@ impl SqliteMemory {
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<usize> {
             let conn = pool.write();
             let tx = begin_immediate(&conn)?;
+            crate::memory::sqlite::rf_forget::drop_prefix_rows_of(
+                &tx,
+                "SELECT DISTINCT workspace_id, owner_id FROM memories WHERE key LIKE ?1 ESCAPE '\\'",
+                params![pattern],
+            )?;
             let affected = tx.execute("DELETE FROM memories WHERE key LIKE ?1 ESCAPE '\\'", params![pattern])?;
             tx.commit()?;
             Ok(affected)
