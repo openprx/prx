@@ -395,6 +395,80 @@ impl Memory for SqliteMemory {
         .await?
     }
 
+    /// Newest `core` memories of the principal's owner and agent partition.
+    ///
+    /// Partition rule is `partition_conjunct`, the one the other reads use. A
+    /// principal without `agent_partition` is read as the Main partition
+    /// (`ma_scope_id IS NULL` or a Main scope of the workspace), never as all
+    /// agents: a named agent's rows are visible only to a principal that
+    /// carries that agent's partition.
+    async fn newest_core_entries(&self, principal: &MemoryPrincipal, limit: usize) -> anyhow::Result<Vec<MemoryEntry>> {
+        let Some(owner) = principal.owner_id.clone() else {
+            return Ok(Vec::new());
+        };
+        let workspace = principal.workspace_id.clone();
+        let partition = match principal.agent_partition.clone() {
+            Some(partition) => partition,
+            None => crate::memory::AgentPartition {
+                workspace_id: workspace.clone(),
+                owner_id: owner.clone(),
+                key: crate::memory::PartitionKey::Main,
+            },
+        };
+        // A partition of another owner or workspace cannot be read under this
+        // principal's filter; refuse to mix the two rather than widen the read.
+        if partition.owner_id != owner || partition.workspace_id != workspace {
+            return Ok(Vec::new());
+        }
+        let pool = self.pool.clone();
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
+            let reader = pool.read()?;
+            let conn = reader.connection()?;
+            let (partition_sql, partition_values) = super::events::partition_conjunct(
+                super::events::MA_SCOPE_COLUMN,
+                Some(&partition),
+                super::events::numbered_placeholders(3),
+            );
+            let limit_marker = 3 + partition_values.len();
+            let sql = format!(
+                "SELECT id, key, content, category, created_at, session_id, useful_count FROM memories
+                 WHERE category = 'core' AND sensitivity = 'normal' AND workspace_id IS ?1 AND owner_id = ?2{partition_sql}
+                 ORDER BY update_seq DESC LIMIT ?{limit_marker}"
+            );
+            let mut values: Vec<rusqlite::types::Value> = vec![
+                rusqlite::types::Value::from(workspace),
+                rusqlite::types::Value::from(owner),
+            ];
+            values.extend(partition_values.into_iter().map(rusqlite::types::Value::from));
+            values.push(rusqlite::types::Value::from(limit));
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(values), |row| {
+                Ok(MemoryEntry {
+                    origin: crate::memory::traits::MemoryEntryOrigin::Stored,
+                    source_event_id: None,
+                    id: row.get(0)?,
+                    key: row.get(1)?,
+                    content: row.get(2)?,
+                    category: Self::str_to_category(&row.get::<_, String>(3)?),
+                    timestamp: row.get(4)?,
+                    session_id: row.get(5)?,
+                    score: None,
+                    tags: None,
+                    access_count: None,
+                    useful_count: row.get(6)?,
+                    source: None,
+                    source_confidence: None,
+                    verification_status: None,
+                    lifecycle_state: None,
+                    compressed_from: None,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(anyhow::Error::from)
+        })
+        .await?
+    }
+
     async fn list_owner_ids(
         &self,
         category: &MemoryCategory,

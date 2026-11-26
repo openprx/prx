@@ -4,6 +4,8 @@
 use std::borrow::Cow;
 use std::fmt::Write;
 
+use crate::memory::traits::MemoryEntry;
+
 /// The preamble (text before the first entry) may use at most `max_chars / PREAMBLE_SHARE`.
 const PREAMBLE_SHARE: usize = 4;
 /// One entry is kept to this many characters; a longer one is cut and marked `...`.
@@ -113,4 +115,74 @@ fn take_chars(text: &str, max_chars: usize) -> (&str, bool) {
         Some((kept, _)) => (kept, true),
         None => (text, false),
     }
+}
+
+/// Store index: how many newest core memories are fetched for the index.
+#[allow(dead_code)] // first caller: K-M2
+pub(crate) const STORE_INDEX_FETCH: usize = 200;
+/// Store index: the whole section, header and footer included, in characters.
+#[allow(dead_code)] // first caller: K-M2
+pub(crate) const STORE_INDEX_MAX_CHARS: usize = 4_000;
+/// Store index: the cap for a compact turn (the same section, smaller budget).
+#[allow(dead_code)] // first caller: K-M2
+pub(crate) const STORE_INDEX_COMPACT_MAX_CHARS: usize = 1_500;
+/// Characters of the content shown per entry line.
+#[allow(dead_code)] // first caller: K-M2
+const STORE_INDEX_CONTENT_CHARS: usize = 160;
+/// Characters of a timestamp shown per entry line (the date part).
+#[allow(dead_code)] // first caller: K-M2
+const STORE_INDEX_STAMP_CHARS: usize = 10;
+#[allow(dead_code)] // first caller: K-M2
+const STORE_INDEX_HEADER: &str =
+    "## Memory index\nNewest first. Read one in full with memory_get <key>, or search with memory_recall.\n";
+
+/// Render the newest-first store index of `entries` within `max_chars` characters.
+///
+/// `entries` are already in the order the store returned them (newest first).
+/// Returns `None` for no entries. A line that would pass the budget, footer
+/// included, is not shown; the footer counts the hidden entries. When
+/// `truncated_at_limit` is set the store had more rows than were fetched, and
+/// the footer shows the count with a `+`. Output depends only on the inputs,
+/// so the same rows always render the same text.
+#[allow(dead_code)] // first caller: K-M2
+pub(crate) fn render_store_index(
+    entries: &[MemoryEntry],
+    max_chars: usize,
+    truncated_at_limit: bool,
+) -> Option<String> {
+    if entries.is_empty() {
+        return None;
+    }
+    let hidden_marker = if truncated_at_limit { "+" } else { "" };
+    // Reserve the footer for the largest count it can show, so the total stays within the budget.
+    let footer_reserve = format!("({}{hidden_marker} more not shown)\n", entries.len())
+        .chars()
+        .count();
+    let mut index = STORE_INDEX_HEADER.to_owned();
+    let mut used = index.chars().count();
+    let mut shown = 0;
+    for entry in entries {
+        let line = store_index_line(entry);
+        let size = line.chars().count();
+        if used + size + footer_reserve > max_chars {
+            break;
+        }
+        used += size;
+        shown += 1;
+        index.push_str(&line);
+    }
+    let hidden = entries.len() - shown;
+    if hidden > 0 || truncated_at_limit {
+        let _ = write!(index, "({hidden}{hidden_marker} more not shown)\n");
+    }
+    Some(index)
+}
+
+/// One entry line: `- [<date>] <key>: <content>`, newlines shown as spaces.
+#[allow(dead_code)] // first caller: K-M2
+fn store_index_line(entry: &MemoryEntry) -> String {
+    let (stamp, _) = take_chars(&entry.timestamp, STORE_INDEX_STAMP_CHARS);
+    let flat = entry.content.replace(['\r', '\n'], " ");
+    let (content, _) = take_chars(&flat, STORE_INDEX_CONTENT_CHARS);
+    format!("- [{stamp}] {}: {content}\n", entry.key)
 }

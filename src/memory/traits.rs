@@ -397,6 +397,17 @@ pub trait Memory: Send + Sync {
         Ok(entries)
     }
 
+    /// Newest `core` memories of `principal`, newest first by write order.
+    ///
+    /// Only the principal's owner and agent partition are read; `sensitivity`
+    /// other than `normal` is never returned. A principal with no
+    /// `agent_partition` is read as the Main partition, never as all agents.
+    /// A backend without this read returns none, so the index is simply absent.
+    async fn newest_core_entries(&self, principal: &MemoryPrincipal, limit: usize) -> anyhow::Result<Vec<MemoryEntry>> {
+        let _ = (principal, limit);
+        Ok(Vec::new())
+    }
+
     /// Delete message-event rows whose idempotency key is `idempotency_key`.
     ///
     /// The default leaves the log untouched. Backends that store the causal
