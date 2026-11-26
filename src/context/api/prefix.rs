@@ -17,17 +17,14 @@ use crate::context::sources::memory_index::{
     STORE_INDEX_COMPACT_MAX_CHARS, STORE_INDEX_FETCH, STORE_INDEX_MAX_CHARS, render_store_index,
 };
 use crate::context::transcript::{
-    MEMORY_INDEX_SOURCE, PrefixSection, append_hook_contributions, append_session_prefix, newest_session_prefix,
-    render_prefix,
+    HOOK_SOURCE_PREFIX, MEMORY_INDEX_SOURCE, PrefixSection, append_hook_contributions, append_session_prefix,
+    newest_session_prefix, render_prefix,
 };
 use crate::hooks::context::{ContextPoint, HookContribution};
 use crate::hooks::{HookIdentity, HookManager};
 use crate::memory::branch_copy::CONTEXT_SWITCH_EVENT_TYPE;
 use crate::memory::{Memory, MemoryEntry, MemoryFabric, MemoryPrincipal};
 use crate::runtime::envelope::RuntimeEnvelope;
-
-/// Source prefix of a context hook section; the hook's name follows it.
-const HOOK_SOURCE_PREFIX: &str = "hook:";
 
 /// What a session prefix reads, borrowed from the turn's state.
 pub(crate) struct SessionPrefixInput<'a> {
@@ -115,6 +112,10 @@ pub(crate) async fn session_prefix(input: SessionPrefixInput<'_>) -> String {
     scope.parent_run_id = None;
     let fabric = MemoryFabric::new(Arc::clone(memory), envelope.workspace_id.clone())
         .with_event_recording(memory_config.event_recording_config());
+    // The `session_opened` hooks run on this render path only. When the row is
+    // not stored below (tool events not recorded, or a backend without an event
+    // log), the next turn renders again and the hooks run again: their output is
+    // not frozen for the session in that case.
     if let Some(hooks) = hooks {
         let contributions = session_opened_contributions(hooks, envelope, resumed).await;
         append_hook_contributions(&fabric, &scope, &contributions).await;
@@ -135,6 +136,11 @@ pub(crate) async fn session_prefix(input: SessionPrefixInput<'_>) -> String {
 /// The `session_opened` context contributions, taken once per prefix render
 /// under the session's identity. `resumed` says a prefix row existed before
 /// this render (a handoff or a memory change re-renders it).
+///
+/// Freezing holds only when the prefix row is stored. Without a stored row
+/// (tool events not recorded, or a backend without an event log) every turn
+/// renders the prefix again, so this hook runs on every turn and a varying
+/// output changes the system prompt each turn.
 async fn session_opened_contributions(
     hooks: &HookManager,
     envelope: &RuntimeEnvelope,

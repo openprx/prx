@@ -26,7 +26,7 @@ const PREFIX_SCHEMA_VERSION: u32 = 1;
 /// Source of the memory index section.
 pub(crate) const MEMORY_INDEX_SOURCE: &str = "memory_index";
 /// Source prefix of a context hook section; the hook's name follows it.
-const HOOK_SOURCE_PREFIX: &str = "hook:";
+pub(crate) const HOOK_SOURCE_PREFIX: &str = "hook:";
 
 /// One section of the session prefix: where its text came from and the text.
 pub(crate) struct PrefixSection {
