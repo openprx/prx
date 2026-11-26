@@ -260,7 +260,7 @@ const CATCH_UNWIND_FILES: &[&str] = &[
     "src/chat/binding/tests/operator_accounting.rs",
     "src/chat/binding/tests/worker_stdin_protocol.rs",
     "src/chat/dispatcher/real_mode_tests/dual_write.rs",
-    "src/chat/sessions/pty.rs",
+    "src/chat/sessions/pty/tests.rs",
     "src/chat/sessions/runtime.rs",
     "src/chat/tests/legacy_chat_compaction_audit_tests.rs",
     "src/chat/tests/session_cleanup_tests.rs",
