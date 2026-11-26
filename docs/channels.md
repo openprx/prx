@@ -261,6 +261,12 @@ an `activity` object:
 }
 ```
 
+A component that carries `"advisory": true` is reported in `/health`, the daemon
+state file and `prx doctor` like any other, but it never decides readiness and never
+goes stale: `/health` answers 503 only for required components. The evolution judge
+(`evolution_judge`) is the one advisory component today, so a judge model that cannot
+be built shows as `failed` with its reason while `/health` still answers 200.
+
 `prx doctor` renders the same data per channel:
 
 ```
