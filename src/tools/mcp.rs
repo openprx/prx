@@ -6,9 +6,7 @@ use crate::security::policy::{ApprovalGrant, ResourceRiskLevel, SideEffectGate};
 use anyhow::bail;
 use async_trait::async_trait;
 use parking_lot::{Mutex, RwLock};
-use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
-use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
-use rmcp::{ServiceExt, model::CallToolRequestParams};
+use rmcp::transport::TokioChildProcess;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
@@ -20,12 +18,15 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime};
 use tokio::process::Command;
 
+use self::client::discovered_tool_meta;
+use self::lifecycle::McpEra;
+
 const MCP_JSON_FILE: &str = "mcp.json";
 const MCP_ROOT_NAME: &str = "mcp_call";
 const MCP_DISCOVERY_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 const MCP_STDIO_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 
-type McpClient = rmcp::service::RunningService<rmcp::RoleClient, ()>;
+type McpClient = rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientConfig>;
 
 /// The HTTP client of every MCP streamable-HTTP transport.
 ///
@@ -145,6 +146,8 @@ struct RuntimeState {
     /// Whether initial tool discovery has been performed at least once.
     initialized: bool,
     discovered_tools: HashMap<String, HashMap<String, DiscoveredToolMeta>>, // server -> tool -> meta
+    /// Protocol era each server answered with, kept until the next refresh.
+    server_eras: HashMap<String, McpEra>,
     discovery_errors: HashMap<String, String>,
     config_error: Option<String>,
     last_refresh_attempt: Option<SystemTime>,
@@ -328,6 +331,7 @@ impl McpTool {
             mcp_json_mtime: None,
             initialized: false,
             discovered_tools: HashMap::new(),
+            server_eras: HashMap::new(),
             discovery_errors: HashMap::new(),
             config_error: None,
             last_refresh_attempt: None,
@@ -1175,7 +1179,8 @@ impl McpTool {
         server_name: &str,
         server: &McpServerConfig,
         launch_root: Option<&Path>,
-    ) -> anyhow::Result<HashMap<String, DiscoveredToolMeta>> {
+        era: Option<McpEra>,
+    ) -> anyhow::Result<(HashMap<String, DiscoveredToolMeta>, McpEra)> {
         let command = server
             .command
             .as_deref()
@@ -1193,25 +1198,17 @@ impl McpTool {
         // alternate screen. MCP/transport failures still surface structurally.
         let (transport, _stderr) = TokioChildProcess::builder(cmd).stderr(Stdio::null()).spawn()?;
         let _registration = register_mcp_child(server_name, &transport);
-        let client = tokio::time::timeout(startup_timeout, ().serve(transport))
-            .await
-            .map_err(|_| anyhow::anyhow!("MCP startup timed out after {} ms", server.startup_timeout_ms))??;
+        let (client, learnt) = lifecycle::start(transport, era, startup_timeout).await?;
 
         let list = client.peer().list_all_tools().await?;
         let _ = client.cancel().await;
 
         let tools = list
             .into_iter()
-            .map(|tool| {
-                let meta = DiscoveredToolMeta {
-                    description: tool.description.map(|v| v.to_string()),
-                    input_schema: serde_json::to_value(tool.input_schema).ok(),
-                };
-                (tool.name.to_string(), meta)
-            })
+            .map(|tool| (tool.name.to_string(), discovered_tool_meta(tool)))
             .collect::<HashMap<_, _>>();
 
-        Ok(tools)
+        Ok((tools, learnt))
     }
 
     async fn discover_server_tools(
@@ -1219,10 +1216,24 @@ impl McpTool {
         server: &McpServerConfig,
         launch_root: Option<&Path>,
         full: bool,
-    ) -> anyhow::Result<HashMap<String, DiscoveredToolMeta>> {
+        era: Option<McpEra>,
+    ) -> anyhow::Result<(HashMap<String, DiscoveredToolMeta>, McpEra)> {
         match server.transport {
-            McpTransport::Stdio => Self::discover_server_tools_stdio(server_name, server, launch_root).await,
-            McpTransport::Http => Self::discover_server_tools_http(server_name, server, full).await,
+            McpTransport::Stdio => Self::discover_server_tools_stdio(server_name, server, launch_root, era).await,
+            McpTransport::Http => Self::discover_server_tools_http(server_name, server, full, era).await,
+        }
+    }
+
+    /// Remember the era `server_name` answered with, or forget it when `era` is `None`.
+    fn record_server_era(&self, server_name: &str, era: Option<McpEra>) {
+        let mut state = self.state.write();
+        match era {
+            Some(era) => {
+                state.server_eras.insert(server_name.to_string(), era);
+            }
+            None => {
+                state.server_eras.remove(server_name);
+            }
         }
     }
 
@@ -1282,15 +1293,27 @@ impl McpTool {
 
         if session.is_none() {
             let working_dir = Self::prepare_launch_directory(self.launch_root.as_deref(), server_name, server).await?;
-            let cmd = Self::stdio_command(server, command, &working_dir);
+            let mut era = self.state.read().server_eras.get(server_name).copied();
+            let (client, learnt, registration) = loop {
+                let cmd = Self::stdio_command(server, command, &working_dir);
 
-            // See `discover_stdio`: the builder override is required because
-            // the convenience constructor always inherits stderr.
-            let (transport, _stderr) = TokioChildProcess::builder(cmd).stderr(Stdio::null()).spawn()?;
-            let registration = register_mcp_child(server_name, &transport);
-            let client = tokio::time::timeout(startup_timeout, ().serve(transport))
-                .await
-                .map_err(|_| anyhow::anyhow!("MCP startup timed out after {} ms", server.startup_timeout_ms))??;
+                // See `discover_stdio`: the builder override is required because
+                // the convenience constructor always inherits stderr.
+                let (transport, _stderr) = TokioChildProcess::builder(cmd).stderr(Stdio::null()).spawn()?;
+                let registration = register_mcp_child(server_name, &transport);
+                match lifecycle::start(transport, era, startup_timeout).await {
+                    Ok((client, learnt)) => break (client, learnt, registration),
+                    // A cached era that no longer fits the server is dropped
+                    // and the process is started once more with a fresh probe.
+                    Err(_) if era.is_some() => {
+                        tracing::warn!(server = server_name, "MCP cached protocol era failed; probing again");
+                        era = None;
+                        self.record_server_era(server_name, None);
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            self.record_server_era(server_name, Some(learnt));
             *session = Some(StdioSession {
                 launch: server.clone(),
                 client,
@@ -1420,12 +1443,15 @@ impl McpTool {
         };
 
         let mut discovered = HashMap::new();
+        let mut eras = HashMap::new();
         let mut discovery_errors = HashMap::new();
         let retired = self.retired.lock().clone();
         for (server_name, server) in new_config.servers.iter().filter(|(name, _)| !retired.contains(*name)) {
-            match Self::discover_server_tools(server_name, server, self.launch_root.as_deref(), self.full()).await {
-                Ok(tools) => {
+            match Self::discover_server_tools(server_name, server, self.launch_root.as_deref(), self.full(), None).await
+            {
+                Ok((tools, era)) => {
                     discovered.insert(server_name.clone(), tools);
+                    eras.insert(server_name.clone(), era);
                 }
                 Err(error) => {
                     // A transport error quotes the server URL, userinfo
@@ -1442,6 +1468,9 @@ impl McpTool {
         state.effective_config = new_config;
         state.below_full = below_full;
         state.discovered_tools = discovered;
+        // The eras learnt here are the only ones kept: a refresh is the end of
+        // their lifetime, so the next connection to any server probes again.
+        state.server_eras = eras;
         state.discovery_errors = discovery_errors;
         state.config_error = config_error;
         state.mcp_json_mtime = file_mtime;
@@ -1474,6 +1503,7 @@ impl McpTool {
         state.effective_config = new_config;
         state.below_full = below_full;
         state.discovered_tools.clear();
+        state.server_eras.clear();
         state.discovery_errors.clear();
         state.config_error = config_error;
         state.mcp_json_mtime = file_mtime;
@@ -1502,7 +1532,7 @@ impl McpTool {
         // ownership prevents asynchronous refresh/retirement through transport.
         // A synchronous file-only update cannot change this captured config;
         // stdio separately checks its actual launched-session inputs.
-        let server = {
+        let (server, cached_era) = {
             let state = self.state.read();
             let published = state.catalog_snapshot.entry(public_name);
             crate::tools::capability::execution_binding::verify_current_dispatch(
@@ -1522,12 +1552,18 @@ impl McpTool {
                 let available = discovered.keys().cloned().collect::<Vec<_>>().join(", ");
                 bail!("Tool '{tool_name}' not found on MCP server '{server_name}'. Available: [{available}]");
             }
-            server.clone()
+            (server.clone(), state.server_eras.get(&server_name).copied())
         };
 
         match server.transport {
             McpTransport::Stdio => self.call_stdio(&server_name, &server, &tool_name, arguments).await,
-            McpTransport::Http => Self::call_http(&server_name, &server, &tool_name, arguments, self.call_full()).await,
+            McpTransport::Http => {
+                let mut era = cached_era;
+                let result =
+                    Self::call_http(&server_name, &server, &tool_name, arguments, self.call_full(), &mut era).await;
+                self.record_server_era(&server_name, era);
+                result
+            }
         }
     }
 }
@@ -1856,6 +1892,7 @@ mod tests;
 
 mod client;
 pub(super) mod level_view;
+mod lifecycle;
 
 #[cfg(test)]
 mod dispatch_binding_tests;

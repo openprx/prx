@@ -39,7 +39,7 @@ async fn first_bytes_listener() -> (u16, tokio::sync::oneshot::Receiver<Vec<u8>>
 async fn the_mcp_http_transport_speaks_tls_to_an_https_url() {
     let (port, first_bytes) = first_bytes_listener().await;
     let url = format!("https://127.0.0.1:{port}/mcp");
-    let connected = McpTool::connect_http(&url, 3_000, false).await;
+    let connected = McpTool::connect_http(&url, 3_000, false, None).await;
     assert!(connected.is_err(), "the probe never completes a handshake");
     let bytes = tokio::time::timeout(Duration::from_secs(3), first_bytes)
         .await
@@ -103,7 +103,7 @@ async fn the_mcp_http_transport_does_not_follow_a_redirect() {
         let _ = axum::serve(origin, origin_app).await;
     });
 
-    let connected = McpTool::connect_http(&format!("http://127.0.0.1:{origin_port}/mcp"), 3_000, false).await;
+    let connected = McpTool::connect_http(&format!("http://127.0.0.1:{origin_port}/mcp"), 3_000, false, None).await;
     assert!(connected.is_err(), "a redirect is not a session");
     assert!(
         origin_hits.load(Ordering::SeqCst) >= 1,
@@ -707,9 +707,10 @@ for line in sys.stdin:
     };
 
     let launch = tempfile::TempDir::new().expect("test: temp dir");
-    let discovered = McpTool::discover_server_tools_stdio("envprobe", &server, Some(launch.path()))
+    let discovered = McpTool::discover_server_tools_stdio("envprobe", &server, Some(launch.path()), None)
         .await
-        .expect("test: discovery runs");
+        .expect("test: discovery runs")
+        .0;
     let description = discovered
         .get("env")
         .and_then(|meta| meta.description.clone())
@@ -785,9 +786,10 @@ for line in sys.stdin:
         ..McpServerConfig::default()
     };
     let launch = tempfile::TempDir::new().expect("test: temp dir");
-    let tools = McpTool::discover_server_tools_stdio("cwd probe", &server, Some(launch.path()))
+    let tools = McpTool::discover_server_tools_stdio("cwd probe", &server, Some(launch.path()), None)
         .await
-        .expect("test: discovery runs");
+        .expect("test: discovery runs")
+        .0;
     let cwd = reported(&tools);
     let expected = crate::config::mcp_launch::launch_directory(launch.path(), "cwd probe", None)
         .expect("test: launch directory");
@@ -799,9 +801,10 @@ for line in sys.stdin:
         working_dir: Some(configured.path().display().to_string()),
         ..server
     };
-    let tools = McpTool::discover_server_tools_stdio("cwd probe", &pinned, Some(launch.path()))
+    let tools = McpTool::discover_server_tools_stdio("cwd probe", &pinned, Some(launch.path()), None)
         .await
-        .expect("test: discovery runs");
+        .expect("test: discovery runs")
+        .0;
     assert_eq!(reported(&tools), canonical(configured.path()));
 }
 
