@@ -263,8 +263,8 @@ pub(crate) struct CandidatePool {
 pub(crate) struct SourceForms {
     by_role: HashMap<String, HashMap<String, Vec<usize>>>,
     /// The stored attachment of each user message, by its event id. A user
-    /// message is replayed as its attachment's prefix, text and tail, so its
-    /// composed form is matched as well ([`Self::row_matches`]).
+    /// message is replayed as its text and attachment tail, so that form is
+    /// matched as well ([`Self::row_matches`]).
     attachments: HashMap<String, Attachment>,
 }
 
@@ -304,15 +304,16 @@ impl SourceForms {
 
     /// The source messages a stored row may stand for: the union, ascending
     /// and de-duplicated, of its plain text and, for a user row, the text as
-    /// it was replayed: its stored attachment composed around the text, then
-    /// neutralized exactly as the replay neutralizes it. Byte equality only.
+    /// it is replayed: its stored attachment's tail after the text
+    /// ([`Attachment::replayed`]), neutralized exactly as the replay
+    /// neutralizes it. Byte equality only.
     fn row_matches(&self, role: &str, event_id: &str, content: &str) -> Vec<usize> {
         let mut indices = self.matches(role, content);
         if role == "user" {
             indices.extend(self.matches(role, &neutralize_reserved_markers(content)));
             if let Some(attachment) = self.attachments.get(event_id) {
-                let composed = attachment.compose(content);
-                indices.extend(self.matches(role, &neutralize_reserved_markers(&composed)));
+                let replayed = attachment.replayed(content);
+                indices.extend(self.matches(role, &neutralize_reserved_markers(&replayed)));
             }
         }
         indices.sort_unstable();

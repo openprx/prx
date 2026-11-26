@@ -1359,9 +1359,9 @@ async fn commit_completed_provider_turn(
 /// it equals the view rebuilt from the committed snapshot
 /// ([`super::compaction::provider_view_from_acked`]). Without a compaction
 /// since the turn copied its view, the committed request and reply are
-/// appended; the request is in the form it was sent (recalled context, attached
-/// files and date line kept beside the turn), the reply is preceded by its tool
-/// rounds. After a worker compaction the view is rebuilt
+/// appended; the request is in the form a later turn replays it (attached files
+/// and the date line kept, the recalled context of the live message not), the
+/// reply is preceded by its tool rounds. After a worker compaction the view is rebuilt
 /// from the committed snapshot instead: appending to the pre-compaction view
 /// would resend the replaced cold prefix and force another rollover or a lossy
 /// fallback on the next turn.
@@ -1384,10 +1384,11 @@ fn adopt_committed_turn(
         *history = view;
         return;
     }
-    // The request in the form it was sent, which the snapshot's view holds too.
+    // The request in the form a later turn replays it (the live prefix is not
+    // kept), which the snapshot's view holds too.
     history.push(crate::agent::turn_contracts::inbound_user_message(&pending.sent.as_ref().map_or_else(
         || pending.user_input.clone(),
-        |sent| sent.compose(&pending.user_input),
+        |sent| sent.replayed(&pending.user_input),
     )));
     if let Some(reply) = reply {
         // The tool rounds of the reply come right before it.

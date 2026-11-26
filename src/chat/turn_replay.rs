@@ -1,6 +1,7 @@
 //! What chat keeps of a finished turn beyond its text, so a later turn's
-//! provider view replays it as the turn had it: the form the user's request was
-//! sent in and the tool rounds of the run that made the reply.
+//! provider view replays it: the attached text and date line the user's request
+//! was sent with (the recalled prefix is sent with the live request only) and
+//! the tool rounds of the run that made the reply.
 //!
 //! Both ride on the stored turn's runtime record
 //! ([`crate::agent::tool_evidence::TurnToolEvidence`]) and are rendered by
@@ -20,10 +21,11 @@ use crate::memory::Memory;
 use crate::providers::ChatMessage;
 use std::sync::Arc;
 
-/// The request as it is sent, and what was put around the typed `user_input`.
-/// `prompt` is `user_input` possibly followed by attached file text; when it
-/// does not start with `user_input`, no sent form is kept and the request is
-/// `prefix + prompt + time_tail`, as it always was.
+/// The live request as it is sent, and what was put around the typed
+/// `user_input`. `prompt` is `user_input` possibly followed by attached file
+/// text; when it does not start with `user_input`, no sent form is kept and the
+/// request is `prefix + prompt + time_tail`, as it always was. A later turn
+/// replays the returned attachment as its text and tail only.
 pub(super) fn sent_request(
     prefix: &str,
     user_input: &str,

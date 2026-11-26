@@ -141,8 +141,8 @@
         #[cfg(feature = "terminal-tui")]
         let routing_input = admitted_binding.routing_input().to_owned();
         let mem_context = admitted_binding.recalled_context(mem.as_ref()).await;
-        // What is put around the typed text is kept with the turn, so a later
-        // turn's view replays this request with the same bytes.
+        // What is put around the typed text is kept with the turn: a later turn
+        // replays the typed text and the tail, not the recalled prefix.
         let (enriched, sent_form) = super::turn_replay::sent_request(
             &mem_context.preamble,
             &user_input,

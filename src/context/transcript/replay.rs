@@ -35,10 +35,11 @@ const REPLAY_ROW_LIMIT: usize = 500;
 /// What was put around a user message when it was sent.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Attachment {
-    /// Text placed before the user's text (recalled memory).
+    /// Text placed before the user's text (recalled memory). Sent with the live
+    /// message only; never replayed on a later turn.
     #[serde(default)]
     pub prefix: String,
-    /// Text placed after it (attached file text, the date line).
+    /// Text placed after it (attached file text, the date line). Kept on replay.
     #[serde(default)]
     pub tail: String,
 }
@@ -47,6 +48,12 @@ impl Attachment {
     /// The message as it was sent: `text` between the prefix and the tail.
     pub(crate) fn compose(&self, text: &str) -> String {
         format!("{}{text}{}", self.prefix, self.tail)
+    }
+
+    /// The message as a later turn replays it: `text` followed by the tail,
+    /// without the prefix. Every replay and match site uses this one form.
+    pub(crate) fn replayed(&self, text: &str) -> String {
+        format!("{text}{}", self.tail)
     }
 }
 
@@ -313,9 +320,9 @@ impl ReplayLog {
     }
 
     /// The stored turns as history messages, in order: each user message with
-    /// its stored attachment, each assistant reply preceded by the tool rounds
-    /// of its run. Event ids line up with the messages, `None` for a replayed
-    /// tool message.
+    /// its stored attachment's tail (the prefix is not replayed), each assistant
+    /// reply preceded by the tool rounds of its run. Event ids line up with the
+    /// messages, `None` for a replayed tool message.
     pub(crate) fn expand_turns(&self, turns: Vec<ConversationTurn>) -> History {
         let mut out = History::default();
         let mut replayed_runs: HashSet<&str> = HashSet::new();
@@ -340,7 +347,7 @@ impl ReplayLog {
             ) {
                 ("user", Some(attachment)) => {
                     out.attachments += 1;
-                    format!("{}{}{}", attachment.prefix, turn.content, attachment.tail)
+                    attachment.replayed(&turn.content)
                 }
                 _ => turn.content,
             };
@@ -386,7 +393,7 @@ pub(crate) struct History {
     pub messages: Vec<ChatMessage>,
     /// The stored event of each message, index for index.
     pub event_ids: Vec<Option<String>>,
-    /// User messages that were replayed with their stored attachment.
+    /// User messages that were replayed with their stored attachment's tail.
     pub(crate) attachments: usize,
     results: Vec<ReplayedResult>,
 }

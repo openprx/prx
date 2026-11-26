@@ -106,9 +106,9 @@ pub(crate) async fn open_turn(input: OpenInput<'_>) -> TurnOpening {
         recall_budget,
     )
     .await;
-    // What is put around the message is stored beside it and replayed on later
-    // turns, so the message keeps its bytes. It is stored (and sent) masked,
-    // the task card included.
+    // What is put around the message is stored beside it. Only the tail is
+    // replayed on later turns; the prefix is sent with this live message alone.
+    // It is stored (and sent) masked, the task card included.
     let prefix = match card {
         Some(card) => crate::security::redaction::redact_secrets(&format!("{}{card}", mem_context.preamble)),
         None => crate::security::redaction::redact_secrets(&mem_context.preamble),

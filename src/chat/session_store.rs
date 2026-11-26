@@ -350,9 +350,10 @@ pub(super) fn session_turns_to_history(session: &session::ChatSession) -> Vec<Ch
 
 /// The provider view of `session`'s stored turns: [`session_turns_to_history`]
 /// with every context handoff in its compact form, every user message in the
-/// form it was sent, and every assistant reply with its replayed tool rounds
-/// before it, or its tool evidence, each by its one renderer, so a resumed or
-/// switched view holds the bytes the turn had in-process.
+/// form a later turn replays it (text and attached tail), and every assistant
+/// reply with its replayed tool rounds before it, or its tool evidence, each by
+/// its one renderer, so a resumed or switched view holds the bytes the turn had
+/// in-process.
 pub(super) fn session_turns_to_provider_view(session: &session::ChatSession) -> Vec<ChatMessage> {
     let history = session_turns_to_history(session);
     let stored_turns = session

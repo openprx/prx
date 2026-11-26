@@ -222,7 +222,7 @@ pub(crate) fn render_user_content<'a>(content: &'a str, evidence: Option<&TurnTo
     let Some(sent) = evidence.and_then(|evidence| evidence.sent.as_ref()) else {
         return Cow::Borrowed(content);
     };
-    Cow::Owned(crate::agent::turn_contracts::neutralize_reserved_markers(&sent.compose(content)).into_owned())
+    Cow::Owned(crate::agent::turn_contracts::neutralize_reserved_markers(&sent.replayed(content)).into_owned())
 }
 
 /// The body of `line` when it is a whole evidence line: its trim starts with

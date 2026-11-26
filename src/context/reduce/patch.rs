@@ -304,7 +304,7 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
         }
         // The stored attachments of the session's own rows (the same key the switch
         // row is written to), so the summary reads each user message's own words. A
-        // failed read gives none, and the summary then reads the composed text.
+        // failed read gives none, and the summary then reads the replayed text.
         let attachments = stored_attachments(
             audit.memory.as_ref(),
             &crate::memory::MemoryPrincipal {

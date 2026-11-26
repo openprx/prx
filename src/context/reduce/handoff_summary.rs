@@ -265,33 +265,40 @@ fn render_cold_message(message: &ChatMessage, attachments: &HashMap<String, Atta
     format!("{}: {}", message.role.to_uppercase(), message.content.trim())
 }
 
-/// The text the user typed in a stored user message. The message was sent as
-/// `prefix + text + tail` with the attachment stored beside it, so the longest
-/// attachment whose prefix and tail both match is removed. No match leaves
-/// `content` unchanged. Prefix and tail match only at character boundaries, so
-/// the cut is always valid.
+/// The text the user typed in a stored user message. A user message is either
+/// the composed form `prefix + text + tail` (the live request) or the replayed
+/// form `text + tail` (a later turn's view), with the attachment stored beside
+/// it. The attachment whose match removes the most is taken: the composed form
+/// removes the prefix and the tail, the replayed form the tail alone. No match
+/// leaves `content` unchanged. Prefix and tail match only at character
+/// boundaries, so the cut is always valid.
 fn visible_user_text<'a>(content: &'a str, attachments: &HashMap<String, Attachment>) -> &'a str {
     let best = attachments
         .values()
         .filter(|attachment| !(attachment.prefix.is_empty() && attachment.tail.is_empty()))
-        .filter(|attachment| {
-            content.len() >= attachment.prefix.len() + attachment.tail.len()
-                && content.starts_with(attachment.prefix.as_str())
-                && content.ends_with(attachment.tail.as_str())
+        .filter_map(|attachment| {
+            if !content.ends_with(attachment.tail.as_str()) {
+                return None;
+            }
+            let end = content.len().saturating_sub(attachment.tail.len());
+            let start = if content.starts_with(attachment.prefix.as_str()) && attachment.prefix.len() <= end {
+                attachment.prefix.len()
+            } else {
+                0
+            };
+            Some(((start, end), attachment))
         })
-        .max_by(|left, right| {
-            let left_len = left.prefix.len() + left.tail.len();
-            let right_len = right.prefix.len() + right.tail.len();
-            left_len
-                .cmp(&right_len)
-                .then_with(|| left.prefix.cmp(&right.prefix))
-                .then_with(|| left.tail.cmp(&right.tail))
+        .max_by(|(left, left_attachment), (right, right_attachment)| {
+            let removed = |(start, end): (usize, usize)| start.saturating_add(content.len().saturating_sub(end));
+            removed(*left)
+                .cmp(&removed(*right))
+                .then_with(|| left_attachment.prefix.cmp(&right_attachment.prefix))
+                .then_with(|| left_attachment.tail.cmp(&right_attachment.tail))
         });
-    let Some(attachment) = best else {
+    let Some(((start, end), _)) = best else {
         return content;
     };
-    let end = content.len().saturating_sub(attachment.tail.len());
-    content.get(attachment.prefix.len()..end).unwrap_or(content)
+    content.get(start..end).unwrap_or(content)
 }
 
 /// An earlier handoff in the cold window: its summary when it has one, else its
