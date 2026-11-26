@@ -141,6 +141,10 @@ impl SessionsSpawnTool {
                             },
                             "session_key": {"type":"string","description":"For 'continue': stable spawn session key."},
 
+                            "transcript": {
+                                "type": "boolean",
+                                "description": "For 'history': true returns the child's stored turns (available after a restart and for finished runs) instead of the live run history."
+                            },
                             "last_n": {
                                 "type": "integer",
                                 "minimum": 1,

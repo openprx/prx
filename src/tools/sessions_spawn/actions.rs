@@ -321,6 +321,11 @@ impl SessionsSpawnTool {
         owner_scope: &sessions_read_model::RunOwnerScope,
         args: &serde_json::Value,
     ) -> anyhow::Result<ToolResult> {
+        if args.get("transcript").and_then(serde_json::Value::as_bool) == Some(true) {
+            return self
+                .execute_transcript_history(run_id, last_n, max_chars_per_entry)
+                .await;
+        }
         let runs = self.active_runs.read().await;
         let Some(run) = runs
             .iter()
@@ -374,6 +379,69 @@ impl SessionsSpawnTool {
             output: format!(
                 "Conversation history for sub-agent `{run_id}` ({} entries, showing last {retained}):\nmetadata: source=runtime, manageable=true, usage={usage}\n\n{}{}",
                 entries.len(),
+                lines.join("\n\n"),
+                omitted
+            ),
+            error: None,
+        })
+    }
+
+    /// The stored turns of a child session, read from the child-session store.
+    /// Available after a restart and for finished runs. The caller's owner is
+    /// the only boundary; the parent-session match of `continue` is not applied.
+    async fn execute_transcript_history(
+        &self,
+        run_id: &str,
+        last_n: Option<usize>,
+        max_chars_per_entry: usize,
+    ) -> anyhow::Result<ToolResult> {
+        let fabric = self
+            .memory_fabric()
+            .ok_or_else(|| anyhow::anyhow!("child transcripts require durable storage"))?;
+        let (owner, _parent) = super::continuation::caller_owner_and_parent()?;
+        let memory = fabric.memory();
+        let store = memory
+            .child_session_store()
+            .ok_or_else(|| anyhow::anyhow!("child session storage unsupported"))?;
+        let Some(record) = store
+            .sessions(fabric.workspace_id(), &owner)?
+            .into_iter()
+            .find(|record| record.session_key == run_id || record.runs.iter().any(|run| run == run_id))
+        else {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("no stored child session for run `{run_id}`")),
+            });
+        };
+        let turns = store.history(&record)?;
+        let retained = last_n.unwrap_or(DEFAULT_HISTORY_LAST_N).min(turns.len());
+        let skipped = turns.len().saturating_sub(retained);
+        let lines: Vec<String> = turns
+            .iter()
+            .skip(skipped)
+            .map(|turn| {
+                let ts = turn.timestamp.format("%H:%M:%S").to_string();
+                let preview: String = turn.content.chars().take(max_chars_per_entry).collect();
+                let ellipsis = if turn.content.chars().count() > max_chars_per_entry {
+                    "\n[entry truncated]"
+                } else {
+                    ""
+                };
+                format!("[{ts}] **{}**: {}{}", turn.role, preview, ellipsis)
+            })
+            .collect();
+        let omitted = if skipped > 0 {
+            format!("\n\n[history omitted: {skipped} older entries; use last_n/max_chars_per_entry to adjust]")
+        } else {
+            String::new()
+        };
+        Ok(ToolResult {
+            success: true,
+            output: format!(
+                "Stored transcript of child session `{}` ({} turns, showing last {retained}):\n\n{}{}",
+                record.session_key,
+                turns.len(),
                 lines.join("\n\n"),
                 omitted
             ),
