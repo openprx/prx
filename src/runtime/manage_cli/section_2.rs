@@ -95,7 +95,10 @@ pub(crate) async fn run_config(command: ConfigCommands, config: Config, io: &mut
                     .list()?
                     .into_iter()
                     .find(|record| {
+                        // Pairing writes are not the operator's latest change:
+                        // `--last` skips them, an explicit id still selects one.
                         record.is_restorable()
+                            && !matches!(record.actor, ConfigActor::GatewayCredential)
                             && matches!(
                                 record.status,
                                 RecordStatus::Activated
