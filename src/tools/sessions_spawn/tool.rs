@@ -112,7 +112,34 @@ impl SessionsSpawnTool {
                                 "description": "For 'spawn', default true: whether the sub-agent posts its own result to the channel. \
                                                 A 'spawn_batch' member never announces; collect a batch with 'join' and report it once."
                             },
+                            "brief": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "description": "For 'spawn' and 'continue': structured brief rendered after the task. Each field is at most 4000 characters; blank fields are omitted.",
+                                "properties": {
+                                    "objective": {"type": "string", "maxLength": 4000, "description": "What the child must achieve."},
+                                    "expected_output": {"type": "string", "maxLength": 4000, "description": "The form the child's result must take."},
+                                    "boundaries": {"type": "string", "maxLength": 4000, "description": "What the child must stay within or must not do."}
+                                }
+                            },
+                            "references": {
+                                "type": "array",
+                                "maxItems": 32,
+                                "description": "For 'spawn' and 'continue': documents and files the child should read, by reference, rendered one line each after the brief. PRX does not check that a reference exists or is readable; the child's own tools report that.",
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "required": ["kind"],
+                                    "properties": {
+                                        "kind": {"type": "string", "enum": ["document", "file"], "description": "'document' needs 'id'; 'file' needs 'path'."},
+                                        "id": {"type": "string", "description": "For kind 'document': the document id."},
+                                        "path": {"type": "string", "description": "For kind 'file': the file path."},
+                                        "note": {"type": "string", "maxLength": 200, "description": "Optional note shown after the reference."}
+                                    }
+                                }
+                            },
                             "session_key": {"type":"string","description":"For 'continue': stable spawn session key."},
+
                             "last_n": {
                                 "type": "integer",
                                 "minimum": 1,

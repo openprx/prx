@@ -296,6 +296,14 @@ impl SessionsSpawnTool {
         if task.is_empty() {
             return Ok(SpawnOutcome::rejected("'task' parameter must not be empty".into()));
         }
+        // The brief and references are rendered after the task, so the child's
+        // recorded input and the process manifest both carry them. Absent or
+        // blank keys leave the task untouched.
+        let rendered_task = match super::brief::render_task(task, args) {
+            Ok(rendered) => rendered,
+            Err(message) => return Ok(SpawnOutcome::rejected(message)),
+        };
+        let task = rendered_task.as_deref().unwrap_or(task);
 
         let mode = args
             .get("mode")

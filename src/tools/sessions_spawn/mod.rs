@@ -20,6 +20,7 @@ pub(crate) use task_control::{TaskFinalization, TaskRunControl};
 mod actions;
 mod announce;
 mod batch;
+mod brief;
 mod builders;
 mod chat_assign;
 mod child_lifecycle;

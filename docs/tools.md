@@ -2053,6 +2053,45 @@ current turn. Session commands operate on the focused child's context,
 model, history, usage, and task-mode approvals. `/level` displays the inherited
 level. A process child's approval calls are relayed to the root approval surface.
 
+### Brief and references for a child
+
+`sessions_spawn` `spawn` and `continue` accept two optional arguments. Both are
+absent by default, and then the child's first message is the `task` text alone,
+exactly as before.
+
+- `brief`: an object with `objective`, `expected_output` and `boundaries`
+  (strings, at most 4,000 characters each). Blank fields are omitted; unknown
+  keys are rejected.
+- `references`: a list of at most 32 entries. Each entry has `kind` (`document`
+  or `file`, required), `id` (for `document`), `path` (for `file`) and an
+  optional `note` (at most 200 characters). A `document` without `id` or a
+  `file` without `path` is rejected.
+
+PRX renders both after the task text, so the child is told the objective,
+the expected output and the boundaries, and is pointed at the documents and
+files to read:
+
+```text
+<task>
+
+[Brief]
+Objective: <objective>
+Expected output: <expected_output>
+Boundaries: <boundaries>
+
+[References]
+- document <id>: read it with document_get_chunk (<note>)
+- file <path>: read it with file_read
+```
+
+Only the lines whose fields are present are written. The `[References]` lines
+follow the entry order. The rendered text is the child's recorded input, so a
+`continue` replays it. A rejected argument (a size bound or a missing field)
+returns a tool error and starts no child. PRX does not check that a referenced
+document or file exists or is readable; the child's own tools report that. A
+top-level `brief` or `references` on `spawn_batch` applies to every member, as
+other batch-level defaults do.
+
 ## Messages between sessions
 
 `sessions_send {"to":"parent","message":"public update"}` delivers ordinary
