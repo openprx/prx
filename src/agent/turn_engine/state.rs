@@ -46,6 +46,18 @@ pub(super) struct TurnInputs<'a> {
     pub(super) safety_surface: Arc<crate::tools::execution::admission::TurnSurface>,
 }
 
+/// The request of one round as it leaves for the provider, with the adapter
+/// its tool calls run through.
+pub(super) struct PreparedRound {
+    pub(super) prepared_messages: crate::multimodal::PreparedMessages,
+    pub(super) compiled_tool_context: crate::agent::turn_context::CompiledToolContext,
+    pub(super) execution_adapter: ToolLoopRuntimeAdapter,
+    pub(super) guarded_delivery: bool,
+    pub(super) system_prompt_sha256: Option<String>,
+    pub(super) system_prompt_chars: usize,
+    pub(super) tool_surface: crate::agent::turn_context::RequestToolMeasurement,
+}
+
 /// Values the rounds of one turn carry forward and change.
 pub(super) struct TurnState {
     /// The round counter; the first round is 1.

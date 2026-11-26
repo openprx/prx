@@ -420,7 +420,7 @@ const USER_MESSAGE_CONSTRUCTION_SITES: &[&str] = &[
     "src/agent/context_paging.rs::recall_context_pages",
     "src/agent/response_guard.rs::append_corrective_aside",
     "src/agent/tool_result_recording.rs::drop",
-    "src/agent/turn_engine.rs::run_turn_unguarded",
+    "src/agent/turn_engine/tool_round.rs::run_tools",
     // The legacy `Agent` dispatcher's own tool-result block and its conversion of
     // an already-built conversation (the user turns in it came through
     // `inbound_user_message` in `agent.rs`).
