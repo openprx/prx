@@ -127,8 +127,7 @@ pub(crate) const STORE_INDEX_COMPACT_MAX_CHARS: usize = 1_500;
 const STORE_INDEX_CONTENT_CHARS: usize = 160;
 /// Characters of a timestamp shown per entry line (the date part).
 const STORE_INDEX_STAMP_CHARS: usize = 10;
-const STORE_INDEX_HEADER: &str =
-    "## Memory index\nNewest first. Read one in full with memory_get <key>, or search with memory_recall.\n";
+const STORE_INDEX_HEADER: &str = "## Memory index\nNewest first. Read one in full with memory_get <key>, or search with memory_recall. Search earlier sessions with transcript_search.\n";
 
 /// Render the newest-first store index of `entries` within `max_chars` characters.
 ///

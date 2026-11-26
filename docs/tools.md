@@ -75,7 +75,7 @@ seen by its next turn without a restart.
 | **Capability discovery** | `capability_search` (tool-capable turns with eligible deferred features) |
 | **Shell & Files** | `shell`, `file_read`, `file_write`, `file_edit` |
 | **Web** | `web_search_tool`, `web_fetch`, `http_request` |
-| **Memory & Documents** | `memory_store`, `memory_recall`, `memory_search`, `memory_get`, `transcript_history_lookup`, `memory_forget`, `memory_reindex`, `chat_profile_update`, `document_search`, `document_get_chunk`, `document_ingest`, `document_sync` |
+| **Memory & Documents** | `memory_store`, `memory_recall`, `memory_search`, `memory_get`, `transcript_history_lookup`, `transcript_search`, `memory_forget`, `memory_reindex`, `chat_profile_update`, `document_search`, `document_get_chunk`, `document_ingest`, `document_sync` |
 | **Skills** | `skills_list`, `skill_read`, `skills_manage`, `skill_execute`, plus up to 32 declared skill-tool aliases |
 | **Messaging** | `message_send`, `stay_silent` (smart group-reply turns only) |
 | **Sessions** | `sessions_spawn`, `sessions_send`, `sessions_list`, `sessions_history`, `session_status`, `subagents`, `delegate`, `managed_session` (`prx chat` only) |
@@ -1860,6 +1860,31 @@ Readers continue to accept the previous inline JSON manifest. Non-Unix parents
 retain that existing transport. Parent and child use the same executable; rolling
 back this transport means reverting both writer and reader together. Existing
 control frames and capability-expiry rules are unchanged.
+
+## Transcript search
+
+`transcript_search` finds earlier messages in the owner's conversations with the
+current agent. It reads the user and assistant messages of every session in the
+agent partition of the calling turn (the main agent's partition for a main-agent
+turn). Other owners, workspaces and agent partitions are never searched, and
+messages in encrypted scopes are not searched.
+
+Parameters:
+
+- `query` (required, string): the words to find. Every word must occur in a message.
+- `session_key` (optional, string): search only this session.
+- `limit` (optional, integer, 1 to 50, default 10): the number of hits.
+
+Matching: words of 3 or more characters are matched through the full-text index,
+and the best match comes first. Shorter words are matched as substrings of the
+message, on the hits of the longer words. When every word is shorter than 3
+characters, the newest matches come first, and the excerpt starts 80 characters
+before the first word.
+
+The index is built on the first search, or at process start by a background
+warm-up, so a search does not pay for building it. Each hit prints its time,
+session, role and an excerpt with secrets redacted. No match returns
+`No earlier conversation matched.`
 
 ## Flat built-in tool schemas
 

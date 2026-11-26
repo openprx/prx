@@ -92,6 +92,7 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "memory_search",
     "memory_get",
     "transcript_history_lookup",
+    "transcript_search",
     // Document retrieval (RAG) reads.
     "document_search",
     "document_get_chunk",

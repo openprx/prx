@@ -25,7 +25,7 @@ impl TranscriptHistoryLookupTool {
         Self { memory }
     }
 
-    fn trusted_principal(args: &serde_json::Value) -> anyhow::Result<MemoryPrincipal> {
+    pub(crate) fn trusted_principal(args: &serde_json::Value) -> anyhow::Result<MemoryPrincipal> {
         anyhow::ensure!(
             args.get("_zc_scope_trusted").and_then(serde_json::Value::as_bool) == Some(true),
             "transcript lookup requires a runtime-authenticated scope"

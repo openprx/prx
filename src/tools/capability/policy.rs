@@ -21,6 +21,7 @@ pub(crate) fn plan_intercepts_tool(name: &str) -> bool {
             | "memory_search"
             | "memory_get"
             | "transcript_history_lookup"
+            | "transcript_search"
             | "document_search"
             | "document_get_chunk"
             | "sessions_list"
@@ -57,6 +58,7 @@ pub const OWNER_ISOLATION_AWARE_TOOLS: &[&str] = &[
     "memory_search",
     "memory_recall",
     "memory_get",
+    "transcript_search",
     "document_search",
     "document_get_chunk",
     "sessions_list",

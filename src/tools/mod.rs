@@ -78,6 +78,7 @@ pub mod subagents;
 pub(crate) mod tool_diff;
 pub mod traits;
 pub mod transcript_history_lookup;
+pub mod transcript_search;
 pub mod web_fetch;
 pub mod web_search_tool;
 pub mod xin;
@@ -154,6 +155,7 @@ pub const STATIC_PUBLIC_TOOL_NAMES: &[&str] = &[
     "memory_search",
     "memory_get",
     "transcript_history_lookup",
+    "transcript_search",
     "memory_forget",
     "memory_reindex",
     "chat_profile_update",
@@ -588,6 +590,8 @@ pub fn all_tools_with_runtime_ext_and_extensions(
             config.memory.acl_enabled,
         )));
         tool_arcs.push(Arc::new(TranscriptHistoryLookupTool::new(memory.clone())));
+        tool_arcs.push(Arc::new(transcript_search::TranscriptSearchTool::new(memory.clone())));
+        transcript_search::warm_index_in_background(memory.clone());
         tool_arcs.push(Arc::new(DocumentSearchTool::new(
             workspace_dir.to_path_buf(),
             memory.clone(),
