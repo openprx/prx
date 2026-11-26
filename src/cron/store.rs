@@ -19,9 +19,8 @@
 
 use crate::config::Config;
 use crate::cron::{
-    CronClaim, CronJob, CronJobLineage, CronJobPatch, CronJobTerminalState, DeliveryConfig,
-    JobCreator, Schedule, SessionTarget, next_run_for_schedule, schedule_cron_expression,
-    validate_schedule,
+    CronClaim, CronJob, CronJobLineage, CronJobPatch, CronJobTerminalState, DeliveryConfig, JobCreator, Schedule,
+    SessionTarget, next_run_for_schedule, schedule_cron_expression, validate_schedule,
 };
 use crate::security::agent_level::CreatorStamp;
 use anyhow::{Context, Result};
@@ -35,14 +34,14 @@ mod runs;
 
 use connection::with_connection;
 use rows::{
-    JobLineage, insert_job_event, load_job_lineage, map_cron_job_row, map_job_event_row, parse_rfc3339, sql_conversion_error,
-    workspace_id,
+    JobLineage, insert_job_event, load_job_lineage, map_cron_job_row, map_job_event_row, parse_rfc3339,
+    sql_conversion_error, workspace_id,
 };
 pub(crate) use rows::{MirrorLineage, cron_job_event_payload, decode_delivery, decode_schedule};
 pub use runs::{finish_claimed_run, list_job_events, list_runs, record_terminal_manual_run};
+pub(crate) use runs::{finish_claimed_run_preserving_schedule, stored_cron_output};
 #[cfg(test)]
 pub use runs::{record_one_shot_terminal_run, record_run};
-pub(crate) use runs::{finish_claimed_run_preserving_schedule, stored_cron_output};
 
 const MAX_CRON_OUTPUT_BYTES: usize = 16 * 1024;
 const TRUNCATED_OUTPUT_MARKER: &str = "\n...[truncated]";

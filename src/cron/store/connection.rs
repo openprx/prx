@@ -207,4 +207,3 @@ pub(super) fn with_connection<T>(config: &Config, f: impl FnOnce(&mut Connection
     }
     result
 }
-

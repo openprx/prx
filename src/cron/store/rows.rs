@@ -5,8 +5,8 @@ use uuid::Uuid;
 
 use crate::config::Config;
 use crate::cron::{
-    CronClaim, CronJob, CronJobEvent, CronJobTerminalState, DeliveryConfig, DeliveryPrincipal, JobOrigin, JobType, Schedule,
-    SessionTarget,
+    CronClaim, CronJob, CronJobEvent, CronJobTerminalState, DeliveryConfig, DeliveryPrincipal, JobOrigin, JobType,
+    Schedule, SessionTarget,
 };
 use crate::runtime::sqlite_pool::in_write_scope;
 

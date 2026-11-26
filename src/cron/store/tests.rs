@@ -1,8 +1,8 @@
 use super::*;
-use crate::cron::{DeliveryPrincipal, JobOrigin};
-use rusqlite::Connection;
 use crate::config::Config;
+use crate::cron::{DeliveryPrincipal, JobOrigin};
 use chrono::Duration as ChronoDuration;
+use rusqlite::Connection;
 use tempfile::TempDir;
 
 fn claim_due(config: &Config, job: &CronJob, worker: &str, now: DateTime<Utc>) -> Option<CronClaim> {
@@ -658,9 +658,8 @@ fn cron_write_waits_past_the_old_five_second_deadline_and_warns() {
     // Runs on this thread so the busy handler's warnings land in this
     // thread's captured subscriber.
     let started = std::time::Instant::now();
-    let (added, logs) = crate::runtime::sqlite_pool::log_capture::capturing_logs(|| {
-        add_job(&config, "*/7 * * * *", "echo blocked")
-    });
+    let (added, logs) =
+        crate::runtime::sqlite_pool::log_capture::capturing_logs(|| add_job(&config, "*/7 * * * *", "echo blocked"));
     let waited = started.elapsed();
     holder.join().expect("test: holder thread");
 
@@ -1058,8 +1057,7 @@ fn rearm_and_terminal_auto_delete_are_serialized() {
 
     let started = Utc::now();
     let claim = claim_manual(&config, &current, started);
-    let deleted =
-        record_one_shot_terminal_run(&config, &current, &claim, started, started, true, "done", 0).unwrap();
+    let deleted = record_one_shot_terminal_run(&config, &current, &claim, started, started, true, "done", 0).unwrap();
     assert!(deleted);
     assert!(get_job(&config, &current.id).is_err());
     assert!(
@@ -1282,15 +1280,10 @@ fn renewed_manual_claim_commits_after_original_expiry_without_advancing_schedule
     let config = test_config(&tmp);
     let job = add_job(&config, "*/5 * * * *", "echo long-manual").unwrap();
     let claimed_at = Utc::now();
-    let original = claim_job_if_current_for_manual_run(
-        &config,
-        &job,
-        "manual-worker",
-        claimed_at,
-        ChronoDuration::seconds(30),
-    )
-    .unwrap()
-    .unwrap();
+    let original =
+        claim_job_if_current_for_manual_run(&config, &job, "manual-worker", claimed_at, ChronoDuration::seconds(30))
+            .unwrap()
+            .unwrap();
     let renewed = renew_job_claim(
         &config,
         &job.id,
