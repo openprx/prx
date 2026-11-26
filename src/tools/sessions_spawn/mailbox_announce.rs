@@ -79,7 +79,7 @@ impl MailboxAnnouncement {
     /// Send the completion to the parent session. `false` leaves the run's
     /// own channel as the fallback; the result stays retrievable either way.
     pub(super) async fn deliver(&self, run_id: &str, completed: bool, result_text: &str) -> bool {
-        let text = announcement_text(run_id, completed, result_text);
+        let text = announcement_text(run_id, completed, result_text, &self.child_session);
         let runtime = Arc::clone(&self.runtime);
         let source = runtime.address(&self.owner, &self.child_session, &self.child_agent);
         let target = runtime.address(&self.owner, &self.parent_session, &self.parent_agent);
@@ -115,17 +115,20 @@ impl MailboxAnnouncement {
 
 /// The inbound message the parent session reads: which run finished, how, and
 /// its result (bounded).
-fn announcement_text(run_id: &str, completed: bool, result_text: &str) -> String {
+fn announcement_text(run_id: &str, completed: bool, result_text: &str, child_session: &str) -> String {
     let outcome = if completed { "completed" } else { "FAILED" };
     let head = format!(
         "Sub-agent `{run_id}` has finished ({outcome}). This is an automatic completion notice for a run you already started, not a new request; that run's task is done. Report this result to the user if useful; the request that started the run is already done, do not start it again."
     );
     let detail = result_text.trim();
+    let references = format!(
+        "\n\n[References]\n- transcript {child_session}: read it with sessions_spawn action=history run_id={run_id} transcript=true, or search it with transcript_search session_key={child_session}"
+    );
     if detail.is_empty() {
-        return format!("{head}\nResult: (empty)");
+        return format!("{head}\nResult: (empty){references}");
     }
     format!(
-        "{head}\nResult:\n{}",
+        "{head}\nResult:\n{}{references}",
         crate::util::truncate_with_ellipsis(detail, ANNOUNCE_RESULT_MAX_CHARS)
     )
 }
