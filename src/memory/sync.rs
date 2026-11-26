@@ -42,6 +42,32 @@ pub struct SnapshotPage {
     pub retained_since: Option<String>,
 }
 
+/// Why a retention pass did nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TrimSkipped {
+    #[default]
+    No,
+    Throttled,
+    SnapshotOpen,
+}
+
+/// Counts of one retention pass. Content-free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MessageTrim {
+    pub skipped: TrimSkipped,
+    pub batches: u32,
+    pub events: u64,
+    pub runs: u64,
+    pub turns: u64,
+    pub attempts: u64,
+    pub links: u64,
+    pub documents: u64,
+    pub traces: u64,
+    pub compactions: u64,
+    /// `turn.deleted` retention notices appended to the rf journal.
+    pub notices: u64,
+}
+
 /// A candidate whose admitting process must be checked before interruption.
 pub struct RestartCandidate {
     pub workspace: String,
@@ -65,4 +91,6 @@ pub trait SyncStore: Send + Sync {
     /// Cancel the approvals that message-woken runs of a dead process left open; returns the runs swept.
     fn cancel_orphaned_woken_approvals(&self) -> anyhow::Result<usize>;
     fn shutdown_signal(&self) -> CancellationToken;
+    /// Delete the message log rows older than `cutoff`, run by run, in at most `max_batches` batches.
+    fn trim_message_log(&self, cutoff: chrono::DateTime<chrono::Utc>, max_batches: u32) -> anyhow::Result<MessageTrim>;
 }
