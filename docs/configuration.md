@@ -2430,8 +2430,35 @@ prefix is not stored, so `session_opened` hooks run on every turn and a varying
 output changes the system prompt each turn.
 
 The points are called by `prx agent`, gateway sessions, channel and scheduled
-entries and `prx chat` (the terminal chat). Child turns do not call them yet;
-K-H3 adds the child point.
+entries. `prx chat` (the terminal chat) does not call them yet.
+
+The tool-result point (`tool_call`) runs once per tool call of a round. Its
+`replace_output` replaces the text the model reads back: the history message,
+the stored result row and the document and external copies hold the replaced
+text, so a redaction hook leaves no raw copy the model can replay. The notify
+`tool_call` event, the failure counters and the repeated-failure rule keep the
+raw output. A `note` is appended to the text as `[Hook note: <name>] <text>`.
+Each contribution writes one audit row. Without a context action the text is
+unchanged and nothing is stored.
+
+The before-handoff point (`reduction_started`) runs when a reduction writes a
+summary handoff inside a turn. Its `summary_instructions` are appended to the
+summary prompt, one per line, and the event is also delivered as a notify
+event. It has no audit row. A reduction outside a turn (the terminal's
+pre-turn rollover and `/compact`) runs no such hook.
+
+The child-open point (`child_started`) runs when a task-mode or process-mode
+child opens its first input. Its `add_context` text goes into the stored
+attachment tail of that input, before the date line, as
+`[Hook context: <name>]` followed by the text, with one audit row under the
+child's session key. Only the first input of a child run takes it; steering
+inputs do not. A task child uses the parent turn's hooks and a process child
+the worker's own `hooks.json`. Delegate children do not open through this
+path and get none. A child runs no `session_opened` or `turn_opened` hook.
+
+A context hook's payload is bounded at 4 MiB. A tool call whose output makes
+the payload larger fails its action: the output is kept unchanged and a
+`hook_failed` event is queued.
 
 #### Webhook hooks
 
