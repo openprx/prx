@@ -149,6 +149,19 @@
             &user_input_for_prompt,
             crate::agent::turn_contracts::current_time_tail(),
         );
+        // The attachment row of this turn, as `open_turn` writes it: a later
+        // terminal switch matches the replayed user message (typed text + tail)
+        // against the log, so the stored tail must exist there too.
+        if let (Some(event), Some(sent)) = (chat_user_event.as_ref(), sent_form.as_ref()) {
+            crate::context::transcript::append_attachment(
+                &memory_fabric,
+                runtime_envelope.message_scope(),
+                &event.event_id,
+                sent,
+                &mem_context.sources,
+            )
+            .await;
+        }
 
         crate::context::request_provenance::note_live_attachment(crate::context::request_provenance::LiveAttachment {
             run_id: runtime_envelope.run_id.clone(),
