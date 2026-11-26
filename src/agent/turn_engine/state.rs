@@ -58,6 +58,14 @@ pub(super) struct PreparedRound {
     pub(super) tool_surface: crate::agent::turn_context::RequestToolMeasurement,
 }
 
+/// What the terminal text branch decided for one response.
+pub(super) enum TextReply {
+    /// A corrective retry: the round runs again without delivering.
+    Retry,
+    /// The accepted reply, ready for outbound middleware and delivery.
+    Deliver(String),
+}
+
 /// Values the rounds of one turn carry forward and change.
 pub(super) struct TurnState {
     /// The round counter; the first round is 1.

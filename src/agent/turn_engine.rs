@@ -17,9 +17,10 @@ use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 mod overflow;
+mod reply;
 mod state;
 mod tool_round;
-use state::{PreparedRound, TurnInputs, TurnState};
+use state::{PreparedRound, TextReply, TurnInputs, TurnState};
 
 #[cfg(test)]
 use crate::agent::compaction::is_tool_roundtrip_companion;
@@ -450,6 +451,32 @@ fn turn_write_provenance(services: &TurnServices<'_>) -> Option<crate::memory::w
                 .as_ref()
                 .and_then(|ingest| ingest.write_provenance.clone())
         })
+}
+
+/// The outbound middleware stage, run once on the accepted reply of a
+/// delivered turn. Only the terminal text branch calls it.
+#[cfg(feature = "wasm-plugins")]
+async fn apply_outbound_middleware(hooks: &HookManager, channel_name: &str, display_text: &mut String) {
+    // Braced so that a `#[cfg(test)]`-item scanner (the source guard
+    // `outbound_middleware_has_one_production_owner`) can tell this
+    // test-only counter from the production call below it.
+    #[cfg(test)]
+    {
+        OUTBOUND_MIDDLEWARE_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+    }
+    let transformed = hooks
+        .process_wasm_middleware(
+            crate::plugins::capabilities::middleware::MiddlewareStage::Outbound,
+            serde_json::json!({
+                "channel": channel_name,
+                "text": display_text.as_str(),
+                "has_tool_calls": false,
+            }),
+        )
+        .await;
+    if let Some(text) = transformed.get("text").and_then(serde_json::Value::as_str) {
+        *display_text = finalize_outbound_display_text(display_text.as_str(), text).into_owned();
+    }
 }
 
 async fn run_turn_unguarded(
@@ -1813,172 +1840,24 @@ async fn run_turn_unguarded(
         };
 
         if tool_calls.is_empty() {
-            // No tool calls — this is the final response.
-            if is_tool_summary_only_response(&response_text) {
-                if state.tool_summary_retry_attempted {
-                    anyhow::bail!("model returned a tool-summary-only response after one corrective retry");
-                }
-                tracing::warn!(
-                    provider = %crate::security::redaction::redact_provider_text(provider_name),
-                    model = %crate::security::redaction::redact_provider_text(model),
-                    "model returned a tool-summary-only response; retrying once with a corrective instruction"
-                );
-                state.tool_summary_retry_attempted = true;
-                state.inject_tool_summary_retry_instruction = true;
-                continue;
-            }
-            if is_empty_assistant_response(&response_text, false) {
-                if state.empty_response_retry_attempted {
-                    anyhow::bail!("model returned an empty response after one corrective retry");
-                }
-                tracing::warn!(
-                    provider = %crate::security::redaction::redact_provider_text(provider_name),
-                    model = %crate::security::redaction::redact_provider_text(model),
-                    "model returned empty assistant response; retrying once with a corrective instruction"
-                );
-                state.empty_response_retry_attempted = true;
-                state.inject_empty_response_retry_instruction = true;
-                continue;
-            }
-            // Fabricated tool-use marker guard. A `[Used tools: ...]` line the
-            // model wrote while this turn never dispatched a tool is a claim
-            // about work that did not happen; spend the one corrective retry on
-            // it (the same budget the summary-only path uses, so a response that
-            // is nothing but a marker still costs at most one retry).
-            // A model-written tool-evidence line that names tools is the same
-            // kind of claim.
-            let fabricated_marker = contains_assistant_fabricated_tool_marker(&response_text)
-                || contains_assistant_fabricated_tool_marker(&display_text)
-                || claims_tool_evidence(&response_text)
-                || claims_tool_evidence(&display_text);
-            if fabricated_marker && !state.executed_any_tool_call && !state.tool_summary_retry_attempted {
-                tracing::warn!(
-                    provider = %crate::security::redaction::redact_provider_text(provider_name),
-                    model = %crate::security::redaction::redact_provider_text(model),
-                    "model claimed tool use without executing any tool; retrying once with a corrective instruction"
-                );
-                state.tool_summary_retry_attempted = true;
-                state.inject_tool_summary_retry_instruction = true;
-                continue;
-            }
-            if fabricated_marker {
-                if state.executed_any_tool_call {
-                    // A tool really ran: keep whatever the model actually
-                    // answered and drop only the marker lines, so the
-                    // fabrication never reaches the user, the history, or the
-                    // next turn's prompt where it would be imitated again.
-                    if let Cow::Owned(cleaned) = strip_assistant_fabricated_tool_markers(&display_text) {
-                        display_text = cleaned;
-                    }
-                    if display_text.trim().is_empty() {
-                        anyhow::bail!("model returned a tool-summary-only response after one corrective retry");
-                    }
-                } else {
-                    // Retry spent and no tool ran: the rest of the reply is
-                    // built on a claim that did not happen, so it is replaced
-                    // whole by a fixed notice. `display_text` is what is
-                    // streamed, pushed to history and returned, so all three
-                    // carry the notice and none the fabricated text.
-                    display_text = UNEXECUTED_TOOL_CLAIM_NOTICE.to_owned();
-                }
-            }
-            // Tool evidence is written by the runtime only: every evidence
-            // line the model wrote is dropped before delivery and history,
-            // a `none` line included.
-            if let Cow::Owned(cleaned) = strip_model_written_tool_evidence(&display_text) {
-                display_text = cleaned;
-                if display_text.trim().is_empty() {
-                    anyhow::bail!("model returned a tool-summary-only response after one corrective retry");
-                }
-            }
-            // One outbound middleware pass per accepted, delivered turn. Every
-            // retry, repair and marker guard above has accepted this response,
-            // and nothing below can replace it: the next statements stream it,
-            // store it and return it. Running the stage earlier — once per loop
-            // iteration, as it used to — executed the plugin again for every
-            // tool round and every corrective retry, so a plugin holding a
-            // counter, an audit log, a rate budget or any other side effect saw
-            // one delivered turn as several. A tool-call iteration keeps the
-            // pre-outbound `assistant_history_content` it always had.
-            //
-            // `has_tool_calls` is necessarily `false` here; it is kept in the
-            // envelope so existing plugins that read the field still parse it.
-            #[cfg(feature = "wasm-plugins")]
+            match Box::pin(reply::finish_text_reply(
+                &turn,
+                &mut state,
+                history,
+                &response_text,
+                display_text,
+                round.guarded_delivery,
+            ))
+            .await?
             {
-                // Braced so that a `#[cfg(test)]`-item scanner (the source guard
-                // `outbound_middleware_has_one_production_owner`) can tell this
-                // test-only counter from the production call below it.
-                #[cfg(test)]
-                {
-                    OUTBOUND_MIDDLEWARE_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
-                }
-                let transformed = hooks
-                    .process_wasm_middleware(
-                        crate::plugins::capabilities::middleware::MiddlewareStage::Outbound,
-                        serde_json::json!({
-                            "channel": channel_name,
-                            "text": display_text,
-                            "has_tool_calls": false,
-                        }),
-                    )
-                    .await;
-                if let Some(text) = transformed.get("text").and_then(serde_json::Value::as_str) {
-                    display_text = finalize_outbound_display_text(&display_text, text).into_owned();
+                TextReply::Retry => continue,
+                TextReply::Deliver(display_text) => {
+                    // FIX #2: fold the cross-turn fallback flag into the returned trace so
+                    // a fallback on any earlier turn is reflected in the recorded status.
+                    let last_turn_trace = state.returned_trace(context);
+                    return Ok((ToolLoopOutcome::Text(display_text), last_turn_trace));
                 }
             }
-            // If a streaming sender is provided, relay the text in small chunks
-            // so the channel can progressively update the draft message.
-            if runtime_adapter.stream_provider && round.guarded_delivery {
-                emit_tool_loop_event(&runtime_adapter, ToolLoopEvent::TextDelta(display_text.clone())).await?;
-            }
-            if let Some(tx) = on_delta {
-                // Semantic-boundary chunking: only flush after closed XML tags
-                // (`<...>`) or closed JSON objects/arrays. See
-                // `stream_buffer::StreamBoundaryBuffer` for the state machine.
-                let mut sbuf = StreamBoundaryBuffer::new();
-                let mut receiver_alive = true;
-                // Precompute the known-tool-name set once. The scrubber needs
-                // it to decide whether an isolated `{"name":...}` JSON object
-                // really is a tool call. Reused for every flushed chunk on
-                // the hot path; rebuilding it per word would be wasteful.
-                let tool_names = known_tool_names(tools_registry.as_ref());
-                // Feed deltas roughly word-sized so progressive flushes still happen
-                // inside long plain-text runs.
-                for word in display_text.split_inclusive(char::is_whitespace) {
-                    if cancellation_token.as_ref().is_some_and(CancellationToken::is_cancelled) {
-                        return Err(ToolLoopCancelled.into());
-                    }
-                    if let Some(chunk) = sbuf.push(word) {
-                        // Sanitize the chunk *before* it enters the channel
-                        // mpsc::Sender so any tool-call XML/JSON artifact is
-                        // removed at the source instead of being painted on
-                        // screen and replaced after the response completes
-                        // (which would flicker — see P0-3 in the chat-mode
-                        // fix plan, 2026-05-12).
-                        let cleaned = sanitize_stream_chunk(&chunk, &tool_names);
-                        if cleaned.is_empty() {
-                            continue;
-                        }
-                        if tx.send(cleaned.into_owned()).await.is_err() {
-                            receiver_alive = false;
-                            break; // receiver dropped
-                        }
-                    }
-                }
-                if receiver_alive && let Some(tail) = sbuf.flush_all() {
-                    let cleaned = sanitize_stream_chunk(&tail, &tool_names);
-                    if !cleaned.is_empty() {
-                        let _ = tx.send(cleaned.into_owned()).await;
-                    }
-                }
-            }
-            history.push(ChatMessage::assistant(display_text.clone()));
-            // FIX-P0-30/31: returning turn — hand back this turn's real
-            // provider attribution alongside the final answer.
-            // FIX #2: fold the cross-turn fallback flag into the returned trace so
-            // a fallback on any earlier turn is reflected in the recorded status.
-            let last_turn_trace = state.returned_trace(context);
-            return Ok((ToolLoopOutcome::Text(display_text), last_turn_trace));
         }
 
         if let Some(outcome) = Box::pin(tool_round::screen_calls(&turn, &mut round, &mut tool_calls)).await? {
