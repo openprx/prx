@@ -299,6 +299,9 @@ async fn run_action_empty_command_fails() {
     let temp = TempDir::new().unwrap();
     let manager = allowed_manager(&temp);
     let action = HookAction {
+        mode: super::config::HookMode::Notify,
+        priority: 0,
+        name: None,
         command: Some("".into()),
         args: vec![],
         env: HashMap::new(),
@@ -319,6 +322,9 @@ async fn run_action_success() {
     let temp = TempDir::new().unwrap();
     let manager = allowed_manager(&temp);
     let action = HookAction {
+        mode: super::config::HookMode::Notify,
+        priority: 0,
+        name: None,
         command: Some("true".into()),
         args: vec![],
         env: HashMap::new(),
@@ -340,6 +346,9 @@ async fn run_action_failure_exit_code() {
     let temp = TempDir::new().unwrap();
     let manager = allowed_manager(&temp);
     let action = HookAction {
+        mode: super::config::HookMode::Notify,
+        priority: 0,
+        name: None,
         command: Some("false".into()),
         args: vec![],
         env: HashMap::new(),
@@ -360,6 +369,9 @@ async fn run_action_timeout() {
     let temp = TempDir::new().unwrap();
     let manager = allowed_manager(&temp);
     let action = HookAction {
+        mode: super::config::HookMode::Notify,
+        priority: 0,
+        name: None,
         command: Some("sleep".into()),
         args: vec!["10".into()],
         env: HashMap::new(),
@@ -382,6 +394,9 @@ async fn run_action_timeout_kills_reaps_and_removes_payload_file() {
     let manager = allowed_manager(&temp);
     let out = temp.path().display().to_string();
     let action = HookAction {
+        mode: super::config::HookMode::Notify,
+        priority: 0,
+        name: None,
         command: Some("sh".into()),
         args: vec![
             "-c".into(),
@@ -487,6 +502,9 @@ async fn a_hook_starts_in_a_cleared_environment_and_its_dedicated_directory() {
     let out = temp.path().join("seen");
     let manager = allowed_manager(&temp);
     let action = HookAction {
+        mode: super::config::HookMode::Notify,
+        priority: 0,
+        name: None,
         command: Some("sh".into()),
         args: vec![
             "-c".into(),
@@ -544,6 +562,9 @@ async fn a_hook_without_a_launch_root_is_refused() {
         launch_root: None,
     };
     let action = HookAction {
+        mode: super::config::HookMode::Notify,
+        priority: 0,
+        name: None,
         command: Some("true".into()),
         args: vec![],
         env: HashMap::new(),
@@ -577,6 +598,9 @@ async fn run_action_large_payload_uses_file_and_stdin_without_env_overflow() {
     let manager = allowed_manager(&temp);
 
     let action = HookAction {
+        mode: super::config::HookMode::Notify,
+        priority: 0,
+        name: None,
         command: Some("sh".to_string()),
         args: vec![
             "-c".to_string(),
@@ -610,6 +634,9 @@ async fn a_hook_payload_names_the_provider_without_url_userinfo() {
     let manager = allowed_manager(&temp);
     let seen_path = temp.path().join("payload.json");
     let action = HookAction {
+        mode: super::config::HookMode::Notify,
+        priority: 0,
+        name: None,
         command: Some("sh".into()),
         args: vec![
             "-c".into(),
