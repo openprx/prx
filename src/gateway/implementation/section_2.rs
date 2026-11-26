@@ -1209,48 +1209,12 @@ async fn run_gateway_chat_with_multimodal(
     *stage = TurnFailureClass::TurnPreparation;
     let turn_result: anyhow::Result<GatewayTurnResult> = child_cleanup
         .run(async {
-            let mem_context = crate::agent::context_recall::scoped_recall(
-                state.mem.as_ref(),
-                &crate::agent::context_recall::RecallScope::from_envelope(
-                    &runtime_envelope,
-                    &config_snapshot.memory,
-                    if fabric_ctx.channel == "webhook" {
-                        "webhook"
-                    } else {
-                        "private"
-                    },
-                )
-                .with_current_input_key(autosave_key.map(str::to_owned)),
-                message,
-                crate::agent::context_recall::RECALL_CONTEXT_BUDGET,
-            )
-            .await;
-            let mut enriched_message = if mem_context.preamble.is_empty() {
-                message.to_string()
-            } else {
-                format!("{}{}", mem_context.preamble, message)
-            };
-            crate::agent::turn_contracts::push_current_time_tail(&mut enriched_message);
-
-            let user_messages = vec![crate::agent::turn_contracts::inbound_user_message(&enriched_message)];
-            let image_marker_count = crate::multimodal::count_image_markers(&user_messages);
             let adapter_capabilities = turn_runtime.provider.capabilities_for(
                 &turn_runtime.model,
                 crate::providers::traits::ProviderRequestMode::NonStreaming,
             );
             let mode_capabilities = providers::selection::catalog_for(&config_snapshot)
                 .effective_provider_capabilities(provider_label, &turn_runtime.model, adapter_capabilities);
-            if image_marker_count > 0 && !mode_capabilities.vision {
-                return Err(ProviderCapabilityError {
-                    provider: providers::redact_endpoint_userinfo(provider_label).into_owned(),
-                    capability: "vision".to_string(),
-                    message: format!(
-                        "received {image_marker_count} image marker(s), but this provider does not support vision input"
-                    ),
-                }
-                .into());
-            }
-
             // Build system prompt with native_tools flag so the prompt instructs the
             // LLM to use tools rather than emit XML tags.
             let multimodal_config = config_snapshot.multimodal.clone();
@@ -1268,9 +1232,42 @@ async fn run_gateway_chat_with_multimodal(
                 native_tools,
             );
 
-            let mut history = Vec::with_capacity(2 + user_messages.len());
-            history.push(ChatMessage::system(system_prompt));
-            history.extend(user_messages);
+            let opening = crate::context::api::open::open_turn(crate::context::api::open::OpenInput {
+                memory: &state.mem,
+                envelope: &runtime_envelope,
+                memory_config: &config_snapshot.memory,
+                chat_type: if fabric_ctx.channel == "webhook" {
+                    "webhook"
+                } else {
+                    "private"
+                },
+                visible_message: message,
+                card: None,
+                previous_turns: Vec::new(),
+                replay: crate::context::api::open::ReplayMode::FitToBudget,
+                recall: crate::context::api::open::OpenRecall::WithSessionCopy,
+                current_input_key: autosave_key,
+                excluded_session: None,
+                system_prompt,
+                service,
+                context: &context,
+                provider_label,
+                model: &turn_runtime.model,
+            })
+            .await;
+            let image_marker_count = crate::multimodal::count_image_markers(opening.history.get(1..).unwrap_or_default());
+            if image_marker_count > 0 && !mode_capabilities.vision {
+                return Err(ProviderCapabilityError {
+                    provider: providers::redact_endpoint_userinfo(provider_label).into_owned(),
+                    capability: "vision".to_string(),
+                    message: format!(
+                        "received {image_marker_count} image marker(s), but this provider does not support vision input"
+                    ),
+                }
+                .into());
+            }
+
+            let mut history: Vec<ChatMessage> = opening.history;
 
             let noop_observer = NoopObserver;
 
