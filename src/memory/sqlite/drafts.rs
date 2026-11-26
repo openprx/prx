@@ -210,6 +210,12 @@ impl SqliteMemory {
             let memory_id = Uuid::new_v4().to_string();
             let coalesce = super::agent_migration::scope_coalesce_set("memories");
             let scope_guard = super::agent_migration::scope_conflict_guard("memories", false);
+            super::rf_forget::drop_prefix_rows_of(
+                &tx,
+                "SELECT DISTINCT workspace_id, owner_id FROM memories
+                 WHERE key = ?1 AND category = 'core' AND (content IS NOT ?2 OR ?3 <> 'core')",
+                params![&draft.key, &draft.content, category.as_str()],
+            )?;
             let changed = tx.execute(
                 &format!(
                     "INSERT INTO memories (

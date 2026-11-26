@@ -9,6 +9,7 @@
 //! for the session, so the index is read once per session and a later memory
 //! write does not add one until a handoff.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::config::MemoryConfig;
@@ -17,7 +18,7 @@ use crate::context::sources::memory_index::{
 };
 use crate::context::transcript::{append_session_prefix, newest_session_prefix};
 use crate::memory::branch_copy::CONTEXT_SWITCH_EVENT_TYPE;
-use crate::memory::{Memory, MemoryFabric, MemoryPrincipal};
+use crate::memory::{Memory, MemoryEntry, MemoryFabric, MemoryPrincipal};
 use crate::runtime::envelope::RuntimeEnvelope;
 
 /// What a session prefix reads, borrowed from the turn's state.
@@ -94,8 +95,42 @@ pub(crate) async fn session_prefix(input: SessionPrefixInput<'_>) -> String {
     scope.parent_run_id = None;
     let fabric = MemoryFabric::new(Arc::clone(memory), envelope.workspace_id.clone())
         .with_event_recording(memory_config.event_recording_config());
-    append_session_prefix(&fabric, scope, &text).await;
+    if let Some(row_id) = append_session_prefix(&fabric, scope, &text).await
+        && !entries.is_empty()
+    {
+        verify_recorded(store, &principal, &entries, row_id).await;
+    }
     text
+}
+
+/// Check, after the row was recorded, that every memory it was rendered from is
+/// still stored with the same content. A forget or a correction that ran in
+/// between is not seen by the row's own transaction, so when a memory is gone
+/// or changed the row is deleted. The text already rendered is still sent for
+/// this turn; the next turn renders a fresh index. A failed re-read deletes the
+/// row too, since the row cannot be shown to be current.
+async fn verify_recorded(store: &dyn Memory, principal: &MemoryPrincipal, rendered: &[MemoryEntry], row_id: i64) {
+    let current = match store.newest_core_entries(principal, STORE_INDEX_FETCH).await {
+        Ok(now) => {
+            let by_key: HashMap<&str, &str> = now
+                .iter()
+                .map(|entry| (entry.key.as_str(), entry.content.as_str()))
+                .collect();
+            rendered
+                .iter()
+                .all(|entry| by_key.get(entry.key.as_str()) == Some(&entry.content.as_str()))
+        }
+        Err(error) => {
+            log_read_failure(&error, "memory index could not be re-read after recording");
+            false
+        }
+    };
+    if current {
+        return;
+    }
+    if let Err(error) = store.delete_session_prefix_row(row_id).await {
+        log_read_failure(&error, "session prefix row could not be dropped after a memory changed");
+    }
 }
 
 /// The id of the newest handoff row of `session_key`, `None` when there is none

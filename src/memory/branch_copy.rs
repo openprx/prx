@@ -18,6 +18,9 @@ pub(crate) const BRANCH_COPY_MAX_ROWS: usize = 4096;
 /// Event type of a persisted context handoff row.
 pub(crate) const CONTEXT_SWITCH_EVENT_TYPE: &str = "context.switch.created";
 
+/// Event type of a session prefix row: the memory index a session sends, frozen per session.
+pub(crate) const SESSION_PREFIX_EVENT_TYPE: &str = "context.prefix.recorded";
+
 /// Idempotency-key prefix of every row a branch copy inserted.
 pub(crate) const BRANCH_COPY_IDEMPOTENCY_PREFIX: &str = "branch-copy:";
 

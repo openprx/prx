@@ -388,6 +388,15 @@ impl SqliteMemory {
                     let scope_guard = super::agent_migration::scope_conflict_guard("memories", !owner_guard.is_empty());
                     let coalesce = super::agent_migration::scope_coalesce_set("memories");
 
+                    // A core memory whose content, sensitivity or category changes
+                    // leaves its owner's session prefix rows, so they go in this transaction.
+                    crate::memory::sqlite::rf_forget::drop_prefix_rows_of(
+                        &tx,
+                        "SELECT DISTINCT workspace_id, owner_id FROM memories
+                         WHERE key = ?1 AND category = 'core'
+                           AND (content IS NOT ?2 OR sensitivity IS NOT ?3 OR ?4 <> 'core')",
+                        params![&key, &content, classified.sensitivity.as_str(), cat],
+                    )?;
                     let changed = tx.execute(
                         &format!("INSERT INTO memories (
                         id, key, content, category, embedding, embedding_provider,
@@ -460,6 +469,12 @@ impl SqliteMemory {
                 } else {
                     let coalesce = super::agent_migration::scope_coalesce_set("memories");
                     let scope_guard = super::agent_migration::scope_conflict_guard("memories", false);
+                    crate::memory::sqlite::rf_forget::drop_prefix_rows_of(
+                        &tx,
+                        "SELECT DISTINCT workspace_id, owner_id FROM memories
+                         WHERE key = ?1 AND category = 'core' AND (content IS NOT ?2 OR ?3 <> 'core')",
+                        params![&key, &content, cat],
+                    )?;
                     let changed = tx.execute(
                         &format!(
                             "INSERT INTO memories (

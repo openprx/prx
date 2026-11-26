@@ -514,6 +514,10 @@ impl Memory for LucidMemory {
         self.local.forget(key).await
     }
 
+    async fn delete_session_prefix_row(&self, row_id: i64) -> anyhow::Result<usize> {
+        self.local.delete_session_prefix_row(row_id).await
+    }
+
     /// An owner-isolated forget is answered by the local store, which deletes
     /// the caller's own row and no other owner's.
     ///

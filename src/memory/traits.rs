@@ -418,6 +418,14 @@ pub trait Memory: Send + Sync {
         Err(crate::memory::erasure::Unsupported("forget_message_idempotency").into())
     }
 
+    /// Delete one session prefix row (`context.prefix.recorded`) by its row id.
+    /// Used when a freshly recorded prefix no longer matches the memories it was
+    /// rendered from. Backends without an ordered event log fail fast.
+    async fn delete_session_prefix_row(&self, row_id: i64) -> anyhow::Result<usize> {
+        let _ = row_id;
+        Err(crate::memory::erasure::Unsupported("delete_session_prefix_row").into())
+    }
+
     /// Key as stored in the backend. Encrypting scopes hash it.
     fn persisted_key(&self, key: &str) -> String {
         key.to_string()

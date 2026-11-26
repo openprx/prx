@@ -453,6 +453,10 @@ impl Memory for EncryptedScope {
         self.inner.forget_message_idempotency(idempotency_key).await
     }
 
+    async fn delete_session_prefix_row(&self, row_id: i64) -> anyhow::Result<usize> {
+        self.inner.delete_session_prefix_row(row_id).await
+    }
+
     async fn checkpoint_wal(&self) -> anyhow::Result<()> {
         self.inner.checkpoint_wal().await
     }

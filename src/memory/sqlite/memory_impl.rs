@@ -493,6 +493,19 @@ impl Memory for SqliteMemory {
         .await?
     }
 
+    async fn delete_session_prefix_row(&self, row_id: i64) -> anyhow::Result<usize> {
+        let pool = self.pool.clone();
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<usize> {
+            let conn = pool.write();
+            let deleted = conn.execute(
+                "DELETE FROM message_events WHERE id = ?1 AND event_type = ?2",
+                params![row_id, crate::memory::branch_copy::SESSION_PREFIX_EVENT_TYPE],
+            )?;
+            Ok(deleted)
+        })
+        .await?
+    }
+
     async fn forget_message_idempotency(&self, idempotency_key: &str) -> anyhow::Result<usize> {
         let pool = self.pool.clone();
         let key = idempotency_key.to_string();

@@ -17,6 +17,7 @@
 //! deleted row ([`erase_context_pages`]); they are not counted.
 
 use super::SqliteMemory;
+use crate::memory::branch_copy::SESSION_PREFIX_EVENT_TYPE;
 use crate::memory::rf_messages::{RfForgetCounts, RfForgetRefused};
 use crate::memory::topic::delete_orphan_topic;
 use crate::memory::write_provenance::WriteProvenance;
@@ -325,9 +326,8 @@ pub(super) fn drop_prefix_rows_of(
     let mut deleted: usize = 0;
     for (workspace, owner) in owners {
         deleted = deleted.saturating_add(tx.execute(
-            "DELETE FROM message_events
-             WHERE event_type = 'context.prefix.recorded' AND workspace_id IS ?1 AND owner_id IS ?2",
-            params![workspace, owner],
+            "DELETE FROM message_events WHERE event_type = ?3 AND workspace_id IS ?1 AND owner_id IS ?2",
+            params![workspace, owner, SESSION_PREFIX_EVENT_TYPE],
         )?);
     }
     Ok(deleted)

@@ -9,10 +9,9 @@
 //! a user or assistant turn, and it carries no run id, so it is never a run's
 //! tool round.
 
+use crate::memory::branch_copy::SESSION_PREFIX_EVENT_TYPE;
 use crate::memory::{Memory, MemoryFabric, MemoryPrincipal, MessageEventScope};
 
-/// Event type of the row that stores a session's frozen prefix.
-pub(crate) const PREFIX_EVENT_TYPE: &str = "context.prefix.recorded";
 /// Content of the row: a label, never the index text.
 const PREFIX_CONTENT: &str = "session prefix";
 /// Schema version of the prefix row payload.
@@ -29,7 +28,7 @@ pub(crate) async fn newest_session_prefix(
     session_key: &str,
 ) -> anyhow::Result<Option<(i64, String)>> {
     let rows = match memory
-        .newest_session_events_of_type(principal, session_key, PREFIX_EVENT_TYPE, 1)
+        .newest_session_events_of_type(principal, session_key, SESSION_PREFIX_EVENT_TYPE, 1)
         .await
     {
         Ok(rows) => rows,
@@ -59,12 +58,13 @@ pub(crate) async fn newest_session_prefix(
     Ok(Some((event.id, text)))
 }
 
-/// Append the prefix row of a session. `scope` must carry no run id: the row
-/// belongs to the session, not to a turn. `text` is the rendered, redacted
-/// index; an empty `text` writes the marker row with no sections, which freezes
-/// "no index" for the session. The write is best effort, like the attachment
-/// row; a failed write is logged with its error digest only.
-pub(crate) async fn append_session_prefix(fabric: &MemoryFabric, scope: MessageEventScope, text: &str) {
+/// Append the prefix row of a session and return its row id. `scope` must carry
+/// no run id: the row belongs to the session, not to a turn. `text` is the
+/// rendered, redacted index; an empty `text` writes the marker row with no
+/// sections, which freezes "no index" for the session. The write is best effort,
+/// like the attachment row: a failed write is logged with its error digest only
+/// and gives `None`, as does a write that stored nothing (tool events not recorded).
+pub(crate) async fn append_session_prefix(fabric: &MemoryFabric, scope: MessageEventScope, text: &str) -> Option<i64> {
     let sections = if text.is_empty() {
         serde_json::json!([])
     } else {
@@ -74,11 +74,22 @@ pub(crate) async fn append_session_prefix(fabric: &MemoryFabric, scope: MessageE
         "schema_version": PREFIX_SCHEMA_VERSION,
         "sections": sections,
     });
-    if let Err(error) = fabric
-        .record_tool_round_event(scope, PREFIX_EVENT_TYPE, PREFIX_CONTENT, Some(payload.to_string()))
+    match fabric
+        .record_tool_round_event(
+            scope,
+            SESSION_PREFIX_EVENT_TYPE,
+            PREFIX_CONTENT,
+            Some(payload.to_string()),
+        )
         .await
     {
-        let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
-        tracing::warn!(error_len, error_sha256, "Failed to persist session prefix");
+        // A synthetic event (tool events not recorded) carries id 0.
+        Ok(event) if event.id > 0 => Some(event.id),
+        Ok(_) => None,
+        Err(error) => {
+            let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+            tracing::warn!(error_len, error_sha256, "Failed to persist session prefix");
+            None
+        }
     }
 }
