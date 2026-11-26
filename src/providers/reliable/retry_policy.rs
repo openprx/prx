@@ -44,10 +44,57 @@ pub(super) fn retry_budget(max_retries: u32, kind: RetryKind, is_last: bool) -> 
     }
 }
 
-/// Whether the failed attempt number `attempt` (0-based) of a candidate may be
-/// followed by another attempt on the same candidate.
-pub(super) fn may_retry(attempt: u32, max_retries: u32, kind: RetryKind, is_last: bool) -> bool {
-    attempt < retry_budget(max_retries, kind, is_last)
+/// The most attempts one candidate can make: the first attempt plus the retry
+/// budget of every kind. The retry loop also stops on [`RetryCounts::may_retry`],
+/// so this is only the bound that keeps it finite.
+pub(super) fn max_attempts(max_retries: u32, is_last: bool) -> u32 {
+    1u32.saturating_add(retry_budget(max_retries, RetryKind::Ordinary, is_last))
+        .saturating_add(retry_budget(max_retries, RetryKind::Overload, is_last))
+        .saturating_add(retry_budget(max_retries, RetryKind::RateLimited, is_last))
+}
+
+/// Retries one candidate has taken, counted per [`RetryKind`]. Each kind spends
+/// only its own budget, so a 502 after several 429s still gets its overload
+/// retries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct RetryCounts {
+    ordinary: u32,
+    overload: u32,
+    rate_limited: u32,
+}
+
+impl RetryCounts {
+    /// Retries already taken for failures of `kind`.
+    pub(super) fn taken(&self, kind: RetryKind) -> u32 {
+        match kind {
+            RetryKind::Ordinary => self.ordinary,
+            RetryKind::Overload => self.overload,
+            RetryKind::RateLimited => self.rate_limited,
+        }
+    }
+
+    /// Whether a failure of `kind` may be followed by another attempt on the
+    /// same candidate, given the retries of that kind already taken.
+    pub(super) fn may_retry(&self, kind: RetryKind, max_retries: u32, is_last: bool) -> bool {
+        self.taken(kind) < retry_budget(max_retries, kind, is_last)
+    }
+
+    /// Count one retry taken for a failure of `kind`.
+    pub(super) fn record(&mut self, kind: RetryKind) {
+        let count = match kind {
+            RetryKind::Ordinary => &mut self.ordinary,
+            RetryKind::Overload => &mut self.overload,
+            RetryKind::RateLimited => &mut self.rate_limited,
+        };
+        *count = count.saturating_add(1);
+    }
+
+    /// Retries taken for failures of any kind.
+    pub(super) fn total(&self) -> u32 {
+        self.ordinary
+            .saturating_add(self.overload)
+            .saturating_add(self.rate_limited)
+    }
 }
 
 /// The fixed wait before rate-limit retry `retry` (1-based), used when the 429

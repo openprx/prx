@@ -16,16 +16,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod retry_policy;
-use retry_policy::{RetryKind, may_retry, rate_limit_wait_ms, retry_budget};
+use retry_policy::{RetryCounts, RetryKind, max_attempts, rate_limit_wait_ms, retry_budget};
 
 mod classify;
-use classify::{
-    CONTENT_FILTER_STOP_PREFIX, StreamFailureClass, TOOL_CALL_INDEX_LIMIT_PREFIX, classify_stream_error, is_non_retryable,
-    is_non_retryable_rate_limit, is_rate_limited, is_tool_schema_refusal, retry_kind, skips_in_place_retry,
-    stream_error_is_tool_schema_refusal, stream_retry_kind,
-};
 #[cfg(test)]
 use classify::has_non_retryable_business_code;
+use classify::{
+    CONTENT_FILTER_STOP_PREFIX, StreamFailureClass, TOOL_CALL_INDEX_LIMIT_PREFIX, classify_stream_error,
+    is_non_retryable, is_non_retryable_rate_limit, is_rate_limited, is_tool_schema_refusal, retry_kind,
+    skips_in_place_retry, stream_error_is_tool_schema_refusal, stream_retry_kind,
+};
 
 /// Wait before each overload retry when the upstream sent no `Retry-After`.
 const OVERLOAD_RETRY_WAITS_MS: [u64; 2] = [2_000, 6_000];
@@ -393,7 +393,7 @@ pub struct ReliableProvider {
     fallback_admission: Option<FallbackAdmission>,
     /// Providers filtered out at startup with reasons (invalid/missing credential/init failure).
     unavailable_providers: Vec<(String, String)>,
-    /// Per-provider cool-down learned from upstream 429/503 responses.
+    /// Per-provider cool-down learned from upstream 429/502/503/504 responses.
     ///
     /// Chains built by [`create_provider_for`](super::create_provider_for)
     /// share the process-wide gate, so a 429 on one request defers every other
@@ -593,12 +593,6 @@ impl ReliableProvider {
             .and_then(|admission| admission.refusal(provider, display_provider, model, requires_native_tools))
     }
 
-    /// The most in-place retries one candidate can take on the rate-limit
-    /// budget; `is_last` tells whether it is the last candidate of the chain.
-    fn max_candidate_retries(&self, is_last: bool) -> u32 {
-        retry_budget(self.max_retries, RetryKind::RateLimited, is_last)
-    }
-
     /// Emit rate-limit telemetry, publish the cool-down to the shared gate and
     /// sleep before the next attempt on the same candidate.
     ///
@@ -709,7 +703,9 @@ struct RetryContext<'a> {
     /// The member's rate-limit gate key ([`member_key`]).
     gate_key: &'a str,
     model: &'a str,
-    /// 1-based attempt number that just failed.
+    /// 1-based number of the retry this failure triggers, counted within its
+    /// [`RetryKind`]: the overload schedule and notices count overload retries
+    /// only, the rate-limit schedule counts rate-limit retries only.
     attempt: u32,
     failure_reason: &'static str,
     error_detail: &'a str,
@@ -928,7 +924,11 @@ impl Provider for ReliableProvider {
                 let mut rate_limited_seen = false;
 
                 let is_last = model_index + 1 == models.len() && provider_index + 1 == self.providers.len();
-                for attempt in 0..=self.max_candidate_retries(is_last) {
+                let mut retries = RetryCounts::default();
+                // The failure kind that used up its budget on this candidate,
+                // with the attempts made up to that failure.
+                let mut exhausted = None;
+                for attempt in 0..max_attempts(self.max_retries, is_last) {
                     let permit = match self.admit_circuit(member_key) {
                         Ok(permit) => permit,
                         Err(ms) => {
@@ -977,7 +977,7 @@ impl Provider for ReliableProvider {
                                 provider_name,
                                 current_model,
                                 attempt + 1,
-                                retry_budget(self.max_retries, kind, is_last) + 1,
+                                max_attempts(self.max_retries, is_last),
                                 failure_reason,
                                 &error_detail,
                             );
@@ -1000,12 +1000,13 @@ impl Provider for ReliableProvider {
                                 break;
                             }
 
-                            if may_retry(attempt, self.max_retries, kind, is_last) {
+                            if retries.may_retry(kind, self.max_retries, is_last) {
+                                retries.record(kind);
                                 let ctx = RetryContext {
                                     provider_name,
                                     gate_key: member_key,
                                     model: current_model,
-                                    attempt: attempt + 1,
+                                    attempt: retries.taken(kind),
                                     failure_reason,
                                     error_detail: &error_detail,
                                     rate_limited,
@@ -1013,36 +1014,54 @@ impl Provider for ReliableProvider {
                                     is_last,
                                 };
                                 if !self.wait_before_retry(&ctx, backoff_ms, &e).await {
+                                    exhausted = Some((kind, attempt + 1));
                                     break;
                                 }
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
-                            } else if rate_limited {
-                                // Final attempt: no sleep follows, but the
-                                // throttle still has to reach the counters — and
-                                // the cool-down still has to reach every other
-                                // in-flight request, even though this one gives up.
-                                let hint = parse_retry_after_ms(&e);
-                                rate_limit::record_rate_limited(provider_name, current_model, false, hint.is_some());
-                                self.rate_limit_gate.note_rate_limited(
-                                    member_key,
-                                    hint.unwrap_or(backoff_ms).min(MAX_HONORED_RETRY_AFTER_MS),
-                                );
-                                break;
                             } else {
+                                exhausted = Some((kind, attempt + 1));
+                                if rate_limited {
+                                    // Final attempt: no sleep follows, but the
+                                    // throttle still has to reach the counters — and
+                                    // the cool-down still has to reach every other
+                                    // in-flight request, even though this one gives up.
+                                    let hint = parse_retry_after_ms(&e);
+                                    rate_limit::record_rate_limited(
+                                        provider_name,
+                                        current_model,
+                                        false,
+                                        hint.is_some(),
+                                    );
+                                    self.rate_limit_gate.note_rate_limited(
+                                        member_key,
+                                        hint.unwrap_or(backoff_ms).min(MAX_HONORED_RETRY_AFTER_MS),
+                                    );
+                                }
                                 break;
                             }
                         }
                     }
                 }
 
-                if rate_limited_seen {
-                    rate_limit::record_exhausted(provider_name);
-                    tracing::error!(
-                        provider = %redact_provider_text(provider_name),
-                        model = *current_model,
-                        attempts = self.max_candidate_retries(is_last) + 1,
-                        "Provider rate limit outlasted the retry budget; abandoning this candidate"
-                    );
+                match exhausted {
+                    Some((RetryKind::RateLimited, made)) => {
+                        rate_limit::record_exhausted(provider_name);
+                        tracing::error!(
+                            provider = %redact_provider_text(provider_name),
+                            model = *current_model,
+                            attempts = made,
+                            "Provider rate limit outlasted the retry budget; abandoning this candidate"
+                        );
+                    }
+                    Some((RetryKind::Overload, made)) => {
+                        tracing::warn!(
+                            provider = %redact_provider_text(provider_name),
+                            model = *current_model,
+                            attempts = made,
+                            "Provider overload outlasted the retry budget; abandoning this candidate"
+                        );
+                    }
+                    Some((RetryKind::Ordinary, _)) | None => {}
                 }
                 tracing::warn!(
                     provider = %redact_provider_text(provider_name),
@@ -1102,7 +1121,11 @@ impl Provider for ReliableProvider {
                 let mut rate_limited_seen = false;
 
                 let is_last = model_index + 1 == models.len() && provider_index + 1 == self.providers.len();
-                for attempt in 0..=self.max_candidate_retries(is_last) {
+                let mut retries = RetryCounts::default();
+                // The failure kind that used up its budget on this candidate,
+                // with the attempts made up to that failure.
+                let mut exhausted = None;
+                for attempt in 0..max_attempts(self.max_retries, is_last) {
                     let permit = match self.admit_circuit(member_key) {
                         Ok(permit) => permit,
                         Err(ms) => {
@@ -1148,7 +1171,7 @@ impl Provider for ReliableProvider {
                                 provider_name,
                                 current_model,
                                 attempt + 1,
-                                retry_budget(self.max_retries, kind, is_last) + 1,
+                                max_attempts(self.max_retries, is_last),
                                 failure_reason,
                                 &error_detail,
                             );
@@ -1171,12 +1194,13 @@ impl Provider for ReliableProvider {
                                 break;
                             }
 
-                            if may_retry(attempt, self.max_retries, kind, is_last) {
+                            if retries.may_retry(kind, self.max_retries, is_last) {
+                                retries.record(kind);
                                 let ctx = RetryContext {
                                     provider_name,
                                     gate_key: member_key,
                                     model: current_model,
-                                    attempt: attempt + 1,
+                                    attempt: retries.taken(kind),
                                     failure_reason,
                                     error_detail: &error_detail,
                                     rate_limited,
@@ -1184,36 +1208,54 @@ impl Provider for ReliableProvider {
                                     is_last,
                                 };
                                 if !self.wait_before_retry(&ctx, backoff_ms, &e).await {
+                                    exhausted = Some((kind, attempt + 1));
                                     break;
                                 }
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
-                            } else if rate_limited {
-                                // Final attempt: no sleep follows, but the
-                                // throttle still has to reach the counters — and
-                                // the cool-down still has to reach every other
-                                // in-flight request, even though this one gives up.
-                                let hint = parse_retry_after_ms(&e);
-                                rate_limit::record_rate_limited(provider_name, current_model, false, hint.is_some());
-                                self.rate_limit_gate.note_rate_limited(
-                                    member_key,
-                                    hint.unwrap_or(backoff_ms).min(MAX_HONORED_RETRY_AFTER_MS),
-                                );
-                                break;
                             } else {
+                                exhausted = Some((kind, attempt + 1));
+                                if rate_limited {
+                                    // Final attempt: no sleep follows, but the
+                                    // throttle still has to reach the counters — and
+                                    // the cool-down still has to reach every other
+                                    // in-flight request, even though this one gives up.
+                                    let hint = parse_retry_after_ms(&e);
+                                    rate_limit::record_rate_limited(
+                                        provider_name,
+                                        current_model,
+                                        false,
+                                        hint.is_some(),
+                                    );
+                                    self.rate_limit_gate.note_rate_limited(
+                                        member_key,
+                                        hint.unwrap_or(backoff_ms).min(MAX_HONORED_RETRY_AFTER_MS),
+                                    );
+                                }
                                 break;
                             }
                         }
                     }
                 }
 
-                if rate_limited_seen {
-                    rate_limit::record_exhausted(provider_name);
-                    tracing::error!(
-                        provider = %redact_provider_text(provider_name),
-                        model = *current_model,
-                        attempts = self.max_candidate_retries(is_last) + 1,
-                        "Provider rate limit outlasted the retry budget; abandoning this candidate"
-                    );
+                match exhausted {
+                    Some((RetryKind::RateLimited, made)) => {
+                        rate_limit::record_exhausted(provider_name);
+                        tracing::error!(
+                            provider = %redact_provider_text(provider_name),
+                            model = *current_model,
+                            attempts = made,
+                            "Provider rate limit outlasted the retry budget; abandoning this candidate"
+                        );
+                    }
+                    Some((RetryKind::Overload, made)) => {
+                        tracing::warn!(
+                            provider = %redact_provider_text(provider_name),
+                            model = *current_model,
+                            attempts = made,
+                            "Provider overload outlasted the retry budget; abandoning this candidate"
+                        );
+                    }
+                    Some((RetryKind::Ordinary, _)) | None => {}
                 }
                 tracing::warn!(
                     provider = %redact_provider_text(provider_name),
@@ -1296,7 +1338,11 @@ impl Provider for ReliableProvider {
                 let mut rate_limited_seen = false;
 
                 let is_last = model_index + 1 == models.len() && provider_index + 1 == self.providers.len();
-                for attempt in 0..=self.max_candidate_retries(is_last) {
+                let mut retries = RetryCounts::default();
+                // The failure kind that used up its budget on this candidate,
+                // with the attempts made up to that failure.
+                let mut exhausted = None;
+                for attempt in 0..max_attempts(self.max_retries, is_last) {
                     super::attempt_accounting::ensure_supported(provider.as_ref())?;
                     let permit = match self.admit_circuit(member_key) {
                         Ok(permit) => permit,
@@ -1372,7 +1418,7 @@ impl Provider for ReliableProvider {
                                 provider_name,
                                 current_model,
                                 attempt + 1,
-                                retry_budget(self.max_retries, kind, is_last) + 1,
+                                max_attempts(self.max_retries, is_last),
                                 failure_reason,
                                 &error_detail,
                             );
@@ -1408,12 +1454,13 @@ impl Provider for ReliableProvider {
                                 break;
                             }
 
-                            if may_retry(attempt, self.max_retries, kind, is_last) {
+                            if retries.may_retry(kind, self.max_retries, is_last) {
+                                retries.record(kind);
                                 let ctx = RetryContext {
                                     provider_name,
                                     gate_key: member_key,
                                     model: current_model,
-                                    attempt: attempt + 1,
+                                    attempt: retries.taken(kind),
                                     failure_reason,
                                     error_detail: &error_detail,
                                     rate_limited,
@@ -1421,36 +1468,54 @@ impl Provider for ReliableProvider {
                                     is_last,
                                 };
                                 if !self.wait_before_retry(&ctx, backoff_ms, &e).await {
+                                    exhausted = Some((kind, attempt + 1));
                                     break;
                                 }
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
-                            } else if rate_limited {
-                                // Final attempt: no sleep follows, but the
-                                // throttle still has to reach the counters — and
-                                // the cool-down still has to reach every other
-                                // in-flight request, even though this one gives up.
-                                let hint = parse_retry_after_ms(&e);
-                                rate_limit::record_rate_limited(provider_name, current_model, false, hint.is_some());
-                                self.rate_limit_gate.note_rate_limited(
-                                    member_key,
-                                    hint.unwrap_or(backoff_ms).min(MAX_HONORED_RETRY_AFTER_MS),
-                                );
-                                break;
                             } else {
+                                exhausted = Some((kind, attempt + 1));
+                                if rate_limited {
+                                    // Final attempt: no sleep follows, but the
+                                    // throttle still has to reach the counters — and
+                                    // the cool-down still has to reach every other
+                                    // in-flight request, even though this one gives up.
+                                    let hint = parse_retry_after_ms(&e);
+                                    rate_limit::record_rate_limited(
+                                        provider_name,
+                                        current_model,
+                                        false,
+                                        hint.is_some(),
+                                    );
+                                    self.rate_limit_gate.note_rate_limited(
+                                        member_key,
+                                        hint.unwrap_or(backoff_ms).min(MAX_HONORED_RETRY_AFTER_MS),
+                                    );
+                                }
                                 break;
                             }
                         }
                     }
                 }
 
-                if rate_limited_seen {
-                    rate_limit::record_exhausted(provider_name);
-                    tracing::error!(
-                        provider = %redact_provider_text(provider_name),
-                        model = *current_model,
-                        attempts = self.max_candidate_retries(is_last) + 1,
-                        "Provider rate limit outlasted the retry budget; abandoning this candidate"
-                    );
+                match exhausted {
+                    Some((RetryKind::RateLimited, made)) => {
+                        rate_limit::record_exhausted(provider_name);
+                        tracing::error!(
+                            provider = %redact_provider_text(provider_name),
+                            model = *current_model,
+                            attempts = made,
+                            "Provider rate limit outlasted the retry budget; abandoning this candidate"
+                        );
+                    }
+                    Some((RetryKind::Overload, made)) => {
+                        tracing::warn!(
+                            provider = %redact_provider_text(provider_name),
+                            model = *current_model,
+                            attempts = made,
+                            "Provider overload outlasted the retry budget; abandoning this candidate"
+                        );
+                    }
+                    Some((RetryKind::Ordinary, _)) | None => {}
                 }
                 tracing::warn!(
                     provider = %redact_provider_text(provider_name),
@@ -1548,7 +1613,11 @@ impl Provider for ReliableProvider {
                 let mut rate_limited_seen = false;
 
                 let is_last = model_index + 1 == models.len() && provider_index + 1 == self.providers.len();
-                for attempt in 0..=self.max_candidate_retries(is_last) {
+                let mut retries = RetryCounts::default();
+                // The failure kind that used up its budget on this candidate,
+                // with the attempts made up to that failure.
+                let mut exhausted = None;
+                for attempt in 0..max_attempts(self.max_retries, is_last) {
                     let permit = match self.admit_circuit(member_key) {
                         Ok(permit) => permit,
                         Err(ms) => {
@@ -1597,7 +1666,7 @@ impl Provider for ReliableProvider {
                                 provider_name,
                                 current_model,
                                 attempt + 1,
-                                retry_budget(self.max_retries, kind, is_last) + 1,
+                                max_attempts(self.max_retries, is_last),
                                 failure_reason,
                                 &error_detail,
                             );
@@ -1620,12 +1689,13 @@ impl Provider for ReliableProvider {
                                 break;
                             }
 
-                            if may_retry(attempt, self.max_retries, kind, is_last) {
+                            if retries.may_retry(kind, self.max_retries, is_last) {
+                                retries.record(kind);
                                 let ctx = RetryContext {
                                     provider_name,
                                     gate_key: member_key,
                                     model: current_model,
-                                    attempt: attempt + 1,
+                                    attempt: retries.taken(kind),
                                     failure_reason,
                                     error_detail: &error_detail,
                                     rate_limited,
@@ -1633,36 +1703,54 @@ impl Provider for ReliableProvider {
                                     is_last,
                                 };
                                 if !self.wait_before_retry(&ctx, backoff_ms, &e).await {
+                                    exhausted = Some((kind, attempt + 1));
                                     break;
                                 }
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
-                            } else if rate_limited {
-                                // Final attempt: no sleep follows, but the
-                                // throttle still has to reach the counters — and
-                                // the cool-down still has to reach every other
-                                // in-flight request, even though this one gives up.
-                                let hint = parse_retry_after_ms(&e);
-                                rate_limit::record_rate_limited(provider_name, current_model, false, hint.is_some());
-                                self.rate_limit_gate.note_rate_limited(
-                                    member_key,
-                                    hint.unwrap_or(backoff_ms).min(MAX_HONORED_RETRY_AFTER_MS),
-                                );
-                                break;
                             } else {
+                                exhausted = Some((kind, attempt + 1));
+                                if rate_limited {
+                                    // Final attempt: no sleep follows, but the
+                                    // throttle still has to reach the counters — and
+                                    // the cool-down still has to reach every other
+                                    // in-flight request, even though this one gives up.
+                                    let hint = parse_retry_after_ms(&e);
+                                    rate_limit::record_rate_limited(
+                                        provider_name,
+                                        current_model,
+                                        false,
+                                        hint.is_some(),
+                                    );
+                                    self.rate_limit_gate.note_rate_limited(
+                                        member_key,
+                                        hint.unwrap_or(backoff_ms).min(MAX_HONORED_RETRY_AFTER_MS),
+                                    );
+                                }
                                 break;
                             }
                         }
                     }
                 }
 
-                if rate_limited_seen {
-                    rate_limit::record_exhausted(provider_name);
-                    tracing::error!(
-                        provider = %redact_provider_text(provider_name),
-                        model = *current_model,
-                        attempts = self.max_candidate_retries(is_last) + 1,
-                        "Provider rate limit outlasted the retry budget; abandoning this candidate"
-                    );
+                match exhausted {
+                    Some((RetryKind::RateLimited, made)) => {
+                        rate_limit::record_exhausted(provider_name);
+                        tracing::error!(
+                            provider = %redact_provider_text(provider_name),
+                            model = *current_model,
+                            attempts = made,
+                            "Provider rate limit outlasted the retry budget; abandoning this candidate"
+                        );
+                    }
+                    Some((RetryKind::Overload, made)) => {
+                        tracing::warn!(
+                            provider = %redact_provider_text(provider_name),
+                            model = *current_model,
+                            attempts = made,
+                            "Provider overload outlasted the retry budget; abandoning this candidate"
+                        );
+                    }
+                    Some((RetryKind::Ordinary, _)) | None => {}
                 }
                 tracing::warn!(
                     provider = %redact_provider_text(provider_name),
@@ -1969,7 +2057,7 @@ where
             // rate-limit error with a Retry-After hint earns an in-place retry
             // (after sleeping) before we fall back to the next candidate.
             let mut backoff_ms = base_backoff_ms;
-            let mut pre_content_retries = 0u32;
+            let mut retries = RetryCounts::default();
             // Whether this candidate was throttled at least once, so recovery /
             // give-up land in the rate-limit counters rather than being lost.
             let mut rate_limited_seen = false;
@@ -2137,8 +2225,8 @@ where
                             let retry_in_place =
                                 matches!(class, StreamFailureClass::RateLimited | StreamFailureClass::Retryable)
                                     && !skips_in_place_retry(&err)
-                                    && may_retry(pre_content_retries, max_retries, kind, is_last);
-                            let retry = pre_content_retries + 1;
+                                    && retries.may_retry(kind, max_retries, is_last);
+                            let retry = retries.taken(kind) + 1;
 
                             if retry_in_place && kind == RetryKind::Overload {
                                 let wait = overload_wait_ms(retry, hint_ms);
@@ -2157,7 +2245,7 @@ where
                                     () = tx.closed() => return,
                                     () = tokio::time::sleep(Duration::from_millis(wait)) => {}
                                 }
-                                pre_content_retries = retry;
+                                retries.record(kind);
                                 last_error = Some(err);
                                 continue 'candidate;
                             }
@@ -2177,7 +2265,7 @@ where
                                             ?class,
                                             retry_after_ms = hint_ms,
                                             wait_ms = wait,
-                                            attempt = pre_content_retries + 1,
+                                            attempt = retry,
                                             "Streaming failure before content; backing off and retrying same provider/model: {err}"
                                         );
                                         if kind == RetryKind::RateLimited {
@@ -2196,7 +2284,7 @@ where
                                             () = tx.closed() => return,
                                             () = tokio::time::sleep(Duration::from_millis(wait)) => {}
                                         }
-                                        pre_content_retries += 1;
+                                        retries.record(kind);
                                         backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                                         last_error = Some(err);
                                         continue 'candidate; // Retry the same candidate.
@@ -2214,7 +2302,7 @@ where
                                 }
                             }
 
-                            if rate_limited_seen {
+                            if rate_limited {
                                 rate_limit::record_exhausted(&attempt.provider_name);
                                 // Publish the cool-down even though this request
                                 // stops here, so concurrent streams defer too.
@@ -2225,8 +2313,15 @@ where
                                 tracing::error!(
                                     provider = %redact_provider_text(&attempt.provider_name),
                                     model = %attempt.model,
-                                    attempts = pre_content_retries + 1,
+                                    attempts = retries.total() + 1,
                                     "Streaming rate limit outlasted the retry budget; abandoning this candidate"
+                                );
+                            } else if kind == RetryKind::Overload && !skips_in_place_retry(&err) {
+                                tracing::warn!(
+                                    provider = %redact_provider_text(&attempt.provider_name),
+                                    model = %attempt.model,
+                                    attempts = retries.total() + 1,
+                                    "Streaming provider overload outlasted the retry budget; abandoning this candidate"
                                 );
                             }
 
