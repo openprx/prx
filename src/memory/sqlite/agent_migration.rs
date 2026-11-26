@@ -316,6 +316,19 @@ pub(super) fn scopes_compatible(conn: &Connection, stored: Option<&str>, writer:
     }
 }
 
+/// Read-only check for rows the repair would still touch. A matching schema
+/// stamp uses it to decide whether the every-open repair is still needed.
+pub(crate) fn legacy_console_pending(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM message_events e WHERE {EVENT_PENDING})
+                 OR EXISTS(SELECT 1 FROM conversation_turns c WHERE {TURN_PENDING})"
+        ),
+        [],
+        |row| row.get(0),
+    )
+}
+
 /// Stamp legacy console history with its owner's Main scope. Returns how many
 /// legacy console rows are still unattributed (unknown owner, workspace or
 /// session, ambiguous workspace, or a fenced scope). Idempotent.

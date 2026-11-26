@@ -33,6 +33,10 @@ const MIGRATION_SOURCES: &[&str] = &[
     include_str!("agent_purge.rs"),
     include_str!("agent_migration.rs"),
     include_str!("recovery_authority.rs"),
+    include_str!("recovery_keys.rs"),
+    include_str!("ingress_recovery.rs"),
+    include_str!("../agent_registry.rs"),
+    include_str!("../../messaging/mailbox.rs"),
 ];
 
 /// Schema-format tag prefixed to the stamp; bump it to force a migration pass
@@ -58,9 +62,15 @@ fn schema_stamp() -> &'static str {
 impl SqliteMemory {
     /// Initialize all tables: memories, FTS5, `embedding_cache`
     pub(super) fn init_schema(conn: &Connection) -> anyhow::Result<()> {
-        // A database last migrated by this build needs no write lock to open.
+        // A database last migrated by this build needs no write lock to open,
+        // unless legacy console rows still need the every-open repair. A
+        // failed check takes the migration path too.
         if Self::schema_stamp_matches(conn) {
-            return Ok(());
+            match super::agent_migration::legacy_console_pending(conn) {
+                Ok(false) => return Ok(()),
+                Ok(true) => {}
+                Err(_) => tracing::warn!("legacy console check failed; running the schema migration"),
+            }
         }
         // Initialization otherwise commits each DDL/backfill separately. Own
         // one write transaction so concurrent turn admissions do not compete
