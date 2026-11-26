@@ -24,11 +24,25 @@ use super::erasure_pool::MemoryPool;
 use super::{SQLITE_READER_PRAGMAS, SQLITE_WRITER_PRAGMAS, SqliteMemory, restrict_owner_mode, rf_delete, sync_journal};
 use crate::runtime::sqlite_pool::SqliteConnectionPool as RawSqliteConnectionPool;
 
-type Registry = Mutex<BTreeMap<PathBuf, Weak<MemoryPool>>>;
+/// One slot per database path. The mutex is held across that path's first open
+/// and guards the `Weak` to its live pool, so concurrent openers of the same path
+/// serialize on the slot while openers of other paths never touch it.
+type Slot = Mutex<Weak<MemoryPool>>;
+
+/// Map from path to slot. Its lock is held only to look up, insert or prune a
+/// slot, never while a pool is opened.
+type Registry = Mutex<BTreeMap<PathBuf, Arc<Slot>>>;
 
 fn registry() -> &'static Registry {
     static REGISTRY: OnceLock<Registry> = OnceLock::new();
     REGISTRY.get_or_init(Mutex::default)
+}
+
+/// Drop slots whose pool is gone. A slot with another holder is in use and kept.
+/// An unheld slot cannot be locked by anyone else, because locking needs a clone
+/// of the `Arc` and the map lock held here blocks new clones.
+fn prune_dead_slots(slots: &mut BTreeMap<PathBuf, Arc<Slot>>) {
+    slots.retain(|_, slot| Arc::strong_count(slot) > 1 || slot.lock().strong_count() > 0);
 }
 
 /// Registry key for `db_path`.
@@ -64,16 +78,25 @@ pub(super) fn open_shared(
     open_timeout_secs: Option<u64>,
 ) -> anyhow::Result<(Arc<MemoryPool>, Arc<sync_journal::Runtime>)> {
     let key = registry_key(db_path)?;
-    // Held across the first open so a racing opener waits here instead of
-    // starting a second `init_schema`. It is not held by any later write.
-    let mut entries = registry().lock();
-    entries.retain(|_, pool| pool.strong_count() > 0);
-    if let Some(pool) = entries.get(&key).and_then(Weak::upgrade) {
+    // Lock order is always map, then slot, and never the reverse. `open_first`
+    // runs with only the slot lock held: the map lock is released first. The
+    // prune in the block above takes a slot lock while the map is held, but only
+    // on a slot with no other holder, so that lock is uncontended and cannot wait.
+    let slot = {
+        let mut slots = registry().lock();
+        prune_dead_slots(&mut slots);
+        Arc::clone(slots.entry(key).or_default())
+    };
+    // The slot lock is held across this path's first open. A racing opener of
+    // the same path waits here and then reuses the pool. Other paths have their
+    // own slot and do not wait.
+    let mut live = slot.lock();
+    if let Some(pool) = live.upgrade() {
         let sync_runtime = sync_journal::for_database(db_path)?;
         return Ok((pool, sync_runtime));
     }
     let (pool, sync_runtime) = open_first(db_path, max_readers, open_timeout_secs)?;
-    entries.insert(key, Arc::downgrade(&pool));
+    *live = Arc::downgrade(&pool);
     Ok((pool, sync_runtime))
 }
 
