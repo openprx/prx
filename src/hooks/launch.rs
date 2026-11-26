@@ -150,6 +150,9 @@ impl HookCore {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
 
         // Stdout is `null` unless captured, so its reader then reads nothing.
+        // A reader that reads past the cap signals the wait below, which ends
+        // the group at once.
+        let (overflow_tx, overflow_rx) = tokio::sync::oneshot::channel::<()>();
         let stdout = child.take_stdout();
         let mut stdout_reader = tokio::spawn(async move {
             let Some(stdout) = stdout else {
@@ -160,8 +163,17 @@ impl HookCore {
                 .take(MAX_CONTEXT_STDOUT_BYTES as u64 + 1)
                 .read_to_end(&mut bytes)
                 .await?;
+            if bytes.len() > MAX_CONTEXT_STDOUT_BYTES {
+                let _ = overflow_tx.send(());
+            }
             Ok(bytes)
         });
+        // Resolves only on overflow; without one it stays pending.
+        let overflow = async move {
+            if overflow_rx.await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        };
 
         let stderr = child.take_stderr();
         let mut stderr_reader = tokio::spawn(async move {
@@ -195,14 +207,25 @@ impl HookCore {
             }
         }
 
-        let status = match tokio::time::timeout_at(deadline, child.wait()).await {
-            Ok(Ok(status)) => status,
-            Ok(Err(error)) => {
+        let waited = tokio::select! {
+            biased;
+            () = overflow => None,
+            result = tokio::time::timeout_at(deadline, child.wait()) => Some(result),
+        };
+        let status = match waited {
+            None => {
+                // More than the cap was written: end the group now, not at the timeout.
+                let _ = child.terminate_and_reap().await;
+                settle_readers(&mut stdout_reader, &mut stderr_reader).await;
+                return Err(over_limit());
+            }
+            Some(Ok(Ok(status))) => status,
+            Some(Ok(Err(error))) => {
                 let _ = child.terminate_and_reap().await;
                 settle_readers(&mut stdout_reader, &mut stderr_reader).await;
                 return Err(error.into());
             }
-            Err(_) => {
+            Some(Err(_)) => {
                 let _ = child.terminate_and_reap().await;
                 settle_readers(&mut stdout_reader, &mut stderr_reader).await;
                 return Err(HookRunError::fail(
@@ -214,13 +237,31 @@ impl HookCore {
         let stdout = match settle_reader(&mut stdout_reader).await {
             Some(bytes) => bytes?,
             None => {
+                let _ = child.terminate_and_reap().await;
+                settle_readers(&mut stdout_reader, &mut stderr_reader).await;
                 return Err(HookRunError::fail(
                     "timeout",
                     format!("hook output did not close within {READER_SETTLE_MS} ms"),
                 ));
             }
         };
-        let mut stderr = stderr_reader.await??;
+        // Over the cap takes precedence over the exit status.
+        if stdout.len() > MAX_CONTEXT_STDOUT_BYTES {
+            return Err(over_limit());
+        }
+        let mut stderr = if capture_stdout {
+            match settle_reader(&mut stderr_reader).await {
+                Some(bytes) => bytes?,
+                None => {
+                    // A grandchild holds stderr open after the hook exited: end its
+                    // group and go on without the excerpt.
+                    let _ = child.terminate_and_reap().await;
+                    Vec::new()
+                }
+            }
+        } else {
+            stderr_reader.await??
+        };
         child.mark_complete();
         let stderr_truncated = stderr.len() > MAX_STDERR_BYTES as usize;
         stderr.truncate(MAX_STDERR_BYTES as usize);
@@ -247,12 +288,6 @@ impl HookCore {
         if !capture_stdout {
             return Ok(None);
         }
-        if stdout.len() > MAX_CONTEXT_STDOUT_BYTES {
-            return Err(HookRunError::fail(
-                "stdout_over_limit",
-                format!("hook stdout is over {MAX_CONTEXT_STDOUT_BYTES} bytes"),
-            ));
-        }
         Ok(Some(stdout))
     }
 }
@@ -274,6 +309,14 @@ async fn settle_reader(reader: &mut OutputReader) -> Option<std::io::Result<Vec<
             None
         }
     }
+}
+
+/// The error of a context run whose stdout passed the cap.
+fn over_limit() -> anyhow::Error {
+    HookRunError::fail(
+        "stdout_over_limit",
+        format!("hook stdout is over {MAX_CONTEXT_STDOUT_BYTES} bytes"),
+    )
 }
 
 /// Settle both readers after a kill; their results are discarded.

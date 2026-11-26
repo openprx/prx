@@ -2323,7 +2323,8 @@ which runs them on the queue exactly as before, so an existing `hooks.json`
 behaves as it did. Each action also takes:
 
 - `priority` (integer, default `0`): context actions run highest first.
-  Actions with equal priority run in order of `name`.
+  The actions of one point run concurrently; their contributions are in
+  priority-then-name order.
 - `name` (string, default: the `command`): the label used in `hook_failed`
   events and ordering.
 
