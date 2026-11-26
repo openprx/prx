@@ -250,6 +250,7 @@ pub(super) fn page(
         tx.execute("DELETE FROM sync_snapshot_rows WHERE snapshot_id=?1", [&id])?;
         tx.execute("DELETE FROM sync_snapshots WHERE id=?1", [&id])?;
     }
+    let retained_since = super::sync_retained::retained_since(&tx)?;
     tx.commit()?;
     Ok(SnapshotPage {
         cursor: format!("{epoch}:{head}"),
@@ -257,5 +258,6 @@ pub(super) fn page(
         snapshot_id: id,
         rows,
         next,
+        retained_since,
     })
 }

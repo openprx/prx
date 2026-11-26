@@ -58,6 +58,9 @@ pub(super) fn event(conn: &Connection, h: &Header) -> anyhow::Result<Value> {
 }
 
 pub(super) fn payload(conn: &Connection, h: &Header) -> anyhow::Result<Value> {
+    if let Some(retained) = super::sync_retained::payload(h)? {
+        return Ok(retained);
+    }
     if h.kind == "session.upsert" && (h.session.starts_with("cron:") || h.session.starts_with("xin:")) {
         let row: Option<(String,Option<String>)> = conn.query_row("SELECT (SELECT created_at FROM sessions WHERE session_key=?1 AND owner_id=?2),raw_payload_json FROM message_events WHERE session_key=?1 AND owner_id=?2 AND parent_run_id IS NULL AND (role='user' OR event_type='scheduled.skipped') ORDER BY id DESC LIMIT 1", params![h.session,h.owner], |r|Ok((r.get(0)?,r.get(1)?))).optional()?;
         let Some((created_at, raw)) = row else {

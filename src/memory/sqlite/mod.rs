@@ -37,6 +37,7 @@ mod sync_woken;
 mod transcript_rows;
 mod transcript_search;
 mod sync_projection;
+mod sync_retained;
 mod sync_snapshot;
 mod write_log;
 

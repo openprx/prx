@@ -71,6 +71,7 @@ pub(super) fn init_schema(conn: &Connection) -> anyhow::Result<()> {
         [uuid::Uuid::new_v4().simple().to_string()],
     )?;
     super::sync_snapshot::init_schema(conn)?;
+    super::sync_retained::init_schema(conn)?;
     if !existed {
         conn.execute(
             "UPDATE sync_meta SET epoch=?1,floor=0,last_prune=0",

@@ -37,6 +37,9 @@ pub struct SnapshotPage {
     pub snapshot_id: String,
     pub rows: Vec<Value>,
     pub next: Option<String>,
+    /// RFC 3339 UTC cutoff of the newest retention pass that deleted rows; absent when none did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retained_since: Option<String>,
 }
 
 /// A candidate whose admitting process must be checked before interruption.
