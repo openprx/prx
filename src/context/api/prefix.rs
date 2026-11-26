@@ -16,7 +16,7 @@ use crate::config::MemoryConfig;
 use crate::context::sources::memory_index::{
     STORE_INDEX_COMPACT_MAX_CHARS, STORE_INDEX_FETCH, STORE_INDEX_MAX_CHARS, render_store_index,
 };
-use crate::context::transcript::{append_session_prefix, newest_session_prefix};
+use crate::context::transcript::{MEMORY_INDEX_SOURCE, PrefixSection, append_session_prefix, newest_session_prefix};
 use crate::memory::branch_copy::CONTEXT_SWITCH_EVENT_TYPE;
 use crate::memory::{Memory, MemoryEntry, MemoryFabric, MemoryPrincipal};
 use crate::runtime::envelope::RuntimeEnvelope;
@@ -95,7 +95,15 @@ pub(crate) async fn session_prefix(input: SessionPrefixInput<'_>) -> String {
     scope.parent_run_id = None;
     let fabric = MemoryFabric::new(Arc::clone(memory), envelope.workspace_id.clone())
         .with_event_recording(memory_config.event_recording_config());
-    if let Some(row_id) = append_session_prefix(&fabric, scope, &text).await
+    let sections = if text.is_empty() {
+        Vec::new()
+    } else {
+        vec![PrefixSection {
+            source: MEMORY_INDEX_SOURCE.to_owned(),
+            text: text.clone(),
+        }]
+    };
+    if let Some(row_id) = append_session_prefix(&fabric, scope, &sections).await
         && !entries.is_empty()
     {
         verify_recorded(store, &principal, &entries, row_id).await;

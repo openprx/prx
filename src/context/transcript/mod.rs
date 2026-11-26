@@ -17,7 +17,7 @@ mod skill_rows;
 mod sources;
 mod tool_rows;
 
-pub(crate) use prefix_rows::{append_session_prefix, newest_session_prefix};
+pub(crate) use prefix_rows::{MEMORY_INDEX_SOURCE, PrefixSection, append_session_prefix, newest_session_prefix};
 pub(crate) use replay::{Attachment, History, ReplayLog, TurnReplay, stub_replayed_results};
 pub(crate) use skill_rows::{SkillLoad, skill_load_of, skills_in_use};
 pub(crate) use sources::AttachmentSources;
