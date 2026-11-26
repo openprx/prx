@@ -15,6 +15,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// A pass that started less than this many seconds ago does nothing.
 const THROTTLE_SECS: i64 = 55 * 60;
+/// Effective minimum retention: the rf journal keeps 14 days, plus one day of margin.
+const MIN_RETENTION_DAYS: u64 = 15;
 /// Rows scanned per batch.
 const SCAN_ROWS: i64 = 2_000;
 /// Eligible units deleted per batch.
@@ -94,6 +96,11 @@ pub(super) fn trim(
     cutoff: chrono::DateTime<chrono::Utc>,
     max_batches: u32,
 ) -> anyhow::Result<MessageTrim> {
+    // Store-side floor: a cutoff later than now minus the 15-day sync window is clamped.
+    let floor = chrono::Utc::now()
+        .checked_sub_days(chrono::Days::new(MIN_RETENTION_DAYS))
+        .ok_or_else(|| anyhow::anyhow!("retention floor out of range"))?;
+    let cutoff = cutoff.min(floor);
     let cutoff_text = cutoff.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
     let now = chrono::Utc::now().timestamp();
     let mut trim = MessageTrim::default();
@@ -140,10 +147,8 @@ pub(super) fn trim(
         let writer = memory.pool.write();
         let tx = begin_immediate(&writer)?;
         let counts = copies::pass(&tx, &cutoff_text)?;
-        let deleted = counts.documents + counts.traces + counts.compactions;
-        if deleted > 0 {
+        if counts.documents + counts.traces + counts.compactions > 0 {
             rf_delete::mark_scrub(&tx, &rf_now)?;
-            record_deleted(&tx, &cutoff_text, now, deleted)?;
         }
         tx.commit()?;
         counts
@@ -255,8 +260,10 @@ fn batch(memory: &SqliteMemory, cutoff: &str, cursor: &mut i64, trim: &mut Messa
     trim.events += u64::try_from(deleted)?;
     trim.runs += u64::try_from(units.len())?;
     let now = chrono::Utc::now();
-    rf_delete::mark_scrub(&tx, &now.to_rfc3339())?;
-    record_deleted(&tx, cutoff, now.timestamp(), deleted)?;
+    if deleted > 0 {
+        rf_delete::mark_scrub(&tx, &now.to_rfc3339())?;
+        record_deleted(&tx, cutoff, now.timestamp(), deleted)?;
+    }
     tx.commit()?;
     *cursor = next;
     Ok(true)
