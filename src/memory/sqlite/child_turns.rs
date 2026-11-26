@@ -71,6 +71,10 @@ pub(super) fn source_written(conn: &rusqlite::Transaction<'_>, event: &MessageEv
             record.context_after = previous.context_after;
             record.context = previous.context;
         }
+        // Stored rows are not kept in the record: event ids are cleared on every turn.
+        for turn in &mut record.context {
+            turn.event_id = None;
+        }
         let scope: Option<String> = conn.query_row(
             "SELECT ma_scope_id FROM message_events WHERE event_id=?1",
             [&event.event_id],
@@ -245,7 +249,15 @@ pub(super) fn replace_context(
         params![record.workspace, record.owner, record.session_key],
         |r| r.get(0),
     )?;
-    value.context = turns.to_owned();
+    // Stored rows are not kept in the record: event ids are cleared on every turn.
+    value.context = turns
+        .iter()
+        .cloned()
+        .map(|mut turn| {
+            turn.event_id = None;
+            turn
+        })
+        .collect();
     let written=tx.execute("UPDATE child_sessions SET record=?4 WHERE key=?1 AND workspace_id=?2 AND owner_id=?3 AND NOT EXISTS(SELECT 1 FROM agent_erase_fences f WHERE f.scope_id=child_sessions.ma_scope_id)",
         params![record.session_key,record.workspace,record.owner,serde_json::to_string(&value)?])?;
     anyhow::ensure!(written == 1, ChildSessionError::ScopeRefused);
