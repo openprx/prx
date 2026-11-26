@@ -131,9 +131,10 @@ impl SessionsSpawnTool {
                                     "additionalProperties": false,
                                     "required": ["kind"],
                                     "properties": {
-                                        "kind": {"type": "string", "enum": ["document", "file"], "description": "'document' needs 'id'; 'file' needs 'path'."},
+                                        "kind": {"type": "string", "enum": ["document", "file", "transcript"], "description": "'document' needs 'id'; 'file' needs 'path'; 'transcript' needs 'session_key'."},
                                         "id": {"type": "string", "description": "For kind 'document': the document id."},
                                         "path": {"type": "string", "description": "For kind 'file': the file path."},
+                                        "session_key": {"type": "string", "description": "For kind 'transcript': the session key to search."},
                                         "note": {"type": "string", "maxLength": 200, "description": "Optional note shown after the reference."}
                                     }
                                 }

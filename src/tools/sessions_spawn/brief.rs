@@ -101,8 +101,13 @@ fn render_reference(index: usize, entry: &Value) -> Result<String, String> {
                 .ok_or_else(|| format!("'{owner}' of kind 'file' requires 'path'"))?;
             format!("- file {path}: read it with file_read")
         }
+        "transcript" => {
+            let session_key = optional_text(fields, &owner, "session_key")?
+                .ok_or_else(|| format!("'{owner}' of kind 'transcript' requires 'session_key'"))?;
+            format!("- transcript {session_key}: search it with transcript_search session_key={session_key}")
+        }
         _ => {
-            return Err(format!("'{owner}.kind' must be 'document' or 'file'"));
+            return Err(format!("'{owner}.kind' must be 'document', 'file' or 'transcript'"));
         }
     };
     match optional_text(fields, &owner, "note")? {
