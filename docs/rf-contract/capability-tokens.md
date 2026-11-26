@@ -440,6 +440,18 @@ The deleted bytes leave PRX's store files (`brain.db` and its WAL) before the de
 Each deleted run (or `context` message) gets one content-free `turn.deleted`
 record for the sync stream (SYNC-1).
 
+**Retention notices.** When the message-log retention pass
+(`memory.message_retention_days`, opt-in; default 0 deletes nothing) deletes
+rf-visible messages by age, it appends one `turn.deleted` journal entry per
+deleted message, in the same transaction as the deletion. Its `event_id` is
+`retained:<message_event_id>` and its source reference `retained:<side>:<message_event_id>`,
+with `side` `message` (a user input or a message tombstone) or `reply` (a final
+assistant row). The projected payload is `{"side","message_id","run_id"?,"reason":"retention"}`
+plus the standard frame fields; `message_id` is the message event id. A client
+handles it as a user delete of that message or reply (same `side`); ignoring
+`reason` is acceptable. The entry is idempotent: a repeat or an unknown
+`message_id` changes nothing. Rows kept by the retention rules get no entry.
+
 **Later attachments.** The recall text of a later turn can quote a deleted
 message (or a memory or document made from it), and that text is stored in the
 later turn's attachment row and replayed to the model. A delete (and a forget)
@@ -684,7 +696,9 @@ limiter. Only snapshot accepts `page_token` and `limit` query parameters.
 Invalid queries use `400 field_invalid`; unsupported backends use the coded
 `storage_unavailable` error.
 
-Snapshot returns `{epoch,cursor,snapshot_id,rows:[{kind,key,payload}],next}`.
+Snapshot returns `{epoch,cursor,snapshot_id,rows:[{kind,key,payload}],next}`, plus
+`retained_since` (RFC 3339 UTC) when a retention pass has deleted rows; the field is
+absent otherwise. Each page carries the same value.
 **This shape supersedes the C section 4 `{sessions,agents}` sketch.** Rows are
 ordered session, agent, child_session, approval, erase_receipt, turn. Turn
 payloads use exactly the message ids returned by the messages/history route.
@@ -699,6 +713,13 @@ outstanding are retained per owner; a third returns `429 rate_limited`.
 Serving the final page (no `next`) immediately releases that cut and its slot
 in the same transaction, including an empty or single-page snapshot. Tokens
 for a drained cut are no longer valid.
+
+A client that was offline longer than the journal window (4410, then a fresh
+snapshot) must drop its local turns older than `retained_since` whose
+`message_id` is not among the snapshot's `turn` rows, after draining the
+snapshot. Turns PRX kept by the retention rules are inventoried, so they stay.
+Absent `retained_since` means no retention deletion ever happened: drop nothing
+on that basis.
 
 After erasure, a fresh snapshot may omit erased turn rows. It still inventories
 an `erase_receipt` for each completed history erase, including receipts within

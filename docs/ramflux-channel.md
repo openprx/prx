@@ -317,3 +317,15 @@ existing snapshot is rewritten even when no operator rows remain, so an older
 scoped-only export cannot survive the next export. Deleting
 a scoped row therefore needs no snapshot mutation. Operator snapshots keep their
 existing operator-only attribution rules.
+
+Message-log retention (`memory.message_retention_days`, opt-in, default 0) deletes
+rf-visible messages by age with a 15-day effective minimum. Each deleted message
+is announced to the sync stream as a `turn.deleted` entry with `reason:"retention"`
+(`retained:<side>:<message_event_id>`), and the snapshot carries `retained_since`
+so a client that was offline longer than the journal window can drop the turns
+PRX removed. Rows kept by the retention rules are not announced. A trimmed message
+is gone for good: a delete of it answers as for an unknown message, and a resend
+of its `client_message_id` is admitted as new, so rf must not resend an acknowledged
+message older than 15 days. Operators enable the key only after rf core
+implements the client rules in `docs/rf-contract/capability-tokens.md`. The
+key does not change the behaviour of a turn.
