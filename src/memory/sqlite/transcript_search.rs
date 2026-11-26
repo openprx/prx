@@ -26,7 +26,14 @@ const INDEX_TABLE: &str = "message_events_fts";
 /// The triggers never fail on their own: they only insert into and delete from
 /// the FTS5 table, using the stored `content` of the row they fire for. The
 /// `rebuild` indexes the rows that exist when the index is created; its cost is
-/// proportional to the number of `message_events` rows.
+/// proportional to the number of `message_events` rows. So the first search
+/// builds the index over all transcript rows of the database, under the write
+/// lock.
+///
+/// `secure-delete` is FTS5's own option: a deleted or blanked row's terms are
+/// overwritten on disk instead of lingering in older segments. It is stored in
+/// the index's `%_config` table (format version 5), so later connections keep
+/// it without setting it. Erasure therefore needs no rebuild.
 const CREATE_INDEX_SQL: &str = "
     CREATE VIRTUAL TABLE IF NOT EXISTS message_events_fts USING fts5(
         content, content='message_events', content_rowid='id');
@@ -42,6 +49,7 @@ const CREATE_INDEX_SQL: &str = "
             VALUES ('delete', old.id, old.content);
         INSERT INTO message_events_fts(rowid, content) VALUES (new.id, new.content);
     END;
+    INSERT INTO message_events_fts(message_events_fts, rank) VALUES ('secure-delete', 1);
     INSERT INTO message_events_fts(message_events_fts) VALUES ('rebuild');";
 
 impl SqliteMemory {
