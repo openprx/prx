@@ -121,7 +121,7 @@ notify-debouncer-mini = "0.7.0"
 # Async traits
 async-trait = "0.1"
 # MCP client (stdio + streamable HTTP)
-rmcp = { version = "3.9.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
+rmcp = { version = "3.11.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
 # The reqwest 0.13 client of the MCP streamable-HTTP transport (rmcp's own
 # reqwest). Its TLS backend is pinned here: without it, `https://` MCP servers
 # would be reachable only when some other dependency enabled rustls on the same
