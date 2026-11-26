@@ -118,7 +118,7 @@ impl MailboxAnnouncement {
 fn announcement_text(run_id: &str, completed: bool, result_text: &str) -> String {
     let outcome = if completed { "completed" } else { "FAILED" };
     let head = format!(
-        "Sub-agent `{run_id}` has finished ({outcome}). This is an automatic completion notice for a run you already started, not a new request; that run's task is done."
+        "Sub-agent `{run_id}` has finished ({outcome}). This is an automatic completion notice for a run you already started, not a new request; that run's task is done. Report this result to the user if useful; the request that started the run is already done, do not start it again."
     );
     let detail = result_text.trim();
     if detail.is_empty() {

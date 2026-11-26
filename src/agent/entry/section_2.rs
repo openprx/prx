@@ -756,6 +756,7 @@ pub(crate) async fn run_with_runtime_envelope(
                         card: scheduled_card.as_deref(),
                         previous_turns,
                         replay,
+                        excluded_session: None,
                         system_prompt,
                         service: decision_service,
                         context: decision_context,

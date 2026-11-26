@@ -50,6 +50,10 @@ pub(crate) struct RecallScope {
     /// to the run id). `Some` restricts recall to this child's own task events;
     /// `None` leaves main, operator and shared-context turns unchanged.
     child_task: Option<String>,
+    /// The session a woken turn's shared-events block leaves out: the sender
+    /// of the message it adopted, whose rows are the run the message reports
+    /// on. `None` for every other turn.
+    excluded_session: Option<String>,
 }
 
 impl RecallScope {
@@ -57,6 +61,13 @@ impl RecallScope {
         if key.is_some() {
             self.current_input_key = key;
         }
+        self
+    }
+
+    /// Leave `session`'s rows out of the shared-events block. `None` keeps it
+    /// unchanged.
+    pub(crate) fn with_excluded_session(mut self, session: Option<&str>) -> Self {
+        self.excluded_session = session.map(str::to_owned);
         self
     }
 
@@ -85,6 +96,7 @@ impl RecallScope {
                     .or_else(|| envelope.run_id.clone())
                     .unwrap_or_default()
             }),
+            excluded_session: None,
         }
     }
 }
@@ -221,6 +233,7 @@ async fn recall_with_session(
         (scope.current_input_key.as_deref(), scope.current_input_event.as_deref()),
         scope.child_task.as_deref(),
         include_current_session,
+        scope.excluded_session.as_deref(),
     )
     .await;
     let semantic_start = bundle.current_session_context.len() + bundle.recent_shared_context.len();
@@ -564,11 +577,16 @@ fn format_session_event_line(event: &MessageEvent) -> String {
 
 #[cfg(test)]
 fn build_shared_events_preamble(principal: &MemoryPrincipal, events: &[MessageEvent]) -> String {
-    build_shared_events_preamble_sourced(principal, events).0
+    build_shared_events_preamble_sourced(principal, events, None).0
 }
 
-/// The shared-events block and the ids of the events it quotes.
-fn build_shared_events_preamble_sourced(principal: &MemoryPrincipal, events: &[MessageEvent]) -> (String, Vec<String>) {
+/// The shared-events block and the ids of the events it quotes. Rows of
+/// `excluded_session` are left out, as are the current session's rows.
+fn build_shared_events_preamble_sourced(
+    principal: &MemoryPrincipal,
+    events: &[MessageEvent],
+    excluded_session: Option<&str>,
+) -> (String, Vec<String>) {
     let mut quoted = Vec::new();
     // D4 review: classify "current session" by the full candidate key set
     // (canonical + legacy), not the single canonical `session_key`. Otherwise a
@@ -582,6 +600,9 @@ fn build_shared_events_preamble_sourced(principal: &MemoryPrincipal, events: &[M
             .as_deref()
             .is_some_and(|session_key| session_candidates.iter().any(|candidate| candidate == session_key))
         {
+            continue;
+        }
+        if excluded_session.is_some_and(|excluded| event.session_key.as_deref() == Some(excluded)) {
             continue;
         }
         if event.role == "tool" || event.role == "system" {
@@ -906,6 +927,7 @@ pub(crate) async fn build_agent_context_with_semantic_scope(
         (None, None),
         None,
         true,
+        None,
     )
     .await
 }
@@ -921,6 +943,7 @@ async fn build_agent_context(
     exclusion: (Option<&str>, Option<&str>),
     child_task: Option<&str>,
     include_current_session: bool,
+    excluded_session: Option<&str>,
 ) -> AgentContextBundle {
     let (excluded_key, excluded_event) = exclusion;
     let gate = child_task.map(|task_id| ChildRecallGate {
@@ -1028,7 +1051,8 @@ async fn build_agent_context(
     } else {
         (String::new(), Vec::new())
     };
-    let (recent_shared_context, shared_event_ids) = build_shared_events_preamble_sourced(&principal, &shared_events);
+    let (recent_shared_context, shared_event_ids) =
+        build_shared_events_preamble_sourced(&principal, &shared_events, excluded_session);
     source_events.extend(shared_event_ids);
     let source_documents = selected_document_items
         .iter()

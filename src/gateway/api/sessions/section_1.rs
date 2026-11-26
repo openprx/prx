@@ -758,6 +758,9 @@ async fn run_console_runtime_turn(
     // root from the stored source event.
     let woken_root = mailbox::woken_scope();
     let woken = woken_root.is_some();
+    // The sender of the adopted message: its rows are left out of the woken
+    // turn's shared recall, since the notice already reports them.
+    let woken_sender = mailbox::woken_sender_session();
     let live_scope = if let Some(root) = woken_root {
         Some(root)
     } else if let (Some(store), Some(source)) = (state.mem.sync_store(), turn_envelope.source_message_event_id.clone())
@@ -842,6 +845,7 @@ async fn run_console_runtime_turn(
         card: None,
         previous_turns,
         replay: crate::context::api::open::ReplayMode::FitToBudget,
+        excluded_session: woken_sender.as_deref(),
         system_prompt,
         service: &decision.service,
         context: &decision.context,

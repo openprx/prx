@@ -175,6 +175,14 @@ fn pending_roots(
 tokio::task_local! {
     /// The woken run's own approval root, `{session, agent, incarnation, run_id}`.
     static WOKEN_TURN: serde_json::Value;
+    /// The session that sent the message the woken run adopted.
+    static WOKEN_SENDER: String;
+}
+
+/// The session that sent the message a woken turn adopted, `None` outside such
+/// a turn. The recall of that turn leaves this session's rows out.
+pub(super) fn woken_sender_session() -> Option<String> {
+    WOKEN_SENDER.try_with(Clone::clone).ok()
 }
 
 /// The approval root of the turn this module drives for an adopted mailbox
@@ -233,6 +241,7 @@ async fn run(
     };
     let run_id = uuid::Uuid::new_v4().to_string();
     let root = receiver_root(&runtime, &input, &run_id).await?;
+    let sender_session = input.message.from.session.clone();
     envelope.run_id = Some(run_id);
     envelope.source_message_event_id = input.receipt.adopted_message_event_id.map(|id| id.to_string());
     envelope = envelope.with_config_generation(&turn_runtime.config_generation);
@@ -281,16 +290,19 @@ async fn run(
         guard,
         owner_authenticated: false,
     };
-    WOKEN_TURN
+    WOKEN_SENDER
         .scope(
-            root,
-            crate::gateway::jobs::scope_cancellation(
-                cancellation,
-                run_console_message_job_work(turn_runtime, state, input.text.clone(), turns, source, target),
+            sender_session,
+            WOKEN_TURN.scope(
+                root,
+                crate::gateway::jobs::scope_cancellation(
+                    cancellation,
+                    run_console_message_job_work(turn_runtime, state, input.text.clone(), turns, source, target),
+                ),
             ),
         )
         .await
-    .map_err(anyhow::Error::msg)?;
+        .map_err(anyhow::Error::msg)?;
     drop(input);
     Ok(())
 }

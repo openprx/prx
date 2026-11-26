@@ -45,6 +45,9 @@ pub(crate) struct OpenInput<'a> {
     pub(crate) previous_turns: Vec<ConversationTurn>,
     /// How the replayed tool results of `previous_turns` are shown.
     pub(crate) replay: ReplayMode,
+    /// The session whose rows the recall's shared-events block leaves out: the
+    /// sender of the message a woken turn adopted. `None` for every other turn.
+    pub(crate) excluded_session: Option<&'a str>,
     /// The system prompt of the turn, passed through untouched.
     pub(crate) system_prompt: String,
     /// The compaction of the turn is resolved from these, for the provider
@@ -80,6 +83,7 @@ pub(crate) async fn open_turn(input: OpenInput<'_>) -> TurnOpening {
         card,
         previous_turns,
         replay,
+        excluded_session,
         system_prompt,
         service,
         context,
@@ -101,7 +105,7 @@ pub(crate) async fn open_turn(input: OpenInput<'_>) -> TurnOpening {
         (effective_compaction.config.max_context_tokens / 2).clamp(REPLAYED_RECALL_BUDGET_FLOOR, RECALL_CONTEXT_BUDGET);
     let mem_context = replayed_session_recall(
         memory.as_ref(),
-        &RecallScope::from_envelope(envelope, memory_config, chat_type),
+        &RecallScope::from_envelope(envelope, memory_config, chat_type).with_excluded_session(excluded_session),
         visible_message,
         recall_budget,
     )
