@@ -2176,9 +2176,11 @@ A child launched from a gateway session (Console, rf or webhook) announces its
 completion the same way: the gateway has no outbound channel, so the parent
 session receives one message from the child's own session
 (`[message from spawn:<run id>/<agent>] Sub-agent \`<run id>\` has finished (completed|FAILED). This is an automatic completion notice for a run you already started, not a new request; ...` followed by `Result:` and the result,
-the result bounded to 16,000 characters). The notice ends by telling the parent
+the result bounded to 16,000 characters). The notice opens by telling the parent
 to report the result to the user if useful and not to start the finished request
-again. The woken turn leaves the sending session's rows out of its shared recall,
+again, and ends with a `[References]` line naming the child transcript: read it
+with `sessions_spawn` `action=history run_id=<run id> transcript=true`, or search
+it with `transcript_search`. The woken turn leaves the sending session's rows out of its shared recall,
 so the child's original request is not quoted back. The message is adopted like any other mailbox
 message. It wakes the parent session as a turn of its own; when a turn of that
 session is still running, the message waits and wakes the session once that
