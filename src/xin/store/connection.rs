@@ -2,7 +2,12 @@ use super::rows::deliver_pending_xin_event_outbox;
 use crate::config::Config;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use parking_lot::Mutex;
 use rusqlite::Connection;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 fn add_column_if_missing(conn: &Connection, table: &str, name: &str, sql_type: &str) -> Result<()> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -26,25 +31,55 @@ fn add_column_if_missing(conn: &Connection, table: &str, name: &str, sql_type: &
     }
 }
 
-pub(super) fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-    let db_path = config.workspace_dir.join("xin").join("tasks.db");
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create xin directory: {}", parent.display()))?;
+/// Database paths whose schema batch has completed in this process, keyed by
+/// canonical path. A second workspace in the same process (a test, say) has a
+/// different key and runs its own batch on its first open.
+static MIGRATED_PATHS: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
+
+/// Set once the WAL switch has failed, so a persistent failure logs one warning
+/// per process instead of one per call.
+static WAL_SWITCH_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Runs the schema batch unless this process already completed it for `db_path`.
+/// The path is recorded only after the whole batch succeeds, so a failed batch
+/// runs again on the next call.
+fn ensure_schema(conn: &Connection, db_path: &Path) -> Result<()> {
+    let key = std::fs::canonicalize(db_path)
+        .with_context(|| format!("Failed to resolve xin DB path: {}", db_path.display()))?;
+    let migrated = MIGRATED_PATHS.get_or_init(|| Mutex::new(BTreeSet::new()));
+    if migrated.lock().contains(&key) {
+        return Ok(());
     }
+    migrate_schema(conn)?;
+    migrated.lock().insert(key);
+    Ok(())
+}
 
-    let mut conn =
-        Connection::open(&db_path).with_context(|| format!("Failed to open xin DB: {}", db_path.display()))?;
+/// Switches the file to WAL and sets `synchronous=NORMAL` on this connection.
+/// The switch needs a brief exclusive moment, which the busy handler waits out.
+/// If it still fails, the call continues in the current journal mode.
+fn enable_wal(conn: &Connection, db_path: &Path) -> Result<()> {
+    match conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0)) {
+        Ok(mode) if mode.eq_ignore_ascii_case("wal") => {}
+        Ok(mode) => warn_wal_once(db_path, &format!("journal mode is {mode}")),
+        Err(error) => warn_wal_once(db_path, &error.to_string()),
+    }
+    conn.execute_batch("PRAGMA synchronous=NORMAL;")
+        .context("Failed to set xin DB synchronous mode")
+}
 
-    // Concurrent task execution must queue behind the database lock, never be
-    // turned into an error by it: the busy *handler* retries for as long as the
-    // lock is held (warning periodically) where a `busy_timeout` would surface
-    // `SQLITE_BUSY` the moment it expired.
-    crate::runtime::sqlite_pool::install_busy_handler(&mut conn)?;
+fn warn_wal_once(db_path: &Path, reason: &str) {
+    if !WAL_SWITCH_WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            path = %db_path.display(),
+            "could not switch xin DB to WAL, continuing in current mode: {reason}"
+        );
+    }
+}
 
+fn migrate_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
-        "PRAGMA foreign_keys = ON; PRAGMA secure_delete=ON;
-         CREATE TABLE IF NOT EXISTS xin_job_owners(job_id TEXT PRIMARY KEY,owner_id TEXT,creator_agent TEXT NOT NULL);
+        "CREATE TABLE IF NOT EXISTS xin_job_owners(job_id TEXT PRIMARY KEY,owner_id TEXT,creator_agent TEXT NOT NULL);
 
          CREATE TABLE IF NOT EXISTS xin_tasks (
             version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
@@ -198,39 +233,39 @@ pub(super) fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) ->
     )
     .context("Failed to initialize xin schema")?;
 
-    add_column_if_missing(&conn, "xin_tasks", "owner_id", "TEXT")?;
-    add_column_if_missing(&conn, "xin_tasks", "topic_id", "TEXT")?;
-    add_column_if_missing(&conn, "xin_tasks", "parent_task_id", "TEXT")?;
-    add_column_if_missing(&conn, "xin_tasks", "source_message_event_id", "TEXT")?;
-    add_column_if_missing(&conn, "xin_tasks", "approval_grant_json", "TEXT")?;
-    add_column_if_missing(&conn, "xin_tasks", "lease_owner", "TEXT")?;
-    add_column_if_missing(&conn, "xin_tasks", "lease_epoch", "INTEGER NOT NULL DEFAULT 0")?;
-    add_column_if_missing(&conn, "xin_tasks", "lease_expires_at", "TEXT")?;
-    add_column_if_missing(&conn, "xin_tasks", "last_heartbeat_at", "TEXT")?;
-    add_column_if_missing(&conn, "xin_task_events", "source_message_event_id", "TEXT")?;
+    add_column_if_missing(conn, "xin_tasks", "owner_id", "TEXT")?;
+    add_column_if_missing(conn, "xin_tasks", "topic_id", "TEXT")?;
+    add_column_if_missing(conn, "xin_tasks", "parent_task_id", "TEXT")?;
+    add_column_if_missing(conn, "xin_tasks", "source_message_event_id", "TEXT")?;
+    add_column_if_missing(conn, "xin_tasks", "approval_grant_json", "TEXT")?;
+    add_column_if_missing(conn, "xin_tasks", "lease_owner", "TEXT")?;
+    add_column_if_missing(conn, "xin_tasks", "lease_epoch", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "xin_tasks", "lease_expires_at", "TEXT")?;
+    add_column_if_missing(conn, "xin_tasks", "last_heartbeat_at", "TEXT")?;
+    add_column_if_missing(conn, "xin_task_events", "source_message_event_id", "TEXT")?;
     // CRON-ORIGIN: nullable, no backfill; see `stored_origin` for how a row
     // written before this column existed is attributed.
-    add_column_if_missing(&conn, "xin_tasks", "origin", "TEXT")?;
+    add_column_if_missing(conn, "xin_tasks", "origin", "TEXT")?;
     // D-107 amendment: which surface created the task. Nullable with no
     // backfill: a row stored before the column existed reads as
     // `agent_tool` until the operator marks it.
-    add_column_if_missing(&conn, "xin_tasks", "created_via", "TEXT")?;
-    add_column_if_missing(&conn, "xin_goals", "origin", "TEXT")?;
+    add_column_if_missing(conn, "xin_tasks", "created_via", "TEXT")?;
+    add_column_if_missing(conn, "xin_goals", "origin", "TEXT")?;
     // The creating call's level and agent. Nullable with no backfill: a row
     // without them runs at Main's level.
-    add_column_if_missing(&conn, "xin_tasks", "creator_level", "TEXT")?;
-    add_column_if_missing(&conn, "xin_tasks", "creator_agent", "TEXT")?;
+    add_column_if_missing(conn, "xin_tasks", "creator_level", "TEXT")?;
+    add_column_if_missing(conn, "xin_tasks", "creator_agent", "TEXT")?;
     // Whether a scheduled run replays its session's earlier runs. Every
     // existing row reads `task`, the behaviour before this column.
-    add_column_if_missing(&conn, "xin_tasks", "context", "TEXT NOT NULL DEFAULT 'task'")?;
-    add_column_if_missing(&conn, "xin_goals", "creator_level", "TEXT")?;
-    add_column_if_missing(&conn, "xin_goals", "creator_agent", "TEXT")?;
+    add_column_if_missing(conn, "xin_tasks", "context", "TEXT NOT NULL DEFAULT 'task'")?;
+    add_column_if_missing(conn, "xin_goals", "creator_level", "TEXT")?;
+    add_column_if_missing(conn, "xin_goals", "creator_agent", "TEXT")?;
     // Which surface created the goal, as on `xin_tasks`. Nullable with no
     // backfill: NULL reads as `agent_tool`.
-    add_column_if_missing(&conn, "xin_goals", "created_via", "TEXT")?;
+    add_column_if_missing(conn, "xin_goals", "created_via", "TEXT")?;
     // Forward-compat for any xin_steps table created before lease_ttl_secs existed.
-    add_column_if_missing(&conn, "xin_steps", "lease_ttl_secs", "INTEGER NOT NULL DEFAULT 0")?;
-    add_column_if_missing(&conn, "xin_steps", "lease_epoch", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "xin_steps", "lease_ttl_secs", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "xin_steps", "lease_epoch", "INTEGER NOT NULL DEFAULT 0")?;
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_xin_tasks_owner ON xin_tasks(owner_id, status, next_run_at);
          CREATE INDEX IF NOT EXISTS idx_xin_tasks_topic ON xin_tasks(topic_id, status, next_run_at);
@@ -239,6 +274,30 @@ pub(super) fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) ->
          CREATE INDEX IF NOT EXISTS idx_xin_tasks_lease_owner ON xin_tasks(lease_owner, status);",
     )
     .context("Failed to initialize xin lineage indexes")?;
+
+    Ok(())
+}
+
+pub(super) fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    let db_path = config.workspace_dir.join("xin").join("tasks.db");
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create xin directory: {}", parent.display()))?;
+    }
+
+    let mut conn =
+        Connection::open(&db_path).with_context(|| format!("Failed to open xin DB: {}", db_path.display()))?;
+
+    // Concurrent task execution must queue behind the database lock, never be
+    // turned into an error by it: the busy *handler* retries for as long as the
+    // lock is held (warning periodically) where a `busy_timeout` would surface
+    // `SQLITE_BUSY` the moment it expired.
+    crate::runtime::sqlite_pool::install_busy_handler(&mut conn)?;
+
+    conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA secure_delete=ON;")
+        .context("Failed to set xin DB pragmas")?;
+    enable_wal(&conn, &db_path)?;
+    ensure_schema(&conn, &db_path)?;
 
     let result = f(&conn);
     if let Err(error) = deliver_pending_xin_event_outbox(&conn) {
