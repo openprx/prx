@@ -698,7 +698,7 @@ Invalid queries use `400 field_invalid`; unsupported backends use the coded
 
 Snapshot returns `{epoch,cursor,snapshot_id,rows:[{kind,key,payload}],next}`, plus
 `retained_since` (RFC 3339 UTC) when a retention pass has deleted rows; the field is
-absent otherwise. Each page carries the same value.
+absent otherwise. The value can rise between pages while a sweep runs; use the value from the final page.
 **This shape supersedes the C section 4 `{sessions,agents}` sketch.** Rows are
 ordered session, agent, child_session, approval, erase_receipt, turn. Turn
 payloads use exactly the message ids returned by the messages/history route.
