@@ -1,6 +1,7 @@
 use crate::auth::discovery::is_claude_code_oauth_setup_token;
 use crate::llm::route_decision::{AttemptStatus, ProviderAttempt, TokenUsage};
 use crate::multimodal;
+use crate::providers::cache_breakpoints::{self, CacheControl};
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, ChatTrace, Provider,
     StreamChunk, StreamError, StreamOptions, StreamResult, ToolCall as ProviderToolCall, ToolCallChunk,
@@ -121,41 +122,6 @@ struct NativeToolSpec<'a> {
     input_schema: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_control: Option<CacheControl>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct CacheControl {
-    #[serde(rename = "type")]
-    cache_type: String,
-}
-
-impl CacheControl {
-    fn ephemeral() -> Self {
-        Self {
-            cache_type: "ephemeral".to_string(),
-        }
-    }
-}
-
-/// Indices, among the non-system messages, that carry a conversation cache
-/// breakpoint. The last message always carries one. When a live user message
-/// follows at least one earlier message, the message just before it (the end
-/// of the replayed history) carries one too. At most two indices, so a request
-/// with tools and a large system prompt stays within Anthropic's four markers.
-fn conversation_breakpoint_indices(roles: &[&str]) -> Vec<usize> {
-    let Some(last) = roles.len().checked_sub(1) else {
-        return Vec::new();
-    };
-    let mut indices = Vec::with_capacity(2);
-    if let Some(history_end) = roles
-        .iter()
-        .rposition(|role| *role == "user")
-        .and_then(|live| live.checked_sub(1))
-    {
-        indices.push(history_end);
-    }
-    indices.push(last);
-    indices
 }
 
 /// Set an ephemeral cache marker on the last content block of a message.
@@ -352,12 +318,12 @@ impl AnthropicProvider {
 
     /// Cache system prompts larger than ~1024 tokens (3KB of text)
     const fn should_cache_system(text: &str) -> bool {
-        text.len() > 3072
+        cache_breakpoints::should_cache_system(text)
     }
 
     /// Cache conversations with more than 4 messages (excluding system)
     fn should_cache_conversation(messages: &[ChatMessage]) -> bool {
-        messages.iter().filter(|m| m.role != "system").count() > 4
+        cache_breakpoints::should_cache_conversation(messages.iter().filter(|m| m.role != "system").count())
     }
 
     /// Mark the conversation breakpoints from the layout: the end of the
@@ -372,7 +338,7 @@ impl AnthropicProvider {
             .filter(|m| m.role != "system")
             .map(|m| m.role.as_str())
             .collect();
-        for index in conversation_breakpoint_indices(&roles) {
+        for index in cache_breakpoints::conversation_breakpoint_indices(&roles) {
             if let Some(message) = native.get_mut(index) {
                 mark_last_block(message);
             }

@@ -20,6 +20,7 @@ pub mod anthropic;
 pub mod app_identity;
 pub(crate) mod attempt_accounting;
 pub mod bedrock;
+pub(crate) mod cache_breakpoints;
 pub mod catalog;
 pub mod circuit_breaker;
 pub mod compatible;
