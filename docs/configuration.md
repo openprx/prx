@@ -87,6 +87,7 @@ and the module-gate family are absorbed on load; they are not live switches.
 | `[scheduler]` | `max_tasks = 64`; `claim_lease_secs = 90` |
 | `[agent]` | `compact_context = false`; `read_only_tool_concurrency_window = 2`; `priority_scheduling_enabled = false`; `low_priority_tools = ["sessions_spawn", "delegate"]`; `[agent.prompt] share_host_identity = true` |
 | `[agent.compaction]` | `mode = "switch"`; `reserve_tokens = 4096`; `keep_recent_messages = 12`; `memory_flush = true`; `max_context_tokens = 128000` |
+| `[agent.compaction]` mode values | `mode` accepts `off` and `switch` (default `switch`). The removed values `safeguard` and `aggressive` load as `switch` with a warning, and a config written back is saved as `switch` |
 | `[agent.compaction]` window rules | `reserve_tokens` is an upper bound: the reply reserve used is `min(reserve_tokens, window / 4)`, and the reply reserve plus the measured tool surface never exceed `window / 2` (never below `reserve_tokens` itself). `keep_recent_messages` is an upper bound on the messages a `switch` keeps word for word: the newest messages are kept while together they stay within `min(window / 4, (window - reserve) / 2)` tokens, and the newest message is always kept, so a short history of large messages is folded. `max_context_tokens` is the window. The hard input limit of a request is `max_context_tokens` minus that reserve, so on a small window the limit can be half the window: with `max_context_tokens = 16000` a reply reserve of 4096 plus a tool surface of 3904 tokens or more reaches the `window / 2 = 8000` cap, giving `hard_limit = 8000` and a warning threshold of 85 percent of it (6800). This is intended (`reserved_budget_config` in `src/agent/budget_inputs.rs`) |
 | `[agent.compaction]` hard limit and threshold | `max_context_tokens` is the whole window. The hard limit of the history is `max_context_tokens - R`, where `R` is the reply reserve plus the measured tool surface under the cap above; the warning threshold is 0.85 of the hard limit. With `max_context_tokens = 16000`, the default `reserve_tokens = 4096` (reply reserve `min(4096, 4000) = 4000`) and a tool surface of 4000 tokens or more (the sum is capped at `window / 2 = 8000`), the hard limit is `16000 - 8000 = 8000` and the warning threshold is `6800`. The history is compared with these numbers by an estimate: the local count of the history plus the tool surface, scaled by the ratio of the provider's reported input tokens to the local count of the last request (used only between 0.800 and 1.600, and only for requests of at least 500 tokens), plus a margin of 2% (at least 16), less the tool-surface reserve. Before the first response, after a response with no reported usage or an unusable ratio, or when the system prompt, the tool surface or the model changed, the local estimate alone is used. No limit is added by this: a request still over the window after the reduction steps is sent and the provider-overflow recovery handles it |
 | `[agent.compaction.os_paging]` | `eviction_threshold = 0.70`; `proactive_retrieval = true`; `max_recalled_pages = 10`; `retrieval_injection_role = "system"`; `keep_recent_messages = 12`. Exact `switch` handoffs skip paging |
@@ -96,7 +97,7 @@ and the module-gate family are absorbed on load; they are not live switches.
 | `[self_system]` | `fitness_interval_hours = 24` (accepted, unused for scheduling); `evolution_interval_hours = 24`; `evolution_config_path` unset; `evolution_debug_raw = false`; `evolution_judge_timeout_secs = 180`; `evolution_model_max_tokens = 16384`; `evolution_model_max_micro_usd = 0` |
 | `[self_system.fitness]` | `auto_run = true`; `timezone = "UTC"`; `run_at = "00:10"`; `retention_days = 180`; `max_backfill_days = 7`; `min_samples = 5`; `min_coverage = 0.60` |
 | `[skills]` | `open_skills_dir` unset (`$HOME/open-skills` when used); `openclaw_skills_dir` unset (`$HOME/.openprx/openclaw-skills/` when used); `github_token` unset (unauthenticated discovery); `sync_repositories = ["https://github.com/besoeasy/open-skills", "https://github.com/openclaw/openclaw"]` |
-| `[skill_rag]` | `top_k = 32` |
+| `[skill_rag]` | no keys (`top_k` was removed; see Removed Configuration Keys) |
 | `[plugins]` | `enabled = false` |
 | `[skills_lifecycle]` | `enabled = false`; `mode = "draft_only"`; `owner_scope` required when enabled; `storage_dir = "self/skill-lifecycle"`; `require_holdout = true`; `min_cases_floor = 3`; `max_concurrent_evaluations = 1`; `max_proposals_per_cycle = 1`; `max_edit_tokens = 300`; `max_edit_fraction = 0.20`; `allow_executable_proposals = false`; `suites = []` |
 | `[[model_routes]]` | `hint`, `provider`, `model` required; `api_key`/`credential_ref` unset; flattened model settings |
@@ -126,7 +127,7 @@ and the module-gate family are absorbed on load; they are not live switches.
 | `[channels_config.dingtalk]` | `client_id` and `client_secret` required; `allowed_users = []`; `mention_only = false` |
 | `[channels_config.qq]` | `app_id` and `app_secret` required; `allowed_users = []`; `mention_only = false` |
 | `[channels_config.ramflux]` | `socket_path` unset; `authorization_mode = "follow_rf"`; `max_in_flight_per_conversation = 1`; `on_new_message = "queue"`; `turn_wall_clock_secs = 120`; `encrypt_at_rest = true`; `surface_limits.max_blocks = 32`, `max_actions = 16`, `max_bytes = 65536`; `attachment_fetch.max_bytes = 5242880`, `max_per_turn = 4`; `allowed_block_types` the built-in surface set (Text, Markdown, Heading, KeyValue, Metric, List, TableFallback, Form, Input, Select, Progress, LogStream, Warning, Error, Success, Approval, ActionGroup, FilePreview, Fallback); `accounts = {}`. An account may set `system_prompt_file`, `model`, `provider`, `scope_profile`, `cross_conversation_retrieval` |
-| `[memory]` | `backend = "sqlite"`; `auto_save = true`; `acl_enabled = false`; `legacy_conversation_turns_visible = true`; `archive_after_days = 7`; `purge_after_days = 30`; `conversation_retention_days = 3`; `daily_retention_days = 7`; `message_retention_days = 0`; `embedding_provider = "local"`; `embedding_model = "prx-local-hash-v1"`; `embedding_dimensions = 384`; `vector_weight = 0.7`; `keyword_weight = 0.3`; `min_relevance_score = 0.4`; `embedding_cache_size = 10000`; `vector_candidate_cap = 2000`; `auto_hydrate = true`; `sqlite_open_timeout_secs` unset; `sqlite_read_pool_size` unset; `lucid_cmd` unset (`lucid`); `lucid_budget` unset (200); `lucid_recall_timeout_ms = 5000`; `lucid_store_timeout_ms = 3000`; `lucid_local_hit_threshold = 3`; `lucid_failure_cooldown_ms = 60000` |
+| `[memory]` | `backend = "sqlite"`; `auto_save = true`; `acl_enabled = false`; `legacy_conversation_turns_visible = true`; `archive_after_days = 7`; `purge_after_days = 30`; `conversation_retention_days = 3`; `daily_retention_days = 7`; `saved_session_retention_days = 0`; `message_retention_days = 0`; `embedding_provider = "local"`; `embedding_model = "prx-local-hash-v1"`; `embedding_dimensions = 384`; `vector_weight = 0.7`; `keyword_weight = 0.3`; `min_relevance_score = 0.4`; `embedding_cache_size = 10000`; `vector_candidate_cap = 2000`; `auto_hydrate = true`; `sqlite_open_timeout_secs` unset; `sqlite_read_pool_size` unset; `lucid_cmd` unset (`lucid`); `lucid_budget` unset (200); `lucid_recall_timeout_ms = 5000`; `lucid_store_timeout_ms = 3000`; `lucid_local_hit_threshold = 3`; `lucid_failure_cooldown_ms = 60000` |
 | `[memory.events]` | `record_user_messages = true`; `record_assistant_messages = true`; `record_tool_events = true` |
 | `[memory.semantic]` | `auto_promote_user_messages = true`; `auto_promote_assistant_messages = false`; `min_chars = 30` |
 | `[[identity_bindings]]` | `user_id`, `channel`, `channel_account` required; `display_name` unset |
@@ -748,14 +749,10 @@ always_exclude = []
 # Chat sessions_spawn is deferred by default; always_include can opt it into the
 # direct surface when policy permits.
 #
-# Skill catalog published in the system prompt. A catalog at or below `top_k` is
-# published whole, in a canonical order, which keeps that section of the prompt a
-# pure function of the installed skills instead of a retrieval result that moves
-# with the wording. The section carries metadata only (instruction bodies stay
-# behind `skill_read`), which is why the default is large. Larger catalogs fall
-# back to relevance retrieval.
-[skill_rag]
-top_k = 32
+# Skill catalog published in the system prompt: a catalog is published whole, in
+# a canonical order, so that section of the prompt is a pure function of the
+# installed skills. The section carries metadata only (instruction bodies stay
+# behind `skill_read`). `skill_rag.top_k` was removed and is ignored.
 
 # WASM plugins. Off by default: nothing under <workspace>/plugins is scanned
 # or loaded, and no plugin tool, provider, memory backend, hook, cron job or
@@ -1392,6 +1389,7 @@ effect) and its response carries the same `warning`.
 | `security.audit.sign_events` | audit signing was never implemented; the setting had no effect |
 | `[security.resources]` (whole table) | never enforced by any code path |
 | `memory.events.retention_days` | never read by the hygiene pass |
+| `skill_rag.top_k` | the prompt publishes the skill catalog whole; the key is accepted with a warning and ignored |
 | `[causal_tree]` (whole table, every key) | removed with the decision plane; refused at load as an unknown configuration path. The turn limits moved to `[decision_engine]` |
 
 The `sessions_spawn` tool also no longer accepts `max_iterations` or
@@ -1718,10 +1716,13 @@ skipped, and a pass is skipped while an rf snapshot is open. It is never called 
 a turn, and a turn waits at most for one batch. Deletion is permanent; setting
 the key back to `0` does not restore deleted rows.
 
-What is not deleted by this setting: saved terminal sessions (their saved JSON
-copy is governed by `memory.saved_session_retention_days`, default `0`, which
-keeps them forever), owner memories, child session records, and the chat
-mailbox store. Logs carry counts and the effective cutoff only.
+`memory.saved_session_retention_days` (default `0` = off) deletes saved terminal
+sessions (`chat_session:*` entries) not updated for N days, during memory
+hygiene; it does not delete the message log (see `memory.message_retention_days`).
+
+What is not deleted by this setting: saved terminal sessions (see the sentence
+above), owner memories, child session records, and the chat mailbox store. Logs
+carry counts and the effective cutoff only.
 
 Paired rf clients also delete the messages PRX deletes by age. For each deleted
 message PRX writes one `turn.deleted` notice with `reason: "retention"` to the
