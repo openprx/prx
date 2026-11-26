@@ -67,24 +67,44 @@ fn keep_recent_token_budget(config: &AgentCompactionConfig) -> usize {
     window_share.min(input_share)
 }
 
-/// How many of the newest `non_system` messages a switch keeps word for word.
+/// The most messages a switch may keep word for word out of `non_system_len`:
+/// the configured `keep_recent_messages`, at least one and at most the messages
+/// there are.
+pub(crate) fn keep_recent_cap(config: &AgentCompactionConfig, non_system_len: usize) -> usize {
+    config.keep_recent_messages.max(1).min(non_system_len)
+}
+
+/// How many of the newest messages a switch keeps word for word, given the
+/// budgeted token weight of each message.
 ///
+/// `weights` is index-aligned with the non-system messages, oldest first.
 /// Newest first, a message is kept while the kept messages stay within a share
-/// of the window; the newest one is always kept. `keep_recent_messages` is an
-/// upper bound, so a short history of large messages folds, and a long one
-/// keeps at most the configured count.
-pub(crate) fn effective_keep_recent_messages(non_system: &[ChatMessage], config: &AgentCompactionConfig) -> usize {
-    let cap = config.keep_recent_messages.max(1).min(non_system.len());
+/// of the window; the newest one is always kept. `cap` (see
+/// [`keep_recent_cap`]) is an upper bound, so a short history of large messages
+/// folds, and a long one keeps at most the configured count.
+pub(crate) fn effective_keep_recent_weighted(weights: &[usize], cap: usize, config: &AgentCompactionConfig) -> usize {
     let budget = keep_recent_token_budget(config);
     let mut used = 0usize;
     let mut kept = 0usize;
-    for message in non_system.iter().rev().take(cap) {
-        let tokens = budgeted_tokens(estimate_history_tokens_with_source(std::slice::from_ref(message)));
-        used = used.saturating_add(tokens);
+    for tokens in weights.iter().rev().take(cap) {
+        used = used.saturating_add(*tokens);
         if kept >= 1 && used > budget {
             break;
         }
         kept += 1;
     }
     kept
+}
+
+/// How many of the newest `non_system` messages a switch keeps word for word,
+/// each weighed by its own text. See [`effective_keep_recent_weighted`].
+pub(crate) fn effective_keep_recent_messages(non_system: &[ChatMessage], config: &AgentCompactionConfig) -> usize {
+    let cap = keep_recent_cap(config, non_system.len());
+    let weights: Vec<usize> = non_system
+        .get(non_system.len().saturating_sub(cap)..)
+        .unwrap_or_default()
+        .iter()
+        .map(|message| budgeted_tokens(estimate_history_tokens_with_source(std::slice::from_ref(message))))
+        .collect();
+    effective_keep_recent_weighted(&weights, cap, config)
 }

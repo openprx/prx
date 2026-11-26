@@ -27,6 +27,7 @@
 //! canonical history, copied lazily at the first step that reshapes the view.
 
 use crate::agent::compaction::render_context_handoff_for_provider;
+use crate::agent::context_budget::{budgeted_tokens, estimate_history_tokens_with_source};
 use crate::agent::context_paging::inject_recalled_context;
 use crate::agent::page_sources::MessageSources;
 use crate::agent::tool_evidence::{TurnToolEvidence, render_assistant_content, render_user_content};
@@ -653,6 +654,44 @@ pub(crate) struct ProviderView {
 impl ProviderView {
     pub(crate) fn into_messages(self) -> Vec<ChatMessage> {
         self.messages
+    }
+}
+
+impl CanonicalHistory {
+    /// The budgeted token weight of each message as the provider view sends
+    /// it, index for index: its rendered content (the same renderers
+    /// [`project`] applies) plus, for an assistant reply, the tool rounds
+    /// replayed before it. A caller-supplied message keeps its stored handoff
+    /// as it is, as an untracked caller's view does.
+    pub(crate) fn provider_weights(&self) -> Vec<usize> {
+        self.messages
+            .iter()
+            .zip(&self.origins)
+            .zip(&self.evidence)
+            .map(|((message, origin), evidence)| {
+                let stored = message.content.as_str();
+                let handed = if *origin == MessageOrigin::CallerSupplied {
+                    std::borrow::Cow::Borrowed(stored)
+                } else {
+                    render_context_handoff_for_provider(&message.role, stored)
+                };
+                let rendered = match message.role.as_str() {
+                    "assistant" => render_assistant_content(&handed, evidence.as_deref()).into_owned(),
+                    "user" => render_user_content(&handed, evidence.as_deref()).into_owned(),
+                    _ => handed.into_owned(),
+                };
+                let mut shown = message.clone();
+                shown.content = rendered;
+                let mut block = Vec::new();
+                if message.role == "assistant"
+                    && let Some(replay) = evidence.as_deref().and_then(|evidence| evidence.replay.as_ref())
+                {
+                    block.extend(replay.messages.iter().cloned());
+                }
+                block.push(shown);
+                budgeted_tokens(estimate_history_tokens_with_source(&block))
+            })
+            .collect()
     }
 }
 
