@@ -21,8 +21,6 @@ use crate::agent::turn_contracts::{ToolCallNotification, ToolLoopCancelled, Tool
 use crate::agent::turn_history::TurnHistory;
 use crate::context::budget::anchor::{self};
 use crate::context::reduce::engine::AfterTools;
-use crate::context::reduce::ladder;
-use crate::context::reduce::trim::MidTurnTrim;
 use crate::context::transcript::{RoundLog, call_id_for};
 use crate::providers::ToolCall;
 
@@ -435,7 +433,11 @@ pub(super) async fn run_tools(
             turn_history,
             reserved_config,
         };
-        anchor::scoped(planning, Box::pin(ladder(&[&MidTurnTrim], &mut after_tools))).await?;
+        anchor::scoped(
+            planning,
+            Box::pin(crate::context::api::round::after_tools(&mut after_tools)),
+        )
+        .await?;
     }
     if let Some(tool_name) = repeated_unrecoverable {
         anyhow::bail!(

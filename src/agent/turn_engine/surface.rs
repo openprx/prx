@@ -9,13 +9,9 @@ use crate::agent::context_budget::RequestToolSurfaceCounts;
 use crate::agent::turn_history::TurnHistory;
 use crate::context::budget::anchor::{self, RequestBudget};
 use crate::context::budget::record::plan_round;
-use crate::context::reduce::clear::ClearOldResults;
-use crate::context::reduce::compact::RoundCompact;
 use crate::context::reduce::engine::{Round, Services};
-use crate::context::reduce::ladder;
 use crate::context::reduce::normalize::repair_view;
 use crate::context::reduce::preflight::PreflightCompaction;
-use crate::context::reduce::trim::RoundTrim;
 
 use super::state::{RoundBudget, RoundSurface, TurnInputs, TurnState};
 use super::{rederive_boxed, refresh_selected_tool};
@@ -236,11 +232,7 @@ pub(super) async fn plan_round_budget(
             budget: None,
         };
         let planning = probe.planning(tool_surface);
-        anchor::scoped(
-            planning,
-            Box::pin(ladder(&[&ClearOldResults, &RoundCompact, &RoundTrim], &mut round)),
-        )
-        .await?;
+        anchor::scoped(planning, Box::pin(crate::context::api::round::next_round(&mut round))).await?;
         request_budget = round
             .budget
             .map(|budget| plan_round(&usage_anchors, probe, config, budget, tool_surface));

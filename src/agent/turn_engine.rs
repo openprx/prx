@@ -50,10 +50,7 @@ use crate::agent::turn_contracts::{ToolCallNotification, ToolLoopCancelled, Tool
 use crate::agent::turn_history::{TurnHistory, same_messages};
 use crate::agent::turn_request::{ToolLoopMemory, TurnDecision, TurnDelivery, TurnRequest, TurnSchedule, TurnServices};
 use crate::context::budget::anchor;
-use crate::context::reduce::clear::ClearOldResults;
-use crate::context::reduce::compact::PreTurnCompact;
 use crate::context::reduce::engine::{PreTurn, Services, history_before_change, report_durable_compaction};
-use crate::context::reduce::ladder;
 #[cfg(test)]
 use crate::memory::{DocumentSearchResult, MemoryPrincipal};
 #[cfg(test)]
@@ -696,7 +693,7 @@ async fn run_turn_unguarded(
                 rederive: rederive_boxed,
             },
         };
-        Box::pin(ladder(&[&ClearOldResults, &PreTurnCompact], &mut pre_turn)).await?;
+        Box::pin(crate::context::api::round::pre_turn(&mut pre_turn)).await?;
     }
 
     // One inbound middleware pass per user turn. Every TUI, CLI, gateway, and
