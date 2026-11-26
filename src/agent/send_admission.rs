@@ -190,13 +190,22 @@ fn unpriced_refusal(
 /// unchanged.
 ///
 /// The answer estimate (`cost::estimate::candidate_tokens(0)`) against the live
-/// remaining decision-slice tokens only warns: that slice is derived from the
-/// model window, not configured, so a full window sends anyway and the context
-/// reducer handles it. A published tool does not veto the answer; the called
-/// tool's own estimate is the dispatch predicate (R2a-2). The priced estimate
-/// against a configured spend ceiling is the only refusal here: the request
-/// size and the response reserve feed it, so an unknown price, measurement or
-/// ledger also refuses.
+/// remaining decision-slice tokens has three cases:
+///
+/// - The slice is the default-derived one and the decision accounting is
+///   settled: the send is admitted and only warns. The slice is derived from
+///   the model window, not configured, so a full window sends and the context
+///   reducer handles it.
+/// - `decision_engine.token_ratio_limit` is configured (differs from the schema
+///   default) and the estimate exceeds the slice: refused, because an operator
+///   limit applies.
+/// - The decision accounting reports an unconfirmed settlement: refused, since
+///   its remaining tokens read as zero and the send must not proceed unaccounted.
+///
+/// A published tool does not veto the answer; the called tool's own estimate
+/// is the dispatch predicate (R2a-2). The priced estimate against a configured
+/// spend ceiling is the other refusal: the request size and the response
+/// reserve feed it, so an unknown price, measurement or ledger also refuses.
 pub(crate) fn admit_provider_send(
     service: &TurnRuntimeService,
     context: &OpenedTurn,
@@ -209,6 +218,20 @@ pub(crate) fn admit_provider_send(
     let remaining = live_g6_tokens(context);
     let answer = crate::cost::estimate::candidate_tokens(0);
     if answer > remaining {
+        let settlement_failed = context
+            .runtime()
+            .accounting
+            .as_ref()
+            .is_some_and(|scope| scope.settlement_failed());
+        let default_ratio = crate::config::schema::decision_engine::DecisionEngineConfig::default().token_ratio_limit;
+        let ratio_configured = service.advisory().config().token_ratio_limit.to_bits() != default_ratio.to_bits();
+        if settlement_failed || ratio_configured {
+            return Err(ProviderSendRefused {
+                reason: crate::agent::refusal::RefusalReason::Budget,
+                diagnostic: format!("provider send refused: answer estimates {answer} tokens but {remaining} remain"),
+            }
+            .into());
+        }
         tracing::warn!(
             answer_tokens = answer,
             remaining_tokens = remaining,

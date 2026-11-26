@@ -118,6 +118,16 @@ impl AccountingScope {
         )
     }
 
+    /// Whether this scope or an ancestor has an unconfirmed settlement. Its
+    /// remaining tokens and money then read as zero, which an exhausted budget
+    /// also does, so the flag is the only way to tell the two apart.
+    pub(crate) fn settlement_failed(&self) -> bool {
+        self.remaining
+            .get()
+            .is_some_and(|owner| owner.settlement_failed.load(Ordering::Acquire))
+            || self.parent.as_ref().is_some_and(|parent| parent.settlement_failed())
+    }
+
     pub(crate) fn remaining_budgets(&self) -> TurnBudgets {
         if self
             .remaining
