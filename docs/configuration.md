@@ -3688,7 +3688,9 @@ Fresh `prx init` starts with no paired bearer. A serialized empty
 explicitly installs a bearer and records its hash in this list; the gateway
 then reports pairing ACTIVE and accepts that bearer instead of offering a new
 one-time pairing code. Keep and use the issued file; do not remove valid
-paired credentials just to request a second pairing.
+paired credentials just to request a second pairing. A token added to or
+removed from `gateway.paired_tokens` takes effect on the running gateway after
+the config reload, with no restart needed.
 
 For mTLS messaging, run `prx a2a init`, then `prx a2a bind 127.0.0.1:16832`.
 Initialization prints the terminal-chat owner alongside the public SPIFFE identity

@@ -398,6 +398,8 @@ pub struct ConfigGenerationManager {
     desired: ArcSwap<DesiredConfigState>,
     reload_lock: Mutex<()>,
     next_generation: AtomicU64,
+    /// Count of reloads that completed successfully (see `successful_reload_count`).
+    successful_reloads: AtomicU64,
     participants: RwLock<Vec<Weak<dyn ConfigGenerationParticipant>>>,
     reload_in_progress: AtomicBool,
     last_report: RwLock<Option<ConfigApplyReport>>,
@@ -506,6 +508,7 @@ impl ConfigGenerationManager {
             desired: ArcSwap::from(desired),
             reload_lock: Mutex::new(()),
             next_generation: AtomicU64::new(next_generation),
+            successful_reloads: AtomicU64::new(0),
             participants: RwLock::new(Vec::new()),
             runtime_writes_frozen: AtomicBool::new(false),
             reload_in_progress: AtomicBool::new(false),
@@ -563,6 +566,7 @@ impl ConfigGenerationManager {
             desired: ArcSwap::from(desired),
             reload_lock: Mutex::new(()),
             next_generation: AtomicU64::new(1),
+            successful_reloads: AtomicU64::new(0),
             participants: RwLock::new(Vec::new()),
             runtime_writes_frozen: AtomicBool::new(false),
             reload_in_progress: AtomicBool::new(false),
@@ -640,6 +644,14 @@ impl ConfigGenerationManager {
     #[must_use]
     pub fn active_generation_id(&self) -> ConfigGenerationId {
         self.active.load().id
+    }
+
+    /// Number of reloads that completed successfully in this process. It moves
+    /// on every success, including one that changes nothing, and never on a
+    /// failed reload, so a reader can tell that a later reload has been seen.
+    #[must_use]
+    pub(crate) fn successful_reload_count(&self) -> u64 {
+        self.successful_reloads.load(Ordering::Acquire)
     }
 
     /// Snapshot coordinator status without exposing mutation primitives.
@@ -979,6 +991,9 @@ impl ConfigGenerationManager {
             (generation.id, generation.source_revision.clone())
         };
 
+        // The only success return of a reload: a failure at any earlier point leaves
+        // the count unchanged.
+        self.successful_reloads.fetch_add(1, Ordering::Release);
         Ok(ConfigApplyReport {
             active_generation,
             active_source_revision,

@@ -25,6 +25,18 @@ const PAIR_LOCKOUT_SECS: u64 = 300; // 5 minutes
 /// Maximum number of tracked client entries to bound memory usage.
 const MAX_TRACKED_CLIENTS: usize = 1024;
 
+/// Where an issued token stands with respect to the config file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IssuedState {
+    /// Issued by `/pair`; no save of it has been made yet.
+    Unpersisted,
+    /// Written to the config file. `observed` is the successful-reload count
+    /// read just before the reload that should adopt it. Any later successful
+    /// reload that still leaves the token out of the live list means the
+    /// operator removed it, so it is dropped.
+    Saved { observed: u64 },
+}
+
 /// Manages pairing state for the gateway.
 ///
 /// Bearer tokens are stored as SHA-256 hashes to prevent plaintext exposure
@@ -38,7 +50,7 @@ pub struct PairingGuard {
     /// One-time pairing code (generated on startup, consumed on first pair).
     pairing_code: Arc<Mutex<Option<String>>>,
     /// Set of SHA-256 hashed bearer tokens (persisted across restarts).
-    paired_tokens: Arc<Mutex<HashSet<String>>>,
+    paired_tokens: Arc<Mutex<HashMap<String, IssuedState>>>,
     /// Brute-force protection: per-client failed attempt counter + lockout time.
     failed_attempts: Arc<Mutex<HashMap<String, (u32, Option<Instant>)>>>,
     /// The owner every paired bearer acts for (HOST-1a). The gateway sets it
@@ -60,9 +72,12 @@ impl PairingGuard {
     /// - Plaintext (`zc_...`): hashed on load for backward compatibility
     /// - Already hashed (64-char hex): stored as-is
     pub fn new(require_pairing: bool, existing_tokens: &[String]) -> Self {
-        let tokens: HashSet<String> = existing_tokens
+        let tokens: HashMap<String, IssuedState> = existing_tokens
             .iter()
-            .map(|t| if is_token_hash(t) { t.clone() } else { hash_token(t) })
+            .map(|t| {
+                let hash = if is_token_hash(t) { t.clone() } else { hash_token(t) };
+                (hash, IssuedState::Unpersisted)
+            })
             .collect();
         let code = if require_pairing && tokens.is_empty() {
             Some(generate_code())
@@ -168,7 +183,7 @@ impl PairingGuard {
                     }
                     let token = generate_token();
                     let mut tokens = self.paired_tokens.lock();
-                    tokens.insert(hash_token(&token));
+                    tokens.insert(hash_token(&token), IssuedState::Unpersisted);
 
                     // Consume the pairing code so it cannot be reused
                     *pairing_code = None;
@@ -236,14 +251,25 @@ impl PairingGuard {
         }
         let hashed = hash_token(token);
         let live = self.live_hashes();
+        let reloads = self.live_tokens.as_ref().map(|shared| shared.successful_reload_count());
         let mut tokens = self.paired_tokens.lock();
         if let Some(live) = live.as_ref() {
-            // Persisted issued tokens are now held by the live list; their
-            // removal from the file must revoke them, so stop tracking them.
-            tokens.retain(|stored| !live.contains(stored));
+            // An issued token is dropped when the live list holds it (persisted,
+            // so its later removal from the file revokes it), or when a reload
+            // completed after its save and still left it out (the operator
+            // removed it). A token not yet saved is never dropped by the second rule.
+            tokens.retain(|stored, state| {
+                if live.contains(stored) {
+                    return false;
+                }
+                match (*state, reloads) {
+                    (IssuedState::Saved { observed }, Some(now)) => now == observed,
+                    _ => true,
+                }
+            });
         }
         let mut found = false;
-        for stored in live.iter().flatten().chain(tokens.iter()) {
+        for stored in live.iter().flatten().chain(tokens.keys()) {
             // constant_time_eq does NOT short-circuit — always iterates all bytes.
             // We bitwise-OR into `found` to avoid short-circuiting across hashes.
             found |= constant_time_eq(&hashed, stored);
@@ -260,11 +286,27 @@ impl PairingGuard {
         !tokens.is_empty()
     }
 
-    /// Get the paired token hashes to persist to config. With a live source
-    /// this is the issued set only (the list already holds the rest).
+    /// Get the paired token hashes to persist to config: only the ones not
+    /// saved yet. A saved hash is already in the file, or the operator removed
+    /// it on purpose, and must never be written back.
     pub fn tokens(&self) -> Vec<String> {
         let tokens = self.paired_tokens.lock();
-        tokens.iter().cloned().collect()
+        tokens
+            .iter()
+            .filter(|(_, state)| **state == IssuedState::Unpersisted)
+            .map(|(hash, _)| hash.clone())
+            .collect()
+    }
+
+    /// Record that these issued hashes were written to the config file, with
+    /// `observed` the successful-reload count read just before the reload.
+    pub(crate) fn mark_saved(&self, hashes: &[String], observed: u64) {
+        let mut tokens = self.paired_tokens.lock();
+        for hash in hashes {
+            if let Some(state) = tokens.get_mut(hash) {
+                *state = IssuedState::Saved { observed };
+            }
+        }
     }
 }
 

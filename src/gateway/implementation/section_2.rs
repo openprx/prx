@@ -885,6 +885,9 @@ async fn persist_pairing_tokens(config: &crate::config::SharedConfig, pairing: &
         .save()
         .await
         .context("Failed to persist paired tokens to config.toml")?;
+    // Saved: a reload that completes after this point and still leaves a token
+    // out means the operator removed it, so the guard stops accepting it.
+    pairing.mark_saved(&paired_tokens, config.successful_reload_count());
     let manager = Arc::clone(config);
     crate::runtime::blocking::spawn_blocking(move || {
         manager.reload_from_disk(crate::config::ConfigReloadTrigger::PairingPersistence)
