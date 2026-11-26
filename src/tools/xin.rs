@@ -11,7 +11,7 @@
 
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::config::{Config, SharedConfig};
-use crate::cron::ScheduledContext;
+use crate::cron::{ScheduledContext, ScheduledDeliver};
 use crate::security::SecurityPolicy;
 use crate::security::policy::{ApprovalGrant, PERSISTED_APPROVAL_GRANT_TTL_SECS};
 use crate::xin::store;
@@ -200,6 +200,16 @@ fn parse_context_arg(args: &serde_json::Value) -> Result<Option<ScheduledContext
     }
 }
 
+/// Parses the optional `deliver` argument. An unknown value is refused before any write.
+fn parse_deliver_arg(args: &serde_json::Value) -> Result<Option<ScheduledDeliver>, ToolResult> {
+    match args.get("deliver") {
+        None => Ok(None),
+        Some(value) => serde_json::from_value::<ScheduledDeliver>(value.clone())
+            .map(Some)
+            .map_err(|_| tool_error("Invalid deliver: use 'note', 'message' or 'none'")),
+    }
+}
+
 fn format_task_line(task: &XinTask) -> String {
     let enabled_marker = if task.enabled { "●" } else { "○" };
     format!(
@@ -243,6 +253,7 @@ fn format_task_detail(task: &XinTask) -> String {
         lines.push(format!("Interval:    {}s", task.interval_secs));
     }
     lines.push(format!("Context:     {}", task.context.as_str()));
+    lines.push(format!("Deliver:     {}", task.deliver.as_str()));
     lines.push(format!("Enabled:     {}", task.enabled));
     lines.push(format!("Runs:        {}", task.run_count));
     lines.push(format!("Failures:    {}", task.fail_count));
@@ -480,6 +491,11 @@ impl XinTool {
                                     "enum": ["task", "fresh"],
                                     "description": "'task' (default) replays the earlier runs of this task's session; 'fresh' starts every run without them. Accepted by 'add' and 'update'; goal steps always use their goal's shared session."
                                 },
+                                "deliver": {
+                                    "type": "string",
+                                    "enum": ["note", "message", "none"],
+                                    "description": "How the owner hears about a finished run: note at the next turn (default), message into the creating session, or none. A one-off agent task created from a session defaults to message. Accepted by 'add' and 'update'."
+                                },
                                 "limit": {
                                     "type": "integer",
                                     "description": "Max run-history entries (1-50, default 20)."
@@ -608,6 +624,7 @@ impl XinTool {
                         &["task_id", "payload"],
                         &["task_id", "interval_secs"],
                         &["task_id", "context"],
+                        &["task_id", "deliver"],
                     ],
                 )
             })
@@ -1053,6 +1070,20 @@ impl Tool for XinTool {
                     Ok(context) => context.unwrap_or_default(),
                     Err(refused) => return Ok(refused),
                 };
+                // A one-off agent task an agent creates from a session reports back
+                // into that session (K-R3b); every other task defaults to a note.
+                let deliver = match parse_deliver_arg(&args) {
+                    Ok(Some(deliver)) => deliver,
+                    Ok(None)
+                        if !recurring
+                            && execution_mode == ExecutionMode::AgentSession
+                            && lineage_scope.source_message_event_id.is_some() =>
+                    {
+                        ScheduledDeliver::Message
+                    }
+                    Ok(None) => ScheduledDeliver::Note,
+                    Err(refused) => return Ok(refused),
+                };
 
                 // Prevent busy-loop: recurring tasks must have ≥60s interval.
                 if recurring && interval_secs < 60 {
@@ -1090,23 +1121,29 @@ impl Tool for XinTool {
                     &creator,
                 ) {
                     Ok(task) => {
-                        // `fresh` is stored by a patch after the create (X5): a failed
-                        // patch removes the task just created.
-                        let context_note = if context == ScheduledContext::Fresh {
-                            let patch = XinTaskPatch {
-                                context: Some(ScheduledContext::Fresh),
-                                ..XinTaskPatch::default()
-                            };
-                            if let Err(error) = store::update_task(&cfg, &task.id, &patch) {
+                        // `fresh` and a non-note `deliver` are stored by a patch after the
+                        // create (X5): a failed patch removes the task just created.
+                        let stored = XinTaskPatch {
+                            context: (context == ScheduledContext::Fresh).then_some(ScheduledContext::Fresh),
+                            deliver: (deliver != ScheduledDeliver::Note).then_some(deliver),
+                            ..XinTaskPatch::default()
+                        };
+                        let mut context_note = String::new();
+                        if stored.context.is_some() || stored.deliver.is_some() {
+                            if let Err(error) = store::update_task(&cfg, &task.id, &stored) {
                                 if store::remove_task(&cfg, &task.id).is_err() {
                                     tracing::warn!(task_id = %task.id, "xin task removal after a failed context patch failed");
                                 }
                                 return Ok(tool_error(error.to_string()));
                             }
-                            ", context: fresh"
-                        } else {
-                            ""
-                        };
+                        }
+                        if stored.context.is_some() {
+                            context_note.push_str(", context: fresh");
+                        }
+                        if stored.deliver.is_some() {
+                            context_note.push_str(", deliver: ");
+                            context_note.push_str(deliver.as_str());
+                        }
                         Ok(ToolResult {
                             success: true,
                             output: format!("Created xin task: {} ({}){}", task.id, task.name, context_note),
@@ -1140,6 +1177,10 @@ impl Tool for XinTool {
                     Ok(context) => context,
                     Err(refused) => return Ok(refused),
                 };
+                let deliver = match parse_deliver_arg(&args) {
+                    Ok(deliver) => deliver,
+                    Err(refused) => return Ok(refused),
+                };
                 let payload = args
                     .get("payload")
                     .and_then(serde_json::Value::as_str)
@@ -1170,6 +1211,7 @@ impl Tool for XinTool {
                     payload,
                     interval_secs: args.get("interval_secs").and_then(serde_json::Value::as_u64),
                     context,
+                    deliver,
                     approval_grant_json,
                     // A payload rewrite re-records this call's level and agent.
                     creator: Some(crate::tools::execution::creator_stamp_from_trusted_args(&args)),
@@ -1181,9 +1223,10 @@ impl Tool for XinTool {
                     && patch.payload.is_none()
                     && patch.interval_secs.is_none()
                     && patch.context.is_none()
+                    && patch.deliver.is_none()
                 {
                     return Ok(tool_error(
-                        "At least one of name, description, priority, payload, interval_secs, or context is required",
+                        "At least one of name, description, priority, payload, interval_secs, context, or deliver is required",
                     ));
                 }
                 if existing.recurring && patch.interval_secs.is_some_and(|interval| interval < 60) {
