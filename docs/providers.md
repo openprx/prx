@@ -172,6 +172,14 @@ subscription marker and is then billed as a token price.
   four non-system messages and a live user message follows at least one earlier
   message. A prefix below the provider's minimum cacheable length is not cached
   and adds no cost.
+- OpenRouter sends `cache_control` only for models whose id starts with
+  `anthropic/`; other models get the same request as before, with no marks.
+  The marks use the same rule as the native Anthropic provider, at most three
+  per request: the system message (when over 3 KB) and the two conversation
+  breakpoints (the end of the replayed history and the last message). Only
+  plain-text messages are marked, in array form; a breakpoint that falls on a
+  tool result or an assistant tool-call message is skipped. Both streaming and
+  non-streaming requests carry the marks. Tools are unchanged.
 - OpenAI (direct) sends native `tools` with `tool_choice: "auto"` and parses
   streamed `tool_calls` deltas. Both the system-prompt and full-history streaming
   entry points use this transport and retain the selected model settings.

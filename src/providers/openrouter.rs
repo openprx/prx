@@ -1,4 +1,5 @@
 use crate::llm::route_decision::{AttemptStatus, ProviderAttempt, TokenUsage};
+use crate::providers::cache_breakpoints::{self, CacheControl};
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, ChatTrace, Provider,
     StreamChunk, StreamError, StreamOptions, StreamResult, ToolCall as ProviderToolCall,
@@ -68,11 +69,28 @@ struct UsageRequest {
 struct NativeMessage {
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
+    content: Option<MessageContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<NativeToolCall>>,
+}
+
+/// Message content as sent on the wire. Unmarked messages keep the plain
+/// string form; only messages that carry a cache breakpoint use the array form.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum MessageContent {
+    Text(String),
+    Marked(Vec<MarkedTextBlock>),
+}
+
+#[derive(Debug, Serialize)]
+struct MarkedTextBlock {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: String,
+    cache_control: CacheControl,
 }
 
 #[derive(Debug, Serialize)]
@@ -156,6 +174,68 @@ struct NativeResponseMessage {
     tool_calls: Option<Vec<NativeToolCall>>,
 }
 
+/// Mark the system message (when its text is over the cache threshold) and
+/// the conversation breakpoints, by the shared K-P1 rule. Native messages map
+/// one-to-one onto `messages`. A breakpoint on a message that is not plain text
+/// (a tool result, an assistant tool-call message, an empty message) is
+/// skipped, never reshaped.
+fn apply_cache_marks(messages: &[ChatMessage], native: &mut [NativeMessage]) {
+    if let Some((message, target)) = messages
+        .iter()
+        .zip(native.iter_mut())
+        .find(|(message, _)| message.role == "system")
+    {
+        if cache_breakpoints::should_cache_system(&message.content) {
+            mark_plain_text(target);
+        }
+    }
+
+    let non_system: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.role != "system")
+        .map(|(index, _)| index)
+        .collect();
+    if !cache_breakpoints::should_cache_conversation(non_system.len()) {
+        return;
+    }
+    let roles: Vec<&str> = non_system
+        .iter()
+        .filter_map(|index| messages.get(*index))
+        .map(|message| message.role.as_str())
+        .collect();
+    for position in cache_breakpoints::conversation_breakpoint_indices(&roles) {
+        let Some(message_index) = non_system.get(position) else {
+            continue;
+        };
+        if let Some(target) = native.get_mut(*message_index) {
+            mark_plain_text(target);
+        }
+    }
+}
+
+/// Switch a plain-text message to the marked array form. Only system, user and
+/// assistant messages with string content qualify; anything else is left as
+/// it is.
+fn mark_plain_text(message: &mut NativeMessage) {
+    if message.tool_calls.is_some() || message.tool_call_id.is_some() {
+        return;
+    }
+    if !matches!(message.role.as_str(), "system" | "user" | "assistant") {
+        return;
+    }
+    match message.content.take() {
+        Some(MessageContent::Text(text)) if !text.is_empty() => {
+            message.content = Some(MessageContent::Marked(vec![MarkedTextBlock {
+                kind: "text",
+                text,
+                cache_control: CacheControl::ephemeral(),
+            }]));
+        }
+        other => message.content = other,
+    }
+}
+
 impl OpenRouterProvider {
     pub fn new(credential: Option<&str>) -> Self {
         Self {
@@ -231,7 +311,7 @@ impl OpenRouterProvider {
                                 let content = value
                                     .get("content")
                                     .and_then(serde_json::Value::as_str)
-                                    .map(ToString::to_string);
+                                    .map(|text| MessageContent::Text(text.to_string()));
                                 return NativeMessage {
                                     role: "assistant".to_string(),
                                     content,
@@ -252,7 +332,7 @@ impl OpenRouterProvider {
                         let content = value
                             .get("content")
                             .and_then(serde_json::Value::as_str)
-                            .map(ToString::to_string);
+                            .map(|text| MessageContent::Text(text.to_string()));
                         return NativeMessage {
                             role: "tool".to_string(),
                             content,
@@ -264,12 +344,23 @@ impl OpenRouterProvider {
 
                 NativeMessage {
                     role: m.role.clone(),
-                    content: Some(m.content.clone()),
+                    content: Some(MessageContent::Text(m.content.clone())),
                     tool_call_id: None,
                     tool_calls: None,
                 }
             })
             .collect()
+    }
+
+    /// `convert_messages`, plus the cache breakpoints for `anthropic/` models.
+    /// Any other model gets exactly `convert_messages`: no mark is added and
+    /// every content stays a plain string.
+    fn convert_messages_for(messages: &[ChatMessage], model: &str) -> Vec<NativeMessage> {
+        let mut native = Self::convert_messages(messages);
+        if model.starts_with("anthropic/") {
+            apply_cache_marks(messages, &mut native);
+        }
+        native
     }
 
     fn parse_native_response(message: NativeResponseMessage) -> ProviderChatResponse {
@@ -312,7 +403,7 @@ impl OpenRouterProvider {
         let tools = self.convert_tools(request.tools, model)?;
         let native_request = NativeChatRequest {
             model: model.to_string(),
-            messages: Self::convert_messages(request.messages),
+            messages: Self::convert_messages_for(request.messages, model),
             temperature,
             stream: false,
             usage: None,
@@ -612,7 +703,7 @@ impl Provider for OpenRouterProvider {
         };
         let request = NativeChatRequest {
             model: model.to_string(),
-            messages: Self::convert_messages(messages),
+            messages: Self::convert_messages_for(messages, model),
             temperature,
             stream: true,
             usage: Some(UsageRequest { include: true }),
@@ -1083,7 +1174,7 @@ mod tests {
         let converted = OpenRouterProvider::convert_messages(&messages);
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].role, "assistant");
-        assert_eq!(converted[0].content.as_deref(), Some("Using tool"));
+        assert!(matches!(&converted[0].content, Some(MessageContent::Text(text)) if text == "Using tool"));
 
         let tool_calls = converted[0].tool_calls.as_ref().unwrap();
         assert_eq!(tool_calls.len(), 1);
@@ -1103,7 +1194,7 @@ mod tests {
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].role, "tool");
         assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_xyz"));
-        assert_eq!(converted[0].content.as_deref(), Some("done"));
+        assert!(matches!(&converted[0].content, Some(MessageContent::Text(text)) if text == "done"));
         assert!(converted[0].tool_calls.is_none());
     }
 
@@ -1113,7 +1204,7 @@ mod tests {
             model: "openai/gpt-4o".to_string(),
             messages: vec![NativeMessage {
                 role: "user".to_string(),
-                content: Some("hello".to_string()),
+                content: Some(MessageContent::Text("hello".to_string())),
                 tool_call_id: None,
                 tool_calls: None,
             }],
