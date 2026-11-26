@@ -78,6 +78,14 @@ const fn enforced_read_mode(context: Option<&MemoryWriteContext>, requested: Mem
     }
 }
 
+/// Marks FTS5 `snippet()` puts around matched words in a transcript excerpt (the
+/// FTS path of `search_transcripts`). Private-use characters: normal text does
+/// not contain them and redaction patterns do not treat them specially.
+/// Readers strip both marks before redacting or displaying an excerpt.
+pub const TRANSCRIPT_MATCH_OPEN: char = '\u{E000}';
+/// Closing mark of [`TRANSCRIPT_MATCH_OPEN`].
+pub const TRANSCRIPT_MATCH_CLOSE: char = '\u{E001}';
+
 /// Core memory trait — implement for any persistence backend
 #[async_trait]
 pub trait Memory: Send + Sync {

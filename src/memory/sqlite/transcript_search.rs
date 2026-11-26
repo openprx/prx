@@ -1,10 +1,12 @@
 //! Full-text index over transcript rows (`message_events.content`) and the
 //! search over it.
 //!
-//! The FTS5 table and its three triggers are created on the first search or by
-//! the warm-up at process start, whichever comes first, not in `schema.rs`, so
-//! a brain.db that never searches carries no index and the schema stamp is
-//! unchanged. The index is external-content: it stores no copy
+//! The FTS5 table and its three triggers are not in `schema.rs`, so the schema
+//! stamp is unchanged. They are created by the warm-up at process start, which
+//! every process that registers tools runs in the background. From then on
+//! every message insert pays the trigger cost. When the warm-up did not run (no
+//! runtime, or a failure), the first search creates them instead. The index is
+//! external-content: it stores no copy
 //! of the text, only the FTS5 structures, and it indexes every row. It uses the
 //! trigram tokenizer, so Chinese and other scripts without spaces match as
 //! substrings. Filters (owner, workspace, agent partition, erased scopes,
@@ -15,7 +17,7 @@
 use super::SqliteMemory;
 use super::erasure_pool::MemoryPool;
 use super::events::{MA_SCOPE_COLUMN, numbered_placeholders, partition_conjunct};
-use crate::memory::traits::{MemoryPrincipal, TranscriptHit};
+use crate::memory::traits::{MemoryPrincipal, TRANSCRIPT_MATCH_CLOSE, TRANSCRIPT_MATCH_OPEN, TranscriptHit};
 use crate::memory::{AgentPartition, PartitionKey};
 use crate::runtime::sqlite_pool::begin_immediate;
 use rusqlite::Connection;
@@ -124,7 +126,9 @@ impl SqliteMemory {
                     (
                         format!("{INDEX_TABLE} JOIN message_events e ON e.id = {INDEX_TABLE}.rowid"),
                         conditions.join(" AND "),
-                        format!("snippet({INDEX_TABLE}, 0, '[', ']', '...', 24)"),
+                        format!(
+                            "snippet({INDEX_TABLE}, 0, '{TRANSCRIPT_MATCH_OPEN}', '{TRANSCRIPT_MATCH_CLOSE}', '...', 24)"
+                        ),
                         format!("bm25({INDEX_TABLE})"),
                     )
                 }

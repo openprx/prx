@@ -1883,7 +1883,10 @@ before the first word.
 
 The index is built on the first search, or at process start by a background
 warm-up, so a search does not pay for building it. Each hit prints its time,
-session, role and an excerpt with secrets redacted. No match returns
+session, role and an excerpt. Excerpts are redacted for secrets after the match
+highlight is removed, so a hit that matches part of a secret shows it redacted.
+An excerpt is at most about 200 characters and may be cut at its edge, so a
+secret that spans the edge can appear cut rather than redacted. No match returns
 `No earlier conversation matched.`
 
 ## Flat built-in tool schemas

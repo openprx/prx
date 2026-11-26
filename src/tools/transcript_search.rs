@@ -5,7 +5,7 @@ use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use super::transcript_history_lookup::TranscriptHistoryLookupTool;
 use crate::agent::diagnostics::error_class;
 use crate::memory::Memory;
-use crate::memory::traits::TranscriptHit;
+use crate::memory::traits::{TRANSCRIPT_MATCH_CLOSE, TRANSCRIPT_MATCH_OPEN, TranscriptHit};
 use crate::security::redaction::redact_secrets;
 use async_trait::async_trait;
 use serde_json::json;
@@ -51,12 +51,23 @@ pub(crate) fn warm_index_in_background(memory: Arc<dyn Memory>) {
     });
 }
 
-/// One line per hit: the time, the session, the role and the excerpt, with
-/// secrets redacted and line breaks flattened.
+/// The excerpt as shown: the FTS match marks removed, then secrets redacted on
+/// the clean text, so no mark can split a secret, then line breaks flattened.
+/// The marks are not replaced by brackets, so a highlighted hit shows no
+/// highlight here.
+fn clean_excerpt(excerpt: &str) -> String {
+    let stripped: String = excerpt
+        .chars()
+        .filter(|ch| *ch != TRANSCRIPT_MATCH_OPEN && *ch != TRANSCRIPT_MATCH_CLOSE)
+        .collect();
+    redact_secrets(&stripped).replace(['\r', '\n'], " ")
+}
+
+/// One line per hit: the time, the session, the role and the clean excerpt.
 fn render_hits(hits: &[TranscriptHit]) -> String {
     hits.iter()
         .map(|hit| {
-            let excerpt = redact_secrets(&hit.excerpt).replace(['\r', '\n'], " ");
+            let excerpt = clean_excerpt(&hit.excerpt);
             format!(
                 "{} {} {}: {excerpt}",
                 hit.created_at,
