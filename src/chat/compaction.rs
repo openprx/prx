@@ -398,7 +398,7 @@ pub(super) async fn build_chat_compaction_patch(
     .await
     {
         Ok(CompactionBuild::Patch(patch)) => Some(patch),
-        Ok(CompactionBuild::NotNeeded | CompactionBuild::Suppressed) => None,
+        Ok(CompactionBuild::NotNeeded(_) | CompactionBuild::Suppressed) => None,
         Err(error) => {
             let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
             tracing::warn!(

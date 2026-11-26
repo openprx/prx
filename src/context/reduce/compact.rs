@@ -64,7 +64,7 @@ impl<'a> Reducer<PreTurn<'a>> for PreTurnCompact {
                 .await?;
                 (services.rederive)(state.turn_history, state.history, services.hooks, services.channel_name).await;
             }
-            Ok(CompactionApply::NotNeeded | CompactionApply::Suppressed) => {}
+            Ok(CompactionApply::NotNeeded(_) | CompactionApply::Suppressed) => {}
             Err(error) => {
                 let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
                 tracing::warn!(error_len, error_sha256, "Pre-turn compaction failed");

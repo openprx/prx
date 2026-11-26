@@ -1777,8 +1777,8 @@ async fn run_turn_unguarded(
                                     }
                                 }
                             }
-                            Ok(CompactionBuild::NotNeeded) => {
-                                degraded_reason = Some("handoff_unavailable");
+                            Ok(CompactionBuild::NotNeeded(not_built)) => {
+                                degraded_reason = Some(not_built.degraded_reason());
                                 None
                             }
                             // An automatic switch this turn already spent: the trim below is the

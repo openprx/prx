@@ -2241,7 +2241,7 @@ async fn apply_redux_context_rollover(
         // no patch at all: the caller's trim is the whole remediation, and it is
         // lossy. Summary mode returns `None` when there is simply nothing to
         // compact, which is not a degradation.
-        Ok(crate::agent::compaction::CompactionBuild::NotNeeded) => {
+        Ok(crate::agent::compaction::CompactionBuild::NotNeeded(not_built)) => {
             let degraded = matches!(config.mode, crate::config::AgentCompactionMode::Switch);
             if degraded {
                 tracing::warn!(
@@ -2257,7 +2257,7 @@ async fn apply_redux_context_rollover(
                 crate::agent::compaction::persist_context_switch_degradation(
                     audit,
                     trigger,
-                    "handoff_unavailable",
+                    not_built.degraded_reason(),
                     budget.used_tokens,
                     after_trim.used_tokens,
                     budget.available_input_tokens,

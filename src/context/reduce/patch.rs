@@ -76,17 +76,60 @@ impl CompactionDemand {
     }
 }
 
+/// Why a compaction built no patch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NotNeededReason {
+    /// The history is within the limit, or compaction is off.
+    BelowLimit,
+    /// Nothing before the live turn can be folded enough to fit the limit.
+    NothingFoldable,
+    /// Exact transcript provenance could not be resolved.
+    ProvenanceUnavailable,
+    /// No durable transcript scope to write the handoff to.
+    NoAudit,
+    /// The handoff note is too large or does not validate.
+    Oversized,
+}
+
+impl NotNeededReason {
+    /// The degraded reason a caller reports when a switch is not built and the
+    /// turn continues on its trim.
+    pub(crate) const fn degraded_reason(self) -> &'static str {
+        match self {
+            Self::BelowLimit => "below_limit",
+            Self::NothingFoldable => "nothing_foldable",
+            Self::ProvenanceUnavailable | Self::NoAudit | Self::Oversized => "handoff_unavailable",
+        }
+    }
+}
+
 /// What the builder decided for one compaction demand.
 pub(crate) enum CompactionBuild {
-    /// No patch: nothing to compact for this demand, or no exact handoff could
-    /// be produced (the caller degrades as it always did).
-    NotNeeded,
+    /// No patch, with the reason. A switch that is not built degrades to the
+    /// caller's trim, labelled by [`NotNeededReason::degraded_reason`].
+    NotNeeded(NotNeededReason),
     /// A patch that replaces the cold window.
     Patch(CompactionPatch),
     /// An automatic `switch` this admitted turn already spent: one succeeded
     /// earlier in the turn. Nothing is built, and nothing is
     /// reported as a degradation; the turn fits its request instead.
     Suppressed,
+}
+
+/// Tokens a switch leaves room for in the handoff note it writes.
+const HANDOFF_NOTE_ALLOWANCE_TOKENS: usize = 600;
+
+/// The fewest leading weights whose sum reaches `needed`, or `None` when all of
+/// them together fall short. `Some(0)` when nothing is needed.
+fn leading_count_covering(weights: &[usize], needed: usize) -> Option<usize> {
+    let mut covered = 0usize;
+    for (index, weight) in weights.iter().enumerate() {
+        if covered >= needed {
+            return Some(index);
+        }
+        covered = covered.saturating_add(*weight);
+    }
+    (covered >= needed).then_some(weights.len())
 }
 
 #[cfg(test)]
@@ -105,7 +148,7 @@ pub(crate) async fn build_configurable_compaction_patch(
     .await?
     {
         CompactionBuild::Patch(patch) => Ok(Some(patch)),
-        CompactionBuild::NotNeeded => Ok(None),
+        CompactionBuild::NotNeeded(_) => Ok(None),
         CompactionBuild::Suppressed => anyhow::bail!("context switch suppressed: the turn spent its switch budget"),
     }
 }
@@ -120,10 +163,10 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
     trigger: &'static str,
 ) -> Result<CompactionBuild> {
     let Some(limit) = compaction_trigger_limit(config) else {
-        return Ok(CompactionBuild::NotNeeded);
+        return Ok(CompactionBuild::NotNeeded(NotNeededReason::BelowLimit));
     };
     if !CompactionDemand::from_trigger(trigger).is_forced() && planning_history_tokens(budget_history) <= limit {
-        return Ok(CompactionBuild::NotNeeded);
+        return Ok(CompactionBuild::NotNeeded(NotNeededReason::BelowLimit));
     }
     // One successful automatic switch per admitted turn.
     // Manual `/compact` is outside the budget and always builds.
@@ -147,11 +190,11 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
     let start = if has_system { 1 } else { 0 };
     let non_system_count = source_history.len().saturating_sub(start);
     if non_system_count <= 1 {
-        return Ok(CompactionBuild::NotNeeded);
+        return Ok(CompactionBuild::NotNeeded(NotNeededReason::NothingFoldable));
     }
 
     // Weighed by what the provider view sends for each message (replayed tool
-    // rounds and recall prefix included), not by its stored text alone.
+    // rounds included), not by its stored text alone.
     let provider_weights = source.provider_weights();
     let non_system = source_history.get(start..).unwrap_or_default();
     let requested_keep_recent = crate::agent::budget_inputs::effective_keep_recent_weighted(
@@ -159,9 +202,30 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
         crate::agent::budget_inputs::keep_recent_cap(config, non_system.len()),
         config,
     );
-    let requested_compact_count = non_system_count.saturating_sub(requested_keep_recent);
+    // An automatic switch folds at least enough oldest messages to bring the
+    // request under the limit with room for the handoff note. The fold stops at
+    // the live turn; when that cannot free enough, nothing is folded. A manual
+    // `/compact` keeps the keep-recent count alone.
+    let fit_count = if automatic_switch {
+        let live_start = source_history
+            .iter()
+            .rposition(|message| message.role == "user")
+            .filter(|&index| index > start)
+            .unwrap_or(source_history.len().saturating_sub(1))
+            .max(start);
+        let excess = planning_history_tokens(budget_history)
+            .saturating_sub(limit)
+            .saturating_add(HANDOFF_NOTE_ALLOWANCE_TOKENS);
+        match leading_count_covering(provider_weights.get(start..live_start).unwrap_or_default(), excess) {
+            Some(count) => count,
+            None => return Ok(CompactionBuild::NotNeeded(NotNeededReason::NothingFoldable)),
+        }
+    } else {
+        0
+    };
+    let requested_compact_count = non_system_count.saturating_sub(requested_keep_recent).max(fit_count);
     if requested_compact_count == 0 {
-        return Ok(CompactionBuild::NotNeeded);
+        return Ok(CompactionBuild::NotNeeded(NotNeededReason::NothingFoldable));
     }
     // Never cut inside a tool round-trip: an orphan `role="tool"` result whose
     // requesting assistant message was compacted away is rejected by every
@@ -175,7 +239,7 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
     let compact_end = compaction_boundary_without_orphan_tool_results(&companions, start, requested_end);
     let compact_count = compact_end.saturating_sub(start);
     if compact_count == 0 {
-        return Ok(CompactionBuild::NotNeeded);
+        return Ok(CompactionBuild::NotNeeded(NotNeededReason::NothingFoldable));
     }
     let keep_recent = source_history.len().saturating_sub(compact_end);
     let compacted_source_messages = source_history.get(start..compact_end);
@@ -205,7 +269,7 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
         .await;
     }
     let Some(guard) = compaction_patch_guard_for(source_history, start, compact_end) else {
-        return Ok(CompactionBuild::NotNeeded);
+        return Ok(CompactionBuild::NotNeeded(NotNeededReason::NothingFoldable));
     };
     let timestamp = chrono::Utc::now().to_rfc3339();
 
@@ -215,7 +279,7 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
                 trigger,
                 "context switch skipped because durable transcript scope is unavailable"
             );
-            return Ok(CompactionBuild::NotNeeded);
+            return Ok(CompactionBuild::NotNeeded(NotNeededReason::NoAudit));
         };
         let Some(source) = audit_source.as_ref().filter(|source| {
             matches!(
@@ -236,10 +300,10 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
                 provenance_status = %status,
                 "context switch skipped because exact transcript provenance is unavailable"
             );
-            return Ok(CompactionBuild::NotNeeded);
+            return Ok(CompactionBuild::NotNeeded(NotNeededReason::ProvenanceUnavailable));
         };
         let Some(range) = source.source_event_range.as_ref() else {
-            return Ok(CompactionBuild::NotNeeded);
+            return Ok(CompactionBuild::NotNeeded(NotNeededReason::ProvenanceUnavailable));
         };
         let (from_generation, parent_handoff_event_id) = context_handoff_lineage(source_history);
         let to_generation = from_generation.saturating_add(1);
@@ -300,7 +364,7 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
                 referenced_events = source.source_event_ids.len(),
                 "context switch skipped because the handoff note is oversized or does not validate"
             );
-            return Ok(CompactionBuild::NotNeeded);
+            return Ok(CompactionBuild::NotNeeded(NotNeededReason::Oversized));
         }
         // The stored attachments of the session's own rows (the same key the switch
         // row is written to), so the summary reads each user message's own words. A
@@ -345,7 +409,7 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
                 referenced_events = source.source_event_ids.len(),
                 "context switch skipped because the handoff note is oversized or does not validate"
             );
-            return Ok(CompactionBuild::NotNeeded);
+            return Ok(CompactionBuild::NotNeeded(NotNeededReason::Oversized));
         }
         persist_context_switch(audit, trigger, source, &handoff_event_id, &handoff_message, &note_json).await?;
         if automatic_switch {
@@ -363,7 +427,7 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
         .map(bounded_compaction_projection)
         .unwrap_or_default();
     if source_projection.is_empty() {
-        return Ok(CompactionBuild::NotNeeded);
+        return Ok(CompactionBuild::NotNeeded(NotNeededReason::NothingFoldable));
     }
 
     // FU-02c-AUX-SENDS: compaction summarizer is exempt from admit_provider_send.
@@ -475,7 +539,7 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
             truncate_with_ellipsis(&summary, COMPACTION_MAX_SUMMARY_CHARS)
         }
         crate::config::AgentCompactionMode::Switch | crate::config::AgentCompactionMode::Off => {
-            return Ok(CompactionBuild::NotNeeded);
+            return Ok(CompactionBuild::NotNeeded(NotNeededReason::NothingFoldable));
         }
     };
     // The summarizer reads the very turns that may still carry a fabricated
@@ -559,7 +623,7 @@ pub(crate) async fn apply_configurable_compaction_over_view(
     .await?
     {
         CompactionBuild::Patch(patch) => patch,
-        CompactionBuild::NotNeeded => return Ok(CompactionApply::NotNeeded),
+        CompactionBuild::NotNeeded(reason) => return Ok(CompactionApply::NotNeeded(reason)),
         CompactionBuild::Suppressed => return Ok(CompactionApply::Suppressed),
     };
     crate::agent::idle::beat(crate::agent::idle::ProgressKind::Compaction);
@@ -572,7 +636,7 @@ pub(crate) async fn apply_configurable_compaction_over_view(
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum CompactionApply {
     /// Nothing applied; see [`CompactionBuild::NotNeeded`].
-    NotNeeded,
+    NotNeeded(NotNeededReason),
     /// Applied; the replacement's length in the canonical history.
     Applied(usize),
     /// An automatic switch the turn already spent; nothing was applied.

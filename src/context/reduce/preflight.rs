@@ -113,10 +113,10 @@ pub(crate) async fn preflight_durable_compaction(
             })
         }
         // A suppressed automatic switch leaves the turn to its trim below.
-        Ok(CompactionApply::NotNeeded) => Ok(PreflightCompaction {
+        Ok(CompactionApply::NotNeeded(reason)) => Ok(PreflightCompaction {
             source: None,
             replacement_len: None,
-            degraded_reason: is_switch.then_some("handoff_unavailable"),
+            degraded_reason: is_switch.then_some(reason.degraded_reason()),
         }),
         Ok(CompactionApply::Suppressed) => Ok(PreflightCompaction {
             source: None,
