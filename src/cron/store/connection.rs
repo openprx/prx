@@ -1,4 +1,10 @@
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use anyhow::{Context, Result};
+use parking_lot::Mutex;
 use rusqlite::Connection;
 
 use crate::config::Config;
@@ -30,6 +36,38 @@ fn add_column_if_missing(conn: &Connection, table: &str, name: &str, sql_type: &
     }
 }
 
+/// Database files whose schema batch has succeeded in this process, keyed by
+/// canonical path. The batch is idempotent, so two first openers racing only
+/// repeat work; a batch that fails is never recorded.
+static MIGRATED_PATHS: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
+static WAL_SWITCH_WARNED: AtomicBool = AtomicBool::new(false);
+
+fn migrated_paths() -> &'static Mutex<BTreeSet<PathBuf>> {
+    MIGRATED_PATHS.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+fn is_migrated(path: &Path) -> bool {
+    migrated_paths().lock().contains(path)
+}
+
+fn mark_migrated(path: PathBuf) {
+    migrated_paths().lock().insert(path);
+}
+
+/// `journal_mode` is persistent per file, so this is a no-op once the file is
+/// WAL. A failed switch must not fail the call: the file keeps its journal mode
+/// and the failure is logged once per process.
+fn switch_to_wal(conn: &Connection, db_path: &Path) {
+    let detail = match conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get::<_, String>(0)) {
+        Ok(mode) if mode.eq_ignore_ascii_case("wal") => return,
+        Ok(mode) => format!("journal_mode is {mode}"),
+        Err(error) => error.to_string(),
+    };
+    if !WAL_SWITCH_WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(path = %db_path.display(), "cron DB stays in its current journal mode: {detail}");
+    }
+}
+
 pub(super) fn with_connection<T>(config: &Config, f: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
     let db_path = config.workspace_dir.join("cron").join("jobs.db");
     if let Some(parent) = db_path.parent() {
@@ -46,9 +84,37 @@ pub(super) fn with_connection<T>(config: &Config, f: impl FnOnce(&mut Connection
     // would surface `SQLITE_BUSY` the moment it expired.
     crate::runtime::sqlite_pool::install_busy_handler(&mut conn)?;
 
+    switch_to_wal(&conn, &db_path);
+    conn.execute_batch("PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON; PRAGMA secure_delete=ON;")
+        .context("Failed to set cron connection pragmas")?;
+
+    let migrated_key = std::fs::canonicalize(&db_path)
+        .with_context(|| format!("Failed to resolve cron DB path: {}", db_path.display()))?;
+    if !is_migrated(&migrated_key) {
+        migrate_schema(&conn)?;
+        mark_migrated(migrated_key);
+    }
+
+    conn.execute(
+        "UPDATE cron_jobs
+         SET terminal_state = CASE WHEN last_status = 'ok' THEN 'succeeded' ELSE 'failed' END,
+             enabled = 0
+         WHERE terminal_state IS NULL AND last_run IS NOT NULL AND last_status IN ('ok', 'error')
+           AND schedule LIKE '%\"kind\":\"at\"%'",
+        [],
+    )
+    .context("Failed to backfill terminal state for historical one-shot jobs")?;
+
+    let result = f(&mut conn);
+    if let Err(error) = deliver_pending_cron_event_outbox(&conn) {
+        tracing::warn!("failed to drain Cron event outbox: {error}");
+    }
+    result
+}
+
+fn migrate_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
-        "PRAGMA foreign_keys = ON; PRAGMA secure_delete=ON;
-         CREATE TABLE IF NOT EXISTS cron_job_owners(job_id TEXT PRIMARY KEY,owner_id TEXT,creator_agent TEXT NOT NULL);
+        "CREATE TABLE IF NOT EXISTS cron_job_owners(job_id TEXT PRIMARY KEY,owner_id TEXT,creator_agent TEXT NOT NULL);
          CREATE TABLE IF NOT EXISTS cron_jobs (
             id               TEXT PRIMARY KEY,
             version          INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
@@ -136,55 +202,55 @@ pub(super) fn with_connection<T>(config: &Config, f: impl FnOnce(&mut Connection
     )
     .context("Failed to initialize cron schema")?;
 
-    add_column_if_missing(&conn, "cron_jobs", "owner_id", "TEXT")?;
-    add_column_if_missing(&conn, "cron_jobs", "topic_id", "TEXT")?;
-    add_column_if_missing(&conn, "cron_jobs", "parent_task_id", "TEXT")?;
-    add_column_if_missing(&conn, "cron_jobs", "source_message_event_id", "TEXT")?;
-    add_column_if_missing(&conn, "cron_jobs", "schedule", "TEXT")?;
-    add_column_if_missing(&conn, "cron_jobs", "job_type", "TEXT NOT NULL DEFAULT 'shell'")?;
-    add_column_if_missing(&conn, "cron_jobs", "prompt", "TEXT")?;
-    add_column_if_missing(&conn, "cron_jobs", "name", "TEXT")?;
-    add_column_if_missing(&conn, "cron_jobs", "session_target", "TEXT NOT NULL DEFAULT 'isolated'")?;
-    add_column_if_missing(&conn, "cron_jobs", "model", "TEXT")?;
-    add_column_if_missing(&conn, "cron_jobs", "enabled", "INTEGER NOT NULL DEFAULT 1")?;
-    add_column_if_missing(&conn, "cron_jobs", "delivery", "TEXT")?;
-    add_column_if_missing(&conn, "cron_jobs", "delete_after_run", "INTEGER NOT NULL DEFAULT 0")?;
-    add_column_if_missing(&conn, "cron_jobs", "last_run", "TEXT")?;
-    add_column_if_missing(&conn, "cron_jobs", "last_status", "TEXT")?;
-    add_column_if_missing(&conn, "cron_jobs", "last_output", "TEXT")?;
-    add_column_if_missing(&conn, "cron_jobs", "terminal_state", "TEXT")?;
-    add_column_if_missing(&conn, "cron_jobs", "approval_grant_json", "TEXT")?;
-    add_column_if_missing(&conn, "cron_jobs", "claim_owner", "TEXT")?;
-    add_column_if_missing(&conn, "cron_jobs", "attempt_id", "TEXT")?;
-    add_column_if_missing(&conn, "cron_jobs", "claimed_at", "TEXT")?;
-    add_column_if_missing(&conn, "cron_jobs", "claim_expires_at", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "owner_id", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "topic_id", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "parent_task_id", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "source_message_event_id", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "schedule", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "job_type", "TEXT NOT NULL DEFAULT 'shell'")?;
+    add_column_if_missing(conn, "cron_jobs", "prompt", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "name", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "session_target", "TEXT NOT NULL DEFAULT 'isolated'")?;
+    add_column_if_missing(conn, "cron_jobs", "model", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "enabled", "INTEGER NOT NULL DEFAULT 1")?;
+    add_column_if_missing(conn, "cron_jobs", "delivery", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "delete_after_run", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "cron_jobs", "last_run", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "last_status", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "last_output", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "terminal_state", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "approval_grant_json", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "claim_owner", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "attempt_id", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "claimed_at", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "claim_expires_at", "TEXT")?;
     // Outbound-authorization identity (T17). Nullable on purpose: a row written
     // before these columns existed, or by anything outside the tool path, keeps
     // NULL and is authorized as the least privileged caller — see
     // `DeliveryPrincipal`. Nothing is backfilled, because there is no honest
     // value to invent for a job whose creator was never recorded.
-    add_column_if_missing(&conn, "cron_jobs", "creator_sender", "TEXT")?;
-    add_column_if_missing(&conn, "cron_jobs", "creator_channel", "TEXT")?;
-    add_column_if_missing(&conn, "cron_jobs", "creator_chat_type", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "creator_sender", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "creator_channel", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "creator_chat_type", "TEXT")?;
     // CRON-ORIGIN: nullable with no backfill. A row stored before this column
     // existed has no provable creator and reads as `JobOrigin::Unattributed`,
     // so it never runs with operator authority; no path wrote agent jobs that
     // only a local operator could reach (the `prx cron` CLI writes shell jobs).
-    add_column_if_missing(&conn, "cron_jobs", "origin", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "origin", "TEXT")?;
     // D-107 amendment: which surface created the job. Nullable with no
     // backfill: a row stored before the column existed reads as
     // `agent_tool` until the operator marks it.
-    add_column_if_missing(&conn, "cron_jobs", "created_via", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "created_via", "TEXT")?;
     // The creating call's level and agent. Nullable with no backfill: a row
     // without them runs at Main's level.
-    add_column_if_missing(&conn, "cron_jobs", "creator_level", "TEXT")?;
-    add_column_if_missing(&conn, "cron_jobs", "creator_agent", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "creator_level", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "creator_agent", "TEXT")?;
     // Whether a scheduled run replays its session's earlier runs. Every
     // existing row reads `task`, the behaviour before this column.
-    add_column_if_missing(&conn, "cron_jobs", "context", "TEXT NOT NULL DEFAULT 'task'")?;
-    add_column_if_missing(&conn, "cron_runs", "attempt_id", "TEXT")?;
-    add_column_if_missing(&conn, "cron_runs", "worker_id", "TEXT")?;
-    add_column_if_missing(&conn, "cron_job_events", "source_message_event_id", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "context", "TEXT NOT NULL DEFAULT 'task'")?;
+    add_column_if_missing(conn, "cron_runs", "attempt_id", "TEXT")?;
+    add_column_if_missing(conn, "cron_runs", "worker_id", "TEXT")?;
+    add_column_if_missing(conn, "cron_job_events", "source_message_event_id", "TEXT")?;
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_cron_jobs_owner ON cron_jobs(owner_id, enabled, next_run);
          CREATE INDEX IF NOT EXISTS idx_cron_jobs_topic ON cron_jobs(topic_id, enabled, next_run);
@@ -193,20 +259,5 @@ pub(super) fn with_connection<T>(config: &Config, f: impl FnOnce(&mut Connection
             ON cron_runs(job_id, attempt_id) WHERE attempt_id IS NOT NULL;",
     )
     .context("Failed to initialize cron lineage indexes")?;
-
-    conn.execute(
-        "UPDATE cron_jobs
-         SET terminal_state = CASE WHEN last_status = 'ok' THEN 'succeeded' ELSE 'failed' END,
-             enabled = 0
-         WHERE terminal_state IS NULL AND last_run IS NOT NULL AND last_status IN ('ok', 'error')
-           AND schedule LIKE '%\"kind\":\"at\"%'",
-        [],
-    )
-    .context("Failed to backfill terminal state for historical one-shot jobs")?;
-
-    let result = f(&mut conn);
-    if let Err(error) = deliver_pending_cron_event_outbox(&conn) {
-        tracing::warn!("failed to drain Cron event outbox: {error}");
-    }
-    result
+    Ok(())
 }
