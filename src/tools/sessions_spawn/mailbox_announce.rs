@@ -117,12 +117,15 @@ impl MailboxAnnouncement {
 /// its result (bounded).
 fn announcement_text(run_id: &str, completed: bool, result_text: &str) -> String {
     let outcome = if completed { "completed" } else { "FAILED" };
+    let head = format!(
+        "Sub-agent `{run_id}` has finished ({outcome}). This is an automatic completion notice for a run you already started, not a new request; that run's task is done."
+    );
     let detail = result_text.trim();
     if detail.is_empty() {
-        return format!("Sub-agent `{run_id}` {outcome}");
+        return format!("{head}\nResult: (empty)");
     }
     format!(
-        "Sub-agent `{run_id}` {outcome}:\n{}",
+        "{head}\nResult:\n{}",
         crate::util::truncate_with_ellipsis(detail, ANNOUNCE_RESULT_MAX_CHARS)
     )
 }
