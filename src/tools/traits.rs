@@ -162,6 +162,9 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// Rewrite the raw arguments before the contract check; the default leaves them unchanged.
+    fn normalize_arguments(&self, _arguments: &mut serde_json::Value) {}
+
     /// Execute the tool with given arguments
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult>;
 

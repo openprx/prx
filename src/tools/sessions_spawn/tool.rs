@@ -237,16 +237,19 @@ impl Tool for SessionsSpawnTool {
         *self.channel.write().await = channel;
     }
 
-    async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    fn normalize_arguments(&self, arguments: &mut serde_json::Value) {
         // A `brief` or `references` given as null, blank or empty means "not
-        // given": drop it before validation. The published schema is unchanged.
-        if let Some(object) = args.as_object_mut() {
+        // given": drop it before the contract check. The published schema is unchanged.
+        if let Some(object) = arguments.as_object_mut() {
             for key in ["brief", "references"] {
                 if object.get(key).is_some_and(super::brief::is_absent) {
                     object.remove(key);
                 }
             }
         }
+    }
+
+    async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
         crate::tools::schema::validate_execution_contract(self.name(), self.execution_schema(), &mut args)?;
         crate::tools::execution::verify_current_child_call("sessions_spawn")?;
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("spawn");

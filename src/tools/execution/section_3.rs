@@ -243,6 +243,9 @@ impl ToolExecutionService {
         // the gateway MCP server, which ran outside it until 0.8.126. The
         // contract enforced is the one the caller was shown: see
         // `ToolExecutionContext::schema_dialect`.
+        // Absent-value normalisation (null, blank or empty optional fields) runs
+        // before the contract check, so such calls are not refused.
+        resolved.backend.normalize_arguments(&mut command.arguments);
         let contract = enforce_command_contract(&mut command.arguments, &descriptor, context.schema_dialect);
         if let Err(error) = contract {
             return self

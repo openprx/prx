@@ -68,6 +68,8 @@ pub trait ToolBackend: Send + Sync {
     fn execution_parameters_schema(&self) -> Option<Arc<serde_json::Value>> {
         None
     }
+    /// Absent-value normalisation of the raw arguments; runs before the contract check.
+    fn normalize_arguments(&self, _arguments: &mut serde_json::Value) {}
     fn root_name(&self) -> &str;
     fn specs(&self) -> Vec<ToolSpec>;
     fn catalog_specs(&self) -> Vec<ToolSpec> {
@@ -154,6 +156,11 @@ impl ToolBackend for SharedRegistryToolAdapter {
 
     fn execution_parameters_schema(&self) -> Option<Arc<serde_json::Value>> {
         self.tool()?.execution_parameters_schema()
+    }
+    fn normalize_arguments(&self, arguments: &mut serde_json::Value) {
+        if let Some(tool) = self.tool() {
+            tool.normalize_arguments(arguments);
+        }
     }
     fn supports_owner_filesystem(&self) -> bool {
         self.tool().is_some_and(Tool::supports_owner_filesystem)
@@ -285,6 +292,9 @@ impl ToolBackend for LegacyToolAdapter {
 
     fn execution_parameters_schema(&self) -> Option<Arc<serde_json::Value>> {
         self.tool.execution_parameters_schema()
+    }
+    fn normalize_arguments(&self, arguments: &mut serde_json::Value) {
+        self.tool.normalize_arguments(arguments);
     }
     fn supports_owner_filesystem(&self) -> bool {
         self.tool.supports_owner_filesystem()

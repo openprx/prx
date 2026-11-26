@@ -1640,6 +1640,12 @@ impl Tool for ToolArcRef {
             .flatten()
     }
 
+    fn normalize_arguments(&self, arguments: &mut serde_json::Value) {
+        if self.name() == self.inner.name() {
+            self.inner.normalize_arguments(arguments);
+        }
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         if let Some(spec) = &self.public_spec {
             self.inner.execute_named(&spec.name, args).await

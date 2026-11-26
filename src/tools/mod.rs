@@ -275,6 +275,10 @@ impl Tool for ArcDelegatingTool {
         self.inner.execution_parameters_schema()
     }
 
+    fn normalize_arguments(&self, arguments: &mut serde_json::Value) {
+        self.inner.normalize_arguments(arguments);
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.inner.execute(args).await
     }

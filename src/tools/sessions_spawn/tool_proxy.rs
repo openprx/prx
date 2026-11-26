@@ -64,6 +64,12 @@ impl Tool for AllowedToolProxy {
         })
     }
 
+    fn normalize_arguments(&self, arguments: &mut serde_json::Value) {
+        if let Some(tool) = self.find_source_tool() {
+            tool.normalize_arguments(arguments);
+        }
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let Some(tool) = self.find_source_tool() else {
             return Ok(ToolResult {
