@@ -6,7 +6,7 @@
 //! erasure requires a backend that implements the ownership-index contract.
 
 use crate::memory::RAMFLUX_MEMORY_KEY_PREFIX;
-use crate::memory::traits::{ConversationTurn, Memory, MemoryCategory, MemoryEntry};
+use crate::memory::traits::{ConversationTurn, Memory, MemoryCategory, MemoryEntry, MemoryPrincipal};
 use crate::security::ramflux_aead::{AccountCrypto, CryptoError, id_hash};
 use anyhow::Context;
 use async_trait::async_trait;
@@ -418,6 +418,24 @@ impl Memory for EncryptedScope {
                 entry.key = record_id;
                 own.push(entry);
             }
+        }
+        own.truncate(limit);
+        Ok(own)
+    }
+
+    /// The inner store's newest core rows of `principal`, narrowed to this scope
+    /// and decrypted the way `list_key_prefix` does. The inner read is unbounded
+    /// because rows of other scopes are dropped after it, as `list_key_prefix` does.
+    async fn newest_core_entries(&self, principal: &MemoryPrincipal, limit: usize) -> anyhow::Result<Vec<MemoryEntry>> {
+        let entries = self.inner.newest_core_entries(principal, usize::MAX).await?;
+        let mut own = Vec::new();
+        for mut entry in entries {
+            let Some((record_id, plain)) = self.open_stored(&entry.key, &entry.content) else {
+                continue;
+            };
+            entry.content = plain;
+            entry.key = record_id;
+            own.push(entry);
         }
         own.truncate(limit);
         Ok(own)

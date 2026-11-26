@@ -140,10 +140,10 @@ const STORE_INDEX_HEADER: &str =
 ///
 /// `entries` are already in the order the store returned them (newest first).
 /// Returns `None` for no entries. A line that would pass the budget, footer
-/// included, is not shown; the footer counts the hidden entries. When
-/// `truncated_at_limit` is set the store had more rows than were fetched, and
-/// the footer shows the count with a `+`. Output depends only on the inputs,
-/// so the same rows always render the same text.
+/// included, is not shown. The footer appears only when at least one entry is
+/// hidden, and it counts them; when `truncated_at_limit` is set the store had
+/// more rows than were fetched, so the count carries a `+`. Output depends only
+/// on the inputs, so the same rows always render the same text.
 #[allow(dead_code)] // first caller: K-M2
 pub(crate) fn render_store_index(
     entries: &[MemoryEntry],
@@ -172,7 +172,7 @@ pub(crate) fn render_store_index(
         index.push_str(&line);
     }
     let hidden = entries.len() - shown;
-    if hidden > 0 || truncated_at_limit {
+    if hidden > 0 {
         let _ = write!(index, "({hidden}{hidden_marker} more not shown)\n");
     }
     Some(index)
