@@ -29,9 +29,10 @@ const MIN_TTL: Duration = Duration::from_secs(60);
 pub(super) type StaleSet = Arc<parking_lot::Mutex<HashSet<String>>>;
 
 /// The deadline a `ttlMs` hint sets for the next rediscovery of a server, or
-/// `None` when the server gave no hint.
+/// `None` when the server gave no hint or the deadline is not representable
+/// (no TTL relist; a `list_changed` still works).
 pub(super) fn ttl_deadline(ttl_ms: Option<u64>) -> Option<Instant> {
-    ttl_ms.map(|ms| Instant::now() + Duration::from_millis(ms).max(MIN_TTL))
+    ttl_ms.and_then(|ms| Instant::now().checked_add(Duration::from_millis(ms).max(MIN_TTL)))
 }
 
 /// Start the `toolsListChanged` subscription of one connection. Returns
