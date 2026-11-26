@@ -564,9 +564,9 @@ pub enum CronCommands {
         name: Option<String>,
     },
     /// Mark a scheduled task as the operator's own (created before PRX
-    /// recorded who creates jobs): its runs are then treated as operator
-    /// work and run at Main's autonomy level, capped by the caller's level
-    /// if lower.
+    /// recorded who creates jobs): its runs then run as operator work at
+    /// Main's autonomy level (a named agent's own level when a named agent
+    /// created the job), capped by the caller's level if lower.
     MarkOperator {
         /// Task ID
         id: String,
@@ -608,8 +608,9 @@ pub enum XinCommands {
         interval_secs: u64,
     },
     /// Mark a task as the operator's own (created before PRX recorded who
-    /// creates tasks): its runs are then treated as operator work and run
-    /// at Main's autonomy level, capped by the caller's level if lower.
+    /// creates tasks): its runs then run as operator work at Main's autonomy
+    /// level (a named agent's own level when a named agent created the task),
+    /// capped by the caller's level if lower.
     MarkOperator { id: String },
     /// Update editable task fields.
     Update {

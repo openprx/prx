@@ -172,7 +172,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             // the same gate as `prx cron add`.
             let job = get_job(config, &id)?;
             mark_job_operator(config, &id)?;
-            println!("\u{2705} Marked cron job {id} as the operator's own: its runs use operator work at Main's autonomy level, capped by the caller's level if lower");
+            println!("\u{2705} Marked cron job {id} as the operator's own: its runs now run as operator work at Main's autonomy level (a named agent's own level when a named agent created the job), capped by the caller's level if lower");
             println!("  Cmd : {}", job.command);
             Ok(())
         }
