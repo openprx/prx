@@ -424,13 +424,19 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
         .await;
         // One model summary of the cold window, asked of this turn's own model. It
         // never fails the turn: a failed or empty call writes the note without one.
+        // K-H3: the before-handoff context hooks of this turn add summary instructions.
+        let instructions = crate::context::api::hook_points::summary_instructions(
+            trigger,
+            compacted_source_messages.map_or(0, <[_]>::len),
+        )
+        .await;
         let cold_summary = summarize_cold_window(
             provider,
             model,
             compacted_source_messages.unwrap_or_default(),
             &attachments,
             config.max_context_tokens,
-            &[],
+            &instructions,
             trigger,
         )
         .await;

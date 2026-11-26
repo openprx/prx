@@ -187,6 +187,26 @@ pub fn notify(event: super::event::HookEvent, data: serde_json::Value) {
     }
 }
 
+/// The manager of the turn the calling task runs, if any: a clone of the one
+/// the turn was scoped with (see [`HookIdentity::with_manager`]).
+#[must_use]
+pub fn current_manager() -> Option<HookManager> {
+    CURRENT.try_with(|identity| identity.manager.clone()).ok().flatten()
+}
+
+/// Run the context actions of `point` through the manager of the turn the
+/// calling task runs. Empty outside a turn scope, so a caller with no turn
+/// contributes nothing.
+pub async fn contribute(
+    point: super::context::ContextPoint,
+    data: serde_json::Value,
+) -> Vec<super::context::HookContribution> {
+    match current_manager() {
+        Some(manager) => manager.contribute(point, data).await,
+        None => Vec::new(),
+    }
+}
+
 /// [`scope`] when there is an identity to install, else `future` as it is.
 pub async fn scope_optional<F: Future>(identity: Option<HookIdentity>, future: F) -> F::Output {
     match identity {

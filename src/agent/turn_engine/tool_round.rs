@@ -13,15 +13,16 @@ use crate::agent::context_budget::reserve_request_tool_surface;
 use crate::agent::diagnostics::{redact_sensitive_json_keys, scrub_credentials, tool_parse_log_digest};
 use crate::agent::document_ingest::{persist_tool_output_document, persist_untrusted_external_copy};
 use crate::agent::tool_result_recording::{
-    ExecutedToolRecords, ToolResultRecorder, compact_tool_result_for_history_with_status,
+    ExecutedToolRecords, ObservedToolResult, ToolResultRecorder, compact_tool_result_for_history_with_status,
     tool_result_inline_budget_for_history,
 };
 use crate::agent::tool_scheduler::{execute_tools_with_service, shared_unrecoverable_tool_error};
 use crate::agent::turn_contracts::{ToolCallNotification, ToolLoopCancelled, ToolLoopOutcome};
 use crate::agent::turn_history::TurnHistory;
+use crate::context::api::hook_points;
 use crate::context::budget::anchor::{self};
 use crate::context::reduce::engine::AfterTools;
-use crate::context::transcript::{RoundLog, call_id_for};
+use crate::context::transcript::{RoundLog, append_hook_contributions, call_id_for};
 use crate::providers::ToolCall;
 
 use super::state::{PreparedRound, TurnInputs, TurnState};
@@ -265,6 +266,27 @@ pub(super) async fn run_tools(
         state.executed_any_tool_call = true;
     }
 
+    // K-H3: the tool-result context hooks may replace the text the model reads
+    // back or add a note. The notify event and the failure counters keep the raw
+    // output; every model-reachable copy below uses the effective text.
+    let raw_calls: Vec<(&str, String, bool, &str)> = tool_calls
+        .iter()
+        .zip(individual_results.iter())
+        .enumerate()
+        .map(|(index, (call, outcome))| {
+            (
+                call.name.as_str(),
+                call_id_for(&call.name, index, &native_tool_calls),
+                outcome.succeeded(),
+                outcome.content.as_str(),
+            )
+        })
+        .collect();
+    let (effective_texts, contributions) = hook_points::tool_result_texts(hooks, &raw_calls).await;
+    if let Some(fabric) = event_fabric.as_ref() {
+        append_hook_contributions(fabric, &tool_event_scope, &contributions).await;
+    }
+
     // FIX-P2-02: persistence (untrusted external copy + oversized tool_output
     // document) happens exactly once per tool result, in this loop, for every
     // mode. The native-history branch below reuses the document status captured
@@ -280,6 +302,14 @@ pub(super) async fn run_tools(
     for (index, (call, outcome)) in tool_calls.iter().zip(individual_results.iter()).enumerate() {
         let success = outcome.succeeded();
         let result = &outcome.content;
+        let replaced = effective_texts
+            .get(index)
+            .and_then(Option::as_ref)
+            .map(|text| ObservedToolResult {
+                content: text.clone(),
+                ..outcome.clone()
+            });
+        let observed = replaced.as_ref().unwrap_or(outcome);
         hooks
             .emit(
                 HookEvent::ToolCall,
@@ -337,7 +367,7 @@ pub(super) async fn run_tools(
         // FIX-P2-02: keep a verbatim, read-only, untrusted copy of successful
         // external content fetches (web_fetch / http_request / file_read).
         if success {
-            persist_untrusted_external_copy(document_ingest.as_ref(), &call.name, result).await;
+            persist_untrusted_external_copy(document_ingest.as_ref(), &call.name, &observed.content).await;
         }
 
         // P0-8: Keep history bounded and persist oversized outputs in the
@@ -346,18 +376,26 @@ pub(super) async fn run_tools(
         // result is stored exactly when it is cut.
         let max_inline_chars =
             tool_result_inline_budget_for_history(&call.name, executed.history(), reserved_config.as_ref());
-        let document_status =
-            persist_tool_output_document(document_ingest.as_ref(), &call.name, result, max_inline_chars)
-                .await
-                .unwrap_or("pending_document_backend");
+        let document_status = persist_tool_output_document(
+            document_ingest.as_ref(),
+            &call.name,
+            &observed.content,
+            max_inline_chars,
+        )
+        .await
+        .unwrap_or("pending_document_backend");
         // FIX-P2-02: record the status so the native-history branch can reuse
         // it without persisting the same document a second time.
         document_statuses.push(document_status);
-        let truncated_result =
-            compact_tool_result_for_history_with_status(&call.name, result, max_inline_chars, document_status);
+        let truncated_result = compact_tool_result_for_history_with_status(
+            &call.name,
+            &observed.content,
+            max_inline_chars,
+            document_status,
+        );
         if let Some(log) = round_log.as_ref() {
             let call_id = call_id_for(&call.name, index, &native_tool_calls);
-            log.append_result(&call_id, &call.name, outcome, &truncated_result, document_status)
+            log.append_result(&call_id, &call.name, observed, &truncated_result, document_status)
                 .await;
         }
         let _ = writeln!(
@@ -395,9 +433,13 @@ pub(super) async fn run_tools(
                 .unwrap_or("pending_document_backend");
             let max_inline_chars =
                 tool_result_inline_budget_for_history(&native_call.name, executed.history(), reserved_config.as_ref());
+            let effective = effective_texts
+                .get(index)
+                .and_then(Option::as_ref)
+                .unwrap_or(&result.content);
             let truncated_result = compact_tool_result_for_history_with_status(
                 &native_call.name,
-                &result.content,
+                effective,
                 max_inline_chars,
                 document_status,
             );
