@@ -27,7 +27,9 @@ pub(crate) struct ChildSegmentTurn {
     started_at: chrono::DateTime<chrono::Utc>,
     route: crate::llm::route_decision::RouteDecision,
     history_commit_len: Option<usize>,
-    recalled_context: String,
+    /// The memory the replayed-session recall of each admitted input reads.
+    recall_memory: Arc<dyn crate::memory::Memory>,
+    memory_config: crate::config::MemoryConfig,
 }
 
 // Resources consumed by the synchronous post-decision terminal admission.
@@ -36,6 +38,8 @@ struct ChildTerminalAdmission {
     config: Arc<crate::config::Config>,
     usage_collector: Option<Arc<super::turn_terminal::TerminalUsageCollector>>,
     route: crate::llm::route_decision::RouteDecision,
+    recall_memory: Arc<dyn crate::memory::Memory>,
+    memory_config: crate::config::MemoryConfig,
 }
 
 impl ChildSegmentTurn {
@@ -81,12 +85,8 @@ impl ChildSegmentTurn {
             .open_issued_segment_turn_context(proof.as_ref(), previous_observation.as_deref(), cancellation)
             .await?;
         let recall_memory = fabric.memory();
-        let recall_scope = crate::agent::context_recall::RecallScope::from_envelope(
-            &execution.envelope,
-            &config.memory,
-            proof.policy_chat_type(),
-        );
-        let mut turn = Self::finish_admission(
+        let memory_config = config.memory.clone();
+        Self::finish_admission(
             service,
             proof,
             decision,
@@ -96,22 +96,12 @@ impl ChildSegmentTurn {
                 config,
                 usage_collector,
                 route,
+                recall_memory,
+                memory_config,
             },
             owner,
             cancellation,
-        )?;
-        {
-            let recall_budget = crate::context::api::open::replayed_recall_budget(turn.compaction().max_context_tokens);
-            turn.recalled_context = crate::agent::context_recall::replayed_session_recall(
-                recall_memory.as_ref(),
-                &recall_scope,
-                turn.proof.routing_input(),
-                recall_budget,
-            )
-            .await
-            .preamble;
-        }
-        Ok(turn)
+        )
     }
 
     // Construct the terminal only after segment work has returned. Keep its
@@ -131,6 +121,8 @@ impl ChildSegmentTurn {
             config,
             usage_collector,
             route,
+            recall_memory,
+            memory_config,
         } = admission;
         let mut execution = execution;
         execution.call_budget = Some(
@@ -165,7 +157,8 @@ impl ChildSegmentTurn {
             started_at: chrono::Utc::now(),
             route,
             history_commit_len: None,
-            recalled_context: String::new(),
+            recall_memory,
+            memory_config,
         })
     }
 
@@ -223,7 +216,10 @@ impl ChildSegmentTurn {
         self.decision.main_compaction()
     }
 
-    pub(crate) fn enrich_input(&self, history: &mut [crate::providers::ChatMessage]) -> anyhow::Result<()> {
+    /// Prefixes the replayed-session recall and appends the date tail to the
+    /// last message of `history`, which must be the admitted input. The recall
+    /// is read here, once per input, for steering inputs and delegated turns.
+    pub(crate) async fn enrich_input(&self, history: &mut [crate::providers::ChatMessage]) -> anyhow::Result<()> {
         use anyhow::Context;
         let input = history
             .last_mut()
@@ -233,11 +229,69 @@ impl ChildSegmentTurn {
             input.content == self.proof.routing_input(),
             "child segment history differs from its admitted input"
         );
-        let mut enriched = self.recalled_context.clone();
+        let scope = crate::agent::context_recall::RecallScope::from_envelope(
+            &self.execution.envelope,
+            &self.memory_config,
+            self.proof.policy_chat_type(),
+        );
+        let recall_budget = crate::context::api::open::replayed_recall_budget(self.compaction().max_context_tokens);
+        let mut enriched = crate::agent::context_recall::replayed_session_recall(
+            self.recall_memory.as_ref(),
+            &scope,
+            self.proof.routing_input(),
+            recall_budget,
+        )
+        .await
+        .preamble;
         enriched.push_str(&input.content);
         crate::agent::turn_contracts::push_current_time_tail(&mut enriched);
         *input = crate::agent::turn_contracts::inbound_user_message(&enriched);
         Ok(())
+    }
+
+    /// Opens the first input of a task segment through the shared turn
+    /// opening: the earlier turns of the child are replayed with their tool
+    /// rounds and attachments, fitted to the budget, the recall of the session
+    /// is read, and the input's attachment row is stored. Returns the whole
+    /// model history: the system message, the replayed turns and the request.
+    pub(crate) async fn open_first_input(
+        &self,
+        previous: Vec<crate::memory::child_sessions::ChildTurn>,
+        system_prompt: String,
+    ) -> anyhow::Result<Vec<crate::providers::ChatMessage>> {
+        let previous_turns = previous
+            .into_iter()
+            .map(|turn| crate::memory::ConversationTurn {
+                id: 0,
+                session_key: self.execution.envelope.session_key.clone(),
+                role: turn.role,
+                content: turn.content,
+                timestamp: turn.timestamp.to_rfc3339(),
+                message_id: turn.event_id.clone(),
+                message_event_id: turn.event_id,
+            })
+            .collect();
+        let model = self.service.resolve_agent_model(self.proof.as_ref())?;
+        let opening = crate::context::api::open::open_turn(crate::context::api::open::OpenInput {
+            memory: &self.recall_memory,
+            envelope: &self.execution.envelope,
+            memory_config: &self.memory_config,
+            chat_type: self.proof.policy_chat_type(),
+            visible_message: self.proof.routing_input(),
+            card: None,
+            previous_turns,
+            replay: crate::context::api::open::ReplayMode::FitToBudget,
+            recall: crate::context::api::open::OpenRecall::ReplayedSession,
+            current_input_key: None,
+            excluded_session: None,
+            system_prompt,
+            service: &self.service,
+            context: &self.decision,
+            provider_label: model.provider_label(),
+            model: model.model(),
+        })
+        .await;
+        Ok(opening.history)
     }
 
     pub(crate) fn adapter(&self) -> ToolLoopRuntimeAdapter {

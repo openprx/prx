@@ -60,6 +60,8 @@ impl SessionsSpawnTool {
         } = launch;
         // Create shared history and steer channel for this run
         let history_arc: Arc<RwLock<Vec<HistoryEntry>>> = Arc::new(RwLock::new(super::continuation::seed_history()));
+        // The stored turns the first input replays through the shared opening.
+        let replay_seed = super::continuation::seed_turns();
         // Class B — bounded. Steering messages are produced by operators and by
         // model tool calls, neither of which is rate-limited now that sub-agent
         // concurrency is uncapped, while the consumer only polls between tool
@@ -412,6 +414,7 @@ impl SessionsSpawnTool {
                         restore_run_id,
                         Arc::clone(&task_progress),
                         parent_hooks,
+                        replay_seed,
                     )
                 });
                 let result = run_cleanup_scope

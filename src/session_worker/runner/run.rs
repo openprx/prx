@@ -1049,7 +1049,7 @@ async fn run_owned_manifest(
                         segment_history.push(crate::agent::turn_contracts::inbound_user_message(&user_task));
                     }
                     if let (Some(turn), Some(segments)) = (child_turn.as_ref(), child_segments.as_ref()) {
-                        if let Err(error) = turn.enrich_input(&mut segment_history) {
+                        if let Err(error) = turn.enrich_input(&mut segment_history).await {
                             let result = cleanup.run(async { Err::<(), _>(error) }).await;
                             let error = result
                                 .err()

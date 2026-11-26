@@ -29,6 +29,12 @@ pub(super) fn seed_history() -> Vec<HistoryEntry> {
     })
 }
 
+/// The stored turns the first input of a continued segment replays, with
+/// their event ids; empty for a fresh spawn.
+pub(super) fn seed_turns() -> Vec<ChildTurn> {
+    current().map_or_else(Vec::new, |seed| seed.history)
+}
+
 pub(super) fn register(runs: &mut Vec<SubAgentRun>, run: SubAgentRun) -> anyhow::Result<()> {
     if let Some(previous) = runs
         .iter_mut()

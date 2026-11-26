@@ -5,6 +5,7 @@ use crate::agent::channel_approval::spawn as spawn_scoped;
 use crate::agent::document_ingest::DocumentIngestRuntime;
 use crate::agent::turn_contracts::ScopeContext;
 use crate::hooks::HookManager;
+use crate::memory::child_sessions::ChildTurn;
 use crate::observability::NoopObserver;
 use crate::providers::{ChatMessage, Provider};
 use crate::security::SecurityPolicy;
@@ -126,6 +127,9 @@ pub(super) async fn run_sub_agent_task(
     // The parent registry's live hook manager, shared by a child that has no
     // Ordinary parent runtime of its own.
     parent_hooks: Option<Arc<HookManager>>,
+    // The stored turns of a continued child, replayed by the first input's
+    // shared opening; empty for a fresh spawn.
+    replay_seed: Vec<ChildTurn>,
 ) -> anyhow::Result<SubAgentTaskResult> {
     let operator_authority = SPAWN_EXECUTION_CONTEXT
         .try_with(|context| context.operator_authority.clone())
@@ -258,6 +262,9 @@ pub(super) async fn run_sub_agent_task(
         restore_run_to_running(&mut runs, rid);
     };
 
+    // The first iteration opens the run's first input through the shared
+    // opening; a steer re-entry takes the history it returns with instead.
+    let mut first_open = Some(replay_seed);
     loop {
         if let Some(authority) = &operator_authority {
             authority.verify_execution(run_id.as_deref(), task, &provider, provider_name, model)?;
@@ -269,6 +276,8 @@ pub(super) async fn run_sub_agent_task(
         let initial_system = (child_source.is_some() || history.first().is_none_or(|message| message.role != "system"))
             .then(|| system_prompt.to_owned());
         let initial_task = history.is_empty().then(|| task.to_owned());
+        let open_seed = first_open.take();
+        let system_prompt_owned = system_prompt.to_owned();
         let mut task_history = history;
         let provider_instance = provider.clone();
         let mut child_source_owned = child_source.clone().context("task segment source missing")?;
@@ -384,18 +393,25 @@ pub(super) async fn run_sub_agent_task(
                     .with_child_cleanup(cleanup_confirmed);
                     let _ = segment_admitted.send(());
 
-                    if let Some(system) = initial_system {
-                        let system = child_turn.system_prompt(&child_config_owned, &system)?;
-                        if let Some(previous) = task_history.first_mut().filter(|message| message.role == "system") {
-                            *previous = ChatMessage::system(system);
-                        } else {
-                            task_history.insert(0, ChatMessage::system(system));
+                    if let Some(seed) = open_seed {
+                        let system = child_turn.system_prompt(&child_config_owned, &system_prompt_owned)?;
+                        task_history = child_turn.open_first_input(seed, system).await?;
+                    } else {
+                        if let Some(system) = initial_system {
+                            let system = child_turn.system_prompt(&child_config_owned, &system)?;
+                            if let Some(previous) =
+                                task_history.first_mut().filter(|message| message.role == "system")
+                            {
+                                *previous = ChatMessage::system(system);
+                            } else {
+                                task_history.insert(0, ChatMessage::system(system));
+                            }
                         }
+                        if let Some(task) = initial_task {
+                            task_history.push(crate::agent::turn_contracts::inbound_user_message(&task));
+                        }
+                        child_turn.enrich_input(&mut task_history).await?;
                     }
-                    if let Some(task) = initial_task {
-                        task_history.push(crate::agent::turn_contracts::inbound_user_message(&task));
-                    }
-                    child_turn.enrich_input(&mut task_history)?;
                     // R9/R26: an enabled engine analyses the child task turn on
                     // its own runtime context and accounting scope.
                     let advice = {

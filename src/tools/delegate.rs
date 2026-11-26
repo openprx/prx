@@ -1437,7 +1437,7 @@ impl DelegateLoopResources {
                 history.insert(0, ChatMessage::system(prompt));
             }
             turn.project_history(history.len() + 1);
-            turn.enrich_input(&mut history)?;
+            turn.enrich_input(&mut history).await?;
         }
         // R9/R26: an enabled engine analyses the delegated child turn on its
         // own runtime context and accounting scope.
