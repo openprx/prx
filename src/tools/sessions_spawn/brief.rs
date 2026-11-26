@@ -121,7 +121,7 @@ fn render_reference(index: usize, entry: &Value) -> Result<String, String> {
 /// A top-level `brief` or `references` value that counts as not given: null,
 /// a blank string or an empty array. Such a value renders nothing and leaves the
 /// task unchanged; every other shape goes through the normal validation.
-fn is_absent(value: &Value) -> bool {
+pub(super) fn is_absent(value: &Value) -> bool {
     match value {
         Value::Null => true,
         Value::String(text) => text.trim().is_empty(),
