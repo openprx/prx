@@ -233,7 +233,13 @@ impl HookCore {
         finished: &std::sync::atomic::AtomicUsize,
     ) {
         if let Err(err) = self.refresh_if_changed() {
-            tracing::warn!(error = %err, "hooks refresh failed");
+            // Every event would repeat this for the same file; log it once per content.
+            let first = !std::mem::replace(&mut self.state.write().rejection_reported, true);
+            if first {
+                tracing::warn!(error = %err, "hooks refresh failed");
+            } else {
+                tracing::debug!(error = %err, "hooks refresh failed (already reported)");
+            }
         } else {
             let (timeout_ms, actions) = {
                 let state = self.state.read();
@@ -308,12 +314,25 @@ impl HookCore {
             return Ok(());
         }
 
-        let config = parse_hook_config(&raw)?;
+        let config = match parse_hook_config(&raw) {
+            Ok(config) => config,
+            Err(err) => {
+                // A new invalid content is reported once more; the same content is not.
+                let mut state = self.state.write();
+                if state.rejected_digest != Some(digest) {
+                    state.rejected_digest = Some(digest);
+                    state.rejection_reported = false;
+                }
+                return Err(err);
+            }
+        };
 
         // Candidate parsing and validation finish before this single generation swap.
         *self.state.write() = RuntimeState {
             config,
             hooks_json_digest: Some(digest),
+            rejected_digest: None,
+            rejection_reported: false,
         };
         Ok(())
     }

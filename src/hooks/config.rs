@@ -82,6 +82,10 @@ impl Default for HookConfig {
 pub(super) struct RuntimeState {
     pub(super) config: HookConfig,
     pub(super) hooks_json_digest: Option<[u8; 32]>,
+    /// Digest of the newest `hooks.json` that failed to parse.
+    pub(super) rejected_digest: Option<[u8; 32]>,
+    /// Whether the warning for `rejected_digest` has been logged.
+    pub(super) rejection_reported: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
