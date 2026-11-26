@@ -1,10 +1,10 @@
 #[cfg(test)]
 use super::get_task;
-use super::{
-    JobLookupError, SELECT_ALL_COLUMNS, TaskLineage, authoritative_now, insert_task_event, map_task_row, parse_rfc3339,
-    sql_err, stored_creator, stored_origin, stored_task_output, with_connection, with_immediate_connection,
-    workspace_id,
+use super::rows::{
+    SELECT_ALL_COLUMNS, TaskLineage, insert_task_event, map_task_row, parse_rfc3339, sql_err, stored_origin,
+    stored_task_output, workspace_id,
 };
+use super::{JobLookupError, authoritative_now, stored_creator, with_connection, with_immediate_connection};
 use crate::config::Config;
 use crate::cron::JobCreator;
 use crate::security::agent_level::CreatorStamp;
