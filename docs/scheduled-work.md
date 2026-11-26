@@ -90,6 +90,21 @@ steps always use their goal's shared session, whatever the task's `context`.
 The Postgres cron store refuses `fresh`, so a create with `fresh` fails and
 leaves no job behind.
 
+Scheduled jobs and Xin tasks also store a `deliver`: `note` (default), `message`
+or `none`. It says how the owner hears about a finished run. `note` is a one-line
+notice at the owner's next interactive turn. `message` sends the result into the
+session that created the job; delivery is added in a later change, so until then
+`message` behaves like `note`. `none` writes no notice and no result row. A
+one-off agent task created from a session (the xin tool with an agent task that is
+not recurring and has a `message_event_id` in the trusted scope; the cron tool
+with an agent job on an `at` schedule and a `message_event_id`) defaults to `message`; everything else
+defaults to `note`. An explicit `deliver` always wins. It is set by the xin tool
+on `add` and `update`, by the cron tool on `add` and in the `update` patch, and
+by `POST` and `PATCH` `/api/cron/jobs`. The xin job routes return it; the cron
+job routes return it with the rest of the job. A route write has no creating
+session, so a route job without `deliver` is a `note`. The Postgres cron store
+refuses `message` and `none` at create and patch, as it refuses `fresh`.
+
 ## HEARTBEAT.md materialization
 
 Each trimmed line that starts with `-` followed by a space becomes a recurring
