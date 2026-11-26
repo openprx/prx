@@ -2428,8 +2428,8 @@ prefix is not stored, so `session_opened` hooks run on every turn and a varying
 output changes the system prompt each turn.
 
 The points are called by `prx agent`, gateway sessions, channel and scheduled
-entries. `prx chat` (the terminal chat) does not call them yet, and child turns
-do not either; K-H3 adds the child point.
+entries and `prx chat` (the terminal chat). Child turns do not call them yet;
+K-H3 adds the child point.
 
 #### Webhook hooks
 

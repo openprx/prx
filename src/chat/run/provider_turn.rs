@@ -141,13 +141,24 @@
         #[cfg(feature = "terminal-tui")]
         let routing_input = admitted_binding.routing_input().to_owned();
         let mem_context = admitted_binding.recalled_context(mem.as_ref()).await;
+        // The turn-open context hook contributions go in the tail, before the
+        // date line: the same tail `open_turn` builds, stored and replayed byte
+        // for byte with the message.
+        let hook_tail = crate::context::api::tail::turn_tail(crate::context::api::tail::TurnTailInput {
+            memory: &mem,
+            envelope: &runtime_envelope,
+            memory_config: &config.memory,
+            visible_message: &user_input,
+            hooks: Some(hooks.as_ref()),
+        })
+        .await;
         // What is put around the typed text is kept with the turn: a later turn
         // replays the typed text and the tail, not the recalled prefix.
         let (enriched, sent_form) = super::turn_replay::sent_request(
             &mem_context.preamble,
             &user_input,
             &user_input_for_prompt,
-            crate::agent::turn_contracts::current_time_tail(),
+            format!("{hook_tail}{}", crate::agent::turn_contracts::current_time_tail()),
         );
         // The attachment row of this turn, as `open_turn` writes it: a later
         // terminal switch matches the replayed user message (typed text + tail)
@@ -178,6 +189,23 @@
         // Publish only this turn's selected metadata. Previous turns do not
         // grant continued Skill exposure; the prompt builder orders entries.
         let system_prompt = build_chat_system_prompt(&config, model_name, &selected_skills, native_tools);
+        // The session's frozen memory index and `session_opened` hook sections go
+        // at the end of the system prompt, as `open_turn` appends them. Empty when
+        // the session has no index and no hook section.
+        let compact = turn_service.publication_scope().generation.effective.agent.compact_context;
+        let prefix_text = crate::context::api::prefix::session_prefix(crate::context::api::prefix::SessionPrefixInput {
+            memory: &mem,
+            envelope: &runtime_envelope,
+            memory_config: &config.memory,
+            compact,
+            hooks: Some(hooks.as_ref()),
+        })
+        .await;
+        let system_prompt = if prefix_text.is_empty() {
+            system_prompt
+        } else {
+            format!("{system_prompt}\n\n{prefix_text}")
+        };
         // An ordered, acknowledged read before this turn builds its sources
         // and copies its provider view: every action sent before it (another
         // turn's compaction whose finalization is still pending included) is
