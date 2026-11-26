@@ -5,7 +5,7 @@
 mod copies;
 
 use super::{SqliteMemory, rf_delete, rf_messages::RESTART_INTERRUPTED, sync_journal, sync_retained};
-use crate::memory::sync::{MessageTrim, TrimSkipped};
+use crate::memory::sync::{MessageTrim, TrimMode, TrimSkipped};
 use crate::runtime::sqlite_pool::begin_immediate;
 use rusqlite::{Connection, OptionalExtension, named_params, params};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -104,6 +104,7 @@ pub(super) fn trim(
     memory: &SqliteMemory,
     cutoff: chrono::DateTime<chrono::Utc>,
     max_batches: u32,
+    mode: TrimMode,
 ) -> anyhow::Result<MessageTrim> {
     // Store-side floor: a cutoff later than now minus the 15-day sync window is clamped.
     let floor = chrono::Utc::now()
@@ -123,7 +124,7 @@ pub(super) fn trim(
                 |r| r.get(0),
             )
             .optional()?;
-        if last.is_some_and(|last| now - last < THROTTLE_SECS) {
+        if mode == TrimMode::Startup && last.is_some_and(|last| now - last < THROTTLE_SECS) {
             trim.skipped = TrimSkipped::Throttled;
             return Ok(trim);
         }

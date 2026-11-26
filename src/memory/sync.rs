@@ -51,6 +51,15 @@ pub enum TrimSkipped {
     SnapshotOpen,
 }
 
+/// Which trigger asks for a retention pass. Only `Startup` honours the 55-minute
+/// throttle; `Hourly` runs even when a startup pass ran recently. Both record the
+/// pass start in the state row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrimMode {
+    Startup,
+    Hourly,
+}
+
 /// Counts of one retention pass. Content-free.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MessageTrim {
@@ -92,5 +101,10 @@ pub trait SyncStore: Send + Sync {
     fn cancel_orphaned_woken_approvals(&self) -> anyhow::Result<usize>;
     fn shutdown_signal(&self) -> CancellationToken;
     /// Delete the message log rows older than `cutoff`, run by run, in at most `max_batches` batches.
-    fn trim_message_log(&self, cutoff: chrono::DateTime<chrono::Utc>, max_batches: u32) -> anyhow::Result<MessageTrim>;
+    fn trim_message_log(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        max_batches: u32,
+        mode: TrimMode,
+    ) -> anyhow::Result<MessageTrim>;
 }

@@ -576,7 +576,8 @@ impl SyncStore for SqliteMemory {
         &self,
         cutoff: chrono::DateTime<chrono::Utc>,
         max_batches: u32,
+        mode: crate::memory::sync::TrimMode,
     ) -> anyhow::Result<crate::memory::sync::MessageTrim> {
-        super::message_retention::trim(self, cutoff, max_batches)
+        super::message_retention::trim(self, cutoff, max_batches, mode)
     }
 }

@@ -7,7 +7,7 @@
 
 use crate::config::SharedConfig;
 use crate::memory::Memory;
-use crate::memory::sync::{MessageTrim, SyncStore, TrimSkipped};
+use crate::memory::sync::{MessageTrim, SyncStore, TrimMode, TrimSkipped};
 use chrono::{DateTime, Utc};
 use std::sync::{Arc, Once};
 use std::time::Duration;
@@ -59,7 +59,7 @@ pub fn run_once(memory: &dyn Memory, days: u32, max_batches: u32) {
     let Some(cutoff) = cutoff_for(days) else {
         return;
     };
-    match store.trim_message_log(cutoff, max_batches) {
+    match store.trim_message_log(cutoff, max_batches, TrimMode::Startup) {
         Ok(trim) => log_pass(cutoff, &trim),
         Err(error) => tracing::warn!(
             error = %crate::agent::diagnostics::error_class(&error),
@@ -88,7 +88,9 @@ pub fn spawn_hourly(store: Arc<dyn SyncStore>, config: SharedConfig, shutdown: C
                 continue;
             };
             let sync = Arc::clone(&store);
-            let pass = crate::runtime::blocking::spawn_blocking(move || sync.trim_message_log(cutoff, HOURLY_BATCHES));
+            let pass = crate::runtime::blocking::spawn_blocking(move || {
+                sync.trim_message_log(cutoff, HOURLY_BATCHES, TrimMode::Hourly)
+            });
             match pass.await {
                 Ok(Ok(trim)) => log_pass(cutoff, &trim),
                 Ok(Err(error)) => tracing::warn!(
