@@ -101,11 +101,12 @@ impl ChildSegmentTurn {
             cancellation,
         )?;
         {
+            let recall_budget = crate::context::api::open::replayed_recall_budget(turn.compaction().max_context_tokens);
             turn.recalled_context = crate::agent::context_recall::replayed_session_recall(
                 recall_memory.as_ref(),
                 &recall_scope,
                 turn.proof.routing_input(),
-                crate::agent::context_recall::RECALL_CONTEXT_BUDGET,
+                recall_budget,
             )
             .await
             .preamble;
