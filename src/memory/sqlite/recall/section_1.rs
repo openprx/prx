@@ -397,6 +397,9 @@ impl SqliteMemory {
                            AND (content IS NOT ?2 OR sensitivity IS NOT ?3 OR ?4 <> 'core')",
                         params![&key, &content, classified.sensitivity.as_str(), cat],
                     )?;
+                    // A memory written without explicit metadata takes the workspace of the
+                    // trusted write context, so the row is found by the session memory index.
+                    let row_workspace = metadata.workspace_id.clone().or_else(|| ctx.workspace_id.clone());
                     let changed = tx.execute(
                         &format!("INSERT INTO memories (
                         id, key, content, category, embedding, embedding_provider,
@@ -440,7 +443,7 @@ impl SqliteMemory {
                             now,
                             now,
                             sid,
-                            metadata.workspace_id.clone(),
+                            row_workspace,
                             owner_id,
                             ctx.channel,
                             chat_type,

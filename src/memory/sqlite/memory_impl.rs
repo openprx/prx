@@ -401,7 +401,8 @@ impl Memory for SqliteMemory {
     /// principal without `agent_partition` is read as the Main partition
     /// (`ma_scope_id IS NULL` or a Main scope of the workspace), never as all
     /// agents: a named agent's rows are visible only to a principal that
-    /// carries that agent's partition.
+    /// carries that agent's partition. NULL-workspace rows (written before the
+    /// fix that stores the write context's workspace) count as this workspace's rows.
     async fn newest_core_entries(&self, principal: &MemoryPrincipal, limit: usize) -> anyhow::Result<Vec<MemoryEntry>> {
         let Some(owner) = principal.owner_id.clone() else {
             return Ok(Vec::new());
@@ -433,7 +434,7 @@ impl Memory for SqliteMemory {
             let limit_marker = 3 + partition_values.len();
             let sql = format!(
                 "SELECT id, key, content, category, created_at, session_id, useful_count FROM memories
-                 WHERE category = 'core' AND sensitivity = 'normal' AND workspace_id IS ?1 AND owner_id = ?2{partition_sql}
+                 WHERE category = 'core' AND sensitivity = 'normal' AND (workspace_id IS ?1 OR workspace_id IS NULL) AND owner_id = ?2{partition_sql}
                  ORDER BY update_seq DESC LIMIT ?{limit_marker}"
             );
             let mut values: Vec<rusqlite::types::Value> = vec![

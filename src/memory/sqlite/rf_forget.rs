@@ -311,7 +311,8 @@ fn evict_embeddings(tx: &Connection, scope: Option<&str>, text: &str) -> anyhow:
 /// session, so a forgotten memory must not survive in it; the next turn of such
 /// a session renders a fresh index. `owners_sql` selects
 /// `workspace_id, owner_id` and is a constant statement with bound values.
-/// Returns the number of rows deleted.
+/// NULL-workspace rows (written before the fix that stores the write context's
+/// workspace) count as this workspace's rows. Returns the number of rows deleted.
 pub(super) fn drop_prefix_rows_of(
     tx: &Connection,
     owners_sql: &str,
@@ -326,7 +327,7 @@ pub(super) fn drop_prefix_rows_of(
     let mut deleted: usize = 0;
     for (workspace, owner) in owners {
         deleted = deleted.saturating_add(tx.execute(
-            "DELETE FROM message_events WHERE event_type = ?3 AND workspace_id IS ?1 AND owner_id IS ?2",
+            "DELETE FROM message_events WHERE event_type = ?3 AND (?1 IS NULL OR workspace_id IS ?1) AND owner_id IS ?2",
             params![workspace, owner, SESSION_PREFIX_EVENT_TYPE],
         )?);
     }
