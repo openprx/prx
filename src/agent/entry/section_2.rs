@@ -485,19 +485,23 @@ pub(crate) async fn run_with_runtime_envelope(
         );
         crate::providers::context_window::trace_effective_compaction_resolution(&effective_compaction);
 
+        // A scheduled run names its session and run; other entries keep the
+        // identity of the calling task.
+        let hook_identity = scheduled_admission
+            .as_ref()
+            .map(|admission| crate::hooks::HookIdentity::for_session(admission.envelope()));
         observer.record_event(&ObserverEvent::AgentStart {
             provider: provider_name.to_string(),
             model: model_name.to_string(),
         });
-        hooks
-            .emit(
-                HookEvent::AgentStart,
-                serde_json::json!({
-                    "provider": provider_name,
-                    "model": model_name,
-                }),
-            )
-            .await;
+        let agent_start_payload = serde_json::json!({
+            "provider": provider_name,
+            "model": model_name,
+        });
+        match &hook_identity {
+            Some(identity) => hooks.emit_for(identity, HookEvent::AgentStart, agent_start_payload).await,
+            None => hooks.emit(HookEvent::AgentStart, agent_start_payload).await,
+        }
 
         // ── Build system prompt from the canonical prompt context ──
         let native_tools = provider
@@ -1034,15 +1038,14 @@ pub(crate) async fn run_with_runtime_envelope(
             tokens_used: None,
             cost_usd: None,
         });
-        hooks
-            .emit(
-                HookEvent::AgentEnd,
-                serde_json::json!({
-                    "duration_ms": duration.as_millis(),
-                    "tokens_used": serde_json::Value::Null,
-                }),
-            )
-            .await;
+        let agent_end_payload = serde_json::json!({
+            "duration_ms": duration.as_millis(),
+            "tokens_used": serde_json::Value::Null,
+        });
+        match &hook_identity {
+            Some(identity) => hooks.emit_for(identity, HookEvent::AgentEnd, agent_end_payload).await,
+            None => hooks.emit(HookEvent::AgentEnd, agent_end_payload).await,
+        }
 
         Ok::<String, anyhow::Error>(final_output)
     });

@@ -245,15 +245,6 @@ async fn run_internal(
         provider: provider_name.to_string(),
         model: model_name.to_string(),
     });
-    hooks
-        .emit(
-            HookEvent::AgentStart,
-            serde_json::json!({
-                "provider": provider_name,
-                "model": model_name,
-            }),
-        )
-        .await;
 
     // ── Skills ────────────────────────────────────────────────────
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
@@ -364,6 +355,18 @@ async fn run_internal(
                 native_tools,
             );
             super::message_inbox::pin_epoch(&config, &chat_session_key).await?;
+            // The terminal session exists from here: its start carries the session key.
+            let agent_started_at = std::time::Instant::now();
+            hooks
+                .emit_for(
+                    &crate::hooks::HookIdentity::for_session_key(chat_session_key.clone(), "terminal"),
+                    HookEvent::AgentStart,
+                    serde_json::json!({
+                        "provider": provider_name,
+                        "model": model_name,
+                    }),
+                )
+                .await;
             // The terminal session is open: a script learns its key here.
             let session_opened_at = std::time::Instant::now();
             hooks
@@ -1081,6 +1084,16 @@ async fn run_internal(
                         "reason": "exit",
                         "turns": chat_dispatcher.session_reader().acked().session.turns.len(),
                         "duration_ms": u64::try_from(session_opened_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    }),
+                )
+                .await;
+            hooks
+                .emit_for(
+                    &crate::hooks::HookIdentity::for_session_key(chat_session_key.clone(), "terminal"),
+                    HookEvent::AgentEnd,
+                    serde_json::json!({
+                        "duration_ms": u64::try_from(agent_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        "tokens_used": serde_json::Value::Null,
                     }),
                 )
                 .await;

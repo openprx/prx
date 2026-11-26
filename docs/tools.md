@@ -1630,8 +1630,8 @@ order by a background worker, never awaited by a turn.
 
 | Event | Emitted | Surfaces | `data` fields |
 |-------|---------|----------|---------------|
-| `agent_start` | Terminal chat start-up; single-shot and scheduled agent entry (`src/chat/run.rs`, `src/agent/entry/section_2.rs`) | terminal, single-shot, scheduled agent entry | `provider`, `model` |
-| `agent_end` | Single-shot and scheduled agent entry (`src/agent/entry/section_2.rs`) | single-shot, scheduled agent entry | `duration_ms`, `tokens_used` (null) |
+| `agent_start` | Terminal chat after its session key is known, with that session key (`src/chat/run.rs`); single-shot agent entry; scheduled entry, with the run's session key (`src/agent/entry/section_2.rs`) | terminal, single-shot, scheduled agent entry | `provider`, `model` |
+| `agent_end` | Terminal chat at exit, one-shot and interactive (`src/chat/run.rs`); single-shot and scheduled agent entry (`src/agent/entry/section_2.rs`) | terminal, single-shot, scheduled agent entry | `duration_ms`, `tokens_used` (null) |
 | `session_opened` | A terminal chat session opened or resumed (`src/chat/run.rs`); a Console session created (`src/gateway/api/sessions/section_1.rs`); a caller-keyed session claimed (`src/gateway/api/sessions/rf_message.rs`) | terminal, Console, keyed (rf) | `resumed`, `surface`, `title` |
 | `session_ended` | A terminal chat session exits (`src/chat/run.rs`) | terminal | `reason`, `turns`, `duration_ms` |
 | `turn_opened` | The turn engine starts a turn (`src/agent/turn_engine.rs`, `run_turn`) | every surface, including children | `input_chars`, `surface` |
