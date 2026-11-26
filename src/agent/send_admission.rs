@@ -185,16 +185,18 @@ fn unpriced_refusal(
         .then(|| crate::agent::refusal::unpriced_reason(model.provider_label(), model.model()))
 }
 
-/// Refuses the send unless it fits G6 and the remaining spend. Nothing is sent
-/// or debited here; decision-attempt token reservation and settlement are
+/// Refuses the send unless it fits the remaining spend. Nothing is sent or
+/// debited here; decision-attempt token reservation and settlement are
 /// unchanged.
 ///
-/// Tokens reproduce the G6 predicate for the answer this round can produce:
-/// its estimate (`cost::estimate::candidate_tokens(0)`) must be at most the
-/// live remaining decision-slice tokens. A published tool does not veto the
-/// answer; the called tool's own estimate is the dispatch predicate (R2a-2).
-/// The request size and the response reserve feed only the priced estimate, so
-/// an unknown price, measurement or ledger also refuses.
+/// The answer estimate (`cost::estimate::candidate_tokens(0)`) against the live
+/// remaining decision-slice tokens only warns: that slice is derived from the
+/// model window, not configured, so a full window sends anyway and the context
+/// reducer handles it. A published tool does not veto the answer; the called
+/// tool's own estimate is the dispatch predicate (R2a-2). The priced estimate
+/// against a configured spend ceiling is the only refusal here: the request
+/// size and the response reserve feed it, so an unknown price, measurement or
+/// ledger also refuses.
 pub(crate) fn admit_provider_send(
     service: &TurnRuntimeService,
     context: &OpenedTurn,
@@ -207,11 +209,11 @@ pub(crate) fn admit_provider_send(
     let remaining = live_g6_tokens(context);
     let answer = crate::cost::estimate::candidate_tokens(0);
     if answer > remaining {
-        return Err(ProviderSendRefused {
-            reason: crate::agent::refusal::RefusalReason::Budget,
-            diagnostic: format!("provider send refused: answer estimates {answer} tokens but {remaining} remain"),
-        }
-        .into());
+        tracing::warn!(
+            answer_tokens = answer,
+            remaining_tokens = remaining,
+            "provider send estimate exceeds the remaining decision-slice tokens; sending it"
+        );
     }
     let limits = service
         .send_limits(proof)
