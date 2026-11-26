@@ -4,6 +4,8 @@
 
 use std::sync::Arc;
 
+use super::prefix::{SessionPrefixInput, session_prefix};
+use super::tail::turn_tail;
 use crate::agent::context_recall::{RECALL_CONTEXT_BUDGET, RecallScope, replayed_session_recall, scoped_recall};
 use crate::config::{AgentCompactionConfig, MemoryConfig};
 use crate::context::request_provenance::{LiveAttachment, note_live_attachment};
@@ -145,7 +147,11 @@ pub(crate) async fn open_turn(input: OpenInput<'_>) -> TurnOpening {
     };
     let attachment = Attachment {
         prefix,
-        tail: crate::agent::turn_contracts::current_time_tail(),
+        tail: format!(
+            "{}{}",
+            turn_tail(envelope, visible_message),
+            crate::agent::turn_contracts::current_time_tail()
+        ),
     };
     let enriched_message = attachment.compose(visible_message);
     let replay_fabric = MemoryFabric::new(Arc::clone(memory), envelope.workspace_id.clone())
@@ -160,6 +166,21 @@ pub(crate) async fn open_turn(input: OpenInput<'_>) -> TurnOpening {
         )
         .await;
     }
+    // The session's frozen memory index goes at the end of the system prompt
+    // (the end of segment 4). Empty when the session has no index.
+    let compact = service.publication_scope().generation.effective.agent.compact_context;
+    let prefix_text = session_prefix(SessionPrefixInput {
+        memory,
+        envelope,
+        memory_config,
+        compact,
+    })
+    .await;
+    let system_prompt = if prefix_text.is_empty() {
+        system_prompt
+    } else {
+        format!("{system_prompt}\n\n{prefix_text}")
+    };
     let system_message = ChatMessage::system(system_prompt);
     let request_message = crate::agent::turn_contracts::inbound_user_message(&enriched_message);
     // Earlier turns with their tool rounds; the oldest results become stubs

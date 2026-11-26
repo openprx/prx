@@ -118,21 +118,15 @@ fn take_chars(text: &str, max_chars: usize) -> (&str, bool) {
 }
 
 /// Store index: how many newest core memories are fetched for the index.
-#[allow(dead_code)] // first caller: K-M2
 pub(crate) const STORE_INDEX_FETCH: usize = 200;
 /// Store index: the whole section, header and footer included, in characters.
-#[allow(dead_code)] // first caller: K-M2
 pub(crate) const STORE_INDEX_MAX_CHARS: usize = 4_000;
 /// Store index: the cap for a compact turn (the same section, smaller budget).
-#[allow(dead_code)] // first caller: K-M2
 pub(crate) const STORE_INDEX_COMPACT_MAX_CHARS: usize = 1_500;
-/// Characters of the content shown per entry line.
-#[allow(dead_code)] // first caller: K-M2
+/// Characters of the content shown per entry line. The key is capped to the same length.
 const STORE_INDEX_CONTENT_CHARS: usize = 160;
 /// Characters of a timestamp shown per entry line (the date part).
-#[allow(dead_code)] // first caller: K-M2
 const STORE_INDEX_STAMP_CHARS: usize = 10;
-#[allow(dead_code)] // first caller: K-M2
 const STORE_INDEX_HEADER: &str =
     "## Memory index\nNewest first. Read one in full with memory_get <key>, or search with memory_recall.\n";
 
@@ -144,7 +138,6 @@ const STORE_INDEX_HEADER: &str =
 /// hidden, and it counts them; when `truncated_at_limit` is set the store had
 /// more rows than were fetched, so the count carries a `+`. Output depends only
 /// on the inputs, so the same rows always render the same text.
-#[allow(dead_code)] // first caller: K-M2
 pub(crate) fn render_store_index(
     entries: &[MemoryEntry],
     max_chars: usize,
@@ -173,16 +166,18 @@ pub(crate) fn render_store_index(
     }
     let hidden = entries.len() - shown;
     if hidden > 0 {
-        let _ = write!(index, "({hidden}{hidden_marker} more not shown)\n");
+        let _ = writeln!(index, "({hidden}{hidden_marker} more not shown)");
     }
     Some(index)
 }
 
 /// One entry line: `- [<date>] <key>: <content>`, newlines shown as spaces.
-#[allow(dead_code)] // first caller: K-M2
+/// Key and content are both flattened and cut to [`STORE_INDEX_CONTENT_CHARS`].
 fn store_index_line(entry: &MemoryEntry) -> String {
     let (stamp, _) = take_chars(&entry.timestamp, STORE_INDEX_STAMP_CHARS);
+    let flat_key = entry.key.replace(['\r', '\n'], " ");
+    let (key, _) = take_chars(&flat_key, STORE_INDEX_CONTENT_CHARS);
     let flat = entry.content.replace(['\r', '\n'], " ");
     let (content, _) = take_chars(&flat, STORE_INDEX_CONTENT_CHARS);
-    format!("- [{stamp}] {}: {content}\n", entry.key)
+    format!("- [{stamp}] {key}: {content}\n")
 }
