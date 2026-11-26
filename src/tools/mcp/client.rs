@@ -1,6 +1,6 @@
 //! MCP client helpers shared by the stdio and streamable-HTTP paths:
-//! tool-result extraction, call parameters, HTTP connect, HTTP discovery and
-//! HTTP calls.
+//! discovered-tool metadata, call parameters, HTTP connect, HTTP discovery and
+//! HTTP calls. Result rendering lives in `result.rs`.
 
 use super::lifecycle::{self, McpEra};
 use super::{DiscoveredToolMeta, McpClient, McpTool, mcp_http_client};
@@ -9,56 +9,56 @@ use rmcp::model::{CallToolRequestParams, Tool};
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use std::collections::HashMap;
+use serde::Serialize;
 use std::time::Duration;
 
-/// The discovered metadata of one tool. Only the description and the input
-/// schema are kept; the rest of the definition is not used by PRX.
+/// The discovered metadata of one tool: description, input schema and the
+/// display fields (title, annotations, output-schema presence, icon count).
+/// Display fields are never used to gate or route a call.
 pub(super) fn discovered_tool_meta(tool: Tool) -> DiscoveredToolMeta {
     DiscoveredToolMeta {
         description: tool.description.map(|v| v.to_string()),
         input_schema: serde_json::to_value(tool.input_schema).ok(),
+        title: tool.title,
+        annotations: tool.annotations.and_then(|a| serde_json::to_value(a).ok()),
+        has_output_schema: tool.output_schema.is_some(),
+        icon_count: tool.icons.map_or(0, |icons| icons.len()),
     }
 }
 
-impl McpTool {
-    pub(super) fn extract_call_success_and_output(value: &serde_json::Value) -> (bool, String) {
-        let is_error = value
-            .get("isError")
-            .or_else(|| value.get("is_error"))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-
-        let content = value
-            .get("content")
-            .and_then(serde_json::Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|item| {
-                        let text = item.get("text").and_then(serde_json::Value::as_str);
-                        if text.is_some() {
-                            return text.map(ToString::to_string);
-                        }
-
-                        if item
-                            .get("type")
-                            .and_then(serde_json::Value::as_str)
-                            .is_some_and(|t| t.eq_ignore_ascii_case("text"))
-                        {
-                            return Some(item.to_string());
-                        }
-
-                        None
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default();
-
-        let output = if content.is_empty() { value.to_string() } else { content };
-
-        (!is_error, output)
+impl DiscoveredToolMeta {
+    pub(super) fn detail(&self, name: &str) -> McpToolDetail {
+        McpToolDetail {
+            name: name.to_string(),
+            title: self.title.clone(),
+            annotations: self.annotations.clone(),
+            has_output_schema: self.has_output_schema,
+            icon_count: self.icon_count,
+        }
     }
+}
 
+/// Per-tool metadata shown on the status API.
+#[derive(Debug, Clone, Serialize)]
+pub struct McpToolDetail {
+    pub name: String,
+    pub title: Option<String>,
+    pub annotations: Option<serde_json::Value>,
+    pub has_output_schema: bool,
+    pub icon_count: usize,
+}
+
+/// The per-tool details of one server, sorted by tool name.
+pub(super) fn detail_list(tools: &HashMap<String, DiscoveredToolMeta>) -> Vec<McpToolDetail> {
+    let mut details = tools
+        .iter()
+        .map(|(tool, meta)| meta.detail(tool))
+        .collect::<Vec<_>>();
+    details.sort_by(|left, right| left.name.cmp(&right.name));
+    details
+}
+
+impl McpTool {
     pub(super) fn call_tool_params(
         tool_name: &str,
         arguments: Option<serde_json::Map<String, serde_json::Value>>,

@@ -220,6 +220,17 @@ configuration key. A server whose reply to `server/discover` is not a modern res
 (for example a plain `{}`), or whose late reply conflicts with the handshake, is retried
 once with the legacy handshake. A connection that fails drops the kept version.
 
+## MCP tool result rendering
+
+The model receives every block of an MCP `tools/call` result, rendered as text in server order and joined by newlines:
+
+- Text blocks are passed through unchanged.
+- Structured content is appended as `[structured content]` plus compact JSON, unless a text block already holds the same JSON value.
+- Resource links render as `[resource link] <name> <uri>`, with the MIME type when present.
+- Embedded text resources render as `[resource <uri>]` followed by the text; embedded blobs, images and audio render as placeholders giving their type and size, never their base64 data.
+- A result with no content and no structured content renders as `(empty result)`. `isError: true` marks the call as failed and keeps its text.
+- A server reply that asks for client input (MRTR) or returns a task is a tool error; the stdio session stays up. Output schemas are not validated, and tool annotations are display-only metadata.
+
 ## Tool behavior
 
 `web_search_tool` uses DuckDuckGo by default. A non-200 response, bot challenge,

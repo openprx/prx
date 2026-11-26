@@ -29,6 +29,7 @@ fn fixture() -> anyhow::Result<(tempfile::TempDir, Arc<McpTool>, ExecutionBindin
                 DiscoveredToolMeta {
                     description: Some("PRX read capability".into()),
                     input_schema: Some(json!({"type":"object","properties":{}})),
+                    ..Default::default()
                 },
             )]),
         );

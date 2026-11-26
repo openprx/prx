@@ -18,8 +18,9 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime};
 use tokio::process::Command;
 
-use self::client::discovered_tool_meta;
+use self::client::{McpToolDetail, discovered_tool_meta};
 use self::lifecycle::McpEra;
+use self::result::render_call_response;
 
 const MCP_JSON_FILE: &str = "mcp.json";
 const MCP_ROOT_NAME: &str = "mcp_call";
@@ -134,6 +135,10 @@ static ALLOWED_MCP_COMMANDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| 
 struct DiscoveredToolMeta {
     description: Option<String>,
     input_schema: Option<serde_json::Value>,
+    title: Option<String>,
+    annotations: Option<serde_json::Value>,
+    has_output_schema: bool,
+    icon_count: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -191,6 +196,7 @@ pub struct McpServerRuntimeInfo {
     pub status: String,
     pub tool_count: usize,
     pub tools: Vec<String>,
+    pub tool_details: Vec<McpToolDetail>,
     pub last_error: Option<String>,
     pub last_refresh_at: Option<String>,
 }
@@ -478,6 +484,7 @@ impl McpTool {
                         input_schema: Some(
                             json!({"type":"object","properties":{"ordinal":{"type":"integer","const":index}}}),
                         ),
+                        ..Default::default()
                     },
                 )
             })
@@ -551,6 +558,7 @@ impl McpTool {
                         description: metadata
                             .description
                             .clone()
+                            .or_else(|| metadata.title.clone())
                             .unwrap_or_else(|| format!("MCP tool '{tool}' from server '{server}'")),
                         parameters: metadata
                             .input_schema
@@ -580,6 +588,7 @@ impl McpTool {
                     .map(|entries| entries.keys().cloned().collect::<Vec<_>>())
                     .unwrap_or_default();
                 tools.sort();
+                let tool_details = state.discovered_tools.get(name).map(client::detail_list).unwrap_or_default();
                 let last_error = state.discovery_errors.get(name).cloned();
                 let status = if last_error.is_some() {
                     "error"
@@ -600,6 +609,7 @@ impl McpTool {
                     status: status.to_string(),
                     tool_count: tools.len(),
                     tools,
+                    tool_details,
                     last_error,
                     last_refresh_at: last_refresh_at.clone(),
                 }
@@ -1348,7 +1358,7 @@ impl McpTool {
 
         let result = match tokio::time::timeout(
             request_timeout,
-            client.call_tool(Self::call_tool_params(tool_name, arguments)),
+            client.call_tool_once(Self::call_tool_params(tool_name, arguments)),
         )
         .await
         {
@@ -1365,26 +1375,15 @@ impl McpTool {
         };
 
         match result {
-            Ok(r) => {
-                let value = serde_json::to_value(r)?;
-                let result_type = if value.is_object() {
-                    "object"
-                } else if value.is_array() {
-                    "array"
-                } else if value.is_string() {
-                    "string"
-                } else {
-                    "other"
-                };
-                let result_bytes = value.to_string().len();
+            Ok(response) => {
+                let rendered = render_call_response(server_name, response)?;
                 tracing::debug!(
                     server = server_name,
                     tool = tool_name,
-                    result_type,
-                    result_bytes,
+                    result_bytes = rendered.1.len(),
                     "MCP call_stdio: result received"
                 );
-                Ok(Self::extract_call_success_and_output(&value))
+                Ok(rendered)
             }
             Err(e) => {
                 tracing::warn!(server = server_name, tool = tool_name, error = %e, "MCP call_stdio: error");
@@ -1392,7 +1391,6 @@ impl McpTool {
                     e,
                     rmcp::service::ServiceError::TransportSend(_)
                         | rmcp::service::ServiceError::TransportClosed
-                        | rmcp::service::ServiceError::UnexpectedResponse
                         | rmcp::service::ServiceError::Cancelled { .. }
                         | rmcp::service::ServiceError::Timeout { .. }
                 ) && let Some(failed) = session.take()
@@ -1913,6 +1911,7 @@ mod tests;
 mod client;
 pub(super) mod level_view;
 mod lifecycle;
+mod result;
 
 #[cfg(test)]
 mod dispatch_binding_tests;

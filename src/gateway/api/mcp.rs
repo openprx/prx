@@ -6,6 +6,9 @@ use serde::Serialize;
 struct McpToolInfo {
     name: String,
     description: String,
+    title: Option<String>,
+    annotations: Option<serde_json::Value>,
+    has_output_schema: bool,
 }
 
 #[derive(Serialize)]
@@ -62,9 +65,15 @@ pub async fn get_mcp_servers(State(state): State<AppState>) -> Json<McpServersRe
             .map(|entries| {
                 entries
                     .iter()
-                    .map(|(tool_name, desc)| McpToolInfo {
-                        name: tool_name.clone(),
-                        description: desc.clone().unwrap_or_default(),
+                    .map(|(tool_name, desc)| {
+                        let detail = info.and_then(|info| info.tool_details.iter().find(|d| &d.name == tool_name));
+                        McpToolInfo {
+                            name: tool_name.clone(),
+                            description: desc.clone().unwrap_or_default(),
+                            title: detail.and_then(|d| d.title.clone()),
+                            annotations: detail.and_then(|d| d.annotations.clone()),
+                            has_output_schema: detail.is_some_and(|d| d.has_output_schema),
+                        }
                     })
                     .collect()
             })

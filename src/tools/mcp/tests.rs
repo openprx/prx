@@ -297,6 +297,7 @@ fn discovery_snapshot_and_exact_execution_spec_cover_aliases_beyond_prompt_windo
                     DiscoveredToolMeta {
                         description: Some(format!("schema {index}")),
                         input_schema: Some(json!({"type":"object","properties":{"index":{"const":index}}})),
+                        ..Default::default()
                     },
                 )
             })
@@ -340,6 +341,7 @@ fn capability_snapshot_changes_when_effective_destination_changes_without_schema
             DiscoveredToolMeta {
                 description: Some("Read".into()),
                 input_schema: Some(json!({"type":"object","properties":{}})),
+                ..Default::default()
             },
         )]),
     );
