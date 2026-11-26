@@ -14,6 +14,7 @@ mod handoff;
 mod hook_rows;
 mod prefix_rows;
 mod replay;
+mod schedule_rows;
 mod skill_rows;
 mod sources;
 mod tool_rows;
@@ -25,6 +26,7 @@ pub(crate) use prefix_rows::{
 };
 pub(crate) use replay::{Attachment, History, ReplayLog, TurnReplay, stub_replayed_results};
 pub(crate) use skill_rows::{SkillLoad, skill_load_of, skills_in_use};
+pub(crate) use schedule_rows::{mark_results_seen, unseen_results_note};
 pub(crate) use sources::AttachmentSources;
 pub(crate) use tool_rows::{RoundLog, append_attachment, call_id_for};
 

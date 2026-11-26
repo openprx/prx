@@ -1,0 +1,186 @@
+//! The scheduled-results note: the owner's unseen `schedule.result.recorded`
+//! rows, shown once at the opening of the owner's next interactive turn.
+//!
+//! The note is built from the rows of the owner and agent partition, across
+//! every session. Rows are grouped per scheduled session (the transcript
+//! session of the run): one line per group, the newest row shown, older failed
+//! attempts dropped as superseded, and older successful runs counted as
+//! `+k earlier`. The seen mark is a `schedule.result.seen` row holding the
+//! newest row id the note has read; the next turn reads only rows after it.
+//! Rows older than seven days are not shown but are covered by the mark.
+
+use chrono::{DateTime, Duration, Utc};
+use serde_json::Value;
+
+use crate::agent::diagnostics::error_log_digest;
+use crate::agent::scheduled_result::SCHEDULE_RESULT_EVENT_TYPE;
+use crate::memory::{Memory, MemoryFabric, MemoryPrincipal, MessageEvent, MessageEventScope};
+
+/// The event type of the seen mark.
+pub(crate) const SCHEDULE_SEEN_EVENT_TYPE: &str = "schedule.result.seen";
+/// Result rows read per turn, newest first.
+const RESULT_ROWS_READ: usize = 50;
+/// Lines shown in the note at most; the rest are covered by the mark.
+const NOTE_MAX_LINES: usize = 10;
+/// Age, from the run's finish, after which a result is not shown.
+const NOTE_MAX_AGE_DAYS: i64 = 7;
+/// Characters of a reply excerpt shown on one line.
+const NOTE_EXCERPT_CHARS: usize = 200;
+
+/// The note for the owner's unseen scheduled results, and the newest row id it
+/// covers. `None` when the owner has no result after the seen mark or the read
+/// fails (logged by digest). The text is empty when every row read is too old
+/// or superseded; the caller still moves the mark to the returned id.
+pub(crate) async fn unseen_results_note(
+    memory: &dyn Memory,
+    principal: &MemoryPrincipal,
+    now: DateTime<Utc>,
+) -> Option<(String, i64)> {
+    let seen = read_rows(memory, principal, SCHEDULE_SEEN_EVENT_TYPE, None, 1).await?;
+    let through_id = seen
+        .first()
+        .and_then(payload_of)
+        .and_then(|payload| payload.get("through_id").and_then(Value::as_i64));
+    let rows = read_rows(
+        memory,
+        principal,
+        SCHEDULE_RESULT_EVENT_TYPE,
+        through_id,
+        RESULT_ROWS_READ,
+    )
+    .await?;
+    let through = rows.iter().map(|row| row.id).max()?;
+    let max_age = Duration::days(NOTE_MAX_AGE_DAYS);
+    let mut groups: Vec<Group> = Vec::new();
+    for row in &rows {
+        let Some(payload) = payload_of(row) else {
+            continue;
+        };
+        if let Some(finished) = payload
+            .get("finished_at")
+            .and_then(Value::as_str)
+            .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
+            && now.signed_duration_since(finished.with_timezone(&Utc)) > max_age
+        {
+            continue;
+        }
+        let key = payload
+            .get("transcript_session")
+            .and_then(Value::as_str)
+            .or(row.session_key.as_deref())
+            .unwrap_or(row.event_id.as_str())
+            .to_owned();
+        let ok = payload.get("status").and_then(Value::as_str) == Some("ok");
+        match groups.iter_mut().find(|group| group.key == key) {
+            Some(group) => {
+                if ok {
+                    group.earlier += 1;
+                }
+            }
+            None => groups.push(Group {
+                key,
+                newest: payload,
+                earlier: 0,
+            }),
+        }
+    }
+    let lines: Vec<String> = groups.iter().take(NOTE_MAX_LINES).map(Group::line).collect();
+    let text = if lines.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n[Scheduled results]\n{}", lines.join("\n"))
+    };
+    Some((text, through))
+}
+
+/// Writes the seen mark: one tool-round row in the owner's turn scope, naming
+/// the newest result row the note has covered. A failure is logged by digest.
+pub(crate) async fn mark_results_seen(fabric: &MemoryFabric, scope: MessageEventScope, through_id: i64) {
+    let payload = serde_json::json!({ "schema_version": 1, "through_id": through_id });
+    if let Err(error) = fabric
+        .record_tool_round_event(
+            scope,
+            SCHEDULE_SEEN_EVENT_TYPE,
+            "scheduled results seen",
+            Some(payload.to_string()),
+        )
+        .await
+    {
+        let (error_len, error_sha256) = error_log_digest(&error);
+        tracing::warn!(
+            error_len,
+            error_sha256,
+            "Failed to record the scheduled results seen mark"
+        );
+    }
+}
+
+/// The rows of `event_type` after `after_id`, or `None` on a read error (logged).
+async fn read_rows(
+    memory: &dyn Memory,
+    principal: &MemoryPrincipal,
+    event_type: &str,
+    after_id: Option<i64>,
+    limit: usize,
+) -> Option<Vec<MessageEvent>> {
+    match memory
+        .newest_owner_events_of_type(principal, event_type, after_id, limit)
+        .await
+    {
+        Ok(rows) => Some(rows),
+        Err(error) => {
+            let (error_len, error_sha256) = error_log_digest(&error);
+            tracing::warn!(
+                error_len,
+                error_sha256,
+                "Failed to read scheduled results for the turn note"
+            );
+            None
+        }
+    }
+}
+
+fn payload_of(row: &MessageEvent) -> Option<Value> {
+    row.raw_payload_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+}
+
+/// One scheduled session: its newest row, and the count of older successful rows.
+struct Group {
+    key: String,
+    newest: Value,
+    earlier: usize,
+}
+
+impl Group {
+    /// `- <finished, to the minute> <name or id> <status>: <excerpt or error class> (transcript <session>)`
+    fn line(&self) -> String {
+        let payload = &self.newest;
+        let text = |field: &str| payload.get(field).and_then(Value::as_str).unwrap_or_default();
+        let finished: String = text("finished_at").chars().take(16).collect();
+        let name = match text("name") {
+            "" => text("id"),
+            name => name,
+        };
+        let status = text("status");
+        let detail = if status == "ok" {
+            text("excerpt")
+                .chars()
+                .take(NOTE_EXCERPT_CHARS)
+                .map(|ch| if ch == '\n' || ch == '\r' { ' ' } else { ch })
+                .collect::<String>()
+        } else {
+            text("error_class").to_owned()
+        };
+        let earlier = if self.earlier > 0 {
+            format!(" (+{} earlier)", self.earlier)
+        } else {
+            String::new()
+        };
+        format!(
+            "- {finished} {name} {status}: {detail} (transcript {}){earlier}",
+            self.key
+        )
+    }
+}
