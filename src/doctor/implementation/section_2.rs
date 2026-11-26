@@ -804,7 +804,14 @@ fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
                 .get("last_error")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("runtime component is not healthy");
-            items.push(DiagItem::error(cat, format!("{name} unhealthy ({status}): {detail}")));
+            // An advisory component never decides readiness (D1), so an unhealthy
+            // one is a warning here; `warn` does not set `has_errors`, so the exit
+            // code is unchanged.
+            if component.get("advisory").and_then(serde_json::Value::as_bool) == Some(true) {
+                items.push(DiagItem::warn(cat, format!("{name} advisory ({status}): {detail}")));
+            } else {
+                items.push(DiagItem::error(cat, format!("{name} unhealthy ({status}): {detail}")));
+            }
         }
 
         // Scheduler
