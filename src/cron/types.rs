@@ -425,9 +425,9 @@ pub struct CronJobPatch {
     pub session_target: Option<SessionTarget>,
     pub delete_after_run: Option<bool>,
     pub context: Option<ScheduledContext>,
-    /// Not accepted from a model-written patch yet: the tool and route fields
-    /// that set it come with K-R3, so the serde path stays closed until then.
-    #[serde(skip)]
+    /// Set by the cron tool's `patch`, the cron routes and the runtime. The
+    /// value is a closed enum (`note`, `message`, `none`), so a model-written
+    /// patch can only choose among those three.
     pub deliver: Option<ScheduledDeliver>,
     #[serde(skip)]
     pub approval_grant_json: Option<String>,

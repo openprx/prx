@@ -211,9 +211,8 @@ pub struct XinTaskPatch {
     pub enabled: Option<bool>,
     pub max_failures: Option<u32>,
     pub context: Option<crate::cron::ScheduledContext>,
-    /// Not accepted from a model-written patch yet: the tool and route fields
-    /// that set it come with K-R3, so the serde path stays closed until then.
-    #[serde(skip)]
+    /// Set by the xin tool's `add` and `update` actions. The tool parses the
+    /// closed enum (`note`, `message`, `none`) itself and refuses anything else.
     pub deliver: Option<crate::cron::ScheduledDeliver>,
     #[serde(skip)]
     pub approval_grant_json: Option<String>,
