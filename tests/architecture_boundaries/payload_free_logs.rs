@@ -1336,11 +1336,11 @@ const REVIEWED_LOG_SITES: &[(&str, &str)] = &[
         "a hex SHA-256 digest of the final system prompt (`prompt_sha256`)",
     ),
     (
-        "src/agent/turn_engine.rs::run_turn_unguarded `system_prompt_sha256 = system_prompt_sha256.as_deref().unwrap_or( )`",
+        "src/agent/turn_engine/request_event.rs::record_request_context `system_prompt_sha256 = system_prompt_sha256.as_deref().unwrap_or( )`",
         "a hex SHA-256 digest of the final system prompt (`prompt_sha256`)",
     ),
     (
-        "src/agent/turn_engine.rs::run_turn_unguarded `tool_snapshot_sha256 = %tool_snapshot.sha256`",
+        "src/agent/turn_engine/request_event.rs::record_request_context `tool_snapshot_sha256 = %tool_snapshot.sha256`",
         "a hex SHA-256 digest of the advertised tool snapshot",
     ),
 ];

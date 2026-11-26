@@ -138,7 +138,7 @@ pub(super) fn compiled_request_context_event_has_one_production_owner() {
 
     assert_eq!(
         owners,
-        vec!["src/agent/turn_engine.rs"],
+        vec!["src/agent/turn_engine/request_event.rs"],
         "request-context provenance must be emitted once by the shared provider loop"
     );
 }
