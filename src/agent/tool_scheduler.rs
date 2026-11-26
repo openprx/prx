@@ -360,6 +360,15 @@ async fn execute_one_unrecorded(
         }
         _ => None,
     });
+    let skill_load = crate::context::transcript::skill_load_of(
+        outcome
+            .descriptor
+            .as_ref()
+            .map(|descriptor| descriptor.backend_name.as_str()),
+        &call.arguments,
+        status,
+        outcome.result.as_ref().map(|result| result.output.as_str()),
+    );
     let result = outcome.model_content;
     emit_tool_outcome(
         adapter,
@@ -382,6 +391,7 @@ async fn execute_one_unrecorded(
         content: result,
         status,
         executed,
+        skill_load,
     })
 }
 

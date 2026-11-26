@@ -12,6 +12,9 @@ pub(crate) struct ObservedToolResult {
     pub content: String,
     pub status: crate::tools::ToolExecutionStatus,
     pub executed: bool,
+    /// The skill instruction this call loaded, when it succeeded as a read
+    /// (see `context::transcript::skill_rows`). `None` for every other call.
+    pub skill_load: Option<crate::context::transcript::SkillLoad>,
 }
 
 impl ObservedToolResult {
@@ -20,6 +23,7 @@ impl ObservedToolResult {
             content,
             status,
             executed: false,
+            skill_load: None,
         }
     }
 

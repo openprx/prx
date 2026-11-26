@@ -1,8 +1,9 @@
 //! The transcript: the one way to append to and read a session's log.
 //!
 //! Writers live in [`tool_rows`] (tool calls, tool results and the attachment
-//! of a user message). Readers live in [`replay`] and are reached through
-//! [`Transcript`], a handle for one session. Every row written here has role
+//! of a user message) and [`skill_rows`] (successful skill instruction loads).
+//! Readers live in [`replay`] and are reached through [`Transcript`], a handle
+//! for one session. Every row written here has role
 //! `tool` and an event type other than `message.created`, so the sync stream,
 //! the history loaders and the handoff provenance match never see it.
 //!
@@ -11,10 +12,12 @@
 
 mod handoff;
 mod replay;
+mod skill_rows;
 mod sources;
 mod tool_rows;
 
 pub(crate) use replay::{Attachment, History, ReplayLog, TurnReplay, stub_replayed_results};
+pub(crate) use skill_rows::{SkillLoad, skill_load_of};
 pub(crate) use sources::AttachmentSources;
 pub(crate) use tool_rows::{RoundLog, append_attachment, call_id_for};
 

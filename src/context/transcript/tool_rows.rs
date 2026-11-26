@@ -1,5 +1,5 @@
-//! Writers of the transcript's tool rows: tool calls, tool results and the
-//! attachment of a user message.
+//! Writers of the transcript's tool rows: tool calls, tool results, the
+//! attachment of a user message and the load of a skill instruction.
 //!
 //! Each call the model makes is appended to `message_events` when the round
 //! dispatches it, and each result when the call returns. A pair shares the
@@ -7,7 +7,7 @@
 //! reader can match them without relying on row order.
 //!
 //! The rows use their own event types (`tool.call.recorded`,
-//! `tool.result.recorded`) with role `tool`. They are not
+//! `tool.result.recorded`, `skill.load.recorded`) with role `tool`. They are not
 //! `message.created`, so the next turn's history loaders, the handoff
 //! provenance match and the sync projection all leave them alone. Whether
 //! they are written is the `record_tool_events` setting of the fabric.
@@ -93,6 +93,9 @@ impl<'a> RoundLog<'a> {
             document_status,
         )
         .await;
+        if let Some(load) = outcome.skill_load.as_ref() {
+            super::skill_rows::append_skill_load(self.fabric, self.scope, self.round, call_id, load).await;
+        }
     }
 }
 
