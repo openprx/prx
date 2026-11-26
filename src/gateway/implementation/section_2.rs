@@ -905,7 +905,7 @@ async fn persist_pairing_tokens(config: &crate::config::SharedConfig, pairing: &
         let base = ConfigTransactions::base_revision(&desired);
         let mut updated = (*desired.config).clone();
         updated.gateway.paired_tokens = merge_paired_tokens(&updated.gateway.paired_tokens, &paired_tokens);
-        let tx = ConfigTransactions::new(Arc::clone(config)).deferring_activation();
+        let tx = ConfigTransactions::new(Arc::clone(config));
         let plan = tx
             .plan(ConfigChange::Structured(Box::new(updated)))
             .await
