@@ -572,7 +572,11 @@ impl SyncStore for SqliteMemory {
     fn shutdown_signal(&self) -> CancellationToken {
         self.sync_runtime.shutdown.lock().clone()
     }
-    fn trim_message_log(&self, _cutoff: chrono::DateTime<chrono::Utc>, _max_batches: u32) -> anyhow::Result<crate::memory::sync::MessageTrim> {
-        Ok(crate::memory::sync::MessageTrim::default())
+    fn trim_message_log(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        max_batches: u32,
+    ) -> anyhow::Result<crate::memory::sync::MessageTrim> {
+        super::message_retention::trim(self, cutoff, max_batches)
     }
 }

@@ -818,7 +818,7 @@ fn record_deleted(
 }
 
 /// The session preview is taken from the newest row that is not deleted.
-fn refresh_preview(tx: &Connection, session_key: &str) -> anyhow::Result<()> {
+pub(super) fn refresh_preview(tx: &Connection, session_key: &str) -> anyhow::Result<()> {
     let latest: Option<String> = tx
         .query_row(
             "SELECT content FROM conversation_turns WHERE session_key = ?1 AND deleted_at IS NULL
@@ -842,7 +842,7 @@ fn refresh_preview(tx: &Connection, session_key: &str) -> anyhow::Result<()> {
 
 /// Note, in the delete's transaction, that its old row images may sit in
 /// WAL frames until a truncating checkpoint runs.
-fn mark_scrub(tx: &Connection, now: &str) -> anyhow::Result<()> {
+pub(super) fn mark_scrub(tx: &Connection, now: &str) -> anyhow::Result<()> {
     tx.execute(
         "INSERT OR IGNORE INTO rf_wal_scrub_pending (singleton, since) VALUES (1, ?1)",
         params![now],

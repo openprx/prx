@@ -17,6 +17,7 @@ pub mod mailbox;
 mod mailbox_continuation;
 mod mailbox_schema;
 mod memory_impl;
+mod message_retention;
 mod mirror;
 mod owner_event_type;
 mod recall;
