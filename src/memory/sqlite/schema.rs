@@ -3,18 +3,102 @@
 use anyhow::Context;
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
+use sha2::{Digest, Sha256};
+use std::sync::OnceLock;
 
 use super::{SqliteMemory, init_approval_grant_schema};
+
+/// Source text of every module that runs DDL or migration logic during
+/// `init_schema`. The schema stamp hashes these bytes, so any change to the
+/// migrations (SQL, Rust-side arguments, backfills) yields a new stamp and the
+/// next open migrates. Maintained by hand: a new file that runs DDL during
+/// init must be added here.
+const MIGRATION_SOURCES: &[&str] = &[
+    include_str!("schema.rs"),
+    include_str!("approval_grants.rs"),
+    include_str!("erasure_pool.rs"),
+    include_str!("agent_registry.rs"),
+    include_str!("remote_tree.rs"),
+    include_str!("child_sessions.rs"),
+    include_str!("mailbox_schema.rs"),
+    include_str!("mailbox_schema.sql"),
+    include_str!("mailbox_child_schema.sql"),
+    include_str!("rf_messages.rs"),
+    include_str!("sync_journal.rs"),
+    include_str!("sync_snapshot.rs"),
+    include_str!("rf_delete.rs"),
+    include_str!("write_log.rs"),
+    include_str!("rf_forget.rs"),
+    include_str!("agent_erasure.rs"),
+    include_str!("agent_purge.rs"),
+    include_str!("agent_migration.rs"),
+    include_str!("recovery_authority.rs"),
+];
+
+/// Schema-format tag prefixed to the stamp; bump it to force a migration pass
+/// for every database.
+const SCHEMA_STAMP_FORMAT: &str = "v1:";
+
+/// The stamp of this build's migrations: SHA-256 over the format tag and each
+/// source in `MIGRATION_SOURCES`, length-prefixed so the boundaries are unambiguous.
+/// Computed once per process.
+fn schema_stamp() -> &'static str {
+    static STAMP: OnceLock<String> = OnceLock::new();
+    STAMP.get_or_init(|| {
+        let mut hasher = Sha256::new();
+        hasher.update(SCHEMA_STAMP_FORMAT.as_bytes());
+        for source in MIGRATION_SOURCES {
+            hasher.update(source.len().to_le_bytes());
+            hasher.update(source.as_bytes());
+        }
+        format!("{SCHEMA_STAMP_FORMAT}{}", hex::encode(hasher.finalize()))
+    })
+}
 
 impl SqliteMemory {
     /// Initialize all tables: memories, FTS5, `embedding_cache`
     pub(super) fn init_schema(conn: &Connection) -> anyhow::Result<()> {
+        // A database last migrated by this build needs no write lock to open.
+        if Self::schema_stamp_matches(conn) {
+            return Ok(());
+        }
         // Initialization otherwise commits each DDL/backfill separately. Own
         // one write transaction so concurrent turn admissions do not compete
         // with a stream of partial schema commits from a newly opened store.
         let transaction = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
         Self::init_schema_in_transaction(&transaction)?;
+        Self::write_schema_stamp(&transaction)?;
         transaction.commit()?;
+        Ok(())
+    }
+
+    /// Plain read outside any transaction, so it takes no write lock. A missing
+    /// stamp table (a database from an older PRX) and any read error count as a
+    /// mismatch; the migration transaction then runs and reports real errors.
+    fn schema_stamp_matches(conn: &Connection) -> bool {
+        conn.query_row("SELECT stamp FROM prx_schema_stamp WHERE id=1", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()
+        .ok()
+        .flatten()
+        .is_some_and(|stamp| stamp == schema_stamp())
+    }
+
+    /// Last statement of the migration transaction: a stamp is written only
+    /// when every migration step before it has committed with it.
+    fn write_schema_stamp(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS prx_schema_stamp(
+                id INTEGER PRIMARY KEY CHECK(id = 1),
+                stamp TEXT NOT NULL
+            ) STRICT;",
+        )?;
+        conn.execute(
+            "INSERT INTO prx_schema_stamp(id, stamp) VALUES(1, ?1)
+             ON CONFLICT(id) DO UPDATE SET stamp = excluded.stamp",
+            params![schema_stamp()],
+        )?;
         Ok(())
     }
 
