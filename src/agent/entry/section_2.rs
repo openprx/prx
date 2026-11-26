@@ -399,8 +399,16 @@ pub(crate) async fn run_with_runtime_envelope(
         }
     }
 
-    // The result row of a scheduled run is written from this copy once the run ends.
-    let result_envelope = runtime_envelope_override.clone();
+    // The result row of a scheduled run is written under the same envelope the
+    // run itself uses (see the turn envelope below), captured before `work` borrows the admission.
+    let result_envelope = scheduled_admission.as_ref().map(|admission| {
+        let envelope = admission.envelope().clone();
+        if envelope.config_source_revision.is_none() {
+            envelope.with_config_generation(&ctx.config_generation)
+        } else {
+            envelope
+        }
+    });
     // Capture invocation state without constructing the large async work yet.
     let work = CliWork {
         ctx: &ctx,
