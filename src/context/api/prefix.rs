@@ -121,7 +121,7 @@ async fn verify_recorded(store: &dyn Memory, principal: &MemoryPrincipal, render
                 .all(|entry| by_key.get(entry.key.as_str()) == Some(&entry.content.as_str()))
         }
         Err(error) => {
-            log_read_failure(&error, "memory index could not be re-read after recording");
+            log_prefix_check_failure(&error, "memory index could not be re-read after recording");
             false
         }
     };
@@ -129,7 +129,12 @@ async fn verify_recorded(store: &dyn Memory, principal: &MemoryPrincipal, render
         return;
     }
     if let Err(error) = store.delete_session_prefix_row(row_id).await {
-        log_read_failure(&error, "session prefix row could not be dropped after a memory changed");
+        let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+        tracing::warn!(
+            error_len,
+            error_sha256,
+            "session prefix row could not be dropped after a memory changed; a later turn may send the older index until the next handoff"
+        );
     }
 }
 
@@ -157,4 +162,15 @@ async fn newest_switch_id(
 fn log_read_failure(error: &anyhow::Error, what: &'static str) {
     let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(error);
     tracing::warn!(error_len, error_sha256, "{what}; this turn sends no memory index");
+}
+
+/// A failed check after a prefix row was recorded. The text is already sent
+/// for this turn, so the message says what happens to the row instead.
+fn log_prefix_check_failure(error: &anyhow::Error, what: &'static str) {
+    let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(error);
+    tracing::warn!(
+        error_len,
+        error_sha256,
+        "{what}; the prefix row is dropped and the next turn renders a fresh index"
+    );
 }
