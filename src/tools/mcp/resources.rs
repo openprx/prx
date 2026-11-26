@@ -10,6 +10,7 @@
 use super::ATTACH_ONLY;
 use super::McpClient;
 use super::McpTool;
+use super::StdioSessionSlot;
 use super::http_session::{self, HttpSessionSlot};
 use super::result::render_resource_contents;
 use crate::config::McpTransport;
@@ -22,11 +23,21 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// A live peer and, for HTTP, the connection it belongs to, so a failure can
-/// reset exactly that connection.
+/// A live peer and the session it belongs to, so a failure resets exactly
+/// that session and no newer replacement.
 pub(super) struct AttachedPeer {
     peer: Peer<RoleClient>,
-    http: Option<(HttpSessionSlot, Arc<McpClient>)>,
+    attachment: Attachment,
+}
+
+enum Attachment {
+    /// The stdio slot and the generation of the session attached to.
+    Stdio { slot: StdioSessionSlot, generation: u64 },
+    /// The HTTP slot and the connection attached to.
+    Http {
+        slot: HttpSessionSlot,
+        client: Arc<McpClient>,
+    },
 }
 
 impl McpTool {
@@ -67,9 +78,9 @@ impl McpTool {
                 .get("uri")
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("Missing 'uri' parameter"))?;
-            self.read_resource(&attached, server, uri, request_timeout).await
+            read_resource(&attached, server, uri, request_timeout).await
         } else {
-            self.list_resources(&attached, server, request_timeout).await
+            list_resources(&attached, server, request_timeout).await
         }
     }
 
@@ -92,11 +103,9 @@ impl McpTool {
         match config.transport {
             McpTransport::Stdio => {
                 self.call_stdio(server, &config, ATTACH_ONLY, None).await?;
-                let peer = self
-                    .stdio_peer(server)
+                self.stdio_attachment(server)
                     .await
-                    .ok_or_else(|| anyhow::anyhow!("MCP stdio session for '{server}' is not running"))?;
-                Ok(AttachedPeer { peer, http: None })
+                    .ok_or_else(|| anyhow::anyhow!("MCP stdio session for '{server}' is not running"))
             }
             McpTransport::Http => {
                 let url = config
@@ -113,7 +122,7 @@ impl McpTool {
                         self.record_server_era(server, Some(learnt));
                         Ok(AttachedPeer {
                             peer: client.peer().clone(),
-                            http: Some((slot, client)),
+                            attachment: Attachment::Http { slot, client },
                         })
                     }
                     Err(error) => {
@@ -125,110 +134,116 @@ impl McpTool {
         }
     }
 
-    /// The peer of the running stdio session of `server`, if any.
-    async fn stdio_peer(&self, server: &str) -> Option<Peer<RoleClient>> {
+    /// The peer and generation of the running stdio session of `server`, if any.
+    async fn stdio_attachment(&self, server: &str) -> Option<AttachedPeer> {
         let slot = self.stdio_sessions.lock().get(server).cloned()?;
-        let session = slot.lock().await;
-        session.as_ref().map(|active| active.client.peer().clone())
+        let (peer, generation) = {
+            let session = slot.lock().await;
+            let active = session.as_ref()?;
+            (active.client.peer().clone(), active.generation)
+        };
+        Some(AttachedPeer {
+            peer,
+            attachment: Attachment::Stdio { slot, generation },
+        })
     }
+}
 
-    /// Drop the session behind `attached`: the HTTP connection if it is still
-    /// current, or the stdio session. Mirrors the reset branches of the call path.
-    async fn reset_attached(&self, server: &str, attached: &AttachedPeer) {
-        match &attached.http {
-            Some((slot, client)) => http_session::reset_if_current(slot, client).await,
-            None => {
-                let Some(slot) = self.stdio_sessions.lock().get(server).cloned() else {
-                    return;
-                };
-                let failed = slot.lock().await.take();
-                if let Some(failed) = failed {
-                    failed.close().await;
+/// Drop the session behind `attached` if the slot still holds it. For HTTP
+/// that is the connection (`reset_if_current`); for stdio it is the session
+/// of the same generation. A newer replacement in the slot is left alone.
+/// The slot lock is held only for the check and the take, never across a read.
+async fn reset_attached(attached: &AttachedPeer) {
+    match &attached.attachment {
+        Attachment::Http { slot, client } => http_session::reset_if_current(slot, client).await,
+        Attachment::Stdio { slot, generation } => {
+            let failed = {
+                let mut guard = slot.lock().await;
+                match guard.as_ref() {
+                    Some(session) if session.generation == *generation => guard.take(),
+                    _ => None,
                 }
+            };
+            if let Some(failed) = failed {
+                failed.close().await;
             }
         }
     }
+}
 
-    /// Reset after a failed request if the failure means the transport is gone
-    /// or stuck. Application-level errors keep the session.
-    async fn reset_after_failure(&self, server: &str, attached: &AttachedPeer, error: &ServiceError) {
-        if http_session::is_transport_failure(error) {
-            self.reset_attached(server, attached).await;
-        }
+/// Reset after a failed request if the failure means the transport is gone
+/// or stuck. Application-level errors keep the session.
+async fn reset_after_failure(attached: &AttachedPeer, error: &ServiceError) {
+    if http_session::is_transport_failure(error) {
+        reset_attached(attached).await;
     }
+}
 
-    /// Resources and templates as compact JSON, under the request timeout.
-    async fn list_resources(
-        &self,
-        attached: &AttachedPeer,
-        server: &str,
-        request_timeout: Duration,
-    ) -> anyhow::Result<String> {
-        let (resources, templates) = match tokio::time::timeout(request_timeout, list_items(&attached.peer)).await {
-            Ok(Ok(items)) => items,
-            Ok(Err(error)) => {
-                self.reset_after_failure(server, attached, &error).await;
-                return Err(request_error(server, attached, error.into()));
-            }
-            Err(_) => {
-                self.reset_attached(server, attached).await;
-                bail!(
-                    "MCP resource list timed out after {} ms; session was reset",
-                    request_timeout.as_millis()
-                );
-            }
-        };
-        let resources = resources.iter().map(listed_resource).collect::<Vec<_>>();
-        let templates = templates.iter().map(listed_template).collect::<Vec<_>>();
-        Ok(serde_json::to_string(&json!({
-            "resources": resources,
-            "resourceTemplates": templates,
-        }))?)
-    }
-
-    /// Read one resource under the request timeout. Text is returned in full;
-    /// a blob is a placeholder with its size and no base64 payload. A not-found
-    /// answer names the URI and keeps the session.
-    async fn read_resource(
-        &self,
-        attached: &AttachedPeer,
-        server: &str,
-        uri: &str,
-        request_timeout: Duration,
-    ) -> anyhow::Result<String> {
-        let request = attached.peer.read_resource_once(ReadResourceRequestParams::new(uri));
-        let response = match tokio::time::timeout(request_timeout, request).await {
-            Ok(Ok(response)) => response,
-            Ok(Err(error)) => {
-                self.reset_after_failure(server, attached, &error).await;
-                return Err(match error {
-                    ServiceError::McpError(ref data) if data.code.0 == -32602 || data.code.0 == -32002 => {
-                        anyhow::anyhow!("resource not found: {uri}")
-                    }
-                    other => request_error(server, attached, other.into()),
-                });
-            }
-            Err(_) => {
-                self.reset_attached(server, attached).await;
-                bail!(
-                    "MCP resource read timed out after {} ms; session was reset",
-                    request_timeout.as_millis()
-                );
-            }
-        };
-        match response {
-            ReadResourceResponse::Complete(result) if result.contents.is_empty() => Ok("(empty resource)".to_string()),
-            ReadResourceResponse::Complete(result) => Ok(result
-                .contents
-                .iter()
-                .map(render_resource_contents)
-                .collect::<Vec<_>>()
-                .join("\n")),
-            ReadResourceResponse::InputRequired(_) => bail!(
-                "MCP server '{server}' asked for client input (elicitation/sampling/roots); PRX does not support MCP input requests yet"
-            ),
-            _ => bail!("MCP server returned a response type PRX does not understand"),
+/// Resources and templates as compact JSON, under the request timeout.
+async fn list_resources(attached: &AttachedPeer, server: &str, request_timeout: Duration) -> anyhow::Result<String> {
+    let (resources, templates) = match tokio::time::timeout(request_timeout, list_items(&attached.peer)).await {
+        Ok(Ok(items)) => items,
+        Ok(Err(error)) => {
+            reset_after_failure(attached, &error).await;
+            return Err(request_error(server, attached, error.into()));
         }
+        Err(_) => {
+            reset_attached(attached).await;
+            bail!(
+                "MCP resource list timed out after {} ms; session was reset",
+                request_timeout.as_millis()
+            );
+        }
+    };
+    let resources = resources.iter().map(listed_resource).collect::<Vec<_>>();
+    let templates = templates.iter().map(listed_template).collect::<Vec<_>>();
+    Ok(serde_json::to_string(&json!({
+        "resources": resources,
+        "resourceTemplates": templates,
+    }))?)
+}
+
+/// Read one resource under the request timeout. Text is returned in full;
+/// a blob is a placeholder with its size and no base64 payload. A not-found
+/// answer names the URI and keeps the session.
+async fn read_resource(
+    attached: &AttachedPeer,
+    server: &str,
+    uri: &str,
+    request_timeout: Duration,
+) -> anyhow::Result<String> {
+    let request = attached.peer.read_resource_once(ReadResourceRequestParams::new(uri));
+    let response = match tokio::time::timeout(request_timeout, request).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            reset_after_failure(attached, &error).await;
+            return Err(match error {
+                ServiceError::McpError(ref data) if data.code.0 == -32602 || data.code.0 == -32002 => {
+                    anyhow::anyhow!("resource not found: {uri}")
+                }
+                other => request_error(server, attached, other.into()),
+            });
+        }
+        Err(_) => {
+            reset_attached(attached).await;
+            bail!(
+                "MCP resource read timed out after {} ms; session was reset",
+                request_timeout.as_millis()
+            );
+        }
+    };
+    match response {
+        ReadResourceResponse::Complete(result) if result.contents.is_empty() => Ok("(empty resource)".to_string()),
+        ReadResourceResponse::Complete(result) => Ok(result
+            .contents
+            .iter()
+            .map(render_resource_contents)
+            .collect::<Vec<_>>()
+            .join("\n")),
+        ReadResourceResponse::InputRequired(_) => bail!(
+            "MCP server '{server}' asked for client input (elicitation/sampling/roots); PRX does not support MCP input requests yet"
+        ),
+        _ => bail!("MCP server returned a response type PRX does not understand"),
     }
 }
 
@@ -247,9 +262,9 @@ async fn list_items(peer: &Peer<RoleClient>) -> Result<(Vec<Resource>, Vec<Resou
 /// The error returned to the model for a failed request. HTTP failures get the
 /// same authorization hint as the call path.
 fn request_error(server: &str, attached: &AttachedPeer, error: anyhow::Error) -> anyhow::Error {
-    match attached.http {
-        Some(_) => http_session::with_authorization_hint(server, error),
-        None => error,
+    match attached.attachment {
+        Attachment::Http { .. } => http_session::with_authorization_hint(server, error),
+        Attachment::Stdio { .. } => error,
     }
 }
 

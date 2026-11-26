@@ -13,6 +13,7 @@ use sha2::Digest;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::process::Command;
@@ -188,6 +189,9 @@ struct StdioSession {
     registration: crate::runtime::registry::WorkGuard,
     /// The `toolsListChanged` subscription of this session, aborted with it.
     tools_listener: Option<tokio::task::AbortHandle>,
+    // Identity of this session within the tool: a holder of an older
+    // generation must not reset a newer session in the same slot.
+    generation: u64,
 }
 
 impl StdioSession {
@@ -256,6 +260,8 @@ pub struct McpTool {
     launch_root: Option<PathBuf>,
     state: RwLock<RuntimeState>,
     stdio_sessions: Mutex<HashMap<String, StdioSessionSlot>>,
+    /// Source of `StdioSession::generation`: identifies one stdio session.
+    stdio_generation: AtomicU64,
     /// The persistent connection of each HTTP server (see `http_session`).
     http_sessions: HttpSessions,
     /// Servers a later configuration generation no longer runs: their
@@ -345,6 +351,7 @@ impl McpTool {
             launch_root: None,
             state: RwLock::new(state),
             stdio_sessions: Mutex::new(HashMap::new()),
+            stdio_generation: AtomicU64::new(0),
             http_sessions: Mutex::new(HashMap::new()),
             retired: Mutex::new(HashSet::new()),
             stale: Arc::new(Mutex::new(HashSet::new())),
@@ -1053,6 +1060,7 @@ impl McpTool {
                 client,
                 registration,
                 tools_listener,
+                generation: self.stdio_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             });
         }
 
