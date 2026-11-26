@@ -44,6 +44,10 @@ pub struct PairingGuard {
     /// The owner every paired bearer acts for (HOST-1a). The gateway sets it
     /// at start-up; a guard without it authenticates no API owner.
     install_owner: Option<InstallOwnerId>,
+    /// When set, the accepted tokens are the active configuration's
+    /// `gateway.paired_tokens` plus the tokens this process issued through
+    /// `/pair` that the configuration does not list yet.
+    live_tokens: Option<crate::config::SharedConfig>,
 }
 
 impl PairingGuard {
@@ -71,6 +75,49 @@ impl PairingGuard {
             paired_tokens: Arc::new(Mutex::new(tokens)),
             failed_attempts: Arc::new(Mutex::new(HashMap::new())),
             install_owner: None,
+            live_tokens: None,
+        }
+    }
+
+    /// Read the accepted tokens from the active configuration from now on.
+    ///
+    /// The startup list is dropped here: the configuration holds it, so a
+    /// token removed from the file stops authenticating at the next request.
+    #[must_use]
+    pub fn with_live_tokens(mut self, shared: crate::config::SharedConfig) -> Self {
+        self.paired_tokens.lock().clear();
+        self.live_tokens = Some(shared);
+        self
+    }
+
+    /// The token hashes the active configuration lists, normalized as in
+    /// [`PairingGuard::new`]. `None` without a live source.
+    fn live_hashes(&self) -> Option<HashSet<String>> {
+        let shared = self.live_tokens.as_ref()?;
+        let active = shared.load_full();
+        Some(
+            active
+                .gateway
+                .paired_tokens
+                .iter()
+                .map(|t| if is_token_hash(t) { t.clone() } else { hash_token(t) })
+                .collect(),
+        )
+    }
+
+    /// Drop issued tokens that the active configuration now lists: they are
+    /// persisted, so their later removal from the file revokes them. Only
+    /// hashes the live list holds are dropped; a token it does not hold stays
+    /// issued until a reload that persists it succeeds.
+    pub(crate) fn forget_issued(&self, hashes: &[String]) {
+        let Some(live) = self.live_hashes() else {
+            return;
+        };
+        let mut tokens = self.paired_tokens.lock();
+        for hash in hashes {
+            if live.contains(hash) {
+                tokens.remove(hash);
+            }
         }
     }
 
@@ -188,9 +235,15 @@ impl PairingGuard {
             return true;
         }
         let hashed = hash_token(token);
-        let tokens = self.paired_tokens.lock();
+        let live = self.live_hashes();
+        let mut tokens = self.paired_tokens.lock();
+        if let Some(live) = live.as_ref() {
+            // Persisted issued tokens are now held by the live list; their
+            // removal from the file must revoke them, so stop tracking them.
+            tokens.retain(|stored| !live.contains(stored));
+        }
         let mut found = false;
-        for stored in tokens.iter() {
+        for stored in live.iter().flatten().chain(tokens.iter()) {
             // constant_time_eq does NOT short-circuit — always iterates all bytes.
             // We bitwise-OR into `found` to avoid short-circuiting across hashes.
             found |= constant_time_eq(&hashed, stored);
@@ -200,11 +253,15 @@ impl PairingGuard {
 
     /// Returns true if the gateway is already paired (has at least one token).
     pub fn is_paired(&self) -> bool {
+        if self.live_hashes().is_some_and(|live| !live.is_empty()) {
+            return true;
+        }
         let tokens = self.paired_tokens.lock();
         !tokens.is_empty()
     }
 
-    /// Get all paired token hashes (for persisting to config).
+    /// Get the paired token hashes to persist to config. With a live source
+    /// this is the issued set only (the list already holds the rest).
     pub fn tokens(&self) -> Vec<String> {
         let tokens = self.paired_tokens.lock();
         tokens.iter().cloned().collect()

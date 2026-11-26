@@ -403,7 +403,8 @@ async fn run_gateway_inner(
     // ── Pairing guard ──────────────────────────────────────
     let pairing = Arc::new(
         PairingGuard::new(config.gateway.require_pairing, &config.gateway.paired_tokens)
-            .with_install_owner(install_owner),
+            .with_install_owner(install_owner)
+            .with_live_tokens(Arc::clone(&shared_config_for_reload)),
     );
     let rate_limit_max_keys = normalize_max_keys(config.gateway.rate_limit_max_keys, RATE_LIMIT_MAX_KEYS_DEFAULT);
     let rate_limiter = Arc::new(GatewayRateLimiter::new(
@@ -890,6 +891,9 @@ async fn persist_pairing_tokens(config: &crate::config::SharedConfig, pairing: &
     })
     .await
     .context("Pairing config reload worker failed")??;
+    // Only after the reload succeeded: the saved list is live, so these
+    // issued tokens are checked against the list alone from now on.
+    pairing.forget_issued(&paired_tokens);
     Ok(())
 }
 
