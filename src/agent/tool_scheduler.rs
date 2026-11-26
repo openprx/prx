@@ -158,8 +158,9 @@ async fn execute_one_with_service(
         }
     };
     // Recorded before returning, so a caller dropped between here and the end
-    // of the batch still leaves evidence that this call ran.
-    recorder.record(index, &result.content);
+    // of the batch still leaves evidence that this call ran. A recorder that
+    // holds results for tool-result hooks keeps a placeholder here instead.
+    recorder.record_observed(index, &result.content);
     if result.status == ToolExecutionStatus::Cancelled {
         return Err(ToolLoopCancelled.into());
     }

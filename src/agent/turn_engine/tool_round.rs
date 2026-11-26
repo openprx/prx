@@ -14,8 +14,8 @@ use crate::agent::context_budget::reserve_request_tool_surface;
 use crate::agent::diagnostics::{redact_sensitive_json_keys, scrub_credentials, tool_parse_log_digest};
 use crate::agent::document_ingest::{persist_tool_output_document, persist_untrusted_external_copy};
 use crate::agent::tool_result_recording::{
-    CONTEXT_HOOK_HELD_RESULT, ExecutedToolRecords, ObservedToolResult, ToolResultRecorder,
-    compact_tool_result_for_history_with_status, tool_result_inline_budget_for_history,
+    ExecutedToolRecords, ObservedToolResult, ToolResultRecorder, compact_tool_result_for_history_with_status,
+    tool_result_inline_budget_for_history,
 };
 use crate::agent::tool_scheduler::{execute_tools_with_service, shared_unrecoverable_tool_error};
 use crate::agent::turn_contracts::{ToolCallNotification, ToolLoopCancelled, ToolLoopOutcome};
@@ -215,7 +215,13 @@ pub(super) async fn run_tools(
     }
 
     let tools_started_at = Instant::now();
-    let recorder = ToolResultRecorder::new(tool_calls.len());
+    // K-H3: decided once per round. When a tool-result context hook may replace
+    // what the calls return, the recorder holds a placeholder for each call from
+    // the moment it returns until the hooks answered below, so no interruption
+    // in between can persist the raw output. Without such an action the
+    // recorder keeps the raw output exactly as before.
+    let hold_tool_results = hooks.has_context_actions(ContextPoint::ToolResult);
+    let recorder = ToolResultRecorder::with_hold(tool_calls.len(), hold_tool_results);
     // The assistant message that *requested* these calls goes into history
     // before any of them runs. Written after the batch, as it used to be, an
     // interruption partway through the batch left the calls that had already
@@ -271,12 +277,10 @@ pub(super) async fn run_tools(
     // back or add a note. The notify event and the failure counters keep the raw
     // output; every model-reachable copy below uses the effective text. With no
     // such action configured nothing is built and every text stays as it was.
-    let (effective_texts, contributions) = if hooks.has_context_actions(ContextPoint::ToolResult) {
-        // The hooks run under an await: until they answer, the recorder holds a
-        // placeholder, so an interrupted batch never persists the raw output.
-        for index in 0..individual_results.len() {
-            recorder.record(index, CONTEXT_HOOK_HELD_RESULT);
-        }
+    let (effective_texts, contributions) = if hold_tool_results {
+        // Every call of the batch returned, so every slot already holds the
+        // placeholder recorded by the scheduler; it stays there while the hooks
+        // run under the await below.
         let raw_calls: Vec<(&str, String, bool, &str)> = tool_calls
             .iter()
             .zip(individual_results.iter())

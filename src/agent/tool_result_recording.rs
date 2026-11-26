@@ -143,10 +143,10 @@ status: {status}\n\
 pub(super) const INTERRUPTED_TOOL_RESULT: &str =
     "Error: this tool call was interrupted before it ran; it may be retried.";
 
-/// Text the recorder holds for a call while its tool-result context hooks are
-/// still running (K-H3). The raw output is not kept there during that await, so
-/// an interruption in that window persists this placeholder, never the raw text
-/// a hook may be redacting.
+/// Text the recorder holds for a call from the moment it returns until its
+/// tool-result context hooks have answered (K-H3). The raw output is never kept
+/// there in that window, so an interruption during the batch or the hook await
+/// persists this placeholder, never the raw text a hook may be redacting.
 pub(super) const CONTEXT_HOOK_HELD_RESULT: &str = "[tool output held back until context hooks finish]";
 
 /// Per-call tool output, captured the instant each call returns.
@@ -168,15 +168,44 @@ pub(super) const CONTEXT_HOOK_HELD_RESULT: &str = "[tool output held back until 
 #[derive(Debug)]
 pub(super) struct ToolResultRecorder {
     slots: parking_lot::Mutex<Vec<Option<String>>>,
+    /// Set when a tool-result context hook may still replace what the calls
+    /// returned (K-H3): [`Self::record_observed`] then keeps
+    /// [`CONTEXT_HOOK_HELD_RESULT`] instead of the raw output, and the round
+    /// writes the effective text with [`Self::record`] once the hooks answered.
+    hold_observed: bool,
 }
 
 impl ToolResultRecorder {
+    /// A recorder that never holds results (tests drive the scheduler with it).
+    #[cfg(test)]
     pub(super) fn new(len: usize) -> Self {
+        Self::with_hold(len, false)
+    }
+
+    /// A recorder whose [`Self::record_observed`] holds raw output back when
+    /// `hold_observed` is set.
+    pub(super) fn with_hold(len: usize, hold_observed: bool) -> Self {
         Self {
             slots: parking_lot::Mutex::new(vec![None; len]),
+            hold_observed,
         }
     }
 
+    /// Record the output a call returned, as the scheduler sees it. While the
+    /// recorder holds results this records the placeholder, so an interruption
+    /// before the hooks decided never persists the raw text.
+    pub(super) fn record_observed(&self, index: usize, raw: &str) {
+        self.record(
+            index,
+            if self.hold_observed {
+                CONTEXT_HOOK_HELD_RESULT
+            } else {
+                raw
+            },
+        );
+    }
+
+    /// Record `result` verbatim.
     pub(super) fn record(&self, index: usize, result: &str) {
         let mut slots = self.slots.lock();
         if let Some(slot) = slots.get_mut(index) {
