@@ -1,8 +1,8 @@
 //! Retry budgets and fixed waits per failure kind for the reliable provider.
 //!
 //! A failed attempt is retried on the same candidate by its [`RetryKind`]:
-//! ordinary errors get the chain's `max_retries`, overloads (HTTP 503 or an
-//! overloaded body) at most [`OVERLOAD_MAX_RETRIES`], and rate limits (HTTP 429)
+//! ordinary errors get the chain's `max_retries`, overloads (HTTP 502, 503 or
+//! 504, or an overloaded body) at most [`OVERLOAD_MAX_RETRIES`], and rate limits (HTTP 429)
 //! at least [`RATE_LIMIT_MAX_RETRIES`], so the retries span a one-minute
 //! provider window.
 
@@ -23,7 +23,7 @@ const RATE_LIMIT_RETRY_WAITS_MS: [u64; 5] = [2_000, 6_000, 15_000, 30_000, 30_00
 pub(super) enum RetryKind {
     /// Any other retryable failure: the chain's `max_retries`.
     Ordinary,
-    /// HTTP 503 or an overloaded error body: at most [`OVERLOAD_MAX_RETRIES`].
+    /// HTTP 502, 503 or 504, or an overloaded error body: at most [`OVERLOAD_MAX_RETRIES`].
     Overload,
     /// HTTP 429 already judged retryable: at least [`RATE_LIMIT_MAX_RETRIES`].
     RateLimited,

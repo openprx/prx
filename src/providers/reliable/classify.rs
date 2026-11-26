@@ -131,19 +131,33 @@ pub(super) fn is_rate_limited(err: &anyhow::Error) -> bool {
     msg.contains("429") && (msg.contains("Too Many") || msg.contains("rate") || msg.contains("limit"))
 }
 
-/// Whether a provider error text names an overload: HTTP 503, or an error
-/// body whose type/code says overloaded or rate limited (`engine_overloaded`,
-/// `overloaded_error`, `rate_limit_exceeded`).
+/// Whether a provider error text names an overload: HTTP 502, 503 or 504, or
+/// an error body whose type/code says overloaded or rate limited
+/// (`engine_overloaded`, `overloaded_error`, `rate_limit_exceeded`).
 pub(super) fn names_overload(lower: &str) -> bool {
-    lower.contains("(503") || lower.contains("http 503") || lower.contains("overloaded") || lower.contains("rate_limit")
+    lower.contains("(502")
+        || lower.contains("(503")
+        || lower.contains("(504")
+        || lower.contains("http 502")
+        || lower.contains("http 503")
+        || lower.contains("http 504")
+        || lower.contains("overloaded")
+        || lower.contains("rate_limit")
 }
 
-/// Whether a retryable buffered failure is an overload response (HTTP 429 or
-/// 503, or an overloaded / rate-limited error body). Callers have already
-/// ruled out non-retryable errors, business 429s included.
+/// Whether an HTTP status is an overload response: 502, 503 or 504. A 429 is
+/// judged as a rate limit, not as an overload.
+fn is_overload_status(code: u16) -> bool {
+    matches!(code, 502 | 503 | 504)
+}
+
+/// Whether a retryable buffered failure is an overload response (HTTP 429,
+/// 502, 503 or 504, or an overloaded / rate-limited error body). Callers have
+/// already ruled out non-retryable errors, business 429s included.
 pub(super) fn is_overload(err: &anyhow::Error) -> bool {
     if let Some(status) = err.downcast_ref::<reqwest::Error>().and_then(reqwest::Error::status) {
-        return matches!(status.as_u16(), 429 | 503);
+        let code = status.as_u16();
+        return code == 429 || is_overload_status(code);
     }
     is_rate_limited(err) || names_overload(&err.to_string().to_lowercase())
 }
@@ -399,13 +413,15 @@ pub(super) fn stream_retry_kind(err: &super::super::traits::StreamError, class: 
 }
 
 /// Whether a retryable pre-content stream failure is an overload response:
-/// HTTP 503, or an in-stream error whose type/code says overloaded or rate
-/// limited.
+/// HTTP 502, 503 or 504, or an in-stream error whose type/code says overloaded
+/// or rate limited.
 pub(super) fn stream_error_is_overload(err: &super::super::traits::StreamError, class: StreamFailureClass) -> bool {
     use super::super::traits::StreamError;
     match (class, err) {
-        (StreamFailureClass::Retryable, StreamError::RateLimited { status, .. }) => *status == 503,
-        (StreamFailureClass::Retryable, StreamError::Http(http)) => http.status().is_some_and(|s| s.as_u16() == 503),
+        (StreamFailureClass::Retryable, StreamError::RateLimited { status, .. }) => is_overload_status(*status),
+        (StreamFailureClass::Retryable, StreamError::Http(http)) => {
+            http.status().is_some_and(|s| is_overload_status(s.as_u16()))
+        }
         (StreamFailureClass::Retryable, StreamError::Provider(message) | StreamError::InvalidSse(message)) => {
             names_overload(&message.to_lowercase())
         }
