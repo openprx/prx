@@ -26,7 +26,9 @@
 use super::execution::scope_is_local_process_operator;
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::config::{Config, SharedConfig};
-use crate::cron::{self, CronJobPatch, DeliveryConfig, JobType, Schedule, ScheduledContext, SessionTarget};
+use crate::cron::{
+    self, CronJobPatch, DeliveryConfig, JobType, Schedule, ScheduledContext, ScheduledDeliver, SessionTarget,
+};
 use crate::security::SecurityPolicy;
 use crate::security::policy::{ApprovalGrant, PERSISTED_APPROVAL_GRANT_TTL_SECS};
 use async_trait::async_trait;
@@ -262,6 +264,30 @@ impl CronTool {
         };
         let approval_grant = ApprovalGrant::from_runtime_args(self.name(), args);
         let lineage = cron::lineage_from_trusted_scope(cfg, args);
+        // A one-shot agent job an agent creates from a session reports back into
+        // that session (K-R3b); every other job defaults to a note.
+        let deliver = match args.get("deliver") {
+            None => {
+                if job_type == JobType::Agent
+                    && matches!(schedule, Schedule::At { .. })
+                    && lineage.source_message_event_id.is_some()
+                {
+                    ScheduledDeliver::Message
+                } else {
+                    ScheduledDeliver::Note
+                }
+            }
+            Some(value) => match serde_json::from_value::<ScheduledDeliver>(value.clone()) {
+                Ok(deliver) => deliver,
+                Err(_) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some("Invalid deliver: use 'note', 'message' or 'none'".to_string()),
+                    });
+                }
+            },
+        };
 
         let result = match job_type {
             JobType::Shell => {
@@ -380,13 +406,15 @@ impl CronTool {
             Ok(job) => {
                 // `fresh` is stored by a patch after the create (X5): a failed patch
                 // removes the job just created, so no half-made job is left behind.
-                let (job, context_note) = if context == ScheduledContext::Fresh {
-                    let patch = CronJobPatch {
-                        context: Some(ScheduledContext::Fresh),
-                        ..CronJobPatch::default()
-                    };
-                    match cron::update_job(cfg, &job.id, patch) {
-                        Ok(updated) => (updated, ", context: fresh"),
+                let stored = CronJobPatch {
+                    context: (context == ScheduledContext::Fresh).then_some(ScheduledContext::Fresh),
+                    deliver: (deliver != ScheduledDeliver::Note).then_some(deliver),
+                    ..CronJobPatch::default()
+                };
+                let mut context_note = String::new();
+                let job = if stored.context.is_some() || stored.deliver.is_some() {
+                    match cron::update_job(cfg, &job.id, stored) {
+                        Ok(updated) => updated,
                         Err(error) => {
                             if cron::remove_job(cfg, &job.id).is_err() {
                                 tracing::warn!(job_id = %job.id, "cron job removal after a failed context patch failed");
@@ -399,8 +427,15 @@ impl CronTool {
                         }
                     }
                 } else {
-                    (job, "")
+                    job
                 };
+                if context == ScheduledContext::Fresh {
+                    context_note.push_str(", context: fresh");
+                }
+                if deliver != ScheduledDeliver::Note {
+                    context_note.push_str(", deliver: ");
+                    context_note.push_str(deliver.as_str());
+                }
                 Ok(ToolResult {
                     success: true,
                     output: format!(
@@ -650,9 +685,14 @@ impl CronTool {
                                         "enum": ["task", "fresh"],
                                         "description": "Agent jobs on 'add'/'schedule': 'task' (default) replays the earlier runs of this job's session; 'fresh' starts every run without them. Also accepted inside 'patch' for 'update'."
                                     },
+                                    "deliver": {
+                                        "type": "string",
+                                        "enum": ["note", "message", "none"],
+                                        "description": "How the owner hears about a finished run: note at the next turn (default), message into the creating session, or none. A one-shot agent job ('at') an agent creates from a session defaults to message. Also accepted inside 'patch' for 'update'."
+                                    },
                                     "patch": {
                                         "type": "object",
-                                        "description": "Fields to update for 'update'/'patch': name, command, prompt, enabled, model, delivery, delete_after_run, schedule, or context ('task' or 'fresh')."
+                                        "description": "Fields to update for 'update'/'patch': name, command, prompt, enabled, model, delivery, delete_after_run, schedule, context ('task' or 'fresh'), or deliver ('note', 'message' or 'none')."
                                     },
                                     "limit": {
                                         "type": "integer",
