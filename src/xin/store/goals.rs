@@ -1,10 +1,11 @@
+use super::connection::{authoritative_now, with_connection, with_immediate_connection};
 #[cfg(test)]
 use super::get_task;
 use super::rows::{
     SELECT_ALL_COLUMNS, TaskLineage, insert_task_event, map_task_row, parse_rfc3339, sql_err, stored_origin,
     stored_task_output, workspace_id,
 };
-use super::{JobLookupError, authoritative_now, stored_creator, with_connection, with_immediate_connection};
+use super::{JobLookupError, stored_creator};
 use crate::config::Config;
 use crate::cron::JobCreator;
 use crate::security::agent_level::CreatorStamp;

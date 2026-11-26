@@ -137,7 +137,7 @@ const ALLOWED_BRAIN_DB_OPENS_OUTSIDE_SQLITE_REPOSITORY: &[&str] = &[
     "src/xin/store.rs::event_outbox_recovers_cross_database_delivery_idempotently::let brain = Connection::open(memory_path.join(\"brain.db\")).unwrap();",
     "src/xin/store.rs::legacy_xin_tasks_schema_migrates_lineage_columns_and_events_table::let conn = Connection::open(&db_path).unwrap();",
     "src/xin/store.rs::open_xin_test_connection::let mut conn = Connection::open(&db_path).unwrap();",
-    "src/xin/store.rs::with_connection::Connection::open(&db_path).with_context(|| format!(\"Failed to open xin DB: {}\", db_path.display()))?;",
+    "src/xin/store/connection.rs::with_connection::Connection::open(&db_path).with_context(|| format!(\"Failed to open xin DB: {}\", db_path.display()))?;",
 ];
 
 /// The `.rs` files directly under `src/memory/sqlite/` that make up the split
@@ -241,8 +241,8 @@ const ALLOWED_PERSISTED_EVENT_TABLES: &[&str] = &[
     "src/memory/sqlite/tests/visibility_events.rs::memory_events",
     "src/memory/sqlite/tests/visibility_events.rs::memory_events",
     "src/xin/evolution.rs::evolution_proposal_events",
-    "src/xin/store.rs::xin_event_outbox",
-    "src/xin/store.rs::xin_task_events",
+    "src/xin/store/connection.rs::xin_event_outbox",
+    "src/xin/store/connection.rs::xin_task_events",
 ];
 
 #[test]
