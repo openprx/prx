@@ -301,6 +301,7 @@ pub(super) async fn run_sub_agent_process(
             role: entry.role.clone(),
             content: entry.content.clone(),
             timestamp: entry.timestamp,
+            event_id: None,
         })
         .collect();
     let sealed_capability = super::compute_worker_capability_with_key(

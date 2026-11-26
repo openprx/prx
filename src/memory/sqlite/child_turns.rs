@@ -144,7 +144,7 @@ fn newest_handoff(
     conn: &rusqlite::Connection,
     record: &ChildSessionRecord,
 ) -> anyhow::Result<Option<(ChildTurn, i64)>> {
-    let mut query = conn.prepare("SELECT e.content,e.created_at FROM message_events e
+    let mut query = conn.prepare("SELECT e.content,e.created_at,e.event_id FROM message_events e
         JOIN child_sessions c ON c.key=e.session_key AND c.ma_scope_id=e.ma_scope_id
         JOIN agent_scopes s ON s.scope_id=c.ma_scope_id
         WHERE c.key=?1 AND c.workspace_id=?2 AND c.owner_id=?3 AND e.workspace_id=?2 AND e.owner_id=?3
@@ -162,10 +162,10 @@ fn newest_handoff(
                 CONTEXT_SWITCH_EVENT_TYPE,
                 HANDOFF_CANDIDATE_ROWS
             ],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    for (content, created_at) in rows {
+    for (content, created_at, event_id) in rows {
         let Some(handoff) = validated_context_handoff(&content) else {
             continue;
         };
@@ -174,6 +174,7 @@ fn newest_handoff(
             role: "assistant".to_owned(),
             content,
             timestamp,
+            event_id: Some(event_id),
         };
         return Ok(Some((turn, handoff.last_row_id)));
     }
@@ -193,7 +194,7 @@ pub(super) fn history(memory: &SqliteMemory, record: &ChildSessionRecord) -> any
         Some((turn, last_row_id)) => (vec![turn], record.context_after.max(last_row_id)),
         None => (record.context.clone(), record.context_after),
     };
-    let mut query = conn.prepare("SELECT e.role,e.content,e.created_at FROM message_events e
+    let mut query = conn.prepare("SELECT e.role,e.content,e.created_at,e.event_id FROM message_events e
         JOIN child_sessions c ON c.key=e.session_key AND c.ma_scope_id=e.ma_scope_id
         JOIN agent_scopes s ON s.scope_id=c.ma_scope_id
         WHERE c.key=?1 AND c.workspace_id=?2 AND c.owner_id=?3 AND e.workspace_id=?2 AND e.owner_id=?3
@@ -208,14 +209,22 @@ pub(super) fn history(memory: &SqliteMemory, record: &ChildSessionRecord) -> any
     let turns: anyhow::Result<Vec<ChildTurn>> = query
         .query_map(
             params![record.session_key, record.workspace, record.owner, after],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            },
         )?
         .map(|row| {
-            let (role, content, timestamp) = row?;
+            let (role, content, timestamp, event_id) = row?;
             Ok(ChildTurn {
                 role,
                 content,
                 timestamp: chrono::DateTime::parse_from_rfc3339(&timestamp)?.with_timezone(&chrono::Utc),
+                event_id: Some(event_id),
             })
         })
         .collect();

@@ -57,6 +57,7 @@ impl ChildFocusContext<'_> {
                         role: turn.role.clone(),
                         content: turn.content.clone(),
                         timestamp: turn.timestamp,
+                        event_id: None,
                     })
                     .collect();
             }
@@ -381,6 +382,7 @@ impl ChildFocus {
                                 role: message.role,
                                 content: message.content,
                                 timestamp: chrono::Utc::now(),
+                                event_id: None,
                             })
                             .collect();
                     } else {

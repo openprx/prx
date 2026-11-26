@@ -87,4 +87,8 @@ pub struct ChildTurn {
     pub role: String,
     pub content: String,
     pub timestamp: DateTime<Utc>,
+    /// The stored row this turn was read from; `None` for a turn kept in the
+    /// record's context or built in memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
 }
