@@ -32,13 +32,16 @@ pub(super) fn sent_request(
     prompt: &str,
     time_tail: String,
 ) -> (String, Option<Attachment>) {
+    // The attached file text is masked like the prefix, before it is sent,
+    // stored and written to the attachment row: the three stay identical.
     let prefix = crate::security::redaction::redact_secrets(prefix);
     let Some(file_text) = prompt.strip_prefix(user_input) else {
-        return (format!("{prefix}{prompt}{time_tail}"), None);
+        let tail = crate::security::redaction::redact_secrets(&format!("{prompt}{time_tail}"));
+        return (format!("{prefix}{tail}"), None);
     };
     let sent = Attachment {
         prefix,
-        tail: format!("{file_text}{time_tail}"),
+        tail: crate::security::redaction::redact_secrets(&format!("{file_text}{time_tail}")),
     };
     (sent.compose(user_input), Some(sent))
 }
