@@ -2412,6 +2412,19 @@ hook can still slow a turn by up to its timeout; it can never stop one.
 
 The hook diagnostics carry the number of context actions as `context_count`.
 
+Where the contributions land. A `session_opened` contribution is a section of
+the session's prefix row, after the memory index, written as
+`[Hook context: <name>]` followed by its text. It is taken once per prefix
+render and frozen with the index: it stays in the system prompt until the
+session's next handoff (or a memory change that drops the row), and later turns
+of the session do not run the hook. A `turn_opened` contribution is placed in
+the stored tail of the turn's user message, before the date line, in the same
+form. The stored tail is replayed byte for byte, so removing the hook does not
+change an earlier turn. Each contribution writes one audit row,
+`hook.contribution.recorded`, with the hook name, the point, the kind, the
+character count and the run id, never the text. Without a context action,
+nothing runs and nothing is stored. Child turns do not call these points yet.
+
 #### Webhook hooks
 
 An action with `url` instead of `command` is a webhook: for each matching
