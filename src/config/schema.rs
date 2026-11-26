@@ -506,6 +506,8 @@ pub use nodes::*;
 mod agent;
 pub use agent::*;
 
+mod compaction_mode;
+
 mod media;
 pub use media::*;
 

@@ -59,7 +59,7 @@ impl Default for AgentPromptConfig {
 }
 
 /// Compaction mode for long conversation contexts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentCompactionMode {
     /// Disable proactive compaction.
@@ -77,7 +77,8 @@ pub enum AgentCompactionMode {
 /// Agent context compaction configuration (`[agent.compaction]`).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AgentCompactionConfig {
-    /// Context rollover strategy (`off`, `switch`, `safeguard`, `aggressive`).
+    /// Context rollover strategy (`off`, `switch`). The removed `safeguard` and
+    /// `aggressive` values load as `switch` with a warning.
     #[serde(default)]
     pub mode: AgentCompactionMode,
     /// Tokens reserved for the next model response; an upper bound, capped at
