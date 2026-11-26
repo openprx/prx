@@ -64,7 +64,11 @@ struct WorkspaceSet {
 
 /// Run a retention pass: state checks, one batch transaction per step, then the
 /// per-pass copies. `cutoff` is the oldest kept instant.
-pub(super) fn trim(memory: &SqliteMemory, cutoff: chrono::DateTime<chrono::Utc>, max_batches: u32) -> anyhow::Result<MessageTrim> {
+pub(super) fn trim(
+    memory: &SqliteMemory,
+    cutoff: chrono::DateTime<chrono::Utc>,
+    max_batches: u32,
+) -> anyhow::Result<MessageTrim> {
     let cutoff_text = cutoff.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
     let now = chrono::Utc::now().timestamp();
     let mut trim = MessageTrim::default();
@@ -72,7 +76,11 @@ pub(super) fn trim(memory: &SqliteMemory, cutoff: chrono::DateTime<chrono::Utc>,
         let writer = memory.pool.write();
         let tx = begin_immediate(&writer)?;
         let last: Option<i64> = tx
-            .query_row("SELECT last_run FROM message_retention_state WHERE singleton = 1", [], |r| r.get(0))
+            .query_row(
+                "SELECT last_run FROM message_retention_state WHERE singleton = 1",
+                [],
+                |r| r.get(0),
+            )
             .optional()?;
         if last.is_some_and(|last| now - last < THROTTLE_SECS) {
             trim.skipped = TrimSkipped::Throttled;
@@ -255,7 +263,9 @@ fn eligible(tx: &Connection, unit: &Unit, cutoff: &str) -> anyhow::Result<bool> 
         }
         Unit::Row { id, .. } => {
             let sql = format!("SELECT NOT EXISTS(SELECT 1 FROM message_events r WHERE r.id = :id AND ({KEEP_ROW}))");
-            tx.query_row(&sql, named_params! {":id": id, ":cutoff": cutoff}, |r| r.get::<_, bool>(0))?
+            tx.query_row(&sql, named_params! {":id": id, ":cutoff": cutoff}, |r| {
+                r.get::<_, bool>(0)
+            })?
         }
     };
     Ok(keep)
