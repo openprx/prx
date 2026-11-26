@@ -3558,6 +3558,11 @@ max_candidates = 12          # 1–32; candidates and mentions a turn considers
 | `max_candidates` | `12` | 1–32 candidates and mentions a turn considers |
 | `backend` | absent | Optional `[decision_engine.backend]` table; absent means `kind = "auto"` with `remote_enabled = false` |
 
+When `token_ratio_limit` is set to a value other than `0.35`, a provider send whose
+answer estimate exceeds the turn's remaining decision slice is refused. With the default
+value, the same send proceeds and logs a warning. A decision-accounting settlement
+failure always refuses the send, whatever the ratio.
+
 `[decision_engine.backend]` keys are `kind` (`auto`, `builtin`,
 `compatible_http`, `typesafe`, `openrouter`), `remote_enabled`, `endpoint`,
 `model`, `pinned_snapshot`, `credential_ref`, `timeout_ms` (default 250),
