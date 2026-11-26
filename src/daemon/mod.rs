@@ -1605,6 +1605,7 @@ fn record_evolution_judge_health<'a>(
     component: &str,
     verdicts: impl IntoIterator<Item = (crate::self_system::evolution::pipeline::JudgeOutcome, &'a [String])>,
 ) {
+    use crate::health::ComponentState;
     use crate::self_system::evolution::pipeline::JudgeOutcome;
 
     let mut scored = false;
@@ -1617,10 +1618,8 @@ fn record_evolution_judge_health<'a>(
                     .map_or("the evolution judge gave no verdict", String::as_str);
                 // The judge error comes from the provider stack; the endpoint
                 // is named without URL userinfo.
-                crate::health::mark_component_error(
-                    component,
-                    crate::providers::redact_endpoint_userinfo(reason).into_owned(),
-                );
+                let reason = crate::providers::redact_endpoint_userinfo(reason).into_owned();
+                crate::health::mark_component_advisory(component, ComponentState::Failed, Some(reason));
                 return;
             }
             JudgeOutcome::Scored => scored = true,
@@ -1628,7 +1627,7 @@ fn record_evolution_judge_health<'a>(
         }
     }
     if scored {
-        crate::health::mark_component_ok(component);
+        crate::health::mark_component_advisory(component, ComponentState::Ready, None);
     }
 }
 
@@ -1645,6 +1644,7 @@ fn record_evolution_judge_health<'a>(
 /// [`EVOLUTION_JUDGE_COMPONENT`] health component (error when degraded, ok when a
 /// real judge is wired) so the daemon health surface reflects it.
 fn build_evolution_judge_model(config: &Config) -> Arc<dyn crate::self_system::evolution::judge::JudgeScoringModel> {
+    use crate::health::ComponentState;
     use crate::self_system::evolution::judge::{ManagedJudge, MockJudgeModel};
     let provider_name = crate::providers::selection::default_provider(config).to_string();
     let built = crate::runtime::evolution_model::EvolutionModel::from_config(
@@ -1653,7 +1653,7 @@ fn build_evolution_judge_model(config: &Config) -> Arc<dyn crate::self_system::e
     );
     match built {
         Ok(model) => {
-            crate::health::mark_component_ok(EVOLUTION_JUDGE_COMPONENT);
+            crate::health::mark_component_advisory(EVOLUTION_JUDGE_COMPONENT, ComponentState::Ready, None);
             Arc::new(ManagedJudge(model))
         }
         Err(error) => {
@@ -1662,10 +1662,8 @@ fn build_evolution_judge_model(config: &Config) -> Arc<dyn crate::self_system::e
             // endpoint without it.
             let provider_name = crate::providers::redact_endpoint_userinfo(&provider_name);
             let error = crate::providers::redact_endpoint_userinfo(&error.to_string()).into_owned();
-            crate::health::mark_component_error(
-                EVOLUTION_JUDGE_COMPONENT,
-                format!("provider '{provider_name}' unavailable: {error}"),
-            );
+            let reason = format!("provider '{provider_name}' unavailable: {error}");
+            crate::health::mark_component_advisory(EVOLUTION_JUDGE_COMPONENT, ComponentState::Failed, Some(reason));
             tracing::warn!(
                 target: "self_system",
                 provider = %provider_name,

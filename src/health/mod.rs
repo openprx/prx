@@ -82,6 +82,10 @@ pub struct ComponentHealth {
     /// heartbeat. `None` means the component only publishes coarse states.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub activity: Option<ComponentActivity>,
+    /// Advisory components are reported in every snapshot but never decide
+    /// readiness and never go stale. Serialised only when set.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub advisory: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -143,6 +147,7 @@ fn new_component(owner: &str, required: bool, freshness_ttl: Duration, state: Co
         last_error: None,
         restart_count: 0,
         activity: None,
+        advisory: false,
     }
 }
 
@@ -187,15 +192,28 @@ where
     registry().changed.notify_one();
 }
 
+fn apply_component_state(entry: &mut ComponentHealth, state: ComponentState, error: Option<String>) {
+    entry.state = state;
+    if state == ComponentState::Ready {
+        entry.last_ok = Some(now_rfc3339());
+        entry.last_error = None;
+    } else if let Some(error) = error {
+        entry.last_error = Some(sanitize_error_summary(&error));
+    }
+}
+
 fn set_component_state(component: &str, state: ComponentState, error: Option<String>) {
+    upsert_component(component, move |entry| apply_component_state(entry, state, error));
+}
+
+/// Report a component that is shown in every snapshot, state file and doctor
+/// run, but never changes readiness and never goes stale. Used for the evolution
+/// judge, which runs once per evolution tick and must not decide `/health`.
+pub fn mark_component_advisory(component: &str, state: ComponentState, reason: Option<String>) {
     upsert_component(component, move |entry| {
-        entry.state = state;
-        if state == ComponentState::Ready {
-            entry.last_ok = Some(now_rfc3339());
-            entry.last_error = None;
-        } else if let Some(error) = error {
-            entry.last_error = Some(sanitize_error_summary(&error));
-        }
+        entry.advisory = true;
+        entry.required = false;
+        apply_component_state(entry, state, reason);
     });
 }
 
@@ -290,7 +308,7 @@ fn timestamp_is_fresh(updated_at: &str, ttl_seconds: u64, now: DateTime<Utc>) ->
 fn apply_freshness(components: &mut BTreeMap<String, ComponentHealth>, now: DateTime<Utc>) {
     for component in components.values_mut() {
         component.fresh = timestamp_is_fresh(&component.updated_at, component.freshness_ttl_seconds, now);
-        if component.state == ComponentState::Ready && !component.fresh {
+        if component.state == ComponentState::Ready && !component.fresh && !component.advisory {
             component.state = ComponentState::Degraded;
             component.status = ComponentState::Degraded.legacy_status().to_string();
             component.last_error = Some("readiness signal is stale".to_string());
@@ -324,6 +342,11 @@ pub fn readiness_from_snapshot(snapshot: &HealthSnapshot) -> ReadinessReport {
     let mut issues = Vec::new();
 
     for (name, component) in &snapshot.components {
+        // Advisory components are reported in the snapshot only; they never
+        // count as issues and never block readiness.
+        if component.advisory {
+            continue;
+        }
         if component.state == ComponentState::Ready && component.fresh {
             if component.required {
                 ready_components += 1;
