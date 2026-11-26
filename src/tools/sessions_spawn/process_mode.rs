@@ -101,6 +101,7 @@ pub(super) async fn run_sub_agent_process(
     process_control: &ProcessRunControl,
     steer_rx: tokio::sync::mpsc::Receiver<String>,
     history: Arc<RwLock<Vec<HistoryEntry>>>,
+    replay_seed: Vec<crate::memory::child_sessions::ChildTurn>,
     progress: Arc<crate::agent::idle::ProgressBeat>,
     source_fabric: Option<&MemoryFabric>,
     source_launch: Option<crate::runtime::operator_spawn::process::ProcessSourceLaunch>,
@@ -292,18 +293,24 @@ pub(super) async fn run_sub_agent_process(
     // authenticated pipe, below Full, with a relay built from the caller.
     let approval_relay =
         approval_relay.and_then(|relay| relay.arm(mailbox_binding.as_ref(), &mut manifest));
-    manifest.seed_history = history
-        .read()
-        .await
-        .iter()
-        .filter(|entry| entry.role != "system")
-        .map(|entry| crate::memory::child_sessions::ChildTurn {
-            role: entry.role.clone(),
-            content: entry.content.clone(),
-            timestamp: entry.timestamp,
-            event_id: None,
-        })
-        .collect();
+    // The stored turns keep their event ids, so the worker can open them
+    // through `open_turn`; without them the display copy is the seed.
+    manifest.seed_history = if replay_seed.is_empty() {
+        history
+            .read()
+            .await
+            .iter()
+            .filter(|entry| entry.role != "system")
+            .map(|entry| crate::memory::child_sessions::ChildTurn {
+                role: entry.role.clone(),
+                content: entry.content.clone(),
+                timestamp: entry.timestamp,
+                event_id: None,
+            })
+            .collect()
+    } else {
+        replay_seed.into_iter().filter(|turn| turn.role != "system").collect()
+    };
     let sealed_capability = super::compute_worker_capability_with_key(
         &launch_transport_key,
         &manifest.run_id,

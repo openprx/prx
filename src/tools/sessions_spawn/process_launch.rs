@@ -131,6 +131,8 @@ impl SessionsSpawnTool {
         let temperature = resolved_temperature;
         let history_arc: Arc<RwLock<Vec<HistoryEntry>>> =
             Arc::new(RwLock::new(super::continuation::seed_history()));
+        // Taken on the spawning task: task-locals do not cross `tokio::spawn`.
+        let replay_seed = super::continuation::seed_turns();
         let process_control = ProcessRunControl::new();
         let stop_control = Arc::clone(&process_control);
         let runtime_handle = tokio::runtime::Handle::try_current()?;
@@ -400,6 +402,7 @@ impl SessionsSpawnTool {
                             monitor_process_control.as_ref(),
                             process_steer_rx,
                             history_arc,
+                            replay_seed,
                             Arc::clone(&monitor_progress),
                             process_memory_fabric.as_ref(),
                             process_source_launch,
