@@ -319,6 +319,17 @@ impl ReplayLog {
         self.attachments
     }
 
+    /// The stored attachment of the user message `user_event_id`, if any.
+    pub(crate) fn attachment_of(&self, user_event_id: &str) -> Option<&Attachment> {
+        self.attachments.get(user_event_id)
+    }
+
+    /// The run of the stored message `event_id`, if the log holds that message
+    /// with a run id.
+    pub(crate) fn run_of_event(&self, event_id: &str) -> Option<&str> {
+        self.run_of_event.get(event_id).map(String::as_str)
+    }
+
     /// The stored turns as history messages, in order: each user message with
     /// its stored attachment's tail (the prefix is not replayed), each assistant
     /// reply preceded by the tool rounds of its run. Event ids line up with the
