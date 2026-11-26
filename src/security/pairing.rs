@@ -174,6 +174,12 @@ impl PairingGuard {
 
         {
             let mut pairing_code = self.pairing_code.lock();
+            // A pairing code exists only while no tokens exist. Once the active
+            // configuration lists one (for example after `prx token issue`), the
+            // code is retired and this attempt takes the existing no-code path.
+            if self.live_hashes().is_some_and(|live| !live.is_empty()) {
+                *pairing_code = None;
+            }
             if let Some(ref expected) = *pairing_code {
                 if constant_time_eq(code.trim(), expected.trim()) {
                     // Reset failed attempts for this client on success
