@@ -2107,10 +2107,12 @@ or as an empty array counts as absent.
 - `brief`: an object with `objective`, `expected_output` and `boundaries`
   (strings, at most 4,000 characters each). Blank fields are omitted; unknown
   keys are rejected.
-- `references`: a list of at most 32 entries. Each entry has `kind` (`document`
-  or `file`, required), `id` (for `document`), `path` (for `file`) and an
-  optional `note` (at most 200 characters). A `document` without `id` or a
-  `file` without `path` is rejected.
+- `references`: a list of at most 32 entries. Each entry has `kind` (`document`,
+  `file` or `transcript`, required), `id` (for `document`), `path` (for `file`),
+  `session_key` (for `transcript`) and an optional `note` (at most 200
+  characters). A `document` without `id`, a `file` without `path` or a
+  `transcript` without `session_key` is rejected. A `transcript` reference
+  names an earlier session to search with `transcript_search`.
 
 PRX renders both after the task text, so the child is told the objective,
 the expected output and the boundaries, and is pointed at the documents and
@@ -2127,6 +2129,7 @@ Boundaries: <boundaries>
 [References]
 - document <id>: read it with document_get_chunk (<note>)
 - file <path>: read it with file_read
+- transcript <session_key>: search it with transcript_search session_key=<session_key>
 ```
 
 Only the lines whose fields are present are written. The `[References]` lines
@@ -2136,6 +2139,21 @@ returns a tool error and starts no child. PRX does not check that a referenced
 document or file exists or is readable; the child's own tools report that. A
 top-level `brief` or `references` on `spawn_batch` applies to every member, as
 other batch-level defaults do.
+
+`history` with `transcript: true` reads a child's stored turns instead of the
+live run history. It finds the child session by its session key or a run id,
+among the sessions the caller's owner started, and returns the last `last_n`
+turns. Stored turns are available after a restart and for finished runs. Only
+text turns are returned; replayed tool rows are not. An unknown run answers
+`no stored child session for run <run_id>`. The read boundary is the owner:
+the parent-session match that `continue` applies is not required.
+
+A completed child's notice to a Console, rf or webhook parent ends with a
+`[References]` line naming the child transcript:
+
+```text
+- transcript <session_key>: read it with sessions_spawn action=history run_id=<run_id> transcript=true, or search it with transcript_search session_key=<session_key>
+```
 
 ## Messages between sessions
 
