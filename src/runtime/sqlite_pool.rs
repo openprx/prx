@@ -43,7 +43,7 @@
 //!
 //! Unbounded waiting is only acceptable because it is observable: every wait is
 //! measured into [`SqlitePoolStats`], and a database lock held by another
-//! process emits a periodic `warn!` for as long as it is held.
+//! connection emits a periodic `warn!` for as long as it is held.
 
 use std::cell::Cell;
 #[cfg(test)]
@@ -113,10 +113,12 @@ pub fn default_read_pool_size() -> usize {
 /// SQLite busy handler that waits for a contended database lock instead of
 /// failing with `SQLITE_BUSY`.
 ///
-/// In-process writes are already serialized by the pool, so this only fires
-/// when another process (a second daemon, a CLI inspecting the database file)
-/// holds the lock. Returning `true` asks SQLite to retry: contention must slow
-/// a caller down rather than turn its work into an error.
+/// This fires whenever another connection holds the database lock. That may be
+/// another pool or standalone connection in this process, or another process
+/// (a second daemon, a CLI inspecting the database file). Pools do not
+/// serialize against each other, so in-process contention reaches this handler
+/// too. Returning `true` asks SQLite to retry: contention must slow a caller
+/// down rather than turn its work into an error.
 ///
 /// The sleep grows with the retry count and is capped so a long wait neither
 /// spins a CPU nor becomes invisible — every [`BUSY_WARN_EVERY_ATTEMPTS`]
@@ -129,7 +131,7 @@ fn wait_for_database_lock(attempts: i32) -> bool {
     if attempt > 0 && attempt.is_multiple_of(BUSY_WARN_EVERY_ATTEMPTS) {
         tracing::warn!(
             attempts = attempt,
-            "SQLite database is locked by another process; waiting rather than failing"
+            "SQLite database is locked by another connection; waiting rather than failing"
         );
     }
     let backoff = attempt.saturating_add(1).min(BUSY_MAX_BACKOFF_MS);
@@ -299,7 +301,7 @@ fn wait_for_database_lock_bounded(attempts: i32) -> bool {
         tracing::error!(
             attempts = attempt,
             waited_ms = BOUNDED_BUSY_WAIT_MS,
-            "SQLite database stayed locked by another process past the bounded wait; failing this write"
+            "SQLite database stayed locked by another connection past the bounded wait; failing this write"
         );
         return false;
     }

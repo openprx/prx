@@ -1713,7 +1713,7 @@ concurrency limiter: when every reader is checked out, callers **queue** for one
 instead of failing, and that wait has no deadline. Writes queue for the writer
 the same way.
 
-This key sizes the memory database only. The WhatsApp session store has its own
+This key sizes the memory database only. Within one process, every opener of the same `brain.db` shares one pool, so the first opener's `sqlite_read_pool_size` and `sqlite_open_timeout_secs` apply to all of them. The WhatsApp session store has its own
 (`channels_config.whatsapp.read_pool_size`) so the two databases can be tuned
 separately, even though both run the same pool implementation.
 

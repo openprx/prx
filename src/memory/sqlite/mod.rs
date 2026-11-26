@@ -63,8 +63,8 @@ use super::embeddings::EmbeddingProvider;
 use super::principal::{ChatType, MemoryWriteContext, Principal, Role, Visibility, resolve_principal};
 use super::traits::{MemoryPrincipal, MessageEvent, MessageEventInput};
 use super::vector;
-use crate::runtime::sqlite_pool::SqliteConnectionPool as RawSqliteConnectionPool;
 mod erasure_pool;
+mod shared_pool;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use erasure_pool::MemoryPool as SqliteConnectionPool;
@@ -427,40 +427,15 @@ impl SqliteMemory {
             std::fs::create_dir_all(parent)?;
         }
 
-        // `reset_transactions_on_release` is on because this module issues bare
-        // `BEGIN` through `execute_batch` in places: `rusqlite::Transaction`
-        // would clean up after itself, a bare `BEGIN` would not, and a leftover
-        // transaction stalls every later write (writer) or pins a stale WAL
-        // snapshot for every later caller (reader).
-        let pool = RawSqliteConnectionPool::builder(db_path.clone())
-            .max_readers(read_pool_size.unwrap_or_else(crate::runtime::sqlite_pool::default_read_pool_size))
-            .open_timeout_secs(open_timeout_secs)
-            .writer_pragmas(SQLITE_WRITER_PRAGMAS)
-            .reader_pragmas(SQLITE_READER_PRAGMAS)
-            .reset_transactions_on_release(true)
-            .build()?;
-        // SQLite creates the file as 0666 masked by the process umask. A
-        // group-writable umask makes the ingress lease reject the database.
-        // Tighten the directory and the file without changing the process umask.
+        // One base pool per process: a second open of this file reuses the live
+        // pool and skips the one-time schema and hook sequence (see `shared_pool`).
+        let (pool, sync_runtime) = shared_pool::open_shared(
+            &db_path,
+            read_pool_size.unwrap_or_else(crate::runtime::sqlite_pool::default_read_pool_size),
+            open_timeout_secs,
+        )?;
+        // Every open re-tightens the mode; the first open already did so before schema init.
         restrict_owner_mode(&db_path)?;
-
-        Self::init_schema(&pool.write())?;
-
-        let pool = Arc::new(pool);
-        RawSqliteConnectionPool::publish_metrics(&pool);
-        let pool = Arc::new(SqliteConnectionPool::new(pool)?);
-        // Deleted rf content a previous process left in the WAL (AC-1b2b).
-        match rf_delete::scrub(&pool) {
-            Ok(true) => {}
-            Ok(false) => tracing::warn!("deleted rf content stays in brain.db-wal while another process reads it"),
-            Err(error) => tracing::warn!(
-                error = %crate::agent::diagnostics::error_class(&error),
-                "deleted rf content WAL scrub failed at open"
-            ),
-        }
-
-        let sync_runtime = sync_journal::for_database(&db_path)?;
-        sync_journal::install_notify(&mut pool.write(), &sync_runtime)?;
         Ok(Self {
             sync_runtime,
             pool,

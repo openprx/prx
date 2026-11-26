@@ -171,6 +171,7 @@ const SQLITE_BACKEND_FILES: &[&str] = &[
 /// Older child modules that were never part of the exemption for the
 /// repository root and stay scanned like any other file.
 const SQLITE_SEPARATE_MODULES: &[&str] = &[
+    "shared_pool.rs",
     "history_retention.rs",
     "terminal_epoch.rs",
     "agent_purge.rs",
