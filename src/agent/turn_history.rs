@@ -661,20 +661,15 @@ impl CanonicalHistory {
     /// The budgeted token weight of each message as the provider view sends
     /// it, index for index: its rendered content (the same renderers
     /// [`project`] applies) plus, for an assistant reply, the tool rounds
-    /// replayed before it. A caller-supplied message keeps its stored handoff
-    /// as it is, as an untracked caller's view does.
+    /// replayed before it. A stored handoff weighs its compact rendering, as the
+    /// terminal and the gateway (which renders stored handoffs) send it.
     pub(crate) fn provider_weights(&self) -> Vec<usize> {
         self.messages
             .iter()
-            .zip(&self.origins)
             .zip(&self.evidence)
-            .map(|((message, origin), evidence)| {
+            .map(|(message, evidence)| {
                 let stored = message.content.as_str();
-                let handed = if *origin == MessageOrigin::CallerSupplied {
-                    std::borrow::Cow::Borrowed(stored)
-                } else {
-                    render_context_handoff_for_provider(&message.role, stored)
-                };
+                let handed = render_context_handoff_for_provider(&message.role, stored);
                 let rendered = match message.role.as_str() {
                     "assistant" => render_assistant_content(&handed, evidence.as_deref()).into_owned(),
                     "user" => render_user_content(&handed, evidence.as_deref()).into_owned(),
