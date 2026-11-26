@@ -4,6 +4,7 @@
 
 use super::http_session::{self, HttpSessionSlot, HttpSessions};
 use super::lifecycle::{self, McpEra};
+use super::listen::StaleSet;
 use super::{DiscoveredToolMeta, McpClient, McpTool, mcp_http_client};
 use crate::config::McpServerConfig;
 use anyhow::bail;
@@ -122,7 +123,8 @@ impl McpTool {
         full: bool,
         era: Option<McpEra>,
         sessions: &HttpSessions,
-    ) -> anyhow::Result<(HashMap<String, DiscoveredToolMeta>, McpEra)> {
+        stale: &StaleSet,
+    ) -> anyhow::Result<(HashMap<String, DiscoveredToolMeta>, McpEra, Option<u64>)> {
         let url = server
             .url
             .as_deref()
@@ -134,8 +136,9 @@ impl McpTool {
         Self::validate_http_target(url, full)?;
 
         let slot = http_session::fresh_slot(sessions, server_name).await;
-        let (_client, learnt, listed) = http_session::acquire(&slot, server_name, url, server, full, era).await?;
-        let Some(listed) = listed else {
+        let (_client, learnt, listed) =
+            http_session::acquire(&slot, server_name, url, server, full, era, stale).await?;
+        let Some((listed, ttl_ms)) = listed else {
             bail!("MCP HTTP session for '{server_name}' listed no tools on connect");
         };
 
@@ -144,7 +147,7 @@ impl McpTool {
             .map(|tool| (tool.name.to_string(), discovered_tool_meta(tool)))
             .collect::<HashMap<_, _>>();
 
-        Ok((tools, learnt))
+        Ok((tools, learnt, ttl_ms))
     }
 
     /// A call uses the server's persistent session. A connect that fails
@@ -160,6 +163,7 @@ impl McpTool {
         arguments: Option<serde_json::Map<String, serde_json::Value>>,
         full: bool,
         era: &mut Option<McpEra>,
+        stale: &StaleSet,
     ) -> anyhow::Result<(bool, String)> {
         let url = server
             .url
@@ -174,7 +178,7 @@ impl McpTool {
         let request_timeout = Duration::from_millis(server.request_timeout_ms);
         // The slot lock is released inside `acquire`; the call runs on the
         // shared client, so concurrent calls to one server do not queue.
-        let (client, learnt, _) = match http_session::acquire(slot, server_name, url, server, full, *era).await {
+        let (client, learnt, _) = match http_session::acquire(slot, server_name, url, server, full, *era, stale).await {
             Ok(connected) => connected,
             Err(error) => {
                 *era = None;

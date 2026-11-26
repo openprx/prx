@@ -16,6 +16,7 @@
 //! the encrypted configuration; nothing in this module formats them.
 
 use super::lifecycle::McpEra;
+use super::listen::{self, StaleSet};
 use super::{McpClient, McpTool};
 use crate::config::McpServerConfig;
 use parking_lot::Mutex;
@@ -36,6 +37,8 @@ pub(super) struct HttpSession {
     /// session's lifetime so a reconnect does not probe again.
     pub(super) era: McpEra,
     pub(super) client: Arc<McpClient>,
+    /// The `toolsListChanged` subscription of this connection, aborted with it.
+    pub(super) tools_listener: Option<tokio::task::AbortHandle>,
 }
 
 /// The session slot of one server. Its lock is held only to read or replace
@@ -51,6 +54,14 @@ async fn close_shared(client: Arc<McpClient>) {
     if let Ok(client) = Arc::try_unwrap(client) {
         let _ = client.cancel().await;
     }
+}
+
+/// Stop the listener of a session and close its connection.
+async fn close_session(session: HttpSession) {
+    if let Some(listener) = session.tools_listener {
+        listener.abort();
+    }
+    close_shared(session.client).await;
 }
 
 /// The digest of the configured headers over their name-sorted pairs. Each
@@ -130,7 +141,7 @@ pub(super) async fn fresh_slot(sessions: &HttpSessions, server_name: &str) -> Ht
     if let Some(slot) = previous {
         let taken = slot.lock().await.take();
         if let Some(session) = taken {
-            close_shared(session.client).await;
+            close_session(session).await;
         }
     }
     slot_for(sessions, server_name)
@@ -143,7 +154,8 @@ pub(super) async fn fresh_slot(sessions: &HttpSessions, server_name: &str) -> Ht
 /// new connection whose tools are listed once, so the `x-mcp-header` cache is
 /// filled; those tools are returned only for a new connection. The slot lock
 /// is held while connecting, so concurrent first calls share one connection.
-/// Returns the client, the era it answered with and the listed tools.
+/// Returns the client, the era it answered with and, for a new connection,
+/// the listed tools with the `ttlMs` hint of that listing.
 pub(super) async fn acquire(
     slot: &HttpSessionSlot,
     server_name: &str,
@@ -151,7 +163,8 @@ pub(super) async fn acquire(
     server: &McpServerConfig,
     full: bool,
     era: Option<McpEra>,
-) -> anyhow::Result<(Arc<McpClient>, McpEra, Option<Vec<Tool>>)> {
+    stale: &StaleSet,
+) -> anyhow::Result<(Arc<McpClient>, McpEra, Option<(Vec<Tool>, Option<u64>)>)> {
     let digest = headers_digest(&server.headers);
     let mut guard = slot.lock().await;
     if let Some(session) = guard.as_ref()
@@ -163,21 +176,22 @@ pub(super) async fn acquire(
     {
         return Ok((Arc::clone(&session.client), session.era, None));
     }
-    if let Some(stale) = guard.take() {
-        close_shared(stale.client).await;
+    if let Some(stale_session) = guard.take() {
+        close_session(stale_session).await;
     }
     let headers = transport_headers(server_name, &server.headers)?;
     let (client, learnt) =
         McpTool::connect_http_retrying(server_name, url, headers, server.startup_timeout_ms, full, era)
             .await
             .map_err(|error| with_authorization_hint(server_name, error))?;
-    let tools = match client.peer().list_all_tools().await {
-        Ok(tools) => tools,
+    let listed = match client.peer().list_all_tools_with_cache_hint().await {
+        Ok(list) => (list.items, list.ttl_ms),
         Err(error) => {
             let _ = client.cancel().await;
             return Err(with_authorization_hint(server_name, error.into()));
         }
     };
+    let tools_listener = listen::spawn_tools_listener(server_name, client.peer().clone(), learnt, stale);
     let client = Arc::new(client);
     *guard = Some(HttpSession {
         url: url.to_string(),
@@ -185,8 +199,9 @@ pub(super) async fn acquire(
         full,
         era: learnt,
         client: Arc::clone(&client),
+        tools_listener,
     });
-    Ok((client, learnt, Some(tools)))
+    Ok((client, learnt, Some(listed)))
 }
 
 /// Drop the session of `slot` only if it still holds `client`. A transport
@@ -200,7 +215,7 @@ pub(super) async fn reset_if_current(slot: &HttpSessionSlot, client: &Arc<McpCli
         }
     };
     if let Some(session) = taken {
-        close_shared(session.client).await;
+        close_session(session).await;
     }
 }
 
@@ -219,7 +234,7 @@ pub(super) async fn close_sessions(sessions: &HttpSessions, names: Option<&[Stri
     for slot in slots {
         let session = slot.lock().await.take();
         if let Some(session) = session {
-            close_shared(session.client).await;
+            close_session(session).await;
             closed += 1;
         }
     }

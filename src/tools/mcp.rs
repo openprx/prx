@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::process::Command;
 
 use self::client::{McpToolDetail, discovered_tool_meta};
@@ -133,7 +133,7 @@ static ALLOWED_MCP_COMMANDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| 
     ])
 });
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 struct DiscoveredToolMeta {
     description: Option<String>,
     input_schema: Option<serde_json::Value>,
@@ -153,6 +153,9 @@ struct RuntimeState {
     /// Whether initial tool discovery has been performed at least once.
     initialized: bool,
     discovered_tools: HashMap<String, HashMap<String, DiscoveredToolMeta>>, // server -> tool -> meta
+    /// Per-server freshness generation inside `mcp_state_epoch`; absent = 0;
+    /// cleared whenever the epoch is bumped by a full path.
+    server_generations: HashMap<String, u64>,
     /// Protocol era each server answered with, kept until the next refresh.
     server_eras: HashMap<String, McpEra>,
     discovery_errors: HashMap<String, String>,
@@ -178,10 +181,15 @@ struct StdioSession {
     launch: McpServerConfig,
     client: McpClient,
     registration: crate::runtime::registry::WorkGuard,
+    /// The `toolsListChanged` subscription of this session, aborted with it.
+    tools_listener: Option<tokio::task::AbortHandle>,
 }
 
 impl StdioSession {
     async fn close(mut self) {
+        if let Some(listener) = self.tools_listener.take() {
+            listener.abort();
+        }
         if matches!(
             self.client.close_with_timeout(MCP_STDIO_CLOSE_TIMEOUT).await,
             Ok(Some(_))
@@ -249,6 +257,11 @@ pub struct McpTool {
     /// sessions were stopped and this tool never starts them again
     /// (D-095 M-2).
     retired: Mutex<HashSet<String>>,
+    /// Servers whose tool list a listener reported changed (see `listen`).
+    stale: listen::StaleSet,
+    /// The `ttlMs` deadline of each server without a listener: rediscovery
+    /// at the next refresh once it passes.
+    ttl_due: Mutex<HashMap<String, Instant>>,
     lifecycle: tokio::sync::RwLock<()>,
 }
 
@@ -308,6 +321,7 @@ impl McpTool {
             mcp_json_mtime: None,
             initialized: false,
             discovered_tools: HashMap::new(),
+            server_generations: HashMap::new(),
             server_eras: HashMap::new(),
             discovery_errors: HashMap::new(),
             config_error: None,
@@ -328,6 +342,8 @@ impl McpTool {
             stdio_sessions: Mutex::new(HashMap::new()),
             http_sessions: Mutex::new(HashMap::new()),
             retired: Mutex::new(HashSet::new()),
+            stale: Arc::new(Mutex::new(HashSet::new())),
+            ttl_due: Mutex::new(HashMap::new()),
             lifecycle: tokio::sync::RwLock::new(()),
         };
         tool.rebuild_catalog_snapshot();
@@ -503,6 +519,11 @@ impl McpTool {
             let Some(server_config) = state.effective_config.servers.get(server) else {
                 continue;
             };
+            let generation = state.server_generations.get(server).copied().unwrap_or(0);
+            // Generation exhaustion fails closed for this server, like the epoch rule above.
+            if generation == u64::MAX {
+                continue;
+            }
             // `env` is a HashMap; canonicalize through Value's sorted map so
             // equivalent effective launch configs have the same generation.
             let Ok(config_bytes) = serde_json::to_value(server_config).and_then(|value| serde_json::to_vec(&value))
@@ -510,8 +531,9 @@ impl McpTool {
                 continue;
             };
             let mut state_hasher = sha2::Sha256::new();
-            state_hasher.update(b"prx.mcp.runtime-binding.v1\0");
+            state_hasher.update(b"prx.mcp.runtime-binding.v2\0");
             state_hasher.update(state.mcp_state_epoch.to_be_bytes());
+            state_hasher.update(generation.to_be_bytes());
             state_hasher.update(config_bytes);
             let state_digest: [u8; 32] = state_hasher.finalize().into();
             for (tool, metadata) in tools {
@@ -861,7 +883,7 @@ impl McpTool {
         server: &McpServerConfig,
         launch_root: Option<&Path>,
         era: Option<McpEra>,
-    ) -> anyhow::Result<(HashMap<String, DiscoveredToolMeta>, McpEra)> {
+    ) -> anyhow::Result<(HashMap<String, DiscoveredToolMeta>, McpEra, Option<u64>)> {
         let command = server
             .command
             .as_deref()
@@ -897,15 +919,16 @@ impl McpTool {
             }
         };
 
-        let list = client.peer().list_all_tools().await?;
+        let list = client.peer().list_all_tools_with_cache_hint().await?;
         let _ = client.cancel().await;
 
         let tools = list
+            .items
             .into_iter()
             .map(|tool| (tool.name.to_string(), discovered_tool_meta(tool)))
             .collect::<HashMap<_, _>>();
 
-        Ok((tools, learnt))
+        Ok((tools, learnt, list.ttl_ms))
     }
 
     async fn discover_server_tools(
@@ -915,10 +938,13 @@ impl McpTool {
         full: bool,
         era: Option<McpEra>,
         http_sessions: &HttpSessions,
-    ) -> anyhow::Result<(HashMap<String, DiscoveredToolMeta>, McpEra)> {
+        stale: &listen::StaleSet,
+    ) -> anyhow::Result<(HashMap<String, DiscoveredToolMeta>, McpEra, Option<u64>)> {
         match server.transport {
             McpTransport::Stdio => Self::discover_server_tools_stdio(server_name, server, launch_root, era).await,
-            McpTransport::Http => Self::discover_server_tools_http(server_name, server, full, era, http_sessions).await,
+            McpTransport::Http => {
+                Self::discover_server_tools_http(server_name, server, full, era, http_sessions, stale).await
+            }
         }
     }
 
@@ -1016,10 +1042,12 @@ impl McpTool {
                 }
             };
             self.record_server_era(server_name, Some(learnt));
+            let tools_listener = listen::spawn_tools_listener(server_name, client.peer().clone(), learnt, &self.stale);
             *session = Some(StdioSession {
                 launch: server.clone(),
                 client,
                 registration,
+                tools_listener,
             });
         }
 
@@ -1114,6 +1142,9 @@ impl McpTool {
                     .and_then(|attempt| attempt.elapsed().ok())
                     .is_some_and(|elapsed| elapsed < MCP_DISCOVERY_RETRY_BACKOFF)
             {
+                if self.freshness_due() {
+                    self.refresh_stale_servers().await;
+                }
                 return;
             }
         }
@@ -1136,6 +1167,7 @@ impl McpTool {
         let mut discovered = HashMap::new();
         let mut eras = HashMap::new();
         let mut discovery_errors = HashMap::new();
+        let mut ttl_deadlines = HashMap::new();
         let retired = self.retired.lock().clone();
         for (server_name, server) in new_config.servers.iter().filter(|(name, _)| !retired.contains(*name)) {
             match Self::discover_server_tools(
@@ -1145,12 +1177,16 @@ impl McpTool {
                 self.full(),
                 None,
                 &self.http_sessions,
+                &self.stale,
             )
             .await
             {
-                Ok((tools, era)) => {
+                Ok((tools, era, ttl_ms)) => {
                     discovered.insert(server_name.clone(), tools);
                     eras.insert(server_name.clone(), era);
+                    if let Some(deadline) = listen::ttl_deadline(ttl_ms) {
+                        ttl_deadlines.insert(server_name.clone(), deadline);
+                    }
                 }
                 Err(error) => {
                     // A transport error quotes the server URL, userinfo
@@ -1162,8 +1198,14 @@ impl McpTool {
             }
         }
 
+        // Every server was just listed through a fresh connection, so the
+        // stale marks and the deadlines of the previous generation are void.
+        self.stale.lock().clear();
+        *self.ttl_due.lock() = ttl_deadlines;
+
         let mut state = self.state.write();
         state.mcp_state_epoch = state.mcp_state_epoch.saturating_add(1);
+        state.server_generations.clear();
         state.effective_config = new_config;
         state.below_full = below_full;
         state.discovered_tools = discovered;
@@ -1199,6 +1241,7 @@ impl McpTool {
 
         let mut state = self.state.write();
         state.mcp_state_epoch = state.mcp_state_epoch.saturating_add(1);
+        state.server_generations.clear();
         state.effective_config = new_config;
         state.below_full = below_full;
         state.discovered_tools.clear();
@@ -1267,6 +1310,7 @@ impl McpTool {
                     arguments,
                     self.call_full(),
                     &mut era,
+                    &self.stale,
                 )
                 .await;
                 self.record_server_era(&server_name, era);
@@ -1602,6 +1646,7 @@ mod client;
 mod http_session;
 pub(super) mod level_view;
 mod lifecycle;
+mod listen;
 mod result;
 mod workspace_overlay;
 
