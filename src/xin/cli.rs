@@ -185,7 +185,7 @@ pub async fn handle_command(command: XinCommands, config: &Config) -> Result<()>
             // Only the local operator reaches the `prx xin` CLI.
             let task = store::get_task(config, &id)?;
             store::mark_task_operator(config, &id)?;
-            println!("Marked xin task {id} as the operator's own: its shell command may run git (hardened)");
+            println!("Marked xin task {id} as the operator's own: its runs use operator work at Main's autonomy level, capped by the caller's level if lower");
             println!("  Payload: {}", task.payload);
             Ok(())
         }
