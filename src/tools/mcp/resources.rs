@@ -129,7 +129,7 @@ impl McpTool {
                 // SSRF protection: the same target check as `call_http`.
                 Self::validate_http_target(url, self.call_full())?;
                 let slot = http_session::slot_for(&self.http_sessions, server);
-                match http_session::acquire(&slot, server, url, &config, self.call_full(), era).await {
+                match http_session::acquire(&slot, server, url, &config, self.call_full(), era, &self.stale).await {
                     Ok((client, learnt, _)) => {
                         self.record_server_era(server, Some(learnt));
                         Ok(AttachedPeer {
