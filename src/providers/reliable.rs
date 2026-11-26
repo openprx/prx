@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod retry_policy;
-use retry_policy::{RetryCounts, RetryKind, max_attempts, rate_limit_wait_ms, retry_budget};
+use retry_policy::{RetryCounts, RetryKind, log_budget_exhausted, max_attempts, rate_limit_wait_ms, retry_budget};
 
 mod classify;
 #[cfg(test)]
@@ -1043,26 +1043,7 @@ impl Provider for ReliableProvider {
                     }
                 }
 
-                match exhausted {
-                    Some((RetryKind::RateLimited, made)) => {
-                        rate_limit::record_exhausted(provider_name);
-                        tracing::error!(
-                            provider = %redact_provider_text(provider_name),
-                            model = *current_model,
-                            attempts = made,
-                            "Provider rate limit outlasted the retry budget; abandoning this candidate"
-                        );
-                    }
-                    Some((RetryKind::Overload, made)) => {
-                        tracing::warn!(
-                            provider = %redact_provider_text(provider_name),
-                            model = *current_model,
-                            attempts = made,
-                            "Provider overload outlasted the retry budget; abandoning this candidate"
-                        );
-                    }
-                    Some((RetryKind::Ordinary, _)) | None => {}
-                }
+                log_budget_exhausted(provider_name, *current_model, exhausted);
                 tracing::warn!(
                     provider = %redact_provider_text(provider_name),
                     model = *current_model,
@@ -1237,26 +1218,7 @@ impl Provider for ReliableProvider {
                     }
                 }
 
-                match exhausted {
-                    Some((RetryKind::RateLimited, made)) => {
-                        rate_limit::record_exhausted(provider_name);
-                        tracing::error!(
-                            provider = %redact_provider_text(provider_name),
-                            model = *current_model,
-                            attempts = made,
-                            "Provider rate limit outlasted the retry budget; abandoning this candidate"
-                        );
-                    }
-                    Some((RetryKind::Overload, made)) => {
-                        tracing::warn!(
-                            provider = %redact_provider_text(provider_name),
-                            model = *current_model,
-                            attempts = made,
-                            "Provider overload outlasted the retry budget; abandoning this candidate"
-                        );
-                    }
-                    Some((RetryKind::Ordinary, _)) | None => {}
-                }
+                log_budget_exhausted(provider_name, *current_model, exhausted);
                 tracing::warn!(
                     provider = %redact_provider_text(provider_name),
                     model = *current_model,
@@ -1497,26 +1459,7 @@ impl Provider for ReliableProvider {
                     }
                 }
 
-                match exhausted {
-                    Some((RetryKind::RateLimited, made)) => {
-                        rate_limit::record_exhausted(provider_name);
-                        tracing::error!(
-                            provider = %redact_provider_text(provider_name),
-                            model = *current_model,
-                            attempts = made,
-                            "Provider rate limit outlasted the retry budget; abandoning this candidate"
-                        );
-                    }
-                    Some((RetryKind::Overload, made)) => {
-                        tracing::warn!(
-                            provider = %redact_provider_text(provider_name),
-                            model = *current_model,
-                            attempts = made,
-                            "Provider overload outlasted the retry budget; abandoning this candidate"
-                        );
-                    }
-                    Some((RetryKind::Ordinary, _)) | None => {}
-                }
+                log_budget_exhausted(provider_name, *current_model, exhausted);
                 tracing::warn!(
                     provider = %redact_provider_text(provider_name),
                     model = *current_model,
@@ -1732,26 +1675,7 @@ impl Provider for ReliableProvider {
                     }
                 }
 
-                match exhausted {
-                    Some((RetryKind::RateLimited, made)) => {
-                        rate_limit::record_exhausted(provider_name);
-                        tracing::error!(
-                            provider = %redact_provider_text(provider_name),
-                            model = *current_model,
-                            attempts = made,
-                            "Provider rate limit outlasted the retry budget; abandoning this candidate"
-                        );
-                    }
-                    Some((RetryKind::Overload, made)) => {
-                        tracing::warn!(
-                            provider = %redact_provider_text(provider_name),
-                            model = *current_model,
-                            attempts = made,
-                            "Provider overload outlasted the retry budget; abandoning this candidate"
-                        );
-                    }
-                    Some((RetryKind::Ordinary, _)) | None => {}
-                }
+                log_budget_exhausted(provider_name, *current_model, exhausted);
                 tracing::warn!(
                     provider = %redact_provider_text(provider_name),
                     model = *current_model,

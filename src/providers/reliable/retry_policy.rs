@@ -2,9 +2,11 @@
 //!
 //! A failed attempt is retried on the same candidate by its [`RetryKind`]:
 //! ordinary errors get the chain's `max_retries`, overloads (HTTP 502, 503 or
-//! 504, or an overloaded body) at most [`OVERLOAD_MAX_RETRIES`], and rate limits (HTTP 429)
-//! at least [`RATE_LIMIT_MAX_RETRIES`], so the retries span a one-minute
-//! provider window.
+//! 504, or an overloaded body) at most [`OVERLOAD_MAX_RETRIES`], and rate
+//! limits (HTTP 429) at least [`RATE_LIMIT_MAX_RETRIES`], so the retries span
+//! a one-minute provider window.
+
+use crate::security::redaction::redact_provider_text;
 
 /// Most in-place retries of one candidate after an overload response.
 const OVERLOAD_MAX_RETRIES: u32 = 2;
@@ -107,4 +109,30 @@ pub(super) fn rate_limit_wait_ms(retry: u32) -> u64 {
         .or_else(|| RATE_LIMIT_RETRY_WAITS_MS.last())
         .copied()
         .unwrap_or(0)
+}
+
+/// Report a candidate whose retry budget ran out on its last failure. `exhausted`
+/// is the kind of that failure and the attempts made up to it. A rate limit is
+/// an error that also feeds the rate-limit counters; an overload is a warning.
+pub(super) fn log_budget_exhausted(provider_name: &str, model: &str, exhausted: Option<(RetryKind, u32)>) {
+    match exhausted {
+        Some((RetryKind::RateLimited, made)) => {
+            crate::providers::rate_limit::record_exhausted(provider_name);
+            tracing::error!(
+                provider = %redact_provider_text(provider_name),
+                model,
+                attempts = made,
+                "Provider rate limit outlasted the retry budget; abandoning this candidate"
+            );
+        }
+        Some((RetryKind::Overload, made)) => {
+            tracing::warn!(
+                provider = %redact_provider_text(provider_name),
+                model,
+                attempts = made,
+                "Provider overload outlasted the retry budget; abandoning this candidate"
+            );
+        }
+        Some((RetryKind::Ordinary, _)) | None => {}
+    }
 }
