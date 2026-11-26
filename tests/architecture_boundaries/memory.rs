@@ -12,7 +12,7 @@ const ALLOWED_BRAIN_DB_OPENS_OUTSIDE_SQLITE_REPOSITORY: &[&str] = &[
     "src/runtime/ingress_recovery/tests.rs::report::let conn = rusqlite::Connection::open_with_flags(",
     "src/runtime/ingress_recovery/tests.rs::legacy_capsules_are_ignored_without_key_reads::let conn = rusqlite::Connection::open(dir.path().join(\"memory/brain.db\")).unwrap();",
     // Test-only isolated fixtures: actual instance routing, source scope, and durable turn receipts.
-    "src/agent/agent.rs::embedded_turn_routes_to_the_registered_instance_and_returns_to_default::let conn = rusqlite::Connection::open_with_flags(",
+    "src/agent/agent/tests.rs::embedded_turn_routes_to_the_registered_instance_and_returns_to_default::let conn = rusqlite::Connection::open_with_flags(",
     "src/agent/embedded_source.rs::embedded_autosave_respects_configuration_and_keeps_original_source::let conn = rusqlite::Connection::open(workspace.path().join(\"memory/brain.db\")).unwrap();",
     "src/agent/embedded_source.rs::embedded_cross_provider_selection_is_refused_before_input_recording::let conn = rusqlite::Connection::open(workspace.path().join(\"memory/brain.db\")).unwrap();",
     // Restart cells tamper with the persisted receipt to prove the verifier refuses it.
