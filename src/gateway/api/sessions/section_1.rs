@@ -845,6 +845,8 @@ async fn run_console_runtime_turn(
         card: None,
         previous_turns,
         replay: crate::context::api::open::ReplayMode::FitToBudget,
+        recall: crate::context::api::open::OpenRecall::ReplayedSession,
+        current_input_key: None,
         excluded_session: woken_sender.as_deref(),
         system_prompt,
         service: &decision.service,

@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use crate::agent::context_recall::{RECALL_CONTEXT_BUDGET, RecallScope, replayed_session_recall};
+use crate::agent::context_recall::{RECALL_CONTEXT_BUDGET, RecallScope, replayed_session_recall, scoped_recall};
 use crate::config::{AgentCompactionConfig, MemoryConfig};
 use crate::context::request_provenance::{LiveAttachment, note_live_attachment};
 use crate::context::transcript::{Attachment, Transcript, append_attachment};
@@ -35,6 +35,17 @@ pub(crate) enum ReplayMode {
     ClearAll,
 }
 
+/// Which recall of the session's memory a turn opening reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenRecall {
+    /// The session's own rows are replayed as history, so the recall leaves
+    /// its current-session block out.
+    ReplayedSession,
+    /// The turn is single shot and keeps no replayed history, so the recall
+    /// carries the session's current-session block as its only session memory.
+    WithSessionCopy,
+}
+
 /// What a turn opening reads, borrowed from the caller's turn state.
 pub(crate) struct OpenInput<'a> {
     /// The memory the recall reads and the attachment row is written to.
@@ -52,6 +63,11 @@ pub(crate) struct OpenInput<'a> {
     pub(crate) previous_turns: Vec<ConversationTurn>,
     /// How the replayed tool results of `previous_turns` are shown.
     pub(crate) replay: ReplayMode,
+    /// Which recall of the session's memory the opening reads.
+    pub(crate) recall: OpenRecall,
+    /// The memory key of the current input, which the recall leaves out. `None`
+    /// keeps the key the recall scope was built with.
+    pub(crate) current_input_key: Option<&'a str>,
     /// The session whose rows the recall's shared-events block leaves out: the
     /// sender of the message a woken turn adopted. `None` for every other turn.
     pub(crate) excluded_session: Option<&'a str>,
@@ -90,6 +106,8 @@ pub(crate) async fn open_turn(input: OpenInput<'_>) -> TurnOpening {
         card,
         previous_turns,
         replay,
+        recall,
+        current_input_key,
         excluded_session,
         system_prompt,
         service,
@@ -106,16 +124,18 @@ pub(crate) async fn open_turn(input: OpenInput<'_>) -> TurnOpening {
     let mut effective_compaction = service.effective_compaction(provider_label, model);
     effective_compaction.config = context.main_compaction().clone();
     crate::providers::context_window::trace_effective_compaction_resolution(&effective_compaction);
-    // The session's own rows are replayed below, so the recall carries no copy
-    // of them, and its shared part is at most half the window of this model.
+    // The recall's shared part is at most half the window of this model; a
+    // replaying turn leaves its own session rows out (they are replayed below).
     let recall_budget = replayed_recall_budget(effective_compaction.config.max_context_tokens);
-    let mem_context = replayed_session_recall(
-        memory.as_ref(),
-        &RecallScope::from_envelope(envelope, memory_config, chat_type).with_excluded_session(excluded_session),
-        visible_message,
-        recall_budget,
-    )
-    .await;
+    let scope = RecallScope::from_envelope(envelope, memory_config, chat_type)
+        .with_excluded_session(excluded_session)
+        .with_current_input_key(current_input_key.map(str::to_owned));
+    let mem_context = match recall {
+        OpenRecall::ReplayedSession => {
+            replayed_session_recall(memory.as_ref(), &scope, visible_message, recall_budget).await
+        }
+        OpenRecall::WithSessionCopy => scoped_recall(memory.as_ref(), &scope, visible_message, recall_budget).await,
+    };
     // What is put around the message is stored beside it. Only the tail is
     // replayed on later turns; the prefix is sent with this live message alone.
     // It is stored (and sent) masked, the task card included.

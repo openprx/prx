@@ -756,6 +756,8 @@ pub(crate) async fn run_with_runtime_envelope(
                         card: scheduled_card.as_deref(),
                         previous_turns,
                         replay,
+                        recall: crate::context::api::open::OpenRecall::ReplayedSession,
+                        current_input_key: None,
                         excluded_session: None,
                         system_prompt,
                         service: decision_service,
