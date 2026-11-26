@@ -11,7 +11,7 @@ use crate::hooks::HookEvent;
 use crate::memory::{Memory, MemoryCategory, MemoryFabric, MessageEventScope};
 use crate::observability::ObserverEvent;
 use crate::providers;
-use crate::providers::{ChatMessage, Provider};
+use crate::providers::Provider;
 use crate::runtime::envelope::{RuntimeEnvelope, RuntimeSource};
 use crate::tools::Tool;
 use anyhow::Result;

@@ -731,71 +731,55 @@ pub(crate) async fn run_with_runtime_envelope(
                     agent_user_event.as_ref().map(|event| event.event_id.as_str()),
                 );
                 // A scheduled run opens from its session's earlier runs and recalls
-                // once, inside the opening; a plain run keeps the request it always had.
+                // once, inside the opening. A plain run is single shot: it replays
+                // no earlier turn, and keeps the session copy as its only session memory.
                 let scheduled_turn = scheduled_admission.is_some();
-                let (mut history, history_event_ids, recalled_ids) = if scheduled_turn {
-                    let previous_turns = scheduled_previous_turns(
+                let previous_turns = if scheduled_turn {
+                    scheduled_previous_turns(
                         &mem,
                         &runtime_envelope,
                         agent_user_event.as_ref().map(|event| event.event_id.as_str()),
                     )
-                    .await;
-                    // A goal step keeps its earlier steps' tool output within budget;
-                    // every other scheduled run replays with the results stubbed.
-                    let replay = if super::scheduled_source::current_goal_id().is_some() {
-                        crate::context::api::open::ReplayMode::FitToBudget
-                    } else {
-                        crate::context::api::open::ReplayMode::ClearAll
-                    };
-                    let opening = crate::context::api::open::open_turn(crate::context::api::open::OpenInput {
-                        memory: &mem,
-                        envelope: &runtime_envelope,
-                        memory_config: &config.memory,
-                        chat_type: "private",
-                        visible_message: &msg,
-                        card: scheduled_card.as_deref(),
-                        previous_turns,
-                        replay,
-                        recall: crate::context::api::open::OpenRecall::ReplayedSession,
-                        current_input_key: None,
-                        excluded_session: None,
-                        system_prompt,
-                        service: decision_service,
-                        context: decision_context,
-                        provider_label: provider_name,
-                        model: model_name,
-                    })
-                    .await;
-                    (opening.history, opening.history_event_ids, opening.recalled_ids)
+                    .await
                 } else {
-                    let mem_context = crate::agent::context_recall::scoped_recall(
-                        mem.as_ref(),
-                        &crate::agent::context_recall::RecallScope::from_envelope(
-                            &runtime_envelope,
-                            &config.memory,
-                            "private",
-                        ),
-                        &msg,
-                        crate::agent::context_recall::RECALL_CONTEXT_BUDGET,
-                    )
-                    .await;
-                    let context = mem_context.preamble.clone();
-                    let card = scheduled_card.as_deref().unwrap_or_default();
-                    let mut enriched = if context.is_empty() && card.is_empty() {
-                        msg.clone()
-                    } else {
-                        format!("{context}{card}{msg}")
-                    };
-                    crate::agent::turn_contracts::push_current_time_tail(&mut enriched);
-                    (
-                        vec![
-                            ChatMessage::system(&system_prompt),
-                            crate::agent::turn_contracts::inbound_user_message(&enriched),
-                        ],
-                        Vec::new(),
-                        mem_context.ids,
-                    )
+                    Vec::new()
                 };
+                // A goal step keeps its earlier steps' tool output within budget;
+                // every other scheduled run replays with the results stubbed.
+                let replay = if scheduled_turn && super::scheduled_source::current_goal_id().is_none() {
+                    crate::context::api::open::ReplayMode::ClearAll
+                } else {
+                    crate::context::api::open::ReplayMode::FitToBudget
+                };
+                let recall = if scheduled_turn {
+                    crate::context::api::open::OpenRecall::ReplayedSession
+                } else {
+                    crate::context::api::open::OpenRecall::WithSessionCopy
+                };
+                let crate::context::api::open::TurnOpening {
+                    mut history,
+                    history_event_ids,
+                    recalled_ids,
+                    ..
+                } = crate::context::api::open::open_turn(crate::context::api::open::OpenInput {
+                    memory: &mem,
+                    envelope: &runtime_envelope,
+                    memory_config: &config.memory,
+                    chat_type: "private",
+                    visible_message: &msg,
+                    card: scheduled_card.as_deref(),
+                    previous_turns,
+                    replay,
+                    recall,
+                    current_input_key: None,
+                    excluded_session: None,
+                    system_prompt,
+                    service: decision_service,
+                    context: decision_context,
+                    provider_label: provider_name,
+                    model: model_name,
+                })
+                .await;
                 let memory_runtime = if scheduled_turn {
                     memory_runtime
                         .with_history_event_ids(history_event_ids)
