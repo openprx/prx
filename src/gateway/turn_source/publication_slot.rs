@@ -45,6 +45,21 @@ impl GatewayPublicationSlot {
         }
     }
 
+    /// The same controlled profile, cleanup owner, security policy and
+    /// targeting as `self`, with an empty decision service. A generation-only
+    /// swap uses it so the next publication is built from the generation it
+    /// is given (the child process binding is sealed against that generation).
+    pub(in crate::gateway) fn republished(&self) -> Self {
+        Self {
+            controlled: self.controlled.clone(),
+            cleanup: Arc::clone(&self.cleanup),
+            service: tokio::sync::Mutex::new(None),
+            security: Arc::clone(&self.security),
+            plugin_generation: self.plugin_generation,
+            targeted: self.targeted.clone(),
+        }
+    }
+
     pub(in crate::gateway) fn with_controlled(
         mut self,
         profile: Option<Arc<crate::runtime::h2_entry::ControlledH2Profile>>,

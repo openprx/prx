@@ -1317,6 +1317,41 @@ impl crate::config::PreparedConfigGeneration for PreparedGatewayTurnRuntime {
     }
 }
 
+/// The turn runtime of `generation` when no rebuild-and-swap field changed:
+/// the previous provider, tool surface and MCP tool (the same instances, so
+/// no server is respawned) with a fresh decision slot, so the next
+/// publication, and the process bindings it seals, come from `generation`.
+/// A controlled profile is sealed against the digest of its whole
+/// configuration and cannot follow a new generation, so the previous state
+/// is kept as it was.
+fn generation_only_swap(previous: &GatewayTurnState, generation: Arc<crate::config::ConfigGeneration>) -> GatewayTurnState {
+    if previous.publication_slot().controlled.is_some() {
+        tracing::warn!(
+            "Controlled gateway profile keeps its configuration generation: the change is not followed by the turn runtime"
+        );
+        return previous.clone();
+    }
+    match previous {
+        GatewayTurnState::Ready(runtime) => GatewayTurnState::from(TurnRuntimeGeneration {
+            provider_binding: runtime.provider_binding.clone(),
+            publication_slot: Arc::new(runtime.publication_slot.republished()),
+            config_generation: generation,
+            provider: Arc::clone(&runtime.provider),
+            model: runtime.model.clone(),
+            temperature: runtime.temperature,
+            tools_registry: Arc::clone(&runtime.tools_registry),
+            mcp_tool: runtime.mcp_tool.clone(),
+        }),
+        GatewayTurnState::NotReady(standby) => GatewayTurnState::NotReady(TurnRuntimeStandby {
+            reason: standby.reason,
+            publication_slot: Arc::new(standby.publication_slot.republished()),
+            config_generation: generation,
+            tools_registry: Arc::clone(&standby.tools_registry),
+            mcp_tool: standby.mcp_tool.clone(),
+        }),
+    }
+}
+
 /// When a new generation replaces the MCP tool, stop the old tool's
 /// servers that the new one no longer runs as they were launched (a
 /// narrowed `mcp.workspace_servers`, a removed or disabled server, a changed
@@ -1365,15 +1400,18 @@ impl crate::config::ConfigGenerationParticipant for GatewayTurnRuntimeOwner {
         true
     }
 
-    fn prepares_for_field(&self, field: &str) -> bool {
-        !crate::config::generation::is_process_restart_only(field)
-            && !crate::config::generation::is_controlled_restart(field)
+    /// Every published generation reaches the turn runtime: a process child
+    /// is sealed against the generation of the turn that spawns it, so a
+    /// restart-only or controlled-restart change (the adopted pairing tokens)
+    /// must replace it too.
+    fn prepares_for_field(&self, _field: &str) -> bool {
+        true
     }
 
     fn prepare(
         &self,
         generation: Arc<crate::config::ConfigGeneration>,
-        _changed_fields: &[String],
+        changed_fields: &[String],
     ) -> anyhow::Result<Box<dyn crate::config::PreparedConfigGeneration>> {
         let previous = self.current.load_full();
         let agents = agent_lifecycle::AgentReconcile::prepare(
@@ -1382,7 +1420,14 @@ impl crate::config::ConfigGenerationParticipant for GatewayTurnRuntimeOwner {
             &previous.config_generation().effective,
             &generation.effective,
         );
-        let runtime = self.build(generation)?;
+        let runtime = if changed_fields.iter().all(|field| {
+            crate::config::generation::is_process_restart_only(field)
+                || crate::config::generation::is_controlled_restart(field)
+        }) {
+            generation_only_swap(&previous, generation)
+        } else {
+            self.build(generation)?
+        };
         Ok(Box::new(PreparedGatewayTurnRuntime {
             current: Arc::clone(&self.current),
             previous,

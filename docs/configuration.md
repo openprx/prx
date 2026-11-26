@@ -1990,8 +1990,8 @@ below).
     `channels_config.nextcloud_talk.webhook_secret`,
     `channels_config.wacli.webhook_secret`, `nodes.server.bearer_token` and
     `nodes.server.hmac_secret`. Whoever holds a new value is let in, and the
-    holders of the old one are shut out (for the restart-only paired tokens,
-    at the next restart).
+    holders of the old one are shut out (paired tokens are adopted live, at
+    the next successful reload).
 
   Retry with
   `?confirm_high_risk=true` and `If-Match: "<revision>"` from the `428`
