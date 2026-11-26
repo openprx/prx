@@ -28,6 +28,8 @@ pub(super) async fn record_request_context(
     } = *turn;
     let tool_surface_counts = &surface.tool_surface_counts;
     let tool_snapshot = round.compiled_tool_context.fingerprint();
+    let system_prompt_sha256 = &round.system_prompt_sha256;
+    let system_prompt_chars = round.system_prompt_chars;
     // How much of this request is prompt and how much is native tool
     // schema. Sizes, counts and estimates only: this is emitted into a
     // durable event, so no schema body, prompt body or tool argument may
@@ -68,8 +70,8 @@ pub(super) async fn record_request_context(
         let token_source: &'static str = token_source_label(messages_measurement.source);
         tracing::debug!(
             target: "openprx::prompt",
-            system_prompt_sha256 = round.system_prompt_sha256.as_deref().unwrap_or("none"),
-            round.system_prompt_chars,
+            system_prompt_sha256 = system_prompt_sha256.as_deref().unwrap_or("none"),
+            system_prompt_chars,
             tool_snapshot_sha256 = %tool_snapshot.sha256,
             tool_count = tool_snapshot.count,
             tool_snapshot_render_hits = state.tool_snapshot_render_cache.hits(),

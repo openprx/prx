@@ -125,11 +125,8 @@ pub(super) async fn select_round_surface<'t>(
     // Refresh dynamic backends before snapshotting their schemas. Rebuild on
     // every iteration so MCP discovery and WASM generation swaps cannot leave
     // the provider with stale ToolSpecs for the remainder of the turn.
-    tracing::debug!(
-        total = tools_registry.len(),
-        filtered = selected_tools.len(),
-        "tool tiering applied"
-    );
+    let total: usize = tools_registry.len();
+    tracing::debug!(total, filtered = selected_tools.len(), "tool tiering applied");
     let tool_catalog = crate::tools::ToolCatalog::from_tools(selected_tools.iter().copied());
     let mut tool_specs = service.agent_execution_specs(proof, context)?.specs;
     let appended = service.agent_appended_execution_specs(proof, context)?;

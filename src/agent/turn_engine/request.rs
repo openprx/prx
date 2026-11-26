@@ -260,7 +260,7 @@ pub(super) async fn prepare_request(
     if let Some(brief_hash) = state.decision_brief_sha256.as_deref() {
         tracing::debug!(
             system_prompt_sha256 = system_prompt_sha256.as_deref(),
-            state.decision_brief_sha256 = brief_hash,
+            decision_brief_sha256 = brief_hash,
             "advisory request prepared"
         );
     }
