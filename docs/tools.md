@@ -1878,7 +1878,8 @@ Parameters:
 Matching: words of 3 or more characters are matched through the full-text index,
 and the best match comes first. Shorter words are matched as substrings of the
 message, on the hits of the longer words. When every word is shorter than 3
-characters, the newest matches come first.
+characters, the newest matches come first. Messages whose rf message or reply
+was deleted are not searched, also before the deletion is settled.
 
 The index is built on the first search, or at process start by a background
 warm-up, so a search does not pay for building it. Each hit prints its time,

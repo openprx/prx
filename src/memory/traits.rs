@@ -1286,7 +1286,8 @@ pub trait Memory: Send + Sync {
     /// query has a word of 3 or more characters; the newest first when every
     /// word is shorter. Only user and assistant messages are searched. `query`
     /// is free text: every word must occur, and each word is matched as a
-    /// literal. Each hit carries the raw, unredacted row text (see
+    /// literal. Rows whose rf message or reply was deleted are not searched.
+    /// Each hit carries the raw, unredacted row text (see
     /// [`TranscriptHit::excerpt`]); callers redact it before showing any of
     /// it. Backends without a transcript index return no hits.
     async fn search_transcripts(

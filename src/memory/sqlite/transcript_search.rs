@@ -10,9 +10,10 @@
 //! of the text, only the FTS5 structures, and it indexes every row. It uses the
 //! trigram tokenizer, so Chinese and other scripts without spaces match as
 //! substrings. Filters (owner, workspace, agent partition, erased scopes,
-//! inactive incarnations, message role and type) are applied at query time,
-//! never in the triggers, so a row's index entry always matches its `content`
-//! and the `delete` command always removes what was indexed.
+//! inactive incarnations, rf-deleted messages, message role and type) are
+//! applied at query time, never in the triggers, so a row's index entry always
+//! matches its `content` and the `delete` command always removes what was
+//! indexed.
 
 use super::SqliteMemory;
 use super::erasure_pool::MemoryPool;
@@ -192,7 +193,13 @@ impl SqliteMemory {
                         JOIN agent_incarnations i
                           ON i.workspace_id = s.workspace_id AND i.owner_id = s.owner_id
                          AND i.agent_key = s.agent_key AND i.incarnation = s.incarnation
-                        WHERE s.scope_id = e.ma_scope_id AND i.state = 'active')){partition_sql}
+                        WHERE s.scope_id = e.ma_scope_id AND i.state = 'active'))
+                   AND NOT EXISTS (SELECT 1 FROM rf_message_attempts a
+                        WHERE a.workspace_id = e.workspace_id AND a.owner_id = e.owner_id
+                          AND ((a.deleted_at IS NOT NULL
+                                AND (a.message_event_id = e.event_id OR a.run_id = e.run_id))
+                            OR (a.reply_deleted_at IS NOT NULL AND a.run_id = e.run_id
+                                AND a.message_event_id <> e.event_id))){partition_sql}
                  ORDER BY {order_sql}
                  LIMIT ?{limit_marker}",
                 owner_marker = first + 1,
