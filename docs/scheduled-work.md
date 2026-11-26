@@ -103,7 +103,9 @@ on `add` and `update`, by the cron tool on `add` and in the `update` patch, and
 by `POST` and `PATCH` `/api/cron/jobs`. The xin job routes return it; the cron
 job routes return it with the rest of the job. A route write has no creating
 session, so a route job without `deliver` is a `note`. The Postgres cron store
-refuses `message` and `none` at create and patch, as it refuses `fresh`.
+refuses `message` and `none` at create and patch, as it refuses `fresh`; there the
+cron tool's default falls back to `note`, while an explicit `message` or `none` is
+refused.
 
 ## HEARTBEAT.md materialization
 

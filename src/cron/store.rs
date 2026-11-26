@@ -56,6 +56,12 @@ fn pg_store(config: &Config) -> Result<Option<std::sync::Arc<crate::cron::postgr
     crate::cron::postgres::resolve(config)
 }
 
+/// Whether the configured cron store is Postgres, which keeps only `deliver = note`
+/// (a patch with any other `deliver` is refused there).
+pub fn store_keeps_only_note_deliver(config: &Config) -> Result<bool> {
+    Ok(pg_store(config)?.is_some())
+}
+
 #[cfg(test)]
 pub fn add_job(config: &Config, expression: &str, command: &str) -> Result<CronJob> {
     let schedule = Schedule::Cron {

@@ -268,9 +268,12 @@ impl CronTool {
         // that session (K-R3b); every other job defaults to a note.
         let deliver = match args.get("deliver") {
             None => {
+                // The default falls back to note on a store that cannot keep a
+                // message (Postgres); an explicit value is still refused by the store.
                 if job_type == JobType::Agent
                     && matches!(schedule, Schedule::At { .. })
                     && lineage.source_message_event_id.is_some()
+                    && !cron::store_keeps_only_note_deliver(cfg)?
                 {
                     ScheduledDeliver::Message
                 } else {
