@@ -80,6 +80,7 @@ async fn startup_inner(state: &AppState, shutdown: &CancellationToken) -> anyhow
     crate::runtime::blocking::spawn_blocking(move || sync.journal(&who, 0, 0)).await??;
     let stop = shutdown.clone();
     let drain = store.shutdown_signal();
+    crate::memory::message_retention::spawn_hourly(Arc::clone(&store), state.config.clone(), shutdown.clone());
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(3600));
         tick.tick().await;

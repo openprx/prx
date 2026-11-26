@@ -17,6 +17,7 @@ pub mod hygiene;
 pub mod ingress_recovery;
 pub mod lucid;
 pub mod markdown;
+pub mod message_retention;
 pub mod none;
 pub mod owner_predicate;
 pub mod postgres;
@@ -597,6 +598,7 @@ pub fn create_memory_with_storage_and_routes_with_acl(
     if let Err(e) = hygiene::run_if_due(config, workspace_dir) {
         tracing::warn!(error = %crate::agent::diagnostics::error_class(&e), "memory hygiene skipped");
     }
+    message_retention::run_once(memory.as_ref(), config.message_retention_days, 2);
     if matches!(backend_kind, MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid) {
         if let Err(e) = snapshot::export_snapshot(workspace_dir) {
             tracing::warn!(error = %crate::agent::diagnostics::error_class(&e), "memory snapshot skipped");

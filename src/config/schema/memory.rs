@@ -131,6 +131,12 @@ pub struct MemoryConfig {
     /// (`message_events`) is never deleted by this setting.
     #[serde(default)]
     pub saved_session_retention_days: u32,
+    /// Delete message-log rows (the transcript) older than this many days,
+    /// run by run. 0 (default) keeps everything. Values 1-14 run as 15 (the
+    /// rf sync window). SQLite only. Saved terminal sessions, owner memories
+    /// and child session records are not deleted by this setting.
+    #[serde(default)]
+    pub message_retention_days: u32,
     /// Embedding provider: "local" | "none" | "openai" | "custom:URL"
     #[serde(default = "default_embedding_provider")]
     pub embedding_provider: String,
@@ -336,6 +342,7 @@ impl Default for MemoryConfig {
             conversation_retention_days: default_conversation_retention_days(),
             daily_retention_days: default_daily_retention_days(),
             saved_session_retention_days: 0,
+            message_retention_days: 0,
             embedding_provider: default_embedding_provider(),
             embedding_provider_explicit: false,
             embedding_model: default_embedding_model(),
