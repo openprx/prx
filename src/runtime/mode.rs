@@ -175,8 +175,8 @@ impl ModeRunner for GatewayRunner {
             (None, None, None) => {}
             _ => anyhow::bail!("controlled H2 gateway requires principal, ceilings and authority lifetime"),
         }
-        // Direct `prx gateway` CLI path: no daemon-owned hot-reload watcher exists,
-        // so pass `None` and let run_gateway build its own SharedConfig fallback.
+        // Direct `prx gateway` CLI path: pass `None`, so run_gateway builds its own
+        // SharedConfig and runs its own config file watcher on it.
         gateway::run_gateway(&me.host, me.port, me.config, None, shutdown).await
     }
 }

@@ -58,12 +58,12 @@ fn build_gateway_turn_provider(
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
 ///
 /// `shared_config` is the single ConfigGeneration owner the gateway uses for all
-/// authorization decisions. When the gateway runs under the daemon, the
-/// daemon owns this handle and also wires it to the file-watch hot-reload manager,
-/// so config.toml edits become visible at every gateway authz point. When invoked
+/// authorization decisions. When the gateway runs under the daemon, the daemon
+/// owns this handle and runs the file-watch hot-reload manager for it, so
+/// config.toml edits become visible at every gateway authz point. When invoked
 /// directly via `prx gateway` (no daemon), `None` is passed and the gateway builds
-/// its own fallback handle — in that mode only the in-gateway ConfigReloadTool / the
-/// `/api/config/reload` route can update it (no file watcher).
+/// its own handle and runs its own config file watcher on it (unless a controlled
+/// H2 profile is active), so a config write by another process is reloaded live.
 #[allow(clippy::too_many_lines)]
 pub async fn run_gateway(
     host: &str,
@@ -166,6 +166,7 @@ async fn run_gateway_inner(
         Err(_) => Arc::new(tests::MockProvider::default()),
     };
     let temperature = config.default_temperature;
+    let owns_shared_config = shared_config.is_none();
     let shared_config_for_reload = shared_config.unwrap_or_else(|| crate::config::new_shared(config.clone()));
     if controlled.is_some() {
         shared_config_for_reload.freeze_runtime_writes();
@@ -513,6 +514,12 @@ async fn run_gateway_inner(
         workspace_id: config.workspace_dir.to_string_lossy().to_string(),
         runtime_handle: tokio::runtime::Handle::current(),
     }));
+    // A gateway that owns its SharedConfig watches config.toml itself, as the
+    // daemon does for its own handle. Not under a controlled H2 profile, and not
+    // when the daemon already runs the watcher (`shared_config` given).
+    let _hot_reload = (owns_shared_config && controlled.is_none()).then(|| {
+        crate::config::HotReloadManager::spawn(config.config_path.clone(), Arc::clone(&shared_config_for_reload))
+    });
 
     let state = AppState {
         rf_streams: Default::default(),
