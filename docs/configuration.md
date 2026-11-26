@@ -136,7 +136,7 @@ and the module-gate family are absorbed on load; they are not live switches.
 | `[gateway]` | `port = 16830`; `host = "127.0.0.1"`; `require_pairing = true`; `allow_public_bind = false`; `paired_tokens = []`; `pair_rate_limit_per_minute = 10`; `webhook_rate_limit_per_minute = 60`; `api_rate_limit_per_minute = 60`; `trust_forwarded_headers = false`; `rate_limit_max_keys = 10000`; `idempotency_ttl_secs = 300`; `idempotency_max_keys = 10000`; `channel_webhook_dedup_ttl_secs = 86400`; `targeted_agents = true` |
 | `[webhook]` | `bind = "0.0.0.0:16899"`; `token` unset (required when enabled); `signing_secret` unset |
 | `[composio]` | `api_key` unset; `entity_id = "default"` |
-| `[mcp]` | `servers = {}`; `workspace_servers = "off"` (`http_only` or `stdio` to widen). A server: `transport = "stdio"`; `command`/`url` unset; `args = []`; `env = {}`; `startup_timeout_ms = 10000`; `request_timeout_ms = 30000`; `tool_name_prefix = "mcp"`; `allow_tools`/`deny_tools = []`; `working_dir` unset |
+| `[mcp]` | `servers = {}`; `workspace_servers = "off"` (`http_only` or `stdio` to widen). A server: `transport = "stdio"`; `command`/`url` unset; `args = []`; `env = {}`; `headers = {}`; `startup_timeout_ms = 10000`; `request_timeout_ms = 30000`; `tool_name_prefix = "mcp"`; `allow_tools`/`deny_tools = []`; `working_dir` unset |
 | `[mcp_server]` | `bind = "127.0.0.1:16831"`; `require_auth = true`; `exposed_tools` the read-only set (`memory_search`, `memory_recall`, `memory_get`, `document_search`, `document_get_chunk`, `sessions_list`, `sessions_history`); `allowed_origins = ["claude.ai", "openai.com", "localhost"]`; `rate_limit_rps = 10`; JWT fields unset; `jwt_jwks_cache_ttl_secs = 300`; `jwt_algorithms = ["RS256"]` |
 | `[a2a]` | Messaging is disabled by default (`messaging_enabled = false`). `bind = "127.0.0.1:16832"`, `trust_domain = "prx.local"`. Run `prx a2a init` before enabling messaging. The dedicated listener always requires pinned mutual TLS, including on loopback. `[a2a.peers.<name>]` has `spiffe_id`, `fingerprints` (one or two full SHA-256 certificate fingerprints), `address` (`host:port`), `owner`, `sessions` and `agents` (default `["*"]`). Legacy discovery/card fields retain their existing behavior. |
 | `[auth]` | `codex_auth_json_auto_import = false`; `codex_auth_json_path` the platform Codex `auth.json` |
@@ -2020,7 +2020,7 @@ which is a file path), so the table stays complete.
 | --- | --- |
 | Provider | `api_key`, `agents.<name>.api_key`, `model_routes[].api_key`, `embedding_routes[].api_key`, `reliability.api_keys[]` |
 | Tool and storage | `composio.api_key`, `browser.computer_use.api_key`, `web_search.brave_api_key`, `storage.provider.config.db_url` (and its accepted aliases `dbURL`, `database_url`, `databaseUrl`) |
-| Gateway and MCP | `gateway.paired_tokens[]`, `mcp.servers.<name>.env.<var>` (every value, whatever the variable is called) |
+| Gateway and MCP | `gateway.paired_tokens[]`, `mcp.servers.<name>.env.<var>` (every value, whatever the variable is called), `mcp.servers.<name>.headers.<header>` (every HTTP header value) |
 | Channels | `channels_config.telegram.bot_token`, `discord.bot_token`, `slack.bot_token`, `slack.app_token`, `mattermost.bot_token`, `dingtalk.client_secret`, `email.password`, `irc.server_password`, `irc.nickserv_password`, `irc.sasl_password`, `lark.app_secret`, `lark.encrypt_key`, `lark.verification_token`, `linq.api_token`, `linq.signing_secret`, `nextcloud_talk.app_token`, `nextcloud_talk.webhook_secret`, `qq.app_secret`, `wacli.webhook_secret`, `webhook.secret`, `whatsapp.access_token`, `whatsapp.app_secret`, `whatsapp.verify_token` (all under `channels_config.`) |
 | Webhook, tunnel, daemon | `webhook.token`, `webhook.signing_secret`, `tunnel.cloudflare.token`, `tunnel.ngrok.auth_token`, `chat.daemon.token` |
 | Remote nodes | `nodes.nodes[].bearer_token`, `nodes.nodes[].hmac_secret`, `nodes.server.bearer_token`, `nodes.server.hmac_secret` (and the accepted alias `token` of both `bearer_token` fields) |
@@ -2140,6 +2140,37 @@ tools:
   `proxy.services`; the wildcard `tool.*` does not select it. PRX still runs every local check, but the proxy then
   resolves the name, so the proxy must enforce its own egress rules (deny
   private, loopback and metadata destinations).
+
+### MCP server HTTP headers
+
+An HTTP MCP server (`transport = "http"`) can receive static request headers,
+for example an API key or a bearer token:
+
+```toml
+[mcp.servers.remote]
+transport = "http"
+url = "https://mcp.example.com/mcp"
+headers = { Authorization = "Bearer <token>" }
+```
+
+Each value is a secret: with `secrets.encrypt = true` it is stored encrypted
+(`enc2:`) like `mcp.servers.<name>.env.<var>`, and every read surface (`prx config
+show`, `GET /api/config`, the raw config API) shows `***`. Header values are never
+written to logs, errors, `mcp_status` or the status API; those show the server name
+and, at most, the header name. The default is no headers. A header name or value
+that HTTP rejects is a configuration error naming the header, and the other servers
+still start.
+
+The server keeps one connection while its URL and headers are unchanged. A changed
+header value opens a new connection and closes the old one; a connection whose
+transport closed is rebuilt on the next call. A server that answers 401 or 403
+reports that it requires authorization and names `mcp.servers.<name>.headers`.
+Redirects are not followed, so a header is never sent to another host.
+
+A workspace `mcp.json` may set `headers` for a new HTTP server it defines. Those
+values are plaintext in that file, as the workspace author wrote them, and are not
+encrypted. For a server that `config.toml` defines, workspace `headers` are ignored
+with the usual notice.
 
 ### MCP server launch environment
 

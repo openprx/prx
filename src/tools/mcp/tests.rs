@@ -39,7 +39,7 @@ async fn first_bytes_listener() -> (u16, tokio::sync::oneshot::Receiver<Vec<u8>>
 async fn the_mcp_http_transport_speaks_tls_to_an_https_url() {
     let (port, first_bytes) = first_bytes_listener().await;
     let url = format!("https://127.0.0.1:{port}/mcp");
-    let connected = McpTool::connect_http(&url, 3_000, false, None).await;
+    let connected = McpTool::connect_http(&url, HashMap::new(), 3_000, false, None).await;
     assert!(connected.is_err(), "the probe never completes a handshake");
     let bytes = tokio::time::timeout(Duration::from_secs(3), first_bytes)
         .await
@@ -103,7 +103,7 @@ async fn the_mcp_http_transport_does_not_follow_a_redirect() {
         let _ = axum::serve(origin, origin_app).await;
     });
 
-    let connected = McpTool::connect_http(&format!("http://127.0.0.1:{origin_port}/mcp"), 3_000, false, None).await;
+    let connected = McpTool::connect_http(&format!("http://127.0.0.1:{origin_port}/mcp"), HashMap::new(), 3_000, false, None).await;
     assert!(connected.is_err(), "a redirect is not a session");
     assert!(
         origin_hits.load(Ordering::SeqCst) >= 1,
@@ -225,6 +225,7 @@ fn convert_json_server_defaults_transport_from_url() {
         args: Vec::new(),
         url: Some("http://127.0.0.1:8181/mcp".into()),
         env: HashMap::new(),
+        headers: Default::default(),
         startup_timeout_ms: None,
         request_timeout_ms: None,
         tool_name_prefix: None,
@@ -246,6 +247,7 @@ fn convert_json_server_defaults_to_stdio_when_command_present() {
         args: vec!["--serve".into()],
         url: None,
         env: HashMap::new(),
+        headers: Default::default(),
         startup_timeout_ms: None,
         request_timeout_ms: None,
         tool_name_prefix: None,

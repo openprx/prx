@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
 use sha2::Digest;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, LazyLock};
@@ -19,6 +19,7 @@ use std::time::{Duration, SystemTime};
 use tokio::process::Command;
 
 use self::client::{McpToolDetail, discovered_tool_meta};
+use self::http_session::HttpSessions;
 use self::lifecycle::McpEra;
 use self::result::render_call_response;
 
@@ -219,6 +220,9 @@ struct McpJsonServer {
     url: Option<String>,
     #[serde(default)]
     env: HashMap<String, String>,
+    /// HTTP request headers; plaintext in this file, as the workspace wrote them.
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
     #[serde(default)]
     startup_timeout_ms: Option<u64>,
     #[serde(default)]
@@ -275,6 +279,8 @@ pub struct McpTool {
     launch_root: Option<PathBuf>,
     state: RwLock<RuntimeState>,
     stdio_sessions: Mutex<HashMap<String, StdioSessionSlot>>,
+    /// The persistent connection of each HTTP server (see `http_session`).
+    http_sessions: HttpSessions,
     /// Servers a later configuration generation no longer runs: their
     /// sessions were stopped and this tool never starts them again
     /// (D-095 M-2).
@@ -314,6 +320,7 @@ fn same_launch(a: &McpServerConfig, b: &McpServerConfig) -> bool {
         && a.args == b.args
         && a.url == b.url
         && a.env == b.env
+        && a.headers == b.headers
         && a.startup_timeout_ms == b.startup_timeout_ms
         && a.working_dir == b.working_dir
 }
@@ -355,6 +362,7 @@ impl McpTool {
             launch_root: None,
             state: RwLock::new(state),
             stdio_sessions: Mutex::new(HashMap::new()),
+            http_sessions: Mutex::new(HashMap::new()),
             retired: Mutex::new(HashSet::new()),
             lifecycle: tokio::sync::RwLock::new(()),
         };
@@ -420,6 +428,7 @@ impl McpTool {
             .collect::<Vec<_>>();
         names.extend(self.base_config.servers.keys().cloned());
         names.extend(self.stdio_sessions.lock().keys().cloned());
+        names.extend(self.http_sessions.lock().keys().cloned());
         names.retain(|name| !keep.contains(name));
         names.sort();
         names.dedup();
@@ -439,7 +448,7 @@ impl McpTool {
                 stopped += 1;
             }
         }
-        stopped
+        stopped + http_session::close_sessions(&self.http_sessions, Some(names.as_slice())).await
     }
 
     /// Return runtime-discovered tools grouped by server name.
@@ -1000,6 +1009,7 @@ impl McpTool {
             ("args", !server.args.is_empty() && server.args != base.args),
             ("url", server.url.is_some() && server.url != base.url),
             ("env", !server.env.is_empty() && server.env != base.env),
+            ("headers", !server.headers.is_empty() && server.headers != base.headers),
             (
                 "startup_timeout_ms",
                 server
@@ -1069,6 +1079,7 @@ impl McpTool {
         out.args = server.args;
         out.url = server.url;
         out.env = server.env;
+        out.headers = server.headers;
 
         if let Some(v) = server.startup_timeout_ms {
             out.startup_timeout_ms = v;
@@ -1243,10 +1254,11 @@ impl McpTool {
         launch_root: Option<&Path>,
         full: bool,
         era: Option<McpEra>,
+        http_sessions: &HttpSessions,
     ) -> anyhow::Result<(HashMap<String, DiscoveredToolMeta>, McpEra)> {
         match server.transport {
             McpTransport::Stdio => Self::discover_server_tools_stdio(server_name, server, launch_root, era).await,
-            McpTransport::Http => Self::discover_server_tools_http(server_name, server, full, era).await,
+            McpTransport::Http => Self::discover_server_tools_http(server_name, server, full, era, http_sessions).await,
         }
     }
 
@@ -1450,6 +1462,7 @@ impl McpTool {
         // close stateful stdio servers before rediscovery so calls cannot retain
         // stale configuration or browser/session state from the old generation.
         self.close_stdio_sessions().await;
+        http_session::close_sessions(&self.http_sessions, None).await;
 
         let (new_config, below_full, config_error) = match self.load_effective_config_with_view() {
             Ok(Some((from_file, below_full))) => (from_file, below_full, None),
@@ -1465,7 +1478,15 @@ impl McpTool {
         let mut discovery_errors = HashMap::new();
         let retired = self.retired.lock().clone();
         for (server_name, server) in new_config.servers.iter().filter(|(name, _)| !retired.contains(*name)) {
-            match Self::discover_server_tools(server_name, server, self.launch_root.as_deref(), self.full(), None).await
+            match Self::discover_server_tools(
+                server_name,
+                server,
+                self.launch_root.as_deref(),
+                self.full(),
+                None,
+                &self.http_sessions,
+            )
+            .await
             {
                 Ok((tools, era)) => {
                     discovered.insert(server_name.clone(), tools);
@@ -1576,9 +1597,18 @@ impl McpTool {
         match server.transport {
             McpTransport::Stdio => self.call_stdio(&server_name, &server, &tool_name, arguments).await,
             McpTransport::Http => {
+                let slot = http_session::slot_for(&self.http_sessions, &server_name);
                 let mut era = cached_era;
-                let result =
-                    Self::call_http(&server_name, &server, &tool_name, arguments, self.call_full(), &mut era).await;
+                let result = Self::call_http(
+                    &server_name,
+                    &server,
+                    &slot,
+                    &tool_name,
+                    arguments,
+                    self.call_full(),
+                    &mut era,
+                )
+                .await;
                 self.record_server_era(&server_name, era);
                 result
             }
@@ -1909,6 +1939,7 @@ impl Tool for McpStatusTool {
 mod tests;
 
 mod client;
+mod http_session;
 pub(super) mod level_view;
 mod lifecycle;
 mod result;

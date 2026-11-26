@@ -58,7 +58,7 @@ pub enum SecretDomain {
     Channel,
     /// A Gateway credential.
     Gateway,
-    /// An MCP server environment value.
+    /// An MCP server environment value or request header.
     Mcp,
     /// A remote node (`prx-node`) credential.
     Node,
@@ -236,6 +236,14 @@ pub static SECRET_PATHS: &[SecretPath] = &[
         domain: SecretDomain::Mcp,
         alias_of: None,
         used_as: SecretUse::ProcessEnvironment,
+    },
+    SecretPath {
+        pattern: "mcp.servers.<name>.headers.<header>",
+        segments: &[Key("mcp"), Key("servers"), AnyKey, Key("headers"), AnyKey],
+        handling: EncryptedAtRest,
+        domain: SecretDomain::Mcp,
+        alias_of: None,
+        used_as: SecretUse::Credential,
     },
     SecretPath {
         pattern: "channels_config.telegram.bot_token",
@@ -557,9 +565,9 @@ pub static ENDPOINT_PATHS: &[EndpointPath] = &[
     ),
     // Endpoints that receive a stored credential (a token, a password, the
     // traffic of every credentialed request through a proxy): re-pointing
-    // one sends that credential to the new host. The MCP server URL gets no
-    // header from this configuration today; re-pointing it redirects tool
-    // traffic and any credential a later header field adds. IRC and email
+    // one sends that credential to the new host. The MCP server URL receives
+    // the server's `headers` (credentials), so re-pointing it redirects them.
+    // IRC and email
     // hosts are host names, not URLs, so they carry no userinfo.
     recipient_url("proxy.http_proxy", &[Key("proxy"), Key("http_proxy")]),
     recipient_url("proxy.https_proxy", &[Key("proxy"), Key("https_proxy")]),

@@ -2,9 +2,12 @@
 //! discovered-tool metadata, call parameters, HTTP connect, HTTP discovery and
 //! HTTP calls. Result rendering lives in `result.rs`.
 
+use super::http_session::{self, HttpSessionSlot, HttpSessions};
 use super::lifecycle::{self, McpEra};
 use super::{DiscoveredToolMeta, McpClient, McpTool, mcp_http_client};
 use crate::config::McpServerConfig;
+use anyhow::bail;
+use reqwest013::header::{HeaderName, HeaderValue};
 use rmcp::model::{CallToolRequestParams, Tool};
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
@@ -71,19 +74,21 @@ impl McpTool {
     }
 
     /// Open a streamable-HTTP MCP session to `url`, which the caller has
-    /// already passed through [`Self::validate_http_url`].
+    /// already passed through [`Self::validate_http_url`], sending `headers`
+    /// with every request.
     ///
     /// Both HTTP entry points (discovery and `call_http`) connect here, so
     /// the transport's HTTP client is chosen in one place.
     pub(super) async fn connect_http(
         url: &str,
+        headers: HashMap<HeaderName, HeaderValue>,
         startup_timeout_ms: u64,
         full: bool,
         era: Option<McpEra>,
     ) -> anyhow::Result<(McpClient, McpEra)> {
         let transport = StreamableHttpClientTransport::with_client(
             mcp_http_client(full)?,
-            StreamableHttpClientTransportConfig::with_uri(url),
+            StreamableHttpClientTransportConfig::with_uri(url).custom_headers(headers),
         );
         lifecycle::start(transport, era, Duration::from_millis(startup_timeout_ms)).await
     }
@@ -92,27 +97,31 @@ impl McpTool {
     pub(super) async fn connect_http_retrying(
         server_name: &str,
         url: &str,
+        headers: HashMap<HeaderName, HeaderValue>,
         startup_timeout_ms: u64,
         full: bool,
         era: Option<McpEra>,
     ) -> anyhow::Result<(McpClient, McpEra)> {
-        match Self::connect_http(url, startup_timeout_ms, full, era).await {
+        match Self::connect_http(url, headers.clone(), startup_timeout_ms, full, era).await {
             Ok(connected) => Ok(connected),
             Err(error) => {
                 let Some(next) = lifecycle::retry_era(era, &error) else {
                     return Err(error);
                 };
                 lifecycle::note_retry(server_name, next);
-                Self::connect_http(url, startup_timeout_ms, full, next).await
+                Self::connect_http(url, headers, startup_timeout_ms, full, next).await
             }
         }
     }
 
+    /// Discovery opens a fresh session and keeps it: the calls that follow use
+    /// the connection that listed the tools.
     pub(super) async fn discover_server_tools_http(
         server_name: &str,
         server: &McpServerConfig,
         full: bool,
         era: Option<McpEra>,
+        sessions: &HttpSessions,
     ) -> anyhow::Result<(HashMap<String, DiscoveredToolMeta>, McpEra)> {
         let url = server
             .url
@@ -124,13 +133,14 @@ impl McpTool {
         // ── SSRF protection: block private/local addresses below Full ──
         Self::validate_http_target(url, full)?;
 
-        let (client, learnt) =
-            Self::connect_http_retrying(server_name, url, server.startup_timeout_ms, full, era).await?;
+        let slot = http_session::fresh_slot(sessions, server_name).await;
+        let (session, listed) = http_session::acquire(&slot, server_name, url, server, full, era).await?;
+        let Some(listed) = listed else {
+            bail!("MCP HTTP session for '{server_name}' listed no tools on connect");
+        };
+        let learnt = http_session::era_of(server_name, session.as_ref())?;
 
-        let list = client.peer().list_all_tools().await?;
-        let _ = client.cancel().await;
-
-        let tools = list
+        let tools = listed
             .into_iter()
             .map(|tool| (tool.name.to_string(), discovered_tool_meta(tool)))
             .collect::<HashMap<_, _>>();
@@ -138,9 +148,15 @@ impl McpTool {
         Ok((tools, learnt))
     }
 
+    /// A call uses the server's persistent session. A connect that fails
+    /// (after its one retry) drops the kept era, so the next call probes the
+    /// server again; the caller writes `era` back. A transport failure or a
+    /// timeout drops the session, so the next call connects anew; the timed
+    /// out call is not replayed.
     pub(super) async fn call_http(
         server_name: &str,
         server: &McpServerConfig,
+        slot: &HttpSessionSlot,
         tool_name: &str,
         arguments: Option<serde_json::Map<String, serde_json::Value>>,
         full: bool,
@@ -157,26 +173,44 @@ impl McpTool {
         Self::validate_http_target(url, full)?;
 
         let request_timeout = Duration::from_millis(server.request_timeout_ms);
-        // A connect that fails (after its one retry) drops the kept era, so the
-        // next call probes the server again; the caller writes `era` back.
-        let (client, learnt) =
-            match Self::connect_http_retrying(server_name, url, server.startup_timeout_ms, full, *era).await {
-                Ok(connected) => connected,
-                Err(error) => {
-                    *era = None;
-                    return Err(error);
-                }
-            };
-        *era = Some(learnt);
+        let (mut session, _) = match http_session::acquire(slot, server_name, url, server, full, *era).await {
+            Ok(connected) => connected,
+            Err(error) => {
+                *era = None;
+                return Err(error);
+            }
+        };
+        *era = Some(http_session::era_of(server_name, session.as_ref())?);
+        let Some(active) = session.as_ref() else {
+            bail!("MCP HTTP session for '{server_name}' was not initialized");
+        };
 
-        let result = tokio::time::timeout(
+        let outcome = tokio::time::timeout(
             request_timeout,
-            client.call_tool(Self::call_tool_params(tool_name, arguments)),
+            active.client.call_tool(Self::call_tool_params(tool_name, arguments)),
         )
-        .await
-        .map_err(|_| anyhow::anyhow!("MCP call timed out after {} ms", server.request_timeout_ms))??;
+        .await;
+        let result = match outcome {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => {
+                if http_session::is_transport_failure(&error)
+                    && let Some(failed) = session.take()
+                {
+                    failed.close().await;
+                }
+                return Err(http_session::with_authorization_hint(server_name, error.into()));
+            }
+            Err(_) => {
+                if let Some(failed) = session.take() {
+                    failed.close().await;
+                }
+                bail!(
+                    "MCP call timed out after {} ms; HTTP session was reset and the call was not replayed",
+                    server.request_timeout_ms
+                );
+            }
+        };
 
-        let _ = client.cancel().await;
         let value = serde_json::to_value(result)?;
         Ok(Self::extract_call_success_and_output(&value))
     }

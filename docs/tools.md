@@ -220,6 +220,11 @@ configuration key. A server whose reply to `server/discover` is not a modern res
 (for example a plain `{}`), or whose late reply conflicts with the handshake, is retried
 once with the legacy handshake. A connection that fails drops the kept version.
 
+An HTTP MCP server keeps one connection for its listing and its calls, so the
+`x-mcp-header` parameters of a tool are mirrored into `Mcp-Param-*` headers. Its
+static headers (`mcp.servers.<name>.headers`) are sent with every request; see
+[configuration](configuration.md#mcp-server-http-headers).
+
 ## MCP tool result rendering
 
 The model receives every block of an MCP `tools/call` result, rendered as text in server order and joined by newlines:

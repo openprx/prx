@@ -1,4 +1,5 @@
 use super::{Deserialize, HashMap, JsonSchema, Serialize, default_true};
+use std::collections::BTreeMap;
 
 // ── Composio (managed tool surface) ─────────────────────────────
 
@@ -477,6 +478,9 @@ pub struct McpServerConfig {
     /// change (high risk).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_dir: Option<String>,
+    /// HTTP request headers sent to this server, e.g. `Authorization`; values are secrets, encrypted at rest
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
 }
 
 pub(super) const fn default_mcp_startup_timeout_ms() -> u64 {
@@ -505,6 +509,7 @@ impl Default for McpServerConfig {
             allow_tools: Vec::new(),
             deny_tools: Vec::new(),
             working_dir: None,
+            headers: BTreeMap::new(),
         }
     }
 }
