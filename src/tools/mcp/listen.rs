@@ -136,11 +136,17 @@ impl McpTool {
         };
 
         let listed = match self.live_peer(server).await {
-            Some(peer) => peer
-                .list_all_tools_with_cache_hint()
-                .await
-                .map(|list| (tools_map(list.items), list.ttl_ms, None))
-                .map_err(anyhow::Error::from),
+            Some(peer) => {
+                let timeout = Duration::from_millis(config.request_timeout_ms);
+                match tokio::time::timeout(timeout, peer.list_all_tools_with_cache_hint()).await {
+                    Ok(Ok(list)) => Ok((tools_map(list.items), list.ttl_ms, None)),
+                    Ok(Err(error)) => Err(anyhow::Error::from(error)),
+                    Err(_) => Err(anyhow::anyhow!(
+                        "MCP tool listing timed out after {} ms",
+                        config.request_timeout_ms
+                    )),
+                }
+            }
             None => Self::discover_server_tools(
                 server,
                 &config,
@@ -158,7 +164,18 @@ impl McpTool {
             Err(error) => {
                 let error = redact_provider_text(&error.to_string());
                 tracing::warn!(server, error = %error, "MCP tool freshness refresh failed; the previous list is kept");
-                self.stale.lock().insert(server.to_string());
+                // Back off instead of re-marking: a failing server is retried
+                // no sooner than MIN_TTL, while a later list_changed still
+                // marks it stale at once.
+                let mut ttl = self.ttl_due.lock();
+                match Instant::now().checked_add(MIN_TTL) {
+                    Some(retry_at) => {
+                        ttl.insert(server.to_string(), retry_at);
+                    }
+                    None => {
+                        ttl.remove(server);
+                    }
+                }
             }
         }
     }

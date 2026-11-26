@@ -1164,6 +1164,12 @@ impl McpTool {
             }
         };
 
+        // Every server is listed again below through a fresh connection, so the
+        // stale marks and deadlines of the previous generation are void. Marks
+        // that arrive during this loop are kept and cost one extra list.
+        self.stale.lock().clear();
+        self.ttl_due.lock().clear();
+
         let mut discovered = HashMap::new();
         let mut eras = HashMap::new();
         let mut discovery_errors = HashMap::new();
@@ -1198,9 +1204,7 @@ impl McpTool {
             }
         }
 
-        // Every server was just listed through a fresh connection, so the
-        // stale marks and the deadlines of the previous generation are void.
-        self.stale.lock().clear();
+        // Seed the `ttlMs` deadlines of the servers just listed.
         *self.ttl_due.lock() = ttl_deadlines;
 
         let mut state = self.state.write();
