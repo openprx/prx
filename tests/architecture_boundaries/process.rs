@@ -56,7 +56,7 @@ const ALLOWED_RAW_CHILD_PROCESS_SPAWNS: &[&str] = &[
     "src/tools/sessions_spawn/tests/owned_child.rs::termination_after_leader_exit_does_not_wait_forever_on_inherited_pipe::let mut child = command.spawn().expect(\"test leader should spawn\");",
     // Test-only: the orphan-reclaim test must create a child that deliberately
     // bypasses the managed path, otherwise there is no orphan to detect.
-    "src/runtime/registry.rs::unreaped_child_is_reported_as_an_orphan_then_reclaimed::let mut child = command.spawn().expect(\"test: spawn detached child\");",
+    "src/runtime/registry/tests.rs::unreaped_child_is_reported_as_an_orphan_then_reclaimed::let mut child = command.spawn().expect(\"test: spawn detached child\");",
     // Test-only: proving the hang detector cleans up through `killpg` requires a
     // child that no RAII path can reclaim, so the managed spawn (which kills on
     // drop) would hide the very thing under test.
