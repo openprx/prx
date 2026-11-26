@@ -849,7 +849,7 @@ async fn finalize_terminal(
     #[cfg(test)]
     let stage =
         super::turn_cleanup::diagnostic::Stage::current(super::turn_cleanup::diagnostic::StageName::TerminalFinalize);
-    let receipt = crate::agent::terminal::finalize_turn(fabric, proposal, &config.cost, &config.workspace_dir).await?;
+    let receipt = crate::context::api::round::commit(fabric, proposal, &config.cost, &config.workspace_dir).await?;
     #[cfg(test)]
     stage.finish();
     Ok(receipt)
@@ -973,7 +973,7 @@ pub(crate) async fn commit_terminal(
     if let Some(guard) = guard {
         guard.commit(proposal).await
     } else {
-        crate::agent::terminal::finalize_turn(fabric, proposal, &config.cost, &config.workspace_dir).await
+        crate::context::api::round::commit(fabric, proposal, &config.cost, &config.workspace_dir).await
     }
 }
 

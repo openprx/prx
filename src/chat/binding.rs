@@ -681,7 +681,7 @@ impl ChatTurnBinding {
         } else {
             // Read-only fixtures and already-owned legacy recovery calls use
             // the same original terminal writer; no source is manufactured.
-            crate::agent::terminal::finalize_turn(fabric, proposal, cost, workspace).await
+            crate::context::api::round::commit(fabric, proposal, cost, workspace).await
         }
     }
 

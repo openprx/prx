@@ -3,8 +3,9 @@
 //! A turn reduces its request at three points: before the loop opens
 //! ([`pre_turn`]), at the start of each provider round ([`next_round`]), and
 //! after a round's tool results are appended ([`after_tools`]). Each point runs
-//! a fixed list of reduction steps through [`ladder`]. This module only names
-//! those calls; it has no behaviour of its own.
+//! a fixed list of reduction steps through [`ladder`]. The turn ends through
+//! [`commit`]. This module only names those calls; it has no behaviour of its
+//! own.
 
 use anyhow::Result;
 
@@ -29,3 +30,6 @@ pub(crate) async fn next_round(state: &mut Round<'_>) -> Result<Report> {
 pub(crate) async fn after_tools(state: &mut AfterTools<'_>) -> Result<Report> {
     ladder(&[&MidTurnTrim], state).await
 }
+
+/// Finalize a turn: commit its outcome, price it and record the receipt.
+pub(crate) use crate::agent::terminal::finalize_turn as commit;
