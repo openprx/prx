@@ -166,6 +166,7 @@ const SQLITE_BACKEND_FILES: &[&str] = &[
     "child_turns.rs",
     "rows.rs",
     "schema.rs",
+    "transcript_search.rs",
 ];
 
 /// Older child modules that were never part of the exemption for the
@@ -404,6 +405,10 @@ fn runtime_and_message_events_preserve_typed_config_generation_columns() {
         ("remote_tree.rs", include_str!("../../src/memory/sqlite/remote_tree.rs")),
         ("rows.rs", include_str!("../../src/memory/sqlite/rows.rs")),
         ("schema.rs", include_str!("../../src/memory/sqlite/schema.rs")),
+        (
+            "transcript_search.rs",
+            include_str!("../../src/memory/sqlite/transcript_search.rs"),
+        ),
     ];
     // Every backend file except `fixture_readback.rs` (test-only observations)
     // must be in the list above.

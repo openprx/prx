@@ -6,7 +6,7 @@ use crate::memory::traits::{
     DocumentChunkRecord, DocumentIngestInput, DocumentRecord, DocumentSearchResult, Memory, MemoryCategory,
     MemoryDraft, MemoryDraftInput, MemoryEntry, MemoryEvent, MemoryEventInput, MemoryLink, MemoryLinkInput,
     MemoryPrincipal, MemoryReadMode, MemoryStoreMetadata, MessageEvent, MessageEventInput, RetrievalTrace,
-    RetrievalTraceInput, SessionContextQuery, SharedContextQuery,
+    RetrievalTraceInput, SessionContextQuery, SharedContextQuery, TranscriptHit,
 };
 use crate::runtime::sqlite_pool::begin_immediate;
 use anyhow::Context;
@@ -1312,6 +1312,16 @@ impl Memory for SqliteMemory {
     ) -> anyhow::Result<Vec<MessageEvent>> {
         self.newest_session_events_of_type_impl(principal, session_key, event_type, limit)
             .await
+    }
+
+    async fn search_transcripts(
+        &self,
+        principal: &MemoryPrincipal,
+        query: &str,
+        session_key: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<TranscriptHit>> {
+        self.search_transcripts_impl(principal, query, session_key, limit).await
     }
 
     async fn append_memory_event(&self, mut input: MemoryEventInput) -> anyhow::Result<MemoryEvent> {

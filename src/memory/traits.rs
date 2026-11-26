@@ -15,7 +15,7 @@ pub use types::{
     LifecycleState, MemoryCategory, validate_memory_write_target, ConversationSessionSummary,
     CALLER_KEYED_SESSION_CHANNEL, SessionClaim, ConversationSessionOwner, ConversationTurn,
     MemoryVisibility, MemoryPrincipal, MessageEventSource, MessageEventSubject, MessageEventInput,
-    MessageEvent
+    MessageEvent, TranscriptHit
 };
 
 #[cfg(test)]
@@ -1278,6 +1278,22 @@ pub trait Memory: Send + Sync {
             self.name(),
             "newest_session_events_of_type",
         ))
+    }
+
+    /// Full-text search over the transcript rows (`message_events`) of the
+    /// principal's owner and workspace, in the agent partition of the principal
+    /// (no partition means Main), best match first. Only user and assistant
+    /// messages are searched. `query` is free text: every word is matched as a
+    /// literal term. Backends without a transcript index return no hits.
+    async fn search_transcripts(
+        &self,
+        principal: &MemoryPrincipal,
+        query: &str,
+        session_key: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<TranscriptHit>> {
+        let _ = (principal, query, session_key, limit);
+        Ok(Vec::new())
     }
 
     /// Append a memory outbox event.

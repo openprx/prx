@@ -730,3 +730,14 @@ impl MessageEvent {
         Ok(())
     }
 }
+
+/// One transcript row matched by [`crate::memory::traits::Memory::search_transcripts`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptHit {
+    pub session_key: Option<String>,
+    pub event_id: String,
+    pub role: String,
+    pub created_at: String,
+    /// Matched text with the matched words in `[` and `]`, from FTS5 `snippet()`.
+    pub excerpt: String,
+}
