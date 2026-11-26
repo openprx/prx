@@ -72,13 +72,22 @@ pub(crate) async fn tool_result_texts(
 /// the turn the reduction runs in. Outside a turn there is no manager, so
 /// nothing is asked. The contributions carry no audit row: the handoff's own
 /// summary is the stored effect.
+///
+/// `reduction_started` is emitted on every in-turn reduction; the contribution
+/// work runs only when a before-handoff action is configured.
 pub(crate) async fn summary_instructions(trigger: &str, cold_messages: usize) -> Vec<String> {
     let data = serde_json::json!({
         "trigger": trigger,
         "cold_messages": cold_messages,
     });
     crate::hooks::notify(HookEvent::ReductionStarted, data.clone());
-    let contributions = crate::hooks::contribute_in_identity(ContextPoint::BeforeHandoff, data).await;
+    let Some(manager) = crate::hooks::current_manager() else {
+        return Vec::new();
+    };
+    if !manager.has_context_actions(ContextPoint::BeforeHandoff) {
+        return Vec::new();
+    }
+    let contributions = manager.contribute(ContextPoint::BeforeHandoff, data).await;
     tracing::debug!(count = contributions.len(), "before-handoff contributions");
     contributions
         .into_iter()
@@ -109,6 +118,9 @@ pub(crate) async fn child_open_tail(input: TurnTailInput<'_>) -> String {
     let Some(hooks) = hooks else {
         return String::new();
     };
+    if !hooks.has_context_actions(ContextPoint::ChildStarted) {
+        return String::new();
+    }
     let mode = match envelope.source {
         RuntimeSource::SessionWorker => "process",
         _ => "task",

@@ -22,7 +22,6 @@ pub use config::{
 };
 pub use event::{HookEvent, payload_error};
 pub use identity::{HookIdentity, current as current_identity, notify, scope as identity_scope, scope_optional as identity_scope_optional, set_round};
-pub use identity::contribute as contribute_in_identity;
 pub use identity::current_manager;
 pub use child::ChildRun;
 pub use manager::HookManager;
