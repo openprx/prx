@@ -141,13 +141,13 @@ pub(super) fn sessions(memory: &SqliteMemory, workspace: &str, owner: &str) -> a
 /// validate as a handoff is passed over.
 const HANDOFF_CANDIDATE_ROWS: i64 = 8;
 
-/// The newest switch row of the child, after its last context reset, that
-/// validates as a handoff: the turn a history starts with, and its validated
-/// values (the rows it covers).
-fn newest_handoff(
+/// The switch rows of the child, after its last context reset, that validate as
+/// handoffs, newest first: the turn a history starts with, and its validated
+/// values (the rows it covers). The rest are the newest's possible ancestors.
+fn valid_handoffs(
     conn: &rusqlite::Connection,
     record: &ChildSessionRecord,
-) -> anyhow::Result<Option<(ChildTurn, ValidatedContextHandoff)>> {
+) -> anyhow::Result<Vec<(ChildTurn, ValidatedContextHandoff)>> {
     let mut query = conn.prepare("SELECT e.content,e.created_at,e.event_id FROM message_events e
         JOIN child_sessions c ON c.key=e.session_key AND c.ma_scope_id=e.ma_scope_id
         JOIN agent_scopes s ON s.scope_id=c.ma_scope_id
@@ -169,6 +169,7 @@ fn newest_handoff(
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut chain = Vec::new();
     for (content, created_at, event_id) in rows {
         let Some(handoff) = validated_context_handoff(&content) else {
             continue;
@@ -180,21 +181,42 @@ fn newest_handoff(
             timestamp,
             event_id: Some(event_id),
         };
-        return Ok(Some((turn, handoff)));
+        chain.push((turn, handoff));
     }
-    Ok(None)
+    Ok(chain)
+}
+
+/// The event ids the newest handoff of `chain` lists, followed by those of its
+/// ancestors reached through `parent_handoff_event_id` among the rows read. The
+/// maximum over them is the boundary: a fold takes a prefix of the window, so
+/// the newest note's rows lie above its ancestors', and a note that folded only
+/// its parent handoff lists no message of its own.
+fn chain_event_ids(chain: &[(ChildTurn, ValidatedContextHandoff)]) -> Vec<&str> {
+    let mut ids = Vec::new();
+    let mut current = chain.first();
+    for _ in 0..chain.len() {
+        let Some((_, handoff)) = current else {
+            break;
+        };
+        ids.extend(handoff.event_ids.iter().map(String::as_str));
+        current = handoff
+            .parent_handoff_event_id
+            .as_deref()
+            .and_then(|parent| chain.iter().find(|(turn, _)| turn.event_id.as_deref() == Some(parent)));
+    }
+    ids
 }
 
 /// The highest row id among the child's `message.created` rows whose event ids
-/// the handoff lists (same scope joins as the history read); `None` when none of
-/// them is left. Rows after it that the note does not list were kept by the
-/// parent handoff and stay in the history.
+/// are in `ids` (same scope joins as the history read); `None` when none of
+/// them is left. Rows after it that the newest note does not list were kept by
+/// the parent handoff and stay in the history.
 fn folded_through(
     conn: &rusqlite::Connection,
     record: &ChildSessionRecord,
-    handoff: &ValidatedContextHandoff,
+    ids: &[&str],
 ) -> anyhow::Result<Option<i64>> {
-    let ids = serde_json::to_string(&handoff.event_ids)?;
+    let ids = serde_json::to_string(ids)?;
     let newest = conn.query_row(
         "SELECT MAX(e.id) FROM message_events e
         JOIN child_sessions c ON c.key=e.session_key AND c.ma_scope_id=e.ma_scope_id
@@ -250,12 +272,15 @@ pub(super) fn history(memory: &SqliteMemory, record: &ChildSessionRecord) -> any
     // A handoff newer than the last context reset starts the history; rows the
     // handoff covers are not loaded again. Without one, the history is exactly
     // the stored context plus the rows after it.
-    let (mut result, after, folded) = match newest_handoff(conn, record)? {
-        Some((turn, handoff)) => {
-            let after = folded_through(conn, record, &handoff)?.unwrap_or(handoff.last_row_id);
-            (vec![turn], record.context_after.max(after), handoff.event_ids)
-        }
-        None => (record.context.clone(), record.context_after, Vec::new()),
+    let chain = valid_handoffs(conn, record)?;
+    let newest_last_row = chain.first().map(|(_, handoff)| handoff.last_row_id);
+    let covered = match newest_last_row {
+        Some(last_row_id) => Some(folded_through(conn, record, &chain_event_ids(&chain))?.unwrap_or(last_row_id)),
+        None => None,
+    };
+    let (mut result, after, folded) = match (chain.into_iter().next(), covered) {
+        (Some((turn, handoff)), Some(after)) => (vec![turn], record.context_after.max(after), handoff.event_ids),
+        _ => (record.context.clone(), record.context_after, Vec::new()),
     };
     let mut query = conn.prepare("SELECT e.role,e.content,e.created_at,e.event_id FROM message_events e
         JOIN child_sessions c ON c.key=e.session_key AND c.ma_scope_id=e.ma_scope_id

@@ -101,8 +101,8 @@ impl<'a> Transcript<'a> {
         if !loaded.from_log {
             return loaded.turns;
         }
-        let found = match handoff::newest_valid_handoff(self.memory, &self.principal, session_key).await {
-            Ok(found) => found,
+        let chain = match handoff::valid_handoffs(self.memory, &self.principal, session_key).await {
+            Ok(chain) => chain,
             Err(error) => {
                 let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
                 tracing::warn!(
@@ -110,36 +110,29 @@ impl<'a> Transcript<'a> {
                     error_sha256,
                     "transcript could not read the session's context handoff; loading all turns"
                 );
-                None
+                Vec::new()
             }
         };
-        let Some((event, handoff)) = found else {
+        let Some((_, newest)) = chain.first() else {
             return loaded.turns;
         };
-        // A chained switch's `last_row_id` is the parent switch row, which lies
-        // above messages the parent kept. The rows the handoff moved are told
-        // apart by their event ids: the turns after the newest of them stay,
-        // except the ones the note itself lists. When none of the listed rows is
-        // loaded any more (all deleted), the recorded row id stands.
-        let folded: std::collections::HashSet<&str> = handoff.event_ids.iter().map(String::as_str).collect();
+        // The rows the newest handoff moved are told apart by their event ids:
+        // the turns after the boundary stay, except the ones the note itself
+        // lists (see `handoff::covered_through` for the boundary).
+        let covered_through = handoff::covered_through(&loaded.turns, &chain);
+        let folded: std::collections::HashSet<&str> = newest.event_ids.iter().map(String::as_str).collect();
         let is_folded =
             |turn: &ConversationTurn| turn.message_event_id.as_deref().is_some_and(|id| folded.contains(id));
-        let covered_through = loaded
+        let kept: Vec<ConversationTurn> = loaded
             .turns
-            .iter()
-            .filter(|turn| is_folded(turn))
-            .map(|turn| turn.id)
-            .max()
-            .unwrap_or(handoff.last_row_id);
-        let mut model = Vec::with_capacity(loaded.turns.len() + 1);
+            .into_iter()
+            .filter(|turn| turn.id > covered_through && !is_folded(turn))
+            .collect();
+        let mut chain = chain;
+        let (event, _) = chain.swap_remove(0);
+        let mut model = Vec::with_capacity(kept.len() + 1);
         model.push(turn_of_event(event));
-        model.extend(
-            loaded
-                .turns
-                .iter()
-                .filter(|turn| turn.id > covered_through && !is_folded(turn))
-                .cloned(),
-        );
+        model.extend(kept);
         model
     }
 

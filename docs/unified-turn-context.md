@@ -908,7 +908,13 @@ is asked only for a handoff that will be written: no call is made for a
 suppressed or refused switch or for a note that cannot validate, and a summary
 that would push the note past its bound is dropped with status `omitted_size`.
 
-A resume (gateway, channel and child session) keeps the turns after the newest row the newest handoff lists, except the rows it lists, so the messages a parent handoff kept survive a chained switch; when none of the listed rows is left, the note's `last_row_id` is the boundary.
+A resume (gateway, channel and child session) keeps the turns after the
+newest row the newest handoff lists, except the rows it lists, so the messages
+a parent handoff kept survive a chained switch. When the newest handoff lists
+no loaded message (it folded only its parent handoff), the boundary comes from
+the nearest ancestor handoff, followed through `parent_handoff_event_id`
+among the switch rows read, that lists a loaded message. Only when the chain
+ends without one is the note's `last_row_id` the boundary.
 
 Each handoff references only the rows it replaced, its parent handoff row
 among them, so a fact older than the newest handoff is reached by following

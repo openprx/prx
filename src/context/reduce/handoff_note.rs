@@ -292,6 +292,8 @@ pub(crate) fn validated_context_handoff_note(content: &str) -> Option<serde_json
 pub(crate) struct ValidatedContextHandoff {
     /// The note's own identity, the argument of a lookup.
     pub(crate) handoff_event_id: String,
+    /// The handoff this one followed, when the note names one.
+    pub(crate) parent_handoff_event_id: Option<String>,
     /// The transcript events the handoff moved out of the window, in order.
     pub(crate) event_ids: Vec<String>,
     /// The row range the referenced events lie in.
@@ -390,6 +392,7 @@ pub(crate) fn validate_context_handoff(content: &str) -> Option<(ValidatedContex
     Some((
         ValidatedContextHandoff {
             handoff_event_id: note.handoff_event_id,
+            parent_handoff_event_id: note.parent_handoff_event_id,
             event_ids,
             first_row_id,
             last_row_id,
