@@ -109,20 +109,15 @@ pub(crate) fn format_context_degraded_notice(dropped_messages: usize) -> String 
     format!("Context trimmed (lossy): {dropped_messages} older {plural} dropped without a recoverable handoff.")
 }
 
-/// Whether an explicit `/compact` has anything to compact: the budgeted token
-/// estimate of the non-system messages in `source_history` exceeds the
-/// kept-recent token budget. The newest message is always kept, so a history
-/// of one message has nothing to fold.
+/// Whether an explicit `/compact` has anything to compact: more non-system
+/// messages in `source_history` than `keep_recent_messages` keeps.
 pub(super) fn manual_compact_has_compactable(
     source_history: &[ChatMessage],
     compaction_config: &crate::config::AgentCompactionConfig,
 ) -> bool {
     let system_count = usize::from(source_history.first().is_some_and(|m| m.role == "system"));
     let non_system = source_history.get(system_count..).unwrap_or_default();
-    let tokens = crate::agent::context_budget::budgeted_tokens(
-        crate::agent::context_budget::estimate_history_tokens_with_source(non_system),
-    );
-    non_system.len() > 1 && tokens > crate::agent::budget_inputs::keep_recent_token_budget(compaction_config)
+    non_system.len() > crate::agent::budget_inputs::effective_keep_recent_messages(non_system, compaction_config)
 }
 
 /// Feedback when `/compact` finds no durable transcript to bind to (D7).

@@ -16,6 +16,12 @@ pub(crate) const REPORTED_EVENT_TYPE: &str = "llm.request.usage.reported";
 /// Once per process: the floor warning is emitted at most once.
 static FLOOR_WARNING: Once = Once::new();
 
+/// Whether the window floor warning is still to be decided. Callers skip
+/// measuring the system prompt once it has fired.
+pub(crate) fn floor_warning_pending() -> bool {
+    !FLOOR_WARNING.is_completed()
+}
+
 /// Note the request the reduction steps of one round have shaped, and set it
 /// against the model window. Without an anchor the estimate checked is the
 /// budgeted local total of the request. The check refuses nothing: a request

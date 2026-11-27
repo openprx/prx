@@ -7,7 +7,9 @@
 //! now bounded by a share of the window, and an operator's explicit value is
 //! honoured as an upper bound.
 
+use crate::agent::context_budget::{budgeted_tokens, estimate_history_tokens_with_source};
 use crate::config::AgentCompactionConfig;
+use crate::providers::ChatMessage;
 
 /// The reply reserve never exceeds `1 / REPLY_RESERVE_WINDOW_DIVISOR` of the window.
 pub(crate) const REPLY_RESERVE_WINDOW_DIVISOR: usize = 4;
@@ -92,4 +94,17 @@ pub(crate) fn effective_keep_recent_weighted(weights: &[usize], cap: usize, conf
         kept += 1;
     }
     kept
+}
+
+/// How many of the newest `non_system` messages a switch keeps word for word,
+/// each weighed by its own text. See [`effective_keep_recent_weighted`].
+pub(crate) fn effective_keep_recent_messages(non_system: &[ChatMessage], config: &AgentCompactionConfig) -> usize {
+    let cap = keep_recent_cap(config, non_system.len());
+    let weights: Vec<usize> = non_system
+        .get(non_system.len().saturating_sub(cap)..)
+        .unwrap_or_default()
+        .iter()
+        .map(|message| budgeted_tokens(estimate_history_tokens_with_source(std::slice::from_ref(message))))
+        .collect();
+    effective_keep_recent_weighted(&weights, cap, config)
 }
