@@ -132,9 +132,12 @@ pub(super) fn compact_tool_result_for_history_with_status(
         ));
     }
     let (document_id, sha256) = tool_output_document_id(tool_name, content);
-    let chunk_count = crate::memory::chunker::chunk_markdown(content, crate::memory::chunker::DOCUMENT_CHUNK_TOKENS)
-        .len()
-        .max(1);
+    // The store chunks the redacted output, so the count is taken on that text.
+    let stored_text = crate::security::redaction::redact_secrets(content);
+    let chunk_count =
+        crate::memory::chunker::chunk_markdown(&stored_text, crate::memory::chunker::DOCUMENT_CHUNK_TOKENS)
+            .len()
+            .max(1);
     crate::security::redaction::redact_secrets(&format!(
         "{preview}\n\n[document_ingest_ref]\n\
 document_id: {document_id}\n\
