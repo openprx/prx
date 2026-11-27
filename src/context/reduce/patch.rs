@@ -3,7 +3,8 @@
 
 use super::audit::{persist_context_switch, switch_refusal_reason};
 use super::handoff_note::{
-    MAX_HANDOFF_MESSAGE_BYTES, context_handoff_lineage, format_context_handoff_message, validated_context_handoff_note,
+    MAX_HANDOFF_MESSAGE_BYTES, context_handoff_lineage, format_context_handoff_message, validated_context_handoff,
+    validated_context_handoff_note,
 };
 use super::handoff_summary::{ColdWindow, summarize_cold_window};
 use super::provenance::{
@@ -459,12 +460,34 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
             trigger,
         )
         .await;
-        let mut note_json = serde_json::to_string(&build_note(cold_summary.status(), cold_summary.text()))?;
+        // No summary written for this window: when it opens with an earlier handoff
+        // that holds one (`written` or `carried`), the note carries that summary
+        // forward verbatim instead of dropping it from the chain.
+        let carried = if cold_summary.text().is_none() {
+            compacted_source_messages
+                .and_then(<[ChatMessage]>::first)
+                .filter(|message| message.role == "assistant")
+                .and_then(|message| validated_context_handoff(&message.content))
+                .and_then(|handoff| handoff.summary().map(str::to_string))
+        } else {
+            None
+        };
+        let (first_status, first_text) = match (cold_summary.text(), carried.as_deref()) {
+            (Some(text), _) => (cold_summary.status(), Some(text)),
+            (None, Some(text)) => ("carried", Some(text)),
+            (None, None) => (cold_summary.status(), None),
+        };
+        let mut note_json = serde_json::to_string(&build_note(first_status, first_text))?;
         let mut handoff_message = format_context_handoff_message(&note_json);
-        let mut final_status = cold_summary.status();
+        let mut final_status = first_status;
         // A summary that pushes the note past its bound is dropped; the handoff is kept.
-        if cold_summary.text().is_some() && validated_context_handoff_note(&handoff_message).is_none() {
-            final_status = "omitted_size";
+        // A carried summary that does not fit gives the plain status of this window.
+        if first_text.is_some() && validated_context_handoff_note(&handoff_message).is_none() {
+            final_status = if first_status == "carried" {
+                cold_summary.status()
+            } else {
+                "omitted_size"
+            };
             note_json = serde_json::to_string(&build_note(final_status, None))?;
             handoff_message = format_context_handoff_message(&note_json);
         }

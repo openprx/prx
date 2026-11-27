@@ -883,8 +883,8 @@ A note may also carry three optional fields (`schema_version` stays 1; a note
 without them validates and renders exactly as above). `skills_in_use` lists up
 to 8 skill names the session had loaded before the handoff (each 1 to 128
 bytes, no control characters, no `[` or `]`). `summary_status` is one of
-`written`, `failed`, `empty`, `invalid_shape` or `omitted_size`; `summary` must be present
-exactly when the status is `written`, and then holds 1 to 6000 bytes that
+`written`, `carried`, `failed`, `empty`, `invalid_shape` or `omitted_size`; `summary` must be present
+exactly when the status is `written` or `carried`, and then holds 1 to 6000 bytes that
 contain none of the markers `[context_handoff]`, `[/context_handoff]`,
 `[document_ingest_ref]` or `[/document_ingest_ref]`. A note that breaks any of
 these rules is invalid, as any other invalid note is. The rendering keeps the
@@ -892,6 +892,8 @@ first line above and appends, in order and only when present: the skills line
 `Skills loaded before the handoff: a, b. Call skill_read for each one before
 continuing its procedure.`; for status `written`, a summary block that opens
 `Summary of the moved turns, written by the model at the handoff` and then the
+summary; for status `carried`, a block that opens `Summary carried from an
+earlier handoff; the messages after it were not summarized` and then the
 summary; for any other status, `No summary was written for these turns.`
 
 A `switch` handoff asks the turn's own model once, with no tools and
@@ -907,6 +909,16 @@ window as material to summarize, not as a request to answer. The note without a 
 is asked only for a handoff that will be written: no call is made for a
 suppressed or refused switch or for a note that cannot validate, and a summary
 that would push the note past its bound is dropped with status `omitted_size`.
+
+When the summary of a handoff is not written (`failed`, `empty`,
+`invalid_shape`) and its cold window opens with an earlier handoff that holds a
+summary (`written` or `carried`), the new note carries that summary verbatim
+with status `carried`; `parent_handoff_event_id` names the handoff it came
+from. A later written summary replaces it, and a carried summary that would
+push the note past its bound gives the plain status. A first handoff with
+nothing to carry is unchanged. An older binary does not know `carried`, treats
+such a note as invalid and falls back to an older valid handoff on resume, so a
+downgrade loads more turns rather than losing any.
 
 A resume (gateway, channel and child session) keeps the turns after the
 newest row the newest handoff lists, except the rows it lists, so the messages

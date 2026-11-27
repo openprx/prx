@@ -104,7 +104,8 @@ pub(crate) struct HandoffNoteSchema {
     /// written before summaries existed.
     #[serde(default)]
     summary_status: Option<HandoffSummaryStatus>,
-    /// The summary itself, present exactly when `summary_status` is `written`.
+    /// The summary itself, present exactly when `summary_status` is `written`
+    /// or `carried`.
     #[serde(default)]
     summary: Option<String>,
     /// Skills the session had loaded before the handoff; absent or empty means none.
@@ -112,12 +113,16 @@ pub(crate) struct HandoffNoteSchema {
     skills_in_use: Vec<String>,
 }
 
-/// The outcome of the summary a handoff note may carry. Only `written` carries
-/// a summary; the other statuses say why none was written.
+/// The outcome of the summary a handoff note may carry. `written` carries the
+/// summary of this handoff's own moved turns; `carried` carries, verbatim, the
+/// summary of the earlier handoff this one opened with, because none was
+/// written for these turns (the earlier handoff is the note's
+/// `parent_handoff_event_id`). The other statuses say why none was written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum HandoffSummaryStatus {
     Written,
+    Carried,
     Failed,
     Empty,
     InvalidShape,
@@ -239,18 +244,18 @@ pub(crate) fn is_handoff_note_tool_name(value: &str) -> bool {
 }
 
 /// Whether a summary status and summary pair is one the writer may produce:
-/// a summary exactly with status `written`, a text within the bound and free
-/// of the reserved markers.
+/// a summary exactly with status `written` or `carried`, a text within the
+/// bound and free of the reserved markers.
 fn is_valid_handoff_summary(status: Option<HandoffSummaryStatus>, summary: Option<&str>) -> bool {
     match (status, summary) {
-        (Some(HandoffSummaryStatus::Written), Some(text)) => {
+        (Some(HandoffSummaryStatus::Written | HandoffSummaryStatus::Carried), Some(text)) => {
             !text.is_empty()
                 && text.len() <= HANDOFF_SUMMARY_MAX_BYTES
                 && !HANDOFF_SUMMARY_FORBIDDEN_MARKERS
                     .iter()
                     .any(|marker| text.contains(*marker))
         }
-        (Some(HandoffSummaryStatus::Written), None) => false,
+        (Some(HandoffSummaryStatus::Written | HandoffSummaryStatus::Carried), None) => false,
         (Some(_), None) | (None, None) => true,
         (_, Some(_)) => false,
     }
@@ -303,7 +308,7 @@ pub(crate) struct ValidatedContextHandoff {
     pub(crate) folded_roundtrips: usize,
     /// The summary status; `None` for a note without the field.
     summary_status: Option<HandoffSummaryStatus>,
-    /// The summary, present exactly when the status is `written`.
+    /// The summary, present exactly when the status is `written` or `carried`.
     summary: Option<String>,
     /// The skills loaded before the handoff, in note order.
     skills_in_use: Vec<String>,
@@ -315,7 +320,8 @@ impl ValidatedContextHandoff {
         self.summary_status
     }
 
-    /// The summary of the moved turns, present exactly when the status is `written`.
+    /// The summary of the moved turns (or, for `carried`, of the earlier
+    /// handoff), present exactly when the status is `written` or `carried`.
     pub(crate) fn summary(&self) -> Option<&str> {
         self.summary.as_deref()
     }
@@ -471,6 +477,14 @@ fn format_compact_context_handoff_tail(handoff: &ValidatedContextHandoff) -> Str
                 );
             }
         }
+        Some(HandoffSummaryStatus::Carried) => {
+            if let Some(summary) = handoff.summary() {
+                let _ = write!(
+                    tail,
+                    "{COMPACT_HANDOFF_CARRIED_HEADER} (use it to continue; look up the messages after it before relying on them):\n{summary}"
+                );
+            }
+        }
         Some(_) => tail.push_str(COMPACT_HANDOFF_NO_SUMMARY),
         None => {}
     }
@@ -485,6 +499,11 @@ pub(crate) const COMPACT_HANDOFF_SKILLS_HEADER: &str = "\nSkills loaded before t
 /// parenthesised instruction that the summary follows.
 pub(crate) const COMPACT_HANDOFF_SUMMARY_HEADER: &str =
     "\n\nSummary of the moved turns, written by the model at the handoff";
+
+/// The opening of the summary block of a compact rendering of a `carried`
+/// note, through the parenthesised instruction that follows it.
+pub(crate) const COMPACT_HANDOFF_CARRIED_HEADER: &str =
+    "\n\nSummary carried from an earlier handoff; the messages after it were not summarized";
 
 /// The line a compact rendering carries when the summary status is not `written`.
 pub(crate) const COMPACT_HANDOFF_NO_SUMMARY: &str = "\nNo summary was written for these turns.";
@@ -567,6 +586,7 @@ fn is_compact_context_handoff_tail(tail: &str) -> bool {
         || [
             COMPACT_HANDOFF_SKILLS_HEADER,
             COMPACT_HANDOFF_SUMMARY_HEADER,
+            COMPACT_HANDOFF_CARRIED_HEADER,
             COMPACT_HANDOFF_NO_SUMMARY,
         ]
         .iter()
