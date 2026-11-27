@@ -12,6 +12,8 @@ use super::SqliteMemory;
 
 const LEDGER_EVENT_TYPE: &str = "tool.execution.finalized";
 
+const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
+
 /// Rows of an erase-fenced scope are removed by their own erase.
 const FENCE_GUARD: &str =
     "NOT EXISTS (SELECT 1 FROM agent_erase_fences f WHERE f.scope_id = message_events.ma_scope_id)";
@@ -58,7 +60,7 @@ impl SqliteMemory {
             let updated = match sealed {
                 Some(sealed) => conn.execute(
                     &format!(
-                        "UPDATE message_events SET raw_payload_json = ?3
+                        "UPDATE message_events SET raw_payload_json = ?3, updated_at = {NOW}
                          WHERE workspace_id = ?1 AND idempotency_key = ?2
                            AND event_type = '{LEDGER_EVENT_TYPE}' AND {FENCE_GUARD}"
                     ),
@@ -70,7 +72,8 @@ impl SqliteMemory {
                              WHEN json_type(raw_payload_json, '$.outcome.result.output') = 'text'
                              THEN json_set(raw_payload_json,
                                  '$.outcome.model_content', ?3, '$.outcome.result.output', ?3)
-                             ELSE json_set(raw_payload_json, '$.outcome.model_content', ?3) END
+                             ELSE json_set(raw_payload_json, '$.outcome.model_content', ?3) END,
+                             updated_at = {NOW}
                          WHERE workspace_id = ?1 AND idempotency_key = ?2
                            AND event_type = '{LEDGER_EVENT_TYPE}'
                            AND json_valid(raw_payload_json)
