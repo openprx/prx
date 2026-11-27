@@ -205,11 +205,13 @@ impl ToolResultRecorder {
         );
     }
 
-    /// Record `result` verbatim.
+    /// Record `result` as the model reads it: secrets masked (CE-63), so an
+    /// interrupted batch writes the same text the live and stored copies hold.
     pub(super) fn record(&self, index: usize, result: &str) {
+        let masked = crate::security::redaction::redact_secrets(result);
         let mut slots = self.slots.lock();
         if let Some(slot) = slots.get_mut(index) {
-            *slot = Some(result.to_string());
+            *slot = Some(masked);
         }
     }
 
