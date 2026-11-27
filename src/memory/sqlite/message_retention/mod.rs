@@ -142,10 +142,20 @@ pub(super) fn trim(
         tx.commit()?;
     }
     let mut cursor = 0_i64;
+    let mut resweep = true;
     for _ in 0..max_batches {
-        if !batch(memory, &cutoff_text, &mut cursor, &mut trim)? {
-            break;
+        if batch(memory, &cutoff_text, &mut cursor, &mut trim)? {
+            continue;
         }
+        // A unit kept only because a later row named it as its cause (E5) is
+        // eligible once that row is gone: a sweep that deleted rows is
+        // followed by one more sweep from the start.
+        if resweep && trim.events > 0 {
+            resweep = false;
+            cursor = 0;
+            continue;
+        }
+        break;
     }
     let rf_now = chrono::Utc::now().to_rfc3339();
     let passed = {
@@ -182,7 +192,7 @@ pub(super) fn trim(
 }
 
 /// One batch in its own IMMEDIATE transaction. Returns `false` when the scan
-/// found no row past `cursor` (the pass is complete).
+/// reached the last row older than the cutoff (the sweep is complete).
 fn batch(memory: &SqliteMemory, cutoff: &str, cursor: &mut i64, trim: &mut MessageTrim) -> anyhow::Result<bool> {
     let writer = memory.pool.write();
     let tx = begin_immediate(&writer)?;
@@ -206,6 +216,7 @@ fn batch(memory: &SqliteMemory, cutoff: &str, cursor: &mut i64, trim: &mut Messa
     if rows.is_empty() {
         return Ok(false);
     }
+    let mut more = i64::try_from(rows.len())? >= SCAN_ROWS;
     trim.batches += 1;
     let mut units = Vec::new();
     let mut decided: HashMap<Unit, bool> = HashMap::new();
@@ -218,6 +229,7 @@ fn batch(memory: &SqliteMemory, cutoff: &str, cursor: &mut i64, trim: &mut Messa
         if !decided.contains_key(&unit) {
             let keep = eligible(&tx, &unit, cutoff, ingress)?;
             if keep && units.len() >= BATCH_UNITS {
+                more = true;
                 break;
             }
             decided.insert(unit.clone(), keep);
@@ -230,7 +242,7 @@ fn batch(memory: &SqliteMemory, cutoff: &str, cursor: &mut i64, trim: &mut Messa
     if units.is_empty() {
         tx.commit()?;
         *cursor = next;
-        return Ok(true);
+        return Ok(more);
     }
 
     let mut ids: Vec<i64> = Vec::new();
@@ -283,7 +295,7 @@ fn batch(memory: &SqliteMemory, cutoff: &str, cursor: &mut i64, trim: &mut Messa
     }
     tx.commit()?;
     *cursor = next;
-    Ok(true)
+    Ok(more)
 }
 
 /// Rules E1-E7 for one unit, evaluated inside the batch transaction. A run

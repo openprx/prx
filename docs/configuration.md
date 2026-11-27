@@ -1714,8 +1714,10 @@ The pass runs at the start of each process that builds the memory backend
 (at most 2 batches), and hourly in the gateway (at most 20 batches, reading the
 live configuration each hour). A start-up pass is skipped when a pass completed
 less than 55 minutes ago; a pass that failed does not count, so the next start
-or hourly tick retries it. A pass is skipped while an rf snapshot is open. It
-is never called from
+or hourly tick retries it. A pass is skipped while an rf snapshot is open. A
+pass that deleted rows sweeps once more from the oldest row, because a run kept
+only by a newer row that names it as its cause becomes eligible once that row
+is gone. It is never called from
 a turn, and a turn waits at most for one batch. A pass's first transaction (the
 journal prune and, on the very first pass, index creation) can hold the writer
 longer than one batch. Deletion is permanent; setting
