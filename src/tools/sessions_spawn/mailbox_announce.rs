@@ -166,7 +166,7 @@ impl MailboxAnnouncement {
                 return false;
             }
         };
-        match memory.rf_run_family_deleted(run_id).await {
+        match memory.rf_run_family_deleted(&self.runtime.workspace, run_id).await {
             Ok(deleted) => deleted,
             Err(error) => {
                 tracing::debug!(run_id = %run_id, error = %crate::agent::diagnostics::error_class(&error), "sessions_spawn deleted-turn check failed");

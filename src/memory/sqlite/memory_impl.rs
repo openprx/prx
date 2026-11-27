@@ -80,11 +80,16 @@ fn scrub_after_delete(pool: &super::SqliteConnectionPool) {
 impl SqliteMemory {
     /// Whether `run_id` belongs to the run family of a deleted rf attempt
     /// (its message or reply deleted, settled or pending).
-    pub(crate) async fn rf_run_family_deleted(&self, run_id: &str) -> anyhow::Result<bool> {
+    pub(crate) async fn rf_run_family_deleted(&self, workspace_id: &str, run_id: &str) -> anyhow::Result<bool> {
         let pool = self.pool.clone();
+        let workspace_id = workspace_id.to_owned();
         let run_id = run_id.to_owned();
-        crate::runtime::blocking::spawn_blocking(move || super::rf_delete::run_family_deleted(&pool.write(), &run_id))
-            .await?
+        crate::runtime::blocking::spawn_blocking(move || {
+            let reader = pool.read()?;
+            let conn = reader.connection()?;
+            super::rf_delete::run_family_deleted(conn, &workspace_id, &run_id)
+        })
+        .await?
     }
 }
 

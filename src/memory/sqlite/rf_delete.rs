@@ -463,19 +463,20 @@ pub(super) fn settle_workspace(conn: &Connection, workspace_id: &str, live_runs:
 
 /// Whether `run_id`, or a run it descends from (`parent_run_id` chain), is
 /// the run of an rf attempt whose message or reply was deleted, settled or
-/// still pending. Run ids are unique, so no workspace filter is needed.
-pub(super) fn run_family_deleted(conn: &Connection, run_id: &str) -> anyhow::Result<bool> {
+/// still pending. The walk is bound to `workspace_id` so it uses the
+/// `(workspace_id, run_id)` index instead of scanning every event.
+pub(super) fn run_family_deleted(conn: &Connection, workspace_id: &str, run_id: &str) -> anyhow::Result<bool> {
     Ok(conn.query_row(
         "WITH RECURSIVE lineage(run) AS (
              SELECT ?1
              UNION
              SELECT e.parent_run_id FROM message_events e JOIN lineage l ON e.run_id = l.run
-             WHERE e.parent_run_id IS NOT NULL)
+             WHERE e.workspace_id = ?2 AND e.parent_run_id IS NOT NULL)
          SELECT EXISTS(SELECT 1 FROM rf_message_attempts a
-             WHERE a.run_id IN (SELECT run FROM lineage)
+             WHERE a.workspace_id = ?2 AND a.run_id IN (SELECT run FROM lineage)
                AND (a.deleted_at IS NOT NULL OR a.reply_deleted_at IS NOT NULL
                     OR a.erase_pending = 1 OR a.reply_erase_pending = 1))",
-        params![run_id],
+        params![run_id, workspace_id],
         |row| row.get(0),
     )?)
 }
