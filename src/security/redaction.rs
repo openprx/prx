@@ -369,7 +369,7 @@ fn is_call(value: &str) -> bool {
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':'))
                 && (arguments.is_empty()
-                    || (!arguments.contains(['=', ':', '(', ')'])
+                    || (!arguments.contains(['=', ':', '(', ')', '"', '\''])
                         && arguments.chars().any(|c| c.is_ascii_alphabetic())))
         })
     })
