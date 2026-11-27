@@ -554,9 +554,6 @@ provider = "duckduckgo"               # duckduckgo | brave
 
 [skills]
 # community_repo = ""
-
-[skill_rag]
-# top_k = 5
 "#
         .into(),
     }
