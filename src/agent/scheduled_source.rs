@@ -32,6 +32,9 @@ pub(crate) struct ScheduledAgentOrigin {
     /// The job or task name and its deliver mode, for the result row.
     name: Option<String>,
     deliver: crate::cron::ScheduledDeliver,
+    /// The finish time of this run, fixed by its first result record so every
+    /// record of the same run reports the same time.
+    finished_at: std::sync::OnceLock<String>,
 }
 
 /// What the result row of a scheduled run needs from its origin.
@@ -50,6 +53,8 @@ pub(crate) struct ScheduledResultMeta {
     /// A run that itself adds jobs never changes it: it is read from this run's
     /// stored task, not from any job the run created.
     pub(crate) source_event_id: Option<String>,
+    /// RFC 3339 UTC finish time of this run, the same on every record of it.
+    pub(crate) finished_at: String,
 }
 
 /// The result-row metadata of the scheduled invocation this call runs inside.
@@ -62,6 +67,10 @@ pub(crate) fn current_result_meta() -> Option<ScheduledResultMeta> {
             local_operator: origin.origin.is_local_operator(),
             has_owner: origin.owner_id.as_deref().is_some_and(|owner| !owner.trim().is_empty()),
             source_event_id: origin.source_event_id.clone(),
+            finished_at: origin
+                .finished_at
+                .get_or_init(|| chrono::Utc::now().to_rfc3339())
+                .clone(),
         })
         .ok()
 }
@@ -124,6 +133,7 @@ impl ScheduledAgentOrigin {
             goal_id: None,
             name: job.name.clone(),
             deliver: job.deliver,
+            finished_at: std::sync::OnceLock::new(),
         }
     }
 
@@ -142,6 +152,7 @@ impl ScheduledAgentOrigin {
             goal_id: None,
             name: Some(task.name.clone()),
             deliver: task.deliver,
+            finished_at: std::sync::OnceLock::new(),
         }
     }
 

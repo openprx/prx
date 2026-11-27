@@ -62,7 +62,7 @@ pub(crate) async fn record(
         "id": meta.task_id,
         "name": meta.name,
         "status": status,
-        "finished_at": chrono::Utc::now().to_rfc3339(),
+        "finished_at": meta.finished_at,
         "excerpt": excerpt,
         "transcript_session": envelope.session_key,
         "error_class": failure,

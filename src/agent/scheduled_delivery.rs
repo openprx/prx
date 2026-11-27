@@ -8,7 +8,7 @@
 use crate::agent::diagnostics::error_class;
 use crate::agent::scheduled_source::ScheduledResultMeta;
 use crate::config::Config;
-use crate::memory::Memory;
+use crate::memory::{Memory, MessageEventSource};
 use crate::messaging::runtime::MessagingRuntime;
 use crate::runtime::envelope::RuntimeEnvelope;
 use sha2::{Digest as _, Sha256};
@@ -66,6 +66,12 @@ pub(crate) async fn deliver_message(
     let Some(session) = event.session_key.as_deref() else {
         return Delivered::NoTarget;
     };
+    // A job created by a scheduled run or inside a child session carries that
+    // run's own inbound event. Its session is one nobody reads, so the result
+    // keeps its note for the task owner instead of a message into it.
+    if is_non_interactive_creator(session, &event.source) {
+        return Delivered::NoTarget;
+    }
     let runtime = match MessagingRuntime::for_config(config) {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -104,13 +110,22 @@ pub(crate) async fn deliver_message(
     }
 }
 
+/// Whether the creating event belongs to a scheduled run or a child session.
+fn is_non_interactive_creator(session: &str, source: &MessageEventSource) -> bool {
+    session.starts_with("cron:")
+        || session.starts_with("xin:")
+        || session.starts_with("spawn:")
+        || matches!(source, MessageEventSource::Cron | MessageEventSource::Xin)
+}
+
 /// The message body: a header naming the job and its finish time, the bounded
-/// reply, and the transcript session the run wrote.
+/// reply, and the transcript session the run wrote. The finish time is the
+/// run's own value, so the body of one run is byte-identical on every send.
 fn message_text(meta: &ScheduledResultMeta, envelope: &RuntimeEnvelope, reply: &str) -> String {
     let label = meta.name.as_deref().unwrap_or(meta.task_id.as_str());
     format!(
         "[Scheduled result] {label} finished at {}:\n\n{}\n\n(transcript {})",
-        chrono::Utc::now().to_rfc3339(),
+        meta.finished_at,
         bounded_reply(reply),
         envelope.session_key,
     )
