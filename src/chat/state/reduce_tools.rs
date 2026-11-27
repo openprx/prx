@@ -109,13 +109,21 @@ impl ChatState {
             tool_result_defaults_expanded,
         };
         let args_preview = build_tool_args_preview(&name, &args, ARGS_PREVIEW_MAX_CHARS, ARGS_PREVIEW_ELLIPSIS);
+        // The copy kept for the saved session is built from redacted arguments:
+        // a preview of the raw text re-escapes quotes and hides credential pairs.
+        let stored_preview = build_tool_args_preview(
+            &name,
+            &crate::chat::sanitize::redact_tool_args_text(&args),
+            ARGS_PREVIEW_MAX_CHARS,
+            ARGS_PREVIEW_ELLIPSIS,
+        );
         let folded = !tool_result_defaults_expanded(&name);
         let tool_key = ToolTaskKey::from_task_id(task_id);
         let invocation_key = ToolInvocationKey::new(tool_call_id, &name);
         self.control
             .tool_buffer_mut(tool_key)
             .tool_args
-            .insert(invocation_key, args_preview.clone());
+            .insert(invocation_key, stored_preview);
         self.ui.conversation_lines.push(ConversationLine::ToolResult {
             tool_name: name,
             args_preview,
@@ -140,11 +148,12 @@ impl ChatState {
         name: String,
         args: String,
     ) -> Vec<Effect> {
-        let args_preview = if args.chars().count() > 80 {
-            let prefix: String = args.chars().take(80).collect();
+        let stored_args = crate::chat::sanitize::redact_tool_args_text(&args);
+        let args_preview = if stored_args.chars().count() > 80 {
+            let prefix: String = stored_args.chars().take(80).collect();
             format!("{prefix}…")
         } else {
-            args.clone()
+            stored_args
         };
         let tool_key = ToolTaskKey::from_task_id(task_id);
         let invocation_key = ToolInvocationKey::new(tool_call_id, &name);

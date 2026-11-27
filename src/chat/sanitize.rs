@@ -52,6 +52,22 @@ pub fn sanitize_text_or_json(content: &str) -> String {
     }
 }
 
+/// Tool-call arguments as raw text, redacted before any preview is built from
+/// them: a JSON object or array is redacted by value (decoded strings, so a
+/// quote escaped once inside a string is seen as the redactor reads it); other
+/// text is redacted as a whole. Never truncates. A preview built from the
+/// unredacted text re-escapes the quotes of a shell command and hides a
+/// credential pair from the text redactor.
+pub fn redact_tool_args_text(raw: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(mut value @ (serde_json::Value::Object(_) | serde_json::Value::Array(_))) => {
+            crate::security::redaction::redact_json_value(&mut value);
+            serde_json::to_string(&value).unwrap_or_else(|_| redact_secrets(raw))
+        }
+        _ => redact_secrets(raw),
+    }
+}
+
 /// Redact every JSON string and credential-named value (the one redactor),
 /// then cap each string like stored session content.
 pub fn sanitize_json_value(value: &mut serde_json::Value) {
