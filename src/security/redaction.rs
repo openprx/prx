@@ -1350,6 +1350,8 @@ mod tests {
         ] {
             assert!(!redact_secrets(text).contains("abcdefgh12345678"), "{text}");
         }
+        // a credential name masks a short value whatever its shape
+        assert!(!redact_secrets("auth=abcdefgh1234").contains("abcdefgh1234"));
     }
 
     #[test]
