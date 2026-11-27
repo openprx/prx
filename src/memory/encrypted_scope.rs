@@ -31,7 +31,9 @@ const ATTACHMENT_SOURCE_LISTS: [&str; 4] = ["memories", "events", "documents", "
 /// Store an attachment row as `{"encrypted_child_payload": sealed, "sources": ...}`
 /// so the store's provenance triggers can find the rows that quote a deleted
 /// memory, document or event. Only the ids (string elements) are copied, never
-/// text. A payload that is not a JSON object is stored as sealed.
+/// text. A payload that is not a JSON object is stored as sealed. When `sealed`
+/// is already a child payload wrapper (`encrypted_child_payload` key), the
+/// `sources` key is added to that object instead of wrapping it again.
 fn attachment_wrapper(payload: &str, sealed: String) -> String {
     let Some(value) = serde_json::from_str::<serde_json::Value>(payload)
         .ok()
@@ -48,8 +50,14 @@ fn attachment_wrapper(payload: &str, sealed: String) -> String {
         };
         sources.insert(list.to_owned(), serde_json::Value::Array(ids));
     }
-    let mut wrapper = serde_json::Map::new();
-    wrapper.insert("encrypted_child_payload".to_owned(), serde_json::Value::String(sealed));
+    let mut wrapper = match serde_json::from_str::<serde_json::Value>(&sealed) {
+        Ok(serde_json::Value::Object(existing)) if existing.contains_key("encrypted_child_payload") => existing,
+        _ => {
+            let mut fresh = serde_json::Map::new();
+            fresh.insert("encrypted_child_payload".to_owned(), serde_json::Value::String(sealed));
+            fresh
+        }
+    };
     wrapper.insert("sources".to_owned(), serde_json::Value::Object(sources));
     serde_json::Value::Object(wrapper).to_string()
 }
