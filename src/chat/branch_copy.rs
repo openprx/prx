@@ -13,6 +13,7 @@ use super::chat_events::chat_runtime_envelope;
 use super::session;
 use crate::agent::compaction::{parse_context_handoff_note, resolve_compaction_event_provenance};
 use crate::agent::turn_contracts::stored_turn_message;
+use crate::context::reduce::provenance::resolve_recorded_rows;
 use crate::memory::Memory;
 use crate::memory::branch_copy::{
     BRANCH_COPY_MAX_ROWS, BranchCopyBatch, BranchCopyError, BranchCopyPlan, BranchCopySessionKeys,
@@ -34,7 +35,12 @@ pub(super) async fn copy_branch_transcript(
     branch: &mut session::ChatSession,
 ) -> Result<()> {
     // The copied turns are new rows of the branch: the source's event ids do
-    // not name them, so none is kept.
+    // not name them, so none is kept after the source rows are resolved.
+    let recorded_ids = branch
+        .turns
+        .iter()
+        .map(|turn| turn.event_id.iter().cloned().collect::<Vec<_>>())
+        .collect::<Vec<_>>();
     for turn in &mut branch.turns {
         turn.event_id = None;
     }
@@ -73,7 +79,7 @@ pub(super) async fn copy_branch_transcript(
     };
 
     let Some(handoff_index) = handoff_index else {
-        match retained_turn_event_ids(mem, &source, branch, None).await {
+        match retained_turn_event_ids(mem, &source, branch, None, &recorded_ids).await {
             Ok(ids) => plan.final_batch.original_event_ids = ids,
             Err(error) => {
                 let (error_len, error_sha256) = crate::agent::diagnostics::tool_parse_log_digest(&error.to_string());
@@ -109,8 +115,18 @@ pub(super) async fn copy_branch_transcript(
         .to_string();
     plan.handoff_batches = handoff_chain_batches(mem, &source, &plan, newest_note).await?;
     plan.final_batch.original_event_ids.push(newest_handoff_id.clone());
-    let retained = retained_turn_event_ids(mem, &source, branch, Some(handoff_index)).await?;
-    plan.final_batch.original_event_ids.extend(retained);
+    match retained_turn_event_ids(mem, &source, branch, Some(handoff_index), &recorded_ids).await {
+        Ok(retained) => plan.final_batch.original_event_ids.extend(retained),
+        Err(error) => {
+            let (error_len, error_sha256) = crate::agent::diagnostics::tool_parse_log_digest(&error.to_string());
+            tracing::warn!(
+                turns = branch.turns.len(),
+                error_len,
+                error_sha256,
+                "branch retained turns have no exact transcript rows; the branch keeps its handoff chain and later compaction lacks provenance for them"
+            );
+        }
+    }
     plan.check_bounds()?;
 
     let result = mem.copy_events_for_branch(plan).await?;
@@ -205,32 +221,53 @@ async fn handoff_chain_batches(
 
 /// The original `message.created` rows of every retained turn (all turns but
 /// the handoff), in turn order.
+///
+/// Turns that recorded one event id each are verified against those rows, with
+/// the handoff first when there is one; otherwise the rows are found by text
+/// over the same sequence.
 async fn retained_turn_event_ids(
     mem: &dyn Memory,
     source: &crate::runtime::envelope::RuntimeEnvelope,
     branch: &session::ChatSession,
     handoff_index: Option<usize>,
+    recorded_ids: &[Vec<String>],
 ) -> Result<Vec<String>> {
-    let retained = branch
-        .turns
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| Some(*index) != handoff_index)
-        .map(|(_, turn)| stored_turn_message(turn.role.clone(), turn.content.clone()))
-        .collect::<Vec<_>>();
-    if retained.is_empty() {
+    let mut order = Vec::with_capacity(branch.turns.len());
+    order.extend(handoff_index);
+    order.extend((0..branch.turns.len()).filter(|index| Some(*index) != handoff_index));
+    let mut joint = Vec::with_capacity(order.len());
+    let mut recorded = Vec::with_capacity(order.len());
+    for index in order {
+        let turn = branch
+            .turns
+            .get(index)
+            .ok_or(BranchCopyError::InvalidPlan("a retained turn is out of range"))?;
+        joint.push(stored_turn_message(turn.role.clone(), turn.content.clone()));
+        recorded.push(recorded_ids.get(index).cloned().unwrap_or_default());
+    }
+    let skip = usize::from(handoff_index.is_some());
+    if joint.len() == skip {
         return Ok(Vec::new());
     }
-    let provenance = resolve_compaction_event_provenance(
-        mem,
-        source.memory_principal(),
-        &retained,
-        crate::agent::compaction::RoundCompanions::Acknowledged,
-    )
-    .await?
-    .filter(|provenance| provenance.companion_message_count == 0 && provenance.source_event_ids.len() == retained.len())
-    .ok_or(BranchCopyError::InvalidPlan(
-        "the retained turns have no exact transcript rows",
-    ))?;
-    Ok(provenance.source_event_ids)
+    let pinned = resolve_recorded_rows(mem, source.memory_principal(), &joint, &recorded).await?;
+    let rows = match pinned.filter(|rows| rows.len() == joint.len()) {
+        Some(rows) => rows.into_iter().map(|(_, event_id)| event_id).collect::<Vec<_>>(),
+        None => {
+            resolve_compaction_event_provenance(
+                mem,
+                source.memory_principal(),
+                &joint,
+                crate::agent::compaction::RoundCompanions::Acknowledged,
+            )
+            .await?
+            .filter(|provenance| {
+                provenance.companion_message_count == 0 && provenance.source_event_ids.len() == joint.len()
+            })
+            .ok_or(BranchCopyError::InvalidPlan(
+                "the retained turns have no exact transcript rows",
+            ))?
+            .source_event_ids
+        }
+    };
+    Ok(rows.into_iter().skip(skip).collect())
 }

@@ -942,6 +942,50 @@ async fn resolve_pinned(
     Ok(verify_pins(&pool, &plan, joint, segment_start))
 }
 
+/// The `(row id, event id)` of every message of `joint` (handoff first when
+/// there is one), resolved from the rows its history recorded: the same proof
+/// as [`resolve_pinned`], read over a complete or stopped pool. `None` when a
+/// message has no single recorded id or the pins do not verify; the caller
+/// falls back to the text search.
+pub(crate) async fn resolve_recorded_rows(
+    mem: &dyn Memory,
+    principal: MemoryPrincipal,
+    joint: &[ChatMessage],
+    recorded: &[Vec<String>],
+) -> Result<Option<Vec<(i64, String)>>> {
+    if principal.session_key.is_none() || joint.is_empty() || joint.len() != recorded.len() {
+        return Ok(None);
+    }
+    let joint_refs = joint.iter().collect::<Vec<_>>();
+    let recorded_refs = recorded.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let Some(plan) = PinPlan::of(&joint_refs, &recorded_refs) else {
+        return Ok(None);
+    };
+    let segment_start = usize::from(plan.handoff.is_some());
+    if joint.len().saturating_sub(segment_start) > crate::tools::transcript_history_lookup::MAX_REFERENCED_EVENTS {
+        return Ok(None);
+    }
+    let principal = MemoryPrincipal {
+        legacy_session_key: None,
+        ..principal
+    };
+    let attachments = stored_attachments(mem, &principal).await;
+    let forms = SourceForms::new(&joint_refs).with_attachments(attachments);
+    let mut pool = match page_pool(mem, &principal, &forms, POOL_MAX_ROWS, None, |pool| {
+        plan.satisfied_by(pool)
+    })
+    .await?
+    {
+        PoolRead::Stopped(pool) | PoolRead::Complete(pool) => pool,
+        PoolRead::Capped(_) | PoolRead::Unproven => return Ok(None),
+    };
+    if !plan.satisfied_by(&pool) {
+        return Ok(None);
+    }
+    pool.finish();
+    Ok(verify_pins(&pool, &plan, &joint_refs, segment_start))
+}
+
 /// P4-P7 over the rows read.
 fn verify_pins(
     pool: &CandidatePool,
