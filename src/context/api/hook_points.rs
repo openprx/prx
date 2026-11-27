@@ -126,6 +126,7 @@ pub(crate) async fn child_open_tail(input: TurnTailInput<'_>) -> String {
     }
     let mode = match envelope.source {
         RuntimeSource::SessionWorker => "process",
+        RuntimeSource::Delegate => "delegate",
         _ => "task",
     };
     let data = serde_json::json!({
