@@ -66,6 +66,12 @@ pub(super) fn spawn_tools_listener(
                 return;
             }
         };
+        if subscription.acknowledged().tools_list_changed != Some(true) {
+            // An empty acknowledgment (a token without push) keeps no stream;
+            // dropping the subscription cancels it on the wire.
+            tracing::debug!(server = %server, "MCP tools listener not acknowledged; closed");
+            return;
+        }
         while let Ok(Some(notification)) = subscription.next().await {
             if matches!(notification, ServerNotification::ToolListChangedNotification(_)) {
                 stale.lock().insert(server.clone());
