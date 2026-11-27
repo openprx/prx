@@ -1,6 +1,6 @@
 //! Per-message channel turn execution.
 
-use super::history::{append_sender_turn, merged_history, normalize_cached_channel_turns};
+use super::history::{append_sender_turn, logged_turns_matching_cache, merged_history, normalize_cached_channel_turns};
 use super::inbound_policy::{
     ConversationKey, authorize_channel_autosave, authorize_channel_inbound, authorize_channel_outbound,
     chat_kind_from_message, conversation_memory_key, group_reply_mode_for, is_bot_mentioned, is_mention_only_enabled,
@@ -838,7 +838,7 @@ pub(super) async fn run_channel_turn(
     // is cut. The request must alternate, so an earlier user message left
     // without a reply is folded into this request's text, ahead of it.
     let current_text = crate::agent::turn_contracts::inbound_user_message(&msg.content).content;
-    let (previous_turns, request_text) = {
+    let (previous_turns, request_text, folded) = {
         let mut cached = merged_history(&ctx.conversation_histories.lock(), &history_key);
         if let Some(index) = cached
             .iter()
@@ -848,10 +848,12 @@ pub(super) async fn run_channel_turn(
         }
         let mut earlier = normalize_cached_channel_turns(cached);
         let mut request_text = msg.content.clone();
+        let mut folded = false;
         if earlier.last().is_some_and(|turn| turn.role == "user")
             && let Some(unanswered) = earlier.pop()
         {
             request_text = format!("{}\n\n{}", unanswered.content, msg.content);
+            folded = true;
         }
         let previous_turns = earlier
             .into_iter()
@@ -865,7 +867,25 @@ pub(super) async fn run_channel_turn(
                 message_event_id: None,
             })
             .collect::<Vec<_>>();
-        (previous_turns, request_text)
+        (previous_turns, request_text, folded)
+    };
+    // CH2: the log replaces the cache only when it holds the same turns one to one.
+    // A folded request (an unanswered earlier message) keeps the cache view.
+    let previous_turns = if folded {
+        previous_turns
+    } else {
+        match logged_turns_matching_cache(
+            turn_memory.as_ref(),
+            runtime_envelope.memory_principal(),
+            &runtime_envelope.session_key,
+            &current_text,
+            &previous_turns,
+        )
+        .await
+        {
+            Some(logged) => logged,
+            None => previous_turns,
+        }
     };
     // The vision card ends with a newline so the user's text does not run on from its closing tag.
     let card_text = signal_vision_context.as_ref().map(|context| format!("{context}\n"));

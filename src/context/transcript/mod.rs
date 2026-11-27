@@ -47,6 +47,13 @@ pub(crate) struct SessionTurns {
     from_log: bool,
 }
 
+impl SessionTurns {
+    /// Whether the turns were read from the log, so their ids are `message_events` ids.
+    pub(crate) const fn from_log(&self) -> bool {
+        self.from_log
+    }
+}
+
 impl<'a> Transcript<'a> {
     /// `principal` names the session and the visibility the reads run with.
     pub(crate) fn new(memory: &'a dyn Memory, principal: MemoryPrincipal) -> Self {

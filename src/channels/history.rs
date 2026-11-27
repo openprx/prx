@@ -5,6 +5,7 @@ use super::{
     Arc, ChannelRuntimeContext, ChatMessage, HashMap, MAX_CHANNEL_HISTORY, MAX_HYDRATED_SESSIONS, Memory, MemoryFabric,
     MemoryPrincipal, MemoryVisibility, RuntimeEnvelope, strip_fabricated_tool_markers_from_assistant_turns,
 };
+use crate::context::transcript::Transcript;
 
 /// Reshape cached turns into the strict user/assistant alternation the
 /// providers expect, and drop fabricated `[Used tools: ...]` lines from the
@@ -108,6 +109,57 @@ pub(super) fn merged_history(
     // the sqlite rows behind it are untouched — `merged` is a fresh clone.
     strip_fabricated_tool_markers_from_assistant_turns(&mut merged);
     merged
+}
+
+/// CH2: the earlier turns of a conversation read from the log, with their
+/// event ids, when the log holds exactly the cached turns.
+///
+/// `cached` is the CH1 cache view (cut before the current message, normalized,
+/// no ids). The log is read under `session_key` with the turn's principal and
+/// cut at the current message the same way. It is used only when the logged
+/// turns match the cache role for role and text for text, in order, and have
+/// the same count: the parity rule the terminal applies on resume. Any other
+/// outcome, including a read failure or a display-projection read, returns
+/// `None` and the cache is replayed.
+pub(super) async fn logged_turns_matching_cache(
+    memory: &dyn Memory,
+    principal: MemoryPrincipal,
+    session_key: &str,
+    current_text: &str,
+    cached: &[crate::memory::ConversationTurn],
+) -> Option<Vec<crate::memory::ConversationTurn>> {
+    let transcript = Transcript::new(memory, principal);
+    let loaded = match transcript.load_session_turns(session_key, MAX_CHANNEL_HISTORY).await {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            tracing::debug!(
+                error = %crate::agent::diagnostics::error_class(&error),
+                "channel history log unavailable; replaying the cache"
+            );
+            return None;
+        }
+    };
+    if !loaded.from_log() {
+        return None;
+    }
+    let mut logged = transcript.model_turns_from(session_key, loaded).await;
+    if let Some(index) = logged
+        .iter()
+        .rposition(|turn| turn.role == "user" && turn.content == current_text)
+    {
+        logged.truncate(index);
+    }
+    // The cache is already normalized, so equal length and equal role and text
+    // in order mean the log needs no merge, drop or stripping to match it.
+    let matches = logged.len() == cached.len()
+        && logged
+            .iter()
+            .zip(cached)
+            .all(|(log, cache)| log.role == cache.role && log.content == cache.content);
+    if !matches {
+        return None;
+    }
+    Some(logged)
 }
 
 pub(super) fn clear_sender_history(ctx: &ChannelRuntimeContext, key: &ConversationKey) {
