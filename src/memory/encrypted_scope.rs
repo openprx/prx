@@ -82,14 +82,16 @@ impl EncryptedScope {
     }
 
     fn open_stored(&self, stored_key: &str, stored: &str) -> Option<(String, String)> {
+        if !stored_key.starts_with(&self.prefix()) {
+            return None;
+        }
         let aad = stored_key.rsplit(':').next()?;
         let plain = self.open_aad(aad, stored)?;
         let value: serde_json::Value = serde_json::from_str(&plain).ok()?;
-        if !stored_key.starts_with(&self.prefix())
-            || value
-                .get("scope")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|scope| scope != self.scope)
+        if value
+            .get("scope")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|scope| scope != self.scope)
             || (value.get("scope").is_none() && !self.crypto.encryption_enabled())
         {
             return None;

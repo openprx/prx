@@ -17,6 +17,7 @@
 //! deleted row ([`erase_context_pages`]); they are not counted.
 
 use super::SqliteMemory;
+use crate::memory::RAMFLUX_MEMORY_KEY_PREFIX;
 use crate::memory::branch_copy::SESSION_PREFIX_EVENT_TYPE;
 use crate::memory::rf_messages::{RfForgetCounts, RfForgetRefused};
 use crate::memory::topic::delete_orphan_topic;
@@ -313,6 +314,14 @@ fn evict_embeddings(tx: &Connection, scope: Option<&str>, text: &str) -> anyhow:
 /// `workspace_id, owner_id` and is a constant statement with bound values.
 /// NULL-workspace rows (written before the fix that stores the write context's
 /// workspace) count as this workspace's rows. Returns the number of rows deleted.
+///
+/// A sealed core memory carries the account's memory-owner MAC as owner, while
+/// its session prefix row (which renders the decrypted text through the
+/// sealed read) carries the resolved owner. An owner value that has any
+/// sealed (`rf:`) memory is therefore a MAC and is never matched by owner:
+/// every prefix row of the workspace is dropped instead, which is safe because
+/// the next turn re-renders the index. The check runs before the caller changes
+/// the memory rows, so the row being changed is still counted.
 pub(super) fn drop_prefix_rows_of(
     tx: &Connection,
     owners_sql: &str,
@@ -326,10 +335,23 @@ pub(super) fn drop_prefix_rows_of(
     };
     let mut deleted: usize = 0;
     for (workspace, owner) in owners {
-        deleted = deleted.saturating_add(tx.execute(
-            "DELETE FROM message_events WHERE event_type = ?3 AND (?1 IS NULL OR workspace_id IS ?1) AND owner_id IS ?2",
-            params![workspace, owner, SESSION_PREFIX_EVENT_TYPE],
-        )?);
+        let sealed = owner.is_some()
+            && tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM memories WHERE owner_id IS ?1 AND substr(key, 1, length(?2)) = ?2)",
+                params![owner, RAMFLUX_MEMORY_KEY_PREFIX],
+                |row| row.get::<_, bool>(0),
+            )?;
+        deleted = deleted.saturating_add(if sealed {
+            tx.execute(
+                "DELETE FROM message_events WHERE event_type = ?2 AND (?1 IS NULL OR workspace_id IS ?1)",
+                params![workspace, SESSION_PREFIX_EVENT_TYPE],
+            )?
+        } else {
+            tx.execute(
+                "DELETE FROM message_events WHERE event_type = ?3 AND (?1 IS NULL OR workspace_id IS ?1) AND owner_id IS ?2",
+                params![workspace, owner, SESSION_PREFIX_EVENT_TYPE],
+            )?
+        });
     }
     Ok(deleted)
 }
