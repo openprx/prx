@@ -478,7 +478,8 @@ of their rows): every row of those runs is tombstoned like the deleted run's
 rows, and each such run gets its own `turn.deleted` record (same `side` as the
 delete, `message_id` `null`, `run_id` the spawned run) in the spawned run's own
 session stream. A spawned run that is still running defers the whole delete as
-a running turn does (`deferred` lists the parent run): the deleted turn's
+a running turn does (the response is the same `"status":"deleted"` body as an
+immediate delete; no extra field is added): the deleted turn's
 conversation rows are hidden at once, and every row of the turn and of the runs
 it spawned, including rows a spawned run writes after the delete, is removed as
 soon as the last of those runs has ended (after a restart, at the first request
