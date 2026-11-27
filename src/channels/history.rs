@@ -142,7 +142,10 @@ pub(super) async fn logged_turns_matching_cache(
     if !loaded.from_log() {
         return None;
     }
-    let mut logged = transcript.model_turns_from(session_key, loaded).await;
+    // The raw log rows, not the handoff view: the model sees what the cache
+    // shows, and a handoff row written by an earlier switch never breaks the
+    // comparison, so later switches keep their event ids.
+    let mut logged = loaded.turns;
     if let Some(index) = logged
         .iter()
         .rposition(|turn| turn.role == "user" && turn.content == current_text)
