@@ -301,15 +301,15 @@ fn batch(memory: &SqliteMemory, cutoff: &str, cursor: &mut i64, trim: &mut Messa
 /// Rules E1-E7 for one unit, evaluated inside the batch transaction. A run
 /// also needs E3 (no unsettled attempt) and E7 (no descendant run). When the
 /// lazily created `ingress_recovery` table exists (`ingress`), E3 also covers
-/// ingress recovery: a unit whose input row still has an unreconciled
-/// recovery record is kept, so a restart can still recover it.
+/// ingress recovery: a unit whose input or evidence row still has an
+/// unreconciled recovery record is kept, so a restart can still recover it.
 fn eligible(tx: &Connection, unit: &Unit, cutoff: &str, ingress: bool) -> anyhow::Result<bool> {
     let keep = match unit {
         Unit::Run { workspace, run } => {
             let keep = keep_row(true);
             let recovering = if ingress {
                 "AND NOT EXISTS(SELECT 1 FROM message_events r
-                     JOIN ingress_recovery i ON i.input_event_id = r.event_id
+                     JOIN ingress_recovery i ON (i.input_event_id = r.event_id OR i.evidence_event_id = r.event_id)
                      WHERE r.workspace_id = :workspace AND r.run_id = :run AND i.state <> 'reconciled')"
             } else {
                 ""
@@ -339,7 +339,7 @@ fn eligible(tx: &Connection, unit: &Unit, cutoff: &str, ingress: bool) -> anyhow
             let keep = keep_row(false);
             let recovering = if ingress {
                 "AND NOT EXISTS(SELECT 1 FROM message_events r
-                     JOIN ingress_recovery i ON i.input_event_id = r.event_id
+                     JOIN ingress_recovery i ON (i.input_event_id = r.event_id OR i.evidence_event_id = r.event_id)
                      WHERE r.id = :id AND i.state <> 'reconciled')"
             } else {
                 ""
