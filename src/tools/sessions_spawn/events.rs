@@ -140,12 +140,20 @@ pub(super) async fn record_spawn_request_event(
 /// ([`crate::session_worker::protocol::worker_result_key`]), so if the worker
 /// (or its monitor) already recorded a result, the store keeps that row and
 /// this write adds nothing. Returns whether this call created the row.
+///
+/// A run whose rf attempt family was deleted writes neither row: the deleted
+/// turn owes no outcome, and returns `Ok(false)`.
 pub(super) async fn record_owner_loss_terminal(
     fabric: &MemoryFabric,
     scope: MessageEventScope,
+    workspace: &str,
     run_id: &str,
     reason: super::OwnerLossReason,
 ) -> anyhow::Result<bool> {
+    if run_family_deleted(workspace, run_id).await {
+        tracing::debug!(run_id = %run_id, "owner-loss terminal skipped: run family deleted");
+        return Ok(false);
+    }
     let key = crate::session_worker::protocol::worker_result_key(run_id);
     let code = reason.code();
     let task_scope = scope.clone();
@@ -195,6 +203,30 @@ pub(super) async fn record_owner_loss_terminal(
         }
     }
     Ok(created)
+}
+
+/// The family check of `MailboxAnnouncement::family_deleted`: an open or
+/// check failure answers `false`, so the owner-loss rows are written as today.
+async fn run_family_deleted(workspace: &str, run_id: &str) -> bool {
+    let path = std::path::PathBuf::from(workspace);
+    let memory = match crate::runtime::blocking::spawn_blocking(move || crate::memory::SqliteMemory::new(&path)).await {
+        Ok(Ok(memory)) => memory,
+        Ok(Err(error)) => {
+            tracing::debug!(run_id = %run_id, error = %crate::agent::diagnostics::error_class(&error), "owner-loss deleted-turn check unavailable");
+            return false;
+        }
+        Err(error) => {
+            tracing::debug!(run_id = %run_id, error = %crate::agent::diagnostics::error_class(&error), "owner-loss deleted-turn check unavailable");
+            return false;
+        }
+    };
+    match memory.rf_run_family_deleted(workspace, run_id).await {
+        Ok(deleted) => deleted,
+        Err(error) => {
+            tracing::debug!(run_id = %run_id, error = %crate::agent::diagnostics::error_class(&error), "owner-loss deleted-turn check failed");
+            false
+        }
+    }
 }
 
 pub(super) async fn record_spawn_result_event(

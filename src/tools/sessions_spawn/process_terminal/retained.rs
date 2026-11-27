@@ -243,6 +243,7 @@ pub(super) async fn sweep_retained_worker_folders(
         let created = match super::super::record_owner_loss_terminal(
             fabric,
             launch.scope,
+            &workspace.to_string_lossy(),
             &folder.run_id,
             OwnerLossReason::OwnerGone,
         )

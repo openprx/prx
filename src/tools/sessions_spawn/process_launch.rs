@@ -270,6 +270,7 @@ impl SessionsSpawnTool {
         };
         let process_memory_fabric = Some(memory_fabric.clone());
         let process_result_scope = spawn_scope_for_event.clone();
+        let process_workspace = workspace_root.to_string_lossy().into_owned();
         let process_lineage = run_lineage.clone();
         let process_cost_config = child_model_config.cost.clone();
         let monitor_process_control = process_control.clone();
@@ -598,6 +599,7 @@ impl SessionsSpawnTool {
                                     if let Err(error) = record_owner_loss_terminal(
                                         fabric,
                                         process_result_scope.clone(),
+                                        &process_workspace,
                                         &rid,
                                         OwnerLossReason::OwnerExited,
                                     )
