@@ -5,7 +5,6 @@
 //! the memory is forgotten the printed text is replaced the same way.
 use super::rf_forget;
 use crate::memory::printed_keys::{MEMORY_REMOVED_TEXT, MEMORY_TOOLS, MEMORY_WRITE_TOOLS, PrintedKeys, printed_keys};
-use crate::security::ramflux_aead::id_hash;
 use rusqlite::{Connection, params, types::Value};
 use std::collections::{HashMap, HashSet};
 
@@ -282,15 +281,13 @@ impl MemoryProbe {
         })
     }
 
-    /// The hash an encrypted row stores for this memory's key: a memory of an
-    /// encrypted scope is stored as `rf:<scope hash>:<id_hash(key)>` and the
-    /// row stores `id_hash(printed key)`, so the last segment is that hash;
-    /// any other key is hashed as it is.
-    fn key_hash(&self) -> String {
-        match self.key.strip_prefix(crate::memory::RAMFLUX_MEMORY_KEY_PREFIX) {
-            Some(rest) => rest.rsplit(':').next().unwrap_or(rest).to_owned(),
-            None => id_hash(&self.key),
-        }
+    /// `(scope hash, key hash)` of a sealed memory, from its stored key
+    /// `rf:<id_hash(scope)>:<id_hash(key)>`; `None` for any other key. An
+    /// encrypted row stores `id_hash(scope)` and `id_hash(printed key)`.
+    fn sealed_ref(&self) -> Option<(&str, &str)> {
+        self.key
+            .strip_prefix(crate::memory::RAMFLUX_MEMORY_KEY_PREFIX)?
+            .split_once(':')
     }
 
     /// True when a result row of `workspace` and `owner` may quote this memory.
@@ -580,40 +577,42 @@ pub(super) fn rewrite_memory_copies(tx: &Connection, probes: &[MemoryProbe], now
 }
 
 /// Event types of the rows an encrypted scope seals with the hashes of the
-/// memory keys they print or carry (`memory/encrypted_scope.rs`).
+/// memory keys they print or carry (`memory/encrypted_scope/tool_copies.rs`).
 const SEALED_COPY_TYPES: &str = "('tool.result.recorded', 'tool.call.recorded', 'tool.execution.finalized')";
 
-/// Swap the pre-sealed replacement into every sealed memory-tool row whose
-/// stored key hashes (`memory_key_hashes`, see `EncryptedScope`) hold the hash
-/// of a forgotten memory's key, in the deleting transaction: `content`
+/// Swap the pre-sealed replacement into every sealed memory-tool row of the
+/// forgotten sealed (`rf:`) memories, in the deleting transaction: `content`
 /// becomes `removed_content` and the payload becomes a wrapper holding only
 /// `removed_payload`, both sealed by the scope for the row's own record ids,
 /// so the row still opens and the call and result pair stays valid for replay.
-/// The same rules as the plaintext rows apply: time bound, workspace and
-/// owner, unscoped and redacted-only naming, fenced scopes. The execution
-/// terminal of a swapped result (same workspace, run and `call_id`) is swapped
-/// too. A row written before the wrapper existed has no hashes and stays
-/// (residual r-E1). Returns the number of rows swapped.
+/// A row matches when its `memory_key_hashes` hold the hash of the memory's key
+/// and its `memory_scope` equals the scope hash in the memory's stored key,
+/// so another conversation's memory of the same name is never touched (the
+/// row's owner is the turn's, not the memory's owner MAC, so it is not
+/// compared). Results and terminals are bound by the memory's creation time,
+/// calls are not (the call is written before the memory). A fenced scope is
+/// skipped. A row written before the wrapper existed has no hashes and stays
+/// (residual r-E1). Only sealed memories are looked for: a plaintext
+/// deployment pays nothing. Returns the number of rows swapped.
 fn rewrite_sealed_copies(tx: &Connection, probes: &[MemoryProbe], oldest: &str, now: &str) -> anyhow::Result<usize> {
-    let mut wanted: Vec<(usize, String, Naming)> = Vec::new();
-    for (index, probe) in probes.iter().enumerate() {
-        wanted.push((index, probe.key_hash(), Naming::Key));
-        if let Some(redacted) = probe.key_redacted.as_deref() {
-            wanted.push((index, id_hash(redacted), Naming::RedactedOnly));
-        }
+    let wanted: HashSet<(&str, &str)> = probes.iter().filter_map(MemoryProbe::sealed_ref).collect();
+    if wanted.is_empty() {
+        return Ok(0);
     }
-    let mut hashes: Vec<&str> = wanted.iter().map(|(_, hash, _)| hash.as_str()).collect();
+    let mut hashes: Vec<&str> = wanted.iter().map(|(_, hash)| *hash).collect();
     hashes.sort_unstable();
     hashes.dedup();
     let mut statement = tx.prepare(&format!(
-        "SELECT event_id, event_type, workspace_id, owner_id, run_id, json_extract(raw_payload_json, '$.call_id'),
+        "SELECT event_id, json_extract(raw_payload_json, '$.memory_scope'),
                 (SELECT json_group_array(value) FROM json_each(raw_payload_json, '$.memory_key_hashes'))
          FROM message_events
          WHERE event_type IN {SEALED_COPY_TYPES}
-           AND id >= COALESCE((SELECT MIN(id) FROM message_events WHERE created_at >= ?1), 9223372036854775807)
+           AND (event_type = 'tool.call.recorded'
+                OR id >= COALESCE((SELECT MIN(id) FROM message_events WHERE created_at >= ?1), 9223372036854775807))
            AND json_valid(raw_payload_json)
            AND json_type(raw_payload_json, '$.removed_content') = 'text'
            AND json_type(raw_payload_json, '$.removed_payload') = 'text'
+           AND json_type(raw_payload_json, '$.memory_scope') = 'text'
            AND EXISTS (SELECT 1 FROM json_each(raw_payload_json, '$.memory_key_hashes') h
                        WHERE h.value IN (SELECT value FROM json_each(?2)))
            AND NOT EXISTS (SELECT 1 FROM agent_erase_fences f WHERE f.scope_id = message_events.ma_scope_id)"
@@ -624,76 +623,38 @@ fn rewrite_sealed_copies(tx: &Connection, probes: &[MemoryProbe], oldest: &str, 
                 row.get::<_, Value>(0)?,
                 row.get::<_, Value>(1)?,
                 row.get::<_, Value>(2)?,
-                row.get::<_, Value>(3)?,
-                row.get::<_, Value>(4)?,
-                row.get::<_, Value>(5)?,
-                row.get::<_, Value>(6)?,
             ])
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(statement);
-    let mut clear = HashMap::new();
     let mut swapped = 0usize;
-    let mut calls: Vec<CallRef> = Vec::new();
-    for [event_id, event_type, workspace, owner, run_id, call_id, stored] in found {
-        let (Value::Text(event_id), Value::Text(event_type), Value::Text(stored)) = (event_id, event_type, stored)
-        else {
+    for [event_id, scope, stored] in found {
+        let (Value::Text(event_id), Value::Text(scope), Value::Text(stored)) = (event_id, scope, stored) else {
             continue;
         };
-        let stored: HashSet<String> = serde_json::from_str::<Vec<String>>(&stored)
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
-        let (workspace_text, owner) = (text_of(workspace.clone()), text_of(owner));
-        let mut matched = false;
-        for (index, hash, naming) in &wanted {
-            let Some(probe) = probes.get(*index) else {
-                continue;
-            };
-            if stored.contains(hash)
-                && probe.covers(workspace_text.as_deref(), owner.as_deref())
-                && probe.applies_to(tx, *naming, workspace_text.as_deref(), owner.as_deref(), &mut clear)?
-            {
-                matched = true;
-                break;
-            }
-        }
-        if !matched {
+        let stored: Vec<String> = serde_json::from_str(&stored).unwrap_or_default();
+        if !stored
+            .iter()
+            .any(|hash| wanted.contains(&(scope.as_str(), hash.as_str())))
+        {
             continue;
         }
-        swapped = swapped.saturating_add(swap_sealed_row(tx, "event_id = ?1", params![event_id, now])?);
-        if event_type == "tool.result.recorded" {
-            calls.extend(call_ref(workspace, run_id, call_id));
-        }
-    }
-    for call in &calls {
-        swapped = swapped.saturating_add(swap_sealed_row(
-            tx,
-            "workspace_id = ?3 AND run_id IS ?4 AND event_type = 'tool.execution.finalized'
-             AND json_extract(raw_payload_json, '$.call_id') = ?5",
-            params![call.call_id, now, call.workspace, call.run_id, call.call_id],
+        swapped = swapped.saturating_add(tx.execute(
+            &format!(
+                "UPDATE message_events SET
+                     content = json_extract(raw_payload_json, '$.removed_content'), content_hash = NULL,
+                     raw_payload_json = json_object('encrypted_child_payload',
+                         json_extract(raw_payload_json, '$.removed_payload'), 'listing_erased', json('true')),
+                     updated_at = ?2
+                 WHERE event_id = ?1 AND event_type IN {SEALED_COPY_TYPES} AND json_valid(raw_payload_json)
+                   AND json_type(raw_payload_json, '$.removed_content') = 'text'
+                   AND json_type(raw_payload_json, '$.removed_payload') = 'text'
+                   AND NOT EXISTS (SELECT 1 FROM agent_erase_fences f WHERE f.scope_id = message_events.ma_scope_id)"
+            ),
+            params![event_id, now],
         )?);
     }
     Ok(swapped)
-}
-
-/// Replace one sealed row (or the terminals selected by `condition`) with its
-/// pre-sealed replacement; `?1` or `?5` is the selector, `?2` the time.
-fn swap_sealed_row(tx: &Connection, condition: &str, values: impl rusqlite::Params) -> anyhow::Result<usize> {
-    Ok(tx.execute(
-        &format!(
-            "UPDATE message_events SET
-                 content = json_extract(raw_payload_json, '$.removed_content'), content_hash = NULL,
-                 raw_payload_json = json_object('encrypted_child_payload',
-                     json_extract(raw_payload_json, '$.removed_payload'), 'listing_erased', json('true')),
-                 updated_at = ?2
-             WHERE {condition} AND event_type IN {SEALED_COPY_TYPES} AND json_valid(raw_payload_json)
-               AND json_type(raw_payload_json, '$.removed_content') = 'text'
-               AND json_type(raw_payload_json, '$.removed_payload') = 'text'
-               AND NOT EXISTS (SELECT 1 FROM agent_erase_fences f WHERE f.scope_id = message_events.ma_scope_id)"
-        ),
-        values,
-    )?)
 }
 
 /// The text of a value, `None` for any other type.

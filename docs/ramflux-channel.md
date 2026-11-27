@@ -230,16 +230,21 @@ retryable through checkpoint failure. Erasure also rebuilds the remaining FTS in
 a TRUNCATE checkpoint empties the WAL, so VACUUM is unnecessary.
 
 Sealed tool rows of the memory tools (a `memory_recall`, `memory_search` or
-`memory_get` result and its execution record, and a `memory_store` call) carry,
-beside the sealed payload, the SHA-256 hashes of the memory keys they print or
-write and a replacement of the row sealed in advance by the same scope. When a
-memory is forgotten, by any delete path, the replacement is swapped in within
-the deleting transaction, so the conversation no longer replays the forgotten
-text to the model. The hashes are of keys only (the same hashes already appear
-in the stored memory key), never of text. Known limits: rows written before this
-change carry no hashes and are not replaced; a key longer than 512 bytes, or a
-key that secret redaction changes in the printed text, is not matched; a
-`memory_store` call is replaced without checking that the write succeeded.
+`memory_get` result and its execution record, and a `memory_store` call) carry
+two plaintext fields beside the sealed payload: `memory_key_hashes`, the
+SHA-256 of each memory key that exists in the conversation (a printed split that
+is not a stored key is never hashed, so no text is), and `memory_scope`, the
+SHA-256 of the conversation id. Both values already appear in the stored memory
+key. The row also holds a replacement of itself sealed in advance by the same
+scope. When a sealed memory is forgotten, by any delete path, the replacement
+is swapped in within the deleting transaction for the rows of the same
+conversation that name that key, so the conversation no longer replays the
+forgotten text to the model. Known limits: rows written before this change carry
+no hashes and are not replaced; a key longer than 512 bytes, or a key that
+secret redaction changes in the printed text, is not matched; a plaintext
+memory recalled into an encrypted conversation is not replaced; a
+`memory_store` call is replaced without checking that the write succeeded
+(within the conversation).
 
 `agent_revoked` removes one conversation's data and keeps the wrapped account
 key. Explicit cross-conversation retrieval configuration widens that revocation
