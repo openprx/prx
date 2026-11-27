@@ -266,9 +266,10 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
         (audit, compacted_source_messages, audit_source.as_mut())
     {
         // The kept messages that claim their own rows in a joint resolution:
-        // acknowledged turns only (never the pending request, this turn's
-        // unstored reply or its tool round-trip traffic).
-        let acknowledged = source.acknowledged_flags();
+        // acknowledged turns and caller-supplied turns other than the pending
+        // request (never this turn's unstored reply or its tool round-trip
+        // traffic).
+        let acknowledged = source.provenance_kept_flags();
         let kept_acknowledged = source_history
             .iter()
             .zip(&acknowledged)

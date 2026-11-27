@@ -274,13 +274,22 @@ impl CanonicalHistory {
         self.messages.len()
     }
 
-    /// Per message, index for index, whether it is an acknowledged message
-    /// ([`MessageOrigin::Acknowledged`]): never the pending request, this
-    /// turn's tool loop output, a refresh aside or caller-supplied history.
-    pub(crate) fn acknowledged_flags(&self) -> Vec<bool> {
+    /// Per message, index for index, whether it may claim its own stored row
+    /// in a provenance resolution: an acknowledged message, or a caller-supplied
+    /// one other than the caller's pending request (its newest user query).
+    /// The same rule [`Self::reducer_form`] applies, so a caller-supplied
+    /// history (a gateway or channel turn) keeps its stored turns provable.
+    pub(crate) fn provenance_kept_flags(&self) -> Vec<bool> {
+        let caller_pending = crate::agent::history::latest_user_query_index(&self.messages)
+            .filter(|index| self.origins.get(*index) == Some(&MessageOrigin::CallerSupplied));
         self.origins
             .iter()
-            .map(|origin| *origin == MessageOrigin::Acknowledged)
+            .enumerate()
+            .map(|(index, origin)| match origin {
+                MessageOrigin::Acknowledged => true,
+                MessageOrigin::CallerSupplied => Some(index) != caller_pending,
+                MessageOrigin::Request | MessageOrigin::TurnRound | MessageOrigin::RefreshAside => false,
+            })
             .collect()
     }
 
