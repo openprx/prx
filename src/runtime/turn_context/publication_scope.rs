@@ -346,7 +346,7 @@ impl<'a> PublicationScope<'a> {
     }
 
     /// G7 permits tool calls only when ingress configuration allows them
-    /// and PMM verified NativeTools for the exact model on this catalog.
+    /// and the exact model on this catalog is a verified chat model.
     /// An id-only invocation can still chat
     /// under PMM's invocation policy, but cannot gain tool authority.
     pub(crate) fn model_can_call_tools(&self, proof: &dyn TurnSourceProof) -> bool {
