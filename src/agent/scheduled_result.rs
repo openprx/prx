@@ -4,6 +4,7 @@
 //! and agent partition, so the agent erasure and purge passes cover it. A
 //! failure to write it is logged by its error class and never fails the run.
 use crate::agent::diagnostics::error_class;
+use crate::agent::scheduled_delivery::deliver_message;
 use crate::config::Config;
 use crate::cron::ScheduledDeliver;
 use crate::memory::{Memory, MemoryFabric};
@@ -48,6 +49,13 @@ pub(crate) async fn record(
         Ok(reply) => ("ok", Some(excerpt(reply)), None),
         Err(error) => ("error", None, Some(error_class(error).to_string())),
     };
+    // Only a successful reply of a `message` job is sent; an error stays a note.
+    let delivered = match outcome {
+        Ok(reply) if meta.deliver == ScheduledDeliver::Message => {
+            deliver_message(memory, config, envelope, &meta, reply).await.is_sent()
+        }
+        _ => false,
+    };
     let payload = serde_json::json!({
         "schema_version": SCHEMA_VERSION,
         "kind": envelope.source.as_str(),
@@ -58,6 +66,8 @@ pub(crate) async fn record(
         "excerpt": excerpt,
         "transcript_session": envelope.session_key,
         "error_class": failure,
+        "deliver": meta.deliver.as_str(),
+        "delivered": delivered,
     });
     let fabric = MemoryFabric::new(Arc::clone(memory), envelope.workspace_id.clone())
         .with_event_recording(config.memory.event_recording_config());

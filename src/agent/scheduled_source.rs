@@ -46,6 +46,10 @@ pub(crate) struct ScheduledResultMeta {
     /// counts as none; the admission envelope always carries a resolved owner,
     /// so the row's owner must be read from the task itself.
     pub(crate) has_owner: bool,
+    /// The message event that created the task, from the job's own origin.
+    /// A run that itself adds jobs never changes it: it is read from this run's
+    /// stored task, not from any job the run created.
+    pub(crate) source_event_id: Option<String>,
 }
 
 /// The result-row metadata of the scheduled invocation this call runs inside.
@@ -57,6 +61,7 @@ pub(crate) fn current_result_meta() -> Option<ScheduledResultMeta> {
             deliver: origin.deliver,
             local_operator: origin.origin.is_local_operator(),
             has_owner: origin.owner_id.as_deref().is_some_and(|owner| !owner.trim().is_empty()),
+            source_event_id: origin.source_event_id.clone(),
         })
         .ok()
 }
