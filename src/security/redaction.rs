@@ -525,7 +525,15 @@ fn keyed_pair_spans(text: &str, url_parts: &[UrlPart], spans: &mut Vec<Range<usi
         }
         // A bare code shape is not a credential: `token = compute()` and
         // `pub token: String` keep their code (CE-64). Quoted values stay masked.
-        let code_shape = kind == 0 && (is_call(source) || (separator.as_str() == ":" && is_type_annotation(source)));
+        // A quote right after the scanned value closes an enclosing argument
+        // (`'password=hunter(two)'`), so that value is a secret, not code.
+        let quote_follows = text
+            .as_bytes()
+            .get(scanned.end)
+            .is_some_and(|byte| matches!(byte, b'\'' | b'"'));
+        let code_shape = kind == 0
+            && !quote_follows
+            && (is_call(source) || (separator.as_str() == ":" && is_type_annotation(source)));
         // The bare `key` is classified by its value; the bare `auth` is a
         // credential name on its own (the only Plain name that gets here).
         let credential = !code_shape
