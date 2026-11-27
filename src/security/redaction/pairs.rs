@@ -104,10 +104,18 @@ fn closing_double_quote(tail: &[u8]) -> (Option<usize>, usize) {
 static ESCAPED_PAIR: LazyLock<Option<Regex>> =
     LazyLock::new(|| Regex::new(r#"(["'])([A-Za-z0-9_.-]+)(\\+)(["'])\s*:\s*(\\+)(["'])"#).ok());
 
-/// The most distinct run lengths one text may use for escaped pairs. A
-/// nesting level k encodes a quote as 2^k - 1 backslashes, so real text has a
-/// few; the cap keeps the cost linear against a text built from many.
+/// The most distinct unusual run lengths one text may use for escaped pairs.
+/// A nesting level k encodes a quote as 2^k - 1 backslashes; the lengths 1,
+/// 3, 7, 15 and 31 and the any-run fallback are never capped, so a text
+/// built from many other lengths cannot switch masking off for the rest. A
+/// capped pair is masked through the fallback instead of being skipped.
 const MAX_ESCAPE_RUNS: usize = 32;
+
+/// Whether a pair run length is a realistic nesting level (1, 3, 7, 15, 31)
+/// or the any-run fallback (0): such keys are exempt from the cap.
+const fn is_standard_run(pair_run: usize) -> bool {
+    pair_run == 0 || (pair_run <= 31 && (pair_run + 1).is_power_of_two())
+}
 
 /// The first run of backslashes followed by a quote, at or after a query
 /// position, cached: forward queries inside the last answered gap reuse it.
@@ -122,18 +130,25 @@ struct RunSearch {
 #[derive(Default)]
 struct EscapedEnds {
     searches: HashMap<(u8, usize), Option<RunSearch>>,
+    /// Distinct non-standard keys in `searches`, counted against the cap.
+    unusual: usize,
 }
 
 impl EscapedEnds {
     /// Where a value ends: the first run of backslashes before `quote` at or
     /// after `at` that closes a value whose pair uses `pair_run` backslashes
-    /// (the value ends before the last `pair_run` of them): its
-    /// length is `pair_run` modulo twice `pair_run + 1` (an escaped
-    /// backslash is `pair_run + 1` of them at that level), so a value may
-    /// end in backslashes. `pair_run == 0` takes any run.
+    /// (the value ends before the last `pair_run` of them): at nesting
+    /// level k the pair uses `pair_run = 2^k - 1` backslashes and an escaped
+    /// backslash in the value is `2 * (pair_run + 1)` of them, so the run's
+    /// length is `pair_run` modulo `2 * pair_run + 2`; a value may end in
+    /// backslashes. `pair_run == 0` takes any run and ends the value at the
+    /// start of the run, as the unescaped scan does.
     fn find(&mut self, bytes: &[u8], at: usize, quote: u8, pair_run: usize) -> Option<usize> {
-        if !self.searches.contains_key(&(quote, pair_run)) && self.searches.len() >= MAX_ESCAPE_RUNS + 2 {
-            return None;
+        if !self.searches.contains_key(&(quote, pair_run)) && !is_standard_run(pair_run) {
+            if self.unusual >= MAX_ESCAPE_RUNS {
+                return None;
+            }
+            self.unusual += 1;
         }
         let slot = self.searches.entry((quote, pair_run)).or_default();
         if let Some(search) = slot
@@ -154,7 +169,11 @@ impl EscapedEnds {
                 .map_or(0, |rest| rest.iter().take_while(|&&b| b == b'\\').count());
             if bytes.get(position + run) == Some(&quote) && (pair_run == 0 || run % (2 * pair_run + 2) == pair_run) {
                 // The value's own trailing backslashes belong to the value.
-                found = Some(position + run - pair_run);
+                found = Some(if pair_run == 0 {
+                    position
+                } else {
+                    position + run - pair_run
+                });
                 break;
             }
             position += run + usize::from(bytes.get(position + run) == Some(&quote));
