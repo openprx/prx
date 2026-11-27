@@ -208,7 +208,7 @@ pub(super) fn history(memory: &SqliteMemory, record: &ChildSessionRecord) -> any
         AND NOT EXISTS(SELECT 1 FROM message_events p WHERE p.event_id=e.causation_event_id AND p.workspace_id=e.workspace_id AND p.owner_id=e.owner_id AND p.session_key=e.session_key AND p.source='prx_mailbox' AND e.role='user')
         AND NOT EXISTS(SELECT 1 FROM message_events p WHERE p.workspace_id=e.workspace_id AND p.owner_id=e.owner_id
           AND p.id<e.id AND p.session_key=e.session_key AND p.role=e.role AND p.content_hash=e.content_hash
-          AND json_extract(e.raw_payload_json,'$.task_run_id')=p.run_id)
+          AND (CASE WHEN json_valid(e.raw_payload_json) THEN json_extract(e.raw_payload_json,'$.task_run_id') END)=p.run_id)
         ORDER BY e.id")?;
     let turns: anyhow::Result<Vec<ChildTurn>> = query
         .query_map(
