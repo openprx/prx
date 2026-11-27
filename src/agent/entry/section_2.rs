@@ -409,6 +409,9 @@ pub(crate) async fn run_with_runtime_envelope(
             envelope
         }
     });
+    // The admission input event of a scheduled run, set once the input is bound,
+    // so its result row can name it as the causation.
+    let scheduled_input_event = parking_lot::Mutex::new(None::<String>);
     // Capture invocation state without constructing the large async work yet.
     let work = CliWork {
         ctx: &ctx,
@@ -420,6 +423,7 @@ pub(crate) async fn run_with_runtime_envelope(
         scheduled_tool_scope,
         scoped_run_id,
         scheduled_admission: &scheduled_admission,
+        scheduled_input_event: &scheduled_input_event,
     };
     // The synchronous factory invokes this closure in its own frame before
     // returning the boxed future. The actual engine work remains owned here.
@@ -434,6 +438,7 @@ pub(crate) async fn run_with_runtime_envelope(
             scheduled_tool_scope,
             scoped_run_id,
             scheduled_admission,
+            scheduled_input_event,
         } = work;
         // `build` took ownership of `config`; reclaim a shared `Arc<Config>` for the
         // rest of this function. `Arc<Config>` deref-coerces to `&Config`, so all the
@@ -617,6 +622,7 @@ pub(crate) async fn run_with_runtime_envelope(
                                 shutdown,
                             )
                             .await?;
+                        *scheduled_input_event.lock() = source.envelope.source_message_event_id.clone();
                         AgentTurnProof {
                             workspace_id: Arc::from(source.envelope.workspace_id.as_str()),
                             owner_id: Arc::from(source.envelope.resolved_owner_id()),
@@ -1066,7 +1072,8 @@ pub(crate) async fn run_with_runtime_envelope(
     };
     // A scheduled run records its result in its own session; a failure there never fails the run.
     if let (Some(envelope), Some(memory)) = (result_envelope.as_ref(), ctx.memory.as_ref()) {
-        super::scheduled_result::record(memory, &ctx.config, envelope, &result).await;
+        let input_event_id = scheduled_input_event.lock().clone();
+        super::scheduled_result::record(memory, &ctx.config, envelope, input_event_id.as_deref(), &result).await;
     }
     if scheduled_admission.is_none() {
         if let Some(service) = &ctx.turn_service {
@@ -1147,6 +1154,7 @@ struct CliWork<'a> {
     scheduled_tool_scope: Option<crate::tools::execution::ScheduledToolScope>,
     scoped_run_id: Option<String>,
     scheduled_admission: &'a Option<super::scheduled_source::ScheduledAdmission>,
+    scheduled_input_event: &'a parking_lot::Mutex<Option<String>>,
 }
 
 // Invoke the small capture closure here so the large future is constructed

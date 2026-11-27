@@ -29,6 +29,7 @@ pub(crate) async fn record(
     memory: &Arc<dyn Memory>,
     config: &Config,
     envelope: &RuntimeEnvelope,
+    input_event_id: Option<&str>,
     outcome: &anyhow::Result<String>,
 ) {
     // A nested run that inherits the scope has another task id; it writes nothing.
@@ -38,13 +39,18 @@ pub(crate) async fn record(
     if meta.deliver == ScheduledDeliver::None {
         return;
     }
-    let scope = if meta.has_owner {
+    let mut scope = if meta.has_owner {
         envelope.message_scope()
     } else if meta.local_operator {
         terminal_result_envelope(envelope).message_scope()
     } else {
         return;
     };
+    // The run's admission input event is the row's causation; the result envelope
+    // is captured before the input is bound, so it carries none of its own.
+    if let Some(input_event_id) = input_event_id {
+        scope.causation_event_id = Some(input_event_id.to_owned());
+    }
     let (status, excerpt, failure) = match outcome {
         Ok(reply) => ("ok", Some(excerpt(reply)), None),
         Err(error) => ("error", None, Some(error_class(error).to_string())),
