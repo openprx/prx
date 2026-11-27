@@ -252,6 +252,14 @@ impl EncryptedScope {
 }
 
 impl EncryptedScope {
+    /// The `owner_id` every sealed row of this account carries. `sealed_write`
+    /// stamps it on write and `newest_core_entries` reads with it, so the two
+    /// cannot disagree on the owner.
+    fn sealed_owner_id(&self) -> Result<String, CryptoError> {
+        self.crypto
+            .mac(&self.account_id, "memory-owner", self.account_id.as_bytes())
+    }
+
     /// The one sealed write shared by `store` and both session-snapshot
     /// paths, so they cannot drift apart: the stored key, the sealed content,
     /// the session MAC and the metadata. The scope's `channel` and `owner_id`
@@ -266,9 +274,7 @@ impl EncryptedScope {
         let session = self
             .crypto
             .mac(&self.account_id, "memory-session", self.scope.as_bytes())?;
-        let owner = self
-            .crypto
-            .mac(&self.account_id, "memory-owner", self.account_id.as_bytes())?;
+        let owner = self.sealed_owner_id()?;
         // Sealed payloads carry attribution without entering plaintext topic
         // classification, which would create a copy outside message erasure.
         let metadata = crate::memory::MemoryStoreMetadata {
@@ -443,11 +449,19 @@ impl Memory for EncryptedScope {
         Ok(own)
     }
 
-    /// The inner store's newest core rows of `principal`, narrowed to this scope
-    /// and decrypted the way `list_key_prefix` does. The inner read is unbounded
-    /// because rows of other scopes are dropped after it, as `list_key_prefix` does.
+    /// The inner store's newest core rows, narrowed to this scope and decrypted
+    /// the way `list_key_prefix` does. Sealed core rows carry the account's
+    /// memory-owner MAC, no workspace and no agent partition (`sealed_write`), so
+    /// the inner read uses that owner instead of the principal's resolved owner.
+    /// The inner read is unbounded because rows of other scopes are dropped after
+    /// it, as `list_key_prefix` does.
     async fn newest_core_entries(&self, principal: &MemoryPrincipal, limit: usize) -> anyhow::Result<Vec<MemoryEntry>> {
-        let entries = self.inner.newest_core_entries(principal, usize::MAX).await?;
+        let sealed = MemoryPrincipal {
+            owner_id: Some(self.sealed_owner_id()?),
+            agent_partition: None,
+            ..principal.clone()
+        };
+        let entries = self.inner.newest_core_entries(&sealed, usize::MAX).await?;
         let mut own = Vec::new();
         for mut entry in entries {
             let Some((record_id, plain)) = self.open_stored(&entry.key, &entry.content) else {
