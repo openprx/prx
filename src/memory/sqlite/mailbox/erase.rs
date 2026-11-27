@@ -3,7 +3,7 @@
 use super::{
     SqliteMailbox,
     gc::require_scope,
-    model::{OutboxMeta, decode, encode},
+    model::{OutboxMeta, ReceiptMeta, decode, encode},
     receipt, storage_error, stream,
 };
 use crate::messaging::mailbox::{MailboxError, MailboxResult, MailboxScope, REPLAY_SECONDS};
@@ -110,24 +110,7 @@ impl SqliteMailbox {
             .map_err(storage_error)?;
         drop(query);
         for (id, json, state) in outboxes {
-            let mut meta: OutboxMeta = decode(&json)?;
-            meta.body_erased_at.get_or_insert(now);
-            meta.body_mime = None;
-            meta.to_pin_token = None;
-            meta.updated_at = now;
-            let terminal = *meta.terminal_at.get_or_insert(now);
-            let expiry = terminal.checked_add(REPLAY_SECONDS).ok_or(MailboxError::CorruptState)?;
-            let state = if state < 2 {
-                meta.last_error = Some("history_pending".into());
-                3
-            } else {
-                state
-            };
-            tx.execute(
-                "UPDATE prx_mailbox_outbox SET body_bytes=NULL,envelope_meta=?1,state=?2,expires_at=?3 WHERE id=?4",
-                params![encode(&meta)?, state, expiry, id],
-            )
-            .map_err(storage_error)?;
+            erase_outbox_body(&tx, id, &json, state, now)?;
             tx.execute("INSERT OR IGNORE INTO agent_erase_manifest(erase_id,store,record_key) VALUES (?1,'prx_mailbox_outbox',?2)",params![erase_id.to_string(),id.to_string()]).map_err(storage_error)?;
         }
         // Scoped mirrors and child JSON are payload, unlike receipts/parents.
@@ -153,6 +136,97 @@ impl SqliteMailbox {
         // consumes this verified adapter report before writing a global receipt.
         Ok(MailboxErasure { erase_id, remaining })
     }
+}
+
+/// Erase the body of one outbox row: payload NULL, replay window from now, a
+/// row not yet delivered (state below 2) closed as `history_pending`.
+fn erase_outbox_body(
+    tx: &rusqlite::Connection,
+    id: i64,
+    envelope_meta_json: &str,
+    state: i64,
+    now: i64,
+) -> MailboxResult<()> {
+    let mut meta: OutboxMeta = decode(envelope_meta_json)?;
+    meta.body_erased_at.get_or_insert(now);
+    meta.body_mime = None;
+    meta.to_pin_token = None;
+    meta.updated_at = now;
+    let terminal = *meta.terminal_at.get_or_insert(now);
+    let expiry = terminal.checked_add(REPLAY_SECONDS).ok_or(MailboxError::CorruptState)?;
+    let state = if state < 2 {
+        meta.last_error = Some("history_pending".into());
+        3
+    } else {
+        state
+    };
+    tx.execute(
+        "UPDATE prx_mailbox_outbox SET body_bytes=NULL,envelope_meta=?1,state=?2,expires_at=?3 WHERE id=?4",
+        params![encode(&meta)?, state, expiry, id],
+    )
+    .map_err(storage_error)?;
+    Ok(())
+}
+
+/// Erase the mailbox bodies of the messages adopted as the conversation rows in
+/// `event_ids_json` (a JSON array of event ids): the receiver's stored body, the
+/// receipt's `body_erased_at`, and the body in the sender's outbox rows of the
+/// same message id. The link is `adopted_message_event_id` in the receipt meta,
+/// which survives the tombstone of the adopted row. A receipt or outbox row whose
+/// metadata does not decode is skipped. Returns the number of receipts handled.
+pub(in crate::memory::sqlite) fn erase_adopted_bodies(
+    tx: &rusqlite::Connection,
+    workspace_id: &str,
+    owner_id: &str,
+    event_ids_json: &str,
+    now: i64,
+) -> anyhow::Result<usize> {
+    let receipts = {
+        let mut query = tx.prepare(
+            "SELECT id, message_id, receipt_meta FROM prx_mailbox_receipts
+             WHERE workspace_id = ?1 AND owner_id = ?2 AND json_valid(receipt_meta)
+               AND json_extract(receipt_meta, '$.adopted_message_event_id') IN (SELECT value FROM json_each(?3))",
+        )?;
+        query
+            .query_map(params![workspace_id, owner_id, event_ids_json], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, String>(2)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut handled = 0usize;
+    for (id, message_id, meta_json) in receipts {
+        let Ok(mut meta) = decode::<ReceiptMeta>(&meta_json) else {
+            continue;
+        };
+        tx.execute("DELETE FROM prx_mailbox_messages WHERE id = ?1", [id])?;
+        meta.body_erased_at.get_or_insert(now);
+        let Ok(encoded) = encode(&meta) else {
+            continue;
+        };
+        tx.execute(
+            "UPDATE prx_mailbox_receipts SET receipt_meta = ?1 WHERE id = ?2",
+            params![encoded, id],
+        )?;
+        let outboxes = {
+            let mut query = tx.prepare(
+                "SELECT id, envelope_meta, state FROM prx_mailbox_outbox
+                 WHERE workspace_id = ?1 AND owner_id = ?2 AND message_id = ?3",
+            )?;
+            query
+                .query_map(params![workspace_id, owner_id, message_id], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (outbox_id, json, state) in outboxes {
+            match erase_outbox_body(tx, outbox_id, &json, state, now) {
+                Ok(()) | Err(MailboxError::InvalidMetadata | MailboxError::CorruptState) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        handled += 1;
+    }
+    Ok(handled)
 }
 
 fn verify_coverage(conn: &rusqlite::Connection, scope: &MailboxScope) -> MailboxResult<i64> {

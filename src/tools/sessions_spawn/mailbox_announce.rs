@@ -187,7 +187,8 @@ fn announcement_text(
 ) -> String {
     let outcome = if completed { "completed" } else { "FAILED" };
     let head = format!(
-        "Sub-agent `{run_id}` has finished ({outcome}). This is an automatic completion notice for a run you already started, not a new request; that run's task is done. Report this result to the user if useful; the request that started the run is already done, do not start it again."
+        "{}{outcome}). This is an automatic completion notice for a run you already started, not a new request; that run's task is done. Report this result to the user if useful; the request that started the run is already done, do not start it again.",
+        crate::messaging::mailbox::completion_notice_head(run_id)
     );
     let detail = result_text.trim();
     let mut references = format!(

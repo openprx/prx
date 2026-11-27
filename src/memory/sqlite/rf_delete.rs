@@ -844,7 +844,7 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
         "SELECT DISTINCT workspace_id, owner_id FROM memories WHERE source_event_id IN (SELECT value FROM json_each(?1))",
         params![direct],
     )?;
-    let probes = derived_sweep::memory_probes(
+    let mut probes = derived_sweep::memory_probes(
         tx,
         "SELECT workspace_id, owner_id, key, created_at FROM memories WHERE source_event_id IN (SELECT value FROM json_each(?1))",
         params![direct],
@@ -871,6 +871,7 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
             &serde_json::to_string(&summary_sources)?,
             &mut handled_runs,
             &mut forgotten,
+            &mut probes,
         )?;
         if found.is_empty() {
             break;
@@ -890,6 +891,9 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
     // without naming the row (position, not text).
     ids.extend(later_handoff_notes(tx, target, &anchor)?);
     let all = serde_json::to_string(&ids)?;
+    // The mailbox bodies of the adopted rows being tombstoned (receiver row and
+    // sender outbox), found by the receipt's adopted event id.
+    erase_mailbox_bodies(tx, target, &all)?;
     // Read before the rewrite: the payload of a tool result names the stored
     // document that holds its large output.
     let output_documents = tool_output_document_ids(tx, target, &all)?;
@@ -927,8 +931,9 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
 /// announcing side is `tools/sessions_spawn/mailbox_announce.rs`, which sends
 /// from the child's session address). A notice is written after the run's
 /// first row. A child session that still holds a row the delete keeps may have
-/// announced another run, so its notices stay; the notice names the run only in
-/// text, which is not matched. Read before the tombstone.
+/// announced another run, so only the notices of the erased runs go, found by
+/// sender and the fixed notice head that PRX writes around the run id
+/// ([`run_notices`]). Read before the tombstone.
 fn announcement_events(tx: &Connection, target: &Target<'_>, children: &[Child]) -> anyhow::Result<Vec<String>> {
     let deleted = serde_json::to_string(
         &children
@@ -962,6 +967,11 @@ fn announcement_events(tx: &Connection, target: &Target<'_>, children: &[Child])
             |row| row.get(0),
         )?;
         if survives {
+            // A continued child session keeps the notices of its other runs;
+            // those of the erased runs are found by the fixed notice head.
+            for child in children.iter().filter(|other| other.session_key == child.session_key) {
+                found.extend(run_notices(tx, target, child)?);
+            }
             continue;
         }
         let first_id = children
@@ -987,6 +997,45 @@ fn announcement_events(tx: &Connection, target: &Target<'_>, children: &[Child])
     found.sort_unstable();
     found.dedup();
     Ok(found)
+}
+
+/// The completion notice of one erased run in its (surviving) child session:
+/// rows of source `prx_mailbox` sent by the child session after the run's first
+/// row whose text, after the `[message from ...]` line the adoption prepends,
+/// starts with the fixed notice head of the run id
+/// (`messaging::mailbox::completion_notice_head`). A head quoted later in a
+/// body does not match. Run ids shorter than `MIN_IDENTIFIER_CHARS` are not matched.
+fn run_notices(tx: &Connection, target: &Target<'_>, child: &Child) -> anyhow::Result<Vec<String>> {
+    if child.run_id.chars().count() < derived_sweep::MIN_IDENTIFIER_CHARS {
+        return Ok(Vec::new());
+    }
+    let head = crate::messaging::mailbox::completion_notice_head(&child.run_id);
+    let mut statement = tx.prepare(
+        "SELECT event_id, content FROM message_events
+         WHERE workspace_id = ?1 AND owner_id = ?2 AND source = 'prx_mailbox' AND event_type = 'message.created'
+           AND sender = ?3 AND id > ?4 AND instr(content, ?5) > 0",
+    )?;
+    let rows = statement
+        .query_map(
+            params![
+                target.workspace_id,
+                target.owner_id,
+                child.session_key,
+                child.first_id,
+                head
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows
+        .into_iter()
+        .filter(|(_, content)| {
+            content
+                .split_once('\n')
+                .is_some_and(|(_, text)| text.starts_with(head.as_str()))
+        })
+        .map(|(event_id, _)| event_id)
+        .collect())
 }
 
 /// The rows of the turns that a deleted mailbox notice woke: among
@@ -1061,6 +1110,14 @@ fn sweep_listings(tx: &Connection, target: &Target<'_>, children: &[Child]) -> a
             |row| row.get(0),
         )?;
         if !survives {
+            // The session prefix row holds only the memory index and hook blocks;
+            // with no row left in the session it is dropped (a continuation
+            // records a fresh one).
+            tx.execute(
+                "DELETE FROM message_events WHERE workspace_id = ?1 AND session_key = ?2
+                   AND event_type = 'context.prefix.recorded'",
+                params![target.workspace_id, child.session_key],
+            )?;
             swept_sessions.push(child.session_key.clone());
         }
     }
@@ -1070,6 +1127,15 @@ fn sweep_listings(tx: &Connection, target: &Target<'_>, children: &[Child]) -> a
         swept_sessions,
     };
     derived_sweep::rewrite_listings(tx, target.workspace_id, &erased, target.now)?;
+    Ok(())
+}
+
+/// Erase the mailbox bodies of the adopted rows among `event_ids` (a JSON
+/// array), in the target's workspace and owner.
+fn erase_mailbox_bodies(tx: &Connection, target: &Target<'_>, event_ids: &str) -> anyhow::Result<()> {
+    let now = chrono::DateTime::parse_from_rfc3339(target.now)
+        .map_or_else(|_| chrono::Utc::now().timestamp(), |time| time.timestamp());
+    super::mailbox::erase_adopted_bodies(tx, target.workspace_id, target.owner_id, event_ids, now)?;
     Ok(())
 }
 
@@ -1169,6 +1235,7 @@ fn erase_compactions(
     ids: &str,
     handled: &mut Vec<String>,
     forgotten: &mut usize,
+    probes: &mut Vec<derived_sweep::MemoryProbe>,
 ) -> anyhow::Result<Vec<Option<String>>> {
     let runs = {
         let mut statement = tx.prepare(
@@ -1202,6 +1269,12 @@ fn erase_compactions(
         )?;
         handled.push(run_id);
         if let Some(key) = memory_key {
+            // Memory-tool results that quoted the summary are swept with the others.
+            probes.extend(derived_sweep::memory_probes(
+                tx,
+                "SELECT workspace_id, owner_id, key, created_at FROM memories WHERE key = ?1",
+                params![key],
+            )?);
             rf_forget::drop_prefix_rows_of(
                 tx,
                 "SELECT DISTINCT workspace_id, owner_id FROM memories WHERE key = ?1",

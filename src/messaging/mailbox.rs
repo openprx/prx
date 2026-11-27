@@ -19,6 +19,14 @@ pub const MAX_ROWS: i64 = 4096;
 pub const MAX_RECEIPTS: i64 = 16_384;
 pub const MAX_BYTES: i64 = 64 * 1024 * 1024;
 
+/// The fixed opening of a sub-agent completion notice, up to the outcome.
+/// The announcer writes it (`tools/sessions_spawn/mailbox_announce.rs`) and the
+/// rf delete matches it to find the notice of an erased run, so both build it here.
+#[must_use]
+pub(crate) fn completion_notice_head(run_id: &str) -> String {
+    format!("Sub-agent `{run_id}` has finished (")
+}
+
 /// Stable refusals, shared by store, IPC and dormant send adapters.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MailboxError {
