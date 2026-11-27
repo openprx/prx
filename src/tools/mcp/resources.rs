@@ -219,7 +219,8 @@ async fn list_resources(
 
 /// Read one resource under the request timeout. Text is returned in full;
 /// a blob is a placeholder with its size and no base64 payload. A not-found
-/// answer names the URI and keeps the session.
+/// answer (`-32002`, or `-32602` for a read of an unknown URI) names the URI
+/// and keeps the session.
 async fn read_resource(
     attached: &AttachedPeer<'_>,
     server: &str,
@@ -232,7 +233,7 @@ async fn read_resource(
         Ok(Err(error)) => {
             reset_after_failure(attached, &error).await;
             return Err(match error {
-                ServiceError::McpError(ref data) if data.code.0 == -32002 => {
+                ServiceError::McpError(ref data) if matches!(data.code.0, -32002 | -32602) => {
                     anyhow::anyhow!("resource not found: {uri}")
                 }
                 other => request_error(server, attached, other.into()),
