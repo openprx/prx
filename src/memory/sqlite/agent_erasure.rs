@@ -585,6 +585,15 @@ pub(super) fn finish_history(memory: &SqliteMemory, work: &EraseWork) -> anyhow:
                 }
             }
             let listing = listing_identifiers(&tx, &scopes)?;
+            // The memories `erase_rows` deletes (one probe scan for all of them).
+            let probes = super::derived_sweep::memory_probes(
+                &tx,
+                &format!(
+                    "SELECT workspace_id, content, created_at FROM memories WHERE {}",
+                    erase_condition("memories", &["ma_scope_id".into()], !work.purge && !work.forget_writes)
+                ),
+                [&scopes],
+            )?;
             erase_rows(
                 &tx,
                 &scopes,
@@ -603,6 +612,7 @@ pub(super) fn finish_history(memory: &SqliteMemory, work: &EraseWork) -> anyhow:
                     &chrono::Utc::now().to_rfc3339(),
                 )?;
             }
+            super::derived_sweep::rewrite_memory_copies(&tx, &probes, &chrono::Utc::now().to_rfc3339())?;
             // Session previews are shared by agents; derive them again from survivors.
             tx.execute("UPDATE sessions SET last_message_preview=COALESCE((SELECT substr(c.content,1,200) FROM conversation_turns c
                 WHERE c.session_key=sessions.session_key AND c.deleted_at IS NULL ORDER BY c.id DESC LIMIT 1),''),

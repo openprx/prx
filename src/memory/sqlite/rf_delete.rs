@@ -770,7 +770,7 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
             params![target.workspace_id, session_key, scope, window_start, target.now],
         )?;
     }
-    let direct_ids: Vec<String> = rows.iter().map(|row| row.event_id.clone()).collect();
+    let mut direct_ids: Vec<String> = rows.iter().map(|row| row.event_id.clone()).collect();
     let direct = serde_json::to_string(&direct_ids)?;
     // The rows of the deleted conversation itself; a scheduled job's result
     // excerpt belongs to the job's session, whose later runs are kept.
@@ -811,9 +811,19 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
         )?;
     }
     let mut ids = rows.into_iter().map(|row| row.event_id).collect::<Vec<_>>();
+    // The completion notices of the erased runs sit in the parent session; they
+    // are deleted with the rows they report and count as sources of summaries.
+    let announcements = announcement_events(tx, target, &children)?;
+    ids.extend(announcements.iter().cloned());
+    direct_ids.extend(announcements);
     rf_forget::drop_prefix_rows_of(
         tx,
         "SELECT DISTINCT workspace_id, owner_id FROM memories WHERE source_event_id IN (SELECT value FROM json_each(?1))",
+        params![direct],
+    )?;
+    let probes = derived_sweep::memory_probes(
+        tx,
+        "SELECT workspace_id, content, created_at FROM memories WHERE source_event_id IN (SELECT value FROM json_each(?1))",
         params![direct],
     )?;
     let mut forgotten = tx.execute(
@@ -875,6 +885,9 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
     let mut inputs = vec![attempt.input_event_id.clone()];
     inputs.extend(children.iter().filter_map(|child| child.first_user.clone()));
     erase_tool_output_documents(tx, &inputs, &output_documents)?;
+    // After the tombstone: the rows of the deleted conversation no longer count
+    // as quoting a document, and the rewrite touches only surviving rows.
+    derived_sweep::rewrite_memory_copies(tx, &probes, target.now)?;
     // The attachments that quoted a deleted event, memory or document were
     // rewritten by the triggers of those deletes, in this transaction.
     for child in &children {
@@ -882,6 +895,70 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
     }
     tombstone_turns(tx, &ids, target.now)?;
     sweep_listings(tx, target, &children)
+}
+
+/// The completion notices that erased child runs delivered to their parent
+/// session through the mailbox: rows of source `prx_mailbox`, type
+/// `message.created`, whose sender is the child's session
+/// (`memory/sqlite/mailbox/adopt.rs`, `sender = stream.from.session`; the
+/// announcing side is `tools/sessions_spawn/mailbox_announce.rs`, which sends
+/// from the child's session address). A notice is written after the run's
+/// first row. A child session that still holds a row the delete keeps may have
+/// announced another run, so its notices stay; the notice names the run only in
+/// text, which is not matched. Read before the tombstone.
+fn announcement_events(tx: &Connection, target: &Target<'_>, children: &[Child]) -> anyhow::Result<Vec<String>> {
+    let deleted = serde_json::to_string(
+        &children
+            .iter()
+            .flat_map(|child| child.event_ids.iter())
+            .collect::<Vec<_>>(),
+    )?;
+    let mut found: Vec<String> = Vec::new();
+    let mut done: Vec<&str> = Vec::new();
+    for child in children {
+        if done.contains(&child.session_key.as_str()) {
+            continue;
+        }
+        done.push(&child.session_key);
+        // The survival rule of `sweep_listings`, with the rows this delete
+        // rewrites not counted (the tombstone has not run yet).
+        let survives: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM message_events WHERE workspace_id = ?2 AND session_key = ?1
+                           AND event_type NOT IN ('message.deleted', 'turn.deleted')
+                           AND event_id NOT IN (SELECT value FROM json_each(?3)))
+                 OR EXISTS(SELECT 1 FROM conversation_turns c WHERE c.session_key = ?1 AND c.deleted_at IS NULL
+                     AND (c.message_event_id IS NULL OR c.message_event_id NOT IN (SELECT value FROM json_each(?3)))
+                     AND (c.ma_scope_id IS NULL OR EXISTS(SELECT 1 FROM agent_scopes a
+                         WHERE a.scope_id = c.ma_scope_id AND a.workspace_id = ?2)))",
+            params![child.session_key, target.workspace_id, deleted],
+            |row| row.get(0),
+        )?;
+        if survives {
+            continue;
+        }
+        let first_id = children
+            .iter()
+            .filter(|other| other.session_key == child.session_key)
+            .map(|other| other.first_id)
+            .min()
+            .unwrap_or(child.first_id);
+        let mut statement = tx.prepare(
+            "SELECT event_id FROM message_events
+             WHERE workspace_id = ?1 AND owner_id = ?2 AND source = 'prx_mailbox' AND event_type = 'message.created'
+               AND sender = ?3 AND id > ?4",
+        )?;
+        found.extend(
+            statement
+                .query_map(
+                    params![target.workspace_id, target.owner_id, child.session_key, first_id],
+                    |row| row.get::<_, String>(0),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        );
+    }
+    found.sort_unstable();
+    found.dedup();
+    Ok(found)
 }
 
 /// Replace the printed text of listing results, workspace-wide and newer than

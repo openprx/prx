@@ -997,21 +997,27 @@ impl SqliteMemory {
                 return Ok(false);
             };
 
+            // One transaction: the prefix rows, the memory, the tool results that
+            // quoted it and the access log entry go together or not at all.
+            let tx = begin_immediate(&conn)?;
+            let probes = crate::memory::sqlite::derived_sweep::memory_probes(
+                &tx,
+                "SELECT workspace_id, content, created_at FROM memories WHERE id = ?1",
+                params![memory_id],
+            )?;
             crate::memory::sqlite::rf_forget::drop_prefix_rows_of(
-                &conn,
+                &tx,
                 "SELECT DISTINCT workspace_id, owner_id FROM memories WHERE id = ?1",
                 params![memory_id],
             )?;
-            let affected = conn.execute("DELETE FROM memories WHERE id = ?1", params![memory_id])?;
-            log_access(
-                &conn,
-                &principal,
-                "forget",
-                Some(&key),
-                Some(&memory_id),
-                None,
-                "allowed",
-            );
+            let affected = tx.execute("DELETE FROM memories WHERE id = ?1", params![memory_id])?;
+            crate::memory::sqlite::derived_sweep::rewrite_memory_copies(
+                &tx,
+                &probes,
+                &chrono::Utc::now().to_rfc3339(),
+            )?;
+            log_access(&tx, &principal, "forget", Some(&key), Some(&memory_id), None, "allowed");
+            tx.commit()?;
             Ok(affected > 0)
         })
         .await?

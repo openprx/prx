@@ -235,6 +235,18 @@ pub(super) fn forget_family(
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
     let mut counts = RfForgetCounts::default();
+    // Tool results that quoted a deleted memory are rewritten once, after the
+    // family is deleted; the probes are read while the memories still exist.
+    let mut probes = Vec::new();
+    for (kind, target_id, _) in &targets {
+        if kind == "memory" {
+            probes.extend(super::derived_sweep::memory_probes(
+                tx,
+                "SELECT workspace_id, content, created_at FROM memories WHERE id = ?1",
+                params![target_id],
+            )?);
+        }
+    }
     for (kind, target_id, created) in &targets {
         match kind.as_str() {
             "memory" => {
@@ -268,6 +280,7 @@ pub(super) fn forget_family(
         counts.memories_created.saturating_add(counts.memories_touched) > 0,
         counts.documents_created.saturating_add(counts.documents_touched) > 0,
     )?;
+    super::derived_sweep::rewrite_memory_copies(tx, &probes, now)?;
     tx.execute(
         concat!(
             "UPDATE memory_write_log SET forgotten_at = COALESCE(forgotten_at, ?4)

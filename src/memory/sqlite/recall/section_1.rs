@@ -209,12 +209,22 @@ impl SqliteMemory {
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<usize> {
             let conn = pool.write();
             let tx = begin_immediate(&conn)?;
+            let probes = crate::memory::sqlite::derived_sweep::memory_probes(
+                &tx,
+                "SELECT workspace_id, content, created_at FROM memories WHERE key LIKE ?1 ESCAPE '\\'",
+                params![pattern],
+            )?;
             crate::memory::sqlite::rf_forget::drop_prefix_rows_of(
                 &tx,
                 "SELECT DISTINCT workspace_id, owner_id FROM memories WHERE key LIKE ?1 ESCAPE '\\'",
                 params![pattern],
             )?;
             let affected = tx.execute("DELETE FROM memories WHERE key LIKE ?1 ESCAPE '\\'", params![pattern])?;
+            crate::memory::sqlite::derived_sweep::rewrite_memory_copies(
+                &tx,
+                &probes,
+                &chrono::Utc::now().to_rfc3339(),
+            )?;
             tx.commit()?;
             Ok(affected)
         })
