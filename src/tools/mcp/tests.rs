@@ -274,14 +274,13 @@ fn parse_alias_name_resolves_server_and_tool() {
         },
     );
 
-    let parsed = McpTool::parse_alias_name(&cfg, "mcp__qmd__search");
+    let parsed = alias::resolve(&RuntimeState { effective_config: cfg, ..RuntimeState::default() }, "mcp__qmd__search");
     assert_eq!(parsed, Some(("qmd".into(), "search".into())));
 }
 
 #[test]
 fn parse_alias_name_no_match() {
-    let cfg = McpConfig::default();
-    assert!(McpTool::parse_alias_name(&cfg, "unrelated_name").is_none());
+    assert!(alias::resolve(&RuntimeState::default(), "unrelated_name").is_none());
 }
 
 #[test]
@@ -485,7 +484,8 @@ fn parse_alias_name_default_prefix() {
             ..McpServerConfig::default()
         },
     );
-    let parsed = McpTool::parse_alias_name(&cfg, "mcp__myserver__run_query");
+    let state = RuntimeState { effective_config: cfg, ..Default::default() };
+    let parsed = alias::resolve(&state, "mcp__myserver__run_query");
     assert_eq!(parsed, Some(("myserver".into(), "run_query".into())));
 }
 
@@ -493,7 +493,7 @@ fn parse_alias_name_default_prefix() {
 
 #[test]
 fn alias_name_format() {
-    assert_eq!(McpTool::alias_name("mcp", "server1", "search"), "mcp__server1__search");
+    assert_eq!(alias::alias_map("mcp", "server1", &["search"])["search"], "mcp__server1__search");
 }
 
 // ── extract_call_success_and_output ──────────────────────────

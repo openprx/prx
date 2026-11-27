@@ -134,9 +134,10 @@ fn is_capability_id(id: &str) -> bool {
         return false;
     }
     if family == "mcp" {
-        // The public name is `mcp__<server>__<tool>`. A discovered tool is filed
-        // under its server, which may itself contain `__`, so the name must
-        // start with exactly `mcp__<namespace>__`. An alias that was not
+        // The public name is `mcp__<server>__<tool>`, with the server part
+        // sanitized to `[A-Za-z0-9_-]`. A discovered tool is filed under its
+        // server, which may itself contain `__`, so the name must start with
+        // exactly `mcp__<sanitized namespace>__`. An alias that was not
         // discovered has the namespace `mcp` and any server and tool.
         let Some(rest) = name.strip_prefix("mcp__") else {
             return false;
@@ -147,7 +148,7 @@ fn is_capability_id(id: &str) -> bool {
                 .is_some_and(|(server, tool)| !server.is_empty() && !tool.is_empty());
         }
         return rest
-            .strip_prefix(namespace)
+            .strip_prefix(crate::tools::mcp::alias::sanitize_part(namespace).as_str())
             .and_then(|after| after.strip_prefix("__"))
             .is_some_and(|tool| !tool.is_empty());
     }

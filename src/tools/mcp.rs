@@ -548,7 +548,12 @@ impl McpTool {
             state_hasher.update(generation.to_be_bytes());
             state_hasher.update(config_bytes);
             let state_digest: [u8; 32] = state_hasher.finalize().into();
+            let names: Vec<&str> = tools.keys().map(String::as_str).collect();
+            let aliases = alias::alias_map(&server_config.tool_name_prefix, server, &names);
             for (tool, metadata) in tools {
+                let Some(alias_name) = aliases.get(tool) else {
+                    continue;
+                };
                 // At Full the per-server allow/deny lists are ignored. Below
                 // Full a filtered tool is dropped, or kept for Full callers.
                 let full_only = !state.full_level && state.tool_full_only(server, server_config, tool);
@@ -561,7 +566,7 @@ impl McpTool {
                     state_digest,
                     full_only,
                     spec: ToolSpec {
-                        name: Self::alias_name(&server_config.tool_name_prefix, server, tool),
+                        name: alias_name.clone(),
                         description: metadata
                             .description
                             .clone()
@@ -630,10 +635,6 @@ impl McpTool {
         self.state.read().config_error.clone()
     }
 
-    fn alias_name(prefix: &str, server: &str, tool: &str) -> String {
-        format!("{prefix}__{server}__{tool}")
-    }
-
     /// Strip PRX's runtime-only arguments off an argument object about to be
     /// forwarded to a third-party MCP server.
     ///
@@ -652,18 +653,6 @@ impl McpTool {
             crate::tools::execution::strip_runtime_only_args(&mut arguments);
             arguments
         })
-    }
-
-    fn parse_alias_name(cfg: &McpConfig, name: &str) -> Option<(String, String)> {
-        for (server_name, server_cfg) in &cfg.servers {
-            let prefix = format!("{}__{}__", server_cfg.tool_name_prefix, server_name);
-            if let Some(tool) = name.strip_prefix(&prefix) {
-                if !tool.is_empty() {
-                    return Some((server_name.clone(), tool.to_string()));
-                }
-            }
-        }
-        None
     }
 
     // ── Security helpers ────────────────────────────────────────────
@@ -1475,7 +1464,7 @@ impl Tool for McpTool {
         }
 
         let state = self.state.read();
-        Self::parse_alias_name(&state.effective_config, name).is_some()
+        alias::resolve(&state, name).is_some()
     }
 
     async fn refresh(&self) -> anyhow::Result<()> {
@@ -1543,8 +1532,8 @@ impl Tool for McpTool {
             (server_name, tool_name, arguments)
         } else {
             let state = self.state.read();
-            let (server_name, tool_name) = Self::parse_alias_name(&state.effective_config, name)
-                .ok_or_else(|| anyhow::anyhow!("Unknown MCP alias tool '{name}'"))?;
+            let (server_name, tool_name) =
+                alias::resolve(&state, name).ok_or_else(|| anyhow::anyhow!("Unknown MCP alias tool '{name}'"))?;
             drop(state);
 
             let arguments = args
@@ -1686,6 +1675,7 @@ impl Tool for McpStatusTool {
 #[cfg(test)]
 mod tests;
 
+pub(crate) mod alias;
 mod client;
 mod http_session;
 pub(super) mod level_view;
