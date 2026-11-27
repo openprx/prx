@@ -57,22 +57,33 @@ pub(crate) struct ScheduledResultMeta {
     pub(crate) finished_at: String,
 }
 
-/// The result-row metadata of the scheduled invocation this call runs inside.
-pub(crate) fn current_result_meta() -> Option<ScheduledResultMeta> {
+/// The result-row metadata of the scheduled invocation this call runs inside,
+/// when `run_task_id` is that invocation's own task.
+///
+/// A nested run that inherits the invocation's scope carries another task id
+/// and gets `None` before the finish time is fixed, so it can never set the
+/// invocation's time.
+pub(crate) fn current_result_meta(run_task_id: Option<&str>) -> Option<ScheduledResultMeta> {
     SCHEDULED_ORIGIN
-        .try_with(|origin| ScheduledResultMeta {
-            task_id: origin.task_id.clone(),
-            name: origin.name.clone(),
-            deliver: origin.deliver,
-            local_operator: origin.origin.is_local_operator(),
-            has_owner: origin.owner_id.as_deref().is_some_and(|owner| !owner.trim().is_empty()),
-            source_event_id: origin.source_event_id.clone(),
-            finished_at: origin
-                .finished_at
-                .get_or_init(|| chrono::Utc::now().to_rfc3339())
-                .clone(),
+        .try_with(|origin| {
+            if run_task_id != Some(origin.task_id.as_str()) {
+                return None;
+            }
+            Some(ScheduledResultMeta {
+                task_id: origin.task_id.clone(),
+                name: origin.name.clone(),
+                deliver: origin.deliver,
+                local_operator: origin.origin.is_local_operator(),
+                has_owner: origin.owner_id.as_deref().is_some_and(|owner| !owner.trim().is_empty()),
+                source_event_id: origin.source_event_id.clone(),
+                finished_at: origin
+                    .finished_at
+                    .get_or_init(|| chrono::Utc::now().to_rfc3339())
+                    .clone(),
+            })
         })
         .ok()
+        .flatten()
 }
 
 /// A read-only observation held by the scheduler, never a permission to replay

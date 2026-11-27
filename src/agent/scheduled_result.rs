@@ -31,11 +31,11 @@ pub(crate) async fn record(
     envelope: &RuntimeEnvelope,
     outcome: &anyhow::Result<String>,
 ) {
-    let Some(meta) = super::scheduled_source::current_result_meta() else {
+    // A nested run that inherits the scope has another task id; it writes nothing.
+    let Some(meta) = super::scheduled_source::current_result_meta(envelope.task_id.as_deref()) else {
         return;
     };
-    // A nested run that inherits the scope has another task id; it writes nothing.
-    if meta.deliver == ScheduledDeliver::None || envelope.task_id.as_deref() != Some(meta.task_id.as_str()) {
+    if meta.deliver == ScheduledDeliver::None {
         return;
     }
     let scope = if meta.has_owner {
