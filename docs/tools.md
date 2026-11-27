@@ -2257,3 +2257,7 @@ derived copies too. Saved transcript snapshots and context pages are always
 cleared. An open terminal chat discards the erased conversation and starts a
 fresh chat; its previous cached history cannot be saved again. Rows written
 before session scoping was introduced are outside this erase contract.
+
+## MCP alias naming
+
+Discovered MCP tools are exposed as `mcp__<server>__<tool>` aliases. Every character of the server and tool parts outside `[A-Za-z0-9_-]` becomes `_`, and an alias longer than 64 characters is cut and ends in `_` plus eight hex characters of SHA-256, so every provider accepts the name; a tool whose plain alias is shared with another tool of the same server gets the same suffix. Skill manifests must use the sanitized alias in `required-tools`; a stale alias resolves as an unknown tool, and calls still send the original tool name to the server.
