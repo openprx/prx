@@ -921,10 +921,12 @@ fn announcement_events(tx: &Connection, target: &Target<'_>, children: &[Child])
         }
         done.push(&child.session_key);
         // The survival rule of `sweep_listings`, with the rows this delete
-        // rewrites not counted (the tombstone has not run yet).
+        // rewrites not counted (the tombstone has not run yet). Accounting rows
+        // (`usage.settled`, written per metered run into the run's session and
+        // kept by this delete) are not content and do not make a session survive.
         let survives: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM message_events WHERE workspace_id = ?2 AND session_key = ?1
-                           AND event_type NOT IN ('message.deleted', 'turn.deleted')
+                           AND event_type NOT IN ('message.deleted', 'turn.deleted', 'usage.settled')
                            AND event_id NOT IN (SELECT value FROM json_each(?3)))
                  OR EXISTS(SELECT 1 FROM conversation_turns c WHERE c.session_key = ?1 AND c.deleted_at IS NULL
                      AND (c.message_event_id IS NULL OR c.message_event_id NOT IN (SELECT value FROM json_each(?3)))
@@ -976,10 +978,11 @@ fn sweep_listings(tx: &Connection, target: &Target<'_>, children: &[Child]) -> a
             continue;
         }
         // The survival rule of `agent_erasure::erased_identifiers`, with the
-        // tombstone event types not counted as rows (they are written here).
+        // tombstone event types not counted as rows (they are written here), and
+        // the kept accounting rows (`usage.settled`) not counted as content.
         let survives: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM message_events WHERE workspace_id = ?2 AND session_key = ?1
-                           AND event_type NOT IN ('message.deleted', 'turn.deleted'))
+                           AND event_type NOT IN ('message.deleted', 'turn.deleted', 'usage.settled'))
                  OR EXISTS(SELECT 1 FROM conversation_turns c WHERE c.session_key = ?1 AND c.deleted_at IS NULL
                      AND (c.ma_scope_id IS NULL OR EXISTS(SELECT 1 FROM agent_scopes a
                          WHERE a.scope_id = c.ma_scope_id AND a.workspace_id = ?2)))",
