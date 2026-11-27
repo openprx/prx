@@ -382,6 +382,10 @@ pub struct CronJobLineage {
     /// The creating call's level and agent (`creator_level`, `creator_agent`).
     /// The default records neither, so the job runs at Main's level.
     pub creator: crate::security::agent_level::CreatorStamp,
+    /// How the job's runs treat earlier runs of its session. Stored by the insert.
+    pub context: ScheduledContext,
+    /// Where a finished run is surfaced to the owner. Stored by the insert.
+    pub deliver: ScheduledDeliver,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

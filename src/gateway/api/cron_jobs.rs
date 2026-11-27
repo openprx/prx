@@ -542,6 +542,8 @@ pub(super) async fn create_job(
     if let Err(response) = authorize_stored_command(&config, &command) {
         return response;
     }
+    lineage.context = write.context.unwrap_or_default();
+    lineage.deliver = write.deliver.unwrap_or_default();
     let created = match schedule {
         WriteSchedule::Once(delay) => {
             cron::add_once_with_lineage_and_approval_grant(&config, &delay, &command, None, lineage)
@@ -558,45 +560,11 @@ pub(super) async fn create_job(
         }
     };
     match created {
-        Ok(job) => {
-            let stored = CronJobPatch {
-                context: write.context.filter(|context| *context == ScheduledContext::Fresh),
-                deliver: write.deliver.filter(|deliver| *deliver != ScheduledDeliver::Note),
-                ..CronJobPatch::default()
-            };
-            let job = if stored.context.is_some() || stored.deliver.is_some() {
-                match apply_stored_fields(&config, job, stored) {
-                    Ok(job) => job,
-                    Err(response) => return response,
-                }
-            } else {
-                job
-            };
-            match redact_job(&config, &job) {
-                Ok(value) => (StatusCode::OK, Json(value)),
-                Err(response) => response,
-            }
-        }
+        Ok(job) => match redact_job(&config, &job) {
+            Ok(value) => (StatusCode::OK, Json(value)),
+            Err(response) => response,
+        },
         Err(error) => store_client_error(&error),
-    }
-}
-
-/// Stores `context = "fresh"` and a non-note `deliver` on a job the route has just
-/// created (X5). A failed patch removes that job, so the caller is never left with a
-/// job it was told failed.
-fn apply_stored_fields(
-    config: &crate::config::Config,
-    job: CronJob,
-    patch: CronJobPatch,
-) -> Result<CronJob, ApiResponse> {
-    match cron::update_job(config, &job.id, patch) {
-        Ok(updated) => Ok(updated),
-        Err(error) => {
-            if cron::remove_job(config, &job.id).is_err() {
-                tracing::warn!(job_id = %job.id, "cron job removal after a failed context patch failed");
-            }
-            Err(store_client_error(&error))
-        }
     }
 }
 

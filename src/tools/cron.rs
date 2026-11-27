@@ -249,7 +249,7 @@ impl CronTool {
             .get("delete_after_run")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(default_delete_after_run);
-        let context = match args.get("context") {
+        let context = match args.get("context").filter(|value| !value.is_null()) {
             None => ScheduledContext::Task,
             Some(value) => match serde_json::from_value::<ScheduledContext>(value.clone()) {
                 Ok(context) => context,
@@ -263,7 +263,7 @@ impl CronTool {
             },
         };
         let approval_grant = ApprovalGrant::from_runtime_args(self.name(), args);
-        let lineage = cron::lineage_from_trusted_scope(cfg, args);
+        let mut lineage = cron::lineage_from_trusted_scope(cfg, args);
         // A one-shot agent job an agent creates from a session reports back into
         // that session (K-R3b); every other job defaults to a note.
         let deliver = match args.get("deliver") {
@@ -291,6 +291,8 @@ impl CronTool {
                 }
             },
         };
+        lineage.context = context;
+        lineage.deliver = deliver;
 
         let result = match job_type {
             JobType::Shell => {
@@ -407,31 +409,7 @@ impl CronTool {
 
         match result {
             Ok(job) => {
-                // `fresh` is stored by a patch after the create (X5): a failed patch
-                // removes the job just created, so no half-made job is left behind.
-                let stored = CronJobPatch {
-                    context: (context == ScheduledContext::Fresh).then_some(ScheduledContext::Fresh),
-                    deliver: (deliver != ScheduledDeliver::Note).then_some(deliver),
-                    ..CronJobPatch::default()
-                };
                 let mut context_note = String::new();
-                let job = if stored.context.is_some() || stored.deliver.is_some() {
-                    match cron::update_job(cfg, &job.id, stored) {
-                        Ok(updated) => updated,
-                        Err(error) => {
-                            if cron::remove_job(cfg, &job.id).is_err() {
-                                tracing::warn!(job_id = %job.id, "cron job removal after a failed context patch failed");
-                            }
-                            return Ok(ToolResult {
-                                success: false,
-                                output: String::new(),
-                                error: Some(error.to_string()),
-                            });
-                        }
-                    }
-                } else {
-                    job
-                };
                 if context == ScheduledContext::Fresh {
                     context_note.push_str(", context: fresh");
                 }

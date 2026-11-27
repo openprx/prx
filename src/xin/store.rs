@@ -4,7 +4,7 @@
 //! Pattern follows `cron/store.rs`: `with_connection()` + `rusqlite::params!`.
 
 use crate::config::Config;
-use crate::cron::JobCreator;
+use crate::cron::{JobCreator, ScheduledContext, ScheduledDeliver};
 use crate::security::agent_level::CreatorStamp;
 use crate::tools::execution::JobOrigin;
 use crate::xin::types::{NewXinTask, XinRun, XinTask, XinTaskEvent, XinTaskPatch};
@@ -94,6 +94,28 @@ pub fn add_task_with_creator_stamp(
     created_via: JobCreator,
     creator: &CreatorStamp,
 ) -> Result<XinTask> {
+    add_task_with_stored_options(
+        config,
+        new,
+        origin,
+        created_via,
+        creator,
+        ScheduledContext::default(),
+        ScheduledDeliver::default(),
+    )
+}
+
+/// [`add_task_with_creator_stamp`] storing the task's `context` and `deliver` in the
+/// same insert, so no task is written without the options it was created with.
+pub fn add_task_with_stored_options(
+    config: &Config,
+    new: &NewXinTask,
+    origin: &JobOrigin,
+    created_via: JobCreator,
+    creator: &CreatorStamp,
+    context: ScheduledContext,
+    deliver: ScheduledDeliver,
+) -> Result<XinTask> {
     let origin = origin.to_stored()?;
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
@@ -111,13 +133,13 @@ pub fn add_task_with_creator_stamp(
                 payload, recurring, interval_secs, created_at, updated_at,
                 last_run_at, next_run_at, last_status, last_output,
                 run_count, fail_count, max_failures, enabled, approval_grant_json, origin, created_via,
-                creator_level, creator_agent
+                creator_level, creator_agent, context, deliver
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5,
                 ?6, ?7, ?8, 'pending', ?9, ?10,
                 ?11, ?12, ?13, ?14, ?15,
                 NULL, ?16, NULL, NULL,
-                0, 0, ?17, 1, ?18, ?19, ?20, ?21, ?22
+                0, 0, ?17, 1, ?18, ?19, ?20, ?21, ?22, ?23, ?24
              )",
             params![
                 id,
@@ -142,6 +164,8 @@ pub fn add_task_with_creator_stamp(
                 created_via.as_str(),
                 creator.level_column(),
                 creator.agent.as_deref(),
+                context.as_str(),
+                deliver.as_str(),
             ],
         )
         .context("Failed to insert xin task")?;

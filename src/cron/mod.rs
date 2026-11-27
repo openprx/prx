@@ -387,6 +387,7 @@ pub fn lineage_from_trusted_scope(config: &Config, args: &serde_json::Value) -> 
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string),
+        ..CronJobLineage::default()
     }
 }
 

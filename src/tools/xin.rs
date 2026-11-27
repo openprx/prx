@@ -192,7 +192,7 @@ fn tool_error(message: impl Into<String>) -> ToolResult {
 
 /// Parses the optional `context` argument. An unknown value is refused before any write.
 fn parse_context_arg(args: &serde_json::Value) -> Result<Option<ScheduledContext>, ToolResult> {
-    match args.get("context") {
+    match args.get("context").filter(|value| !value.is_null()) {
         None => Ok(None),
         Some(value) => serde_json::from_value::<ScheduledContext>(value.clone())
             .map(Some)
@@ -1113,34 +1113,21 @@ impl Tool for XinTool {
                 };
 
                 let creator = crate::tools::execution::creator_stamp_from_trusted_args(&args);
-                match store::add_task_with_creator_stamp(
+                match store::add_task_with_stored_options(
                     &cfg,
                     &new,
                     &origin,
                     crate::cron::JobCreator::AgentTool,
                     &creator,
+                    context,
+                    deliver,
                 ) {
                     Ok(task) => {
-                        // `fresh` and a non-note `deliver` are stored by a patch after the
-                        // create (X5): a failed patch removes the task just created.
-                        let stored = XinTaskPatch {
-                            context: (context == ScheduledContext::Fresh).then_some(ScheduledContext::Fresh),
-                            deliver: (deliver != ScheduledDeliver::Note).then_some(deliver),
-                            ..XinTaskPatch::default()
-                        };
                         let mut context_note = String::new();
-                        if stored.context.is_some() || stored.deliver.is_some() {
-                            if let Err(error) = store::update_task(&cfg, &task.id, &stored) {
-                                if store::remove_task(&cfg, &task.id).is_err() {
-                                    tracing::warn!(task_id = %task.id, "xin task removal after a failed context patch failed");
-                                }
-                                return Ok(tool_error(error.to_string()));
-                            }
-                        }
-                        if stored.context.is_some() {
+                        if context == ScheduledContext::Fresh {
                             context_note.push_str(", context: fresh");
                         }
-                        if stored.deliver.is_some() {
+                        if deliver != ScheduledDeliver::Note {
                             context_note.push_str(", deliver: ");
                             context_note.push_str(deliver.as_str());
                         }

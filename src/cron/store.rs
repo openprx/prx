@@ -138,6 +138,8 @@ pub fn add_shell_job_with_lineage_approval_and_delete(
     let origin = lineage.origin.to_stored()?;
     let created_via = lineage.created_via.as_str();
     let creator = lineage.creator;
+    let stored_context = lineage.context;
+    let stored_deliver = lineage.deliver;
 
     with_connection(config, |conn| {
         conn.execute(
@@ -146,9 +148,9 @@ pub fn add_shell_job_with_lineage_approval_and_delete(
                 expression, command, schedule, job_type, prompt, name, session_target, model,
                 enabled, delivery, delete_after_run, created_at, next_run, approval_grant_json,
                 creator_sender, creator_channel, creator_chat_type, origin, created_via,
-                creator_level, creator_agent
+                creator_level, creator_agent, context, deliver
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'shell', NULL, ?9, 'isolated', NULL, 1, ?10, ?11, ?12, ?13, ?14,
-                       ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                       ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
             params![
                 id,
                 owner_id.as_deref(),
@@ -171,6 +173,8 @@ pub fn add_shell_job_with_lineage_approval_and_delete(
                 created_via,
                 creator.level_column(),
                 creator.agent.as_deref(),
+                stored_context.as_str(),
+                stored_deliver.as_str(),
             ],
         )
         .context("Failed to insert cron shell job")?;
@@ -267,6 +271,8 @@ pub fn add_agent_job_with_lineage(
     let delivery_principal = lineage.delivery_principal;
     let origin = lineage.origin.to_stored()?;
     let creator = lineage.creator;
+    let stored_context = lineage.context;
+    let stored_deliver = lineage.deliver;
 
     with_connection(config, |conn| {
         conn.execute(
@@ -274,9 +280,10 @@ pub fn add_agent_job_with_lineage(
                 id, owner_id, topic_id, parent_task_id, source_message_event_id,
                 expression, command, schedule, job_type, prompt, name, session_target, model,
                 enabled, delivery, delete_after_run, created_at, next_run, approval_grant_json,
-                creator_sender, creator_channel, creator_chat_type, origin, creator_level, creator_agent
+                creator_sender, creator_channel, creator_chat_type, origin, creator_level, creator_agent,
+                context, deliver
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', ?7, 'agent', ?8, ?9, ?10, ?11, 1, ?12, ?13, ?14, ?15, NULL,
-                       ?16, ?17, ?18, ?19, ?20, ?21)",
+                       ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
             params![
                 id,
                 owner_id.as_deref(),
@@ -299,6 +306,8 @@ pub fn add_agent_job_with_lineage(
                 origin.as_str(),
                 creator.level_column(),
                 creator.agent.as_deref(),
+                stored_context.as_str(),
+                stored_deliver.as_str(),
             ],
         )
         .context("Failed to insert cron agent job")?;

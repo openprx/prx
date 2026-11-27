@@ -200,6 +200,7 @@ impl PostgresCronStore {
         delete_after_run: bool,
         lineage: CronJobLineage,
     ) -> Result<CronJob> {
+        refuse_unsupported_insert_fields(&lineage)?;
         let now = Utc::now();
         validate_schedule(&schedule, now)?;
         let next_run = next_run_for_schedule(&schedule, now)?;
@@ -285,6 +286,7 @@ impl PostgresCronStore {
         delete_after_run: bool,
         lineage: CronJobLineage,
     ) -> Result<CronJob> {
+        refuse_unsupported_insert_fields(&lineage)?;
         let now = Utc::now();
         validate_schedule(&schedule, now)?;
         let next_run = next_run_for_schedule(&schedule, now)?;
@@ -1906,3 +1908,18 @@ pub fn resolve(config: &Config) -> Result<Option<Arc<PostgresCronStore>>> {
 #[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests;
+
+/// The Postgres cron store keeps only the defaults `context = task` and `deliver = note`.
+/// A job created with anything else is refused before any row is written.
+fn refuse_unsupported_insert_fields(lineage: &CronJobLineage) -> Result<()> {
+    if lineage.context == ScheduledContext::Fresh {
+        anyhow::bail!("context = \"fresh\" is not supported by the Postgres cron store");
+    }
+    if lineage.deliver != ScheduledDeliver::Note {
+        anyhow::bail!(
+            "deliver = \"{}\" is not supported by the Postgres cron store",
+            lineage.deliver.as_str()
+        );
+    }
+    Ok(())
+}
