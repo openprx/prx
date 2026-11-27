@@ -64,10 +64,10 @@ fn select_listing_rows(
     identifiers: &[&str],
     since_id: i64,
 ) -> anyhow::Result<Vec<MatchedRow>> {
-    let identifiers = serde_json::to_string(identifiers)?;
+    let identifiers_json = serde_json::to_string(identifiers)?;
     let tools = serde_json::to_string(&LISTING_TOOLS)?;
     let mut statement = tx.prepare(
-        "SELECT event_id, json_extract(raw_payload_json, '$.document.document_id')
+        "SELECT event_id, json_extract(raw_payload_json, '$.document.document_id'), content
          FROM message_events
          WHERE workspace_id = ?1 AND event_type = 'tool.result.recorded' AND id > ?2
            AND json_valid(raw_payload_json)
@@ -76,18 +76,41 @@ fn select_listing_rows(
            AND NOT EXISTS (SELECT 1 FROM agent_erase_fences f WHERE f.scope_id = message_events.ma_scope_id)",
     )?;
     let rows = statement
-        .query_map(params![workspace_id, since_id, identifiers, tools], |row| {
+        .query_map(params![workspace_id, since_id, identifiers_json, tools], |row| {
             let document_id: rusqlite::types::Value = row.get(1)?;
-            Ok(MatchedRow {
-                event_id: row.get(0)?,
-                document_id: match document_id {
-                    rusqlite::types::Value::Text(text) => Some(text),
-                    _ => None,
+            let content: String = row.get(2)?;
+            Ok((
+                MatchedRow {
+                    event_id: row.get(0)?,
+                    document_id: match document_id {
+                        rusqlite::types::Value::Text(text) => Some(text),
+                        _ => None,
+                    },
                 },
-            })
+                content,
+            ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
+    Ok(rows
+        .into_iter()
+        .filter(|(_, content)| identifiers.iter().any(|id| names_identifier(content, id)))
+        .map(|(row, _)| row)
+        .collect())
+}
+
+fn is_identifier_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | ':' | '.' | '-')
+}
+
+/// True when `text` holds `identifier` followed by the end of the text or a
+/// character that cannot continue an identifier, so `child-segment:P:1` does
+/// not match `child-segment:P:12`.
+fn names_identifier(text: &str, identifier: &str) -> bool {
+    text.match_indices(identifier).any(|(start, found)| {
+        text.get(start + found.len()..)
+            .and_then(|rest| rest.chars().next())
+            .is_none_or(|next| !is_identifier_char(next))
+    })
 }
 
 /// Replace the text of each row; returns the document ids the rows named.
