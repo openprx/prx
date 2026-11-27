@@ -128,6 +128,14 @@ refuses `message` and `none` at create and patch, as it refuses `fresh`; there t
 cron tool's default falls back to `note`, while an explicit `message` or `none` is
 refused.
 
+The note at the owner's next interactive turn lists at most ten groups; any
+further unseen groups are counted on one `+n more` line and covered by the seen
+mark. A note's rows count as seen only once their turn reaches `turn.finalized`,
+so a turn that fails after showing the note shows it again at the next turn. A
+turn with no source message event id gets no note: the note is stored with the
+user message only when that message has an id, so a note that could not be
+replayed is not sent and stays unseen.
+
 ## HEARTBEAT.md materialization
 
 Each trimmed line that starts with `-` followed by a space becomes a recurring

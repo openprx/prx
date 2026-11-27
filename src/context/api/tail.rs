@@ -35,7 +35,9 @@ pub(crate) struct TurnTailInput<'a> {
 /// The text placed after the user's message on this turn: the `turn_opened`
 /// hook blocks, then, on an interactive turn (Console, Chat or Channel, but not
 /// a group-shared channel chat), the unseen scheduled-results note. The note's
-/// rows are marked seen in the same step.
+/// rows are marked seen in the same step. A turn with no source message event
+/// id gets no note: the tail is stored with that message only when it has an
+/// id, so a note that cannot be stored is not sent either, and stays unseen.
 pub(crate) async fn turn_tail(input: TurnTailInput<'_>) -> String {
     let memory = input.memory;
     let envelope = input.envelope;
@@ -45,6 +47,7 @@ pub(crate) async fn turn_tail(input: TurnTailInput<'_>) -> String {
         envelope.source,
         RuntimeSource::Console | RuntimeSource::Chat | RuntimeSource::Channel
     ) || is_group_shared_channel(envelope)
+        || envelope.source_message_event_id.is_none()
     {
         return tail;
     }

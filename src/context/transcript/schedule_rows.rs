@@ -7,6 +7,10 @@
 //! attempts dropped as superseded, and older successful runs counted as
 //! `+k earlier`. The seen mark is a `schedule.result.seen` row holding the
 //! newest row id the note has read; the next turn reads only rows after it.
+//! A mark counts only when its turn reached `turn.finalized` (the
+//! `turn:<run>:final` row), so a turn that failed after it showed the note
+//! leaves the note unseen. A note shown past the line limit ends with a
+//! `+n more` line.
 //! Rows older than seven days are not shown but are covered by the mark. A
 //! group whose newest row was delivered as a message is not shown, unless an
 //! older successful run of it was not delivered; its older failed attempts are
@@ -44,11 +48,7 @@ pub(crate) async fn unseen_results_note(
     now: DateTime<Utc>,
 ) -> Option<(String, Option<i64>)> {
     let seen = read_rows(memory, principal, SCHEDULE_SEEN_EVENT_TYPE, None, SEEN_ROWS_READ).await?;
-    let seen_through = seen
-        .iter()
-        .filter_map(payload_of)
-        .filter_map(|payload| payload.get("through_id").and_then(Value::as_i64))
-        .max();
+    let seen_through = verified_seen_through(memory, principal, &seen).await;
     let rows = read_rows(
         memory,
         principal,
@@ -98,18 +98,53 @@ pub(crate) async fn unseen_results_note(
     }
     // A group whose newest row was sent as a message is already in the session,
     // unless an older successful run of it was never delivered.
-    let lines: Vec<String> = groups
-        .iter()
-        .filter(|group| !group.delivered())
-        .take(NOTE_MAX_LINES)
-        .map(Group::line)
-        .collect();
+    let pending: Vec<&Group> = groups.iter().filter(|group| !group.delivered()).collect();
+    let mut lines: Vec<String> = pending.iter().take(NOTE_MAX_LINES).map(|group| group.line()).collect();
+    if pending.len() > NOTE_MAX_LINES {
+        lines.push(format!("+{} more", pending.len() - NOTE_MAX_LINES));
+    }
     let text = if lines.is_empty() {
         String::new()
     } else {
         format!("\n\n[Scheduled results]\n{}", lines.join("\n"))
     };
     Some((text, mark))
+}
+
+/// The largest `through_id` of the seen marks whose run reached `turn.finalized`,
+/// newest mark first. A mark whose run has no `turn:<run>:final` row (the turn
+/// failed or is still running) does not count, so its rows stay unseen. A mark
+/// with no run id cannot be checked and does not count either. A failed lookup
+/// is logged by digest and counts as not finalized.
+async fn verified_seen_through(memory: &dyn Memory, principal: &MemoryPrincipal, seen: &[MessageEvent]) -> Option<i64> {
+    let mut marks: Vec<(i64, &str)> = seen
+        .iter()
+        .filter_map(|row| {
+            let through = payload_of(row)?.get("through_id").and_then(Value::as_i64)?;
+            Some((through, row.run_id.as_deref()?))
+        })
+        .collect();
+    marks.sort_unstable_by(|left, right| right.0.cmp(&left.0));
+    let owner_id = principal.owner_id.as_deref()?;
+    for (through, run_id) in marks {
+        let key = format!("turn:{run_id}:final");
+        match memory
+            .find_owned_message_event_by_idempotency_key(&principal.workspace_id, owner_id, &key)
+            .await
+        {
+            Ok(Some(_)) => return Some(through),
+            Ok(None) => {}
+            Err(error) => {
+                let (error_len, error_sha256) = error_log_digest(&error);
+                tracing::warn!(
+                    error_len,
+                    error_sha256,
+                    "Failed to check the turn of a scheduled results seen mark"
+                );
+            }
+        }
+    }
+    None
 }
 
 /// Writes the seen mark: one tool-round row in the owner's turn scope, naming
