@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 pub const TRANSCRIPT_SEARCH_TOOL_NAME: &str = "transcript_search";
 const DEFAULT_LIMIT: usize = 10;
@@ -24,6 +25,12 @@ const EXCERPT_LEAD_CHARS: usize = 80;
 /// Set once the warm-up has been started in this process.
 static WARM_STARTED: AtomicBool = AtomicBool::new(false);
 
+/// The first wait before a failed warm-up is tried again in this process. The
+/// wait doubles after each failure, up to [`WARM_RETRY_MAX`].
+const WARM_RETRY_FIRST: Duration = Duration::from_secs(30);
+/// The longest wait between two warm-up attempts in this process.
+const WARM_RETRY_MAX: Duration = Duration::from_secs(600);
+
 /// Search the owner's earlier sessions with the current agent.
 pub struct TranscriptSearchTool {
     memory: Arc<dyn Memory>,
@@ -36,9 +43,11 @@ impl TranscriptSearchTool {
 }
 
 /// Build the transcript index in the background, once per process: create it
-/// if missing and fill it in short batches (resuming an interrupted fill).
-/// Searches match on the rows themselves until the index is complete. Without a
-/// Tokio runtime nothing is started.
+/// if missing and fill it in short batches (resuming an interrupted fill). A
+/// failed attempt is retried in this process with a doubling wait (see
+/// [`WARM_RETRY_FIRST`] and [`WARM_RETRY_MAX`]), so a long-running process does
+/// not wait for its next start. Searches match on the rows themselves until the
+/// index is complete. Without a Tokio runtime nothing is started.
 pub(crate) fn warm_index_in_background(memory: Arc<dyn Memory>) {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return;
@@ -47,11 +56,18 @@ pub(crate) fn warm_index_in_background(memory: Arc<dyn Memory>) {
         return;
     }
     handle.spawn(async move {
-        if let Err(error) = memory.warm_transcript_index().await {
+        let mut wait = WARM_RETRY_FIRST;
+        loop {
+            let Err(error) = memory.warm_transcript_index().await else {
+                return;
+            };
             tracing::warn!(
                 error = %error_class(&error),
-                "transcript index warm-up failed; searches match without the index until a later start completes it"
+                retry_in_secs = wait.as_secs(),
+                "transcript index warm-up failed; searches match without the index until a retry completes it"
             );
+            tokio::time::sleep(wait).await;
+            wait = (wait * 2).min(WARM_RETRY_MAX);
         }
     });
 }
