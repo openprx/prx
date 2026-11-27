@@ -9,6 +9,7 @@
 
 use super::McpTool;
 use super::subscription_stream::{self, OpenFailure};
+use crate::config::Config;
 use crate::security::redaction::redact_provider_text;
 use crate::tools::traits::ToolResult;
 use anyhow::{anyhow, bail};
@@ -37,9 +38,11 @@ pub(super) struct SubscriberKey {
     agent: String,
 }
 
-/// One subscriber of a stream, with the time it subscribed.
+/// One subscriber of a stream, with the time it subscribed and the chain event
+/// of its latest subscribe call (the wake-depth anchor of its notices).
 pub(super) struct SubscriberState {
     since: SystemTime,
+    chain_event: Option<String>,
 }
 
 /// The health of one (server, URI) stream as `status` shows it.
@@ -83,47 +86,60 @@ impl UriStream {
         matches!(self.state, StreamState::Declined)
     }
 
-    /// Add `caller`; `true` when the stream now has more than one subscriber.
-    fn add_subscriber(&mut self, caller: SubscriberKey) -> bool {
-        self.subscribers.entry(caller).or_insert_with(|| SubscriberState {
+    /// Add `caller`, or refresh its chain event; `true` when the stream now has
+    /// more than one subscriber.
+    fn add_subscriber(&mut self, caller: SubscriberKey, chain_event: Option<String>) -> bool {
+        let subscriber = self.subscribers.entry(caller).or_insert_with(|| SubscriberState {
             since: SystemTime::now(),
+            chain_event: None,
         });
+        subscriber.chain_event = chain_event;
         self.subscribers.len() > 1
     }
 
     /// Install a freshly opened stream and its consumer task.
-    fn start(&mut self, task: AbortHandle, caller: SubscriberKey) {
+    fn start(&mut self, task: AbortHandle, caller: SubscriberKey, chain_event: Option<String>) {
         self.task = Some(task);
         self.state = StreamState::Active;
         self.last_outage = None;
-        self.add_subscriber(caller);
+        self.add_subscriber(caller, chain_event);
     }
+}
+
+/// A registry that adopted the hub, with the configuration it was built from.
+struct Owner {
+    tool: Weak<McpTool>,
+    config: Arc<Config>,
 }
 
 /// One workspace's subscriptions and the registries that serve them.
 #[derive(Default)]
 pub(super) struct Hub {
     /// Registries that adopted this hub, oldest first. Dead ones are pruned on adopt.
-    owners: Mutex<Vec<Weak<McpTool>>>,
+    owners: Mutex<Vec<Owner>>,
     /// Streams keyed by (server, URI).
     streams: Mutex<BTreeMap<(String, String), UriStream>>,
 }
 
 impl Hub {
-    /// The newest registry still alive, if any.
-    pub(super) fn newest_owner(&self) -> Option<Arc<McpTool>> {
-        self.owners.lock().iter().rev().find_map(Weak::upgrade)
+    /// The newest registry still alive and its configuration, if any.
+    pub(super) fn newest_owner(&self) -> Option<(Arc<McpTool>, Arc<Config>)> {
+        self.owners
+            .lock()
+            .iter()
+            .rev()
+            .find_map(|owner| Some((owner.tool.upgrade()?, Arc::clone(&owner.config))))
     }
 
     /// Add `caller` to a live stream of `key`; `None` when there is no live
     /// stream (none, or one declined by the server).
-    fn join(&self, key: &(String, String), caller: &SubscriberKey) -> Option<bool> {
+    fn join(&self, key: &(String, String), caller: &SubscriberKey, chain_event: &Option<String>) -> Option<bool> {
         let mut streams = self.streams.lock();
         let stream = streams.get_mut(key)?;
         if stream.task.is_none() || stream.is_declined() {
             return None;
         }
-        Some(stream.add_subscriber(caller.clone()))
+        Some(stream.add_subscriber(caller.clone(), chain_event.clone()))
     }
 
     /// Subscribe `caller` to (server, URI), opening the stream if none is live.
@@ -131,11 +147,12 @@ impl Hub {
         self: &Arc<Self>,
         tool: &McpTool,
         caller: SubscriberKey,
+        chain_event: Option<String>,
         server: &str,
         uri: &str,
     ) -> anyhow::Result<bool> {
         let key = (server.to_string(), uri.to_string());
-        if let Some(shared) = self.join(&key, &caller) {
+        if let Some(shared) = self.join(&key, &caller, &chain_event) {
             return Ok(shared);
         }
         let subscription: Subscription = match subscription_stream::open(tool, server, uri).await {
@@ -147,13 +164,13 @@ impl Hub {
         let stream = streams.entry(key.clone()).or_insert_with(UriStream::pending);
         if stream.task.is_some() && !stream.is_declined() {
             // A racing subscribe opened the stream first: share it and drop ours.
-            let shared = stream.add_subscriber(caller);
+            let shared = stream.add_subscriber(caller, chain_event);
             drop(streams);
             drop(subscription);
             return Ok(shared);
         }
         let task = tokio::spawn(subscription_stream::run(Arc::clone(self), key, subscription));
-        stream.start(task.abort_handle(), caller);
+        stream.start(task.abort_handle(), caller, chain_event);
         Ok(stream.subscribers.len() > 1)
     }
 
@@ -248,14 +265,18 @@ impl Hub {
 }
 
 /// Register `tool` with the hub of `workspace_dir`, creating the hub on first use.
-pub(crate) fn adopt(tool: &Arc<McpTool>, workspace_dir: &Path) {
+/// `root_config` is the configuration the registry was built from.
+pub(crate) fn adopt(tool: &Arc<McpTool>, workspace_dir: &Path, root_config: &Config) {
     let hub = {
         let mut hubs = registry().lock();
         Arc::clone(hubs.entry(workspace_dir.to_path_buf()).or_default())
     };
     let mut owners = hub.owners.lock();
-    owners.retain(|owner| owner.strong_count() > 0);
-    owners.push(Arc::downgrade(tool));
+    owners.retain(|owner| owner.tool.strong_count() > 0);
+    owners.push(Owner {
+        tool: Arc::downgrade(tool),
+        config: Arc::new(root_config.clone()),
+    });
 }
 
 /// The hub that `tool` adopted, if any. A registry built outside the tool
@@ -263,21 +284,28 @@ pub(crate) fn adopt(tool: &Arc<McpTool>, workspace_dir: &Path) {
 pub(super) fn hub_for(tool: &McpTool) -> Option<Arc<Hub>> {
     let hubs = registry().lock();
     hubs.values()
-        .find(|hub| hub.owners.lock().iter().any(|owner| std::ptr::eq(owner.as_ptr(), tool)))
+        .find(|hub| {
+            hub.owners
+                .lock()
+                .iter()
+                .any(|owner| std::ptr::eq(owner.tool.as_ptr(), tool))
+        })
         .cloned()
 }
 
-/// The subscriber of this `mcp_call`, from its receipt.
-fn caller_key() -> anyhow::Result<SubscriberKey> {
+/// The subscriber of this `mcp_call` from its receipt, and the receipt's
+/// source event (the chain its notices continue).
+fn caller_key() -> anyhow::Result<(SubscriberKey, Option<String>)> {
     let caller = crate::tools::execution::current_child_call_context()
         .ok_or_else(|| anyhow!("subscribe needs a session context"))?;
     caller.verify_tool("mcp_call")?;
     let envelope = &caller.context().envelope;
-    Ok(SubscriberKey {
+    let key = SubscriberKey {
         owner: envelope.resolved_owner_id(),
         session: envelope.session_key.to_string(),
         agent: envelope.agent_id.as_deref().unwrap_or("main").to_string(),
-    })
+    };
+    Ok((key, envelope.source_message_event_id.clone()))
 }
 
 fn rfc3339(time: SystemTime) -> String {
@@ -303,7 +331,7 @@ impl McpTool {
     }
 
     async fn run_subscription_action(&self, action: &str, args: &Value) -> anyhow::Result<String> {
-        let caller = caller_key()?;
+        let (caller, chain_event) = caller_key()?;
         let server = args
             .get("server")
             .and_then(Value::as_str)
@@ -318,7 +346,7 @@ impl McpTool {
             return Ok(json!({"subscribed": false, "server": server, "uri": uri}).to_string());
         }
         self.refresh_runtime_state(false).await;
-        let shared = hub.subscribe(self, caller, server, uri).await?;
+        let shared = hub.subscribe(self, caller, chain_event, server, uri).await?;
         Ok(json!({"subscribed": true, "server": server, "uri": uri, "shared": shared}).to_string())
     }
 
@@ -326,7 +354,7 @@ impl McpTool {
     /// receipt, so the field is omitted.
     pub(super) fn subscriptions_view(&self) -> Option<Value> {
         // Without a receipt there is no subscriber to show; the field is omitted.
-        let caller = caller_key().ok()?;
+        let (caller, _) = caller_key().ok()?;
         let entries = hub_for(self).map(|hub| hub.view(&caller)).unwrap_or_default();
         Some(Value::Array(entries))
     }

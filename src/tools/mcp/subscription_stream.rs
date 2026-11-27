@@ -182,7 +182,7 @@ async fn consume(hub: &Hub, key: &(String, String), subscription: &mut Subscript
 
 /// Reopen the stream of `key` on the newest live registry.
 async fn reconnect(hub: &Hub, key: &(String, String)) -> Result<Subscription, OpenFailure> {
-    let Some(tool) = hub.newest_owner() else {
+    let Some((tool, _)) = hub.newest_owner() else {
         return Err(OpenFailure::Failed {
             error: anyhow!("no live MCP registry serves server '{}'", key.0),
             retry_after: None,
