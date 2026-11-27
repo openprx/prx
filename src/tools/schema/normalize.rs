@@ -9,7 +9,10 @@ impl CompiledToolSchema {
     /// Models routinely send `"deliver": null` for a field they mean to leave
     /// out. A key is dropped when this contract declares the property, does not
     /// list it in `required`, and the property's own schema does not accept
-    /// `null` (so an explicit nullable type keeps its value). A `null` on a
+    /// `null` (a `null` type, an `anyOf` / `oneOf` null branch or
+    /// `nullable: true` keeps its value). Callers compile the schema as
+    /// published, before any provider-dialect cleaning, so the same call keeps
+    /// or drops a `null` the same way on every provider. A `null` on a
     /// required property is left alone and is reported by the validator as
     /// before. The rule descends into declared properties and array items,
     /// each object using its own `required` list.
@@ -22,7 +25,7 @@ impl CompiledToolSchema {
                         && self
                             .properties
                             .get(name)
-                            .is_some_and(|property| !property.matches(&Value::Null)))
+                            .is_some_and(|property| !property.nullable_keyword && !property.matches(&Value::Null)))
                 });
                 for (name, entry) in entries.iter_mut() {
                     if let Some(property) = self.properties.get(name) {

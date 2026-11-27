@@ -432,6 +432,9 @@ pub struct CompiledToolSchema {
     additional_properties: CompiledAdditionalProperties,
     conditions: Vec<CompiledCondition>,
     items: Option<Box<Self>>,
+    /// OpenAPI-style `"nullable": true`. Not a validation keyword here; it only
+    /// tells argument normalisation that a `null` on this node is meant.
+    nullable_keyword: bool,
 }
 
 /// Local `$defs` / `definitions` entries of one schema document, borrowed for
@@ -601,6 +604,7 @@ impl CompiledToolSchema {
                 display: expected.to_string(),
             });
         }
+        compiled.nullable_keyword = object.get("nullable").and_then(Value::as_bool) == Some(true);
         compiled.const_value = object.get("const").cloned();
         compiled.enum_values = object.get("enum").and_then(Value::as_array).cloned();
         compiled.min_length = object.get("minLength").and_then(Value::as_u64);

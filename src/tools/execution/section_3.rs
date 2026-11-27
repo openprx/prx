@@ -1450,7 +1450,8 @@ pub fn strip_runtime_only_args(root: &mut serde_json::Map<String, serde_json::Va
 /// keys are removed first because the runtime authors them after validation and
 /// they are intentionally absent from public schemas.
 ///
-/// Before validation, `null` on non-required declared properties is dropped (see
+/// Before validation, `null` on non-required declared properties whose published
+/// schema does not accept `null` is dropped (see
 /// [`crate::tools::schema::CompiledToolSchema::drop_null_optional_properties`]).
 ///
 /// On success the arguments are normalized in place — see
@@ -1473,8 +1474,18 @@ pub(crate) fn enforce_command_contract(
         return Err("tool arguments must be a JSON object".to_string());
     }
     // A `null` on an optional property means "not sent": drop it so the
-    // validator and the tool both see the key as absent.
-    compiled.drop_null_optional_properties(arguments);
+    // validator and the tool both see the key as absent. Nullability is read
+    // from the schema as published (Raw), not the provider-lowered one, so the
+    // same call is treated the same on every provider.
+    crate::tools::schema::compiled_tool_schema_for_dialect(
+        &descriptor.public_name,
+        ToolSchemaDialect::Raw,
+        descriptor
+            .execution_parameters
+            .as_deref()
+            .unwrap_or(&descriptor.parameters),
+    )
+    .drop_null_optional_properties(arguments);
     let issues =
         crate::tools::schema::with_public_arguments(arguments, |public| compiled.validate_tool_arguments(public));
     if !issues.is_empty() {
