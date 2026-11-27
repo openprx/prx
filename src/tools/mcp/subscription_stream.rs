@@ -142,8 +142,9 @@ pub(super) async fn run(hub: Arc<Hub>, key: (String, String), mut subscription: 
                     return;
                 }
                 Err(OpenFailure::Gone(error)) => {
-                    tracing::warn!(server = %key.0, reason = %redact_provider_text(&format!("{error:#}")), "MCP resource subscription removed");
-                    hub.remove_stream(&key);
+                    let reason = redact_provider_text(&format!("{error:#}"));
+                    tracing::warn!(server = %key.0, reason = %reason, "MCP resource subscription removed");
+                    hub.end_stream(&key, &reason);
                     return;
                 }
                 Err(OpenFailure::Failed {
@@ -163,7 +164,7 @@ pub(super) async fn run(hub: Arc<Hub>, key: (String, String), mut subscription: 
 
 /// Read notifications until the stream ends. Counts updates of the stream's URI
 /// and returns the reason the stream ended, for `status`.
-async fn consume(hub: &Hub, key: &(String, String), subscription: &mut Subscription) -> String {
+async fn consume(hub: &Arc<Hub>, key: &(String, String), subscription: &mut Subscription) -> String {
     loop {
         match subscription.next().await {
             Ok(Some(ServerNotification::ResourceUpdatedNotification(notification))) => {

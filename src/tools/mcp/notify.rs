@@ -6,6 +6,9 @@ use super::subscriptions::SubscriberKey;
 use crate::config::Config;
 use crate::messaging::SessionAddr;
 use crate::messaging::runtime::{MessagingRuntime, RuntimeSender};
+use parking_lot::Mutex;
+use std::collections::HashSet;
+use std::sync::OnceLock;
 use uuid::Uuid;
 
 /// One notice for a subscriber.
@@ -103,4 +106,16 @@ fn prepare(
         .bind(source, chain_event)
         .map_err(|_| Delivery::Undelivered("mailbox refused the sender"))?;
     Ok((sender, target))
+}
+
+/// Warn once per (server, reason) and process that a notice was not delivered.
+pub(super) fn warn_undelivered(server: &str, reason: &'static str) {
+    static WARNED: OnceLock<Mutex<HashSet<(String, &'static str)>>> = OnceLock::new();
+    let first = WARNED
+        .get_or_init(Mutex::default)
+        .lock()
+        .insert((server.to_string(), reason));
+    if first {
+        tracing::warn!(server = %server, reason = reason, "MCP resource notice not delivered");
+    }
 }

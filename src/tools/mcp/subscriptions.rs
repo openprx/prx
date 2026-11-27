@@ -8,6 +8,7 @@
 //! the same (server, URI); the stream task lives in `subscription_stream`.
 
 use super::McpTool;
+use super::notify::{self, Delivery, Notice};
 use super::subscription_stream::{self, OpenFailure};
 use crate::config::Config;
 use crate::security::redaction::redact_provider_text;
@@ -20,7 +21,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::task::AbortHandle;
 
 /// The hubs of this process, keyed by the workspace directory of their registries.
@@ -38,11 +39,37 @@ pub(super) struct SubscriberKey {
     pub(super) agent: String,
 }
 
-/// One subscriber of a stream, with the time it subscribed and the chain event
-/// of its latest subscribe call (the wake-depth anchor of its notices).
+/// The minimum gap between two update notices of one subscriber and resource.
+const NOTICE_WINDOW: Duration = Duration::from_secs(2);
+
+/// One subscriber of a stream: when it subscribed, the chain event of its latest
+/// subscribe call (the wake-depth anchor of its notices), and its notice state.
 pub(super) struct SubscriberState {
     since: SystemTime,
     chain_event: Option<String>,
+    /// Updates not yet sent in a notice.
+    pending: u64,
+    /// When the last update notice was sent.
+    last_sent: Option<Instant>,
+    /// The timer that sends `pending` when the window closes.
+    timer: Option<AbortHandle>,
+    /// The last notice that could not be delivered to this subscriber.
+    undelivered: Option<Undelivered>,
+}
+
+/// A notice that could not be delivered, with how many were lost so far.
+pub(super) struct Undelivered {
+    count: u64,
+    reason: &'static str,
+    last_at: SystemTime,
+}
+
+/// A notice ready to be sent to one subscriber of one stream.
+struct Outgoing {
+    key: (String, String),
+    subscriber: SubscriberKey,
+    chain_event: Option<String>,
+    text: String,
 }
 
 /// The health of one (server, URI) stream as `status` shows it.
@@ -86,12 +113,28 @@ impl UriStream {
         matches!(self.state, StreamState::Declined)
     }
 
+    /// Stop the consumer task and every coalescing timer of the stream.
+    fn end(self) {
+        if let Some(task) = self.task {
+            task.abort();
+        }
+        for subscriber in self.subscribers.into_values() {
+            if let Some(timer) = subscriber.timer {
+                timer.abort();
+            }
+        }
+    }
+
     /// Add `caller`, or refresh its chain event; `true` when the stream now has
     /// more than one subscriber.
     fn add_subscriber(&mut self, caller: SubscriberKey, chain_event: Option<String>) -> bool {
         let subscriber = self.subscribers.entry(caller).or_insert_with(|| SubscriberState {
             since: SystemTime::now(),
             chain_event: None,
+            pending: 0,
+            last_sent: None,
+            timer: None,
+            undelivered: None,
         });
         subscriber.chain_event = chain_event;
         self.subscribers.len() > 1
@@ -177,19 +220,25 @@ impl Hub {
     /// Remove `caller` from (server, URI). The last subscriber ends the stream;
     /// the dropped subscription cancels the request on the wire.
     pub(super) fn unsubscribe(&self, caller: &SubscriberKey, server: &str, uri: &str) {
-        let key = (server.to_string(), uri.to_string());
+        self.remove_subscriber(caller, &(server.to_string(), uri.to_string()));
+    }
+
+    /// Remove one subscriber, and its stream when it was the last one.
+    fn remove_subscriber(&self, caller: &SubscriberKey, key: &(String, String)) {
         let mut streams = self.streams.lock();
-        let Some(stream) = streams.get_mut(&key) else {
+        let Some(stream) = streams.get_mut(key) else {
             return;
         };
-        if stream.subscribers.remove(caller).is_none() {
+        let Some(removed) = stream.subscribers.remove(caller) else {
             return;
+        };
+        if let Some(timer) = removed.timer {
+            timer.abort();
         }
         if stream.subscribers.is_empty()
-            && let Some(ended) = streams.remove(&key)
-            && let Some(task) = ended.task
+            && let Some(ended) = streams.remove(key)
         {
-            task.abort();
+            ended.end();
         }
     }
 
@@ -219,17 +268,73 @@ impl Hub {
                 if let Some(outage) = stream.last_outage {
                     entry["last_outage_secs"] = json!(outage.as_secs());
                 }
+                if let Some(missed) = &subscriber.undelivered {
+                    entry["undelivered"] = json!({
+                        "count": missed.count,
+                        "reason": missed.reason,
+                        "last_at": rfc3339(missed.last_at),
+                    });
+                }
                 Some(entry)
             })
             .collect()
     }
 
-    /// Count one update of a stream. Other URIs never reach here.
-    pub(super) fn record_update(&self, key: &(String, String)) {
-        if let Some(stream) = self.streams.lock().get_mut(key) {
+    /// Count one update of a stream and coalesce its notices: each subscriber
+    /// gets at most one update notice per window, and the updates that arrive
+    /// inside a window are sent when it closes. Other URIs never reach here.
+    pub(super) fn record_update(self: &Arc<Self>, key: &(String, String)) {
+        let now = Instant::now();
+        let mut outgoing = Vec::new();
+        {
+            let mut streams = self.streams.lock();
+            let Some(stream) = streams.get_mut(key) else {
+                return;
+            };
             stream.updates += 1;
             stream.last_update_at = Some(SystemTime::now());
+            for (caller, subscriber) in &mut stream.subscribers {
+                subscriber.pending += 1;
+                if subscriber.timer.is_some() {
+                    continue;
+                }
+                match subscriber.last_sent {
+                    Some(last) if now.duration_since(last) < NOTICE_WINDOW => {
+                        subscriber.timer = Some(self.arm_timer(key, caller, last + NOTICE_WINDOW));
+                    }
+                    _ => outgoing.extend(take_notice(key, caller, subscriber, now)),
+                }
+            }
         }
+        self.dispatch(outgoing);
+    }
+
+    /// A task that sends the pending updates of one subscriber at `deadline`.
+    fn arm_timer(self: &Arc<Self>, key: &(String, String), caller: &SubscriberKey, deadline: Instant) -> AbortHandle {
+        let hub = Arc::clone(self);
+        let key = key.clone();
+        let caller = caller.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+            hub.flush(&key, &caller);
+        })
+        .abort_handle()
+    }
+
+    /// Send the updates that a closed window held for one subscriber.
+    fn flush(self: &Arc<Self>, key: &(String, String), caller: &SubscriberKey) {
+        let outgoing = {
+            let mut streams = self.streams.lock();
+            let Some(subscriber) = streams
+                .get_mut(key)
+                .and_then(|stream| stream.subscribers.get_mut(caller))
+            else {
+                return;
+            };
+            subscriber.timer = None;
+            take_notice(key, caller, subscriber, Instant::now())
+        };
+        self.dispatch(outgoing.into_iter().collect());
     }
 
     /// Mark a stream down; keeps the start of an outage that is already running.
@@ -243,25 +348,156 @@ impl Hub {
         }
     }
 
-    /// Mark a stream up again after an outage of `outage`.
-    pub(super) fn set_active(&self, key: &(String, String), outage: Duration) {
-        if let Some(stream) = self.streams.lock().get_mut(key) {
+    /// Mark a stream up again after an outage of `outage`, and tell every subscriber.
+    pub(super) fn set_active(self: &Arc<Self>, key: &(String, String), outage: Duration) {
+        let text = Notice::Resumed {
+            server: &key.0,
+            uri: &key.1,
+            outage_secs: outage.as_secs(),
+        }
+        .text();
+        let outgoing = {
+            let mut streams = self.streams.lock();
+            let Some(stream) = streams.get_mut(key) else {
+                return;
+            };
             stream.state = StreamState::Active;
             stream.last_outage = Some(outage);
-        }
+            outgoing_for_all(key, stream, &text)
+        };
+        self.dispatch(outgoing);
     }
 
-    /// Mark a stream declined; its subscribers stay so `status` shows it.
-    pub(super) fn set_declined(&self, key: &(String, String)) {
-        if let Some(stream) = self.streams.lock().get_mut(key) {
-            stream.state = StreamState::Declined;
+    /// Mark a stream declined; its subscribers stay so `status` shows it, and
+    /// they are told once.
+    pub(super) fn set_declined(self: &Arc<Self>, key: &(String, String)) {
+        let text = Notice::Ended {
+            server: &key.0,
+            uri: &key.1,
+            reason: "the server no longer acknowledges the subscription",
         }
+        .text();
+        let outgoing = {
+            let mut streams = self.streams.lock();
+            let Some(stream) = streams.get_mut(key) else {
+                return;
+            };
+            stream.state = StreamState::Declined;
+            outgoing_for_all(key, stream, &text)
+        };
+        self.dispatch(outgoing);
     }
 
     /// Drop a stream and its subscribers: the server cannot serve it any more.
-    pub(super) fn remove_stream(&self, key: &(String, String)) {
-        self.streams.lock().remove(key);
+    /// Every subscriber is told why.
+    pub(super) fn end_stream(self: &Arc<Self>, key: &(String, String), reason: &str) {
+        let text = Notice::Ended {
+            server: &key.0,
+            uri: &key.1,
+            reason,
+        }
+        .text();
+        let outgoing = {
+            let mut streams = self.streams.lock();
+            let Some(stream) = streams.remove(key) else {
+                return;
+            };
+            let outgoing = outgoing_for_all(key, &stream, &text);
+            stream.end();
+            outgoing
+        };
+        self.dispatch(outgoing);
     }
+
+    /// Send each notice in its own task: delivery never blocks the stream task.
+    fn dispatch(self: &Arc<Self>, outgoing: Vec<Outgoing>) {
+        for item in outgoing {
+            let hub = Arc::clone(self);
+            tokio::spawn(async move {
+                let outcome = match hub.newest_owner() {
+                    Some((_, config)) => {
+                        notify::deliver(config, item.subscriber.clone(), item.chain_event, item.text).await
+                    }
+                    None => Delivery::Undelivered("no live MCP registry"),
+                };
+                hub.apply(&item.key, &item.subscriber, outcome);
+            });
+        }
+    }
+
+    /// Record the outcome of one delivery on its subscriber.
+    fn apply(&self, key: &(String, String), caller: &SubscriberKey, outcome: Delivery) {
+        match outcome {
+            Delivery::SessionGone => self.remove_subscriber(caller, key),
+            Delivery::Delivered => self.with_subscriber(key, caller, |subscriber| subscriber.undelivered = None),
+            Delivery::Undelivered(reason) => {
+                self.with_subscriber(key, caller, |subscriber| {
+                    let count = subscriber.undelivered.as_ref().map_or(0, |missed| missed.count) + 1;
+                    subscriber.undelivered = Some(Undelivered {
+                        count,
+                        reason,
+                        last_at: SystemTime::now(),
+                    });
+                });
+                notify::warn_undelivered(&key.0, reason);
+            }
+        }
+    }
+
+    fn with_subscriber(
+        &self,
+        key: &(String, String),
+        caller: &SubscriberKey,
+        change: impl FnOnce(&mut SubscriberState),
+    ) {
+        if let Some(subscriber) = self
+            .streams
+            .lock()
+            .get_mut(key)
+            .and_then(|stream| stream.subscribers.get_mut(caller))
+        {
+            change(subscriber);
+        }
+    }
+}
+
+/// Take the pending updates of one subscriber as one update notice.
+fn take_notice(
+    key: &(String, String),
+    caller: &SubscriberKey,
+    subscriber: &mut SubscriberState,
+    now: Instant,
+) -> Option<Outgoing> {
+    if subscriber.pending == 0 {
+        return None;
+    }
+    let count = std::mem::take(&mut subscriber.pending);
+    subscriber.last_sent = Some(now);
+    Some(Outgoing {
+        key: key.clone(),
+        subscriber: caller.clone(),
+        chain_event: subscriber.chain_event.clone(),
+        text: Notice::Updated {
+            server: &key.0,
+            uri: &key.1,
+            count,
+        }
+        .text(),
+    })
+}
+
+/// One notice of `text` for each subscriber of a stream, not coalesced.
+fn outgoing_for_all(key: &(String, String), stream: &UriStream, text: &str) -> Vec<Outgoing> {
+    stream
+        .subscribers
+        .iter()
+        .map(|(caller, subscriber)| Outgoing {
+            key: key.clone(),
+            subscriber: caller.clone(),
+            chain_event: subscriber.chain_event.clone(),
+            text: text.to_string(),
+        })
+        .collect()
 }
 
 /// Register `tool` with the hub of `workspace_dir`, creating the hub on first use.
