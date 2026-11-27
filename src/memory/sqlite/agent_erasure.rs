@@ -411,8 +411,9 @@ fn verify(conn: &Connection, scopes: &str, keep_message_keys: bool, preserve_mem
 
 /// Run ids and session keys of the rows an erase is about to delete, with the
 /// smallest of their row ids: the listing results that name them were written
-/// after that row. `None` when the scopes hold no rows.
-fn listing_identifiers(conn: &Connection, scopes: &str) -> anyhow::Result<Option<(Vec<String>, i64)>> {
+/// after that row. `None` when the scopes hold no rows. Session keys are only
+/// candidates here: a session shared with another agent survives the erase.
+fn listing_identifiers(conn: &Connection, scopes: &str) -> anyhow::Result<Option<ListingIdentifiers>> {
     let Some(since_id) = conn.query_row(
         "SELECT MIN(id) FROM message_events WHERE ma_scope_id IN (SELECT value FROM json_each(?1))",
         [scopes],
@@ -421,15 +422,49 @@ fn listing_identifiers(conn: &Connection, scopes: &str) -> anyhow::Result<Option
     else {
         return Ok(None);
     };
-    let mut statement = conn.prepare(
-        "SELECT run_id FROM message_events WHERE ma_scope_id IN (SELECT value FROM json_each(?1)) AND run_id IS NOT NULL
-         UNION SELECT session_key FROM message_events WHERE ma_scope_id IN (SELECT value FROM json_each(?1))
+    let collect = |sql: &str| -> anyhow::Result<Vec<String>> {
+        let mut statement = conn.prepare(sql)?;
+        Ok(statement
+            .query_map([scopes], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    };
+    let run_ids = collect(
+        "SELECT DISTINCT run_id FROM message_events WHERE ma_scope_id IN (SELECT value FROM json_each(?1)) AND run_id IS NOT NULL",
+    )?;
+    let session_keys = collect(
+        "SELECT DISTINCT session_key FROM message_events WHERE ma_scope_id IN (SELECT value FROM json_each(?1))
            AND session_key IS NOT NULL",
     )?;
-    let identifiers = statement
-        .query_map([scopes], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(Some((identifiers, since_id)))
+    Ok(Some(ListingIdentifiers {
+        run_ids,
+        session_keys,
+        since_id,
+    }))
+}
+
+/// Identifiers read before the erase deletes its rows.
+struct ListingIdentifiers {
+    run_ids: Vec<String>,
+    session_keys: Vec<String>,
+    since_id: i64,
+}
+
+/// Run ids, plus the session keys that no `message_events` row names any more
+/// (call after the rows are erased): a session that still holds another
+/// agent's rows was not erased, so its listings stay.
+fn erased_identifiers(conn: &Connection, found: ListingIdentifiers) -> anyhow::Result<(Vec<String>, i64)> {
+    let mut identifiers = found.run_ids;
+    for key in found.session_keys {
+        let survives: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM message_events WHERE session_key = ?1)",
+            [&key],
+            |row| row.get(0),
+        )?;
+        if !survives {
+            identifiers.push(key);
+        }
+    }
+    Ok((identifiers, found.since_id))
 }
 
 pub(super) fn finish_history(memory: &SqliteMemory, work: &EraseWork) -> anyhow::Result<serde_json::Value> {
@@ -537,7 +572,8 @@ pub(super) fn finish_history(memory: &SqliteMemory, work: &EraseWork) -> anyhow:
                 !work.purge && !work.forget_writes,
             )
             .context(ErasureStep::EraseRows)?;
-            if let Some((identifiers, since_id)) = listing {
+            if let Some(found) = listing {
+                let (identifiers, since_id) = erased_identifiers(&tx, found)?;
                 super::derived_sweep::rewrite_listings(
                     &tx,
                     &work.workspace,
