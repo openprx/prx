@@ -11,7 +11,7 @@ use super::McpTool;
 use super::notify::{self, Delivery, Notice};
 use super::subscription_stream::{self, OpenFailure};
 use crate::config::Config;
-use crate::security::redaction::redact_provider_text;
+use crate::security::redaction::{redact_provider_text, redact_url_value};
 use crate::tools::traits::ToolResult;
 use anyhow::{anyhow, bail};
 use chrono::{DateTime, Utc};
@@ -20,6 +20,7 @@ use rmcp::service::Subscription;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::task::AbortHandle;
@@ -42,11 +43,29 @@ pub(super) struct SubscriberKey {
 /// The minimum gap between two update notices of one subscriber and resource.
 const NOTICE_WINDOW: Duration = Duration::from_secs(2);
 
+/// The source of `SubscriberState::instance`: a subscriber removed and added
+/// again is a new instance, so a late outcome of the old one is not applied.
+static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
 /// One subscriber of a stream: when it subscribed, the chain event of its latest
-/// subscribe call (the wake-depth anchor of its notices), and its notice state.
+/// subscribe call (the wake-depth anchor of its notices), its notice state and
+/// the counters `status` shows. The counters cover only the time since this
+/// subscriber joined, so they reveal nothing about other subscribers.
 pub(super) struct SubscriberState {
+    instance: u64,
     since: SystemTime,
     chain_event: Option<String>,
+    /// Updates of the resource since this subscriber joined.
+    updates: u64,
+    last_update_at: Option<SystemTime>,
+    /// The part of the last outage that this subscriber was subscribed for.
+    last_outage: Option<Duration>,
+    /// Notices queued for this subscriber so far; each carries its number.
+    sent: u64,
+    /// `sent` when the last `SessionGone` was counted (or at re-subscribe):
+    /// an outcome of a notice numbered at or below it was already in flight
+    /// then and is not counted again.
+    gone_mark: u64,
     /// Updates not yet sent in a notice.
     pending: u64,
     /// When the last update notice was sent.
@@ -70,6 +89,9 @@ pub(super) struct Undelivered {
 struct Outgoing {
     key: (String, String),
     subscriber: SubscriberKey,
+    /// The subscriber instance and notice number the outcome applies to.
+    instance: u64,
+    seq: u64,
     chain_event: Option<String>,
     text: String,
 }
@@ -92,11 +114,6 @@ pub(super) struct UriStream {
     /// The consumer task; `None` only while a first subscribe is being set up.
     task: Option<AbortHandle>,
     state: StreamState,
-    updates: u64,
-    last_update_at: Option<SystemTime>,
-    /// The length of the last outage, from the end of the stream to the new
-    /// acknowledgment (the value M6d reports on "resumed").
-    last_outage: Option<Duration>,
 }
 
 impl UriStream {
@@ -105,9 +122,6 @@ impl UriStream {
             subscribers: BTreeMap::new(),
             task: None,
             state: StreamState::Active,
-            updates: 0,
-            last_update_at: None,
-            last_outage: None,
         }
     }
 
@@ -127,12 +141,24 @@ impl UriStream {
         }
     }
 
-    /// Add `caller`, or refresh its chain event; `true` when the stream now has
-    /// more than one subscriber.
+    /// Add `caller`, or refresh its chain event and clear its `SessionGone`
+    /// streak (a re-subscribe proves the session exists); `true` when another
+    /// session of the same owner shares the stream. Subscribers of other
+    /// owners are never revealed.
     fn add_subscriber(&mut self, caller: SubscriberKey, chain_event: Option<String>) -> bool {
+        let shared = self
+            .subscribers
+            .keys()
+            .any(|other| other.owner == caller.owner && *other != caller);
         let subscriber = self.subscribers.entry(caller).or_insert_with(|| SubscriberState {
+            instance: NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
             since: SystemTime::now(),
             chain_event: None,
+            updates: 0,
+            last_update_at: None,
+            last_outage: None,
+            sent: 0,
+            gone_mark: 0,
             pending: 0,
             last_sent: None,
             timer: None,
@@ -140,15 +166,16 @@ impl UriStream {
             gone: 0,
         });
         subscriber.chain_event = chain_event;
-        self.subscribers.len() > 1
+        subscriber.gone = 0;
+        subscriber.gone_mark = subscriber.sent;
+        shared
     }
 
     /// Install a freshly opened stream and its consumer task.
-    fn start(&mut self, task: AbortHandle, caller: SubscriberKey, chain_event: Option<String>) {
+    fn start(&mut self, task: AbortHandle, caller: SubscriberKey, chain_event: Option<String>) -> bool {
         self.task = Some(task);
         self.state = StreamState::Active;
-        self.last_outage = None;
-        self.add_subscriber(caller, chain_event);
+        self.add_subscriber(caller, chain_event)
     }
 }
 
@@ -189,6 +216,9 @@ impl Hub {
     }
 
     /// Subscribe `caller` to (server, URI), opening the stream if none is live.
+    /// The joining registry must still serve the server, also when the stream
+    /// is already live. Returns whether another session of the same owner
+    /// shares the stream.
     pub(super) async fn subscribe(
         self: &Arc<Self>,
         tool: &McpTool,
@@ -198,6 +228,7 @@ impl Hub {
         uri: &str,
     ) -> anyhow::Result<bool> {
         let key = (server.to_string(), uri.to_string());
+        subscription_stream::served_timeout_ms(tool, server)?;
         if let Some(shared) = self.join(&key, &caller, &chain_event) {
             return Ok(shared);
         }
@@ -216,8 +247,7 @@ impl Hub {
             return Ok(shared);
         }
         let task = tokio::spawn(subscription_stream::run(Arc::clone(self), key, subscription));
-        stream.start(task.abort_handle(), caller, chain_event);
-        Ok(stream.subscribers.len() > 1)
+        Ok(stream.start(task.abort_handle(), caller, chain_event))
     }
 
     /// Remove `caller` from (server, URI). The last subscriber ends the stream;
@@ -228,21 +258,7 @@ impl Hub {
 
     /// Remove one subscriber, and its stream when it was the last one.
     fn remove_subscriber(&self, caller: &SubscriberKey, key: &(String, String)) {
-        let mut streams = self.streams.lock();
-        let Some(stream) = streams.get_mut(key) else {
-            return;
-        };
-        let Some(removed) = stream.subscribers.remove(caller) else {
-            return;
-        };
-        if let Some(timer) = removed.timer {
-            timer.abort();
-        }
-        if stream.subscribers.is_empty()
-            && let Some(ended) = streams.remove(key)
-        {
-            ended.end();
-        }
+        remove_locked(&mut self.streams.lock(), caller, key);
     }
 
     /// The streams `caller` subscribed to, as `status` shows them.
@@ -257,18 +273,20 @@ impl Hub {
                     StreamState::Reconnecting { last_error, .. } => ("reconnecting", Some(last_error.as_str())),
                     StreamState::Declined => ("declined", None),
                 };
+                // URI credentials (userinfo, query values, fragment) are redacted;
+                // notices keep the raw URI so their suggested read call works.
                 let mut entry = json!({
                     "server": server,
-                    "uri": uri,
+                    "uri": redact_url_value(uri),
                     "state": state,
                     "since": rfc3339(subscriber.since),
-                    "updates": stream.updates,
-                    "last_update_at": stream.last_update_at.map(rfc3339),
+                    "updates": subscriber.updates,
+                    "last_update_at": subscriber.last_update_at.map(rfc3339),
                 });
                 if let Some(last_error) = last_error {
                     entry["last_error"] = json!(last_error);
                 }
-                if let Some(outage) = stream.last_outage {
+                if let Some(outage) = subscriber.last_outage {
                     entry["last_outage_secs"] = json!(outage.as_secs());
                 }
                 if let Some(missed) = &subscriber.undelivered {
@@ -294,9 +312,10 @@ impl Hub {
             let Some(stream) = streams.get_mut(key) else {
                 return;
             };
-            stream.updates += 1;
-            stream.last_update_at = Some(SystemTime::now());
+            let at = SystemTime::now();
             for (caller, subscriber) in &mut stream.subscribers {
+                subscriber.updates += 1;
+                subscriber.last_update_at = Some(at);
                 subscriber.pending += 1;
                 if subscriber.timer.is_some() {
                     continue;
@@ -351,22 +370,30 @@ impl Hub {
         }
     }
 
-    /// Mark a stream up again after an outage of `outage`, and tell every subscriber.
+    /// Mark a stream up again after an outage of `outage`, and tell every
+    /// subscriber the part of the outage it was subscribed for.
     pub(super) fn set_active(self: &Arc<Self>, key: &(String, String), outage: Duration) {
-        let text = Notice::Resumed {
-            server: &key.0,
-            uri: &key.1,
-            outage_secs: outage.as_secs(),
-        }
-        .text();
         let outgoing = {
             let mut streams = self.streams.lock();
             let Some(stream) = streams.get_mut(key) else {
                 return;
             };
             stream.state = StreamState::Active;
-            stream.last_outage = Some(outage);
-            outgoing_for_all(key, stream, &text)
+            stream
+                .subscribers
+                .iter_mut()
+                .map(|(caller, subscriber)| {
+                    let seen = outage.min(subscriber.since.elapsed().unwrap_or_default());
+                    subscriber.last_outage = Some(seen);
+                    let text = Notice::Resumed {
+                        server: &key.0,
+                        uri: &key.1,
+                        outage_secs: seen.as_secs(),
+                    }
+                    .text();
+                    outgoing_to(key, caller, subscriber, text)
+                })
+                .collect()
         };
         self.dispatch(outgoing);
     }
@@ -402,10 +429,10 @@ impl Hub {
         .text();
         let outgoing = {
             let mut streams = self.streams.lock();
-            let Some(stream) = streams.remove(key) else {
+            let Some(mut stream) = streams.remove(key) else {
                 return;
             };
-            let outgoing = outgoing_for_all(key, &stream, &text);
+            let outgoing = outgoing_for_all(key, &mut stream, &text);
             stream.end();
             outgoing
         };
@@ -414,72 +441,117 @@ impl Hub {
 
     /// Send each notice in its own task: delivery never blocks the stream task.
     fn dispatch(self: &Arc<Self>, outgoing: Vec<Outgoing>) {
-        for item in outgoing {
+        for mut item in outgoing {
             let hub = Arc::clone(self);
             tokio::spawn(async move {
                 let outcome = match hub.newest_owner() {
                     Some((_, config)) => {
-                        notify::deliver(config, item.subscriber.clone(), item.chain_event, item.text).await
+                        let text = std::mem::take(&mut item.text);
+                        notify::deliver(config, item.subscriber.clone(), item.chain_event.take(), text).await
                     }
                     None => Delivery::Undelivered("no live MCP registry"),
                 };
-                hub.apply(&item.key, &item.subscriber, outcome);
+                hub.apply(&item, outcome);
             });
         }
     }
 
-    /// Record the outcome of one delivery on its subscriber.
-    fn apply(&self, key: &(String, String), caller: &SubscriberKey, outcome: Delivery) {
-        match outcome {
-            Delivery::SessionGone => {
-                // The receiver can be briefly absent (for example while the config
-                // file is rewritten): remove the subscriber only on a second outcome in a row.
-                let streak = self.with_subscriber(key, caller, |subscriber| {
+    /// Record the outcome of one delivery on its subscriber. The decision and
+    /// a removal happen under one lock, so an unsubscribe or re-subscribe in
+    /// between is never undone, and the `SessionGone` outcomes of notices that
+    /// were in flight together count once.
+    fn apply(&self, item: &Outgoing, outcome: Delivery) {
+        let warned = {
+            let mut streams = self.streams.lock();
+            let Some(subscriber) = streams
+                .get_mut(&item.key)
+                .and_then(|stream| stream.subscribers.get_mut(&item.subscriber))
+                .filter(|subscriber| subscriber.instance == item.instance)
+            else {
+                return;
+            };
+            let fresh = item.seq > subscriber.gone_mark;
+            match outcome {
+                Delivery::SessionGone => {
+                    if !fresh {
+                        return;
+                    }
+                    // The receiver can be briefly absent (for example while the config
+                    // file is rewritten): remove the subscriber only on a second outcome
+                    // in a row.
                     subscriber.gone += 1;
-                    subscriber.gone
-                });
-                if streak.is_some_and(|streak| streak >= 2) {
-                    self.remove_subscriber(caller, key);
-                } else {
-                    self.record_undelivered(key, caller, "receiver not found");
+                    subscriber.gone_mark = subscriber.sent;
+                    if subscriber.gone >= 2 {
+                        remove_locked(&mut streams, &item.subscriber, &item.key);
+                        return;
+                    }
+                    record_undelivered(subscriber, "receiver not found");
+                    "receiver not found"
+                }
+                Delivery::Delivered => {
+                    if fresh {
+                        subscriber.gone = 0;
+                        subscriber.undelivered = None;
+                    }
+                    return;
+                }
+                Delivery::Undelivered(reason) => {
+                    if fresh {
+                        subscriber.gone = 0;
+                    }
+                    record_undelivered(subscriber, reason);
+                    reason
                 }
             }
-            Delivery::Delivered => {
-                self.with_subscriber(key, caller, |subscriber| {
-                    subscriber.gone = 0;
-                    subscriber.undelivered = None;
-                });
-            }
-            Delivery::Undelivered(reason) => {
-                self.with_subscriber(key, caller, |subscriber| subscriber.gone = 0);
-                self.record_undelivered(key, caller, reason);
-            }
-        }
+        };
+        notify::warn_undelivered(&item.key.0, warned);
     }
+}
 
-    fn record_undelivered(&self, key: &(String, String), caller: &SubscriberKey, reason: &'static str) {
-        self.with_subscriber(key, caller, |subscriber| {
-            let count = subscriber.undelivered.as_ref().map_or(0, |missed| missed.count) + 1;
-            subscriber.undelivered = Some(Undelivered {
-                count,
-                reason,
-                last_at: SystemTime::now(),
-            });
-        });
-        notify::warn_undelivered(&key.0, reason);
+/// Count one notice that could not be delivered to `subscriber`.
+fn record_undelivered(subscriber: &mut SubscriberState, reason: &'static str) {
+    let count = subscriber.undelivered.as_ref().map_or(0, |missed| missed.count) + 1;
+    subscriber.undelivered = Some(Undelivered {
+        count,
+        reason,
+        last_at: SystemTime::now(),
+    });
+}
+
+/// Remove one subscriber from the locked streams, and its stream when it was
+/// the last one.
+fn remove_locked(streams: &mut BTreeMap<(String, String), UriStream>, caller: &SubscriberKey, key: &(String, String)) {
+    let Some(stream) = streams.get_mut(key) else {
+        return;
+    };
+    let Some(removed) = stream.subscribers.remove(caller) else {
+        return;
+    };
+    if let Some(timer) = removed.timer {
+        timer.abort();
     }
+    if stream.subscribers.is_empty()
+        && let Some(ended) = streams.remove(key)
+    {
+        ended.end();
+    }
+}
 
-    fn with_subscriber<R>(
-        &self,
-        key: &(String, String),
-        caller: &SubscriberKey,
-        change: impl FnOnce(&mut SubscriberState) -> R,
-    ) -> Option<R> {
-        self.streams
-            .lock()
-            .get_mut(key)
-            .and_then(|stream| stream.subscribers.get_mut(caller))
-            .map(change)
+/// Number the next notice of `subscriber` and address it.
+fn outgoing_to(
+    key: &(String, String),
+    caller: &SubscriberKey,
+    subscriber: &mut SubscriberState,
+    text: String,
+) -> Outgoing {
+    subscriber.sent += 1;
+    Outgoing {
+        key: key.clone(),
+        subscriber: caller.clone(),
+        instance: subscriber.instance,
+        seq: subscriber.sent,
+        chain_event: subscriber.chain_event.clone(),
+        text,
     }
 }
 
@@ -495,30 +567,21 @@ fn take_notice(
     }
     let count = std::mem::take(&mut subscriber.pending);
     subscriber.last_sent = Some(now);
-    Some(Outgoing {
-        key: key.clone(),
-        subscriber: caller.clone(),
-        chain_event: subscriber.chain_event.clone(),
-        text: Notice::Updated {
-            server: &key.0,
-            uri: &key.1,
-            count,
-        }
-        .text(),
-    })
+    let text = Notice::Updated {
+        server: &key.0,
+        uri: &key.1,
+        count,
+    }
+    .text();
+    Some(outgoing_to(key, caller, subscriber, text))
 }
 
 /// One notice of `text` for each subscriber of a stream, not coalesced.
-fn outgoing_for_all(key: &(String, String), stream: &UriStream, text: &str) -> Vec<Outgoing> {
+fn outgoing_for_all(key: &(String, String), stream: &mut UriStream, text: &str) -> Vec<Outgoing> {
     stream
         .subscribers
-        .iter()
-        .map(|(caller, subscriber)| Outgoing {
-            key: key.clone(),
-            subscriber: caller.clone(),
-            chain_event: subscriber.chain_event.clone(),
-            text: text.to_string(),
-        })
+        .iter_mut()
+        .map(|(caller, subscriber)| outgoing_to(key, caller, subscriber, text.to_string()))
         .collect()
 }
 

@@ -42,17 +42,7 @@ pub(super) enum OpenFailure {
 /// checks of a first subscribe. The subscription is dropped (and cancelled on the
 /// wire) on every failure.
 pub(super) async fn open(tool: &McpTool, server: &str, uri: &str) -> Result<Subscription, OpenFailure> {
-    let timeout_ms = {
-        let state = tool.state.read();
-        McpTool::resolve_server(&state.effective_config, server).map(|config| config.request_timeout_ms)
-    }
-    .map_err(OpenFailure::Gone)?;
-    if tool.retired.lock().contains(server) {
-        return Err(OpenFailure::Gone(anyhow!(
-            "MCP server '{}' was removed or narrowed by a configuration change; it is no longer started",
-            server.escape_default()
-        )));
-    }
+    let timeout_ms = served_timeout_ms(tool, server).map_err(OpenFailure::Gone)?;
     let attached = match tool.attach_peer(server).await {
         Ok(attached) => attached,
         Err(error) => {
@@ -113,6 +103,23 @@ pub(super) async fn open(tool: &McpTool, server: &str, uri: &str) -> Result<Subs
     Ok(subscription)
 }
 
+/// The request timeout of `server` when `tool` still serves it: configured
+/// and not retired by a configuration change. A first subscribe and a join of
+/// a live stream both pass here, so a server dropped by a reload is refused.
+pub(super) fn served_timeout_ms(tool: &McpTool, server: &str) -> anyhow::Result<u64> {
+    let timeout_ms = {
+        let state = tool.state.read();
+        McpTool::resolve_server(&state.effective_config, server).map(|config| config.request_timeout_ms)
+    }?;
+    if tool.retired.lock().contains(server) {
+        anyhow::bail!(
+            "MCP server '{}' was removed or narrowed by a configuration change; it is no longer started",
+            server.escape_default()
+        );
+    }
+    Ok(timeout_ms)
+}
+
 /// Consume a stream until it ends, then reopen it with backoff. Ends when the
 /// URI is declined, the server is gone, or the subscription is aborted by the
 /// last unsubscribe.
@@ -120,8 +127,16 @@ pub(super) async fn run(hub: Arc<Hub>, key: (String, String), mut subscription: 
     let mut backoff = BACKOFF_FIRST;
     loop {
         let started = Instant::now();
-        let reason = consume(&hub, &key, &mut subscription).await;
+        let ended = consume(&hub, &key, &mut subscription).await;
         drop(subscription);
+        let reason = match ended {
+            StreamEnd::Ended(reason) => reason,
+            StreamEnd::Orphaned => {
+                tracing::debug!(server = %key.0, "MCP resource subscription ended: no live registry");
+                hub.end_stream(&key, NO_LIVE_REGISTRY);
+                return;
+            }
+        };
         // A stream that lived long enough was healthy: the next outage starts again at 1 s.
         // A shorter one is still flapping, so its reopen waits longer even when it succeeds.
         backoff = if started.elapsed() >= STABLE_AFTER {
@@ -162,32 +177,55 @@ pub(super) async fn run(hub: Arc<Hub>, key: (String, String), mut subscription: 
     }
 }
 
+/// Why `consume` returned.
+enum StreamEnd {
+    /// The stream ended or failed; the reason is shown by `status`.
+    Ended(String),
+    /// Every registry of the hub is gone (for example after the workspace
+    /// directory changed on reload): the stream is ended, not reopened.
+    Orphaned,
+}
+
+/// The reason given to subscribers when no live registry serves the hub any more.
+const NO_LIVE_REGISTRY: &str = "no live MCP registry serves this workspace any more";
+
+/// How often a healthy stream checks that a live registry still serves its hub.
+const LIVENESS_CHECK: Duration = Duration::from_secs(30);
+
 /// Read notifications until the stream ends. Counts updates of the stream's URI
-/// and returns the reason the stream ended, for `status`.
-async fn consume(hub: &Arc<Hub>, key: &(String, String), subscription: &mut Subscription) -> String {
+/// and returns why the stream ended. A hub left without a live registry ends
+/// its stream at the next liveness check, so the subscription does not keep
+/// the old peer alive.
+async fn consume(hub: &Arc<Hub>, key: &(String, String), subscription: &mut Subscription) -> StreamEnd {
+    let mut liveness = tokio::time::interval_at(tokio::time::Instant::now() + LIVENESS_CHECK, LIVENESS_CHECK);
     loop {
-        match subscription.next().await {
-            Ok(Some(ServerNotification::ResourceUpdatedNotification(notification))) => {
-                if notification.params.uri == key.1 {
-                    hub.record_update(key);
-                } else {
-                    tracing::debug!(server = %key.0, "MCP resource update for another URI ignored");
+        tokio::select! {
+            next = subscription.next() => match next {
+                Ok(Some(ServerNotification::ResourceUpdatedNotification(notification))) => {
+                    if notification.params.uri == key.1 {
+                        hub.record_update(key);
+                    } else {
+                        tracing::debug!(server = %key.0, "MCP resource update for another URI ignored");
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => return StreamEnd::Ended("the stream ended".to_string()),
+                Err(error) => return StreamEnd::Ended(redact_provider_text(&format!("the stream failed: {error}"))),
+            },
+            _ = liveness.tick() => {
+                if hub.newest_owner().is_none() {
+                    return StreamEnd::Orphaned;
                 }
             }
-            Ok(Some(_)) => {}
-            Ok(None) => return "the stream ended".to_string(),
-            Err(error) => return redact_provider_text(&format!("the stream failed: {error}")),
         }
     }
 }
 
-/// Reopen the stream of `key` on the newest live registry.
+/// Reopen the stream of `key` on the newest live registry. A hub without one
+/// ends the stream at once instead of retrying forever.
 async fn reconnect(hub: &Hub, key: &(String, String)) -> Result<Subscription, OpenFailure> {
     let Some((tool, _)) = hub.newest_owner() else {
-        return Err(OpenFailure::Failed {
-            error: anyhow!("no live MCP registry serves server '{}'", key.0),
-            retry_after: None,
-        });
+        return Err(OpenFailure::Gone(anyhow!(NO_LIVE_REGISTRY)));
     };
     open(&tool, &key.0, &key.1).await
 }
