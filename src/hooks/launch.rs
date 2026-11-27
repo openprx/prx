@@ -113,7 +113,10 @@ impl HookCore {
         cmd.env_clear();
         cmd.envs(environment);
         cmd.current_dir(&working_dir);
+        // Each event variable is set under its `PRX_HOOK_*` name and its
+        // legacy `ZERO_HOOK_*` name, which stays for compatibility.
         cmd.env("ZERO_HOOK_EVENT", event.as_str());
+        cmd.env("PRX_HOOK_EVENT", event.as_str());
         for (name, value) in identity_variables(payload) {
             cmd.env(name, value);
         }
@@ -122,9 +125,12 @@ impl HookCore {
         const MAX_ENV_PAYLOAD_BYTES: usize = 8 * 1024;
         if payload_json.len() <= MAX_ENV_PAYLOAD_BYTES {
             cmd.env("ZERO_HOOK_PAYLOAD", &payload_json);
+            cmd.env("PRX_HOOK_PAYLOAD", &payload_json);
         } else {
             cmd.env("ZERO_HOOK_PAYLOAD", "");
             cmd.env("ZERO_HOOK_PAYLOAD_TRUNCATED", "1");
+            cmd.env("PRX_HOOK_PAYLOAD", "");
+            cmd.env("PRX_HOOK_PAYLOAD_TRUNCATED", "1");
         }
 
         // NamedTempFile is created with restrictive permissions and removes itself on every exit.
@@ -135,6 +141,7 @@ impl HookCore {
         payload_file.write_all(payload_json.as_bytes())?;
         payload_file.flush()?;
         cmd.env("ZERO_HOOK_PAYLOAD_FILE", payload_file.path());
+        cmd.env("PRX_HOOK_PAYLOAD_FILE", payload_file.path());
 
         if action.stdin_json {
             cmd.stdin(std::process::Stdio::piped());

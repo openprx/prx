@@ -2360,7 +2360,7 @@ A command hook that runs:
 - starts from the cleared launch environment of MCP servers (`PATH`, `HOME`,
   `LANG`, `LC_*`, `TMPDIR`, on Windows also `SYSTEMROOT`, `USERPROFILE`,
   `TEMP` and `TMP`), plus its own `env` from `hooks.json` as written and the
-  `ZERO_HOOK_*` event variables. No provider key or other variable of PRX's
+  `PRX_HOOK_*` event variables (the legacy `ZERO_HOOK_*` names are set too). No provider key or other variable of PRX's
   environment reaches it unless the hook's own `env` names it: this is secret
   protection and stays. The `env` of a hook may set any variable (`PATH`, a
   proxy, `NODE_OPTIONS`); only an entry holding a NUL byte is dropped, with a

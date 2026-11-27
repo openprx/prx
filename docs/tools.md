@@ -1701,13 +1701,15 @@ events is not defined.
 Fields that are not known for an event are `null`; `parent` appears only for a
 child session and `schedule` only for a scheduled run. `v` is raised only for a
 breaking change. The same JSON is the stdin of a command hook, the content of
-`ZERO_HOOK_PAYLOAD` (up to 8 KiB, else empty with `ZERO_HOOK_PAYLOAD_TRUNCATED=1`)
-and `ZERO_HOOK_PAYLOAD_FILE`, the payload of a WASM hook and the payload of the
+`PRX_HOOK_PAYLOAD` (up to 8 KiB, else empty with `PRX_HOOK_PAYLOAD_TRUNCATED=1`)
+and `PRX_HOOK_PAYLOAD_FILE`, the payload of a WASM hook and the payload of the
 `prx.lifecycle.<event>` event-bus topic. A command hook also receives
-`ZERO_HOOK_EVENT` and, when known, `PRX_HOOK_SESSION`, `PRX_HOOK_RUN` and
+`PRX_HOOK_EVENT` and, when known, `PRX_HOOK_SESSION`, `PRX_HOOK_RUN` and
 `PRX_HOOK_ORIGIN`. Before the envelope, the payload was the `data` object
 itself; a script or plugin that read fields at the top level reads them from
-`data` now.
+`data` now. The `ZERO_HOOK_*` names (`ZERO_HOOK_EVENT`, `ZERO_HOOK_PAYLOAD`,
+`ZERO_HOOK_PAYLOAD_TRUNCATED`, `ZERO_HOOK_PAYLOAD_FILE`) are still set with the
+same values for compatibility.
 
 ### Configuration
 
