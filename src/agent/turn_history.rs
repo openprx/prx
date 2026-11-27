@@ -276,9 +276,11 @@ impl CanonicalHistory {
 
     /// Per message, index for index, whether it may claim its own stored row
     /// in a provenance resolution: an acknowledged message, or a caller-supplied
-    /// one other than the caller's pending request (its newest user query).
-    /// The same rule [`Self::reducer_form`] applies, so a caller-supplied
-    /// history (a gateway or channel turn) keeps its stored turns provable.
+    /// one other than the caller's pending request (its newest user query) that
+    /// carries a stored event id. A caller-supplied message without an event id
+    /// (appended by this turn, or a channel history) claims no row, so it cannot
+    /// resolve onto an older identical row. Otherwise the same rule as
+    /// [`Self::reducer_form`].
     pub(crate) fn provenance_kept_flags(&self) -> Vec<bool> {
         let caller_pending = crate::agent::history::latest_user_query_index(&self.messages)
             .filter(|index| self.origins.get(*index) == Some(&MessageOrigin::CallerSupplied));
@@ -287,7 +289,10 @@ impl CanonicalHistory {
             .enumerate()
             .map(|(index, origin)| match origin {
                 MessageOrigin::Acknowledged => true,
-                MessageOrigin::CallerSupplied => Some(index) != caller_pending,
+                MessageOrigin::CallerSupplied => {
+                    Some(index) != caller_pending
+                        && self.sources.get(index).is_some_and(MessageSources::has_stored_event)
+                }
                 MessageOrigin::Request | MessageOrigin::TurnRound | MessageOrigin::RefreshAside => false,
             })
             .collect()

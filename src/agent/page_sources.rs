@@ -33,6 +33,11 @@ impl MessageSources {
         }
     }
 
+    /// Whether the message derives from at least one stored event.
+    pub(crate) fn has_stored_event(&self) -> bool {
+        !self.event_ids.is_empty()
+    }
+
     /// The union of `sources`: a message derived from all of them.
     pub(crate) fn union(sources: &[Self]) -> Self {
         let event_ids: BTreeSet<&String> = sources.iter().flat_map(|source| &source.event_ids).collect();
