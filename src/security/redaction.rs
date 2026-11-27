@@ -391,7 +391,10 @@ impl NextByte {
 /// same line and whatever follows up to the next bare delimiter (whitespace,
 /// `,`, `;`, `{`, `}`), so `token = String::from("abc")` is masked whole and
 /// masking twice changes nothing. `None` when the quote does not close on
-/// its line.
+/// its line. A quote directly followed by whitespace, `,`, `;`, `{`, `}`,
+/// `)`, `]`, a backslash or the end of the text closes an enclosing string
+/// (the closing `'` of a shell argument, `'api_key: x' 'next'`); it does not
+/// open a literal, so the bare value keeps its own end.
 #[derive(Default)]
 struct QuotedTail {
     double: NextByte,
@@ -407,6 +410,11 @@ impl QuotedTail {
             b'\'' => &mut self.single,
             _ => return None,
         };
+        if text.as_bytes().get(quote_at + 1).is_none_or(|&after| {
+            after.is_ascii_whitespace() || matches!(after, b',' | b';' | b'{' | b'}' | b')' | b']' | b'\\')
+        }) {
+            return None;
+        }
         let close = closes.find(text, quote_at + 1, |byte| {
             byte == quote || matches!(byte, b'\n' | b'\r')
         });
