@@ -491,12 +491,26 @@ impl CanonicalHistory {
         self.messages
             .iter()
             .zip(&self.origins)
-            .map(|(message, origin)| match origin {
-                MessageOrigin::TurnRound | MessageOrigin::CallerSupplied => {
-                    crate::agent::compaction::is_tool_roundtrip_companion(message)
+            .enumerate()
+            .map(|(index, (message, origin))| match origin {
+                MessageOrigin::TurnRound => crate::agent::compaction::is_tool_roundtrip_companion(message),
+                // Round-trip traffic is never persisted, so a caller-supplied
+                // message with a stored event id is a durable turn, whatever its shape.
+                MessageOrigin::CallerSupplied => {
+                    !self.sources.get(index).is_some_and(MessageSources::has_stored_event)
+                        && crate::agent::compaction::is_tool_roundtrip_companion(message)
                 }
                 MessageOrigin::Acknowledged | MessageOrigin::Request | MessageOrigin::RefreshAside => false,
             })
+            .collect()
+    }
+
+    /// Per message, index for index, the stored event ids it derives from
+    /// (empty when it has none). A kept message must resolve to its own row.
+    pub(crate) fn recorded_event_ids(&self) -> Vec<Vec<String>> {
+        self.sources
+            .iter()
+            .map(|sources| sources.event_ids().to_vec())
             .collect()
     }
 

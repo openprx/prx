@@ -38,6 +38,11 @@ impl MessageSources {
         !self.event_ids.is_empty()
     }
 
+    /// The stored event ids the message derives from (empty when none).
+    pub(crate) fn event_ids(&self) -> &[String] {
+        &self.event_ids
+    }
+
     /// The union of `sources`: a message derived from all of them.
     pub(crate) fn union(sources: &[Self]) -> Self {
         let event_ids: BTreeSet<&String> = sources.iter().flat_map(|source| &source.event_ids).collect();

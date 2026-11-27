@@ -5,7 +5,7 @@ use super::audit::{persist_context_switch, switch_refusal_reason};
 use super::handoff_note::{
     MAX_HANDOFF_MESSAGE_BYTES, context_handoff_lineage, format_context_handoff_message, validated_context_handoff_note,
 };
-use super::handoff_summary::summarize_cold_window;
+use super::handoff_summary::{ColdWindow, summarize_cold_window};
 use super::provenance::{
     COMPACTION_PROVENANCE_EXACT_WITH_TOOL_ROUNDTRIPS, attach_compaction_event_provenance, stored_attachments,
 };
@@ -141,6 +141,21 @@ fn excess_in_weight_units(excess: usize, planning_total: usize, weights: &[usize
     usize::try_from(scaled).unwrap_or(usize::MAX)
 }
 
+/// The stored event id of each message in `start..end`, for the cold summary:
+/// the id when the message derives from exactly one stored event, else `None`
+/// (the summary then matches its attachment by content, as before).
+fn cold_window_event_ids(recorded: &[Vec<String>], start: usize, end: usize) -> Vec<Option<String>> {
+    recorded
+        .get(start..end)
+        .unwrap_or_default()
+        .iter()
+        .map(|ids| match ids.as_slice() {
+            [only] => Some(only.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 pub(crate) async fn build_configurable_compaction_patch(
     history: &[ChatMessage],
@@ -262,6 +277,7 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
     let compacted_source_messages = source_history.get(start..compact_end);
     let compacted_companions = RoundCompanions::Marked(companions.get(start..compact_end).unwrap_or_default());
     let mut audit_source = audit.and_then(|_| compacted_source_messages.map(build_compaction_audit_source));
+    let recorded = source.recorded_event_ids();
     if let (Some(audit), Some(source_messages), Some(audit_source)) =
         (audit, compacted_source_messages, audit_source.as_mut())
     {
@@ -273,9 +289,12 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
         let kept_acknowledged = source_history
             .iter()
             .zip(&acknowledged)
+            .enumerate()
             .skip(compact_end)
-            .filter(|(message, acknowledged)| **acknowledged && matches!(message.role.as_str(), "user" | "assistant"))
-            .map(|(message, _)| message)
+            .filter(|(_, (message, acknowledged))| {
+                **acknowledged && matches!(message.role.as_str(), "user" | "assistant")
+            })
+            .map(|(index, (message, _))| (message, recorded.get(index).cloned().unwrap_or_default()))
             .collect::<Vec<_>>();
         attach_compaction_event_provenance(
             audit,
@@ -425,10 +444,14 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
             compacted_source_messages.map_or(0, <[_]>::len),
         )
         .await;
+        let cold_event_ids = cold_window_event_ids(&recorded, start, compact_end);
         let cold_summary = summarize_cold_window(
             provider,
             model,
-            compacted_source_messages.unwrap_or_default(),
+            ColdWindow {
+                messages: compacted_source_messages.unwrap_or_default(),
+                event_ids: &cold_event_ids,
+            },
             &attachments,
             config.max_context_tokens,
             &instructions,

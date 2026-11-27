@@ -127,6 +127,14 @@ impl HandoffSummary {
     }
 }
 
+/// The cold window to summarize: its messages, and the stored event id of each
+/// one (`None` when the message has none, or more than one).
+#[derive(Clone, Copy)]
+pub(crate) struct ColdWindow<'a> {
+    pub(crate) messages: &'a [ChatMessage],
+    pub(crate) event_ids: &'a [Option<String>],
+}
+
 /// Asks `provider` once, with `model`, for the summary of the cold window
 /// `cold`. `attachments` are the stored attachments of the session's rows, which
 /// let a user message be read as the user wrote it. `max_context_tokens` sizes
@@ -136,7 +144,7 @@ impl HandoffSummary {
 pub(crate) async fn summarize_cold_window(
     provider: &dyn Provider,
     model: &str,
-    cold: &[ChatMessage],
+    cold: ColdWindow<'_>,
     attachments: &HashMap<String, Attachment>,
     max_context_tokens: usize,
     extra_instructions: &[String],
@@ -223,20 +231,29 @@ fn source_budget_chars(max_context_tokens: usize) -> usize {
 /// The cold window as `ROLE: text` blocks, one per message, bounded to
 /// `budget_chars` characters; with whether the bound cut it.
 fn build_cold_window_source(
-    cold: &[ChatMessage],
+    cold: ColdWindow<'_>,
     attachments: &HashMap<String, Attachment>,
     budget_chars: usize,
 ) -> (String, bool) {
     let blocks: Vec<String> = cold
+        .messages
         .iter()
-        .map(|message| render_cold_message(message, attachments))
+        .enumerate()
+        .map(|(index, message)| {
+            let event_id = cold.event_ids.get(index).and_then(Option::as_deref);
+            render_cold_message(message, event_id, attachments)
+        })
         .collect();
     let text = blocks.join("\n\n");
     let cut = text.chars().count() > budget_chars;
     (bound_chars(&text, budget_chars), cut)
 }
 
-fn render_cold_message(message: &ChatMessage, attachments: &HashMap<String, Attachment>) -> String {
+fn render_cold_message(
+    message: &ChatMessage,
+    event_id: Option<&str>,
+    attachments: &HashMap<String, Attachment>,
+) -> String {
     if is_context_handoff_message(message) {
         return render_earlier_handoff(&message.content);
     }
@@ -260,7 +277,10 @@ fn render_cold_message(message: &ChatMessage, attachments: &HashMap<String, Atta
         return format!("TOOL: {}", cut_chars(message.content.trim(), TOOL_RESULT_MAX_CHARS));
     }
     if message.role == "user" {
-        return format!("USER: {}", visible_user_text(&message.content, attachments).trim());
+        return format!(
+            "USER: {}",
+            visible_user_text(&message.content, event_id, attachments).trim()
+        );
     }
     format!("{}: {}", message.role.to_uppercase(), message.content.trim())
 }
@@ -271,10 +291,20 @@ fn render_cold_message(message: &ChatMessage, attachments: &HashMap<String, Atta
 /// it. The attachment whose match removes the most is taken: the composed form
 /// removes the prefix and the tail, the replayed form the tail alone. No match
 /// leaves `content` unchanged. Prefix and tail match only at character
-/// boundaries, so the cut is always valid.
-fn visible_user_text<'a>(content: &'a str, attachments: &HashMap<String, Attachment>) -> &'a str {
-    let best = attachments
-        .values()
+/// boundaries, so the cut is always valid. With the message's own `event_id`,
+/// only that row's attachment is considered (none when the row has none); without
+/// one, every attachment is matched by content as before.
+fn visible_user_text<'a>(
+    content: &'a str,
+    event_id: Option<&str>,
+    attachments: &HashMap<String, Attachment>,
+) -> &'a str {
+    let candidates: Vec<&Attachment> = match event_id {
+        Some(event_id) => attachments.get(event_id).into_iter().collect(),
+        None => attachments.values().collect(),
+    };
+    let best = candidates
+        .into_iter()
         .filter(|attachment| !(attachment.prefix.is_empty() && attachment.tail.is_empty()))
         .filter_map(|attachment| {
             if !content.ends_with(attachment.tail.as_str()) {

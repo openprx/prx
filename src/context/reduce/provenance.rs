@@ -818,15 +818,16 @@ pub(crate) async fn resolve_compaction_event_provenance_detailed(
 
 /// [`resolve_compaction_event_provenance_detailed`] for `source_messages`
 /// resolved together with `kept`: acknowledged messages after the source,
-/// in history order, each of which claims a row of its own. The assignment
-/// must be unique over source and `kept` together; only the source's rows
-/// are returned.
+/// in history order, each of which claims a row of its own, with the stored
+/// event ids recorded for it (empty when none). The assignment must be unique
+/// over source and `kept` together, and every kept message with a recorded id
+/// must claim exactly that row; only the source's rows are returned.
 pub(crate) async fn resolve_provenance_with_kept(
     mem: &dyn Memory,
     principal: MemoryPrincipal,
     source_messages: &[ChatMessage],
     companions: RoundCompanions<'_>,
-    kept: &[&ChatMessage],
+    kept: &[(&ChatMessage, Vec<String>)],
 ) -> anyhow::Result<ProvenanceResolution> {
     if principal.session_key.is_none() || source_messages.is_empty() {
         return Ok(ProvenanceResolution::Unavailable(ProvenanceGap::NoSessionKey));
@@ -853,7 +854,7 @@ pub(crate) async fn resolve_provenance_with_kept(
     }
     let source_count = durable_messages.len();
     let mut joint_messages = durable_messages;
-    joint_messages.extend_from_slice(kept);
+    joint_messages.extend(kept.iter().map(|(message, _)| *message));
 
     // Only the session's own rows (canonical key): rows under the legacy key
     // (child or worker traffic) never take part.
@@ -874,6 +875,22 @@ pub(crate) async fn resolve_provenance_with_kept(
     // One row per message in history order: the source's rows lead.
     if matched.len() != joint_messages.len() {
         return Ok(ProvenanceResolution::Unavailable(ProvenanceGap::TurnUnmatched));
+    }
+    // A kept message with a recorded event id must claim that row. Several
+    // recorded ids, or a different row, is a doubt: the source is refused.
+    for (offset, (_, recorded)) in kept.iter().enumerate() {
+        if recorded.is_empty() {
+            continue;
+        }
+        let [expected] = recorded.as_slice() else {
+            return Ok(ProvenanceResolution::Unavailable(ProvenanceGap::TurnAmbiguous));
+        };
+        let Some((_, claimed)) = matched.get(source_count.saturating_add(offset)) else {
+            return Ok(ProvenanceResolution::Unavailable(ProvenanceGap::TurnUnmatched));
+        };
+        if claimed != expected {
+            return Ok(ProvenanceResolution::Unavailable(ProvenanceGap::TurnAmbiguous));
+        }
     }
     matched.truncate(source_count);
 
@@ -902,7 +919,7 @@ pub(crate) async fn attach_compaction_event_provenance(
     audit: &DocumentIngestRuntime,
     source_messages: &[ChatMessage],
     companions: RoundCompanions<'_>,
-    kept_acknowledged: &[&ChatMessage],
+    kept_acknowledged: &[(&ChatMessage, Vec<String>)],
     source: &mut CompactionAuditSource,
 ) {
     let resolution = match resolve_compaction_event_provenance_detailed(
