@@ -176,9 +176,11 @@ subscription marker and is then billed as a token price.
   `anthropic/`; other models get the same request as before, with no marks.
   The marks use the same rule as the native Anthropic provider, at most three
   per request: the system message (when over 3 KB) and the two conversation
-  breakpoints (the end of the replayed history and the last message). Only
-  plain-text messages are marked, in array form; a breakpoint that falls on a
-  tool result or an assistant tool-call message is skipped. Both streaming and
+  breakpoints (the end of the replayed history and the last message). Plain-text
+  messages and tool results are marked, in array form, so a turn that ends with
+  a tool result keeps its last-message mark; a breakpoint on an assistant
+  tool-call message without text moves to the nearest earlier message that can
+  carry it. Both streaming and
   non-streaming requests carry the marks. Tools are unchanged.
 - OpenAI (direct) sends native `tools` with `tool_choice: "auto"` and parses
   streamed `tool_calls` deltas. Both the system-prompt and full-history streaming
