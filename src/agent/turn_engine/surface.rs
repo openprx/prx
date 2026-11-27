@@ -210,9 +210,9 @@ pub(super) async fn plan_round_budget(
     let mut request_budget: Option<RequestBudget> = None;
     let budgeted_totals: Option<(usize, usize)> = if let Some(config) = compaction_config {
         // The system prompt is the leading message of the history; its
-        // budgeted size feeds the window floor warning in `plan_round`. It is
-        // measured only until that warning has fired.
-        let system_tokens = if crate::context::budget::record::floor_warning_pending() {
+        // budgeted size feeds the window floor check in `plan_round`. It is
+        // measured only by the first request of the process.
+        let system_tokens = if crate::context::budget::record::floor_check_pending() {
             history.first().filter(|m| m.role == "system").map_or(0, |m| {
                 crate::agent::context_budget::budgeted_tokens(
                     crate::agent::context_budget::estimate_history_tokens_with_source(std::slice::from_ref(m)),
