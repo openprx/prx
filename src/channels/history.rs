@@ -5,7 +5,7 @@ use super::{
     Arc, ChannelRuntimeContext, ChatMessage, HashMap, MAX_CHANNEL_HISTORY, MAX_HYDRATED_SESSIONS, Memory, MemoryFabric,
     MemoryPrincipal, MemoryVisibility, RuntimeEnvelope, strip_fabricated_tool_markers_from_assistant_turns,
 };
-use crate::context::transcript::Transcript;
+use crate::context::transcript::{SessionTurns, Transcript};
 
 /// Reshape cached turns into the strict user/assistant alternation the
 /// providers expect, and drop fabricated `[Used tools: ...]` lines from the
@@ -119,10 +119,11 @@ pub(super) fn merged_history(
 /// cut at the current message the same way, and a leading reply is dropped as
 /// the cache normalization does. It is used only when the newest `cached.len()`
 /// logged turns equal the cache role for role and text for text, in order (an
-/// exact suffix match), and then only those turns are returned. The log rows are
-/// the raw rows, not the handoff view. Any other
-/// outcome, including a read failure or a display-projection read, returns
-/// `None` and the cache is replayed.
+/// exact suffix match), and then those turns are returned as the model's view
+/// of the log, the same view the gateway uses: the session's newest valid
+/// context handoff first, followed by the matched turns after its row range.
+/// Any other outcome, including a read failure or a display-projection read,
+/// returns `None` and the cache is replayed.
 pub(super) async fn logged_turns_matching_cache(
     memory: &dyn Memory,
     principal: MemoryPrincipal,
@@ -144,9 +145,9 @@ pub(super) async fn logged_turns_matching_cache(
     if !loaded.from_log() {
         return None;
     }
-    // The raw log rows, not the handoff view: the model sees what the cache
-    // shows, and a handoff row written by an earlier switch never breaks the
-    // comparison, so later switches keep their event ids.
+    // The comparison runs on the raw log rows (a handoff row is not one of
+    // them, so an earlier switch never breaks it); the handoff view is applied
+    // to the matched turns below.
     let mut logged = loaded.turns;
     if let Some(index) = logged
         .iter()
@@ -174,7 +175,11 @@ pub(super) async fn logged_turns_matching_cache(
     if !matches {
         return None;
     }
-    Some(suffix)
+    Some(
+        transcript
+            .model_turns_from(session_key, SessionTurns::logged(suffix))
+            .await,
+    )
 }
 
 pub(super) fn clear_sender_history(ctx: &ChannelRuntimeContext, key: &ConversationKey) {

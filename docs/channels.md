@@ -159,6 +159,11 @@ as on those surfaces. Semantic recall leaves out memories autosaved from the
 session's own earlier messages, because the replayed history already carries
 them; memories of other sessions and memories without a source event are kept.
 
+When the session log holds exactly the turns the channel cache holds, the
+earlier turns come from the log as the gateway reads them: the newest context
+handoff of the session first, then the turns after it, so a later switch
+records that handoff as its parent. Any mismatch replays the cache.
+
 Direct chats keep the session's memory index in the system prompt (recorded
 once per session and replayed on later turns) and see the unseen
 scheduled-results note. Group-like chats (a chat whose visibility is

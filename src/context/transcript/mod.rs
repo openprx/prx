@@ -47,6 +47,12 @@ pub(crate) struct SessionTurns {
 }
 
 impl SessionTurns {
+    /// Turns that were read from the log (`message_events`), for example a
+    /// verified suffix of [`Transcript::load_session_turns`].
+    pub(crate) const fn logged(turns: Vec<ConversationTurn>) -> Self {
+        Self { turns, from_log: true }
+    }
+
     /// Whether the turns were read from the log, so their ids are `message_events` ids.
     pub(crate) const fn from_log(&self) -> bool {
         self.from_log
