@@ -5,7 +5,7 @@ use crate::config::DelegateAgentConfig;
 use crate::hooks::HookManager;
 use crate::memory::{Memory, MemoryEventRecording, MemoryFabric, MessageEventScope};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
-use crate::providers::{self, ChatMessage, Provider};
+use crate::providers::{self, Provider};
 use crate::runtime::envelope::RuntimeEnvelope;
 use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
@@ -1423,22 +1423,13 @@ impl DelegateLoopResources {
             .map(|directory| security.workspace_dir.join(directory));
         let role_prompt =
             crate::identity::delegated::compose(identity_path.as_deref(), agent_config.system_prompt.as_deref());
-        let mut history = vec![ChatMessage::system(role_prompt.clone())];
-        history.push(crate::agent::turn_contracts::inbound_user_message(full_prompt));
-
-        {
+        let mut history = {
             let turn = &mut child_turn;
-            turn.project_history(history.len() + 1);
-
             let prompt = turn.system_prompt(&child_config, &role_prompt)?;
-            if let Some(system) = history.first_mut().filter(|message| message.role == "system") {
-                *system = ChatMessage::system(prompt);
-            } else if !prompt.is_empty() {
-                history.insert(0, ChatMessage::system(prompt));
-            }
+            let history = turn.open_first_input(Vec::new(), prompt, Some(hooks.as_ref())).await?;
             turn.project_history(history.len() + 1);
-            turn.enrich_input(&mut history).await?;
-        }
+            history
+        };
         // R9/R26: an enabled engine analyses the delegated child turn on its
         // own runtime context and accounting scope.
         let advice = {

@@ -96,11 +96,14 @@ pub(crate) async fn summary_instructions(trigger: &str, cold_messages: usize) ->
 }
 
 /// Whether a turn opened from `source` is a child's first input: the sources
-/// of the sessions_spawn task and the session-worker process. A child takes
-/// the child-open contribution in place of the turn-open and session-open
-/// points.
+/// of the sessions_spawn task, the session-worker process and the delegate
+/// tool. A child takes the child-open contribution in place of the turn-open
+/// and session-open points.
 pub(crate) const fn is_child_open(source: RuntimeSource) -> bool {
-    matches!(source, RuntimeSource::SessionWorker | RuntimeSource::SessionsSpawn)
+    matches!(
+        source,
+        RuntimeSource::SessionWorker | RuntimeSource::SessionsSpawn | RuntimeSource::Delegate
+    )
 }
 
 /// The child-open contributions of a child's first input, rendered as the

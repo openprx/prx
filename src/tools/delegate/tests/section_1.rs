@@ -1,6 +1,6 @@
     use super::*;
     use crate::memory::{MemoryPrincipal, SqliteMemory};
-    use crate::providers::{ChatRequest, ChatResponse, ToolCall};
+    use crate::providers::{ChatMessage, ChatRequest, ChatResponse, ToolCall};
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
