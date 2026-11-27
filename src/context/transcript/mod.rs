@@ -158,8 +158,16 @@ impl<'a> Transcript<'a> {
     pub(crate) async fn expand_turns(&self, turns: Vec<ConversationTurn>) -> History {
         // Attachments are read back to the oldest turn replayed, whatever the
         // newest message rows of the session hold (deleted turns, continuation
-        // inputs).
-        let replay_floor = turns.iter().map(|turn| turn.id).min();
+        // inputs). Only turns that carry a log row id and event id give a
+        // floor: when any turn lacks one (a child turn carries id 0), the
+        // oldest message row read stands in. A display projection turn's id is
+        // not a log id; the log read pages to the lower of the two, so it
+        // never gets less than that row covers.
+        let replay_floor = if turns.iter().all(|turn| turn.id > 0 && turn.message_event_id.is_some()) {
+            turns.iter().map(|turn| turn.id).min()
+        } else {
+            None
+        };
         ReplayLog::load(self.memory, &self.principal, replay_floor)
             .await
             .expand_turns(turns)

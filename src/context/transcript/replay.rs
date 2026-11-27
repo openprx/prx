@@ -124,9 +124,10 @@ impl ReplayLog {
     /// Read the session's tool, attachment and message rows. A read that fails
     /// leaves the log empty, so the turn replays as it did before these rows.
     ///
-    /// `replay_floor` is the id of the oldest turn that will be replayed, when the
-    /// caller knows its turns: attachments are paged back to it. Without it the
-    /// oldest user or assistant row read stands in.
+    /// `replay_floor` is the log id of the oldest turn that will be replayed,
+    /// when the caller knows its turns by log id. Attachments older than the tool
+    /// window are paged back to the lower of it and the oldest user or assistant
+    /// row read, and never fewer than the newest [`REPLAY_ROW_LIMIT`] of them.
     pub(super) async fn load(
         mem: &dyn crate::memory::Memory,
         principal: &MemoryPrincipal,
@@ -168,7 +169,14 @@ impl ReplayLog {
                 // attachment of a message still wins.
                 let window_full = tool_rows.len() >= REPLAY_ROW_LIMIT || message_rows.len() >= REPLAY_ROW_LIMIT;
                 if with_messages && tool_rows.len() >= REPLAY_ROW_LIMIT {
-                    let replay_from = replay_floor.or_else(|| message_rows.iter().map(|event| event.id).min());
+                    // The oldest message row read also bounds the paging, so
+                    // turns whose ids are not log ids (a display projection)
+                    // still get at least what that row covers.
+                    let message_floor = message_rows.iter().map(|event| event.id).min();
+                    let replay_from = match (replay_floor, message_floor) {
+                        (Some(turns), Some(messages)) => Some(turns.min(messages)),
+                        (turns, messages) => turns.or(messages),
+                    };
                     let mut rows = Self::attachment_rows_outside(mem, principal, &tool_rows, replay_from).await;
                     rows.append(&mut tool_rows);
                     tool_rows = rows;
@@ -187,35 +195,36 @@ impl ReplayLog {
         }
     }
 
-    /// The attachment rows older than the tool window `tool_rows` that the
-    /// replayed turns may need, oldest first. An attachment is written after its
-    /// user message, so every attachment the replay needs has a row id above
-    /// `replay_from`, the id of the oldest replayed turn (the oldest message row
-    /// read when the caller has no turns): only attachment rows are read, paged
-    /// back from the window to that id with `session_events_of_type_before`, so
-    /// no attachment is lost however many tool rows the session holds. A backend
-    /// without the read, or a failed page (an unreadable row of an encrypted
-    /// scope among them), keeps what was read so far.
+    /// The attachment rows older than the tool window `tool_rows`, oldest
+    /// first. Only attachment rows are read (`session_events_of_type_before`,
+    /// pages of [`REPLAY_ROW_LIMIT`] rows, newest first, before the window).
+    /// The first page is always read: it holds every row the newest
+    /// [`REPLAY_ROW_LIMIT`] attachment rows of the session held outside the
+    /// window. An attachment is written after its user message, so every
+    /// attachment a replayed turn needs has a row id above `replay_from`, the
+    /// oldest replayed turn (or the oldest message row read): further pages are
+    /// read until one reaches it or the session starts. A backend without the
+    /// read, or a failed page (an unreadable row of an encrypted scope among
+    /// them), keeps what was read so far.
     async fn attachment_rows_outside(
         mem: &dyn crate::memory::Memory,
         principal: &MemoryPrincipal,
         tool_rows: &[MessageEvent],
         replay_from: Option<i64>,
     ) -> Vec<MessageEvent> {
-        let (Some(window_oldest), Some(replay_from)) = (tool_rows.iter().map(|event| event.id).min(), replay_from)
-        else {
+        let (Some(session_key), Some(window_oldest)) = (
+            principal.session_key.as_deref(),
+            tool_rows.iter().map(|event| event.id).min(),
+        ) else {
             return Vec::new();
         };
         let mut rows = Vec::new();
         let mut before = window_oldest;
-        while replay_from < before {
-            let query = SessionContextQuery {
-                principal: principal.clone(),
-                since_event_id: None,
-                limit: REPLAY_ROW_LIMIT,
-                include_roles: vec!["tool".to_owned()],
-            };
-            let page = match mem.load_session_context_before(query, before).await {
+        loop {
+            let page = match mem
+                .session_events_of_type_before(principal, session_key, ATTACHMENT_EVENT_TYPE, before, REPLAY_ROW_LIMIT)
+                .await
+            {
                 Ok(page) => page,
                 Err(error) => {
                     if !error.is::<crate::memory::erasure::Unsupported>() {
@@ -231,11 +240,12 @@ impl ReplayLog {
             let Some(page_oldest) = page.iter().map(|event| event.id).min() else {
                 break;
             };
-            rows.extend(
-                page.into_iter()
-                    .filter(|event| event.event_type == ATTACHMENT_EVENT_TYPE),
-            );
-            if page_len < REPLAY_ROW_LIMIT {
+            // A backend that ignored the cursor would page forever.
+            if page_oldest >= before {
+                break;
+            }
+            rows.extend(page);
+            if page_len < REPLAY_ROW_LIMIT || replay_from.is_none_or(|floor| page_oldest <= floor) {
                 break;
             }
             before = page_oldest;
