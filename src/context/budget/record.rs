@@ -3,13 +3,18 @@
 
 use super::anchor::{Calibration, LocalPlan, Probe, ReportedRequest, RequestBudget, UsageAnchors};
 use super::{ContextBudgetSnapshot, check_request_window, request_tool_tokens};
+use crate::agent::budget_inputs::{capped_reply_reserve, keep_recent_token_budget};
 use crate::agent::turn_context::RequestToolMeasurement;
 use crate::llm::route_decision::TokenUsage;
 use crate::memory::{MemoryFabric, MessageEventScope};
 use crate::tokens::count::TokenMeasurementSource;
+use std::sync::Once;
 
 /// The event type of the per-request usage row.
 pub(crate) const REPORTED_EVENT_TYPE: &str = "llm.request.usage.reported";
+
+/// Once per process: the floor warning is emitted at most once.
+static FLOOR_WARNING: Once = Once::new();
 
 /// Note the request the reduction steps of one round have shaped, and set it
 /// against the model window. Without an anchor the estimate checked is the
@@ -22,7 +27,9 @@ pub(crate) fn plan_round(
     config: &crate::config::AgentCompactionConfig,
     budget: ContextBudgetSnapshot,
     tool_surface: RequestToolMeasurement,
+    system_tokens: usize,
 ) -> RequestBudget {
+    warn_once_if_window_floor_is_tight(config, tool_surface, system_tokens);
     let (_, heuristic_total_tokens) = budget.local_request_totals(tool_surface);
     let planned = anchors.note_request(
         probe,
@@ -43,6 +50,34 @@ pub(crate) fn plan_round(
         );
     }
     planned
+}
+
+/// Warn once per process when the window, after the reply reserve, the system
+/// prompt and the tool surface, leaves less room than the kept-recent token
+/// budget. Counts only, and nothing is refused or trimmed for it.
+fn warn_once_if_window_floor_is_tight(
+    config: &crate::config::AgentCompactionConfig,
+    tool_surface: RequestToolMeasurement,
+    system_tokens: usize,
+) {
+    let hard_limit_tokens = config
+        .max_context_tokens
+        .saturating_sub(capped_reply_reserve(config.max_context_tokens, config.reserve_tokens));
+    let system_and_tool_tokens = system_tokens.saturating_add(request_tool_tokens(tool_surface));
+    let headroom = hard_limit_tokens.saturating_sub(system_and_tool_tokens);
+    let keep_recent_budget = keep_recent_token_budget(config);
+    if headroom >= keep_recent_budget {
+        return;
+    }
+    FLOOR_WARNING.call_once(|| {
+        tracing::warn!(
+            window_tokens = config.max_context_tokens,
+            hard_limit_tokens,
+            system_and_tool_tokens,
+            keep_recent_budget_tokens = keep_recent_budget,
+            "the model window leaves less room than the kept recent messages after the system prompt and the tool surface"
+        );
+    });
 }
 
 /// Settle the response of one request: it becomes the anchor of the next

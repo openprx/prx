@@ -209,6 +209,13 @@ pub(super) async fn plan_round_budget(
     // report there.
     let mut request_budget: Option<RequestBudget> = None;
     let budgeted_totals: Option<(usize, usize)> = if let Some(config) = compaction_config {
+        // The system prompt is the leading message of the history; its
+        // budgeted size feeds the window floor warning in `plan_round`.
+        let system_tokens = history.first().filter(|m| m.role == "system").map_or(0, |m| {
+            crate::agent::context_budget::budgeted_tokens(
+                crate::agent::context_budget::estimate_history_tokens_with_source(std::slice::from_ref(m)),
+            )
+        });
         // The durable phase, then the projection phase: the two steps of
         // the reduction ladder that run on every round, under the
         // calibration the last response's reported usage gives.
@@ -235,7 +242,7 @@ pub(super) async fn plan_round_budget(
         anchor::scoped(planning, Box::pin(crate::context::api::round::next_round(&mut round))).await?;
         request_budget = round
             .budget
-            .map(|budget| plan_round(&usage_anchors, probe, config, budget, tool_surface));
+            .map(|budget| plan_round(&usage_anchors, probe, config, budget, tool_surface, system_tokens));
         round.budget.map(|budget| budget.local_request_totals(tool_surface))
     } else {
         None

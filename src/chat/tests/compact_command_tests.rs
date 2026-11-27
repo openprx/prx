@@ -104,7 +104,7 @@ fn compact_command_with_nothing_beyond_the_kept_window_reports_noop() {
 }
 
 #[test]
-fn compact_command_below_the_budget_still_compacts_beyond_the_kept_window() {
+fn compact_command_below_the_budget_has_nothing_to_compact_beyond_the_kept_window() {
     let config = crate::config::AgentCompactionConfig {
         max_context_tokens: 1_000_000,
         max_context_tokens_explicit: true,
@@ -118,7 +118,10 @@ fn compact_command_below_the_budget_still_compacts_beyond_the_kept_window() {
         ChatMessage::user("three"),
     ];
 
-    assert!(manual_compact_has_compactable(&history, &config));
+    assert!(
+        !manual_compact_has_compactable(&history, &config),
+        "non-system messages within the kept-recent token budget have nothing to compact"
+    );
 }
 
 #[test]
