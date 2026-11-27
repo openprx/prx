@@ -25,7 +25,6 @@ fn window_holding(fits: &[ChatMessage]) -> crate::config::AgentCompactionConfig 
         mode: crate::config::AgentCompactionMode::Off,
         reserve_tokens: 1,
         keep_recent_messages: 2,
-        memory_flush: false,
         max_context_tokens: estimate_history_tokens(fits).saturating_add(1),
         max_context_tokens_explicit: true,
         ..crate::config::AgentCompactionConfig::default()
@@ -417,7 +416,6 @@ async fn newest_handoff_is_trimmed_last_on_preflight_projection() {
                     mode: crate::config::AgentCompactionMode::Off,
                     reserve_tokens: 10,
                     keep_recent_messages: 2,
-                    memory_flush: false,
                     max_context_tokens: 4106,
                     max_context_tokens_explicit: true,
                     ..crate::config::AgentCompactionConfig::default()
@@ -515,7 +513,6 @@ async fn newest_handoff_is_trimmed_last_on_mid_turn_trim() {
                     mode: crate::config::AgentCompactionMode::Off,
                     reserve_tokens: CONTEXT_BUDGET_FIXTURE_RESERVE_TOKENS,
                     keep_recent_messages: 2,
-                    memory_flush: false,
                     max_context_tokens: available.saturating_add(CONTEXT_BUDGET_FIXTURE_RESERVE_TOKENS),
                     max_context_tokens_explicit: true,
                     ..crate::config::AgentCompactionConfig::default()
@@ -629,7 +626,6 @@ async fn newest_handoff_is_trimmed_last_on_overflow_without_handoff() {
                 ];
                 let config = crate::config::AgentCompactionConfig {
                     mode: crate::config::AgentCompactionMode::Off,
-                    memory_flush: false,
                     ..crate::config::AgentCompactionConfig::default()
                 };
 

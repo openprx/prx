@@ -402,7 +402,6 @@ async fn redux_injection_overbudget_diagnostic_emits_only_for_injected_delta_and
         mode: crate::config::AgentCompactionMode::Off,
         reserve_tokens: 10,
         keep_recent_messages: 1,
-        memory_flush: false,
         max_context_tokens: 120,
         max_context_tokens_explicit: true,
         ..crate::config::AgentCompactionConfig::default()
@@ -466,7 +465,6 @@ fn redux_injection_overbudget_diagnostic_skips_normal_history_overflow() {
         mode: crate::config::AgentCompactionMode::Off,
         reserve_tokens: 10,
         keep_recent_messages: 1,
-        memory_flush: false,
         max_context_tokens: 120,
         max_context_tokens_explicit: true,
         ..crate::config::AgentCompactionConfig::default()
@@ -681,7 +679,6 @@ async fn redux_driver_preflight_emits_injection_overbudget_diagnostic_without_hi
         mode: crate::config::AgentCompactionMode::Off,
         reserve_tokens: 10,
         keep_recent_messages: 1,
-        memory_flush: false,
         max_context_tokens: 120,
         max_context_tokens_explicit: true,
         ..crate::config::AgentCompactionConfig::default()

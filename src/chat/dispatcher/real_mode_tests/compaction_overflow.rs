@@ -194,7 +194,6 @@ async fn redux_driver_switch_degradation_tells_the_user_context_was_dropped() {
                 mode: crate::config::AgentCompactionMode::Switch,
                 reserve_tokens: 10,
                 keep_recent_messages: 2,
-                memory_flush: false,
                 max_context_tokens: 160,
                 max_context_tokens_explicit: true,
                 ..crate::config::AgentCompactionConfig::default()
@@ -364,7 +363,6 @@ async fn redux_driver_preflight_uses_provider_summary_before_first_stream_reques
                 mode: crate::config::AgentCompactionMode::Switch,
                 reserve_tokens: 10,
                 keep_recent_messages: 2,
-                memory_flush: false,
                 max_context_tokens: 160,
                 max_context_tokens_explicit: true,
                 ..crate::config::AgentCompactionConfig::default()
@@ -582,7 +580,6 @@ async fn resumed_compacted_session_does_not_call_summarizer_again() {
         mode: crate::config::AgentCompactionMode::Switch,
         reserve_tokens: 10,
         keep_recent_messages: 1,
-        memory_flush: false,
         max_context_tokens: 170,
         max_context_tokens_explicit: true,
         ..crate::config::AgentCompactionConfig::default()
@@ -801,7 +798,6 @@ async fn redux_driver_preflight_provider_history_keeps_real_user_question_last_a
                 mode: crate::config::AgentCompactionMode::Switch,
                 reserve_tokens: 10,
                 keep_recent_messages: 1,
-                memory_flush: false,
                 max_context_tokens: 180,
                 max_context_tokens_explicit: true,
                 ..crate::config::AgentCompactionConfig::default()
@@ -907,7 +903,6 @@ async fn redux_switch_without_exact_provenance_degrades_instead_of_failing_the_t
         mode: crate::config::AgentCompactionMode::Switch,
         reserve_tokens: 1,
         keep_recent_messages: 1,
-        memory_flush: false,
         max_context_tokens: 50,
         max_context_tokens_explicit: true,
     };
@@ -1026,7 +1021,6 @@ async fn redux_compaction_guard_uses_persisted_source_when_provider_history_is_e
         mode: crate::config::AgentCompactionMode::Switch,
         reserve_tokens: 5,
         keep_recent_messages: 1,
-        memory_flush: false,
         max_context_tokens: 220,
         max_context_tokens_explicit: true,
         ..crate::config::AgentCompactionConfig::default()
@@ -1177,7 +1171,6 @@ async fn redux_compaction_guard_source_is_inert_when_provider_history_is_not_enr
         mode: crate::config::AgentCompactionMode::Switch,
         reserve_tokens: 5,
         keep_recent_messages: 1,
-        memory_flush: false,
         max_context_tokens: 120,
         max_context_tokens_explicit: true,
         ..crate::config::AgentCompactionConfig::default()

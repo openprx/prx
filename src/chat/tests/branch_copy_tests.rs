@@ -59,7 +59,6 @@ fn switch_config() -> crate::config::AgentCompactionConfig {
         mode: crate::config::AgentCompactionMode::Switch,
         reserve_tokens: 1,
         keep_recent_messages: 2,
-        memory_flush: false,
         max_context_tokens: 50,
         max_context_tokens_explicit: true,
     }

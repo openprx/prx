@@ -46,7 +46,6 @@ fn compaction_config() -> crate::config::AgentCompactionConfig {
         mode: crate::config::AgentCompactionMode::Switch,
         reserve_tokens: 0,
         keep_recent_messages: 2,
-        memory_flush: false,
         // Over budget with both oversized replies, within it once the older
         // one is compacted, so the kept tail is never trimmed.
         max_context_tokens: 4_000,

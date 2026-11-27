@@ -85,10 +85,6 @@ pub struct AgentCompactionConfig {
     /// compaction; the token share of the window may keep fewer.
     #[serde(default = "default_agent_compaction_keep_recent_messages")]
     pub keep_recent_messages: usize,
-    /// Run memory flush extraction before legacy summary/truncation modes.
-    /// Exact `switch` handoffs never invoke a summarizer.
-    #[serde(default = "default_true")]
-    pub memory_flush: bool,
     /// Total model context window in tokens. This uses the same unit as
     /// `RouterModelConfig.max_context`; runtime trigger thresholds subtract
     /// `reserve_tokens` from this total window.
@@ -108,7 +104,6 @@ impl Default for AgentCompactionConfig {
             mode: AgentCompactionMode::Switch,
             reserve_tokens: default_agent_compaction_reserve_tokens(),
             keep_recent_messages: default_agent_compaction_keep_recent_messages(),
-            memory_flush: true,
             max_context_tokens: default_agent_compaction_max_context_tokens(),
             max_context_tokens_explicit: false,
         }

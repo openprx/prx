@@ -110,7 +110,6 @@ fn start_llm_turn_carries_compaction_config_to_effect() {
         max_context_tokens: 120,
         reserve_tokens: 10,
         max_context_tokens_explicit: true,
-        memory_flush: false,
         ..crate::config::AgentCompactionConfig::default()
     };
 

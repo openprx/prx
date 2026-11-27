@@ -406,7 +406,6 @@ fn plain_mode_does_not_emit_context_budget_chrome() {
         mode: crate::config::AgentCompactionMode::Switch,
         reserve_tokens: 5,
         keep_recent_messages: 2,
-        memory_flush: false,
         max_context_tokens: 120,
         max_context_tokens_explicit: true,
         ..crate::config::AgentCompactionConfig::default()

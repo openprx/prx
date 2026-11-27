@@ -69,7 +69,6 @@ async fn redux_compaction_keeps_enrichment_only_trim_fallback() {
         mode: crate::config::AgentCompactionMode::Switch,
         reserve_tokens: 5,
         keep_recent_messages: 1,
-        memory_flush: false,
         max_context_tokens: 120,
         max_context_tokens_explicit: true,
         ..crate::config::AgentCompactionConfig::default()
@@ -185,7 +184,6 @@ async fn redux_driver_preserve_trim_floor_preserves_fitting_summary_and_matches_
         mode: crate::config::AgentCompactionMode::Switch,
         reserve_tokens: 5,
         keep_recent_messages: 1,
-        memory_flush: true,
         max_context_tokens: 300,
         max_context_tokens_explicit: true,
         ..crate::config::AgentCompactionConfig::default()
@@ -334,7 +332,6 @@ async fn redux_driver_preserve_trim_floor_drops_unfit_summary_and_matches_reduce
         mode: crate::config::AgentCompactionMode::Switch,
         reserve_tokens: 10,
         keep_recent_messages: 4,
-        memory_flush: false,
         max_context_tokens: 90,
         max_context_tokens_explicit: true,
         ..crate::config::AgentCompactionConfig::default()
@@ -490,7 +487,6 @@ async fn redux_driver_off_mode_preflight_trims_without_history_compacted_action(
                 mode: crate::config::AgentCompactionMode::Off,
                 reserve_tokens: 10,
                 keep_recent_messages: 2,
-                memory_flush: false,
                 max_context_tokens: 120,
                 max_context_tokens_explicit: true,
                 ..crate::config::AgentCompactionConfig::default()
@@ -650,7 +646,6 @@ async fn redux_driver_summarizer_failure_uses_local_guard_before_stream() {
                 mode: crate::config::AgentCompactionMode::Switch,
                 reserve_tokens: 10,
                 keep_recent_messages: 2,
-                memory_flush: false,
                 max_context_tokens: 120,
                 max_context_tokens_explicit: true,
                 ..crate::config::AgentCompactionConfig::default()
@@ -826,7 +821,6 @@ async fn redux_driver_overflow_retry_uses_provider_summary_patch() {
                 mode: crate::config::AgentCompactionMode::Switch,
                 reserve_tokens: 10,
                 keep_recent_messages: 2,
-                memory_flush: false,
                 max_context_tokens: 2_500,
                 max_context_tokens_explicit: true,
                 ..crate::config::AgentCompactionConfig::default()
@@ -1093,7 +1087,6 @@ async fn tui_preflight_irreducible_request_fails_before_provider() {
                 max_context_tokens_explicit: true,
                 reserve_tokens: 10,
                 keep_recent_messages: 1,
-                memory_flush: false,
                 ..crate::config::AgentCompactionConfig::default()
             };
             EffectExecutor::new_with_deps(deps)
@@ -1264,7 +1257,6 @@ async fn redux_rollover_compacts_the_source_and_rebuilds_a_shorter_provider_view
             mode: crate::config::AgentCompactionMode::Switch,
             reserve_tokens: 10,
             keep_recent_messages: 4,
-            memory_flush: false,
             max_context_tokens: 400,
             max_context_tokens_explicit: true,
             ..crate::config::AgentCompactionConfig::default()

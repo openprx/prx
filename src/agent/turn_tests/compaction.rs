@@ -174,7 +174,6 @@ async fn configurable_context_switch_emits_exact_handoff_without_summary() {
         mode: crate::config::AgentCompactionMode::Switch,
         reserve_tokens: 1,
         keep_recent_messages: 1,
-        memory_flush: true,
         max_context_tokens: 50,
         max_context_tokens_explicit: true,
     };
@@ -257,7 +256,6 @@ async fn configurable_context_switch_can_roll_over_repeatedly_with_generation_li
         mode: crate::config::AgentCompactionMode::Switch,
         reserve_tokens: 1,
         keep_recent_messages: 1,
-        memory_flush: false,
         max_context_tokens: 50,
         max_context_tokens_explicit: true,
     };
@@ -370,7 +368,6 @@ async fn configurable_context_switch_fails_closed_without_exact_provenance() {
         mode: crate::config::AgentCompactionMode::Switch,
         reserve_tokens: 1,
         keep_recent_messages: 1,
-        memory_flush: false,
         max_context_tokens: 50,
         max_context_tokens_explicit: true,
     };
@@ -480,7 +477,6 @@ async fn switch_handoff_states_how_many_tool_roundtrips_it_folded() {
         mode: crate::config::AgentCompactionMode::Switch,
         reserve_tokens: 1,
         keep_recent_messages: 2,
-        memory_flush: true,
         max_context_tokens: 50,
         max_context_tokens_explicit: true,
     };
@@ -546,7 +542,6 @@ async fn context_switch_resolves_provenance_across_tool_roundtrips() {
         mode: crate::config::AgentCompactionMode::Switch,
         reserve_tokens: 1,
         keep_recent_messages: 2,
-        memory_flush: true,
         max_context_tokens: 50,
         max_context_tokens_explicit: true,
     };
@@ -654,7 +649,6 @@ async fn context_switch_preflight_degrades_to_trim_instead_of_failing_the_turn()
         mode: crate::config::AgentCompactionMode::Switch,
         reserve_tokens: 1,
         keep_recent_messages: 2,
-        memory_flush: false,
         max_context_tokens: 400,
         max_context_tokens_explicit: true,
     };
@@ -924,7 +918,6 @@ async fn a_cold_window_of_only_tool_roundtrips_still_folds_into_one_handoff() {
         mode: crate::config::AgentCompactionMode::Switch,
         reserve_tokens: 1,
         keep_recent_messages: 2,
-        memory_flush: true,
         max_context_tokens: 50,
         max_context_tokens_explicit: true,
     };
@@ -1036,7 +1029,6 @@ async fn switch_provenance_holds_when_tool_events_are_recorded() {
             mode: crate::config::AgentCompactionMode::Switch,
             reserve_tokens: 1,
             keep_recent_messages: 2,
-            memory_flush: true,
             max_context_tokens: 50,
             max_context_tokens_explicit: true,
         },
@@ -1250,7 +1242,6 @@ async fn the_preflight_builds_its_durable_compaction_from_the_canonical_history_
             mode: crate::config::AgentCompactionMode::Switch,
             reserve_tokens: 1,
             keep_recent_messages: 2,
-            memory_flush: false,
             max_context_tokens: 400,
             max_context_tokens_explicit: true,
         };
@@ -1428,7 +1419,6 @@ impl ProvenanceStore {
             mode: crate::config::AgentCompactionMode::Switch,
             reserve_tokens: 1,
             keep_recent_messages: keep_recent,
-            memory_flush: false,
             max_context_tokens: 50,
             max_context_tokens_explicit: true,
         };

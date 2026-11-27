@@ -187,7 +187,6 @@ async fn the_restored_request_never_splits_a_native_tool_round_trip() {
         mode: crate::config::AgentCompactionMode::Off,
         reserve_tokens: 10,
         keep_recent_messages: 2,
-        memory_flush: false,
         max_context_tokens: 90,
         max_context_tokens_explicit: true,
         ..crate::config::AgentCompactionConfig::default()

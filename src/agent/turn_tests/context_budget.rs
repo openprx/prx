@@ -45,7 +45,6 @@ async fn context_switch_degradation_writes_one_event_per_turn() {
         mode: crate::config::AgentCompactionMode::Switch,
         reserve_tokens: 1,
         keep_recent_messages: 2,
-        memory_flush: false,
         max_context_tokens: 400,
         max_context_tokens_explicit: true,
     };
@@ -131,7 +130,6 @@ fn token_aware_trim_never_strands_a_tool_result() {
             mode: crate::config::AgentCompactionMode::Switch,
             reserve_tokens: 1,
             keep_recent_messages: 2,
-            memory_flush: false,
             max_context_tokens,
             max_context_tokens_explicit: true,
         };
@@ -174,7 +172,6 @@ async fn configurable_compaction_1m_window_does_not_compact_above_128k() {
         mode: crate::config::AgentCompactionMode::Switch,
         reserve_tokens: 4_096,
         keep_recent_messages: 1,
-        memory_flush: false,
         max_context_tokens: 1_000_000,
         max_context_tokens_explicit: false,
     };
@@ -319,7 +316,6 @@ async fn the_preflight_floor_preserves_a_prompt_guided_request_not_the_tool_resu
         mode: crate::config::AgentCompactionMode::Off,
         reserve_tokens: 10,
         keep_recent_messages: 2,
-        memory_flush: false,
         max_context_tokens: 90,
         max_context_tokens_explicit: true,
         ..crate::config::AgentCompactionConfig::default()
@@ -385,7 +381,6 @@ async fn an_empty_inbound_turn_is_not_handed_the_previous_turns_question() {
         mode: crate::config::AgentCompactionMode::Off,
         reserve_tokens: 10,
         keep_recent_messages: 2,
-        memory_flush: false,
         max_context_tokens: 90,
         max_context_tokens_explicit: true,
         ..crate::config::AgentCompactionConfig::default()
@@ -440,7 +435,6 @@ async fn a_user_turn_opening_with_a_tool_marker_is_not_read_as_bookkeeping() {
         mode: crate::config::AgentCompactionMode::Off,
         reserve_tokens: 10,
         keep_recent_messages: 2,
-        memory_flush: false,
         max_context_tokens: 90,
         max_context_tokens_explicit: true,
         ..crate::config::AgentCompactionConfig::default()
@@ -500,7 +494,6 @@ async fn a_user_turn_opening_like_the_refresh_aside_is_not_read_as_bookkeeping()
         mode: crate::config::AgentCompactionMode::Off,
         reserve_tokens: 10,
         keep_recent_messages: 2,
-        memory_flush: false,
         max_context_tokens: 90,
         max_context_tokens_explicit: true,
         ..crate::config::AgentCompactionConfig::default()

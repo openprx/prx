@@ -504,7 +504,6 @@ pub(super) fn context_budget_fixture_config(
         mode: crate::config::AgentCompactionMode::Off,
         reserve_tokens: CONTEXT_BUDGET_FIXTURE_RESERVE_TOKENS,
         keep_recent_messages: 2,
-        memory_flush: false,
         max_context_tokens: budgeted_tokens(estimate_history_tokens_with_source(history))
             .saturating_add(headroom_tokens)
             .saturating_add(CONTEXT_BUDGET_FIXTURE_RESERVE_TOKENS),

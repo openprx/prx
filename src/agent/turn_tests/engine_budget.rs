@@ -1077,7 +1077,6 @@ async fn an_oversized_tool_payload_never_trims_away_the_current_user_message() {
             mode: crate::config::AgentCompactionMode::Switch,
             reserve_tokens: CONTEXT_BUDGET_FIXTURE_RESERVE_TOKENS,
             keep_recent_messages: 2,
-            memory_flush: false,
             max_context_tokens: payload_tokens / 2,
             max_context_tokens_explicit: true,
             ..crate::config::AgentCompactionConfig::default()
@@ -1308,7 +1307,6 @@ fn mid_turn_floor_fixture_config(
         mode: crate::config::AgentCompactionMode::Off,
         reserve_tokens: CONTEXT_BUDGET_FIXTURE_RESERVE_TOKENS,
         keep_recent_messages: 2,
-        memory_flush: false,
         max_context_tokens: budgeted_tokens(estimate_history_tokens_with_source(history))
             .saturating_add(slack_tokens)
             .saturating_add(budgeted_request_tool_tokens(tool_surface))
@@ -2151,7 +2149,6 @@ async fn preflight_compacts_before_provider_call_when_over_hard_limit() {
         mode: crate::config::AgentCompactionMode::Switch,
         reserve_tokens: 10,
         keep_recent_messages: 2,
-        memory_flush: false,
         max_context_tokens: 4106,
         max_context_tokens_explicit: true,
         ..crate::config::AgentCompactionConfig::default()
@@ -2266,7 +2263,6 @@ async fn off_mode_preflight_trims_without_silent_summary() {
         mode: crate::config::AgentCompactionMode::Off,
         reserve_tokens: 10,
         keep_recent_messages: 2,
-        memory_flush: false,
         max_context_tokens: 4106,
         max_context_tokens_explicit: true,
         ..crate::config::AgentCompactionConfig::default()

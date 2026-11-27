@@ -70,7 +70,6 @@ async fn first_request_of_trimmed_turn(history: Vec<PMsg>, guard: Option<Vec<PMs
                 mode: crate::config::AgentCompactionMode::Off,
                 reserve_tokens: 10,
                 keep_recent_messages: 2,
-                memory_flush: false,
                 max_context_tokens: 6_000,
                 max_context_tokens_explicit: true,
                 ..crate::config::AgentCompactionConfig::default()

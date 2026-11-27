@@ -133,7 +133,6 @@ async fn overflow_patch_and_ordered_commit_preserve_one_pending_request() {
                 mode: crate::config::AgentCompactionMode::Switch,
                 max_context_tokens: 1_000_000,
                 keep_recent_messages: 12,
-                memory_flush: false,
                 ..crate::config::AgentCompactionConfig::default()
             };
             let effects = state.reduce(Action::StartLLMTurn {
@@ -346,7 +345,6 @@ async fn redux_rollover_then_overflow_persists_one_switch_per_admitted_turn() {
                     max_context_tokens: 2_000,
                     reserve_tokens: 256,
                     keep_recent_messages: 12,
-                    memory_flush: false,
                     ..crate::config::AgentCompactionConfig::default()
                 };
                 let effects = state.reduce(Action::StartLLMTurn {

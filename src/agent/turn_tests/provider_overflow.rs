@@ -182,7 +182,6 @@ async fn overflow_turn(
 fn overflow_config(mode: AgentCompactionMode) -> AgentCompactionConfig {
     AgentCompactionConfig {
         mode,
-        memory_flush: false,
         ..AgentCompactionConfig::default()
     }
 }

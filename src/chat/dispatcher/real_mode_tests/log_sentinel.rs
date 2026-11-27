@@ -405,7 +405,6 @@ async fn a_compaction_whose_audit_storage_fails_logs_no_stored_content() {
             mode: crate::config::AgentCompactionMode::Switch,
             reserve_tokens: 1,
             keep_recent_messages: 1,
-            memory_flush: false,
             max_context_tokens: 50,
             max_context_tokens_explicit: true,
         };
@@ -502,7 +501,6 @@ async fn a_switch_rollover_whose_handoff_insert_fails_logs_no_stored_content() {
             mode: crate::config::AgentCompactionMode::Switch,
             reserve_tokens: 1,
             keep_recent_messages: 1,
-            memory_flush: false,
             max_context_tokens: 50,
             max_context_tokens_explicit: true,
         };

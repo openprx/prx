@@ -84,7 +84,6 @@ fn the_inline_tool_result_budget_keeps_a_preview_when_the_window_is_spent() {
         mode: crate::config::AgentCompactionMode::Off,
         reserve_tokens: 10,
         keep_recent_messages: 2,
-        memory_flush: false,
         max_context_tokens: 40,
         max_context_tokens_explicit: true,
         ..crate::config::AgentCompactionConfig::default()
