@@ -80,6 +80,19 @@ pub(crate) fn tool_result_inline_budget_for_history(
 /// Status `persist_tool_output_document` reports for a stored document.
 const PERSISTED_DOCUMENT_STATUS: &str = "persisted_document_backend";
 
+/// Defuse the reference tags in a tool's own output text.
+///
+/// PRX appends one `[document_ingest_ref]` block to a stored result, and the
+/// clear step reads the document id from the trailing block of the text. A tool
+/// that wrote the same tags would be indistinguishable from PRX, so every tag
+/// in the tool's text gets a space before its closing bracket. PRX's own block
+/// is appended after this runs and stays unchanged. Text without the tags is
+/// returned byte for byte.
+pub(crate) fn neutralise_reference_tags(text: &str) -> String {
+    text.replace("[document_ingest_ref]", "[document_ingest_ref ]")
+        .replace("[/document_ingest_ref]", "[/document_ingest_ref ]")
+}
+
 /// Compact a large tool result before inserting it into LLM history.
 ///
 /// This is the Phase-0 document-ingest spike: the full document backend is not
@@ -98,10 +111,11 @@ pub(super) fn compact_tool_result_for_history_with_status(
     // leak as a preview. The cut itself is decided by the raw size, as the
     // document store decides it, and the document id and digest stay those of
     // the raw output.
+    let neutral = neutralise_reference_tags(content);
     if content.len() <= max_inline_chars {
-        return crate::security::redaction::redact_secrets(content);
+        return crate::security::redaction::redact_secrets(&neutral);
     }
-    let masked = crate::security::redaction::redact_secrets(content);
+    let masked = crate::security::redaction::redact_secrets(&neutral);
     let boundary = masked
         .char_indices()
         .map(|(i, _)| i)
@@ -213,7 +227,7 @@ impl ToolResultRecorder {
     /// Record `result` as the model reads it: secrets masked (CE-63), so an
     /// interrupted batch writes the same text the live and stored copies hold.
     pub(super) fn record(&self, index: usize, result: &str) {
-        let masked = crate::security::redaction::redact_secrets(result);
+        let masked = crate::security::redaction::redact_secrets(&neutralise_reference_tags(result));
         let mut slots = self.slots.lock();
         if let Some(slot) = slots.get_mut(index) {
             *slot = Some(masked);

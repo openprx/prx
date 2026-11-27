@@ -504,7 +504,10 @@ document id only as `tool-output:<tool>:<16 hex>` read from the result's
 trailing reference block, else the stub says the output is not kept. A tool
 name outside the charset (or over 64 bytes) is written in the id as
 `t-<first 16 hex of sha256(name)>`, so the stub still names the document while
-it shows the tool as `unknown`. A step
+it shows the tool as `unknown`. Before PRX appends its own block, every
+`[document_ingest_ref]` and `[/document_ingest_ref]` tag in the tool's own text
+is written with a space before the bracket, so only PRX's block can be read as
+a reference. A step
 that clears emits `reduction_finished` with `step = "clear_tool_results"`.
 
 Steps that still run outside the ladder: the overflow retry (compaction, then a
