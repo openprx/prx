@@ -196,7 +196,8 @@ fn escaped_value_end(ends: &mut EscapedEnds, text: &str, start: usize, quote: u8
 
 /// The values of credential pairs whose quotes are escaped, as in
 /// `config {\"password\":\"hunter22\"} ok` (also at deeper nesting, with
-/// 3, 7, ... backslashes, and with `'`), masked exactly as the unescaped
+/// 3, 7, ... backslashes, an even equal run such as 2 where a shell command
+/// escaped the quotes of an already escaped text, and with `'`), masked exactly as the unescaped
 /// pair is: the name decides ([`is_credential_value`]), the name is kept.
 pub(super) fn escaped_pair_spans(text: &str, spans: &mut Vec<Range<usize>>) {
     #[cfg(test)]
@@ -226,7 +227,7 @@ pub(super) fn escaped_pair_spans(text: &str, spans: &mut Vec<Range<usize>>) {
             continue;
         }
         let run = close.len();
-        if run % 2 == 0 || value_open.len() != run {
+        if value_open.len() != run {
             continue;
         }
         let (Some(quote), Some(closing), Some(value_quote)) = (
