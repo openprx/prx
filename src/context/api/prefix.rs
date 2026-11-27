@@ -7,7 +7,9 @@
 //! (`context.switch.created`) was recorded after it. A session whose index is
 //! empty records a marker row with no sections; the marker freezes "no index"
 //! for the session, so the index is read once per session and a later memory
-//! write does not add one until a handoff.
+//! write does not add one until a handoff. A group-shared channel turn has no
+//! index and no row: it renders only its `session_opened` hook blocks, every
+//! turn.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -56,6 +58,12 @@ pub(crate) async fn session_prefix(input: SessionPrefixInput<'_>) -> String {
     if envelope.session_key.is_empty() {
         return String::new();
     }
+    // A group-shared channel chat reads and records no prefix row: its memory
+    // index stays out of the prompt, and the legacy session key it may share
+    // with a direct chat must not carry a row from one into the other.
+    if super::tail::is_group_shared_channel(envelope) {
+        return group_hook_prefix(memory, envelope, memory_config, hooks).await;
+    }
     let principal = envelope.memory_principal();
     let session_key = envelope.session_key.as_str();
     let store: &dyn Memory = memory.as_ref();
@@ -81,16 +89,11 @@ pub(crate) async fn session_prefix(input: SessionPrefixInput<'_>) -> String {
         return text;
     }
 
-    // A group-shared channel chat keeps its memory index out of the prompt.
-    let entries = if super::tail::is_group_shared_channel(envelope) {
-        Vec::new()
-    } else {
-        match store.newest_core_entries(&principal, STORE_INDEX_FETCH).await {
-            Ok(entries) => entries,
-            Err(error) => {
-                log_read_failure(&error, "memory index could not be read");
-                return String::new();
-            }
+    let entries = match store.newest_core_entries(&principal, STORE_INDEX_FETCH).await {
+        Ok(entries) => entries,
+        Err(error) => {
+            log_read_failure(&error, "memory index could not be read");
+            return String::new();
         }
     };
     let truncated = entries.len() >= STORE_INDEX_FETCH;
@@ -136,6 +139,41 @@ pub(crate) async fn session_prefix(input: SessionPrefixInput<'_>) -> String {
         verify_recorded(store, &principal, &entries, row_id).await;
     }
     rendered
+}
+
+/// The prefix of a group-shared channel turn: only the `session_opened` hook
+/// blocks, rendered on every turn. No prefix row is read or recorded, so a
+/// row frozen by a direct chat on a shared session key never reaches a group
+/// turn, and a group turn never freezes a row a direct chat would replay. The
+/// hooks see `resumed: false`, since no row is consulted. Their contributions
+/// are still logged like any other hook output.
+async fn group_hook_prefix(
+    memory: &Arc<dyn Memory>,
+    envelope: &RuntimeEnvelope,
+    memory_config: &MemoryConfig,
+    hooks: Option<&HookManager>,
+) -> String {
+    let Some(hooks) = hooks else {
+        return String::new();
+    };
+    let contributions = session_opened_contributions(hooks, envelope, false).await;
+    if contributions.is_empty() {
+        return String::new();
+    }
+    let fabric = MemoryFabric::new(Arc::clone(memory), envelope.workspace_id.clone())
+        .with_event_recording(memory_config.event_recording_config());
+    let mut scope = envelope.message_scope();
+    scope.run_id = None;
+    scope.parent_run_id = None;
+    append_hook_contributions(&fabric, &scope, &contributions).await;
+    let sections: Vec<PrefixSection> = contributions
+        .into_iter()
+        .map(|contribution| PrefixSection {
+            source: format!("{HOOK_SOURCE_PREFIX}{}", contribution.hook),
+            text: contribution.text,
+        })
+        .collect();
+    render_prefix(&sections)
 }
 
 /// The `session_opened` context contributions, taken once per prefix render
