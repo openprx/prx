@@ -103,13 +103,19 @@ error run sends nothing and stays a note. A `message` job with no creating
 session falls back to a note: an owner-less job (operator CLI), a job whose
 creating message is no longer stored, a job created through a route, a
 non-SQLite backend, or a send refused by the inbound setting. A task created by a
-scheduled run (its creating event is the run's own `xin:` or `cron:` session) or
-inside a child session (`spawn:` session) also falls back to a note for the task
-owner, so such a run stays visible at the owner's next turn. A message to a
+scheduled run (its creating event is the run's own `xin:` or `cron:` session), by
+a heartbeat run, or inside a child session (a `spawn:` session, a session worker,
+or a delegate run that records its own input) also falls back to a note for the
+task owner, so such a run stays visible at the owner's next turn. A job created
+inside a delegate that carries its caller's creating message is delivered to the
+caller's session. The message continues the mailbox chain of the creating turn,
+so a turn woken by a delivered result counts toward the existing wake-depth
+limit. A message to a
 Console session with no live receiver is stored and is taken at the session's
 next submission or at the gateway's restart. A note that was delivered as a
-message is not repeated at the next turn; a delivered run's older successful run
-that was not delivered is still shown. `none` writes no notice and no result row. A
+message is not repeated at the next turn, unless an older successful run of the
+same job was not delivered: then the job's group stays in the note, headed by its
+newest run. `none` writes no notice and no result row. A
 one-off agent task created from a session (the xin tool with an agent task that is
 not recurring and has a `message_event_id` in the trusted scope; the cron tool
 with an agent job on an `at` schedule and a `message_event_id`) defaults to `message`; everything else
