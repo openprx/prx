@@ -151,17 +151,21 @@ refreshed throughout. Both are reports: neither can end anything.
 
 ## Turn Opening On Channel Turns
 
-Every channel turn, the ramflux bridge included, opens through the same turn
-opening as the console, chat and gateway surfaces. The session's memory index
-goes into the system prompt, the `session_opened` and `turn_opened` hooks run,
-the unseen scheduled-results note is shown once, and the user message is stored
-with its attachment row (the memory preamble and the hook contributions, masked
-for secrets). Recall is bounded by the window of the model, as on those
-surfaces.
+Every channel turn opens through the same turn opening as the console, chat and
+gateway surfaces. The `session_opened` and `turn_opened` hooks run, and the user
+message is stored with its attachment row (the memory preamble and the hook
+contributions, masked for secrets). Recall is bounded by the window of the model,
+as on those surfaces.
+
+Two things are left out for group-like chats (a chat whose visibility is
+session-shared): the session's memory index is not put in the system prompt,
+and the unseen scheduled-results note is not shown. Direct chats keep both.
+Hooks still run in group chats.
 
 The earlier turns of a channel conversation still come from the in-memory
 conversation cache, not from stored message events, so they carry no event ids.
-Group conversations keep the same visibility as before.
+An earlier user message that never received a reply is folded into the next
+request's text, so the request alternates between user and assistant turns.
 
 ## Tools On Channel Turns
 
