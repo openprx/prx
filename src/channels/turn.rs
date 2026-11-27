@@ -829,10 +829,13 @@ pub(super) async fn run_channel_turn(
         }
     }
 
-    // The earlier turns are the conversation cache without the current message.
-    // Admission pushed that message, so it is removed by identity (the newest user
-    // entry with its text); when admission was recovered it is absent and nothing
-    // is removed. The request must alternate, so an earlier user message left
+    // The earlier turns are the conversation cache up to the current message.
+    // Admission pushed that message, so the cache is cut at it (the newest user
+    // entry with its text) and everything after it is dropped too: a message
+    // admitted later in the same chat belongs to its own turn and is never
+    // folded into this one. Cache entries carry no message id, so the match is
+    // by text; when admission was recovered the message is absent and nothing
+    // is cut. The request must alternate, so an earlier user message left
     // without a reply is folded into this request's text, ahead of it.
     let current_text = crate::agent::turn_contracts::inbound_user_message(&msg.content).content;
     let (previous_turns, request_text) = {
@@ -841,7 +844,7 @@ pub(super) async fn run_channel_turn(
             .iter()
             .rposition(|turn| turn.role == "user" && turn.content == current_text)
         {
-            cached.remove(index);
+            cached.truncate(index);
         }
         let mut earlier = normalize_cached_channel_turns(cached);
         let mut request_text = msg.content.clone();
