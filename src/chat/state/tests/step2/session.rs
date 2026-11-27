@@ -298,6 +298,7 @@ fn test_redux_session_loaded_only_user_assistant_in_history() {
         tool_calls: vec![],
         context_handoff: false,
         tool_evidence: None,
+        event_id: None,
     });
     loaded.add_user_turn("q");
     let _ = state.reduce(Action::SessionLoaded {

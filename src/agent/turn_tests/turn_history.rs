@@ -322,10 +322,10 @@ fn canonical_with_evidence(evidence: &TurnToolEvidence) -> CanonicalHistory {
     CanonicalHistory::from_acknowledged_turns(
         Some("sys"),
         [
-            ("user", "q1", Some(evidence)),
-            ("assistant", "a1", Some(evidence)),
-            ("user", "q2", None),
-            ("assistant", "a2", Some(&none)),
+            ("user", "q1", Some(evidence), None),
+            ("assistant", "a1", Some(evidence), None),
+            ("user", "q2", None, None),
+            ("assistant", "a2", Some(&none), None),
         ],
     )
     .with_raw_request("request")

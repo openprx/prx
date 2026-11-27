@@ -1,7 +1,7 @@
 //! Reducer arms for session load/save/switch, turn recording and history compaction.
 
 use super::{
-    ChatState, Effect, ToolTaskKey, conversation_lines_from_turns, durable_turns_from_compacted_history,
+    ChatState, Effect, ToolTaskKey, TurnRecord, conversation_lines_from_turns, durable_turns_from_compacted_history,
     handoff_note_contents, turn_evidence_by_history_index,
 };
 use crate::chat::action::{CompactReason, ProviderUsageRecordKind};
@@ -318,6 +318,7 @@ impl ChatState {
             tool_calls: Vec::new(),
             context_handoff: false,
             tool_evidence: None,
+            event_id: None,
         });
         // On the first user turn with an empty title, set it automatically (as session.add_user_turn does)
         if self.session.title.is_empty() {
@@ -353,11 +354,38 @@ impl ChatState {
     pub(super) fn reduce_turn_records_attached(
         &mut self,
         user_text: &str,
+        event_ids: (Option<String>, Option<String>),
         sent: Option<crate::context::transcript::Attachment>,
         reply: Option<&str>,
         replay: Option<std::sync::Arc<crate::context::transcript::TurnReplay>>,
     ) -> Vec<Effect> {
         let user_text = crate::agent::turn_contracts::neutralize_reserved_markers(user_text);
+        let (user_event_id, reply_event_id) = event_ids;
+        let mut ids_attached = false;
+        if let Some(event_id) = user_event_id
+            && let Some(turn) = self
+                .session
+                .turns
+                .iter_mut()
+                .rev()
+                .find(|turn| turn.role == "user" && turn.content == user_text)
+                .filter(|turn| turn.event_id.is_none())
+        {
+            turn.event_id = Some(event_id);
+            ids_attached = true;
+        }
+        if let Some(event_id) = reply_event_id
+            && let Some(turn) = self
+                .session
+                .turns
+                .iter_mut()
+                .rev()
+                .find(|turn| turn.role == "assistant")
+                .filter(|turn| Some(turn.content.as_str()) == reply && turn.event_id.is_none())
+        {
+            turn.event_id = Some(event_id);
+            ids_attached = true;
+        }
         let mut sent_attached = false;
         if let Some(sent) = sent
             && let Some(turn) = self.session.turns.iter_mut().rev().find(|turn| {
@@ -382,7 +410,7 @@ impl ChatState {
             turn.tool_evidence.get_or_insert_with(Default::default).replay = Some(replay);
             replay_attached = true;
         }
-        if sent_attached {
+        if sent_attached || ids_attached {
             vec![Effect::SaveSession(self.session_commit())]
         } else if replay_attached {
             vec![Effect::PublishSession(self.session_commit())]
@@ -410,6 +438,7 @@ impl ChatState {
             tool_calls,
             context_handoff: false,
             tool_evidence,
+            event_id: None,
         });
         self.session.history.push(ChatMessage::assistant(content));
         vec![Effect::LogTrace {
@@ -585,10 +614,10 @@ impl ChatState {
         // anything else carries nothing.
         let (range_start, range_end) = (patch.range_start(), patch.range_end());
         if range_start <= range_end && range_end <= evidence.len() {
-            let appended = std::iter::repeat_n(None, patch.append_after.len());
+            let appended = std::iter::repeat_n(TurnRecord::default(), patch.append_after.len());
             evidence.splice(range_start..range_end, replacement_evidence.into_iter().chain(appended));
         } else {
-            evidence = vec![None; history.len()];
+            evidence = vec![TurnRecord::default(); history.len()];
         }
         let budget = crate::agent::context_budget::plan_context_budget(
             history,
@@ -702,10 +731,10 @@ impl ChatState {
 /// matched and a handoff or summary never inherits a record.
 fn replacement_tail_evidence(
     history: &[ChatMessage],
-    evidence: &[Option<crate::agent::tool_evidence::TurnToolEvidence>],
+    evidence: &[TurnRecord],
     patch: &crate::agent::turn_contracts::CompactionPatch,
-) -> Vec<Option<crate::agent::tool_evidence::TurnToolEvidence>> {
-    let mut carried = vec![None; patch.replacement.len()];
+) -> Vec<TurnRecord> {
+    let mut carried = vec![TurnRecord::default(); patch.replacement.len()];
     let range = patch.range_start()..patch.range_end();
     let (Some(replaced), Some(replaced_evidence)) = (history.get(range.clone()), evidence.get(range)) else {
         return carried;

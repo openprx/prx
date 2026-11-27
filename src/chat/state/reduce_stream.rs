@@ -44,11 +44,14 @@ impl ChatState {
             .first()
             .filter(|message| message.role == "system")
             .map(|message| message.content.as_str());
-        let turns = self
-            .session
-            .turns
-            .iter()
-            .map(|turn| (turn.role.as_str(), turn.content.as_str(), turn.tool_evidence.as_ref()));
+        let turns = self.session.turns.iter().map(|turn| {
+            (
+                turn.role.as_str(),
+                turn.content.as_str(),
+                turn.tool_evidence.as_ref(),
+                turn.event_id.as_deref(),
+            )
+        });
         if let Some(open) = self.open_request() {
             return crate::agent::turn_history::CanonicalHistory::from_acknowledged_turns_with_request(
                 leading_system,

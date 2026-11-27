@@ -33,6 +33,11 @@ pub(super) async fn copy_branch_transcript(
     source_session_id: &str,
     branch: &mut session::ChatSession,
 ) -> Result<()> {
+    // The copied turns are new rows of the branch: the source's event ids do
+    // not name them, so none is kept.
+    for turn in &mut branch.turns {
+        turn.event_id = None;
+    }
     if branch.turns.is_empty() {
         return Ok(());
     }

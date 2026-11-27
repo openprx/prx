@@ -994,6 +994,7 @@ fn loading_fresh_session_clears_visible_title_turns_and_token_usage() {
         tool_calls: Vec::new(),
         context_handoff: false,
         tool_evidence: None,
+        event_id: None,
     });
     state.ui.turn_count = 1;
     state.ui.token_usage_summary = MainSessionTokenUsageSummary {

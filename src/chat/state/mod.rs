@@ -113,18 +113,26 @@ fn conversation_lines_from_turns(turns: &[ChatTurn]) -> Vec<ConversationLine> {
         .collect()
 }
 
+/// What a stored turn keeps beyond its text, carried with it through a
+/// compaction: the runtime's tool evidence and the event id of its stored row.
+#[derive(Debug, Clone, Default)]
+struct TurnRecord {
+    evidence: Option<crate::agent::tool_evidence::TurnToolEvidence>,
+    event_id: Option<String>,
+}
+
 /// The durable turns of a compacted history. `handoff_notes` are the exact
 /// contents of the context handoff notes the compaction code wrote (the
 /// current patch's and every earlier one the session kept); a turn equal to
 /// one of them keeps that provenance.
 ///
-/// `evidence` is the tool evidence per index of `history`
+/// `evidence` is the turn record (tool evidence and event id) per index of `history`
 /// ([`turn_evidence_by_history_index`], with the patch applied); a durable
 /// message keeps the evidence at its index.
 fn durable_turns_from_compacted_history(
     history: &[ChatMessage],
     handoff_notes: &std::collections::HashSet<String>,
-    evidence: &[Option<crate::agent::tool_evidence::TurnToolEvidence>],
+    evidence: &[TurnRecord],
 ) -> Vec<ChatTurn> {
     let timestamp = chrono::Utc::now();
     history
@@ -138,7 +146,8 @@ fn durable_turns_from_compacted_history(
             tool_calls: Vec::new(),
             context_handoff: crate::agent::compaction::is_context_handoff_message(message)
                 && handoff_notes.contains(&message.content),
-            tool_evidence: evidence.get(index).cloned().flatten(),
+            tool_evidence: evidence.get(index).and_then(|record| record.evidence.clone()),
+            event_id: evidence.get(index).and_then(|record| record.event_id.clone()),
         })
         .collect()
 }
@@ -153,15 +162,12 @@ fn durable_turns_from_compacted_history(
 /// attached to the wrong reply is not.
 ///
 /// [`stored_turn_message`]: crate::agent::turn_contracts::stored_turn_message
-fn turn_evidence_by_history_index(
-    history: &[ChatMessage],
-    turns: &[ChatTurn],
-) -> (
-    Vec<Option<crate::agent::tool_evidence::TurnToolEvidence>>,
-    Option<usize>,
-) {
-    let mut evidence = vec![None; history.len()];
-    if turns.iter().all(|turn| turn.tool_evidence.is_none()) {
+fn turn_evidence_by_history_index(history: &[ChatMessage], turns: &[ChatTurn]) -> (Vec<TurnRecord>, Option<usize>) {
+    let mut evidence = vec![TurnRecord::default(); history.len()];
+    if turns
+        .iter()
+        .all(|turn| turn.tool_evidence.is_none() && turn.event_id.is_none())
+    {
         return (evidence, None);
     }
     let mut stored_turns = turns
@@ -183,7 +189,8 @@ fn turn_evidence_by_history_index(
             return (evidence, Some(index));
         };
         if let Some(slot) = evidence.get_mut(index) {
-            slot.clone_from(&turn.tool_evidence);
+            slot.evidence.clone_from(&turn.tool_evidence);
+            slot.event_id.clone_from(&turn.event_id);
         }
     }
     (evidence, None)
@@ -1439,10 +1446,18 @@ impl ChatState {
             Action::UserTurnAdmitted { admission, content } => self.reduce_user_turn_admitted(admission, content),
             Action::TurnRecordsAttached {
                 user_text,
+                user_event_id,
+                reply_event_id,
                 sent,
                 reply,
                 replay,
-            } => self.reduce_turn_records_attached(&user_text, sent, reply.as_deref(), replay),
+            } => self.reduce_turn_records_attached(
+                &user_text,
+                (user_event_id, reply_event_id),
+                sent,
+                reply.as_deref(),
+                replay,
+            ),
             Action::RecordAssistantTurn { task_id, content } => self.reduce_record_assistant_turn(task_id, content),
             Action::RecordSystemMessage { content } => self.reduce_record_system_message(content),
             Action::SetLeadingSystemPrompt { content } => self.reduce_set_leading_system_prompt(content),

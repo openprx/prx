@@ -399,11 +399,22 @@ pub(super) fn session_turns_to_provider_view(session: &session::ChatSession) -> 
 /// evidence.
 fn acknowledged_turns(
     session: &session::ChatSession,
-) -> impl Iterator<Item = (&str, &str, Option<&crate::agent::tool_evidence::TurnToolEvidence>)> {
-    session
-        .turns
-        .iter()
-        .map(|turn| (turn.role.as_str(), turn.content.as_str(), turn.tool_evidence.as_ref()))
+) -> impl Iterator<
+    Item = (
+        &str,
+        &str,
+        Option<&crate::agent::tool_evidence::TurnToolEvidence>,
+        Option<&str>,
+    ),
+> {
+    session.turns.iter().map(|turn| {
+        (
+            turn.role.as_str(),
+            turn.content.as_str(),
+            turn.tool_evidence.as_ref(),
+            turn.event_id.as_deref(),
+        )
+    })
 }
 
 /// The canonical history of `session`'s acknowledged turns under

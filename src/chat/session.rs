@@ -38,6 +38,13 @@ pub struct ChatTurn {
     /// turns saved before the record existed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_evidence: Option<crate::agent::tool_evidence::TurnToolEvidence>,
+    /// Event id of the `message.created` row that stores this turn, when the
+    /// terminal knows it. Provenance of a later context switch resolves the
+    /// turn to exactly that row. `None` for turns saved before the field
+    /// existed and for turns whose row is not known; older binaries ignore
+    /// the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
 }
 
 /// Condensed record of a tool call for session replay.
@@ -359,6 +366,7 @@ impl ChatSession {
             tool_calls: Vec::new(),
             context_handoff: false,
             tool_evidence: None,
+            event_id: None,
         });
         self.updated_at = Utc::now();
 
@@ -377,6 +385,7 @@ impl ChatSession {
             tool_calls,
             context_handoff: false,
             tool_evidence: None,
+            event_id: None,
         });
         self.updated_at = Utc::now();
     }

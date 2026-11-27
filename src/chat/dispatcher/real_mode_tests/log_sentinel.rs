@@ -92,6 +92,7 @@ fn sentinel_session() -> ChatSession {
             }],
             context_handoff: false,
             tool_evidence: None,
+            event_id: None,
         },
         ChatTurn {
             role: "assistant".to_owned(),
@@ -100,6 +101,7 @@ fn sentinel_session() -> ChatSession {
             tool_calls: Vec::new(),
             context_handoff: false,
             tool_evidence: None,
+            event_id: None,
         },
         ChatTurn {
             role: "user".to_owned(),
@@ -108,6 +110,7 @@ fn sentinel_session() -> ChatSession {
             tool_calls: Vec::new(),
             context_handoff: false,
             tool_evidence: None,
+            event_id: None,
         },
         ChatTurn {
             role: "assistant".to_owned(),
@@ -116,6 +119,7 @@ fn sentinel_session() -> ChatSession {
             tool_calls: Vec::new(),
             context_handoff: false,
             tool_evidence: None,
+            event_id: None,
         },
     ];
     session

@@ -565,9 +565,14 @@ pub enum Action {
     /// turn had them. `sent` is the form the user's request was sent in; it goes
     /// to the newest user turn holding `user_text` that has none. `replay` holds
     /// the tool rounds of the run that made `reply`; it goes to the newest
-    /// assistant turn when that turn is exactly `reply`.
+    /// assistant turn when that turn is exactly `reply`. `user_event_id` and
+    /// `reply_event_id` are the event ids of the turn's stored rows; each
+    /// goes to the same turn as the text it belongs to, and only when that
+    /// turn has no event id yet.
     TurnRecordsAttached {
         user_text: String,
+        user_event_id: Option<String>,
+        reply_event_id: Option<String>,
         sent: Option<crate::context::transcript::Attachment>,
         reply: Option<String>,
         replay: Option<std::sync::Arc<crate::context::transcript::TurnReplay>>,

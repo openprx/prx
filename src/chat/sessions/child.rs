@@ -273,6 +273,7 @@ impl ChildSessionRegistry {
                         tool_calls,
                         context_handoff: false,
                         tool_evidence: None,
+                        event_id: None,
                     }
                 })
                 .collect();

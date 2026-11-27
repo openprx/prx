@@ -418,6 +418,7 @@ impl ChildFocus {
                 tool_calls: Vec::new(),
                 context_handoff: false,
                 tool_evidence: None,
+                event_id: None,
             })
             .collect();
         if let Some(run) = ctx.sessions.child_run(&record.session_key).await {

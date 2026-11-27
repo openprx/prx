@@ -99,6 +99,7 @@ async fn switched_session() -> (TempDir, session::ChatSession) {
             tool_calls: Vec::new(),
             context_handoff: crate::agent::compaction::is_context_handoff_message(message),
             tool_evidence: None,
+            event_id: None,
         })
         .collect();
     (temp, session)

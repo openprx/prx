@@ -130,16 +130,17 @@ impl CanonicalHistory {
     {
         Self::from_stored_turns(
             leading_system,
-            turns.into_iter().map(|(role, content)| (role, content, None)),
+            turns.into_iter().map(|(role, content)| (role, content, None, None)),
             None,
         )
     }
 
     /// As [`Self::from_acknowledged`], with each stored turn's runtime record
-    /// (tool evidence and replayed rounds of a reply, sent form of a request).
+    /// (tool evidence and replayed rounds of a reply, sent form of a request)
+    /// and the event id of its stored `message.created` row, when it has one.
     pub(crate) fn from_acknowledged_turns<'a, I>(leading_system: Option<&str>, turns: I) -> Self
     where
-        I: IntoIterator<Item = (&'a str, &'a str, Option<&'a TurnToolEvidence>)>,
+        I: IntoIterator<Item = (&'a str, &'a str, Option<&'a TurnToolEvidence>, Option<&'a str>)>,
     {
         Self::from_stored_turns(leading_system, shared_evidence(turns), None)
     }
@@ -153,7 +154,7 @@ impl CanonicalHistory {
         request_turn: usize,
     ) -> Self
     where
-        I: IntoIterator<Item = (&'a str, &'a str, Option<&'a TurnToolEvidence>)>,
+        I: IntoIterator<Item = (&'a str, &'a str, Option<&'a TurnToolEvidence>, Option<&'a str>)>,
     {
         Self::from_stored_turns(leading_system, shared_evidence(turns), Some(request_turn))
     }
@@ -180,14 +181,14 @@ impl CanonicalHistory {
     {
         Self::from_stored_turns(
             leading_system,
-            turns.into_iter().map(|(role, content)| (role, content, None)),
+            turns.into_iter().map(|(role, content)| (role, content, None, None)),
             Some(request_turn),
         )
     }
 
     fn from_stored_turns<'a, I>(leading_system: Option<&str>, turns: I, request_turn: Option<usize>) -> Self
     where
-        I: IntoIterator<Item = (&'a str, &'a str, Option<Arc<TurnToolEvidence>>)>,
+        I: IntoIterator<Item = (&'a str, &'a str, Option<Arc<TurnToolEvidence>>, Option<&'a str>)>,
     {
         let mut messages: Vec<ChatMessage> = leading_system
             .map(|prompt| ChatMessage::system(prompt.to_owned()))
@@ -196,7 +197,7 @@ impl CanonicalHistory {
         let mut origins = vec![MessageOrigin::Acknowledged; messages.len()];
         let mut evidence = vec![None; messages.len()];
         let mut sources = vec![MessageSources::default(); messages.len()];
-        for (index, (role, content, turn_evidence)) in turns.into_iter().enumerate() {
+        for (index, (role, content, turn_evidence, event_id)) in turns.into_iter().enumerate() {
             if !matches!(role, "user" | "assistant") {
                 continue;
             }
@@ -211,7 +212,7 @@ impl CanonicalHistory {
             sources.push(if origin == MessageOrigin::Request {
                 MessageSources::turn_round()
             } else {
-                MessageSources::default()
+                MessageSources::stored(event_id)
             });
         }
         Self {
@@ -553,6 +554,7 @@ impl CanonicalHistory {
                         message.role.as_str(),
                         message.content.as_str(),
                         self.evidence.get(index).cloned().flatten(),
+                        None,
                     )
                 })
             });
@@ -584,13 +586,20 @@ impl CanonicalHistory {
 /// Stored turns with their tool evidence shared, ready for the canonical
 /// history (one copy per evidence record; later clones of the history share
 /// it).
-fn shared_evidence<'a, I>(turns: I) -> impl Iterator<Item = (&'a str, &'a str, Option<Arc<TurnToolEvidence>>)>
+fn shared_evidence<'a, I>(
+    turns: I,
+) -> impl Iterator<Item = (&'a str, &'a str, Option<Arc<TurnToolEvidence>>, Option<&'a str>)>
 where
-    I: IntoIterator<Item = (&'a str, &'a str, Option<&'a TurnToolEvidence>)>,
+    I: IntoIterator<Item = (&'a str, &'a str, Option<&'a TurnToolEvidence>, Option<&'a str>)>,
 {
-    turns
-        .into_iter()
-        .map(|(role, content, evidence)| (role, content, evidence.map(|evidence| Arc::new(evidence.clone()))))
+    turns.into_iter().map(|(role, content, evidence, event_id)| {
+        (
+            role,
+            content,
+            evidence.map(|evidence| Arc::new(evidence.clone())),
+            event_id,
+        )
+    })
 }
 
 /// The refresh aside a durable compaction appends after its replacement, and

@@ -210,6 +210,7 @@ mod tests {
             tool_calls: Vec::new(),
             context_handoff,
             tool_evidence: None,
+            event_id: None,
         }
     }
 

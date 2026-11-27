@@ -1255,6 +1255,7 @@ async fn a_session_snapshot_with_pii_shapes_saves_byte_identical_and_the_generic
                 tool_calls: Vec::new(),
                 context_handoff: false,
                 tool_evidence: None,
+                event_id: None,
             });
         }
         let json = session.to_json().expect("test: serialize the chat session");

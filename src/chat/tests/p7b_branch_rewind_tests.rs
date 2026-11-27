@@ -11,6 +11,7 @@ fn turn(role: &str, content: &str) -> session::ChatTurn {
         tool_calls: Vec::new(),
         context_handoff: false,
         tool_evidence: None,
+        event_id: None,
     }
 }
 

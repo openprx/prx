@@ -258,6 +258,7 @@ async fn a_session_snapshot_through_the_scope_is_sealed_in_real_sqlite_and_reads
                 tool_calls: Vec::new(),
                 context_handoff: false,
                 tool_evidence: None,
+                event_id: None,
             });
         }
         let json = session.to_json().expect("test: serialize the chat session");

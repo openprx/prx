@@ -551,6 +551,7 @@ async fn resumed_compacted_session_does_not_call_summarizer_again() {
                 tool_calls: Vec::new(),
                 context_handoff: false,
                 tool_evidence: None,
+                event_id: None,
             })
             .collect()
     }

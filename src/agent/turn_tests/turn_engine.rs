@@ -3942,7 +3942,7 @@ async fn tools_published_for(canonical_turns: &[(&str, &str)]) -> Vec<Vec<String
         crate::agent::turn_tests::admission::AdmittedTurn::with_config(config, REQUEST, Arc::clone(&registry)).await;
     let canonical = crate::agent::turn_history::CanonicalHistory::from_acknowledged_turns(
         Some("sys"),
-        canonical_turns.iter().map(|(role, content)| (*role, *content, None)),
+        canonical_turns.iter().map(|(role, content)| (*role, *content, None, None)),
     )
     .with_raw_request(REQUEST);
     let mut view = vec![ChatMessage::system("sys")];

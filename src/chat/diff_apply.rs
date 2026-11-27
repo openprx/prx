@@ -745,6 +745,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 context_handoff: false,
                 tool_evidence: None,
+                event_id: None,
             },
             ChatTurn {
                 role: "user".to_string(),
@@ -753,6 +754,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 context_handoff: false,
                 tool_evidence: None,
+                event_id: None,
             },
         ];
         let latest = latest_fenced_diff(&turns, 1).unwrap_or_default();
