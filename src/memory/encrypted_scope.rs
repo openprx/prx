@@ -16,6 +16,12 @@ use std::sync::Arc;
 
 mod transcript_search;
 
+/// Event types of the scheduled-run results read by `newest_owner_events_of_type`.
+const SCHEDULED_RESULT_EVENT_TYPES: [&str; 2] = [
+    crate::agent::scheduled_result::SCHEDULE_RESULT_EVENT_TYPE,
+    crate::context::transcript::SCHEDULE_SEEN_EVENT_TYPE,
+];
+
 /// Encrypting view of `inner` for one `agent_account_id/conversation_id` scope.
 pub struct EncryptedScope {
     inner: Arc<dyn Memory>,
@@ -157,6 +163,18 @@ impl EncryptedScope {
             .open(&self.account_id, &self.scope, record_hash, &blob)
             .ok()?;
         String::from_utf8(plain).ok()
+    }
+
+    /// Whether `stored` is ciphertext sealed by this account (any scope), as
+    /// `seal` writes it. Plaintext rows never pass this check.
+    fn looks_sealed(&self, stored: &str) -> bool {
+        if self.crypto.encryption_enabled() {
+            base64::engine::general_purpose::STANDARD
+                .decode(stored.as_bytes())
+                .is_ok_and(|blob| blob.starts_with(b"RF1"))
+        } else {
+            serde_json::from_str::<serde_json::Value>(stored).is_ok_and(|value| value.get("scope").is_some())
+        }
     }
 
     fn owns_event(&self, event: &crate::memory::MessageEvent) -> bool {
@@ -1246,6 +1264,42 @@ impl Memory for EncryptedScope {
             .into_iter()
             .filter(|event| self.owns_event(event))
             .map(|event| self.reveal(event))
+            .collect())
+    }
+
+    /// Scheduled-run results are the one read that returns plaintext rows.
+    /// Scheduled runs record outside any encrypted scope (`scheduled_result`
+    /// writes through the run's base memory), so their rows are plaintext rows
+    /// of the owner. Only those scheduled-result types are read; any other
+    /// event type stays empty. Inner filters workspace, owner, event type and
+    /// partition in SQL, so every row here belongs to the principal's owner.
+    /// Sealed rows go through `owns_event` and `reveal`; sealed rows of another
+    /// scope are dropped; plaintext rows are returned as stored.
+    async fn newest_owner_events_of_type(
+        &self,
+        principal: &crate::memory::MemoryPrincipal,
+        event_type: &str,
+        after_id: Option<i64>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<crate::memory::MessageEvent>> {
+        if !SCHEDULED_RESULT_EVENT_TYPES.contains(&event_type) {
+            return Ok(Vec::new());
+        }
+        let events = self
+            .inner
+            .newest_owner_events_of_type(principal, event_type, after_id, limit)
+            .await?;
+        Ok(events
+            .into_iter()
+            .filter_map(|event| {
+                if self.owns_event(&event) {
+                    Some(self.reveal(event))
+                } else if self.looks_sealed(&event.content) {
+                    None
+                } else {
+                    Some(event)
+                }
+            })
             .collect())
     }
 

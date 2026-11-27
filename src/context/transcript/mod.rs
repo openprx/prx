@@ -25,7 +25,7 @@ pub(crate) use prefix_rows::{
     render_prefix,
 };
 pub(crate) use replay::{Attachment, History, ReplayLog, TurnReplay, stub_replayed_results};
-pub(crate) use schedule_rows::{mark_results_seen, unseen_results_note};
+pub(crate) use schedule_rows::{SCHEDULE_SEEN_EVENT_TYPE, mark_results_seen, unseen_results_note};
 pub(crate) use skill_rows::{SkillLoad, skill_load_of, skills_in_use};
 pub(crate) use sources::AttachmentSources;
 pub(crate) use tool_rows::{RoundLog, append_attachment, call_id_for};
