@@ -12,8 +12,15 @@
 //! their text, retrieval traces of the run, memories, drafts and links that
 //! name a deleted event as their source, the stored tool-output documents of
 //! the run (unless a tool result of a surviving run still quotes them), and
-//! compaction summaries and handoff
-//! notes built from a deleted event. The attempt rows keep their key and get
+//! compaction summaries (and the summaries built from those) and handoff
+//! notes built from a deleted event. A delete also takes the runs the turn
+//! spawned (child and grandchild sessions, by `parent_run_id`) with all their
+//! rows, each with its own `turn.deleted` record, and a message delete takes
+//! the scheduled-result rows of the job its message created (`correlation_id`).
+//! Every handoff note of a session created after the session's first deleted
+//! row goes, by position. Attachments that quoted deleted events, memories or
+//! documents are rewritten by the triggers of `rf_attachments`, and listings of
+//! the erased runs by `derived_sweep`, in the same transaction. The attempt rows keep their key and get
 //! the deleted mark; a message delete also clears the request digest, the
 //! only derivative of the message the record held.
 //!
@@ -24,7 +31,7 @@
 //! job has ended.
 
 use super::SqliteMemory;
-use super::rf_attachments;
+use super::derived_sweep;
 use super::rf_forget::{self, ForgetState, Partition};
 use crate::memory::rf_messages::{RfDeletedAgent, RfForget, RfForgetCounts, RfMessageDelete, RfReplyDelete};
 use crate::runtime::sqlite_pool::begin_immediate;
@@ -173,10 +180,7 @@ pub(super) fn delete_message(conn: &Connection, request: &RfMessageDelete) -> an
     )?;
     let mut agents: Vec<RfDeletedAgent> = Vec::new();
     for attempt in &attempts {
-        let live = attempt
-            .run_id
-            .as_ref()
-            .is_some_and(|run| request.live_runs.contains(run));
+        let live = is_live(&tx, &target, attempt, &request.live_runs)?;
         // Before the erase, so a memory the erase would remove by its source
         // event is counted as forgotten.
         let forget = if request.forget_writes {
@@ -215,11 +219,6 @@ pub(super) fn delete_message(conn: &Connection, request: &RfMessageDelete) -> an
                 agent.forget = Some(agent.forget.map_or(forget, |earlier| earlier.merge(forget)));
             }
         }
-    }
-    if request.forget_writes {
-        // A forget after a plain delete finds no row left to erase; the
-        // attachments that quoted the forgotten memories are still checked.
-        blank_attachments(&tx, &target, &[])?;
     }
     refresh_preview(&tx, &request.session_key)?;
     mark_scrub(&tx, &now)?;
@@ -281,7 +280,6 @@ pub(super) fn delete_reply(
         // A replay answers the recorded counts; a first forget on an
         // already deleted run runs now (its log rows are still there).
         let forget = forget_attempt(&tx, &target, &attempt, false)?;
-        blank_attachments(&tx, &target, &[])?;
         if attempt.forget.recorded.is_none() {
             mark_scrub(&tx, &now)?;
         }
@@ -348,10 +346,11 @@ pub(super) fn settle(
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
     let mut settled = false;
-    for attempt in pending
-        .iter()
-        .filter(|attempt| attempt.run_id.as_ref().is_none_or(|run| !live_runs.contains(run)))
-    {
+    for attempt in &pending {
+        // A run is live while it or a run it spawned is.
+        if is_live(&tx, &target, attempt, live_runs)? {
+            continue;
+        }
         // A forget asked while the run was live runs now, before the erase.
         if attempt.forget.requested && attempt.forget.recorded.is_none() {
             forget_now(&tx, &target, attempt)?;
@@ -405,6 +404,39 @@ fn forget_now(tx: &Connection, target: &Target<'_>, attempt: &Attempt) -> anyhow
     Ok(counts)
 }
 
+/// The runs spawned by `run_id`, children and deeper (`parent_run_id`
+/// closure of this owner's rows), without `run_id` itself.
+fn descendant_runs(tx: &Connection, workspace_id: &str, owner_id: &str, run_id: &str) -> anyhow::Result<Vec<String>> {
+    let mut statement = tx.prepare(
+        "WITH RECURSIVE family(run) AS (
+             SELECT ?3
+             UNION
+             SELECT e.run_id FROM message_events e JOIN family f ON e.parent_run_id = f.run
+             WHERE e.workspace_id = ?1 AND e.owner_id = ?2 AND e.run_id IS NOT NULL)
+         SELECT run FROM family WHERE run <> ?3",
+    )?;
+    Ok(statement
+        .query_map(params![workspace_id, owner_id, run_id], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?)
+}
+
+/// Whether the attempt's run, or a run it spawned, is still live in this
+/// process (`live_runs`).
+fn is_live(tx: &Connection, target: &Target<'_>, attempt: &Attempt, live_runs: &[String]) -> anyhow::Result<bool> {
+    let Some(run) = attempt.run_id.as_deref() else {
+        return Ok(false);
+    };
+    if live_runs.is_empty() {
+        return Ok(false);
+    }
+    if live_runs.iter().any(|live| live == run) {
+        return Ok(true);
+    }
+    Ok(descendant_runs(tx, target.workspace_id, target.owner_id, run)?
+        .iter()
+        .any(|descendant| live_runs.contains(descendant)))
+}
+
 /// The event ids of a run's rows.
 fn run_event_ids(tx: &Connection, target: &Target<'_>, run_id: Option<&str>) -> anyhow::Result<Vec<String>> {
     let Some(run_id) = run_id else {
@@ -419,35 +451,131 @@ fn run_event_ids(tx: &Connection, target: &Target<'_>, run_id: Option<&str>) -> 
 
 /// One event row a delete rewrites.
 struct EventRow {
+    id: i64,
     event_id: String,
-    conversational: bool,
+    role: String,
     content: String,
+    run_id: Option<String>,
+    session_key: Option<String>,
+    scope: Option<String>,
 }
 
-/// Tombstone one side of an attempt and every copy derived from it.
+impl EventRow {
+    /// A user or assistant message (its text is cached and recalled).
+    fn conversational(&self) -> bool {
+        matches!(self.role.as_str(), "user" | "assistant")
+    }
+}
+
+/// A run spawned by the deleted run, erased with it, in its own session.
+struct Child {
+    run_id: String,
+    session_key: String,
+    scope: Option<String>,
+    /// Smallest row id of the run among the rows the delete rewrites.
+    first_id: i64,
+    /// The run's first user row, else `None`.
+    first_user: Option<String>,
+    event_ids: Vec<String>,
+    contents: Vec<String>,
+}
+
+impl Child {
+    fn partition(&self, main: bool) -> Partition<'_> {
+        Partition {
+            scope: self.scope.as_deref(),
+            main,
+        }
+    }
+}
+
+/// Group the rewritten rows of the spawned runs by run, in row order.
+fn children_of(rows: &[EventRow], descendants: &[String], target: &Target<'_>) -> Vec<Child> {
+    let mut children: Vec<Child> = Vec::new();
+    for row in rows {
+        let Some(run) = row.run_id.as_deref().filter(|run| descendants.iter().any(|d| d == run)) else {
+            continue;
+        };
+        let index = if let Some(index) = children.iter().position(|child| child.run_id == run) {
+            index
+        } else {
+            children.push(Child {
+                run_id: run.to_owned(),
+                session_key: row.session_key.clone().unwrap_or_else(|| target.session_key.to_owned()),
+                scope: row.scope.clone(),
+                first_id: row.id,
+                first_user: None,
+                event_ids: Vec::new(),
+                contents: Vec::new(),
+            });
+            children.len() - 1
+        };
+        if let Some(child) = children.get_mut(index) {
+            child.first_id = child.first_id.min(row.id);
+            if child.first_user.is_none() && row.role == "user" {
+                child.first_user = Some(row.event_id.clone());
+            }
+            child.event_ids.push(row.event_id.clone());
+            if row.conversational() && !row.content.is_empty() {
+                child.contents.push(row.content.clone());
+            }
+        }
+    }
+    children
+}
+
+/// The `(agent_key, incarnation)` of an agent scope, `None` for no scope.
+fn scope_agent(tx: &Connection, scope: Option<&str>) -> anyhow::Result<Option<(String, String)>> {
+    let Some(scope) = scope else {
+        return Ok(None);
+    };
+    Ok(tx
+        .query_row(
+            "SELECT agent_key, incarnation FROM agent_scopes WHERE scope_id = ?1",
+            [scope],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?)
+}
+
+/// Tombstone one side of an attempt and every copy derived from it: the
+/// rows of the run and of every run it spawned, the result rows of a job its
+/// message created (message side only), the handoff notes after the first
+/// deleted row of a session, and the compaction summaries built from any of
+/// them. The attachments and listings that quoted them are rewritten by the
+/// store's triggers and `derived_sweep`.
 fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) -> anyhow::Result<()> {
+    let descendants = match attempt.run_id.as_deref() {
+        Some(run) => descendant_runs(tx, target.workspace_id, target.owner_id, run)?,
+        None => Vec::new(),
+    };
     // The usage row holds accounting only (tokens, model, cost) and stays; a
     // delete's own record and rows already tombstoned are never rewritten.
     let sql = match side {
         Side::Message => {
-            "SELECT event_id, role IN ('user', 'assistant'), content FROM message_events
+            "SELECT id, event_id, role, content, run_id, session_key, ma_scope_id FROM message_events
              WHERE workspace_id = ?1 AND owner_id = ?2
                AND (event_id = ?3 OR (?4 IS NOT NULL AND run_id = ?4)
+                    OR run_id IN (SELECT value FROM json_each(?5))
                     OR (event_type IN ('message.attachment.recorded', 'tool.call.recorded',
                                        'tool.result.recorded', 'turn.decision.claimed')
                         AND (causation_event_id = ?3
                              OR (json_valid(raw_payload_json)
-                                 AND json_extract(raw_payload_json, '$.user_event_id') = ?3))))
-               AND event_type NOT IN ('turn.deleted', 'usage.settled', 'message.deleted')"
+                                 AND json_extract(raw_payload_json, '$.user_event_id') = ?3)))
+                    OR (event_type = 'schedule.result.recorded' AND correlation_id = ?3))
+               AND event_type NOT IN ('turn.deleted', 'usage.settled', 'message.deleted')
+             ORDER BY id"
         }
         Side::Reply => {
-            "SELECT event_id, role IN ('user', 'assistant'), content FROM message_events
+            "SELECT id, event_id, role, content, run_id, session_key, ma_scope_id FROM message_events
              WHERE workspace_id = ?1 AND owner_id = ?2 AND event_id <> ?3
-               AND (run_id = ?4
-                    OR (event_type IN ('tool.call.recorded', 'tool.result.recorded', 'turn.decision.claimed')
-                        AND causation_event_id = ?3))
+               AND (run_id IN (SELECT value FROM json_each(?5))
+                    OR ((run_id = ?4
+                         OR (event_type IN ('tool.call.recorded', 'tool.result.recorded', 'turn.decision.claimed')
+                             AND causation_event_id = ?3))
+                        AND event_type NOT LIKE 'turn.ingress.%'))
                AND event_type NOT IN ('turn.deleted', 'usage.settled', 'message.deleted')
-               AND event_type NOT LIKE 'turn.ingress.%'"
+             ORDER BY id"
         }
     };
     let rows = {
@@ -458,13 +586,18 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
                     target.workspace_id,
                     target.owner_id,
                     attempt.input_event_id,
-                    attempt.run_id
+                    attempt.run_id,
+                    serde_json::to_string(&descendants)?
                 ],
                 |row| {
                     Ok(EventRow {
-                        event_id: row.get(0)?,
-                        conversational: row.get(1)?,
-                        content: row.get(2)?,
+                        id: row.get(0)?,
+                        event_id: row.get(1)?,
+                        role: row.get(2)?,
+                        content: row.get(3)?,
+                        run_id: row.get(4)?,
+                        session_key: row.get(5)?,
+                        scope: row.get(6)?,
                     })
                 },
             )?
@@ -473,6 +606,7 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
     if rows.is_empty() {
         return Ok(());
     }
+    let children = children_of(&rows, &descendants, target);
     let window_start: Option<String> = tx
         .query_row(
             "SELECT created_at FROM message_events WHERE workspace_id = ?1 AND event_id = ?2",
@@ -480,34 +614,53 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
             |row| row.get(0),
         )
         .optional()?;
-    for row in rows.iter().filter(|row| row.conversational && !row.content.is_empty()) {
+    for row in rows
+        .iter()
+        .filter(|row| row.conversational() && !row.content.is_empty())
+    {
+        // A spawned run's rows belong to its own session and agent.
+        let spawned = row
+            .run_id
+            .as_deref()
+            .is_some_and(|run| descendants.iter().any(|descendant| descendant == run));
+        let (scope, session_key) = if spawned {
+            (
+                row.scope.as_deref(),
+                row.session_key.as_deref().unwrap_or(target.session_key),
+            )
+        } else {
+            (attempt.scope.as_deref(), target.session_key)
+        };
         for hash in [
             SqliteMemory::scoped_content_hash(None, &row.content),
-            SqliteMemory::scoped_content_hash(attempt.scope.as_deref(), &row.content),
+            SqliteMemory::scoped_content_hash(scope, &row.content),
         ] {
             tx.execute("DELETE FROM embedding_cache WHERE content_hash = ?1", params![hash])?;
         }
         tx.execute(
             "DELETE FROM retrieval_traces WHERE workspace_id = ?1 AND session_key = ?2 AND query = ?3",
-            params![target.workspace_id, target.session_key, row.content],
+            params![target.workspace_id, session_key, row.content],
         )?;
     }
-    // Traces the run wrote (recall and tool queries) for this agent.
-    tx.execute(
-        "DELETE FROM retrieval_traces WHERE workspace_id = ?1 AND session_key = ?2 AND ma_scope_id IS ?3
-           AND julianday(created_at) >= julianday(?4) AND julianday(created_at) <= julianday(?5)",
-        params![
-            target.workspace_id,
-            target.session_key,
-            attempt.scope,
-            window_start,
-            target.now
-        ],
-    )?;
-    let direct = serde_json::to_string(&rows.iter().map(|row| row.event_id.as_str()).collect::<Vec<_>>())?;
+    // Traces the run and the runs it spawned wrote (recall and tool queries)
+    // for their agents, each in its own session.
+    let trace_windows = std::iter::once((target.session_key, attempt.scope.as_deref())).chain(
+        children
+            .iter()
+            .map(|child| (child.session_key.as_str(), child.scope.as_deref())),
+    );
+    for (session_key, scope) in trace_windows {
+        tx.execute(
+            "DELETE FROM retrieval_traces WHERE workspace_id = ?1 AND session_key = ?2 AND ma_scope_id IS ?3
+               AND julianday(created_at) >= julianday(?4) AND julianday(created_at) <= julianday(?5)",
+            params![target.workspace_id, session_key, scope, window_start, target.now],
+        )?;
+    }
+    let direct_ids: Vec<String> = rows.iter().map(|row| row.event_id.clone()).collect();
+    let direct = serde_json::to_string(&direct_ids)?;
     let contents = rows
         .iter()
-        .filter(|row| row.conversational && !row.content.is_empty())
+        .filter(|row| row.conversational() && !row.content.is_empty())
         .map(|row| row.content.as_str())
         .collect::<Vec<_>>();
     rf_forget::erase_context_pages(
@@ -518,8 +671,22 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
         &attempt.input_event_id,
         &contents,
     )?;
-    let texts: Vec<String> = contents.iter().map(|text| (*text).to_owned()).collect();
-    let direct_event_ids: Vec<String> = rows.iter().map(|row| row.event_id.clone()).collect();
+    for child in &children {
+        let main = scope_agent(tx, child.scope.as_deref())?.is_none_or(|(agent_key, _)| agent_key == "m");
+        let child_contents: Vec<&str> = child.contents.iter().map(String::as_str).collect();
+        rf_forget::erase_context_pages(
+            tx,
+            &child.session_key,
+            child.partition(main),
+            &serde_json::to_string(&child.event_ids)?,
+            child
+                .first_user
+                .as_deref()
+                .or(child.event_ids.first().map(String::as_str))
+                .unwrap_or_default(),
+            &child_contents,
+        )?;
+    }
     let mut ids = rows.into_iter().map(|row| row.event_id).collect::<Vec<_>>();
     rf_forget::drop_prefix_rows_of(
         tx,
@@ -536,49 +703,36 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
     ] {
         tx.execute(statement, params![direct])?;
     }
-    ids.extend(erase_compactions(tx, target, &direct, &mut forgotten)?);
+    // A summary of a summary: each pass matches the deleted ids plus the
+    // summary events found so far and handles only the compaction runs no
+    // earlier pass found, so the loop ends when a pass finds none new.
+    let mut summary_sources = direct_ids.clone();
+    let mut handled_runs: Vec<String> = Vec::new();
+    loop {
+        let found = erase_compactions(
+            tx,
+            target,
+            &serde_json::to_string(&summary_sources)?,
+            &mut handled_runs,
+            &mut forgotten,
+        )?;
+        if found.is_empty() {
+            break;
+        }
+        for summary in found.into_iter().flatten() {
+            summary_sources.push(summary.clone());
+            ids.push(summary);
+        }
+    }
     if forgotten > 0 {
         // FTS5 keeps a deleted row's terms in its segments until a merge;
         // a rebuild drops them as well as their tombstones.
         tx.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')", [])?;
     }
-    // Switch notes derive from the messages they cover, and a later handoff is
-    // built from an earlier one (its summary, and `parent_handoff_event_id` as
-    // text), so a note can hold a deleted event's content without naming its id.
-    // A note's `event_id` is its `handoff_event_id`. Each pass matches the
-    // directly deleted ids plus the handoff ids of the notes found so far, and
-    // keeps only the notes no earlier pass found. The session has finitely many
-    // switch rows, so the loop ends when a pass finds none new.
-    let mut frontier: Vec<String> = direct_event_ids;
-    let mut notes: Vec<String> = Vec::new();
-    loop {
-        let matched = {
-            let mut statement = tx.prepare(
-                "SELECT event_id FROM message_events
-                 WHERE workspace_id = ?1 AND session_key = ?2 AND event_type = 'context.switch.created'
-                   AND (causation_event_id IN (SELECT value FROM json_each(?3))
-                        OR correlation_id IN (SELECT value FROM json_each(?3))
-                        OR EXISTS(SELECT 1 FROM json_each(?3) j WHERE instr(content, j.value) > 0))",
-            )?;
-            statement
-                .query_map(
-                    params![
-                        target.workspace_id,
-                        target.session_key,
-                        serde_json::to_string(&frontier)?
-                    ],
-                    |row| row.get::<_, String>(0),
-                )?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        let fresh: Vec<String> = matched.into_iter().filter(|id| !notes.contains(id)).collect();
-        if fresh.is_empty() {
-            break;
-        }
-        frontier.extend(fresh.iter().cloned());
-        notes.extend(fresh);
-    }
-    ids.extend(notes);
+    // A handoff note summarizes the window before it, so every note of a
+    // session created after its first deleted row can hold deleted content
+    // without naming the row (position, not text).
+    ids.extend(later_handoff_notes(tx, target, &direct)?);
     let all = serde_json::to_string(&ids)?;
     // Read before the rewrite: the payload of a tool result names the stored
     // document that holds its large output.
@@ -595,25 +749,45 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
          WHERE workspace_id = ?1 AND event_id IN (SELECT value FROM json_each(?2))",
         params![target.workspace_id, all, target.now],
     )?;
-    erase_tool_output_documents(tx, &attempt.input_event_id, &output_documents)?;
-    // After the memories and events above are gone: a later attachment of the
-    // session that quoted any of them is rewritten (`rf_attachments`).
-    blank_attachments(tx, target, &texts.iter().map(String::as_str).collect::<Vec<_>>())?;
+    let mut inputs = vec![attempt.input_event_id.clone()];
+    inputs.extend(children.iter().filter_map(|child| child.first_user.clone()));
+    erase_tool_output_documents(tx, &inputs, &output_documents)?;
+    // The attachments that quoted a deleted event, memory or document were
+    // rewritten by the triggers of those deletes, in this transaction.
+    for child in &children {
+        record_child_deleted(tx, target, side, child)?;
+    }
+    if let Some(since_id) = children.iter().map(|child| child.first_id).min() {
+        // Listings in later runs of the session may name the erased runs and
+        // their sessions (run ids and `child-` keys are both identifiers).
+        let erased = derived_sweep::ErasedIdentifiers {
+            run_ids: children
+                .iter()
+                .flat_map(|child| [child.run_id.clone(), child.session_key.clone()])
+                .collect(),
+            since_id,
+            swept_sessions: Vec::new(),
+        };
+        derived_sweep::rewrite_listings(tx, target.workspace_id, &erased, target.now)?;
+    }
     tombstone_turns(tx, &ids, target.now)
 }
 
-/// Rewrite the later attachments of the session that quote deleted content;
-/// `deleted_texts` serve the text match of attachments without provenance.
-fn blank_attachments(tx: &Connection, target: &Target<'_>, deleted_texts: &[&str]) -> anyhow::Result<()> {
-    rf_attachments::blank_stale_attachments(
-        tx,
-        target.workspace_id,
-        target.owner_id,
-        target.session_key,
-        target.now,
-        deleted_texts,
+/// The handoff notes created after the first deleted row of their session
+/// (`direct`, a JSON array of the directly deleted event ids), except the
+/// notes already among them.
+fn later_handoff_notes(tx: &Connection, target: &Target<'_>, direct: &str) -> anyhow::Result<Vec<String>> {
+    let mut statement = tx.prepare(
+        "SELECT n.event_id FROM message_events n
+         WHERE n.workspace_id = ?1 AND n.event_type = 'context.switch.created' AND n.session_key IS NOT NULL
+           AND n.event_id NOT IN (SELECT value FROM json_each(?2))
+           AND n.id > (SELECT MIN(d.id) FROM message_events d
+                       WHERE d.workspace_id = ?1 AND d.session_key = n.session_key
+                         AND d.event_id IN (SELECT value FROM json_each(?2)))",
     )?;
-    Ok(())
+    Ok(statement
+        .query_map(params![target.workspace_id, direct], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?)
 }
 
 /// The document kinds a run's tool outputs are stored as: the oversized
@@ -630,7 +804,9 @@ fn tool_output_document_ids(tx: &Connection, target: &Target<'_>, event_ids: &st
            AND event_id IN (SELECT value FROM json_each(?2))",
     )?;
     let ids = statement
-        .query_map(params![target.workspace_id, event_ids], |row| row.get::<_, Option<String>>(0))?
+        .query_map(params![target.workspace_id, event_ids], |row| {
+            row.get::<_, Option<String>>(0)
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(ids
         .into_iter()
@@ -640,12 +816,17 @@ fn tool_output_document_ids(tx: &Connection, target: &Target<'_>, event_ids: &st
 }
 
 /// Delete the stored tool-output documents of a deleted run: those its tool
-/// result rows referenced and those stored with its input event as source.
+/// result rows referenced and those stored with one of its input events
+/// (`input_event_ids`: the run's and its spawned runs') as source.
 /// A document is content-addressed, so one that a tool result row of a
 /// surviving run still references stays (that row quotes it by id).
-fn erase_tool_output_documents(tx: &Connection, input_event_id: &str, referenced: &[String]) -> anyhow::Result<()> {
+fn erase_tool_output_documents(
+    tx: &Connection,
+    input_event_ids: &[String],
+    referenced: &[String],
+) -> anyhow::Result<()> {
     let mut ids = referenced.to_vec();
-    {
+    for input_event_id in input_event_ids {
         let mut statement = tx.prepare(&format!(
             "SELECT document_id FROM documents WHERE source_message_event_id = ?1 AND source_kind IN {TOOL_OUTPUT_KINDS}"
         ))?;
@@ -657,7 +838,9 @@ fn erase_tool_output_documents(tx: &Connection, input_event_id: &str, referenced
     let mut deleted = false;
     for id in ids {
         let kind_ok: bool = tx.query_row(
-            &format!("SELECT EXISTS(SELECT 1 FROM documents WHERE document_id = ?1 AND source_kind IN {TOOL_OUTPUT_KINDS})"),
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM documents WHERE document_id = ?1 AND source_kind IN {TOOL_OUTPUT_KINDS})"
+            ),
             params![id],
             |row| row.get(0),
         )?;
@@ -675,14 +858,17 @@ fn erase_tool_output_documents(tx: &Connection, input_event_id: &str, referenced
     rf_forget::rebuild_indexes(tx, false, deleted)
 }
 
-/// Compaction summaries built from a deleted event: the summary text, its
-/// memory row and the summary event (returned, for tombstoning).
+/// Compaction summaries built from a deleted event: the summary text and its
+/// memory row are removed, and the summary event is returned (for
+/// tombstoning), one entry per compaction run not in `handled` yet; the runs
+/// found are added to `handled`.
 fn erase_compactions(
     tx: &Connection,
     target: &Target<'_>,
     ids: &str,
+    handled: &mut Vec<String>,
     forgotten: &mut usize,
-) -> anyhow::Result<Vec<String>> {
+) -> anyhow::Result<Vec<Option<String>>> {
     let runs = {
         let mut statement = tx.prepare(
             "SELECT run_id, summary_memory_key,
@@ -706,10 +892,14 @@ fn erase_compactions(
     };
     let mut summaries = Vec::new();
     for (run_id, memory_key, summary_event) in runs {
+        if handled.contains(&run_id) {
+            continue;
+        }
         tx.execute(
             "UPDATE compaction_runs SET summary = '' WHERE workspace_id = ?1 AND run_id = ?2",
             params![target.workspace_id, run_id],
         )?;
+        handled.push(run_id);
         if let Some(key) = memory_key {
             rf_forget::drop_prefix_rows_of(
                 tx,
@@ -718,7 +908,7 @@ fn erase_compactions(
             )?;
             *forgotten = forgotten.saturating_add(tx.execute("DELETE FROM memories WHERE key = ?1", params![key])?);
         }
-        summaries.extend(summary_event);
+        summaries.push(summary_event);
     }
     Ok(summaries)
 }
@@ -730,6 +920,69 @@ fn tombstone_turns(tx: &Connection, event_ids: &[String], now: &str) -> anyhow::
          WHERE message_event_id IN (SELECT value FROM json_each(?1))",
         params![serde_json::to_string(event_ids)?, now],
     )?;
+    Ok(())
+}
+
+/// Insert the content-free `turn.deleted` row of `subject` (one per run and
+/// side; a repeat keeps the first) and return its event id.
+fn insert_deleted_row(
+    tx: &Connection,
+    target: &Target<'_>,
+    session_key: &str,
+    side: Side,
+    subject: &str,
+    payload: &serde_json::Value,
+    scope: Option<&str>,
+) -> anyhow::Result<String> {
+    let key = format!("rf-delete:{}:{subject}", side.label());
+    tx.execute(
+        "INSERT INTO message_events (
+            event_id, idempotency_key, workspace_id, owner_id, source, session_key, role,
+            event_type, content, raw_payload_json, created_at, updated_at, ma_scope_id
+         ) VALUES (?1, ?2, ?3, ?4, 'console', ?5, 'event', 'turn.deleted', 'turn.deleted', ?6, ?7, ?7, ?8)
+         ON CONFLICT DO NOTHING",
+        params![
+            uuid::Uuid::new_v4().to_string(),
+            key,
+            target.workspace_id,
+            target.owner_id,
+            session_key,
+            payload.to_string(),
+            target.now,
+            scope,
+        ],
+    )?;
+    Ok(tx.query_row(
+        "SELECT event_id FROM message_events WHERE workspace_id=?1 AND owner_id=?2 AND idempotency_key=?3",
+        params![target.workspace_id, target.owner_id, key],
+        |r| r.get(0),
+    )?)
+}
+
+/// The sync header fields of one `turn.deleted` row.
+struct DeletedHeader<'a> {
+    session_key: &'a str,
+    agent: &'a str,
+    incarnation: &'a str,
+    run_id: Option<&'a str>,
+    event_id: &'a str,
+    /// The anchor message of the deleted run.
+    message_id: &'a str,
+}
+
+/// Append the sync header of a `turn.deleted` row; its source is content-free.
+fn append_deleted_header(tx: &Connection, target: &Target<'_>, fields: &DeletedHeader<'_>) -> anyhow::Result<()> {
+    let mut header = super::sync_journal::Header::new(
+        target.owner_id,
+        "turn.deleted",
+        fields.session_key,
+        fields.agent,
+        fields.incarnation,
+        format!("event:{}", fields.event_id),
+    );
+    header.run_id = fields.run_id.map(str::to_owned);
+    header.source_ref = format!("deleted:{}:{}", fields.event_id, fields.message_id);
+    super::sync_journal::append(tx, &header)?;
     Ok(())
 }
 
@@ -750,50 +1003,17 @@ fn record_deleted(
         "message_id": client_message_id,
         "run_id": attempt.run_id,
     });
-    tx.execute(
-        "INSERT INTO message_events (
-            event_id, idempotency_key, workspace_id, owner_id, source, session_key, role,
-            event_type, content, raw_payload_json, created_at, updated_at, ma_scope_id
-         ) VALUES (?1, ?2, ?3, ?4, 'console', ?5, 'event', 'turn.deleted', 'turn.deleted', ?6, ?7, ?7, ?8)
-         ON CONFLICT DO NOTHING",
-        params![
-            uuid::Uuid::new_v4().to_string(),
-            format!("rf-delete:{}:{subject}", side.label()),
-            target.workspace_id,
-            target.owner_id,
-            target.session_key,
-            payload.to_string(),
-            target.now,
-            attempt.scope,
-        ],
-    )?;
-    let event_id: String = tx.query_row(
-        "SELECT event_id FROM message_events WHERE workspace_id=?1 AND owner_id=?2 AND idempotency_key=?3",
-        params![
-            target.workspace_id,
-            target.owner_id,
-            format!("rf-delete:{}:{subject}", side.label())
-        ],
-        |r| r.get(0),
+    let event_id = insert_deleted_row(
+        tx,
+        target,
+        target.session_key,
+        side,
+        subject,
+        &payload,
+        attempt.scope.as_deref(),
     )?;
     // The delete source is content-free and names its root attempt explicitly.
-    let incarnation: Option<String> = tx
-        .query_row(
-            "SELECT incarnation FROM agent_scopes WHERE scope_id=?1",
-            [&attempt.scope],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if let Some(incarnation) = incarnation {
-        let mut header = super::sync_journal::Header::new(
-            target.owner_id,
-            "turn.deleted",
-            target.session_key,
-            &attempt.agent_key,
-            &incarnation,
-            format!("event:{event_id}"),
-        );
-        header.run_id = attempt.run_id.clone();
+    if let Some((_, incarnation)) = scope_agent(tx, attempt.scope.as_deref())? {
         let message_id = match side {
             Side::Message => Some(attempt.input_event_id.clone()),
             Side::Reply => tx
@@ -811,8 +1031,53 @@ fn record_deleted(
         // A failed/interrupted run can have no assistant row. Its input
         // remains the stable history anchor; side/run_id identify the reply.
         let message_id = message_id.unwrap_or_else(|| attempt.input_event_id.clone());
-        header.source_ref = format!("deleted:{event_id}:{message_id}");
-        super::sync_journal::append(tx, &header)?;
+        let fields = DeletedHeader {
+            session_key: target.session_key,
+            agent: &attempt.agent_key,
+            incarnation: &incarnation,
+            run_id: attempt.run_id.as_deref(),
+            event_id: &event_id,
+            message_id: &message_id,
+        };
+        append_deleted_header(tx, target, &fields)?;
+    }
+    Ok(())
+}
+
+/// The `turn.deleted` record of a run spawned by the deleted run, in the
+/// spawned run's own session (side as the parent delete, no message id).
+fn record_child_deleted(tx: &Connection, target: &Target<'_>, side: Side, child: &Child) -> anyhow::Result<()> {
+    let agent = scope_agent(tx, child.scope.as_deref())?;
+    let name = match agent.as_ref().map(|(key, _)| key.as_str()) {
+        Some("m") | None => "main",
+        Some(key) => key.strip_prefix("n:").unwrap_or(key),
+    };
+    let payload = serde_json::json!({
+        "side": side.label(),
+        "agent": name,
+        "message_id": serde_json::Value::Null,
+        "run_id": child.run_id,
+    });
+    let event_id = insert_deleted_row(
+        tx,
+        target,
+        &child.session_key,
+        side,
+        &child.run_id,
+        &payload,
+        child.scope.as_deref(),
+    )?;
+    if let Some((_, incarnation)) = &agent {
+        let anchor = child.first_user.as_deref().unwrap_or(&event_id);
+        let fields = DeletedHeader {
+            session_key: &child.session_key,
+            agent: name,
+            incarnation: &incarnation,
+            run_id: Some(&child.run_id),
+            event_id: &event_id,
+            message_id: anchor,
+        };
+        append_deleted_header(tx, target, &fields)?;
     }
     Ok(())
 }

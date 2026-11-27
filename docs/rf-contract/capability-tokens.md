@@ -454,26 +454,46 @@ handles it as a user delete of that message or reply (same `side`); ignoring
 
 **Later attachments.** The recall text of a later turn can quote a deleted
 message (or a memory or document made from it), and that text is stored in the
-later turn's attachment row and replayed to the model. A delete (and a forget)
-therefore also rewrites, in the same transaction, the attachment rows of the
-same session that still quote deleted content. A row written with provenance
-(its payload `sources`: the ids of the memories, session or shared events and
-documents its text was built from) is rewritten when any of them is gone: a
-quoted event is tombstoned, or a quoted memory or document no longer exists
-(deleted with the message, or forgotten by `forget_writes`). A memory that
+later turn's attachment row and replayed to the model. The store therefore
+rewrites, in the same transaction as the deleting statement, every attachment
+row that still quotes deleted content, in any session of the workspace. This
+holds for every path that deletes a message, memory or document (message and
+reply delete, forget, history erase, retention), not only these routes. A row
+is written with provenance (its payload `sources`: the ids of the memories,
+session or shared events, documents and scheduled results its text was built
+from) and is rewritten when any of them is gone: a quoted event is tombstoned
+or deleted, or a quoted memory or document no longer exists. A memory that
 still exists is not a reason, so after a plain delete the attachments that
 quote only a surviving memory stay; those that quote the deleted message's own
-text are rewritten. A row written before provenance (no `sources`) is matched
-by text, within the session only: it is rewritten when its recalled text
-contains the first 64 characters (line breaks read as spaces) of a deleted
-user or assistant message of at least 12 characters. A rewritten row keeps its
-date line, gets an empty recalled text and the mark `"blanked":true`; the
-message then replays as plain input with its date line. The rewrite is
-content-only: no new sync-stream record, and the session routes' JSON does not
-change. Limits of the text match: a message shorter than 12 characters, a
-message whose recall line was clipped before the 64 characters, one that
-contained media markers or was masked by secret redaction, may not be found in
-an old row.
+text are rewritten. A rewritten row keeps its date line, gets an empty recalled
+text and the mark `"blanked":true`; the message then replays as plain input
+with its date line. Rows written before provenance (no `sources`) were blanked
+once when the store was upgraded; they are no longer matched by text. The
+rewrite is content-only: no new sync-stream record, and the session routes'
+JSON does not change.
+
+**Runs the turn spawned.** A message or reply delete also deletes the runs the
+turn spawned (child and grandchild sessions, found through the parent-run link
+of their rows): every row of those runs is tombstoned like the deleted run's
+rows, and each such run gets its own `turn.deleted` record (same `side` as the
+delete, `message_id` `null`, `run_id` the spawned run) in the spawned run's own
+session stream. A spawned run that is still running defers the whole delete as
+a running turn does (`deferred` lists the parent run). Tool results in later
+runs of the session that listed an erased run or session by its id are replaced
+by a fixed text.
+
+**Scheduled jobs.** Deleting the message that created a scheduled job (a message
+delete, not a reply delete) removes the job's stored result rows (the excerpts
+shown in the owner's session) and the notes that quoted them. The job itself is
+a separate object: it is not deleted or disabled and keeps running until it
+is removed on its own.
+
+**Handoff notes and summaries.** Every handoff note of a session created after
+the session's first deleted row is tombstoned, whether or not it names a
+deleted message (a note summarizes everything before it); conversation rows
+projected from a tombstoned note get `deleted_at`. Compaction summaries built
+from a deleted row, and summaries built from those summaries, are removed with
+their memory rows.
 
 **Running turns.** Deleting a message whose turn is still running cancels
 nothing: its input is a tombstone in the history at once, and its reply and
