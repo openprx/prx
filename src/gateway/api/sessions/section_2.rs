@@ -487,6 +487,29 @@ async fn submit_console_message(
         return error.into_response();
     }
 
+    // `/compact` is the terminal's compaction command: the whole trimmed text,
+    // nothing stored, no turn. A multipart message and an rf message (whose text
+    // is the rendered caller-context block) stay ordinary messages.
+    if rf.is_none() && uploads.paths.is_empty() && is_compact_command(&message) {
+        return match run_console_compact(&state, &turn_runtime, &runtime_envelope, &turns).await {
+            Ok(reply) => (
+                StatusCode::OK,
+                Json(SendMessageResponse {
+                    status: "ok".to_string(),
+                    reply,
+                }),
+            )
+                .into_response(),
+            Err(error) => {
+                tracing::warn!(
+                    error = %crate::agent::diagnostics::error_class(&error),
+                    "Console compaction failed"
+                );
+                json_error(StatusCode::INTERNAL_SERVER_ERROR, "Console compaction failed")
+            }
+        };
+    }
+
     let input_cancellation = tokio_util::sync::CancellationToken::new();
     let ticket = match turn_runtime.publication_slot.cleanup.register(input_cancellation) {
         Ok(ticket) => ticket,
@@ -619,6 +642,100 @@ async fn submit_console_message(
         return (StatusCode::ACCEPTED, Json(job.accepted_body())).into_response();
     }
     job.wait().await.into_response()
+}
+
+/// Whether a console message is exactly the compaction command.
+fn is_compact_command(message: &str) -> bool {
+    message.trim() == "/compact"
+}
+
+/// The terminal's `/compact` on the stored session: force a context switch over
+/// the cold window of the session's turns and return the notice the terminal
+/// prints. No turn runs and no row is stored for the command; the switch writes
+/// its own `context.switch.created` row and the next turn opens on it. The
+/// handoff summary is the one model request, as in the terminal.
+async fn run_console_compact(
+    state: &AppState,
+    turn_runtime: &std::sync::Arc<crate::gateway::TurnRuntimeGeneration>,
+    envelope: &RuntimeEnvelope,
+    turns: &[crate::memory::ConversationTurn],
+) -> anyhow::Result<String> {
+    use crate::chat::compaction as notice;
+    let service = turn_runtime
+        .publication_slot
+        .publish(turn_runtime, state)
+        .await
+        .map_err(|_| anyhow::anyhow!("Console compaction publication failed"))?;
+    let provider_label = turn_runtime
+        .provider_binding
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Console provider binding missing"))?
+        .provider_name()
+        .to_string();
+    let config = service
+        .effective_compaction(&provider_label, &turn_runtime.model)
+        .config;
+    let source = crate::agent::turn_history::CanonicalHistory::from_acknowledged(
+        None,
+        turns.iter().map(|turn| (turn.role.as_str(), turn.content.as_str())),
+    );
+    if !notice::manual_compact_has_compactable(source.messages(), &config) {
+        return Ok(notice::format_nothing_to_compact_feedback(source.messages(), &config));
+    }
+    let audit = match crate::agent::document_ingest::DocumentIngestRuntime::from_envelope(state.mem.clone(), envelope)
+        .bound_to_newest_user_input()
+        .await
+    {
+        Ok(Some(audit)) => audit,
+        Ok(None) => return Ok(notice::NOTHING_TO_COMPACT_NO_TRANSCRIPT.to_owned()),
+        Err(error) => {
+            let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+            tracing::warn!(
+                error_len,
+                error_sha256,
+                "console compaction could not read the durable transcript"
+            );
+            return Ok(format!(
+                "Compaction unavailable: the durable transcript could not be read ({error})."
+            ));
+        }
+    };
+    let build = crate::agent::compaction::build_configurable_compaction_patch_with_source_history(
+        source.messages(),
+        &source,
+        turn_runtime.provider.as_ref(),
+        &turn_runtime.model,
+        &config,
+        Some(&audit),
+        crate::agent::compaction::MANUAL_COMPACT_TRIGGER,
+    )
+    .await;
+    let patch = match build {
+        Ok(crate::agent::compaction::CompactionBuild::Patch(patch)) => patch,
+        Ok(_) => return Ok(notice::NO_DURABLE_COMPACTION_FEEDBACK.to_owned()),
+        Err(error) => {
+            let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+            tracing::warn!(
+                error_len,
+                error_sha256,
+                "console compaction failed; no durable compaction"
+            );
+            return Ok(notice::NO_DURABLE_COMPACTION_FEEDBACK.to_owned());
+        }
+    };
+    let mut compacted = source.clone();
+    if let Err(error) = compacted.apply_patch(&patch) {
+        return Ok(format!("Compaction refused: {error}. Nothing was changed."));
+    }
+    let turns_before = source.messages().len();
+    let turns_after = compacted.messages().len();
+    Ok(notice::format_compact_feedback(
+        turns_before,
+        turns_after,
+        crate::agent::context_budget::measure_history_tokens(source.messages()),
+        crate::agent::context_budget::measure_history_tokens(compacted.messages()),
+        config.max_context_tokens,
+    ))
 }
 
 /// The unbounded half of `POST /sessions/{id}/message`, run as a job.

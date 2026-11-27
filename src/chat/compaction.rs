@@ -40,7 +40,7 @@ fn format_compact_token_count(tokens: usize) -> String {
     }
 }
 
-pub(super) fn format_compact_feedback(
+pub(crate) fn format_compact_feedback(
     turns_before: usize,
     turns_after: usize,
     tokens_before: usize,
@@ -111,7 +111,7 @@ pub(crate) fn format_context_degraded_notice(dropped_messages: usize) -> String 
 
 /// Whether an explicit `/compact` has anything to compact: more non-system
 /// messages in `source_history` than `keep_recent_messages` keeps.
-pub(super) fn manual_compact_has_compactable(
+pub(crate) fn manual_compact_has_compactable(
     source_history: &[ChatMessage],
     compaction_config: &crate::config::AgentCompactionConfig,
 ) -> bool {
@@ -121,7 +121,7 @@ pub(super) fn manual_compact_has_compactable(
 }
 
 /// Feedback when `/compact` finds no durable transcript to bind to (D7).
-pub(super) const NOTHING_TO_COMPACT_NO_TRANSCRIPT: &str = "Nothing to compact (no durable transcript yet).";
+pub(crate) const NOTHING_TO_COMPACT_NO_TRANSCRIPT: &str = "Nothing to compact (no durable transcript yet).";
 
 /// Everything an explicit `/compact` works on.
 pub(super) struct ManualCompact<'a> {
@@ -141,7 +141,7 @@ pub(super) struct ManualCompact<'a> {
 
 /// Feedback when no handoff or summary can be built: the session is left
 /// unchanged and each request is trimmed on its own.
-pub(super) const NO_DURABLE_COMPACTION_FEEDBACK: &str =
+pub(crate) const NO_DURABLE_COMPACTION_FEEDBACK: &str =
     "No durable compaction available; requests will be trimmed per request. Nothing was changed.";
 
 /// What an explicit `/compact` or a chat preflight compaction did. Callers
@@ -308,7 +308,7 @@ pub(super) fn provider_view_from_acked(
         .into_messages()
 }
 
-pub(super) fn format_nothing_to_compact_feedback(
+pub(crate) fn format_nothing_to_compact_feedback(
     history: &[ChatMessage],
     compaction_config: &crate::config::AgentCompactionConfig,
 ) -> String {
