@@ -79,16 +79,30 @@ fn keep_row(run_unit: bool) -> String {
     )
 }
 
-/// E8 for a run unit: a pending recovery attestation names one of its rows.
+/// Indexes on the attestation columns E8 joins on; created only when the table exists.
+const ATTESTATION_INDEXES: &str = "
+    CREATE INDEX IF NOT EXISTS idx_recovery_attestations_input
+        ON recovery_attestations(input_event_id);
+    CREATE INDEX IF NOT EXISTS idx_recovery_attestations_terminal
+        ON recovery_attestations(terminal_event_id);";
+
+/// E8 for a run unit: a pending recovery attestation names one of its rows. Two
+/// EXISTS, one per column, so each can use its index.
 const PENDING_ATTESTATION_RUN: &str = "
                  AND NOT EXISTS(SELECT 1 FROM message_events r
-                     JOIN recovery_attestations a ON (a.input_event_id = r.event_id OR a.terminal_event_id = r.event_id)
+                     JOIN recovery_attestations a ON a.input_event_id = r.event_id
+                     WHERE r.workspace_id = :workspace AND r.run_id = :run AND a.state = 'pending')
+                 AND NOT EXISTS(SELECT 1 FROM message_events r
+                     JOIN recovery_attestations a ON a.terminal_event_id = r.event_id
                      WHERE r.workspace_id = :workspace AND r.run_id = :run AND a.state = 'pending')";
 
 /// E8 for a runless unit.
 const PENDING_ATTESTATION_ROW: &str = "
                  AND NOT EXISTS(SELECT 1 FROM message_events r
-                     JOIN recovery_attestations a ON (a.input_event_id = r.event_id OR a.terminal_event_id = r.event_id)
+                     JOIN recovery_attestations a ON a.input_event_id = r.event_id
+                     WHERE r.id = :id AND a.state = 'pending')
+                 AND NOT EXISTS(SELECT 1 FROM message_events r
+                     JOIN recovery_attestations a ON a.terminal_event_id = r.event_id
                      WHERE r.id = :id AND a.state = 'pending')";
 
 /// Which optional tables exist in this store, checked once per batch.
@@ -136,19 +150,21 @@ pub(super) fn trim(
     let cutoff_text = cutoff.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
     let now = chrono::Utc::now().timestamp();
     let mut trim = MessageTrim::default();
-    {
+    let start = {
+        // Own transaction: the state checks and the back-off record. It commits before
+        // the index and prune step, so a failure there still starts the back-off.
         let writer = memory.pool.write();
         let tx = begin_immediate(&writer)?;
-        ensure_attempt_column(&tx)?;
-        let state: Option<(i64, Option<i64>)> = tx
+        ensure_state_columns(&tx)?;
+        let state: Option<(i64, Option<i64>, Option<i64>)> = tx
             .query_row(
-                "SELECT last_run, last_attempt FROM message_retention_state WHERE singleton = 1",
+                "SELECT last_run, last_attempt, scan_after FROM message_retention_state WHERE singleton = 1",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
         if mode == TrimMode::Startup
-            && state.is_some_and(|(last_run, last_attempt)| {
+            && state.is_some_and(|(last_run, last_attempt, _)| {
                 now - last_run < THROTTLE_SECS || last_attempt.is_some_and(|at| now - at < BACKOFF_SECS)
             })
         {
@@ -170,11 +186,23 @@ pub(super) fn trim(
              ON CONFLICT(singleton) DO UPDATE SET last_attempt = excluded.last_attempt",
             params![now],
         )?;
+        tx.commit()?;
+        state.and_then(|(_, _, scan_after)| scan_after).unwrap_or(0)
+    };
+    {
+        let writer = memory.pool.write();
+        let tx = begin_immediate(&writer)?;
         tx.execute_batch(INDEXES)?;
+        if copies::has_table(&tx, "recovery_attestations")? {
+            tx.execute_batch(ATTESTATION_INDEXES)?;
+        }
         sync_journal::prune(&tx)?;
         tx.commit()?;
     }
-    let mut cursor = 0_i64;
+    // The scan resumes where the previous pass stopped (`scan_after`), so a block of
+    // kept rows at the front cannot hide later eligible rows from every pass. A scan
+    // that reaches the end wraps to the start.
+    let mut cursor = start;
     let mut resweep = true;
     for _ in 0..max_batches {
         if batch(memory, &cutoff_text, &mut cursor, &mut trim)? {
@@ -188,6 +216,7 @@ pub(super) fn trim(
             cursor = 0;
             continue;
         }
+        cursor = 0;
         break;
     }
     let rf_now = chrono::Utc::now().to_rfc3339();
@@ -201,9 +230,9 @@ pub(super) fn trim(
         // Only a pass that got this far counts for the start-up throttle; a
         // failed pass leaves `last_run` as it was, so the next start retries.
         tx.execute(
-            "INSERT INTO message_retention_state(singleton, last_run) VALUES(1, ?1)
-             ON CONFLICT(singleton) DO UPDATE SET last_run = excluded.last_run",
-            params![now],
+            "INSERT INTO message_retention_state(singleton, last_run, scan_after) VALUES(1, ?1, ?2)
+             ON CONFLICT(singleton) DO UPDATE SET last_run = excluded.last_run, scan_after = excluded.scan_after",
+            params![now, cursor],
         )?;
         tx.commit()?;
         counts
@@ -293,7 +322,8 @@ fn tables(conn: &Connection) -> anyhow::Result<Tables> {
 /// transaction re-checks each candidate (its rows must still exist and E1-E8 must
 /// still hold) and deletes those that pass, so the delete decision is made under
 /// the writer. Returns `false` when the scan reached the last row older than the
-/// cutoff (the sweep is complete).
+/// cutoff (the sweep is complete). The open-snapshot check (E6) and the throttle
+/// are made once per pass in `trim`, not per batch.
 fn batch(memory: &SqliteMemory, cutoff: &str, cursor: &mut i64, trim: &mut MessageTrim) -> anyhow::Result<bool> {
     let scanned = {
         let reader = memory.pool.read()?;
@@ -468,16 +498,20 @@ fn members(tx: &Connection, unit: &Unit) -> anyhow::Result<Vec<(i64, String, Opt
     Ok(rows)
 }
 
-/// Adds the `last_attempt` column to a state row created before it existed.
-/// Literals only; no request data reaches the DDL.
-fn ensure_attempt_column(tx: &Connection) -> anyhow::Result<()> {
-    let present: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('message_retention_state') WHERE name = 'last_attempt')",
-        [],
-        |row| row.get(0),
-    )?;
-    if !present {
-        tx.execute_batch("ALTER TABLE message_retention_state ADD COLUMN last_attempt INTEGER")?;
+/// Adds the state-row columns that older stores lack. Literal names only; no
+/// request data reaches the DDL.
+fn ensure_state_columns(tx: &Connection) -> anyhow::Result<()> {
+    for column in ["last_attempt", "scan_after"] {
+        let present: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('message_retention_state') WHERE name = ?1)",
+            [column],
+            |row| row.get(0),
+        )?;
+        if !present {
+            tx.execute_batch(&format!(
+                "ALTER TABLE message_retention_state ADD COLUMN {column} INTEGER"
+            ))?;
+        }
     }
     Ok(())
 }
