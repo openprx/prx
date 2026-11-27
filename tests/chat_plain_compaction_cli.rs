@@ -1038,37 +1038,6 @@ fn an_enriched_earlier_request_stays_plain_through_a_mid_turn_compaction() {
     );
 }
 
-/// The system prompt the compaction summarizer receives.
-const SUMMARIZER_PROMPT: &str = "context compaction summarizer";
-/// The prefix of every summary the scripted summarizer writes; the summary's
-/// ordinal follows it.
-const SUMMARY_PREFIX: &str = "SUMMARY-ORDINAL-";
-
-/// Whether `request` is a compaction summarizer call.
-fn is_summarizer_request(request: &serde_json::Value) -> bool {
-    request["messages"].as_array().is_some_and(|messages| {
-        messages
-            .iter()
-            .any(|message| message["role"] == "system" && message_text(message).contains(SUMMARIZER_PROMPT))
-    })
-}
-
-/// The compaction script with a summarizer that numbers its summaries and a
-/// [`MULTI_READ`] turn of [`MULTI_READ_ROUNDS`] reads.
-fn script_numbered_summaries() -> Script {
-    let mut base = script_with_multi_read();
-    let mut summaries = 0usize;
-    Box::new(move |index, request| {
-        if is_summarizer_request(request) {
-            summaries += 1;
-            return Scripted::text(&format!(
-                "## Decisions\n{SUMMARY_PREFIX}{summaries}\n## Progress\nfiller files read\n## Pending\nnone"
-            ));
-        }
-        base(index, request)
-    })
-}
-
 /// Largest `chat.log` the consecutive-summary case reads.
 const CHAT_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
 

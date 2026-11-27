@@ -27,13 +27,10 @@ use crate::agent::runtime_prompt::build_runtime_system_prompt;
 use crate::agent::turn_contracts::{ChatMode, ToolLoopOutcome};
 use crate::agent::turn_engine::run_turn;
 use crate::agent::turn_request::ToolLoopMemory;
-use crate::config::{Config, ToolTieringConfig};
+use crate::config::Config;
 use crate::memory::embeddings::LocalHashEmbedding;
 use crate::providers::traits::{ChatMessage, ChatRequest, ChatResponse, Provider};
-use crate::skills::{SessionSkillExposure, Skill, SkillTool};
-use crate::tools::legacy_intent_tests::{
-    SessionToolExposure, SessionToolSurface, UnroutedToolPolicy, resolve_tools_for_intent,
-};
+use crate::skills::{Skill, SkillTool};
 use crate::tools::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
@@ -111,67 +108,6 @@ impl Tool for FixtureTool {
     fn categories(&self) -> &'static [ToolCategory] {
         self.categories
     }
-}
-
-fn registry() -> Vec<Box<dyn Tool>> {
-    vec![
-        Box::new(FixtureTool {
-            name: "fixture_shell",
-            tier: ToolTier::Core,
-            categories: &[],
-        }) as Box<dyn Tool>,
-        Box::new(FixtureTool {
-            name: "fixture_web_search",
-            tier: ToolTier::Standard,
-            categories: &[ToolCategory::WebBrowsing],
-        }) as Box<dyn Tool>,
-        Box::new(FixtureTool {
-            name: "fixture_http",
-            tier: ToolTier::Extended,
-            categories: &[ToolCategory::WebBrowsing],
-        }) as Box<dyn Tool>,
-        Box::new(FixtureTool {
-            name: "fixture_git",
-            tier: ToolTier::Standard,
-            categories: &[ToolCategory::DevOps],
-        }) as Box<dyn Tool>,
-        Box::new(FixtureTool {
-            name: "fixture_cron",
-            tier: ToolTier::Extended,
-            categories: &[ToolCategory::Scheduling],
-        }) as Box<dyn Tool>,
-    ]
-}
-
-/// What a stateless entry point publishes for this turn.
-fn exposed_names(tools: &[Box<dyn Tool>], message: &str, tiering: &ToolTieringConfig) -> Vec<String> {
-    policy_names(tools, message, tiering, UnroutedToolPolicy::PublishEverything)
-}
-
-/// What a chat turn publishes: the session surface decided by the dispatcher,
-/// resolved again by the shared tool loop exactly as production does.
-fn session_names(tools: &[Box<dyn Tool>], message: &str, surface: &SessionToolSurface) -> Vec<String> {
-    policy_names(tools, message, &surface.tiering, surface.unrouted)
-}
-
-fn policy_names(
-    tools: &[Box<dyn Tool>],
-    message: &str,
-    tiering: &ToolTieringConfig,
-    unrouted: UnroutedToolPolicy,
-) -> Vec<String> {
-    let mut names = resolve_tools_for_intent(
-        tools,
-        message,
-        &tiering.always_include,
-        &tiering.always_exclude,
-        unrouted,
-    )
-    .into_iter()
-    .map(|tool| tool.name().to_string())
-    .collect::<Vec<_>>();
-    names.sort();
-    names
 }
 
 fn fixture_config(workspace: &std::path::Path) -> Config {

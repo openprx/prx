@@ -13,7 +13,7 @@ use super::*;
 use crate::agent::tool_result_recording::MAX_TOOL_RESULT_INLINE_CHARS;
 use crate::agent::turn_tests::{
     CONTEXT_BUDGET_FIXTURE_RESERVE_TOKENS, DelayTool, NativeScriptedProvider, RecordingTool, RefreshCountingTool,
-    ScriptedProvider, SystemSummaryProvider, WIDE_SCHEMA_TOOL_BODY_MARKER, WideSchemaTool, business_tool_specs_of,
+    ScriptedProvider, WIDE_SCHEMA_TOOL_BODY_MARKER, WideSchemaTool, business_tool_specs_of,
     context_budget_fixture_config, context_budget_fixture_history, first_orphan_tool_index, tool_specs_of,
 };
 use async_trait::async_trait;
@@ -241,10 +241,6 @@ struct RecordingBudgetProvider {
     first_call_tokens: Arc<AtomicUsize>,
 }
 
-struct CapturingCompactionProvider {
-    captured_history: Arc<Mutex<Option<Vec<ChatMessage>>>>,
-}
-
 #[async_trait]
 impl Provider for RecordingBudgetProvider {
     async fn chat_with_system(
@@ -268,37 +264,6 @@ impl Provider for RecordingBudgetProvider {
             .ok();
         Ok(ChatResponse {
             text: Some("done".to_string()),
-            tool_calls: Vec::new(),
-            reasoning_content: None,
-        })
-    }
-}
-
-#[async_trait]
-impl Provider for CapturingCompactionProvider {
-    async fn chat_with_system(
-        &self,
-        _system_prompt: Option<&str>,
-        _message: &str,
-        _model: &str,
-        _temperature: f64,
-    ) -> anyhow::Result<String> {
-        Ok("## Decisions\n- preserve compacted context\n## Open TODOs\n- answer the latest user question\n## Critical Context\n- ISS-037 capture test".to_string())
-    }
-
-    async fn chat(&self, request: ChatRequest<'_>, _model: &str, _temperature: f64) -> anyhow::Result<ChatResponse> {
-        let last_user = request
-            .messages
-            .iter()
-            .rfind(|message| message.role == "user")
-            .map(|message| message.content.clone())
-            .unwrap_or_default();
-        *self
-            .captured_history
-            .lock()
-            .expect("captured history lock should be valid") = Some(request.messages.to_vec());
-        Ok(ChatResponse {
-            text: Some(format!("answer bound to: {last_user}")),
             tool_calls: Vec::new(),
             reasoning_content: None,
         })

@@ -14,16 +14,14 @@ use super::*;
 use crate::agent::context_preflight::preflight_context_budget_before_provider_call;
 use crate::agent::document_ingest::DocumentIngestRuntime;
 use crate::agent::history::build_native_assistant_history;
-use crate::agent::tool_result_recording::{MAX_TOOL_RESULT_INLINE_CHARS, compact_tool_result_for_history_with_status};
 use crate::agent::turn_contracts::ScopeContext;
 use crate::agent::turn_tests::{
-    ScriptedProvider, SystemSummaryProvider, first_orphan_tool_index, tool_roundtrip_history_fixture,
+    ScriptedProvider, first_orphan_tool_index, tool_roundtrip_history_fixture,
     tool_roundtrip_history_fixture_with_tools,
 };
-use crate::config::agent_name::AgentName;
 use crate::memory::{
-    AgentPartition, CompactionSourceEventRange, DocumentIngestInput, DocumentRecord, Memory, MemoryCategory,
-    MemoryEntry, MemoryFabric, MemoryPrincipal, MessageEvent, MessageEventInput, PartitionKey, SqliteMemory,
+    DocumentIngestInput, DocumentRecord, Memory, MemoryCategory, MemoryEntry, MemoryFabric, MemoryPrincipal,
+    MessageEvent, MessageEventInput, SqliteMemory,
 };
 use crate::providers::{ChatMessage, ToolCall};
 use crate::runtime::envelope::RuntimeEnvelope;

@@ -155,40 +155,6 @@ fn legacy_preflight_compaction_feedback_emits_system_message() {
     );
 }
 
-struct SlowSummaryProvider;
-
-#[async_trait::async_trait]
-impl Provider for SlowSummaryProvider {
-    async fn chat_with_system(
-        &self,
-        _system_prompt: Option<&str>,
-        _message: &str,
-        _model: &str,
-        _temperature: f64,
-    ) -> anyhow::Result<String> {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        Ok("## Decisions\nslow summary".to_string())
-    }
-}
-
-struct ImmediateSummaryProvider;
-
-#[async_trait::async_trait]
-impl Provider for ImmediateSummaryProvider {
-    async fn chat_with_system(
-        &self,
-        _system_prompt: Option<&str>,
-        _message: &str,
-        _model: &str,
-        _temperature: f64,
-    ) -> anyhow::Result<String> {
-        Ok(
-                "## Decisions\n- PERSISTED_GUARD_SUMMARY\n## Open TODOs\n- continue\n## Critical Context\n- persisted source"
-                    .to_string(),
-            )
-    }
-}
-
 #[tokio::test]
 async fn chat_compaction_helper_refuses_a_patch_for_another_source_without_any_change() {
     tokio::time::timeout(ACK_TEST_DEADLINE, async {

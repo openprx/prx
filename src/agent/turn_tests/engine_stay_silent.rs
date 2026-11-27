@@ -11,7 +11,6 @@
 )]
 
 use super::*;
-use crate::agent::compaction::build_configurable_compaction_patch;
 use crate::tools::StaySilentTool;
 
 async fn run_without_tools(

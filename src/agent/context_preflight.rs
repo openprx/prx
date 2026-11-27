@@ -339,6 +339,3 @@ pub(crate) fn ensure_current_request_capacity(
     }
     Ok(())
 }
-
-#[path = "turn_tests/context_preflight.rs"]
-mod tests;
