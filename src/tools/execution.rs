@@ -8,6 +8,7 @@
 pub(crate) mod admission;
 mod approval_record;
 mod approval_route;
+mod effective_output;
 mod refusal_record;
 pub use refusal_record::ToolCallRefusalReason;
 pub(crate) use refusal_record::ToolRefusalNotice;

@@ -592,6 +592,38 @@ impl Memory for EncryptedScope {
         Ok(self.reveal(event))
     }
 
+    async fn rewrite_tool_ledger_output(
+        &self,
+        workspace_id: &str,
+        terminal_key: &str,
+        effective_text: &str,
+        sealed_payload: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        // The ledger payload is sealed here: open it, rewrite, seal it again
+        // through the scope's own path.
+        let _ = sealed_payload;
+        let Some(stored) = self
+            .inner
+            .find_message_event_by_idempotency_key(workspace_id, terminal_key)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let source = stored.source.clone();
+        let opened = self.reveal(stored);
+        let Some(rewritten) = opened
+            .raw_payload_json
+            .as_deref()
+            .and_then(|payload| crate::memory::sqlite::ledger_effective::rewrite_payload(payload, effective_text))
+        else {
+            return Ok(false);
+        };
+        let sealed = self.seal_payload(&source, terminal_key, &rewritten)?;
+        self.inner
+            .rewrite_tool_ledger_output(workspace_id, terminal_key, effective_text, Some(&sealed))
+            .await
+    }
+
     async fn append_message_event_until(
         &self,
         mut input: crate::memory::MessageEventInput,

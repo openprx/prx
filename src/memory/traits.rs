@@ -790,6 +790,24 @@ pub trait Memory: Send + Sync {
         Err(crate::memory::fabric::fail_fast(self.name(), "append_message_event"))
     }
 
+    /// Rewrite the output fields (`outcome.model_content` and a text
+    /// `outcome.result.output`) of the tool idempotency ledger row
+    /// `terminal_key` to `effective_text`, the text a `tool_result` hook
+    /// substituted, so a retry replays it. `sealed_payload`, when given,
+    /// replaces the whole stored payload (a sealing wrapper's rewrite). A row
+    /// that is absent or not the expected record is left as is; returns
+    /// whether a row changed. Backends without a ledger change nothing.
+    async fn rewrite_tool_ledger_output(
+        &self,
+        workspace_id: &str,
+        terminal_key: &str,
+        effective_text: &str,
+        sealed_payload: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let _ = (workspace_id, terminal_key, effective_text, sealed_payload);
+        Ok(false)
+    }
+
     /// Append at most 32 independent events, returning one result per input in
     /// the original order. Unsupported backends retain explicit per-event errors.
     async fn append_message_events(&self, inputs: Vec<MessageEventInput>) -> Vec<anyhow::Result<MessageEvent>> {

@@ -1229,6 +1229,17 @@ impl Memory for SqliteMemory {
             .await
     }
 
+    async fn rewrite_tool_ledger_output(
+        &self,
+        workspace_id: &str,
+        terminal_key: &str,
+        effective_text: &str,
+        sealed_payload: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        self.rewrite_tool_ledger_output_impl(workspace_id, terminal_key, effective_text, sealed_payload)
+            .await
+    }
+
     async fn find_message_event_by_idempotency_key(
         &self,
         workspace_id: &str,

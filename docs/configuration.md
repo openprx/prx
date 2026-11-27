@@ -2519,7 +2519,9 @@ text, so a redaction hook leaves no raw copy the model can replay. The notify
 `tool_call` event, the failure counters and the repeated-failure rule keep the
 raw output. A `note` is appended to the text as `[Hook note: <name>] <text>`.
 A `replace_output` on a call that read a skill does not change the stored
-skill-load row, which keeps the raw skill instructions.
+skill-load row, which keeps the raw skill instructions. The call's tool execution
+ledger row (`tool.execution.finalized`) is rewritten to the replaced text, masked
+for secrets, so a retry of the same operation replays what the model read.
 Each contribution writes one audit row. Without a context action the text is
 unchanged and nothing is stored.
 

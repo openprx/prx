@@ -301,6 +301,20 @@ pub(super) async fn run_tools(
                 .and_then(Option::as_ref)
                 .map_or(outcome.content.as_str(), String::as_str);
             recorder.record(index, effective);
+            // The ledger row keeps the raw output; a retry of this operation
+            // must replay what the model read, so a replaced text is written
+            // into the row (masked for secrets).
+            if effective != outcome.content
+                && let Some(service) = round.execution_adapter.tool_execution_service.as_ref()
+            {
+                service
+                    .rewrite_ledger_effective_output(
+                        &round.execution_adapter.tool_execution_context,
+                        &call_id_for(&tool_calls[index].name, index, &native_tool_calls),
+                        effective,
+                    )
+                    .await;
+            }
         }
         (texts, contributions)
     } else {
