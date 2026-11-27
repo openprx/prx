@@ -1,6 +1,5 @@
-use crate::agent::context_recall::build_context_with_shared_events_and_scope;
 use crate::config::Config;
-use crate::memory::{Memory, MemoryCategory, MemoryFabric, MessageEvent, MessageEventScope};
+use crate::memory::{MemoryCategory, MemoryFabric, MessageEvent, MessageEventScope};
 use crate::runtime::envelope::RuntimeEnvelope;
 use crate::security::policy::ResourceRiskLevel;
 use crate::security::{SecurityPolicy, SideEffectGate};
@@ -104,62 +103,6 @@ fn shared_worker_workspace_id(manifest: &WorkerManifest) -> String {
         .map(|path| path.to_string_lossy().to_string())
         .or_else(|| manifest.memory_workspace_id.clone())
         .unwrap_or_else(|| manifest.workspace_dir.to_string_lossy().to_string())
-}
-
-pub(super) async fn load_worker_shared_context(
-    manifest: &WorkerManifest,
-    config: &Config,
-    shared_memory: &dyn Memory,
-) -> String {
-    let strategy = manifest.memory_strategy.as_deref().unwrap_or("shared_fabric");
-    if strategy == "isolated_private" {
-        return String::new();
-    }
-
-    let workspace_id = if strategy == "hybrid" {
-        shared_worker_workspace_id(manifest)
-    } else {
-        manifest
-            .memory_workspace_id
-            .clone()
-            .unwrap_or_else(|| manifest.workspace_dir.to_string_lossy().to_string())
-    };
-
-    let runtime_envelope = worker_runtime_envelope_for_workspace(manifest, workspace_id);
-    let semantic_scope = match manifest.scope_chat_type.as_deref() {
-        Some(chat_type)
-            if !chat_type.is_empty()
-                && manifest.scope_sender.as_deref().is_some_and(|value| !value.is_empty())
-                && manifest.scope_channel.as_deref().is_some_and(|value| !value.is_empty())
-                && manifest.scope_chat_id.as_deref().is_some_and(|value| !value.is_empty()) =>
-        {
-            Some(runtime_envelope.memory_write_context(chat_type))
-        }
-        _ => None,
-    };
-
-    // OWNER-VIS OV-D: the shared-events feed is limited to the reader's own
-    // owner. A worker reads for the owner that spawned it — the owner its
-    // manifest carries and its result events are recorded under — not for
-    // the channel/sender composition of its own envelope.
-    let mut principal = runtime_envelope.memory_principal();
-    if let Some(owner_id) = manifest
-        .owner_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|owner| !owner.is_empty())
-    {
-        principal.owner_id = Some(owner_id.to_string());
-    }
-    build_context_with_shared_events_and_scope(
-        shared_memory,
-        principal,
-        &manifest.task,
-        config.memory.min_relevance_score,
-        semantic_scope.as_ref(),
-    )
-    .await
-    .preamble
 }
 
 fn worker_session_scope_key(manifest: &WorkerManifest) -> &str {

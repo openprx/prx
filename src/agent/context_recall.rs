@@ -909,6 +909,7 @@ async fn append_document_retrieval_trace(
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn build_agent_context_with_semantic_scope(
     mem: &dyn Memory,
     principal: MemoryPrincipal,
@@ -1068,32 +1069,6 @@ async fn build_agent_context(
         document_context,
         recalled_memory_ids: semantic.ids,
         semantic_summaries: semantic.summaries,
-    }
-}
-
-/// Build context with recent shared message events plus semantic memory recall,
-/// flattened from the structured [`AgentContextBundle`].
-pub(crate) async fn build_context_with_shared_events_and_scope(
-    mem: &dyn Memory,
-    principal: MemoryPrincipal,
-    user_msg: &str,
-    min_relevance_score: f64,
-    semantic_scope: Option<&MemoryWriteContext>,
-) -> RecalledMemoryContext {
-    let bundle =
-        build_agent_context_with_semantic_scope(mem, principal, user_msg, min_relevance_score, semantic_scope).await;
-    let semantic_start = bundle.current_session_context.len() + bundle.recent_shared_context.len();
-    let semantic_range = semantic_start..semantic_start + bundle.semantic_memory_context.len();
-    RecalledMemoryContext {
-        preamble: bundle.preamble(),
-        sources: crate::context::transcript::AttachmentSources {
-            memories: bundle.recalled_memory_ids.clone(),
-            events: bundle.source_events.clone(),
-            documents: bundle.source_documents.clone(),
-        },
-        ids: bundle.recalled_memory_ids,
-        semantic_range,
-        summaries: bundle.semantic_summaries,
     }
 }
 
