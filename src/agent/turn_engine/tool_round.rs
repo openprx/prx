@@ -305,12 +305,13 @@ pub(super) async fn run_tools(
             // must replay what the model read, so a replaced text is written
             // into the row (masked for secrets).
             if effective != outcome.content
+                && !outcome.operation_id.is_empty()
                 && let Some(service) = round.execution_adapter.tool_execution_service.as_ref()
             {
                 service
                     .rewrite_ledger_effective_output(
                         &round.execution_adapter.tool_execution_context,
-                        &call_id_for(&tool_calls[index].name, index, &native_tool_calls),
+                        &outcome.operation_id,
                         effective,
                     )
                     .await;

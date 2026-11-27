@@ -15,6 +15,10 @@ pub(crate) struct ObservedToolResult {
     /// The skill instruction this call loaded, when it succeeded as a read
     /// (see `context::transcript::skill_rows`). `None` for every other call.
     pub skill_load: Option<crate::context::transcript::SkillLoad>,
+    /// The id the scheduler keyed this call's ledger row with (the native call
+    /// id, else the one it generated). Empty when the call never reached the
+    /// execution service.
+    pub operation_id: String,
 }
 
 impl ObservedToolResult {
@@ -24,6 +28,7 @@ impl ObservedToolResult {
             status,
             executed: false,
             skill_load: None,
+            operation_id: String::new(),
         }
     }
 

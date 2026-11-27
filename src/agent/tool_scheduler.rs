@@ -375,7 +375,7 @@ async fn execute_one_unrecorded(
         adapter,
         call,
         ToolLoopEvent::ToolFinished {
-            tool_call_id,
+            tool_call_id: tool_call_id.clone(),
             name: call.name.clone(),
             success,
             duration_ms: outcome.duration_ms,
@@ -393,6 +393,7 @@ async fn execute_one_unrecorded(
         status,
         executed,
         skill_load,
+        operation_id: tool_call_id,
     })
 }
 
