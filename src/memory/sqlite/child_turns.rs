@@ -185,6 +185,38 @@ fn newest_handoff(
     Ok(None)
 }
 
+/// The partition of the child's own rows, read from the agent scope its
+/// logical session is bound to: `agent_key` `m` is Main, `n:<name>` is the
+/// named agent with the incarnation the scope pins. A child without a bound
+/// scope reads as Main.
+pub(super) fn partition(memory: &SqliteMemory, record: &ChildSessionRecord) -> anyhow::Result<AgentPartition> {
+    let reader = memory.pool.read()?;
+    let conn = reader.connection()?;
+    let scope: Option<(String, String)> = conn
+        .query_row(
+            "SELECT s.agent_key, s.incarnation FROM child_sessions c JOIN agent_scopes s ON s.scope_id=c.ma_scope_id
+             WHERE c.key=?1 AND c.workspace_id=?2 AND c.owner_id=?3",
+            params![record.session_key, record.workspace, record.owner],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let key = match scope {
+        Some((agent_key, incarnation)) => match agent_key.strip_prefix("n:") {
+            Some(name) => PartitionKey::Named {
+                name: crate::config::agent_name::AgentName::parse(name)?,
+                incarnation: uuid::Uuid::parse_str(&incarnation)?,
+            },
+            None => PartitionKey::Main,
+        },
+        None => PartitionKey::Main,
+    };
+    Ok(AgentPartition {
+        workspace_id: record.workspace.clone(),
+        owner_id: record.owner.clone(),
+        key,
+    })
+}
+
 pub(super) fn history(memory: &SqliteMemory, record: &ChildSessionRecord) -> anyhow::Result<Vec<ChildTurn>> {
     let reader = memory.pool.read()?;
     let conn = reader.connection()?;

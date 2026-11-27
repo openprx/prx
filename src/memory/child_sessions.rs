@@ -45,6 +45,9 @@ pub trait ChildSessionStore: Send + Sync {
     fn sessions(&self, workspace: &str, owner: &str) -> anyhow::Result<Vec<ChildSessionRecord>>;
     /// Full model-visible history, excluding internal lifecycle and reasoning rows.
     fn history(&self, record: &ChildSessionRecord) -> anyhow::Result<Vec<ChildTurn>>;
+    /// The agent partition the child's own rows were written under: `Named`
+    /// for a named agent (its name and incarnation), `Main` otherwise.
+    fn partition(&self, record: &ChildSessionRecord) -> anyhow::Result<Option<crate::memory::AgentPartition>>;
     /// Replace only a child's model-visible context and selection. Transcript
     /// erasure remains the owner's separate history-erase operation.
     fn replace_context(&self, record: &ChildSessionRecord, turns: &[ChildTurn]) -> anyhow::Result<()>;

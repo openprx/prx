@@ -152,6 +152,12 @@ impl ChildSessionStore for SqliteMemory {
     ) -> anyhow::Result<Vec<crate::memory::child_sessions::ChildTurn>> {
         super::child_turns::history(self, record)
     }
+    fn partition(
+        &self,
+        record: &crate::memory::child_sessions::ChildSessionRecord,
+    ) -> anyhow::Result<Option<AgentPartition>> {
+        super::child_turns::partition(self, record).map(Some)
+    }
     fn load(&self, key: &str, context: &ChildSessionContext) -> anyhow::Result<Option<ScopedChildRecord>> {
         validate_key(key, context)?;
         let writer = self.pool.write();
