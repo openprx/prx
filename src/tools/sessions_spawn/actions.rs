@@ -420,11 +420,14 @@ impl SessionsSpawnTool {
         let window: Vec<&crate::memory::child_sessions::ChildTurn> = turns.iter().skip(skipped).collect();
         // The child's own partition, so its tool rows are read with the rows
         // its turns were written under; the turns are expanded by event id.
+        // A partition that cannot be built leaves the turns without tool rows;
+        // the read itself does not fail and is not widened to other partitions.
+        let partition = store.partition(&record);
         let principal = crate::memory::MemoryPrincipal {
             workspace_id: record.workspace.clone(),
             owner_id: Some(record.owner.clone()),
             session_key: Some(record.session_key.clone()),
-            agent_partition: store.partition(&record)?,
+            agent_partition: partition.as_ref().ok().cloned().flatten(),
             ..crate::memory::MemoryPrincipal::default()
         };
         let conversation: Vec<crate::memory::ConversationTurn> = window
@@ -440,9 +443,13 @@ impl SessionsSpawnTool {
                 message_event_id: turn.event_id.clone(),
             })
             .collect();
-        let history = crate::context::transcript::Transcript::new(memory.as_ref(), principal)
-            .expand_turns(conversation)
-            .await;
+        let history = if partition.is_ok() {
+            crate::context::transcript::Transcript::new(memory.as_ref(), principal)
+                .expand_turns(conversation)
+                .await
+        } else {
+            crate::context::transcript::Transcript::expand_turns_plain(conversation)
+        };
         let stamps: std::collections::HashMap<&str, String> = window
             .iter()
             .filter_map(|turn| {

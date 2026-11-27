@@ -151,6 +151,11 @@ impl<'a> Transcript<'a> {
     pub(crate) async fn expand_turns(&self, turns: Vec<ConversationTurn>) -> History {
         self.replay_log().await.expand_turns(turns)
     }
+
+    /// The stored `turns` as history without any tool rows.
+    pub(crate) fn expand_turns_plain(turns: Vec<ConversationTurn>) -> History {
+        ReplayLog::default().expand_turns(turns)
+    }
 }
 
 /// A stored message row as the turn the history expansion reads.
