@@ -417,7 +417,7 @@ the caller only (another owner's or a missing session: `404 session_unknown`).
 | Route | Answer |
 |---|---|
 | `POST /api/sessions/{session_id}/messages/{client_message_id}/delete`, body `{"agent"?: "<name>"\|"main"}` (an empty body is `{}`) | `200 {"message_id","status":"deleted","agents":[{"agent":"main"\|"<name>","runs":["<run_id>",…]},…]}`. `agent` omitted deletes the message for every agent it reached in this session (each agent has its own key); `agent` given, only for that agent. Per agent PRX deletes every attempt's input, the replies and the tool and working rows of those runs; a `deliver:"context"` message answers `runs:[]`. A repeat answers the same `200`. No record of the id (for that agent) in this session: `404 message_unknown`. A bad `agent` or body: `400 field_invalid` |
-| `POST /api/sessions/{session_id}/runs/{run_id}/reply/delete` | Deletes the assistant side of one run (the reply and its tool and working rows); the user's input stays. `200 {"run_id","status":"deleted"}`, the same on a repeat. A run still running: `409 run_active` (cancel it first). No such run of this owner in this session: `404 run_unknown` |
+| `POST /api/sessions/{session_id}/runs/{run_id}/reply/delete` | Deletes the assistant side of one run (the reply and its tool and working rows); the user's input stays. `200 {"run_id","status":"deleted"}`, the same on a repeat. A run still running: `409 run_active` (cancel it first); a run whose spawned runs are still running is accepted and its rows are removed when they end. No such run of this owner in this session: `404 run_unknown` |
 | `POST /api/sessions/{session_id}/messages/delete`, body `{"ids":[1 to 100 client_message_id],"agent"?}` | `200 {"results":[…]}` in request order, one item per id: the single delete's `200` body, or `{"message_id","error":{"code":"message_unknown","message"}}`. Not all-or-nothing. Empty or more than 100 ids: `400 field_invalid` |
 
 **Tombstone.** Delete removes the content from the stored rows; it does not
@@ -478,7 +478,13 @@ of their rows): every row of those runs is tombstoned like the deleted run's
 rows, and each such run gets its own `turn.deleted` record (same `side` as the
 delete, `message_id` `null`, `run_id` the spawned run) in the spawned run's own
 session stream. A spawned run that is still running defers the whole delete as
-a running turn does (`deferred` lists the parent run). Tool results in later
+a running turn does (`deferred` lists the parent run): the deleted turn's
+conversation rows are hidden at once, and every row of the turn and of the runs
+it spawned, including rows a spawned run writes after the delete, is removed as
+soon as the last of those runs has ended (after a restart, at the first request
+to the workspace). A reply delete of a turn whose spawned runs are still
+running is accepted and deferred the same way; only a run that is itself still
+running answers `409 run_active`. Tool results in later
 runs of the workspace (any session) that listed an erased run or session by its
 id are replaced by a fixed text; a spawned run's session counts as erased only
 when no row of it survives.

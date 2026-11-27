@@ -617,6 +617,7 @@ impl RunInFlight {
 impl Drop for RunInFlight {
     fn drop(&mut self) {
         IN_FLIGHT.lock().remove(&self.0);
+        crate::runtime::registry::notify_run_ended();
     }
 }
 
@@ -628,6 +629,15 @@ pub(super) fn runs_in_flight(workspace: &str) -> Vec<String> {
         .iter()
         .filter_map(|key| key.strip_prefix(prefix.as_str()).map(str::to_owned))
         .collect()
+}
+
+/// The runs a delete must not rewrite yet: the rf runs of `workspace` whose
+/// job has not ended and every sub-agent run still live in this process (run
+/// ids are unique, so a foreign one never matches this workspace's rows).
+pub(super) fn live_runs(workspace: &str) -> Vec<String> {
+    let mut live = runs_in_flight(workspace);
+    live.extend(crate::runtime::registry::live_sub_agent_runs());
+    live
 }
 
 /// Every validated body field, in a fixed order, for the request hash.

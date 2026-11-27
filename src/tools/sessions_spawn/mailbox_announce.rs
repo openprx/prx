@@ -104,7 +104,14 @@ impl MailboxAnnouncement {
 
     /// Send the completion to the parent session. `false` leaves the run's
     /// own channel as the fallback; the result stays retrievable either way.
+    /// A run of a deleted rf turn's family announces nothing (`true`, so no
+    /// fallback either): the delete erases the run's rows, and an
+    /// announcement would carry its result into a new parent turn.
     pub(super) async fn deliver(&self, run_id: &str, completed: bool, result_text: &str, documents: &[String]) -> bool {
+        if self.family_deleted(run_id).await {
+            tracing::info!(run_id = %run_id, "sessions_spawn announcement withheld: the turn that started the run was deleted");
+            return true;
+        }
         let text = announcement_text(run_id, completed, result_text, &self.child_session, documents);
         let runtime = Arc::clone(&self.runtime);
         let source = runtime.address(&self.owner, &self.child_session, &self.child_agent);
@@ -133,6 +140,36 @@ impl MailboxAnnouncement {
             }
             Err(error) => {
                 tracing::warn!(run_id = %run_id, error = %error, "sessions_spawn mailbox announcement refused");
+                false
+            }
+        }
+    }
+}
+
+impl MailboxAnnouncement {
+    /// Whether the rf turn this run descends from was deleted (message or
+    /// reply, settled or pending). A failed read announces as before.
+    async fn family_deleted(&self, run_id: &str) -> bool {
+        let workspace = std::path::PathBuf::from(&self.runtime.workspace);
+        let memory = match crate::runtime::blocking::spawn_blocking(move || {
+            crate::memory::SqliteMemory::new(&workspace)
+        })
+        .await
+        {
+            Ok(Ok(memory)) => memory,
+            Ok(Err(error)) => {
+                tracing::debug!(run_id = %run_id, error = %crate::agent::diagnostics::error_class(&error), "sessions_spawn deleted-turn check unavailable");
+                return false;
+            }
+            Err(error) => {
+                tracing::debug!(run_id = %run_id, error = %crate::agent::diagnostics::error_class(&error), "sessions_spawn deleted-turn check unavailable");
+                return false;
+            }
+        };
+        match memory.rf_run_family_deleted(run_id).await {
+            Ok(deleted) => deleted,
+            Err(error) => {
+                tracing::debug!(run_id = %run_id, error = %crate::agent::diagnostics::error_class(&error), "sessions_spawn deleted-turn check failed");
                 false
             }
         }

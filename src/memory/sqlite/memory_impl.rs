@@ -77,6 +77,17 @@ fn scrub_after_delete(pool: &super::SqliteConnectionPool) {
     }
 }
 
+impl SqliteMemory {
+    /// Whether `run_id` belongs to the run family of a deleted rf attempt
+    /// (its message or reply deleted, settled or pending).
+    pub(crate) async fn rf_run_family_deleted(&self, run_id: &str) -> anyhow::Result<bool> {
+        let pool = self.pool.clone();
+        let run_id = run_id.to_owned();
+        crate::runtime::blocking::spawn_blocking(move || super::rf_delete::run_family_deleted(&pool.write(), &run_id))
+            .await?
+    }
+}
+
 #[async_trait]
 impl Memory for SqliteMemory {
     fn child_session_store(&self) -> Option<&dyn crate::memory::child_sessions::ChildSessionStore> {
@@ -985,6 +996,7 @@ impl Memory for SqliteMemory {
         session_key: &str,
         run_id: &str,
         forget_writes: bool,
+        live_runs: Vec<String>,
     ) -> anyhow::Result<crate::memory::RfReplyDelete> {
         let pool = self.pool.clone();
         let (workspace_id, owner_id, session_key, run_id) = (
@@ -1001,6 +1013,7 @@ impl Memory for SqliteMemory {
                 &session_key,
                 &run_id,
                 forget_writes,
+                &live_runs,
             )?;
             if matches!(outcome, crate::memory::RfReplyDelete::Deleted { .. }) {
                 scrub_after_delete(&pool);
@@ -1016,13 +1029,24 @@ impl Memory for SqliteMemory {
         owner_id: &str,
         session_key: &str,
         live_runs: Vec<String>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let pool = self.pool.clone();
         let (workspace_id, owner_id, session_key) =
             (workspace_id.to_owned(), owner_id.to_owned(), session_key.to_owned());
-        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
-            super::rf_delete::settle(&pool.write(), &workspace_id, &owner_id, &session_key, &live_runs)?;
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<bool> {
+            let pending = super::rf_delete::settle(&pool.write(), &workspace_id, &owner_id, &session_key, &live_runs)?;
             // Also finishes a scrub an earlier delete could not complete.
+            scrub_after_delete(&pool);
+            Ok(pending)
+        })
+        .await?
+    }
+
+    async fn rf_settle_deleted_workspace(&self, workspace_id: &str, live_runs: Vec<String>) -> anyhow::Result<()> {
+        let pool = self.pool.clone();
+        let workspace_id = workspace_id.to_owned();
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
+            super::rf_delete::settle_workspace(&pool.write(), &workspace_id, &live_runs)?;
             scrub_after_delete(&pool);
             Ok(())
         })

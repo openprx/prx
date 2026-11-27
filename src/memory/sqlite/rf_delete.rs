@@ -24,11 +24,13 @@
 //! the deleted mark; a message delete also clears the request digest, the
 //! only derivative of the message the record held.
 //!
-//! The rows of a run whose job is still live in this process are not
-//! rewritten under it (its terminal commit re-reads its own input and event
-//! rows): the delete marks the attempt `erase_pending`, tombstones the
-//! conversation rows at once, and [`settle`] rewrites the event rows once the
-//! job has ended.
+//! The rows of a run whose job, or a run it spawned, is still live in this
+//! process are not rewritten under it (its terminal commit re-reads its own
+//! input and event rows): the delete marks the attempt `erase_pending` (a
+//! reply delete `reply_erase_pending`), tombstones the conversation rows at
+//! once, and [`settle`] rewrites the event rows once the last run of the
+//! family has ended; [`settle_workspace`] does the same for every session
+//! after a restart.
 
 use super::SqliteMemory;
 use super::derived_sweep;
@@ -53,6 +55,11 @@ pub(super) fn init_schema(conn: &Connection) -> anyhow::Result<()> {
             "rf_message_attempts",
             "erase_pending",
             "INTEGER NOT NULL DEFAULT 0 CHECK (erase_pending IN (0, 1))",
+        ),
+        (
+            "rf_message_attempts",
+            "reply_erase_pending",
+            "INTEGER NOT NULL DEFAULT 0",
         ),
         ("conversation_turns", "deleted_at", "TEXT"),
     ] {
@@ -234,6 +241,7 @@ pub(super) fn delete_reply(
     session_key: &str,
     run_id: &str,
     forget_writes: bool,
+    live_runs: &[String],
 ) -> anyhow::Result<RfReplyDelete> {
     let now = chrono::Utc::now().to_rfc3339();
     let target = Target {
@@ -248,7 +256,7 @@ pub(super) fn delete_reply(
             "SELECT agent_key, client_message_id, job_id, message_event_id, ma_scope_id, interrupted,
                     deleted_at IS NOT NULL OR reply_deleted_at IS NOT NULL, forget_requested,
                     forgot_memories_created, forgot_memories_touched, forgot_documents_created,
-                    forgot_documents_touched
+                    forgot_documents_touched, erase_pending = 1 OR reply_erase_pending = 1
              FROM rf_message_attempts
              WHERE workspace_id = ?1 AND owner_id = ?2 AND session_key = ?3 AND run_id = ?4",
             params![workspace_id, owner_id, session_key, run_id],
@@ -265,11 +273,12 @@ pub(super) fn delete_reply(
                     row.get::<_, String>(1)?,
                     row.get::<_, bool>(5)?,
                     row.get::<_, bool>(6)?,
+                    row.get::<_, bool>(12)?,
                 ))
             },
         )
         .optional()?;
-    let Some((attempt, client_message_id, interrupted, deleted)) = row else {
+    let Some((attempt, client_message_id, interrupted, deleted, pending)) = row else {
         return Ok(RfReplyDelete::Unknown);
     };
     let job_id = attempt.job_id.clone().unwrap_or_default();
@@ -278,8 +287,10 @@ pub(super) fn delete_reply(
             return Ok(RfReplyDelete::Deleted { job_id, forget: None });
         }
         // A replay answers the recorded counts; a first forget on an
-        // already deleted run runs now (its log rows are still there).
-        let forget = forget_attempt(&tx, &target, &attempt, false)?;
+        // already deleted run runs now (its log rows are still there), or
+        // with the settle while its erase waits for a live run.
+        let live = pending && is_live(&tx, &target, &attempt, live_runs)?;
+        let forget = forget_attempt(&tx, &target, &attempt, live)?;
         if attempt.forget.recorded.is_none() {
             mark_scrub(&tx, &now)?;
         }
@@ -292,8 +303,11 @@ pub(super) fn delete_reply(
     if !interrupted && !super::rf_messages::has_terminal(&tx, workspace_id, owner_id, run_id)? {
         return Ok(RfReplyDelete::Active);
     }
+    // The run ended but a run it spawned may not have: its rows wait for the
+    // settle, its conversation rows are hidden now.
+    let live = is_live(&tx, &target, &attempt, live_runs)?;
     let forget = if forget_writes {
-        Some(forget_attempt(&tx, &target, &attempt, false)?)
+        Some(forget_attempt(&tx, &target, &attempt, live)?)
     } else {
         None
     };
@@ -301,7 +315,19 @@ pub(super) fn delete_reply(
         "UPDATE rf_message_attempts SET reply_deleted_at = ?3 WHERE workspace_id = ?1 AND run_id = ?2",
         params![workspace_id, run_id, now],
     )?;
-    erase(&tx, &target, Side::Reply, &attempt)?;
+    if live {
+        let ids: Vec<String> = run_event_ids(&tx, &target, Some(run_id))?
+            .into_iter()
+            .filter(|id| *id != attempt.input_event_id)
+            .collect();
+        tombstone_turns(&tx, &ids, &now)?;
+        tx.execute(
+            "UPDATE rf_message_attempts SET reply_erase_pending = 1 WHERE workspace_id = ?1 AND run_id = ?2",
+            params![workspace_id, run_id],
+        )?;
+    } else {
+        erase(&tx, &target, Side::Reply, &attempt)?;
+    }
     record_deleted(&tx, &target, Side::Reply, &attempt, &client_message_id)?;
     refresh_preview(&tx, session_key)?;
     mark_scrub(&tx, &now)?;
@@ -309,15 +335,17 @@ pub(super) fn delete_reply(
     Ok(RfReplyDelete::Deleted { job_id, forget })
 }
 
-/// Rewrite the event rows of every deleted run of the session whose job is
-/// no longer live (`live_runs` are the runs still live in this process).
+/// Rewrite the event rows of every deleted run of the session whose family
+/// is no longer live (`live_runs` are the runs still live in this process),
+/// in one transaction. `true` while an attempt of the session stays pending
+/// (its family is live, or its row could not be read; such a row is kept).
 pub(super) fn settle(
     conn: &Connection,
     workspace_id: &str,
     owner_id: &str,
     session_key: &str,
     live_runs: &[String],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let now = chrono::Utc::now().to_rfc3339();
     let target = Target {
         workspace_id,
@@ -327,39 +355,67 @@ pub(super) fn settle(
     };
     let any: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM rf_message_attempts
-             WHERE workspace_id = ?1 AND owner_id = ?2 AND session_key = ?3 AND erase_pending = 1)",
+             WHERE workspace_id = ?1 AND owner_id = ?2 AND session_key = ?3
+               AND (erase_pending = 1 OR reply_erase_pending = 1))",
         params![workspace_id, owner_id, session_key],
         |row| row.get(0),
     )?;
     if !any {
-        return Ok(());
+        return Ok(false);
     }
     let tx = begin_immediate(conn)?;
+    let mut still_pending = false;
     let pending = {
         let mut statement = tx.prepare(&format!(
-            "SELECT {} FROM rf_message_attempts
-             WHERE workspace_id = ?1 AND owner_id = ?2 AND session_key = ?3 AND erase_pending = 1",
+            "SELECT {}, erase_pending = 1 FROM rf_message_attempts
+             WHERE workspace_id = ?1 AND owner_id = ?2 AND session_key = ?3
+               AND (erase_pending = 1 OR reply_erase_pending = 1)",
             Attempt::COLUMNS
         ))?;
-        statement
-            .query_map(params![workspace_id, owner_id, session_key], Attempt::from_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()?
+        let rows = statement.query_map(params![workspace_id, owner_id, session_key], |row| {
+            Ok((Attempt::from_row(row)?, row.get::<_, bool>(10)?))
+        })?;
+        let mut pending = Vec::new();
+        for row in rows {
+            match row {
+                Ok(attempt) => pending.push(attempt),
+                Err(error) => {
+                    // An unreadable row keeps its flag; the others settle.
+                    tracing::warn!(
+                        error = %crate::agent::diagnostics::error_class(&error),
+                        "a pending rf delete row could not be read; it stays pending"
+                    );
+                    still_pending = true;
+                }
+            }
+        }
+        pending
     };
     let mut settled = false;
-    for attempt in &pending {
+    for (attempt, message_side) in &pending {
         // A run is live while it or a run it spawned is.
         if is_live(&tx, &target, attempt, live_runs)? {
+            still_pending = true;
             continue;
         }
         // A forget asked while the run was live runs now, before the erase.
         if attempt.forget.requested && attempt.forget.recorded.is_none() {
             forget_now(&tx, &target, attempt)?;
         }
-        erase(&tx, &target, Side::Message, attempt)?;
-        tx.execute(
-            "UPDATE rf_message_attempts SET erase_pending = 0 WHERE workspace_id = ?1 AND message_event_id = ?2",
-            params![workspace_id, attempt.input_event_id],
-        )?;
+        if *message_side {
+            erase(&tx, &target, Side::Message, attempt)?;
+            tx.execute(
+                "UPDATE rf_message_attempts SET erase_pending = 0, reply_erase_pending = 0
+                 WHERE workspace_id = ?1 AND message_event_id = ?2",
+                params![workspace_id, attempt.input_event_id],
+            )?;
+        } else {
+            erase(&tx, &target, Side::Reply, attempt)?;
+            tx.execute(
+                "UPDATE rf_message_attempts SET reply_erase_pending = 0 WHERE workspace_id = ?1 AND run_id = ?2",
+                params![workspace_id, attempt.run_id],
+            )?;
+        }
         settled = true;
     }
     if settled {
@@ -367,7 +423,61 @@ pub(super) fn settle(
         mark_scrub(&tx, &now)?;
         tx.commit()?;
     }
+    Ok(still_pending)
+}
+
+/// [`settle`] every session of the workspace with a pending attempt (after a
+/// restart nothing of an earlier process is live), one transaction per
+/// session; a session that fails is logged and left pending, the rest settle.
+pub(super) fn settle_workspace(conn: &Connection, workspace_id: &str, live_runs: &[String]) -> anyhow::Result<()> {
+    let sessions = {
+        let mut statement = conn.prepare(
+            "SELECT DISTINCT owner_id, session_key FROM rf_message_attempts
+             WHERE workspace_id = ?1 AND (erase_pending = 1 OR reply_erase_pending = 1)",
+        )?;
+        let rows = statement.query_map(params![workspace_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut sessions = Vec::new();
+        for row in rows {
+            match row {
+                Ok(session) => sessions.push(session),
+                Err(error) => tracing::warn!(
+                    error = %crate::agent::diagnostics::error_class(&error),
+                    "a pending rf delete session could not be read; it stays pending"
+                ),
+            }
+        }
+        sessions
+    };
+    for (owner_id, session_key) in sessions {
+        if let Err(error) = settle(conn, workspace_id, &owner_id, &session_key, live_runs) {
+            tracing::warn!(
+                error = %crate::agent::diagnostics::error_class(&error),
+                "a pending rf delete could not be settled; it stays pending"
+            );
+        }
+    }
     Ok(())
+}
+
+/// Whether `run_id`, or a run it descends from (`parent_run_id` chain), is
+/// the run of an rf attempt whose message or reply was deleted, settled or
+/// still pending. Run ids are unique, so no workspace filter is needed.
+pub(super) fn run_family_deleted(conn: &Connection, run_id: &str) -> anyhow::Result<bool> {
+    Ok(conn.query_row(
+        "WITH RECURSIVE lineage(run) AS (
+             SELECT ?1
+             UNION
+             SELECT e.parent_run_id FROM message_events e JOIN lineage l ON e.run_id = l.run
+             WHERE e.parent_run_id IS NOT NULL)
+         SELECT EXISTS(SELECT 1 FROM rf_message_attempts a
+             WHERE a.run_id IN (SELECT run FROM lineage)
+               AND (a.deleted_at IS NOT NULL OR a.reply_deleted_at IS NOT NULL
+                    OR a.erase_pending = 1 OR a.reply_erase_pending = 1))",
+        params![run_id],
+        |row| row.get(0),
+    )?)
 }
 
 /// The forget answer of one attempt: the recorded counts on a replay, a

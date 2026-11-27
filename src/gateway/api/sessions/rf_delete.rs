@@ -4,11 +4,14 @@
 //! A delete tombstones the stored rows of a message (every attempt's input,
 //! the replies and the tool and working rows of their runs) or of one run's
 //! assistant side, in one transaction with the deleted mark on the attempt
-//! record (`memory/sqlite/rf_delete.rs`). A run whose job is still live here
-//! keeps its event rows until the job ends: its conversation rows are
-//! tombstoned at once, the job's in-memory result is erased now and when it
-//! finishes, and [`settle_deleted`] rewrites the event rows after the job's
-//! terminal phase. Nothing is cancelled and what tools did is not undone.
+//! record (`memory/sqlite/rf_delete.rs`). A run whose job, or a run it
+//! spawned, is still live here keeps its event rows until the last of them
+//! ends: its conversation rows are tombstoned at once, the job's in-memory
+//! result is erased now and when it finishes, and [`settle_deleted`] rewrites
+//! the event rows once nothing of the family is live (one waiter per session
+//! re-settles each time a run ends; the first settle of a workspace in this
+//! process also settles what a restart left pending). Nothing is cancelled
+//! and what tools did is not undone.
 //!
 //! With `"forget_writes": true` (`message_forget_writes_v1`) the same
 //! transaction also deletes the memories and documents the deleted runs and
@@ -16,7 +19,7 @@
 
 use super::super::ApiPrincipal;
 use super::super::capabilities::{coded_error, rf_session_refusal};
-use super::rf_message::{is_message_id, require_session_owner, runs_in_flight};
+use super::rf_message::{is_message_id, live_runs, require_session_owner, runs_in_flight};
 use super::target::{AgentField, TurnTarget};
 use crate::gateway::{AppState, jobs};
 use crate::memory::{RfDeletedAgent, RfForget, RfForgetCounts, RfForgetRefused, RfMessageDelete, RfReplyDelete};
@@ -28,6 +31,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::sync::LazyLock;
 
 /// The most ids one batch delete takes.
 const BATCH_MAX: usize = 100;
@@ -213,6 +218,7 @@ async fn admit(state: &AppState, session_key: String, request: Request) -> Resul
         .workspace_dir
         .to_string_lossy()
         .into_owned();
+    sweep_workspace_once(state, &workspace_id).await;
     Ok((
         Scope {
             workspace_id,
@@ -252,7 +258,7 @@ async fn delete_one(
         session_key: scope.session_key.clone(),
         client_message_id: client_message_id.to_owned(),
         agent_key: agent.map(str::to_owned),
-        live_runs: runs_in_flight(&scope.workspace_id),
+        live_runs: live_runs(&scope.workspace_id),
         forget_writes,
     };
     let agents = state.mem.rf_delete_message(request).await.map_err(|error| {
@@ -266,14 +272,9 @@ async fn delete_one(
         return Ok(None);
     }
     erase_jobs(agents.iter().flat_map(|agent| agent.jobs.iter()));
-    // A deferred run whose job ended while the delete committed missed the
-    // job-end settle; settle it now (a no-op when nothing is pending).
-    let in_flight = runs_in_flight(&scope.workspace_id);
-    if agents
-        .iter()
-        .flat_map(|agent| agent.deferred.iter())
-        .any(|run| !in_flight.contains(run))
-    {
+    // A family whose last run ended while the delete committed missed its
+    // end signal; settle it now, else arm the session's waiter.
+    if agents.iter().any(|agent| !agent.deferred.is_empty()) {
         settle_deleted(state, &scope.workspace_id, &scope.owner_id, &scope.session_key).await;
     }
     Ok(Some(agents.into_iter().map(wire_agent).collect()))
@@ -295,21 +296,96 @@ fn erase_jobs<'a>(ids: impl Iterator<Item = &'a String>) {
     }
 }
 
-/// Tombstone the event rows of the session's deleted runs whose jobs have
-/// ended. Called when an rf job reaches its terminal phase, after a delete
-/// and before a history read. A failure leaves the rows pending for the
-/// next call and is logged without payload.
-pub(super) async fn settle_deleted(state: &AppState, workspace_id: &str, owner_id: &str, session_key: &str) {
-    if let Err(error) = state
+/// Sessions with a settle waiter, keyed `workspace\0owner\0session`.
+static WAITERS: LazyLock<parking_lot::Mutex<HashSet<String>>> = LazyLock::new(Default::default);
+
+/// Workspaces whose pending deletes this process has swept once.
+static SWEPT: LazyLock<parking_lot::Mutex<HashSet<String>>> = LazyLock::new(Default::default);
+
+/// One settle of the session against the runs live now; `true` while an
+/// attempt stays pending. A failure counts as pending (the rows stay for the
+/// next call) and is logged without payload.
+async fn settle_once(state: &AppState, workspace_id: &str, owner_id: &str, session_key: &str) -> bool {
+    match state
         .mem
-        .rf_settle_deleted(workspace_id, owner_id, session_key, runs_in_flight(workspace_id))
+        .rf_settle_deleted(workspace_id, owner_id, session_key, live_runs(workspace_id))
         .await
+    {
+        Ok(pending) => pending,
+        Err(error) => {
+            tracing::warn!(
+                error_kind = super::console_error_kind(&error),
+                "Deleted rf rows could not be settled"
+            );
+            true
+        }
+    }
+}
+
+/// Tombstone the event rows of the session's deleted runs whose run families
+/// have ended. Called when an rf job reaches its terminal phase, after a
+/// delete or reply delete that deferred and before a history read or a turn.
+/// While an attempt stays pending, one waiter per session settles again each
+/// time a run ends (no timer). The first call for a workspace in this process
+/// also settles every session a restart left pending.
+pub(super) async fn settle_deleted(state: &AppState, workspace_id: &str, owner_id: &str, session_key: &str) {
+    sweep_workspace_once(state, workspace_id).await;
+    if settle_once(state, workspace_id, owner_id, session_key).await {
+        arm_waiter(state, workspace_id, owner_id, session_key);
+    }
+}
+
+/// Settle, once per workspace in this process, every session whose delete a
+/// restart left pending (nothing of an earlier process is live). A failed
+/// sweep is tried again by the next call.
+async fn sweep_workspace_once(state: &AppState, workspace_id: &str) {
+    let first_in_workspace = SWEPT.lock().insert(workspace_id.to_owned());
+    if first_in_workspace
+        && let Err(error) = state
+            .mem
+            .rf_settle_deleted_workspace(workspace_id, live_runs(workspace_id))
+            .await
     {
         tracing::warn!(
             error_kind = super::console_error_kind(&error),
-            "Deleted rf rows could not be settled"
+            "Pending rf deletes of the workspace could not be settled"
         );
+        SWEPT.lock().remove(workspace_id);
     }
+}
+
+/// Start the session's settle waiter unless it has one. It subscribes to the
+/// run-end signal, settles, and on each signal settles again; it ends when
+/// the session has nothing pending.
+fn arm_waiter(state: &AppState, workspace_id: &str, owner_id: &str, session_key: &str) {
+    let key = format!("{workspace_id}\0{owner_id}\0{session_key}");
+    if !WAITERS.lock().insert(key.clone()) {
+        return;
+    }
+    let state = state.clone();
+    let (workspace_id, owner_id, session_key) = (workspace_id.to_owned(), owner_id.to_owned(), session_key.to_owned());
+    tokio::spawn(async move {
+        let mut ended = crate::runtime::registry::subscribe_ended();
+        ended.mark_unchanged();
+        loop {
+            if !settle_once(&state, &workspace_id, &owner_id, &session_key).await {
+                WAITERS.lock().remove(&key);
+                // A delete may have deferred between the settle and the
+                // removal and seen this waiter: settle once more.
+                if !settle_once(&state, &workspace_id, &owner_id, &session_key).await
+                    || !WAITERS.lock().insert(key.clone())
+                {
+                    return;
+                }
+            }
+            if ended.changed().await.is_err() {
+                // The signal lives for the process; a closed one ends the
+                // wait and leaves the rows to the next settle call.
+                WAITERS.lock().remove(&key);
+                return;
+            }
+        }
+    });
 }
 
 /// `POST /api/sessions/{session_id}/messages/{client_message_id}/delete`,
@@ -401,8 +477,9 @@ pub(in crate::gateway::api) async fn post_batch_delete(
 
 /// `POST /api/sessions/{session_id}/runs/{run_id}/reply/delete`: deletes
 /// the assistant side of one run; `200 {"run_id","status":"deleted"}`, the
-/// same on a repeat; a run still running is `409 run_active`; no such run of
-/// this owner in this session is `404 run_unknown`.
+/// same on a repeat; a run still running is `409 run_active`, a run whose
+/// spawned runs are still running is deleted with its rows deferred until
+/// they end; no such run of this owner in this session is `404 run_unknown`.
 pub(in crate::gateway::api) async fn post_reply_delete(
     State(state): State<AppState>,
     Path((session_id, run_id)): Path<(String, String)>,
@@ -427,11 +504,15 @@ pub(in crate::gateway::api) async fn post_reply_delete(
             &scope.session_key,
             &run_id,
             forget_writes,
+            live_runs(&scope.workspace_id),
         )
         .await
     {
         Ok(RfReplyDelete::Deleted { job_id, forget }) => {
             erase_jobs(std::iter::once(&job_id));
+            // A run it spawned still running defers the rows: settle now (the
+            // last one may have ended meanwhile) or arm the waiter.
+            settle_deleted(&state, &scope.workspace_id, &scope.owner_id, &scope.session_key).await;
             Json(DeletedReply {
                 run_id: &run_id,
                 status: "deleted",

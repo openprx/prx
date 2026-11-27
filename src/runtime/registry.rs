@@ -429,9 +429,13 @@ impl Drop for WorkGuard {
             // row; `snapshot_all` classifies it against the OS and retires it
             // once the pid is genuinely gone.
             self.slot.state.store(STATE_ABANDONED, Ordering::Relaxed);
-            return;
+        } else {
+            REGISTRY.remove(self.slot.id);
         }
-        REGISTRY.remove(self.slot.id);
+        if self.slot.kind == WorkKind::SubAgent {
+            // Removed or abandoned: either way no longer live.
+            notify_run_ended();
+        }
     }
 }
 
@@ -802,6 +806,42 @@ pub fn snapshot_all() -> Vec<WorkSnapshot> {
 pub fn snapshot(id: WorkId) -> Option<WorkSnapshot> {
     let slot = REGISTRY.get(id.raw())?;
     slot.reported_state().map(|state| slot.snapshot(state))
+}
+
+/// The run ids of the sub-agent runs still live in this process: rows of
+/// kind [`WorkKind::SubAgent`] in state `Running` or `KillRequested`. An
+/// abandoned row is not live. Run ids are unique, so callers need no
+/// workspace filter.
+#[must_use]
+pub fn live_sub_agent_runs() -> Vec<String> {
+    REGISTRY
+        .slots()
+        .into_iter()
+        .filter(|slot| slot.kind == WorkKind::SubAgent)
+        .filter(|slot| {
+            matches!(
+                slot.reported_state(),
+                Some(WorkState::Running | WorkState::KillRequested)
+            )
+        })
+        .filter_map(|slot| slot.run_id.as_deref().map(str::to_owned))
+        .collect()
+}
+
+/// A counter bumped each time a run leaves a live set (a sub-agent guard
+/// dropped, an rf job ended). Waiters re-check their condition on a change;
+/// the value itself carries no meaning.
+static ENDED: LazyLock<tokio::sync::watch::Sender<u64>> = LazyLock::new(|| tokio::sync::watch::Sender::new(0));
+
+/// Subscribe to [`notify_run_ended`].
+#[must_use]
+pub fn subscribe_ended() -> tokio::sync::watch::Receiver<u64> {
+    ENDED.subscribe()
+}
+
+/// Wake every [`subscribe_ended`] receiver: a run is no longer live.
+pub fn notify_run_ended() {
+    ENDED.send_modify(|count| *count = count.wrapping_add(1));
 }
 
 // ── Kill ────────────────────────────────────────────────────────────────────

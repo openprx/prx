@@ -940,7 +940,8 @@ pub trait Memory: Send + Sync {
     }
 
     /// Delete the assistant side of one ended rf run in one transaction;
-    /// with `forget_writes`, also forget what its run family wrote.
+    /// with `forget_writes`, also forget what its run family wrote. While a
+    /// run it spawned is in `live_runs`, the rows wait for the settle.
     async fn rf_delete_reply(
         &self,
         workspace_id: &str,
@@ -948,22 +949,34 @@ pub trait Memory: Send + Sync {
         session_key: &str,
         run_id: &str,
         forget_writes: bool,
+        live_runs: Vec<String>,
     ) -> anyhow::Result<super::rf_messages::RfReplyDelete> {
-        let _ = (workspace_id, owner_id, session_key, run_id, forget_writes);
+        let _ = (workspace_id, owner_id, session_key, run_id, forget_writes, live_runs);
         Err(crate::memory::fabric::fail_fast(self.name(), "rf_delete_reply"))
     }
 
-    /// Tombstone the rows of the session's deleted runs whose jobs have
-    /// ended (every pending run not in `live_runs`).
+    /// Tombstone the rows of the session's deleted runs whose run families
+    /// have ended (every pending run with no run in `live_runs`); `true`
+    /// while an attempt of the session stays pending.
     async fn rf_settle_deleted(
         &self,
         workspace_id: &str,
         owner_id: &str,
         session_key: &str,
         live_runs: Vec<String>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let _ = (workspace_id, owner_id, session_key, live_runs);
         Err(crate::memory::fabric::fail_fast(self.name(), "rf_settle_deleted"))
+    }
+
+    /// [`Self::rf_settle_deleted`] for every session of the workspace with a
+    /// pending delete (run once per process, after a restart).
+    async fn rf_settle_deleted_workspace(&self, workspace_id: &str, live_runs: Vec<String>) -> anyhow::Result<()> {
+        let _ = (workspace_id, live_runs);
+        Err(crate::memory::fabric::fail_fast(
+            self.name(),
+            "rf_settle_deleted_workspace",
+        ))
     }
 
     /// Empty the WAL of deleted rf content when a delete left it pending
