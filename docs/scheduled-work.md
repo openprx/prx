@@ -102,8 +102,14 @@ derived from the job and the run, so a run recorded twice sends one message. An
 error run sends nothing and stays a note. A `message` job with no creating
 session falls back to a note: an owner-less job (operator CLI), a job whose
 creating message is no longer stored, a job created through a route, a
-non-SQLite backend, or a send refused by the inbound setting. A note that was
-delivered as a message is not repeated at the next turn. `none` writes no notice and no result row. A
+non-SQLite backend, or a send refused by the inbound setting. A task created by a
+scheduled run (its creating event is the run's own `xin:` or `cron:` session) or
+inside a child session (`spawn:` session) also falls back to a note for the task
+owner, so such a run stays visible at the owner's next turn. A message to a
+Console session with no live receiver is stored and is taken at the session's
+next submission or at the gateway's restart. A note that was delivered as a
+message is not repeated at the next turn; a delivered run's older successful run
+that was not delivered is still shown. `none` writes no notice and no result row. A
 one-off agent task created from a session (the xin tool with an agent task that is
 not recurring and has a `message_event_id` in the trusted scope; the cron tool
 with an agent job on an `at` schedule and a `message_event_id`) defaults to `message`; everything else
