@@ -86,7 +86,6 @@ pub(super) fn context_handoff_has_one_production_owner_and_exact_lookup_is_regis
     }
     let loop_source =
         fs::read_to_string(repository_root().join("src/agent/turn_engine.rs")).expect("read src/agent/turn_engine.rs");
-    assert!(loop_source.contains("context_mode_uses_os_paging"));
     assert!(loop_source.contains("tool_specs.push(required)"));
 }
 
@@ -417,7 +416,6 @@ fn without_feature_gated_test_items(text: &str) -> String {
 const USER_MESSAGE_CONSTRUCTION_SITES: &[&str] = &[
     // Loop-written notes: the reserved markers themselves, and the corrective aside.
     "src/context/reduce/patch.rs::post_compaction_refresh_aside",
-    "src/agent/context_paging.rs::recall_context_pages",
     "src/agent/response_guard.rs::append_corrective_aside",
     "src/agent/tool_result_recording.rs::drop",
     "src/agent/turn_engine/tool_round.rs::run_tools",

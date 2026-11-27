@@ -1,6 +1,6 @@
 use super::helpers::{
     assert_inventory, blank_comments_and_literals, enclosing_function, function_body, is_test_code_file,
-    production_source_files, read_source, relative_path, repository_root, strip_cfg_test_items, test_module_files,
+    production_source_files, read_source, relative_path, strip_cfg_test_items, test_module_files,
     test_module_files_of,
 };
 use super::loop_prompt::REVIEWED_DECISION_HANDOFFS;
@@ -427,16 +427,7 @@ fn compaction_none_spellings_and_test_module_files_are_exact() {
             "actual cfg(test) declaration not followed: {relative}"
         );
     }
-    // Loaded by a production `#[path]` declaration, but test code by its own
-    // `#![cfg(test)]` marker.
-    let marked = "src/agent/turn_tests/context_paging.rs";
-    assert!(is_test_code_file(
-        marked,
-        &read_source(&repository_root().join(marked)),
-        &modules
-    ));
     for production_file in [
-        "src/agent/context_paging.rs",
         "src/providers/mod.rs",
         "src/agent/contests.rs",
     ] {
