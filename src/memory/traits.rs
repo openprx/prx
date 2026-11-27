@@ -1445,6 +1445,20 @@ pub trait Memory: Send + Sync {
         Ok(HashSet::new())
     }
 
+    /// The ids among `event_ids` (`MessageEvent::event_id`) that are message
+    /// events of the principal's own session. Recall uses it to leave out
+    /// memories autosaved from the conversation's own earlier messages, which
+    /// the replayed history already carries. Reads ids only, no content.
+    /// Backends that do not store message events exclude nothing.
+    async fn message_event_ids_in_session(
+        &self,
+        principal: &MemoryPrincipal,
+        event_ids: &[String],
+    ) -> anyhow::Result<HashSet<String>> {
+        let _ = (principal, event_ids);
+        Ok(HashSet::new())
+    }
+
     /// Build the transcript index now, so the first search does not. Backends
     /// without a transcript index do nothing.
     async fn warm_transcript_index(&self) -> anyhow::Result<()> {

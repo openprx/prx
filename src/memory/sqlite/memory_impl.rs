@@ -1400,6 +1400,14 @@ impl Memory for SqliteMemory {
         self.excluded_transcript_rows_impl(row_ids).await
     }
 
+    async fn message_event_ids_in_session(
+        &self,
+        principal: &MemoryPrincipal,
+        event_ids: &[String],
+    ) -> anyhow::Result<std::collections::HashSet<String>> {
+        self.message_event_ids_in_session_impl(principal, event_ids).await
+    }
+
     async fn warm_transcript_index(&self) -> anyhow::Result<()> {
         self.warm_transcript_index_impl().await
     }

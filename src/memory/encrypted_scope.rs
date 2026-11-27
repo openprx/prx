@@ -1423,6 +1423,14 @@ impl Memory for EncryptedScope {
         self.inner.excluded_transcript_rows(row_ids).await
     }
 
+    async fn message_event_ids_in_session(
+        &self,
+        principal: &crate::memory::MemoryPrincipal,
+        event_ids: &[String],
+    ) -> anyhow::Result<std::collections::HashSet<String>> {
+        self.inner.message_event_ids_in_session(principal, event_ids).await
+    }
+
     async fn search_transcripts(
         &self,
         principal: &MemoryPrincipal,

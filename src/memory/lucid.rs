@@ -307,6 +307,14 @@ impl Memory for LucidMemory {
         self.local.excluded_transcript_rows(row_ids).await
     }
 
+    async fn message_event_ids_in_session(
+        &self,
+        principal: &crate::memory::MemoryPrincipal,
+        event_ids: &[String],
+    ) -> anyhow::Result<std::collections::HashSet<String>> {
+        self.local.message_event_ids_in_session(principal, event_ids).await
+    }
+
     async fn newest_core_entries(&self, principal: &MemoryPrincipal, limit: usize) -> anyhow::Result<Vec<MemoryEntry>> {
         self.local.newest_core_entries(principal, limit).await
     }

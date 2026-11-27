@@ -330,7 +330,18 @@ pub(crate) async fn build_context_with_scope(
     min_relevance_score: f64,
     scope_ctx: Option<&MemoryWriteContext>,
 ) -> RecalledMemoryContext {
-    build_semantic_context(mem, user_msg, min_relevance_score, scope_ctx, false, None, None, None).await
+    build_semantic_context(
+        mem,
+        user_msg,
+        min_relevance_score,
+        scope_ctx,
+        false,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
 }
 
 /// Rows recalled into the prompt per turn.
@@ -387,6 +398,37 @@ pub(crate) fn recall_query(input: &str) -> String {
     query
 }
 
+/// Drop recalled items whose source event is a message event of the turn's own
+/// session: they are the conversation's earlier messages (autosaved on
+/// channels), which the replayed history already carries. Checks only the
+/// candidates' source ids (one indexed query); items without a source event
+/// are kept, and a failed check keeps everything.
+async fn drop_own_session_sources<T>(
+    mem: &dyn Memory,
+    own_session: Option<&MemoryPrincipal>,
+    items: &mut Vec<T>,
+    source_of: impl Fn(&T) -> Option<&str>,
+) {
+    let Some(principal) = own_session else {
+        return;
+    };
+    let ids = items
+        .iter()
+        .filter_map(|item| source_of(item).map(str::to_owned))
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        return;
+    }
+    let Ok(own) = mem.message_event_ids_in_session(principal, &ids).await else {
+        return;
+    };
+    if !own.is_empty() {
+        items.retain(|item| source_of(item).is_none_or(|id| !own.contains(id)));
+    }
+}
+
 async fn build_semantic_context(
     mem: &dyn Memory,
     user_msg: &str,
@@ -396,6 +438,7 @@ async fn build_semantic_context(
     excluded_key: Option<&str>,
     excluded_event: Option<&str>,
     child: Option<&ChildRecallGate<'_>>,
+    own_session: Option<&MemoryPrincipal>,
 ) -> RecalledMemoryContext {
     let mut summaries = Vec::new();
     let mut context = String::new();
@@ -413,6 +456,7 @@ async fn build_semantic_context(
         .filter(|entry| excluded_event.is_none() || entry.source_event_id.as_deref() != excluded_event)
         .filter(|entry| !unscoped_remote_hit(entry.origin, entry.source_event_id.as_deref()))
         .collect::<Vec<_>>();
+    drop_own_session_sources(mem, own_session, &mut candidates, |entry| entry.source_event_id.as_deref()).await;
     rank_with_recency(&mut candidates);
     candidates.truncate(RECALL_LIMIT);
     let scored_entries = candidates
@@ -465,6 +509,10 @@ async fn build_semantic_context(
                 None
             }
         };
+        let mut hits = hits;
+        if let Some(hits) = hits.as_mut() {
+            drop_own_session_sources(mem, own_session, hits, |hit| hit.source_event_id.as_deref()).await;
+        }
         hits.filter(|hits| {
             hits.len() <= 5
                 && hits.iter().all(|hit| {
@@ -986,6 +1034,7 @@ async fn build_agent_context(
             excluded_key,
             excluded_event,
             gate.as_ref(),
+            (!include_current_session).then_some(&principal),
         )
         .await
     } else {

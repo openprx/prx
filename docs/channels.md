@@ -155,7 +155,9 @@ Every channel turn opens through the same turn opening as the console, chat and
 gateway surfaces. The `session_opened` and `turn_opened` hooks run, and the user
 message is stored with its attachment row (the memory preamble and the hook
 contributions, masked for secrets). Recall is bounded by the window of the model,
-as on those surfaces.
+as on those surfaces. Semantic recall leaves out memories autosaved from the
+session's own earlier messages, because the replayed history already carries
+them; memories of other sessions and memories without a source event are kept.
 
 Direct chats keep the session's memory index in the system prompt (recorded
 once per session and replayed on later turns) and see the unseen
