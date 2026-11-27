@@ -501,7 +501,10 @@ output was stored at record time, else a rerun of the tool. The wording is one
 function, `cleared_result_text`, shared with the terminal replay stub; it
 repeats a tool name only in the tool-name charset (at most 64 bytes) and a
 document id only as `tool-output:<tool>:<16 hex>` read from the result's
-trailing reference block, else the stub says the output is not kept. A step
+trailing reference block, else the stub says the output is not kept. A tool
+name outside the charset (or over 64 bytes) is written in the id as
+`t-<first 16 hex of sha256(name)>`, so the stub still names the document while
+it shows the tool as `unknown`. A step
 that clears emits `reduction_finished` with `step = "clear_tool_results"`.
 
 Steps that still run outside the ladder: the overflow retry (compaction, then a
