@@ -164,15 +164,16 @@
         // terminal switch matches the replayed user message (typed text + tail)
         // against the log, so the stored tail must exist there too.
         if let (Some(event), Some(sent)) = (chat_user_event.as_ref(), sent_form.as_ref()) {
+            let (note, results) = hook_tail.stored_note(&sent.tail);
             let mut sources = mem_context.sources.clone();
-            sources.results.clone_from(&hook_tail.results);
+            sources.results = results.to_vec();
             crate::context::transcript::append_attachment(
                 &memory_fabric,
                 runtime_envelope.message_scope(),
                 &event.event_id,
                 sent,
                 &sources,
-                &hook_tail.note,
+                note,
             )
             .await;
         }

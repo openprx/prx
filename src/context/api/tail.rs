@@ -43,6 +43,23 @@ pub(crate) struct TurnTail {
     pub(crate) results: Vec<String>,
 }
 
+impl TurnTail {
+    /// The note and result ids to store with a tail that was redacted after
+    /// the note was built: kept only while the stored tail still contains the
+    /// note verbatim, since the later cut of the note matches that text.
+    /// Otherwise empty (one log line, digest only).
+    pub(crate) fn stored_note<'a>(&'a self, stored_tail: &str) -> (&'a str, &'a [String]) {
+        if self.note.is_empty() || stored_tail.contains(&self.note) {
+            return (&self.note, &self.results);
+        }
+        tracing::warn!(
+            note = %crate::agent::diagnostics::text_class(&self.note),
+            "scheduled-results note changed by redaction; not stored"
+        );
+        ("", &[])
+    }
+}
+
 /// The text placed after the user's message on this turn: the `turn_opened`
 /// hook blocks, then, on an interactive turn (Console, Chat or Channel, but not
 /// a group-shared channel chat), the unseen scheduled-results note. The note's
