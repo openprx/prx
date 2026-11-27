@@ -139,11 +139,6 @@ pub(super) fn trim(
         }
         tx.execute_batch(INDEXES)?;
         sync_journal::prune(&tx)?;
-        tx.execute(
-            "INSERT INTO message_retention_state(singleton, last_run) VALUES(1, ?1)
-             ON CONFLICT(singleton) DO UPDATE SET last_run = excluded.last_run",
-            params![now],
-        )?;
         tx.commit()?;
     }
     let mut cursor = 0_i64;
@@ -160,6 +155,13 @@ pub(super) fn trim(
         if counts.documents + counts.traces + counts.compactions > 0 {
             rf_delete::mark_scrub(&tx, &rf_now)?;
         }
+        // Only a pass that got this far counts for the start-up throttle; a
+        // failed pass leaves `last_run` as it was, so the next start retries.
+        tx.execute(
+            "INSERT INTO message_retention_state(singleton, last_run) VALUES(1, ?1)
+             ON CONFLICT(singleton) DO UPDATE SET last_run = excluded.last_run",
+            params![now],
+        )?;
         tx.commit()?;
         counts
     };
@@ -277,7 +279,7 @@ fn batch(memory: &SqliteMemory, cutoff: &str, cursor: &mut i64, trim: &mut Messa
     let now = chrono::Utc::now();
     if deleted > 0 {
         rf_delete::mark_scrub(&tx, &now.to_rfc3339())?;
-        record_deleted(&tx, cutoff, now.timestamp(), deleted)?;
+        record_deleted(&tx, cutoff, deleted)?;
     }
     tx.commit()?;
     *cursor = next;
@@ -371,14 +373,16 @@ fn members(tx: &Connection, unit: &Unit) -> anyhow::Result<Vec<(i64, String, Opt
 
 /// Writes the state row: `cutoff` only ever rises (fixed-width text, so the
 /// comparison is chronological) and `deleted_total` accumulates. Callers invoke
-/// it only when rows were deleted.
-fn record_deleted(tx: &Connection, cutoff: &str, now: i64, deleted: usize) -> anyhow::Result<()> {
+/// it only when rows were deleted. `last_run` is left to the end of the pass; a
+/// first row starts at 0 (no completed pass), so a pass that fails after this
+/// batch is not throttled.
+fn record_deleted(tx: &Connection, cutoff: &str, deleted: usize) -> anyhow::Result<()> {
     tx.execute(
-        "INSERT INTO message_retention_state(singleton, last_run, cutoff, deleted_total) VALUES(1, ?1, ?2, ?3)
+        "INSERT INTO message_retention_state(singleton, last_run, cutoff, deleted_total) VALUES(1, 0, ?1, ?2)
          ON CONFLICT(singleton) DO UPDATE SET
              cutoff = CASE WHEN cutoff IS NULL OR cutoff < excluded.cutoff THEN excluded.cutoff ELSE cutoff END,
              deleted_total = deleted_total + excluded.deleted_total",
-        params![now, cutoff, i64::try_from(deleted)?],
+        params![cutoff, i64::try_from(deleted)?],
     )?;
     Ok(())
 }
