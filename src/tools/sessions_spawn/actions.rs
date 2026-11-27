@@ -470,7 +470,9 @@ impl SessionsSpawnTool {
                 render_history_message(message, stamp, max_chars_per_entry)
             })
             .collect();
-        let tool_rows_note = if window_full {
+        let tool_rows_note = if partition.is_err() {
+            "\n\n[tool rows unavailable: the child's agent partition could not be read]"
+        } else if window_full {
             "\n\n[older tool rows may not be shown: the read window of 500 rows is full]"
         } else {
             ""
