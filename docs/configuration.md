@@ -1306,7 +1306,7 @@ PRX treats `chat`, `agent`, `gateway`, `channel`, `delegate`, and `sessions_spaw
 
 `[memory.semantic]` controls promotion from event/message content into durable semantic memory. Assistant promotion is disabled by default to reduce noisy self-generated memory.
 
-Unseen scheduled results reach the owner as a note. Each scheduled run writes a `schedule.result.recorded` row. Results of tasks and jobs created from the `prx xin add` / `prx cron` CLI or from the terminal are written under the terminal owner, so they appear as this note in `prx chat`. At the opening of the owner's next Console turn, the rows of the owner's agent partition that the owner has not seen are read, newest first, and shown in one `[Scheduled results]` block placed after the hook context and before the date line. Rows are grouped per scheduled session: one line per group shows the newest run; older failed attempts are dropped, and older successful runs count as `(+k earlier)`. The note shows at most 10 lines, and only results finished within the last 7 days; each line keeps at most 200 characters of the reply. The block is stored with the turn and replayed with it. The seen mark is a `schedule.result.seen` row in the same step, so the next turn does not repeat the note. Webhook, scheduled and child turns show no note. A result whose task is owned by another owner, or that belongs to another agent partition, is not shown. Encrypted-scope memories show no note.
+Unseen scheduled results reach the owner as a note. Each scheduled run writes a `schedule.result.recorded` row. Results of tasks and jobs created from the `prx xin add` / `prx cron` CLI or from the terminal are written under the terminal owner, so they appear as this note in `prx chat`. At the opening of the owner's next Console or terminal chat turn, the rows of the owner's agent partition that the owner has not seen are read, newest first, and shown in one `[Scheduled results]` block placed after the hook context and before the date line. Rows are grouped per scheduled session: one line per group shows the newest run; older failed attempts are dropped, and older successful runs count as `(+k earlier)`. The note shows at most 10 lines, and only results finished within the last 7 days; each line keeps at most 200 characters of the reply. The block is stored with the turn and replayed with it. The seen mark is a `schedule.result.seen` row in the same step, so the next turn does not repeat the note. Webhook, scheduled and child turns show no note. A result whose task is owned by another owner, or that belongs to another agent partition, is not shown. Encrypted-scope memories show no note.
 
 For `sessions_spawn`, `task` runs an in-process sub-agent and `process` launches a worker process. Process mode uses a manifest with `memory_strategy`, `shared_memory_db_path`, and `worker_memory_db_path`; the default `shared_fabric` strategy writes worker events into the parent workspace fabric while still keeping the execution boundary explicit. Set `[sessions_spawn].process_memory_strategy = "isolated_private"` for a private worker DB. `hybrid` is fail-closed because no production merge consumer or merge/reject/ack/cleanup protocol exists; use `shared_fabric` or `isolated_private` instead.
 
@@ -1356,7 +1356,7 @@ effect) and its response carries the same `warning`.
 | Removed key | Why |
 |---|---|
 | `agent.max_tool_iterations` | progressing agent work has no arbitrary tool-round ceiling |
-| `agent.max_history_messages` | conversation retention follows the context-token budget, not a message count |
+| `agent.max_history_messages` | conversation retention is by age (`memory.message_retention_days`, `memory.conversation_retention_days`), not by a message count; the context-token budget decides what is sent, not what is kept |
 | `agent.parallel_tools` | no concurrency ceiling to switch |
 | `agent.tool_dispatcher` | never read: the tool-call wire form follows the provider's capabilities |
 | `agent.read_only_tool_timeout_secs` | no timeouts on agent work |
@@ -1370,7 +1370,6 @@ effect) and its response carries the same `warning`.
 | `agent.concurrency_rollback_error_rate_threshold` | staged rollout retired |
 | `[agent.compaction.os_paging]` (whole table) | OS paging was removed; long sessions are handed off by the context switch |
 | `agent.compaction.memory_flush` | the memory flush belonged to the removed summary modes |
-| `skill_rag.top_k` | the prompt publishes the skill catalog whole; the key has no effect |
 | `sessions_spawn.max_concurrent` | sub-agent fan-out is uncapped; use `prx tasks` to see and end runs |
 | `sessions_spawn.max_spawn_depth` | legacy global limit is ignored; nesting is bounded by the sealed spawn depth |
 | `sessions_spawn.max_children_per_agent` | per-session fan-out is uncapped |

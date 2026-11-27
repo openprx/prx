@@ -859,13 +859,15 @@ lookup: it hands work to a live `prx chat` session and is authorized by its
 own default-deny `autonomy.scopes.assign_owners` / `assign_allow` rules.
 
 The `[Recent shared workspace events]` block that a process-mode sub-agent
-worker receives in its prompt follows the same rule. It used to carry the 24
+worker receives with its input follows the same rule. It used to carry the 24
 most recent `workspace` events of the whole workspace — other owners' spawn
 task text and sub-agent results included, with no prompt injection needed to
 get them there. It now carries only events of the reader's own owner from its
 other sessions: the shared-context feed requires the owner on its `workspace`
-arm for every reader, and a worker reads for the owner that spawned it (the
-owner in its manifest). Events without an owner, and a reader without an owner
+arm for every reader. The block is built by the child's own recall in
+`enrich_input` (`src/runtime/child_turn.rs:222`), from the child's envelope; a
+process worker takes that envelope's owner from its manifest
+(`src/session_worker/runner/context.rs:153-154`). Events without an owner, and a reader without an owner
 id, contribute nothing to it.
 
 The local-process operator keeps the workspace-wide view: turns driven from the
@@ -1058,8 +1060,8 @@ identically about the same `chunk_id`: `document_search` does not return a
 snippet of a chunk that `document_get_chunk` would then refuse. This applies to
 the keyword, vector and fallback chunk queries alike. It matters because a
 document is stored at `workspace` visibility unless the writer says otherwise,
-and the context evictor ingests the evicted conversation transcript as a
-document, so the chunk table holds verbatim conversation.
+and builds that ran the OS-paging evictor stored the evicted conversation
+transcript as documents, so the chunk table can still hold verbatim conversation.
 
 Nothing changes for any other origin: chat, channel, agent, cron, xin and
 sub-agent principals are never owner-isolated and keep the workspace-shared view
@@ -1867,7 +1869,8 @@ control frames and capability-expiry rules are unchanged.
 current agent. It reads the user and assistant messages of every session in the
 agent partition of the calling turn (the main agent's partition for a main-agent
 turn). Other owners, workspaces and agent partitions are never searched, and
-messages in encrypted scopes are not searched.
+in an encrypted ramflux channel conversation the search covers the current
+conversation only, and scans at most 2,000 rows.
 
 Parameters:
 
