@@ -10,7 +10,7 @@ use super::tail::{TurnTailInput, turn_tail};
 use crate::agent::context_recall::{RECALL_CONTEXT_BUDGET, RecallScope, replayed_session_recall, scoped_recall};
 use crate::config::{AgentCompactionConfig, MemoryConfig};
 use crate::context::request_provenance::{LiveAttachment, note_live_attachment};
-use crate::context::transcript::{Attachment, History, Transcript, append_attachment};
+use crate::context::transcript::{Attachment, History, ReplayLog, Transcript, append_attachment};
 use crate::hooks::HookManager;
 use crate::memory::{ConversationTurn, Memory, MemoryFabric};
 use crate::providers::ChatMessage;
@@ -217,6 +217,10 @@ pub(crate) async fn open_turn(input: OpenInput<'_>) -> TurnOpening {
     // empty history is the one `expand_turns` returns for zero turns.
     let mut replayed = if previous_turns.is_empty() {
         History::default()
+    } else if previous_turns.iter().all(|turn| turn.message_event_id.is_none()) {
+        // Cached turns (a channel's in-memory history) have no stored rows to
+        // read; expanding them against an empty log gives the same history.
+        ReplayLog::default().expand_turns(previous_turns)
     } else {
         Transcript::new(memory.as_ref(), envelope.memory_principal())
             .expand_turns(previous_turns)
