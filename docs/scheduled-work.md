@@ -130,13 +130,26 @@ refused.
 
 The note at the owner's next interactive turn lists at most ten groups; any
 further unseen groups are counted on one `+n more` line and covered by the seen
-mark. A note's rows count as seen only once their turn reaches `turn.finalized`,
-so a turn that fails after showing the note shows it again at the next turn. A
-turn with no source message event id gets no note: the note is stored with the
+mark. A note's rows count as seen only once their turn reaches `turn.finalized`
+with a status that kept the note. `completed` and `silent` count on every
+surface. `failed` and `cancelled` count only for a Console turn, whose history
+replays the aborted user message with its stored note; for `prx chat` and
+channel turns the note is lost with the aborted turn and is shown again at the
+next turn. A turn that never finalizes (a crash with no recovery) does not count
+either. Each new mark carries the seen point it was computed from, so a run of
+unfinalized marks never makes older results show again. In an encrypted
+conversation the seen state is kept sealed in that conversation; another
+encrypted conversation of the same owner, or a plaintext surface, shows the same
+results once more, while a plaintext mark counts in an encrypted conversation.
+A turn with no source message event id gets no note: the note is stored with the
 user message only when that message has an id, so a note that could not be
 replayed is not sent and stays unseen.
 A scheduled run's result row names its admission input event as
 `causation_event_id`.
+
+Encryption at rest: scheduled runs and their result rows are stored like other
+plaintext rows (secret redaction applies to the reply excerpt). Conversation-level
+sealing covers only turns run inside an encrypted conversation.
 
 ## HEARTBEAT.md materialization
 
