@@ -258,6 +258,20 @@ fn is_credential_segment(segment: &str) -> bool {
 /// names `key` and `auth` are decided by where they appear).
 fn classify_name(key: &str) -> KeyName {
     let segments = key_segments(key);
+    // Pagination tokens, count and budget names and cursors carry no
+    // credential unless the value looks like one (CE-64 follow-up).
+    if segments.iter().any(|segment| segment == "cursor")
+        || (segments.iter().any(|segment| segment == "token")
+            && segments.iter().any(|segment| {
+                matches!(
+                    segment.as_str(),
+                    "next" | "page" | "continuation" | "sync" | "count" | "limit" | "budget"
+                )
+            }))
+        || matches!(segments.as_slice(), [only] if only == "key")
+    {
+        return KeyName::CredentialIfSecretShaped;
+    }
     let by_words = segments.iter().any(|segment| is_credential_segment(segment))
         || segments
             .windows(2)
@@ -267,19 +281,19 @@ fn classify_name(key: &str) -> KeyName {
     if by_words {
         return KeyName::Credential;
     }
-    // `…key` (D-054 amendment 4): a run-together segment (`masterkey`) or a
-    // `key` segment after another (`hmac_key`), classified by its stem; the
-    // strongest classification among them wins
+    // `…key` (D-054 amendment 4): a `key` word after another segment
+    // (`hmac_key`, `APIKey`), classified by its stem; the strongest
+    // classification among them wins. A run-together `monkey`, `hotkey` or
+    // `masterkey` is not a `key` word, so it is not a credential name.
     let mut class = KeyName::Plain;
     for (index, segment) in segments.iter().enumerate() {
-        let stem = if segment == "key" {
-            index
-                .checked_sub(1)
-                .and_then(|previous| segments.get(previous))
-                .map(String::as_str)
-        } else {
-            segment.strip_suffix("key").filter(|stem| !stem.is_empty())
-        };
+        if segment != "key" {
+            continue;
+        }
+        let stem = index
+            .checked_sub(1)
+            .and_then(|previous| segments.get(previous))
+            .map(String::as_str);
         match stem.map(key_stem_class) {
             Some(KeyName::Credential) => return KeyName::Credential,
             Some(KeyName::CredentialIfSecretShaped) => class = KeyName::CredentialIfSecretShaped,
@@ -299,13 +313,18 @@ fn is_bare_key_or_auth(key: &str) -> bool {
     matches!(key_segments(key).as_slice(), [only] if only == "key" || only == "auth")
 }
 
+/// Whether the whole key is the bare name `auth`.
+fn is_bare_auth(key: &str) -> bool {
+    matches!(key_segments(key).as_slice(), [only] if only == "auth")
+}
+
 /// Whether `key`, as a JSON object key, names a credential (D-054 amendments
 /// 3 and 4): a credential word or ending, a `…key` name whose stem is not on
-/// the non-secret list, or the bare `key` / `auth`. A `session…key` is decided
-/// by its value ([`is_credential_value`]).
+/// the non-secret list, or the bare `auth`. A `session…key` and the bare `key`
+/// are decided by their value ([`is_credential_value`]).
 #[must_use]
 pub fn is_credential_key(key: &str) -> bool {
-    names_a_credential(key) || is_bare_key_or_auth(key)
+    names_a_credential(key) || is_bare_auth(key)
 }
 
 /// Whether the value under `key` is a secret: always under a credential
@@ -333,15 +352,25 @@ fn is_type_annotation(value: &str) -> bool {
     TYPE_ANNOTATION_NAMES.contains(&base)
 }
 
-/// Whether a bare value is a call (`compute()`, `self.get(key)`): an identifier
-/// path followed by a parenthesised argument list (CE-64).
+/// Whether a bare value is a call (`getpass()`, `compute(key)`, `self.get(key)`,
+/// `env::var(X)`): a callee that starts with a lowercase ASCII letter or `_`,
+/// then an argument list that is empty or holds a letter and no `=`, `:`,
+/// parenthesis. `PASSWORD=Summer(2024)` and `hunter(2)` are secrets, not calls
+/// (CE-64 review).
 fn is_call(value: &str) -> bool {
     value.strip_suffix(')').is_some_and(|head| {
-        head.split_once('(').is_some_and(|(callee, _)| {
-            !callee.is_empty()
+        head.split_once('(').is_some_and(|(callee, arguments)| {
+            let starts_like_a_name = callee
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_lowercase() || c == '_');
+            starts_like_a_name
                 && callee
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':'))
+                && (arguments.is_empty()
+                    || (!arguments.contains(['=', ':', '(', ')'])
+                        && arguments.chars().any(|c| c.is_ascii_alphabetic())))
         })
     })
 }
@@ -553,6 +582,14 @@ fn keyed_pair_spans(text: &str, url_parts: &[UrlPart], spans: &mut Vec<Range<usi
                 value.end = value.end.min(part.range.end);
             }
         }
+        // A bare value that stops at a quote (`String::from("abc123")`) takes
+        // the quoted literal with it, so the literal is masked too.
+        if kind == 0
+            && let Some(quote @ ('"' | '\'')) = text.get(value.end..).and_then(|tail| tail.chars().next())
+            && let Some(close) = text.get(value.end + 1..).and_then(|tail| tail.find(quote))
+        {
+            value.end += close + 2;
+        }
         if value.is_empty() {
             continue;
         }
@@ -580,13 +617,14 @@ fn keyed_pair_spans(text: &str, url_parts: &[UrlPart], spans: &mut Vec<Range<usi
         // A bare code shape is not a credential: `token = compute()` and
         // `pub token: String` keep their code (CE-64). Quoted values stay masked.
         let code_shape = kind == 0 && (is_call(source) || (separator.as_str() == ":" && is_type_annotation(source)));
+        // The bare `key` is classified by its value; the bare `auth` is a
+        // credential name on its own (the only Plain name that gets here).
         let credential = !code_shape
-            && (bare_key
-                || match class {
-                    KeyName::Credential => true,
-                    KeyName::CredentialIfSecretShaped => scan.secret_shaped(text, &value),
-                    KeyName::Plain => false,
-                });
+            && match class {
+                KeyName::Credential => true,
+                KeyName::CredentialIfSecretShaped => scan.secret_shaped(text, &value),
+                KeyName::Plain => bare_key,
+            };
         if credential && value.end > covered_until {
             covered_until = value.end;
             spans.push(value);
