@@ -347,7 +347,9 @@ impl Memory for EncryptedScope {
     ) -> anyhow::Result<()> {
         let (stored_key, mut sealed, session, metadata) =
             self.sealed_write(key, content, crate::memory::MemoryStoreMetadata::default())?;
-        if let Some(current) = self.inner.get(&stored_key).await?
+        // A failed read of the current row only skips the reuse: the store then
+        // writes the fresh seal, as it did before the identical re-store check.
+        if let Ok(Some(current)) = self.inner.get(&stored_key).await
             && self.open_record(key, &current.content).as_deref() == Some(content)
         {
             sealed = current.content;
