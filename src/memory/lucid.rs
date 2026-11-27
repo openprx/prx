@@ -776,6 +776,28 @@ impl Memory for LucidMemory {
             .await
     }
 
+    async fn rewrite_tool_ledger_output(
+        &self,
+        workspace_id: &str,
+        terminal_key: &str,
+        effective_text: &str,
+    ) -> anyhow::Result<bool> {
+        self.local
+            .rewrite_tool_ledger_output(workspace_id, terminal_key, effective_text)
+            .await
+    }
+
+    async fn replace_tool_ledger_payload(
+        &self,
+        workspace_id: &str,
+        terminal_key: &str,
+        payload: crate::memory::SealedLedgerPayload,
+    ) -> anyhow::Result<bool> {
+        self.local
+            .replace_tool_ledger_payload(workspace_id, terminal_key, payload)
+            .await
+    }
+
     async fn list_console_conversation_turns(
         &self,
         principal: &MemoryPrincipal,

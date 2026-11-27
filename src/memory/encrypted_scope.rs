@@ -597,11 +597,9 @@ impl Memory for EncryptedScope {
         workspace_id: &str,
         terminal_key: &str,
         effective_text: &str,
-        sealed_payload: Option<&str>,
     ) -> anyhow::Result<bool> {
         // The ledger payload is sealed here: open it, rewrite, seal it again
         // through the scope's own path.
-        let _ = sealed_payload;
         let Some(stored) = self
             .inner
             .find_message_event_by_idempotency_key(workspace_id, terminal_key)
@@ -620,7 +618,11 @@ impl Memory for EncryptedScope {
         };
         let sealed = self.seal_payload(&source, terminal_key, &rewritten)?;
         self.inner
-            .rewrite_tool_ledger_output(workspace_id, terminal_key, effective_text, Some(&sealed))
+            .replace_tool_ledger_payload(
+                workspace_id,
+                terminal_key,
+                crate::memory::SealedLedgerPayload::new(sealed),
+            )
             .await
     }
 

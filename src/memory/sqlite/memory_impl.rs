@@ -1234,9 +1234,18 @@ impl Memory for SqliteMemory {
         workspace_id: &str,
         terminal_key: &str,
         effective_text: &str,
-        sealed_payload: Option<&str>,
     ) -> anyhow::Result<bool> {
-        self.rewrite_tool_ledger_output_impl(workspace_id, terminal_key, effective_text, sealed_payload)
+        self.rewrite_tool_ledger_output_impl(workspace_id, terminal_key, effective_text, None)
+            .await
+    }
+
+    async fn replace_tool_ledger_payload(
+        &self,
+        workspace_id: &str,
+        terminal_key: &str,
+        payload: crate::memory::SealedLedgerPayload,
+    ) -> anyhow::Result<bool> {
+        self.rewrite_tool_ledger_output_impl(workspace_id, terminal_key, "", Some(payload.as_str()))
             .await
     }
 

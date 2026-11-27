@@ -22,7 +22,7 @@ impl ToolExecutionService {
         let (_, terminal_key) = tool_execution_ledger_keys(context, idempotency_key);
         let masked = crate::security::redaction::redact_secrets(effective);
         if let Err(error) = memory
-            .rewrite_tool_ledger_output(&context.envelope.workspace_id, &terminal_key, &masked, None)
+            .rewrite_tool_ledger_output(&context.envelope.workspace_id, &terminal_key, &masked)
             .await
         {
             tracing::warn!(error = %error, "failed to rewrite the tool ledger row with the effective output");

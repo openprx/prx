@@ -59,6 +59,7 @@ pub use sqlite::SqliteMemory;
 pub use traits::CALLER_KEYED_SESSION_CHANNEL;
 pub use traits::LifecycleState;
 pub use traits::Memory;
+pub use traits::SealedLedgerPayload;
 pub use traits::{
     AgentPartition, AgentPartitionUnreadable, AgentScopeRefused, AgentScopeUnsupported, ChatProfile, CompactionRun,
     CompactionRunInput, CompactionSourceEventRange, ConversationSessionOwner, ConversationSessionSummary,

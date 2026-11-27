@@ -98,6 +98,21 @@ const fn enforced_read_mode(context: Option<&MemoryWriteContext>, requested: Mem
 }
 
 /// Core memory trait — implement for any persistence backend
+/// A tool ledger payload sealed by the encrypted scope. The constructor is
+/// crate-private, so only in-crate code can hand one to
+/// [`Memory::replace_tool_ledger_payload`].
+pub struct SealedLedgerPayload(String);
+
+impl SealedLedgerPayload {
+    pub(crate) const fn new(sealed: String) -> Self {
+        Self(sealed)
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[async_trait]
 pub trait Memory: Send + Sync {
     /// Available only with the transactional rf journal backend.
@@ -793,18 +808,30 @@ pub trait Memory: Send + Sync {
     /// Rewrite the output fields (`outcome.model_content` and a text
     /// `outcome.result.output`) of the tool idempotency ledger row
     /// `terminal_key` to `effective_text`, the text a `tool_result` hook
-    /// substituted, so a retry replays it. `sealed_payload`, when given,
-    /// replaces the whole stored payload (a sealing wrapper's rewrite). A row
-    /// that is absent or not the expected record is left as is; returns
-    /// whether a row changed. Backends without a ledger change nothing.
+    /// substituted, so a retry replays it. A row that is absent or not the
+    /// expected record is left as is; returns whether a row changed. Backends
+    /// without a ledger change nothing.
     async fn rewrite_tool_ledger_output(
         &self,
         workspace_id: &str,
         terminal_key: &str,
         effective_text: &str,
-        sealed_payload: Option<&str>,
     ) -> anyhow::Result<bool> {
-        let _ = (workspace_id, terminal_key, effective_text, sealed_payload);
+        let _ = (workspace_id, terminal_key, effective_text);
+        Ok(false)
+    }
+
+    /// Replace the stored payload of the ledger row `terminal_key` with one the
+    /// encrypted scope sealed. A [`SealedLedgerPayload`] can only be built
+    /// inside this crate, by the scope that sealed it. Backends without a
+    /// ledger change nothing.
+    async fn replace_tool_ledger_payload(
+        &self,
+        workspace_id: &str,
+        terminal_key: &str,
+        payload: SealedLedgerPayload,
+    ) -> anyhow::Result<bool> {
+        let _ = (workspace_id, terminal_key, payload);
         Ok(false)
     }
 
