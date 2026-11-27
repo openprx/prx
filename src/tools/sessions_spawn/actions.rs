@@ -639,11 +639,11 @@ fn render_history_message(message: &crate::providers::ChatMessage, stamp: Option
     let parsed: Option<serde_json::Value> = serde_json::from_str(&message.content).ok();
     match (message.role.as_str(), parsed.as_ref()) {
         ("tool", Some(value)) => {
-            let text = value
-                .get("content")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            format!("**tool result**: {}", bounded_display(text, max_chars))
+            let text = value.get("content").and_then(serde_json::Value::as_str);
+            format!(
+                "**tool result**: {}",
+                bounded_display(text.unwrap_or(&message.content), max_chars)
+            )
         }
         ("assistant", Some(value)) if value.get("tool_calls").is_some_and(serde_json::Value::is_array) => {
             let mut parts: Vec<String> = Vec::new();
