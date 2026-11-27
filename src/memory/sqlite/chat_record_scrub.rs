@@ -35,17 +35,24 @@ pub(super) fn init_schema(conn: &Connection) -> anyhow::Result<()> {
     if done.is_some() {
         return Ok(());
     }
-    let records: Vec<(String, String)> = {
-        let mut statement = conn.prepare(
-            "SELECT key, content FROM memories
-             WHERE key LIKE 'chat_session:%' AND json_valid(content)",
-        )?;
-        statement
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<Result<_, _>>()?
+    // Keys only up front; each record is read, scrubbed and written one at a
+    // time so peak memory stays one record on a large store.
+    let keys: Vec<String> = {
+        let mut statement = conn.prepare("SELECT key FROM memories WHERE key LIKE 'chat_session:%'")?;
+        statement.query_map([], |row| row.get(0))?.collect::<Result<_, _>>()?
     };
     let mut rewritten = 0_u64;
-    for (key, content) in records {
+    for key in keys {
+        let content: Option<String> = conn
+            .query_row(
+                "SELECT content FROM memories WHERE key = ?1 AND json_valid(content)",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(content) = content else {
+            continue;
+        };
         let Ok(mut record) = serde_json::from_str::<Value>(&content) else {
             continue;
         };
