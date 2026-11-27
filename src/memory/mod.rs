@@ -22,6 +22,7 @@ pub mod none;
 pub mod owner_predicate;
 pub mod postgres;
 pub mod principal;
+pub(crate) mod printed_keys;
 pub mod recovery_authority;
 pub mod retrieval;
 pub mod rf_messages;

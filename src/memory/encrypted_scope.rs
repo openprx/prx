@@ -25,6 +25,28 @@ const SCHEDULED_RESULT_EVENT_TYPES: [&str; 2] = [
 /// Event type of an attachment row (`context/transcript/tool_rows.rs`).
 const ATTACHMENT_EVENT_TYPE: &str = "message.attachment.recorded";
 
+/// Event types of the tool rows (`context/transcript/tool_rows.rs`,
+/// `tools/execution/section_2.rs`).
+const TOOL_RESULT_EVENT_TYPE: &str = "tool.result.recorded";
+const TOOL_CALL_EVENT_TYPE: &str = "tool.call.recorded";
+const TOOL_TERMINAL_EVENT_TYPE: &str = "tool.execution.finalized";
+
+/// Add `fields` beside the sealed payload: `sealed` is either the ciphertext
+/// (stored as `{"encrypted_child_payload": sealed, ...fields}`) or already a
+/// child payload wrapper, which keeps its own keys.
+fn with_fields(sealed: String, fields: serde_json::Map<String, serde_json::Value>) -> String {
+    let mut wrapper = match serde_json::from_str::<serde_json::Value>(&sealed) {
+        Ok(serde_json::Value::Object(existing)) if existing.contains_key("encrypted_child_payload") => existing,
+        _ => {
+            let mut fresh = serde_json::Map::new();
+            fresh.insert("encrypted_child_payload".to_owned(), serde_json::Value::String(sealed));
+            fresh
+        }
+    };
+    wrapper.extend(fields);
+    serde_json::Value::Object(wrapper).to_string()
+}
+
 /// Source lists of an attachment payload that stay readable beside the seal.
 const ATTACHMENT_SOURCE_LISTS: [&str; 4] = ["memories", "events", "documents", "results"];
 
@@ -149,19 +171,174 @@ impl EncryptedScope {
         Ok(())
     }
 
+    /// Seal the content and the payload of an event. The plaintext content of
+    /// a tool result or terminal row is kept for the payload step, which
+    /// stores the hashes of the keys it prints (see [`Self::memory_copy_fields`]).
+    fn seal_event(&self, input: &mut crate::memory::MessageEventInput) -> anyhow::Result<()> {
+        let plain = matches!(
+            input.event_type.as_str(),
+            TOOL_RESULT_EVENT_TYPE | TOOL_TERMINAL_EVENT_TYPE
+        )
+        .then(|| input.content.clone());
+        self.seal_event_content(input)?;
+        self.seal_event_payload(input, plain.as_deref())
+    }
+
     /// Keep only routing metadata visible to SQLite's transactional child hook.
     /// Source text and the complete original payload remain encrypted.
-    fn seal_event_payload(&self, input: &mut crate::memory::MessageEventInput) -> anyhow::Result<()> {
+    /// `content` is the plaintext content of a tool result or terminal row.
+    fn seal_event_payload(
+        &self,
+        input: &mut crate::memory::MessageEventInput,
+        content: Option<&str>,
+    ) -> anyhow::Result<()> {
         if let Some(payload) = input.raw_payload_json.take() {
             let key = input.idempotency_key.as_deref().unwrap_or("event");
             let sealed = self.seal_payload(&input.source, key, &payload)?;
             input.raw_payload_json = Some(if input.event_type == ATTACHMENT_EVENT_TYPE {
                 attachment_wrapper(&payload, sealed)
+            } else if let Some(fields) = self.memory_copy_fields(&input.event_type, key, &payload, content)? {
+                with_fields(sealed, fields)
             } else {
                 sealed
             });
         }
         Ok(())
+    }
+
+    /// Seal the payload of the ledger row rewritten after it was written, with
+    /// the same wrapper `seal_event_payload` gives it. `content` is the row's
+    /// plaintext content.
+    fn seal_ledger_payload(
+        &self,
+        source: &crate::memory::MessageEventSource,
+        key: &str,
+        payload: &str,
+        content: &str,
+    ) -> anyhow::Result<String> {
+        let sealed = self.seal_payload(source, key, payload)?;
+        Ok(
+            match self.memory_copy_fields(TOOL_TERMINAL_EVENT_TYPE, key, payload, Some(content))? {
+                Some(fields) => with_fields(sealed, fields),
+                None => sealed,
+            },
+        )
+    }
+
+    /// The cleartext fields stored beside the sealed payload of a memory-tool
+    /// row, so a forget can replace the sealed copy in its own transaction
+    /// without any key (design Q-E1, option C). They are written for a
+    /// `tool.result.recorded` row of a memory tool, a `tool.call.recorded` row
+    /// of `memory_store` and the `tool.execution.finalized` row of a memory
+    /// tool call: `memory_key_hashes` (`id_hash` of each printed or written
+    /// key), `call_id` (results and terminals), and two replacements sealed by
+    /// this scope for the row's own record ids, `removed_content` and
+    /// `removed_payload`, rewritten the way the plaintext sweep rewrites the
+    /// row. Never a key or text. `None` for any other row or when no key is
+    /// named. `content` is the row's plaintext content (results print their
+    /// keys there; a terminal keeps it as it is).
+    fn memory_copy_fields(
+        &self,
+        event_type: &str,
+        key: &str,
+        payload: &str,
+        content: Option<&str>,
+    ) -> anyhow::Result<Option<serde_json::Map<String, serde_json::Value>>> {
+        use crate::memory::printed_keys::{MEMORY_REMOVED_TEXT, MEMORY_TOOLS, MEMORY_WRITE_TOOLS, printed_memory_keys};
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(payload) else {
+            return Ok(None);
+        };
+        let text_at = |value: &serde_json::Value, pointer: &str| {
+            value
+                .pointer(pointer)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        };
+        let memory_tool = |tool: Option<String>, tools: &[&str]| tool.filter(|tool| tools.contains(&tool.as_str()));
+        let (keys, removed_content, call_id) = match event_type {
+            TOOL_RESULT_EVENT_TYPE => {
+                let (Some(tool), Some(content), Some(object)) = (
+                    memory_tool(text_at(&value, "/tool"), &MEMORY_TOOLS),
+                    content,
+                    value.as_object_mut(),
+                ) else {
+                    return Ok(None);
+                };
+                object.insert("document".into(), serde_json::Value::Null);
+                object.insert("inline_bytes".into(), MEMORY_REMOVED_TEXT.len().into());
+                object.insert("listing_erased".into(), true.into());
+                let call_id = object
+                    .get("call_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+                (
+                    printed_memory_keys(&tool, content),
+                    MEMORY_REMOVED_TEXT.to_owned(),
+                    call_id,
+                )
+            }
+            TOOL_CALL_EVENT_TYPE => {
+                let Some(tool) = memory_tool(text_at(&value, "/tool"), &MEMORY_WRITE_TOOLS) else {
+                    return Ok(None);
+                };
+                let Some(memory_key) = text_at(&value, "/arguments/key") else {
+                    return Ok(None);
+                };
+                let Some(arguments) = value
+                    .get_mut("arguments")
+                    .and_then(serde_json::Value::as_object_mut)
+                    .filter(|arguments| arguments.get("content").is_some_and(|content| !content.is_null()))
+                else {
+                    return Ok(None);
+                };
+                arguments.insert("content".into(), MEMORY_REMOVED_TEXT.into());
+                let removed = format!("{tool} {}", serde_json::Value::Object(arguments.clone()));
+                (vec![memory_key], removed, None)
+            }
+            TOOL_TERMINAL_EVENT_TYPE => {
+                let (Some(tool), Some(content)) = (
+                    memory_tool(text_at(&value, "/reservation/capability"), &MEMORY_TOOLS),
+                    content,
+                ) else {
+                    return Ok(None);
+                };
+                let mut keys = Vec::new();
+                for pointer in ["/outcome/model_content", "/outcome/result/output"] {
+                    if let Some(output) = text_at(&value, pointer) {
+                        keys.extend(printed_memory_keys(&tool, &output));
+                    }
+                }
+                keys.sort_unstable();
+                keys.dedup();
+                let call_id = text_at(&value, "/outcome/operation_id");
+                let Some(outcome) = value.get_mut("outcome").and_then(serde_json::Value::as_object_mut) else {
+                    return Ok(None);
+                };
+                outcome.insert("model_content".into(), MEMORY_REMOVED_TEXT.into());
+                if let Some(result) = outcome.get_mut("result").and_then(serde_json::Value::as_object_mut) {
+                    result.insert("output".into(), MEMORY_REMOVED_TEXT.into());
+                }
+                (keys, content.to_owned(), call_id)
+            }
+            _ => return Ok(None),
+        };
+        if keys.is_empty() {
+            return Ok(None);
+        }
+        let mut fields = serde_json::Map::new();
+        fields.insert(
+            "memory_key_hashes".into(),
+            keys.iter().map(|key| id_hash(key)).collect::<Vec<_>>().into(),
+        );
+        fields.insert("removed_content".into(), self.seal(key, &removed_content)?.into());
+        fields.insert(
+            "removed_payload".into(),
+            self.seal(&format!("{key}:payload"), &value.to_string())?.into(),
+        );
+        if let Some(call_id) = call_id {
+            fields.insert("call_id".into(), call_id.into());
+        }
+        Ok(Some(fields))
     }
 
     fn seal_payload(
@@ -583,11 +760,10 @@ impl Memory for EncryptedScope {
         &self,
         mut input: crate::memory::MessageEventInput,
     ) -> anyhow::Result<crate::memory::MessageEvent> {
-        self.seal_event_content(&mut input)?;
         // Ingress keeps its capsule wrapper parseable. Every other event,
         // including the terminal marker, seals the payload so reply text is
         // not stored beside the ciphertext.
-        self.seal_event_payload(&mut input)?;
+        self.seal_event(&mut input)?;
         let event = self.inner.append_message_event(input).await?;
         Ok(self.reveal(event))
     }
@@ -616,7 +792,7 @@ impl Memory for EncryptedScope {
         else {
             return Ok(false);
         };
-        let sealed = self.seal_payload(&source, terminal_key, &rewritten)?;
+        let sealed = self.seal_ledger_payload(&source, terminal_key, &rewritten, &opened.content)?;
         self.inner
             .replace_tool_ledger_payload(
                 workspace_id,
@@ -631,8 +807,7 @@ impl Memory for EncryptedScope {
         mut input: crate::memory::MessageEventInput,
         deadline: std::time::Instant,
     ) -> anyhow::Result<crate::memory::MessageEvent> {
-        self.seal_event_content(&mut input)?;
-        self.seal_event_payload(&mut input)?;
+        self.seal_event(&mut input)?;
         Ok(self.reveal(self.inner.append_message_event_until(input, deadline).await?))
     }
 

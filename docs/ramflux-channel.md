@@ -229,6 +229,18 @@ retryable through checkpoint failure. Erasure also rebuilds the remaining FTS in
 `secure_delete` overwrites freed pages;
 a TRUNCATE checkpoint empties the WAL, so VACUUM is unnecessary.
 
+Sealed tool rows of the memory tools (a `memory_recall`, `memory_search` or
+`memory_get` result and its execution record, and a `memory_store` call) carry,
+beside the sealed payload, the SHA-256 hashes of the memory keys they print or
+write and a replacement of the row sealed in advance by the same scope. When a
+memory is forgotten, by any delete path, the replacement is swapped in within
+the deleting transaction, so the conversation no longer replays the forgotten
+text to the model. The hashes are of keys only (the same hashes already appear
+in the stored memory key), never of text. Known limits: rows written before this
+change carry no hashes and are not replaced; a key longer than 512 bytes, or a
+key that secret redaction changes in the printed text, is not matched; a
+`memory_store` call is replaced without checking that the write succeeded.
+
 `agent_revoked` removes one conversation's data and keeps the wrapped account
 key. Explicit cross-conversation retrieval configuration widens that revocation
 to the account's retrieval scope. `agent_removed` erases all account data,

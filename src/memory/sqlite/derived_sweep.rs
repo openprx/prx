@@ -4,6 +4,8 @@
 //! tool result of a memory tool prints the key of each memory it quotes; once
 //! the memory is forgotten the printed text is replaced the same way.
 use super::rf_forget;
+use crate::memory::printed_keys::{MEMORY_REMOVED_TEXT, MEMORY_TOOLS, MEMORY_WRITE_TOOLS, PrintedKeys, printed_keys};
+use crate::security::ramflux_aead::id_hash;
 use rusqlite::{Connection, params, types::Value};
 use std::collections::{HashMap, HashSet};
 
@@ -22,13 +24,6 @@ pub(super) const LISTING_REMOVED_TEXT: &str = "[output removed: it named a sessi
 /// Run ids are UUIDs and child keys are `child-<64 hex>`; shorter identifiers
 /// (`main`, short names) would match unrelated text.
 pub(super) const MIN_IDENTIFIER_CHARS: usize = 32;
-
-/// Tool results of the memory tools that quote a memory's text.
-const MEMORY_TOOLS: [&str; 3] = ["memory_recall", "memory_search", "memory_get"];
-/// Tools whose call arguments carry a memory's key (`key`) and text
-/// (`content`), `tools/memory_store.rs`; it is the only memory write tool.
-const MEMORY_WRITE_TOOLS: [&str; 1] = ["memory_store"];
-pub(super) const MEMORY_REMOVED_TEXT: &str = "[output removed: it quoted a memory that was forgotten]";
 
 const TOOL_OUTPUT_KINDS: &str = "('tool_output', 'untrusted_external')";
 const UNTRUSTED_PREFIX: &str = "untrusted:";
@@ -287,6 +282,17 @@ impl MemoryProbe {
         })
     }
 
+    /// The hash an encrypted row stores for this memory's key: a memory of an
+    /// encrypted scope is stored as `rf:<scope hash>:<id_hash(key)>` and the
+    /// row stores `id_hash(printed key)`, so the last segment is that hash;
+    /// any other key is hashed as it is.
+    fn key_hash(&self) -> String {
+        match self.key.strip_prefix(crate::memory::RAMFLUX_MEMORY_KEY_PREFIX) {
+            Some(rest) => rest.rsplit(':').next().unwrap_or(rest).to_owned(),
+            None => id_hash(&self.key),
+        }
+    }
+
     /// True when a result row of `workspace` and `owner` may quote this memory.
     fn covers(&self, workspace: Option<&str>, owner: Option<&str>) -> bool {
         self.workspace_id.as_deref().is_none_or(|own| workspace == Some(own))
@@ -412,98 +418,6 @@ fn redacted_form_survives(
         }
     }
     Ok(false)
-}
-
-/// The keys a printed result holds (see [`printed_keys`]).
-#[derive(Default)]
-struct PrintedKeys<'a> {
-    /// Keys in the tool's own entry form.
-    exact: HashSet<&'a str>,
-    /// `memory_recall` keys that end in the redaction mask and whose `:`
-    /// separator the mask swallowed: redaction of the printed line carries an
-    /// unquoted value through the `:` that follows it, so
-    /// `- [core] token=<secret>: text` is stored as
-    /// `- [core] token=[REDACTED] text` (or `- [core] token=[REDACTED]` at
-    /// the end of the line). Only a redacted key form can match one.
-    swallowed: HashSet<&'a str>,
-}
-
-/// Start of a `memory_recall` entry line. An entry line may also start with
-/// the mask: an entry whose key names a credential and whose content is empty
-/// (`- [core] token:` at the end of its line) has the next line's `-` taken
-/// into the redacted value, so the next entry reads `[REDACTED] [core] key: text`.
-const RECALL_ENTRY_STARTS: [&str; 2] = ["- [", "[REDACTED] ["];
-
-/// The keys of the memory entries that the printed `output` of `tool` holds,
-/// each in the form the tool prints it, as the stored (redacted) copy shows
-/// it; a key longer than `max_len` bytes is not collected (no probe has one).
-/// One pass over the output, so a result is parsed once however many probes
-/// there are:
-/// - `memory_recall` (`tools/memory_recall.rs`): `- [category] key: content`,
-///   or `- [category] key:` at the end of the line; a redacted key may have
-///   lost its `:` (see [`PrintedKeys::swallowed`]);
-/// - `memory_search` (`tools/memory_search.rs`): a line `- key: key`;
-/// - `memory_get` (`tools/memory_get.rs`, `render_range`): the output starts
-///   with `key lines a-b:` (or `key is empty.`).
-///
-/// A key may itself hold `] ` or `: `, so every split of a line that fits is
-/// collected; the probes decide which of them is a real key.
-fn printed_keys<'a>(tool: &str, output: &'a str, max_len: usize) -> PrintedKeys<'a> {
-    let mut keys = PrintedKeys::default();
-    match tool {
-        "memory_recall" => {
-            let mask = crate::security::redaction::REDACTED;
-            let ends_entry = |line: &str, at: usize| {
-                line.get(at..)
-                    .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
-            };
-            for line in output
-                .lines()
-                .filter(|line| RECALL_ENTRY_STARTS.iter().any(|start| line.starts_with(start)))
-            {
-                let ends: Vec<usize> = line
-                    .match_indices(':')
-                    .map(|(at, _)| at)
-                    .filter(|at| ends_entry(line, at.saturating_add(1)))
-                    .collect();
-                let masked_ends: Vec<usize> = line
-                    .match_indices(mask)
-                    .map(|(at, _)| at.saturating_add(mask.len()))
-                    .filter(|end| ends_entry(line, *end))
-                    .collect();
-                for (at, _) in line.match_indices("] ") {
-                    let start = at.saturating_add(2);
-                    for (found, set) in [(&ends, &mut keys.exact), (&masked_ends, &mut keys.swallowed)] {
-                        let first = found.partition_point(|end| *end < start);
-                        for end in found
-                            .iter()
-                            .skip(first)
-                            .take_while(|end| end.saturating_sub(start) <= max_len)
-                        {
-                            set.extend(line.get(start..*end));
-                        }
-                    }
-                }
-            }
-        }
-        "memory_search" => {
-            keys.exact
-                .extend(output.lines().filter_map(|line| line.strip_prefix("- key: ")));
-        }
-        "memory_get" => {
-            for marker in [" lines ", " is empty."] {
-                for (at, _) in output.match_indices(marker).take_while(|(at, _)| *at <= max_len) {
-                    let rest = output.get(at..).unwrap_or_default();
-                    let whole = marker != " is empty." || rest == marker || rest.starts_with(" is empty.\n");
-                    if whole {
-                        keys.exact.extend(output.get(..at));
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-    keys
 }
 
 /// The probes of the memories selected by `memories_sql`, a constant statement
@@ -661,7 +575,125 @@ pub(super) fn rewrite_memory_copies(tx: &Connection, probes: &[MemoryProbe], now
         let calls: Vec<CallRef> = rows.iter().filter_map(|row| row.call.clone()).collect();
         rewritten = rewritten.saturating_add(rewrite_call_terminals(tx, &calls, MEMORY_REMOVED_TEXT, now)?);
     }
-    Ok(rewritten.saturating_add(rewrite_write_calls(tx, probes, now)?))
+    rewritten = rewritten.saturating_add(rewrite_write_calls(tx, probes, now)?);
+    Ok(rewritten.saturating_add(rewrite_sealed_copies(tx, probes, oldest, now)?))
+}
+
+/// Event types of the rows an encrypted scope seals with the hashes of the
+/// memory keys they print or carry (`memory/encrypted_scope.rs`).
+const SEALED_COPY_TYPES: &str = "('tool.result.recorded', 'tool.call.recorded', 'tool.execution.finalized')";
+
+/// Swap the pre-sealed replacement into every sealed memory-tool row whose
+/// stored key hashes (`memory_key_hashes`, see `EncryptedScope`) hold the hash
+/// of a forgotten memory's key, in the deleting transaction: `content`
+/// becomes `removed_content` and the payload becomes a wrapper holding only
+/// `removed_payload`, both sealed by the scope for the row's own record ids,
+/// so the row still opens and the call and result pair stays valid for replay.
+/// The same rules as the plaintext rows apply: time bound, workspace and
+/// owner, unscoped and redacted-only naming, fenced scopes. The execution
+/// terminal of a swapped result (same workspace, run and `call_id`) is swapped
+/// too. A row written before the wrapper existed has no hashes and stays
+/// (residual r-E1). Returns the number of rows swapped.
+fn rewrite_sealed_copies(tx: &Connection, probes: &[MemoryProbe], oldest: &str, now: &str) -> anyhow::Result<usize> {
+    let mut wanted: Vec<(usize, String, Naming)> = Vec::new();
+    for (index, probe) in probes.iter().enumerate() {
+        wanted.push((index, probe.key_hash(), Naming::Key));
+        if let Some(redacted) = probe.key_redacted.as_deref() {
+            wanted.push((index, id_hash(redacted), Naming::RedactedOnly));
+        }
+    }
+    let mut hashes: Vec<&str> = wanted.iter().map(|(_, hash, _)| hash.as_str()).collect();
+    hashes.sort_unstable();
+    hashes.dedup();
+    let mut statement = tx.prepare(&format!(
+        "SELECT event_id, event_type, workspace_id, owner_id, run_id, json_extract(raw_payload_json, '$.call_id'),
+                (SELECT json_group_array(value) FROM json_each(raw_payload_json, '$.memory_key_hashes'))
+         FROM message_events
+         WHERE event_type IN {SEALED_COPY_TYPES}
+           AND id >= COALESCE((SELECT MIN(id) FROM message_events WHERE created_at >= ?1), 9223372036854775807)
+           AND json_valid(raw_payload_json)
+           AND json_type(raw_payload_json, '$.removed_content') = 'text'
+           AND json_type(raw_payload_json, '$.removed_payload') = 'text'
+           AND EXISTS (SELECT 1 FROM json_each(raw_payload_json, '$.memory_key_hashes') h
+                       WHERE h.value IN (SELECT value FROM json_each(?2)))
+           AND NOT EXISTS (SELECT 1 FROM agent_erase_fences f WHERE f.scope_id = message_events.ma_scope_id)"
+    ))?;
+    let found = statement
+        .query_map(params![oldest, serde_json::to_string(&hashes)?], |row| {
+            Ok([
+                row.get::<_, Value>(0)?,
+                row.get::<_, Value>(1)?,
+                row.get::<_, Value>(2)?,
+                row.get::<_, Value>(3)?,
+                row.get::<_, Value>(4)?,
+                row.get::<_, Value>(5)?,
+                row.get::<_, Value>(6)?,
+            ])
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    let mut clear = HashMap::new();
+    let mut swapped = 0usize;
+    let mut calls: Vec<CallRef> = Vec::new();
+    for [event_id, event_type, workspace, owner, run_id, call_id, stored] in found {
+        let (Value::Text(event_id), Value::Text(event_type), Value::Text(stored)) = (event_id, event_type, stored)
+        else {
+            continue;
+        };
+        let stored: HashSet<String> = serde_json::from_str::<Vec<String>>(&stored)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let (workspace_text, owner) = (text_of(workspace.clone()), text_of(owner));
+        let mut matched = false;
+        for (index, hash, naming) in &wanted {
+            let Some(probe) = probes.get(*index) else {
+                continue;
+            };
+            if stored.contains(hash)
+                && probe.covers(workspace_text.as_deref(), owner.as_deref())
+                && probe.applies_to(tx, *naming, workspace_text.as_deref(), owner.as_deref(), &mut clear)?
+            {
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            continue;
+        }
+        swapped = swapped.saturating_add(swap_sealed_row(tx, "event_id = ?1", params![event_id, now])?);
+        if event_type == "tool.result.recorded" {
+            calls.extend(call_ref(workspace, run_id, call_id));
+        }
+    }
+    for call in &calls {
+        swapped = swapped.saturating_add(swap_sealed_row(
+            tx,
+            "workspace_id = ?3 AND run_id IS ?4 AND event_type = 'tool.execution.finalized'
+             AND json_extract(raw_payload_json, '$.call_id') = ?5",
+            params![call.call_id, now, call.workspace, call.run_id, call.call_id],
+        )?);
+    }
+    Ok(swapped)
+}
+
+/// Replace one sealed row (or the terminals selected by `condition`) with its
+/// pre-sealed replacement; `?1` or `?5` is the selector, `?2` the time.
+fn swap_sealed_row(tx: &Connection, condition: &str, values: impl rusqlite::Params) -> anyhow::Result<usize> {
+    Ok(tx.execute(
+        &format!(
+            "UPDATE message_events SET
+                 content = json_extract(raw_payload_json, '$.removed_content'), content_hash = NULL,
+                 raw_payload_json = json_object('encrypted_child_payload',
+                     json_extract(raw_payload_json, '$.removed_payload'), 'listing_erased', json('true')),
+                 updated_at = ?2
+             WHERE {condition} AND event_type IN {SEALED_COPY_TYPES} AND json_valid(raw_payload_json)
+               AND json_type(raw_payload_json, '$.removed_content') = 'text'
+               AND json_type(raw_payload_json, '$.removed_payload') = 'text'
+               AND NOT EXISTS (SELECT 1 FROM agent_erase_fences f WHERE f.scope_id = message_events.ma_scope_id)"
+        ),
+        values,
+    )?)
 }
 
 /// The text of a value, `None` for any other type.
