@@ -23,6 +23,7 @@ use parking_lot::Mutex;
 use reqwest013::header::{HeaderName, HeaderValue};
 use rmcp::model::Tool;
 use rmcp::service::{ClientInitializeError, ServiceError};
+use rmcp::transport::streamable_http_client::StreamableHttpError;
 use sha2::Digest;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -242,13 +243,33 @@ pub(super) async fn close_sessions(sessions: &HttpSessions, names: Option<&[Stri
 }
 
 /// Whether a failed call means the transport is gone or stuck, so its session
-/// must be reset. Application-level errors keep the session.
+/// must be reset. Application-level errors keep the session, and so does an
+/// HTTP answer with status 429 or 5xx: the server replied, so the connection
+/// is sound and the error is returned to the model as a tool error.
 pub(super) fn is_transport_failure(error: &ServiceError) -> bool {
-    matches!(
-        error,
-        ServiceError::TransportSend(_)
-            | ServiceError::TransportClosed
-            | ServiceError::Cancelled { .. }
-            | ServiceError::Timeout { .. }
-    )
+    match error {
+        ServiceError::TransportSend(_) => !is_http_status_answer(error),
+        ServiceError::TransportClosed | ServiceError::Cancelled { .. } | ServiceError::Timeout { .. } => true,
+        _ => false,
+    }
+}
+
+/// Whether a send failure is an HTTP answer with status 429 or 5xx. rmcp keeps
+/// the status in the typed `StreamableHttpError::HttpStatus` of the reqwest
+/// transport (reqwest 0.13, the same crate as `reqwest013`); it is read from
+/// the source chain by type, never from the message text.
+fn is_http_status_answer(error: &ServiceError) -> bool {
+    let ServiceError::TransportSend(dynamic) = error else {
+        return false;
+    };
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(dynamic.error.as_ref());
+    while let Some(current) = source {
+        if let Some(StreamableHttpError::HttpStatus(status)) =
+            current.downcast_ref::<StreamableHttpError<reqwest013::Error>>()
+        {
+            return status.status == 429 || (500..=599).contains(&status.status);
+        }
+        source = current.source();
+    }
+    false
 }
