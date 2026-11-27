@@ -361,7 +361,7 @@ async fn redux_driver_preflight_uses_provider_summary_before_first_stream_reques
         .run(async {
             let executor = EffectExecutor::new_with_deps(deps);
             let config = crate::config::AgentCompactionConfig {
-                mode: crate::config::AgentCompactionMode::Safeguard,
+                mode: crate::config::AgentCompactionMode::Switch,
                 reserve_tokens: 10,
                 keep_recent_messages: 2,
                 memory_flush: false,
@@ -579,7 +579,7 @@ async fn resumed_compacted_session_does_not_call_summarizer_again() {
         guard,
     };
     let config = crate::config::AgentCompactionConfig {
-        mode: crate::config::AgentCompactionMode::Safeguard,
+        mode: crate::config::AgentCompactionMode::Switch,
         reserve_tokens: 10,
         keep_recent_messages: 1,
         memory_flush: false,
@@ -798,7 +798,7 @@ async fn redux_driver_preflight_provider_history_keeps_real_user_question_last_a
         .run(async {
             let executor = EffectExecutor::new_with_deps(deps);
             let config = crate::config::AgentCompactionConfig {
-                mode: crate::config::AgentCompactionMode::Safeguard,
+                mode: crate::config::AgentCompactionMode::Switch,
                 reserve_tokens: 10,
                 keep_recent_messages: 1,
                 memory_flush: false,
@@ -1023,7 +1023,7 @@ async fn redux_compaction_guard_uses_persisted_source_when_provider_history_is_e
     let mut compaction_guard_history =
         crate::agent::turn_history::CanonicalHistory::from_test_messages(original_history.clone());
     let config = crate::config::AgentCompactionConfig {
-        mode: crate::config::AgentCompactionMode::Safeguard,
+        mode: crate::config::AgentCompactionMode::Switch,
         reserve_tokens: 5,
         keep_recent_messages: 1,
         memory_flush: false,
@@ -1174,7 +1174,7 @@ async fn redux_compaction_guard_source_is_inert_when_provider_history_is_not_enr
     let mut compaction_guard_history =
         crate::agent::turn_history::CanonicalHistory::from_test_messages(original_history.clone());
     let config = crate::config::AgentCompactionConfig {
-        mode: crate::config::AgentCompactionMode::Safeguard,
+        mode: crate::config::AgentCompactionMode::Switch,
         reserve_tokens: 5,
         keep_recent_messages: 1,
         memory_flush: false,

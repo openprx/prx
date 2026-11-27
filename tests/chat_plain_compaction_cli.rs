@@ -1101,61 +1101,6 @@ fn refused_patch_lines(sandbox: &Sandbox, stderr: &str) -> Vec<String> {
         .collect()
 }
 
-/// Summary compactions in consecutive turns, the first an outer rollover at a
-/// turn's start, through real HTTP/SSE and real SQLite: every summary is
-/// accepted by the session (no refused patch, no guard mismatch), and the
-/// saved session ends on the newest summary.
-#[test]
-fn consecutive_summary_compactions_after_an_outer_rollover_are_all_accepted() {
-    let sandbox = Sandbox::new();
-    write_filler_files(&sandbox.workspace, SWITCH_FILLERS);
-    let server = LoopbackOpenAi::start(MODEL, Some((11, 7)), script_numbered_summaries());
-    set_window_and_mode(
-        &sandbox,
-        &server,
-        compaction_script::SMALL_WINDOW_TOKENS,
-        openprx::config::schema::AgentCompactionMode::Safeguard,
-    );
-    let mut command = sandbox.command(&["chat", "--plain"]);
-    command.env("RUST_LOG", "warn");
-    let mut chat = HeldChat {
-        sandbox: &sandbox,
-        running: Running::spawn(command),
-    };
-    let mut replies = 0;
-    for index in 0..4 {
-        replies += 1;
-        chat.turn(&read_line(index), replies);
-    }
-    replies += 1;
-    chat.turn(MULTI_READ, replies);
-    replies += 1;
-    chat.turn(&read_line(9), replies);
-    let saved = wait_for_saved_reply_to(&sandbox, &read_line(9));
-    let output = chat.exit();
-    assert_clean(&output, "consecutive summary compactions");
-
-    let summaries = server
-        .requests()
-        .iter()
-        .filter(|request| is_summarizer_request(request))
-        .count();
-    assert!(
-        summaries >= 2,
-        "at least two summary compactions ran ({summaries}); saved: {saved:?}"
-    );
-    let refused = refused_patch_lines(&sandbox, &output.stderr);
-    assert!(
-        refused.is_empty(),
-        "no compaction patch was refused or mismatched its guard: {refused:?}"
-    );
-    let newest = format!("{SUMMARY_PREFIX}{summaries}");
-    assert!(
-        saved.iter().any(|(_, content)| content.contains(&newest)),
-        "the saved session adopted the newest summary `{newest}`: {saved:?}"
-    );
-}
-
 /// PR #207 review r10. Non-TUI only: the inline turn records its request at
 /// admission, so an adopted outer preflight saves a snapshot that already
 /// holds it. The TUI build runs every turn on a detached provider worker,
@@ -1336,7 +1281,7 @@ mod hot_request {
             &sandbox,
             &server,
             HOT_WINDOW_TOKENS,
-            openprx::config::schema::AgentCompactionMode::Safeguard,
+            openprx::config::schema::AgentCompactionMode::Switch,
         );
         let mut command = sandbox.command(&["chat", "--plain"]);
         command.env("RUST_LOG", "warn");

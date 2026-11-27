@@ -402,7 +402,7 @@ async fn a_compaction_whose_audit_storage_fails_logs_no_stored_content() {
             ChatMessage::assistant("recent assistant"),
         ];
         let config = crate::config::AgentCompactionConfig {
-            mode: crate::config::AgentCompactionMode::Safeguard,
+            mode: crate::config::AgentCompactionMode::Switch,
             reserve_tokens: 1,
             keep_recent_messages: 1,
             memory_flush: false,

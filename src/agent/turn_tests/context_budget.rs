@@ -151,69 +151,6 @@ fn token_aware_trim_never_strands_a_tool_result() {
 }
 
 #[tokio::test]
-async fn legacy_preflight_preserving_trim_falls_back_when_summary_alone_exceeds_hard_limit() {
-    let provider = SystemSummaryProvider {
-        response: format!(
-            "## Decisions\n- {}\n## Critical Context\n- SUMMARY_TOO_LARGE",
-            "summary-over-budget ".repeat(800)
-        ),
-    };
-    let mut history = vec![ChatMessage::system("sys")];
-    for idx in 0..8 {
-        history.push(ChatMessage::user(format!(
-            "trim-candidate-{idx} {}",
-            "recent-bulk ".repeat(80)
-        )));
-    }
-    let config = crate::config::AgentCompactionConfig {
-        mode: crate::config::AgentCompactionMode::Safeguard,
-        reserve_tokens: 10,
-        keep_recent_messages: 4,
-        memory_flush: false,
-        max_context_tokens: 90,
-        max_context_tokens_explicit: true,
-    };
-
-    let budget = preflight_context_budget_before_provider_call(
-        &mut history,
-        &provider,
-        "model",
-        &config,
-        crate::agent::turn_context::RequestToolMeasurement::NONE,
-        None,
-        "test_preflight",
-    )
-    .await
-    .unwrap();
-    let final_budget = plan_context_budget(&history, &config, PRE_TURN_FLUSH_THRESHOLD);
-
-    assert!(
-        final_budget.over_hard_limit,
-        "the floor is the request, so the history left is over the limit"
-    );
-    assert!(
-        budget.over_hard_limit,
-        "the returned snapshot must report the over-limit history it actually left"
-    );
-    assert!(
-        !history.iter().any(|msg| msg.content.contains("SUMMARY_TOO_LARGE")),
-        "plain trim floor may delete an unfit summary instead of sending an oversized prompt"
-    );
-    // Changed with the current-request floor: the floor fallback still
-    // deletes the unfit summary and every older turn, but it stops at the
-    // turn's own request, so the result is a request over the limit rather
-    // than a prompt with no question in it.
-    assert!(
-        history.iter().any(|msg| msg.content.contains("trim-candidate-7")),
-        "the current turn's request survives the floor fallback"
-    );
-    assert!(
-        !history.iter().any(|msg| msg.content.contains("trim-candidate-6")),
-        "everything the floor is allowed to free is still freed"
-    );
-}
-
-#[tokio::test]
 async fn configurable_compaction_1m_window_does_not_compact_above_128k() {
     let provider = ScriptedProvider::from_text_responses(vec!["should not be called"]);
     let mut history = vec![
@@ -234,7 +171,7 @@ async fn configurable_compaction_1m_window_does_not_compact_above_128k() {
     let before_roles: Vec<String> = history.iter().map(|msg| msg.role.clone()).collect();
     let before_contents: Vec<String> = history.iter().map(|msg| msg.content.clone()).collect();
     let config = crate::config::AgentCompactionConfig {
-        mode: crate::config::AgentCompactionMode::Safeguard,
+        mode: crate::config::AgentCompactionMode::Switch,
         reserve_tokens: 4_096,
         keep_recent_messages: 1,
         memory_flush: false,
@@ -287,7 +224,7 @@ fn count_tokens_subword_split_beats_char_heuristic() {
 #[test]
 fn plan_context_budget_uses_cl100k_proxy_for_hard_budget() {
     let config = crate::config::AgentCompactionConfig {
-        mode: crate::config::AgentCompactionMode::Safeguard,
+        mode: crate::config::AgentCompactionMode::Switch,
         reserve_tokens: 1,
         max_context_tokens: 10,
         max_context_tokens_explicit: true,
@@ -421,91 +358,6 @@ async fn the_preflight_floor_preserves_a_prompt_guided_request_not_the_tool_resu
     assert!(
         budget.over_hard_limit,
         "a preserved request larger than the window is reported as such"
-    );
-}
-
-/// Summary compaction can remove the current request on its own: the
-/// compacted range ends at the first message that may head the hot window,
-/// and in a prompt-guided tool round that message is the assistant envelope
-/// *after* the request. When the summary then fits the window no trim runs,
-/// so a restore that only guards the trim never fires.
-#[tokio::test]
-async fn the_preflight_restores_a_request_a_compaction_summarized_away() {
-    const QUESTION_MARKER: &str = "compaction-only-request-marker";
-
-    let provider = SystemSummaryProvider {
-        response:
-            "## Decisions\n- keep going\n## Open TODOs\n- answer the question\n## Critical Context\n- SHORT_SUMMARY"
-                .to_string(),
-    };
-    let mut history = vec![
-        ChatMessage::system("sys"),
-        ChatMessage::user(format!("{QUESTION_MARKER} {}", "question-bulk ".repeat(120))),
-        ChatMessage::assistant("Checking that now."),
-        ChatMessage::user(format!(
-            "{}\n<tool_result name=\"probe\">\nok\n</tool_result>",
-            crate::agent::turn_contracts::TOOL_RESULTS_PREFIX
-        )),
-    ];
-    let config = crate::config::AgentCompactionConfig {
-        mode: crate::config::AgentCompactionMode::Safeguard,
-        reserve_tokens: 10,
-        keep_recent_messages: 1,
-        memory_flush: false,
-        max_context_tokens: 260,
-        max_context_tokens_explicit: true,
-        ..crate::config::AgentCompactionConfig::default()
-    };
-
-    let budget = preflight_context_budget_before_provider_call(
-        &mut history,
-        &provider,
-        "model",
-        &config,
-        crate::agent::turn_context::RequestToolMeasurement::NONE,
-        None,
-        "test_preflight",
-    )
-    .await
-    .expect("test: the preflight completes on the compaction path");
-
-    assert!(
-        history
-            .iter()
-            .any(|message| message.content.starts_with("[Context compacted at")),
-        "the fixture must reach summary compaction, or it proves nothing about it"
-    );
-    assert!(
-        history
-            .iter()
-            .any(|message| message.role == "user" && message.content.contains(QUESTION_MARKER)),
-        "a compaction that summarized the request away must put it back"
-    );
-    assert_eq!(
-        history
-            .iter()
-            .filter(|message| message.content.contains(QUESTION_MARKER))
-            .count(),
-        1,
-        "the request may be restored once, never duplicated"
-    );
-    assert!(
-        history
-            .last()
-            .is_some_and(|message| message.content.contains(QUESTION_MARKER)),
-        "the request returns at the tail, after the summary and the refresh aside"
-    );
-    let compacted_only = history
-        .get(..history.len().saturating_sub(1))
-        .expect("test: the restored request is the last message");
-    assert!(
-        !plan_context_budget(compacted_only, &config, PRE_TURN_FLUSH_THRESHOLD).over_hard_limit,
-        "compaction alone brought this fixture under the window, so no trim ran and only the restore can explain the request"
-    );
-    assert_eq!(
-        budget.used_tokens,
-        plan_context_budget(&history, &config, PRE_TURN_FLUSH_THRESHOLD).used_tokens,
-        "the returned snapshot must describe the history the restore left behind"
     );
 }
 

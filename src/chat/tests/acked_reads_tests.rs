@@ -43,7 +43,7 @@ impl Provider for SectionSummaryProvider {
 
 fn compaction_config() -> crate::config::AgentCompactionConfig {
     crate::config::AgentCompactionConfig {
-        mode: crate::config::AgentCompactionMode::Safeguard,
+        mode: crate::config::AgentCompactionMode::Switch,
         reserve_tokens: 0,
         keep_recent_messages: 2,
         memory_flush: false,

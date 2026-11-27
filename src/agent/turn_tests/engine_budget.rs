@@ -950,7 +950,7 @@ async fn the_mid_turn_trim_after_a_tool_round_aims_at_the_reserved_window() {
             // Summary compaction is what an over-budget preflight reaches for,
             // and the mark it leaves in history is what makes the difference
             // observable from outside the loop.
-            mode: crate::config::AgentCompactionMode::Aggressive,
+            mode: crate::config::AgentCompactionMode::Switch,
             ..decision_sized_fixture_config(context_budget_fixture_config(
                 &history,
                 payload_tokens.saturating_add(appended_tokens),
@@ -1074,7 +1074,7 @@ async fn an_oversized_tool_payload_never_trims_away_the_current_user_message() {
         let mut history = context_budget_fixture_history(payload_tokens / 8);
         history.push(ChatMessage::user(CURRENT_TURN_MARKER));
         let config = crate::config::AgentCompactionConfig {
-            mode: crate::config::AgentCompactionMode::Aggressive,
+            mode: crate::config::AgentCompactionMode::Switch,
             reserve_tokens: CONTEXT_BUDGET_FIXTURE_RESERVE_TOKENS,
             keep_recent_messages: 2,
             memory_flush: false,
@@ -2148,7 +2148,7 @@ async fn preflight_compacts_before_provider_call_when_over_hard_limit() {
     let observer = NoopObserver;
     let hooks = HookManager::new(std::env::temp_dir());
     let config = crate::config::AgentCompactionConfig {
-        mode: crate::config::AgentCompactionMode::Aggressive,
+        mode: crate::config::AgentCompactionMode::Switch,
         reserve_tokens: 10,
         keep_recent_messages: 2,
         memory_flush: false,
@@ -2250,110 +2250,6 @@ async fn preflight_compacts_before_provider_call_when_over_hard_limit() {
     assert!(
         first_call_tokens.load(Ordering::SeqCst) <= fixture_main_window.saturating_add(current_request_tokens),
         "first provider call must be the main hard limit plus at most the current request"
-    );
-}
-
-#[tokio::test]
-async fn legacy_preflight_provider_history_keeps_real_user_question_last_after_compaction() {
-    let current_question = "What should ISS-037 answer now?";
-    let captured_history = Arc::new(Mutex::new(None));
-    let provider = CapturingCompactionProvider {
-        captured_history: Arc::clone(&captured_history),
-    };
-    let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
-    let observer = NoopObserver;
-    let hooks = HookManager::new(std::env::temp_dir());
-    let config = crate::config::AgentCompactionConfig {
-        mode: crate::config::AgentCompactionMode::Safeguard,
-        reserve_tokens: 10,
-        keep_recent_messages: 1,
-        memory_flush: false,
-        max_context_tokens: 4106,
-        max_context_tokens_explicit: true,
-        ..crate::config::AgentCompactionConfig::default()
-    };
-    let mut history = vec![ChatMessage::system("sys")];
-    for i in 0..24 {
-        history.push(ChatMessage::user(format!(
-            "old turn {i} {}",
-            "long context ".repeat(400)
-        )));
-    }
-    history.push(ChatMessage::user(current_question));
-
-    let workspace = TempDir::new().expect("budget fixture workspace");
-    let mut admission_config = crate::config::Config::default();
-    admission_config.workspace_dir = workspace.path().to_path_buf();
-    admission_config.agent.compaction = config.clone();
-    let tools_registry = Arc::new(tools_registry);
-    let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_config(
-        admission_config,
-        &history.last().expect("current fixture input").content,
-        Arc::clone(&tools_registry),
-    )
-    .await;
-    admission.assert_selected_specs(&[]);
-
-    let result = run_turn(
-        &mut history,
-        crate::agent::turn_request::TurnRequest {
-            advice: None,
-            channel_name: "cli",
-            scope: None,
-            mode: ChatMode::default(),
-            silent: true,
-            expose_stay_silent: false,
-            multimodal: &crate::config::MultimodalConfig::default(),
-            schedule: crate::agent::turn_request::TurnSchedule {
-                read_only_tool_concurrency_window: 2,
-                priority_scheduling_enabled: false,
-                low_priority_tool_names: Vec::new(),
-            },
-            compaction: Some(admission.compaction()),
-            decision: admission.decision(),
-        },
-        crate::agent::turn_request::TurnServices {
-            provider: &provider,
-            provider_name: "ollama",
-            model: "prx-local-model",
-            temperature: 0.0,
-            tools_registry,
-            observer: &observer,
-            hooks: &hooks,
-            approval: None,
-            approval_resolver: None,
-            runtime_adapter: Some(admission.adapter()),
-            memory: ToolLoopMemory::none(),
-        },
-        crate::agent::turn_request::TurnDelivery {
-            cancellation: None,
-            on_delta: None,
-            on_tool_call: None,
-        },
-    )
-    .await
-    .map(|(outcome, _trace)| outcome.into_text())
-    .expect("legacy provider call should complete");
-
-    let captured = captured_history
-        .lock()
-        .expect("captured history lock should be valid")
-        .clone()
-        .expect("provider-bound history should be captured");
-    let last = captured.last().expect("captured history should not be empty");
-    assert_eq!(last.role, "user");
-    assert_eq!(last.content, current_question);
-    let refresh_index = captured
-        .iter()
-        .position(|message| message.content.starts_with("[Post-compaction context refresh]"))
-        .expect("refresh marker should be present");
-    assert!(
-        refresh_index + 1 < captured.len(),
-        "refresh marker must not be the trailing provider-bound message"
-    );
-    assert!(
-        result.contains(current_question),
-        "assistant response must be bound to the real current user question"
     );
 }
 
@@ -2569,7 +2465,7 @@ async fn skill_metadata_stays_suppressed_across_an_in_turn_rebuild() {
                 tool_surface,
                 MID_TURN_SATURATED_SLACK_TOKENS,
             ));
-            config.mode = crate::config::AgentCompactionMode::Safeguard;
+            config.mode = crate::config::AgentCompactionMode::Switch;
             let reserved = reserve_request_tool_surface(&fixture_main_compaction(&config), tool_surface);
             assert!(
                 !plan_context_budget(&first_view, &reserved, PRE_TURN_FLUSH_THRESHOLD).over_hard_limit,

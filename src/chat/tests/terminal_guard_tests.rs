@@ -403,7 +403,7 @@ fn mouse_wheel_scrolls_fullscreen_transcript_by_three_rows() {
 #[test]
 fn plain_mode_does_not_emit_context_budget_chrome() {
     let config = crate::config::AgentCompactionConfig {
-        mode: crate::config::AgentCompactionMode::Aggressive,
+        mode: crate::config::AgentCompactionMode::Switch,
         reserve_tokens: 5,
         keep_recent_messages: 2,
         memory_flush: false,

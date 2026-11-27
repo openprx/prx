@@ -1285,65 +1285,6 @@ async fn an_inline_marker_beside_real_tool_calls_is_stripped_without_a_retry() {
         .await;
 }
 
-/// The summarizer reads the turns it is compacting and is explicitly
-/// asked to preserve recent exchanges verbatim, so a marker in those
-/// turns comes back inside the summary — which is then replayed on every
-/// later turn and persisted as compaction audit.
-///
-/// MUTATION GUARD: drop the strip applied to `summary` in
-/// `build_configurable_compaction_patch_with_source_history` and the
-/// replacement message carries `[Used tools:`.
-#[tokio::test]
-async fn a_compaction_summary_carrying_a_marker_is_stripped_in_both_grains() {
-    let provider = SystemSummaryProvider {
-        response: "## Decisions\n- keep the fixture\n## Open TODOs\n- none\n\
-                           ## Critical Context\n- Fixture checked. [Used tools: shell]\n\
-                           ## Progress\n[Used tools: shell, file_read]"
-            .to_string(),
-    };
-    let mut history = vec![ChatMessage::system("sys")];
-    for idx in 0..10 {
-        history.push(ChatMessage::user(format!("turn-{idx} {}", "bulk-token ".repeat(80))));
-    }
-    let config = crate::config::AgentCompactionConfig {
-        mode: crate::config::AgentCompactionMode::Safeguard,
-        reserve_tokens: 10,
-        keep_recent_messages: 2,
-        memory_flush: false,
-        max_context_tokens: 120,
-        max_context_tokens_explicit: true,
-    };
-
-    let patch = build_configurable_compaction_patch(
-        &history,
-        &provider,
-        "model",
-        &config,
-        None,
-        "test_inline_marker_compaction",
-    )
-    .await
-    .expect("compaction must not fail")
-    .expect("an over-budget history must produce a compaction patch");
-
-    assert!(
-        patch
-            .replacement
-            .iter()
-            .all(|message| !message.content.contains("[Used tools:")),
-        "a compaction summary is replayed on every later turn: {:?}",
-        patch.replacement
-    );
-    assert!(
-        patch
-            .replacement
-            .iter()
-            .any(|message| message.content.contains("Fixture checked.")),
-        "only the marker is removed; the summary itself survives: {:?}",
-        patch.replacement
-    );
-}
-
 /// Case 1 of the 2026-09-19 cross-audit fence probe, replayed verbatim
 /// through the delivery path: a `~~~text` block whose body holds the
 /// line ```` ```example ````, closed by `~~~`, and then a prose marker.

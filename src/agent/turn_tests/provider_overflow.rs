@@ -196,8 +196,8 @@ async fn provider_overflow_retry_keeps_current_request() {
             for config in [
                 None,
                 Some(overflow_config(AgentCompactionMode::Off)),
-                Some(overflow_config(AgentCompactionMode::Safeguard)),
-                Some(overflow_config(AgentCompactionMode::Aggressive)),
+                Some(overflow_config(AgentCompactionMode::Switch)),
+                Some(overflow_config(AgentCompactionMode::Switch)),
             ] {
                 let tmp = TempDir::new().expect("overflow workspace");
                 std::fs::write(tmp.path().join("overflow-probe.txt"), PROBE_CONTENT).expect("probe file");
@@ -230,7 +230,7 @@ async fn provider_overflow_retry_keeps_current_request() {
                     provider.compaction_calls.load(Ordering::SeqCst) > 0,
                     config
                         .as_ref()
-                        .is_some_and(|c| matches!(c.mode, AgentCompactionMode::Safeguard)),
+                        .is_some_and(|c| matches!(c.mode, AgentCompactionMode::Switch)),
                     "the error route must really invoke the failing compaction provider"
                 );
                 let requests = provider.requests.lock().expect("requests");
@@ -259,7 +259,7 @@ async fn provider_overflow_retry_keeps_current_request() {
                 if streaming
                     && config
                         .as_ref()
-                        .is_some_and(|c| matches!(c.mode, AgentCompactionMode::Aggressive))
+                        .is_some_and(|c| matches!(c.mode, AgentCompactionMode::Switch))
                 {
                     let events = events.0.lock().expect("events");
                     let (patch, source_history) = events
@@ -391,7 +391,7 @@ async fn provider_overflow_recovery_stops_after_three_passes() {
                 ChatMessage::assistant("old detail ".repeat(4_000)),
                 ChatMessage::assistant("retained boundary"),
             ];
-            let mut config = overflow_config(AgentCompactionMode::Safeguard);
+            let mut config = overflow_config(AgentCompactionMode::Switch);
             config.keep_recent_messages = 1;
             let error = overflow_turn(
                 &mut history,

@@ -130,7 +130,7 @@ async fn overflow_patch_and_ordered_commit_preserve_one_pending_request() {
             let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
             let task = scheduler.enqueue(REQUEST, crate::chat::turn_scheduler::TurnPriority::Normal, base.len());
             let config = crate::config::AgentCompactionConfig {
-                mode: crate::config::AgentCompactionMode::Aggressive,
+                mode: crate::config::AgentCompactionMode::Switch,
                 max_context_tokens: 1_000_000,
                 keep_recent_messages: 12,
                 memory_flush: false,

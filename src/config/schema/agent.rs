@@ -68,10 +68,6 @@ pub enum AgentCompactionMode {
     /// durable transcript unchanged.
     #[default]
     Switch,
-    /// Conservative compaction that prefers summary replacement.
-    Safeguard,
-    /// Aggressive truncation mode for tighter contexts.
-    Aggressive,
 }
 
 /// Agent context compaction configuration (`[agent.compaction]`).

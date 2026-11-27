@@ -66,7 +66,7 @@ async fn redux_compaction_keeps_enrichment_only_trim_fallback() {
     let mut compaction_guard_history =
         crate::agent::turn_history::CanonicalHistory::from_test_messages(original_history.clone());
     let config = crate::config::AgentCompactionConfig {
-        mode: crate::config::AgentCompactionMode::Safeguard,
+        mode: crate::config::AgentCompactionMode::Switch,
         reserve_tokens: 5,
         keep_recent_messages: 1,
         memory_flush: false,
@@ -182,7 +182,7 @@ async fn redux_driver_preserve_trim_floor_preserves_fitting_summary_and_matches_
     let mut compaction_guard_history =
         crate::agent::turn_history::CanonicalHistory::from_test_messages(original_history.clone());
     let config = crate::config::AgentCompactionConfig {
-        mode: crate::config::AgentCompactionMode::Safeguard,
+        mode: crate::config::AgentCompactionMode::Switch,
         reserve_tokens: 5,
         keep_recent_messages: 1,
         memory_flush: true,
@@ -331,7 +331,7 @@ async fn redux_driver_preserve_trim_floor_drops_unfit_summary_and_matches_reduce
     let mut compaction_guard_history =
         crate::agent::turn_history::CanonicalHistory::from_test_messages(original_history.clone());
     let config = crate::config::AgentCompactionConfig {
-        mode: crate::config::AgentCompactionMode::Safeguard,
+        mode: crate::config::AgentCompactionMode::Switch,
         reserve_tokens: 10,
         keep_recent_messages: 4,
         memory_flush: false,
@@ -647,7 +647,7 @@ async fn redux_driver_summarizer_failure_uses_local_guard_before_stream() {
         .run(async {
             let executor = EffectExecutor::new_with_deps(deps);
             let config = crate::config::AgentCompactionConfig {
-                mode: crate::config::AgentCompactionMode::Safeguard,
+                mode: crate::config::AgentCompactionMode::Switch,
                 reserve_tokens: 10,
                 keep_recent_messages: 2,
                 memory_flush: false,
@@ -823,7 +823,7 @@ async fn redux_driver_overflow_retry_uses_provider_summary_patch() {
         .run(async {
             let executor = EffectExecutor::new_with_deps(deps);
             let config = crate::config::AgentCompactionConfig {
-                mode: crate::config::AgentCompactionMode::Safeguard,
+                mode: crate::config::AgentCompactionMode::Switch,
                 reserve_tokens: 10,
                 keep_recent_messages: 2,
                 memory_flush: false,
@@ -1088,7 +1088,7 @@ async fn tui_preflight_irreducible_request_fails_before_provider() {
                 ChatMessage::user(&request),
             ];
             let config = crate::config::AgentCompactionConfig {
-                mode: crate::config::AgentCompactionMode::Safeguard,
+                mode: crate::config::AgentCompactionMode::Switch,
                 max_context_tokens: 32,
                 max_context_tokens_explicit: true,
                 reserve_tokens: 10,
@@ -1261,7 +1261,7 @@ async fn redux_rollover_compacts_the_source_and_rebuilds_a_shorter_provider_view
         );
         let mut guard_history = crate::agent::turn_history::CanonicalHistory::from_test_messages(source.clone());
         let config = crate::config::AgentCompactionConfig {
-            mode: crate::config::AgentCompactionMode::Safeguard,
+            mode: crate::config::AgentCompactionMode::Switch,
             reserve_tokens: 10,
             keep_recent_messages: 4,
             memory_flush: false,
