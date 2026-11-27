@@ -157,15 +157,23 @@ message is stored with its attachment row (the memory preamble and the hook
 contributions, masked for secrets). Recall is bounded by the window of the model,
 as on those surfaces.
 
-Two things are left out for group-like chats (a chat whose visibility is
-session-shared): the session's memory index is not put in the system prompt,
-and the unseen scheduled-results note is not shown. Direct chats keep both.
-Hooks still run in group chats.
+Direct chats keep the session's memory index in the system prompt (recorded
+once per session and replayed on later turns) and see the unseen
+scheduled-results note. Group-like chats (a chat whose visibility is
+session-shared) get only hook context: no memory index and no scheduled-results
+note. A group chat reads and records no session prefix row, so a direct chat
+and a group chat that share a session key never pass a prefix to each other;
+the `session_opened` hooks run on every group turn instead of once per session.
+Some channels report rooms as direct chats (Slack, Mattermost, Lark, QQ,
+DingTalk, IRC and Nextcloud); their rooms are treated as direct chats here,
+which is how those channels already classified them.
 
 The earlier turns of a channel conversation still come from the in-memory
 conversation cache, not from stored message events, so they carry no event ids.
-An earlier user message that never received a reply is folded into the next
-request's text, so the request alternates between user and assistant turns.
+The cache is cut at the current message, so a message that arrived after it in
+the same chat is left to its own turn. An earlier user message that never
+received a reply is folded into the request's text ahead of the current one,
+so the request alternates between user and assistant turns.
 
 ## Tools On Channel Turns
 
