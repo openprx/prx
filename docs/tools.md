@@ -2177,6 +2177,8 @@ form a model replay shows. An unknown run answers
 `no stored child session for run <run_id>`. The read boundary is the owner:
 the parent-session match that `continue` applies is not required.
 
+A `child_started` hook's context is part of the child's first input, so a transcript read can show it as `[Hook context: <hook>]`; the hook is the workspace's own configuration and this read is limited to the owner.
+
 A completed child's notice to a Console, rf or webhook parent ends with a
 `[References]` line naming the child transcript:
 
