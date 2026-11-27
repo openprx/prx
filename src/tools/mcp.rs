@@ -527,6 +527,12 @@ impl McpTool {
         if state.mcp_state_epoch == u64::MAX {
             return snapshot;
         }
+        // One table over every server, so an alias is unique across servers as well.
+        let aliases = alias::alias_table(state.discovered_tools.iter().filter_map(|(server, tools)| {
+            let config = state.effective_config.servers.get(server)?;
+            let names: Vec<&str> = tools.keys().map(String::as_str).collect();
+            Some((server.as_str(), config.tool_name_prefix.as_str(), names))
+        }));
         for (server, tools) in &state.discovered_tools {
             let Some(server_config) = state.effective_config.servers.get(server) else {
                 continue;
@@ -548,10 +554,8 @@ impl McpTool {
             state_hasher.update(generation.to_be_bytes());
             state_hasher.update(config_bytes);
             let state_digest: [u8; 32] = state_hasher.finalize().into();
-            let names: Vec<&str> = tools.keys().map(String::as_str).collect();
-            let aliases = alias::alias_map(&server_config.tool_name_prefix, server, &names);
             for (tool, metadata) in tools {
-                let Some(alias_name) = aliases.get(tool) else {
+                let Some(alias_name) = aliases.get(server).and_then(|names| names.get(tool)) else {
                     continue;
                 };
                 // At Full the per-server allow/deny lists are ignored. Below
@@ -1674,6 +1678,9 @@ impl Tool for McpStatusTool {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod alias_tests;
 
 pub(crate) mod alias;
 mod client;

@@ -261,28 +261,6 @@ fn convert_json_server_defaults_to_stdio_when_command_present() {
     assert_eq!(out.args, vec!["--serve"]);
 }
 
-// ── parse_alias_name ────────────────────────────────────────
-
-#[test]
-fn parse_alias_name_resolves_server_and_tool() {
-    let mut cfg = McpConfig::default();
-    cfg.servers.insert(
-        "qmd".into(),
-        McpServerConfig {
-            tool_name_prefix: "mcp".into(),
-            ..McpServerConfig::default()
-        },
-    );
-
-    let parsed = alias::resolve(&RuntimeState { effective_config: cfg, ..RuntimeState::default() }, "mcp__qmd__search");
-    assert_eq!(parsed, Some(("qmd".into(), "search".into())));
-}
-
-#[test]
-fn parse_alias_name_no_match() {
-    assert!(alias::resolve(&RuntimeState::default(), "unrelated_name").is_none());
-}
-
 #[test]
 fn discovery_snapshot_and_exact_execution_spec_cover_aliases_beyond_prompt_window() {
     let mut cfg = McpConfig::default();
@@ -472,28 +450,6 @@ fn shared_publications_preserve_old_view_and_fail_closed_on_epoch_exhaustion() {
         first.entry(name).is_some(),
         "held view remains immutable, not live authority"
     );
-}
-
-#[test]
-fn parse_alias_name_default_prefix() {
-    let mut cfg = McpConfig::default();
-    cfg.servers.insert(
-        "myserver".into(),
-        McpServerConfig {
-            tool_name_prefix: "mcp".into(),
-            ..McpServerConfig::default()
-        },
-    );
-    let state = RuntimeState { effective_config: cfg, ..Default::default() };
-    let parsed = alias::resolve(&state, "mcp__myserver__run_query");
-    assert_eq!(parsed, Some(("myserver".into(), "run_query".into())));
-}
-
-// ── alias_name ──────────────────────────────────────────────
-
-#[test]
-fn alias_name_format() {
-    assert_eq!(alias::alias_map("mcp", "server1", &["search"])["search"], "mcp__server1__search");
 }
 
 // ── extract_call_success_and_output ──────────────────────────

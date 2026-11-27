@@ -142,15 +142,17 @@ fn is_capability_id(id: &str) -> bool {
         let Some(rest) = name.strip_prefix("mcp__") else {
             return false;
         };
-        if namespace == "mcp" {
-            return rest
-                .split_once("__")
-                .is_some_and(|(server, tool)| !server.is_empty() && !tool.is_empty());
-        }
-        return rest
-            .strip_prefix(crate::tools::mcp::alias::sanitize_part(namespace).as_str())
-            .and_then(|after| after.strip_prefix("__"))
-            .is_some_and(|tool| !tool.is_empty());
+        let structured = if namespace == "mcp" {
+            rest.split_once("__")
+                .is_some_and(|(server, tool)| !server.is_empty() && !tool.is_empty())
+        } else {
+            rest.strip_prefix(crate::tools::mcp::alias::sanitize_part(namespace).as_str())
+                .and_then(|after| after.strip_prefix("__"))
+                .is_some_and(|tool| !tool.is_empty())
+        };
+        // A hashed alias (a cut name plus a hash suffix) has no recoverable
+        // `__` structure, so it is accepted on the `mcp__` prefix alone.
+        return structured || (crate::tools::mcp::alias::is_hashed_alias(name) && !rest.is_empty());
     }
     name != "shell" || family == "filesystem"
 }
