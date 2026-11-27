@@ -328,7 +328,7 @@ Before this change only terminal line-mode chat replaced old replayed tool
 results by a one-line stub (`[tool result cleared: tool <name>, status
 <status>, <n> bytes; ...]`) ahead of compaction. Every surface that runs the
 engine with a compaction config now does it: the Console, the gateway and rf
-sessions, channels, scheduled runs, task and process children, `prx agent` and
+sessions, channels, scheduled runs, task and process children, `prx chat --message` and
 full-screen chat. At the start of a turn and on each provider round, while the
 request is over the warning threshold, the oldest tool results of the request
 are stubbed, oldest first, until it fits; the results of the current turn and of

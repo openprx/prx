@@ -439,7 +439,7 @@ Which surface runs which step, in order (the order is today's behaviour):
 
 | Surface | Before the loop | Each provider round | After a round's tool results |
 |---|---|---|---|
-| Console, rf, channels, scheduled runs, task and process children, `prx agent` | `ClearOldResults`, `PreTurnCompact` | `ClearOldResults`, `RoundCompact`, `RoundTrim`, then the protocol repair | `MidTurnTrim` |
+| Console, rf, channels, scheduled runs, task and process children | `ClearOldResults`, `PreTurnCompact` | `ClearOldResults`, `RoundCompact`, `RoundTrim`, then the protocol repair | `MidTurnTrim` |
 | Terminal chat, line mode | `StubReplayed`, then the chat preflight compaction (not yet a reducer) | as above, inside the engine | as above |
 | Terminal chat, full-screen | the dispatcher rollover and trim (not yet a reducer) | as above, inside the engine | as above |
 

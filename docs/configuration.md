@@ -2470,7 +2470,7 @@ nothing runs and nothing is stored. When tool events are not recorded the
 prefix is not stored, so `session_opened` hooks run on every turn and a varying
 output changes the system prompt each turn.
 
-The points are called by `prx agent`, `prx chat` (the terminal chat), gateway
+The points are called by `prx chat` (the terminal chat and `prx chat --message`), gateway
 sessions, channel and scheduled entries. Child turns call the child-open point
 described below instead of the session-open and turn-open points.
 
