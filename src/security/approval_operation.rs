@@ -272,8 +272,9 @@ pub(crate) const SKILLS_MANAGE_GRANT_BOUND_ACTIONS: [&str; 12] = [
 ];
 
 /// True when the call can only succeed with its own human approval: the tool
-/// itself demands a signed one-shot grant bound to the exact target, at every
-/// autonomy level. Execution upgrades an Allow decision to Ask for these, and
+/// itself demands a signed one-shot grant bound to the exact target below the
+/// `full` autonomy level (at `full` it asks nothing). Below `full` execution
+/// upgrades an Allow decision to Ask for these, and
 /// session allowlisting must never mint a grant for them. Derived from the same
 /// table as `skills_manage_lifecycle_operation`.
 pub(crate) fn requires_explicit_grant(tool: &str, args: &serde_json::Value) -> bool {

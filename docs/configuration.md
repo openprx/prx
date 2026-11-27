@@ -799,9 +799,10 @@ enabled = false
 # another process holds the store lock) and `status` lists any proposal it had
 # to skip. Publishing or rolling back through `skills_manage` needs a signed
 # one-shot approval grant bound to the proposal (or to skill, revision and
-# observed generation for a rollback), in every autonomy level; the grant is
-# spent on use. `skills_manage` action `lifecycle_import_executable` publishes a
-# reviewed directory in auto mode, with a signed one-shot grant bound to `source`
+# observed generation for a rollback), below the `full` autonomy level; the grant
+# is spent on use. At `full` no grant is asked. `skills_manage` action
+# `lifecycle_import_executable` publishes a reviewed directory in auto mode, with
+# a signed one-shot grant below `full` bound to `source`
 # and `revision_id` (the complete bundle hash). Enabling the lifecycle does not
 # authorize executable imports or waive execution-time review lineage checks.
 [skills_lifecycle]

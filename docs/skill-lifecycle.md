@@ -214,27 +214,30 @@ When enabled and opened successfully, `skills_manage` adds these actions:
 Calls must match the configured owner. Mutations retain the common side-effect
 boundary. Agent publication and rollback additionally require a signed,
 one-shot approval grant bound to the exact proposal, or the rollback's skill,
-revision and observed generation, at every autonomy level. Tool output or a
-model's decision cannot supply that authority. Executable import also requires
-a signed one-shot grant, bound to both `source` and `revision_id`, and `auto`
-mode; see [executable bundles](#executable-bundles). There is no agent
+revision and observed generation, below `full`. At an effective `full` level
+no grant is asked and none is required. Tool output or a model's decision
+cannot supply that authority. Executable import also requires a signed one-shot
+grant below `full`, bound to both `source` and `revision_id`, and `auto` mode;
+see [executable bundles](#executable-bundles). There is no agent
 `force-close`, `propose`, suite-authoring or evaluation action.
 
 ### Approving publication, rollback and import
 
-`lifecycle_publish`, `lifecycle_rollback` and `lifecycle_import_executable` are
-always put to the operator, at every autonomy level including `full`, because
-the tool only accepts them with a grant for that exact target. `lifecycle_cancel`
-only closes a proposal and needs no such grant. Naming the tool is enough to
-start: the agent asks the model for the call, records it as a pending decision
-that names the exact operation, and runs nothing until the operator approves it.
+Below `full`, `lifecycle_publish`, `lifecycle_rollback` and
+`lifecycle_import_executable` are put to the operator, because the tool only
+accepts them with a grant for that exact target. At an effective `full` level
+no approval is asked for them: the tool runs them under the configured lifecycle
+mode and publication policy, and the evaluation gates (frozen suite, holdout,
+deterministic gate) still apply. `lifecycle_cancel` only closes a proposal and
+needs no grant at any level. Below `full`, naming the tool is enough to start:
+the agent asks the model for the call, records it as a pending decision that
+names the exact operation, and runs nothing until the operator approves it.
 
 1. Ask for the change and name `skills_manage`, for example "use skills_manage
    to import the reviewed bundle in `/srv/skills/report-runner` with revision
-   `r1-...`". The turn ends as awaiting approval with a decision id. Under
-   `supervised` this is the only form that starts a request; under `full` the
-   model may also call the tool in an ordinary turn and gets the same pending
-   decision.
+   `r1-...`". Below `full` the turn ends as awaiting approval with a decision
+   id. Under `supervised` this is the only form that starts a request. Under
+   `full` the call runs in an ordinary turn without a pending decision.
 2. Inspect the pending call. In chat run `/approval --decision <uuid>`; in the
    web console open the waiting reply. Check the action and its target: the
    `proposal_id` for publish, the skill, revision and observed generation for
@@ -249,8 +252,8 @@ that names the exact operation, and runs nothing until the operator approves it.
    or an approval for a different hash, source, proposal or generation, is
    refused.
 
-An "Always" answer in a terminal prompt never covers these three actions: each
-one needs its own approval. Read-only autonomy still refuses them outright, and
+An "Always" answer in a terminal prompt never covers these three actions below
+`full`: each one needs its own approval. Read-only autonomy still refuses them outright, and
 a model cannot supply grant material: every `_zc_*` argument it sends is
 dropped before the tool runs.
 
@@ -336,8 +339,9 @@ SL11 adds reviewed executable revisions: a bundle with scripts or declared
   plans a legacy executable directory as `ExecutableNeedsReview` and never
   imports it on its own. The operator reviews the directory and publishes it
   with `skills_manage` action `lifecycle_import_executable` (`source`,
-  `revision_id`). It needs a signed one-shot grant bound to the directory and
-  the complete bundle hash, in every autonomy level, and runs only in `auto`
+  `revision_id`). Below `full` it needs a signed one-shot grant bound to the
+  directory and the complete bundle hash; at an effective `full` level no grant
+  is asked, and it runs only in `auto`
   mode under a valid publication policy, like any publication. The review
   requires well-formed tools, script paths inside the bundle that are marked
   executable, no executable file that no tool runs, and no untrusted-origin
