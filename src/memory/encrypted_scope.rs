@@ -22,6 +22,38 @@ const SCHEDULED_RESULT_EVENT_TYPES: [&str; 2] = [
     crate::context::transcript::SCHEDULE_SEEN_EVENT_TYPE,
 ];
 
+/// Event type of an attachment row (`context/transcript/tool_rows.rs`).
+const ATTACHMENT_EVENT_TYPE: &str = "message.attachment.recorded";
+
+/// Source lists of an attachment payload that stay readable beside the seal.
+const ATTACHMENT_SOURCE_LISTS: [&str; 4] = ["memories", "events", "documents", "results"];
+
+/// Store an attachment row as `{"encrypted_child_payload": sealed, "sources": ...}`
+/// so the store's provenance triggers can find the rows that quote a deleted
+/// memory, document or event. Only the ids (string elements) are copied, never
+/// text. A payload that is not a JSON object is stored as sealed.
+fn attachment_wrapper(payload: &str, sealed: String) -> String {
+    let Some(value) = serde_json::from_str::<serde_json::Value>(payload)
+        .ok()
+        .filter(serde_json::Value::is_object)
+    else {
+        return sealed;
+    };
+    let mut sources = serde_json::Map::new();
+    for list in ATTACHMENT_SOURCE_LISTS {
+        let ids: Vec<serde_json::Value> = match value.pointer(&format!("/sources/{list}")) {
+            Some(serde_json::Value::Array(items)) => items.iter().filter(|item| item.is_string()).cloned().collect(),
+            Some(item @ serde_json::Value::String(_)) => vec![item.clone()],
+            _ => Vec::new(),
+        };
+        sources.insert(list.to_owned(), serde_json::Value::Array(ids));
+    }
+    let mut wrapper = serde_json::Map::new();
+    wrapper.insert("encrypted_child_payload".to_owned(), serde_json::Value::String(sealed));
+    wrapper.insert("sources".to_owned(), serde_json::Value::Object(sources));
+    serde_json::Value::Object(wrapper).to_string()
+}
+
 /// Encrypting view of `inner` for one `agent_account_id/conversation_id` scope.
 pub struct EncryptedScope {
     inner: Arc<dyn Memory>,
@@ -114,7 +146,12 @@ impl EncryptedScope {
     fn seal_event_payload(&self, input: &mut crate::memory::MessageEventInput) -> anyhow::Result<()> {
         if let Some(payload) = input.raw_payload_json.take() {
             let key = input.idempotency_key.as_deref().unwrap_or("event");
-            input.raw_payload_json = Some(self.seal_payload(&input.source, key, &payload)?);
+            let sealed = self.seal_payload(&input.source, key, &payload)?;
+            input.raw_payload_json = Some(if input.event_type == ATTACHMENT_EVENT_TYPE {
+                attachment_wrapper(&payload, sealed)
+            } else {
+                sealed
+            });
         }
         Ok(())
     }
