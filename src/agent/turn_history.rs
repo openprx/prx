@@ -96,7 +96,7 @@ pub(crate) struct CanonicalHistory {
     /// message's slot can be filled.
     evidence: Vec<Option<Arc<TurnToolEvidence>>>,
     /// One set of source event ids per message, index for index; a durable
-    /// replacement message records the union over the messages it replaces.
+    /// replacement message carries none (it is a new message).
     sources: Vec<MessageSources>,
 }
 
@@ -338,12 +338,6 @@ impl CanonicalHistory {
         true
     }
 
-    /// The union of the sources of `self[start..end]`, which a replacement of
-    /// that range derives from.
-    fn range_sources(&self, start: usize, end: usize) -> MessageSources {
-        MessageSources::union(self.sources.get(start..end).unwrap_or_default())
-    }
-
     /// The guard of a patch that replaces `self[range_start..]`.
     pub(crate) fn guard_from(&self, range_start: usize) -> Option<crate::agent::turn_contracts::CompactionPatchGuard> {
         crate::agent::compaction::compaction_patch_guard_for(&self.messages, range_start, self.messages.len())
@@ -378,15 +372,22 @@ impl CanonicalHistory {
     /// refresh aside) are a projection and are returned with the index they
     /// follow, for [`ProjectionInputs::set_refresh_notes`]. The replacement is
     /// the compaction's own messages; every message outside the replaced range
-    /// keeps its provenance. On error `self` is unchanged.
+    /// keeps its provenance; the replacement itself carries no event ids. On error `self` is unchanged.
     pub(crate) fn apply_patch(
         &mut self,
         patch: &crate::agent::turn_contracts::CompactionPatch,
     ) -> Result<RefreshNotes, crate::agent::turn_contracts::CompactionPatchError> {
         self.check_patch(patch)?;
         let (start, end) = (patch.range_start(), patch.range_end());
-        let derived = self.range_sources(start, end);
-        if !self.splice(start, end, &patch.replacement, MessageOrigin::Acknowledged, &derived) {
+        // A replacement (handoff or summary) is a new message with no stored
+        // row of its own here: it never inherits the folded messages' ids.
+        if !self.splice(
+            start,
+            end,
+            &patch.replacement,
+            MessageOrigin::Acknowledged,
+            &MessageSources::default(),
+        ) {
             return Err(crate::agent::turn_contracts::CompactionPatchError::RangeOutOfBounds {
                 start,
                 end,
