@@ -121,7 +121,9 @@ pub struct McpServerRuntimeConfig {
     #[serde(default = "default_mcp_server_rate_limit_rps")]
     pub rate_limit_rps: u32,
     /// Apply `rate_limit_rps` to authenticated callers. Default false:
-    /// authenticated MCP callers are not limited.
+    /// authenticated MCP callers (and the anonymous caller when `require_auth`
+    /// is false) are not limited; a call without a valid identity gets 401
+    /// before the budget.
     #[serde(default)]
     pub rate_limit_authenticated: bool,
     /// Expected `iss` claim for inbound bearer JWTs. When unset, bearer JWT

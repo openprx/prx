@@ -1167,7 +1167,9 @@ mod tests {
         );
 
         let workspace = TempDir::new().expect("test: workspace");
-        let config = config_with(workspace.path(), vec![], &[]);
+        let mut config = config_with(workspace.path(), vec![], &[]);
+        // Count paired traffic so the test proves the mailbox routes sit outside the limit.
+        config.gateway.api_rate_limit_authenticated = true;
         let (base_url, server) = serve(test_app_state_with_api_limit(config, api_limit)).await;
 
         let mut sessions = Vec::new();

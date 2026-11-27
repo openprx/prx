@@ -739,7 +739,9 @@ response says the ledger is unavailable — and a read-only tool still runs.
 `mcp_server.rate_limit_rps` is a per-caller budget, in requests per second,
 enforced on `POST /mcp/v1/tools/call` and keyed by the same owner id; `0`
 disables it. It applies only when `mcp_server.rate_limit_authenticated = true`
-(default `false`): by default an authenticated MCP caller is not limited. `GET /mcp/v1/tools/list` reports each admissible exposed tool's
+(default `false`): by default an authenticated MCP caller is not limited, and neither
+is the anonymous caller used when `mcp_server.require_auth = false`. A call with no
+valid identity is answered `401` before the budget and is never counted. `GET /mcp/v1/tools/list` reports each admissible exposed tool's
 real effect (`readonly` or `act`) rather than assuming the list is read-only,
 and a side-effecting entry in `mcp_server.exposed_tools` is warned about at
 config load.
