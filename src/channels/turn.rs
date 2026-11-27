@@ -829,15 +829,28 @@ pub(super) async fn run_channel_turn(
         }
     }
 
-    // The earlier turns are the conversation cache without the current message,
-    // which admission pushed as the newest user entry. Cache turns carry no event
-    // ids, so the opening replays them as plain messages.
-    let previous_turns = {
+    // The earlier turns are the conversation cache without the current message.
+    // Admission pushed that message, so it is removed by identity (the newest user
+    // entry with its text); when admission was recovered it is absent and nothing
+    // is removed. The request must alternate, so an earlier user message left
+    // without a reply is folded into this request's text, ahead of it.
+    let current_text = crate::agent::turn_contracts::inbound_user_message(&msg.content).content;
+    let (previous_turns, request_text) = {
         let mut cached = merged_history(&ctx.conversation_histories.lock(), &history_key);
-        if cached.last().is_some_and(|turn| turn.role == "user") {
-            cached.pop();
+        if let Some(index) = cached
+            .iter()
+            .rposition(|turn| turn.role == "user" && turn.content == current_text)
+        {
+            cached.remove(index);
         }
-        normalize_cached_channel_turns(cached)
+        let mut earlier = normalize_cached_channel_turns(cached);
+        let mut request_text = msg.content.clone();
+        if earlier.last().is_some_and(|turn| turn.role == "user")
+            && let Some(unanswered) = earlier.pop()
+        {
+            request_text = format!("{}\n\n{}", unanswered.content, msg.content);
+        }
+        let previous_turns = earlier
             .into_iter()
             .map(|turn| crate::memory::ConversationTurn {
                 id: 0,
@@ -848,8 +861,11 @@ pub(super) async fn run_channel_turn(
                 message_id: None,
                 message_event_id: None,
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        (previous_turns, request_text)
     };
+    // The vision card ends with a newline so the user's text does not run on from its closing tag.
+    let card_text = signal_vision_context.as_ref().map(|context| format!("{context}\n"));
     let crate::context::api::open::TurnOpening {
         mut history,
         history_event_ids,
@@ -859,8 +875,8 @@ pub(super) async fn run_channel_turn(
         envelope: &runtime_envelope,
         memory_config: &config_generation.effective.memory,
         chat_type: inferred_chat_type,
-        visible_message: &msg.content,
-        card: signal_vision_context.as_deref(),
+        visible_message: &request_text,
+        card: card_text.as_deref(),
         previous_turns,
         replay: crate::context::api::open::ReplayMode::FitToBudget,
         recall: crate::context::api::open::OpenRecall::ReplayedSession,
