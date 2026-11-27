@@ -9,7 +9,10 @@ use async_trait::async_trait;
 use axum::{
     Json, Router,
     extract::State,
-    http::{HeaderMap, StatusCode, header::{AUTHORIZATION, RETRY_AFTER}},
+    http::{
+        HeaderMap, StatusCode,
+        header::{AUTHORIZATION, RETRY_AFTER},
+    },
     response::{IntoResponse, Response},
     routing::post,
 };
@@ -183,18 +186,9 @@ struct ExistingIngestion {
     topic_id: Option<String>,
 }
 
-impl SqliteWebhookRepository {
-    fn new(db_path: PathBuf, workspace_id: String) -> Result<Self> {
-        ensure_memory_schema(&db_path)?;
-        let mut conn = Connection::open(&db_path)
-            .with_context(|| format!("failed to open webhook repository {}", db_path.display()))?;
-        // Same policy as the pooled connections onto this file: a lock held by
-        // another writer makes this call wait (and warn), never fail.
-        crate::runtime::sqlite_pool::install_busy_handler(&mut conn)
-            .context("failed to install webhook repository busy handler")?;
-        conn.execute_batch(
-            "PRAGMA foreign_keys = ON;
-             CREATE TABLE IF NOT EXISTS webhook_ingestions (
+/// DDL of the SQLite ingestion table, shared with the memory schema: its
+/// `topic_id` keeps a topic alive, so the topic cleanup trigger reads it.
+pub(crate) const SQLITE_INGESTIONS_DDL: &str = "CREATE TABLE IF NOT EXISTS webhook_ingestions (
                  ingestion_key    TEXT PRIMARY KEY,
                  event_identity   TEXT NOT NULL UNIQUE,
                  request_hash     TEXT NOT NULL,
@@ -214,9 +208,20 @@ impl SqliteWebhookRepository {
              CREATE INDEX IF NOT EXISTS idx_webhook_ingestions_status
                  ON webhook_ingestions(status, lease_expires_at);
              CREATE INDEX IF NOT EXISTS idx_webhook_ingestions_external
-                 ON webhook_ingestions(source, project, external_id, event_type);",
-        )
-        .context("failed to initialize durable webhook ingestion schema")?;
+                 ON webhook_ingestions(source, project, external_id, event_type);";
+
+impl SqliteWebhookRepository {
+    fn new(db_path: PathBuf, workspace_id: String) -> Result<Self> {
+        ensure_memory_schema(&db_path)?;
+        let mut conn = Connection::open(&db_path)
+            .with_context(|| format!("failed to open webhook repository {}", db_path.display()))?;
+        // Same policy as the pooled connections onto this file: a lock held by
+        // another writer makes this call wait (and warn), never fail.
+        crate::runtime::sqlite_pool::install_busy_handler(&mut conn)
+            .context("failed to install webhook repository busy handler")?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .and_then(|()| conn.execute_batch(SQLITE_INGESTIONS_DDL))
+            .context("failed to initialize durable webhook ingestion schema")?;
         Ok(Self {
             conn: Arc::new(ParkingMutex::new(conn)),
             workspace_id: Arc::from(workspace_id),
@@ -1166,9 +1171,10 @@ fn rate_limited_reply() -> Response {
         })),
     )
         .into_response();
-    response
-        .headers_mut()
-        .insert(RETRY_AFTER, axum::http::HeaderValue::from(WEBHOOK_RATE_LIMIT_WINDOW_SECS));
+    response.headers_mut().insert(
+        RETRY_AFTER,
+        axum::http::HeaderValue::from(WEBHOOK_RATE_LIMIT_WINDOW_SECS),
+    );
     response
 }
 
