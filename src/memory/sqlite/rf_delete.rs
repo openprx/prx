@@ -532,57 +532,10 @@ fn descendant_runs(tx: &Connection, workspace_id: &str, owner_id: &str, run_id: 
         .collect::<rusqlite::Result<Vec<String>>>()?)
 }
 
-/// Every run an erase of `run` can reach, for liveness: the runs it spawned,
-/// the runs the completion notices of those wake in their parent session, and
-/// the runs those woken turns spawned, repeated until no run is new. The
-/// attempt run itself is not in the result. The set only grows and is finite,
-/// so the loop ends. It ignores the survival rule of a continued child session
-/// (an over-approximation), because it is used only to decide whether a delete
-/// waits.
-fn erased_runs(tx: &Connection, workspace_id: &str, owner_id: &str, run_id: &str) -> anyhow::Result<Vec<String>> {
-    let mut runs = descendant_runs(tx, workspace_id, owner_id, run_id)?;
-    let mut statement = tx.prepare(
-        "SELECT DISTINCT w.run_id FROM message_events w
-         WHERE w.workspace_id = ?1 AND w.owner_id = ?2 AND w.event_type = 'message.created'
-           AND w.role = 'user' AND w.run_id IS NOT NULL
-           AND w.causation_event_id IN (
-               SELECT n.event_id FROM message_events n
-               JOIN (SELECT session_key AS key, MIN(id) AS first_id FROM message_events
-                     WHERE workspace_id = ?1 AND owner_id = ?2 AND session_key IS NOT NULL
-                       AND run_id IN (SELECT value FROM json_each(?3))
-                     GROUP BY session_key) s ON n.sender = s.key AND n.id > s.first_id
-               WHERE n.workspace_id = ?1 AND n.owner_id = ?2 AND n.source = 'prx_mailbox'
-                 AND n.event_type = 'message.created')",
-    )?;
-    loop {
-        let woken = statement
-            .query_map(params![workspace_id, owner_id, serde_json::to_string(&runs)?], |row| {
-                row.get::<_, String>(0)
-            })?
-            .collect::<rusqlite::Result<Vec<String>>>()?;
-        let mut grew = false;
-        for woken_run in woken {
-            if woken_run == run_id || runs.contains(&woken_run) {
-                continue;
-            }
-            for run in
-                std::iter::once(woken_run.clone()).chain(descendant_runs(tx, workspace_id, owner_id, &woken_run)?)
-            {
-                if run != run_id && !runs.contains(&run) {
-                    runs.push(run);
-                    grew = true;
-                }
-            }
-        }
-        if !grew {
-            return Ok(runs);
-        }
-    }
-}
-
-/// Whether the attempt's run, or a run its erase reaches ([`erased_runs`]:
-/// spawned runs, woken turns and their spawns), is still live in this process
-/// (`live_runs`).
+/// Whether the attempt's run, or a run its erase reaches (the spawned runs
+/// and the woken turns of [`select_family`], the same selection `erase`
+/// rewrites), is still live in this process (`live_runs`). The message-side
+/// selection is a superset of the reply side.
 fn is_live(tx: &Connection, target: &Target<'_>, attempt: &Attempt, live_runs: &[String]) -> anyhow::Result<bool> {
     let Some(run) = attempt.run_id.as_deref() else {
         return Ok(false);
@@ -593,9 +546,13 @@ fn is_live(tx: &Connection, target: &Target<'_>, attempt: &Attempt, live_runs: &
     if live_runs.iter().any(|live| live == run) {
         return Ok(true);
     }
-    Ok(erased_runs(tx, target.workspace_id, target.owner_id, run)?
+    let family = select_family(tx, target, Side::Message, attempt)?;
+    Ok(family
+        .descendants
         .iter()
-        .any(|descendant| live_runs.contains(descendant)))
+        .map(String::as_str)
+        .chain(family.woken.iter().filter_map(|row| row.run_id.as_deref()))
+        .any(|member| live_runs.iter().any(|live| live == member)))
 }
 
 /// The event ids of a run's rows.
@@ -699,13 +656,30 @@ fn scope_agent(tx: &Connection, scope: Option<&str>) -> anyhow::Result<Option<(S
         .optional()?)
 }
 
-/// Tombstone one side of an attempt and every copy derived from it: the
-/// rows of the run and of every run it spawned, the result rows of a job its
-/// message created (message side only), the handoff notes after the first
-/// deleted row of a session, and the compaction summaries built from any of
-/// them. The attachments and listings that quoted them are rewritten by the
-/// store's triggers and `derived_sweep`.
-fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) -> anyhow::Result<()> {
+/// The rows one side of an attempt erases and the runs and notices they
+/// reach; the single selection both `erase` and `is_live` use.
+#[derive(Default)]
+struct Family {
+    /// The runs spawned by the attempt run and by the woken turns, deeper too.
+    descendants: Vec<String>,
+    rows: Vec<EventRow>,
+    children: Vec<Child>,
+    /// Completion notices of the erased runs.
+    announcements: Vec<String>,
+    /// Rows of the turns those notices woke.
+    woken: Vec<EventRow>,
+}
+
+/// Select what a delete of `attempt` reaches: the run, the runs it spawned,
+/// the completion notices of those runs, the turns the notices woke and the
+/// runs those turns spawned, selected again until a pass finds no new run.
+/// Woken turns are followed only from the notices of erased runs (found by
+/// sender session and the fixed notice head), never from an adopted row that
+/// is in `rows` only because adoption stamped it with the run id. A woken
+/// turn's own session is never searched for notices, because only the spawned
+/// runs (`children`) name a sender session; so the messages the woken turn's
+/// session (usually the rf session) sends later are not family.
+fn select_family(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) -> anyhow::Result<Family> {
     let mut descendants = match attempt.run_id.as_deref() {
         Some(run) => descendant_runs(tx, target.workspace_id, target.owner_id, run)?,
         None => Vec::new(),
@@ -744,7 +718,7 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
     // A turn woken by a notice can itself spawn runs (their notices wake more
     // turns), so the rows are selected again with those runs added until a pass
     // finds no new run.
-    let (rows, children, mut announcements, woken) = loop {
+    loop {
         let rows = {
             let mut statement = tx.prepare(sql)?;
             statement
@@ -772,7 +746,10 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
         if rows.is_empty() {
-            return Ok(());
+            return Ok(Family {
+                descendants,
+                ..Family::default()
+            });
         }
         let children = children_of(&rows, &descendants, target);
         // The completion notices of the erased runs sit in the parent session; they
@@ -782,14 +759,22 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
         // The turn each deleted notice woke in the parent session reports the
         // same result: its input, reply, tool rows and terminal go too.
         let woken = {
-            let mut sources: Vec<&str> = rows.iter().map(|row| row.event_id.as_str()).collect();
-            sources.extend(announcements.iter().map(String::as_str));
-            announcement_turns(tx, target, &serde_json::to_string(&sources)?)?
+            let mut kept: Vec<&str> = rows.iter().map(|row| row.event_id.as_str()).collect();
+            kept.extend(announcements.iter().map(String::as_str));
+            announcement_turns(
+                tx,
+                target,
+                &serde_json::to_string(&announcements)?,
+                &serde_json::to_string(&kept)?,
+            )?
         };
         // Runs the woken turns spawned, in their own sessions, join the erase
         // exactly like the attempt's own descendants.
         let mut extra: Vec<String> = Vec::new();
-        for run in woken.iter().filter_map(|row| row.run_id.as_deref()) {
+        let mut woken_runs: Vec<&str> = woken.iter().filter_map(|row| row.run_id.as_deref()).collect();
+        woken_runs.sort_unstable();
+        woken_runs.dedup();
+        for run in woken_runs {
             for spawned in descendant_runs(tx, target.workspace_id, target.owner_id, run)? {
                 if attempt.run_id.as_deref() != Some(spawned.as_str())
                     && !descendants.contains(&spawned)
@@ -800,10 +785,35 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
             }
         }
         if extra.is_empty() {
-            break (rows, children, announcements, woken);
+            return Ok(Family {
+                descendants,
+                rows,
+                children,
+                announcements,
+                woken,
+            });
         }
         descendants.extend(extra);
-    };
+    }
+}
+
+/// Tombstone one side of an attempt and every copy derived from it: the
+/// rows of the run and of every run it spawned, the result rows of a job its
+/// message created (message side only), the handoff notes after the first
+/// deleted row of a session, and the compaction summaries built from any of
+/// them. The attachments and listings that quoted them are rewritten by the
+/// store's triggers and `derived_sweep`.
+fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) -> anyhow::Result<()> {
+    let Family {
+        descendants,
+        rows,
+        children,
+        mut announcements,
+        woken,
+    } = select_family(tx, target, side, attempt)?;
+    if rows.is_empty() {
+        return Ok(());
+    }
     let window_start: Option<String> = tx
         .query_row(
             "SELECT created_at FROM message_events WHERE workspace_id = ?1 AND event_id = ?2",
@@ -1109,17 +1119,23 @@ fn run_notices(tx: &Connection, target: &Target<'_>, child: &Child) -> anyhow::R
         .collect())
 }
 
-/// The rows of the turns that a deleted mailbox notice woke: among
-/// `sources` (a JSON array of the event ids this delete removes, the notices
-/// included), the rows of source `prx_mailbox`; a turn they woke has its input
+/// The rows of the turns that a deleted completion notice woke: among
+/// `notices` (a JSON array of the event ids of the notices of erased runs),
+/// the rows of source `prx_mailbox`; a turn they woke has its input
 /// (`message.created`, role `user`) caused by the notice
 /// (`causation_event_id`, set from the adopted event by
 /// `gateway/api/sessions/mailbox.rs` and `RuntimeEnvelope::message_scope`) and
 /// its own run, and every row of that run goes: input, attachment, request
 /// and tool rows, reply, decision and terminal. The accounting row stays, as
-/// for the deleted run. Rows already among `sources` are left out. Matched by
+/// for the deleted run. Rows already among `kept` (every event id this delete
+/// removes) are left out. Matched by
 /// key only, never by text. Read before the tombstone.
-fn announcement_turns(tx: &Connection, target: &Target<'_>, sources: &str) -> anyhow::Result<Vec<EventRow>> {
+fn announcement_turns(
+    tx: &Connection,
+    target: &Target<'_>,
+    notices: &str,
+    kept: &str,
+) -> anyhow::Result<Vec<EventRow>> {
     let mut statement = tx.prepare(
         "WITH notices(event_id) AS (
              SELECT event_id FROM message_events
@@ -1133,11 +1149,11 @@ fn announcement_turns(tx: &Connection, target: &Target<'_>, sources: &str) -> an
          FROM message_events
          WHERE workspace_id = ?1 AND owner_id = ?2 AND run_id IN (SELECT run_id FROM woken)
            AND event_type NOT IN ('turn.deleted', 'usage.settled', 'message.deleted')
-           AND event_id NOT IN (SELECT value FROM json_each(?3))
+           AND event_id NOT IN (SELECT value FROM json_each(?4))
          ORDER BY id",
     )?;
     Ok(statement
-        .query_map(params![target.workspace_id, target.owner_id, sources], |row| {
+        .query_map(params![target.workspace_id, target.owner_id, notices, kept], |row| {
             Ok(EventRow {
                 id: row.get(0)?,
                 event_id: row.get(1)?,
