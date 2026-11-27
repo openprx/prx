@@ -952,6 +952,18 @@ execution service's trusted scope, enforces memory visibility, requires the
 current session, and returns every referenced event in note order or an
 incomplete-reference error.
 
+Provenance of the folded messages is checked against the event ids the history
+recorded for them. A folded message that has recorded ids must resolve to one of
+them; any other admissible row refuses the switch as ambiguous. When the session
+has more own rows than the 20,000-row pool read can cover, the provenance falls
+back to a pinned read: if every folded and kept message has exactly one
+recorded id, the rows are read newest to oldest until each pinned row (and the
+one switch row that matches the handoff message) is found, and the result is
+exact only if each pinned row has the message's role and text, the pinned order
+is admissible, the handoff row is the newest switch row read, and no pinned row
+was already folded by it. Anything else keeps the refusal. Terminal histories
+record no event ids, so they take no part in the fallback.
+
 `channels::build_system_prompt_with_mode` remains as a compatibility entrypoint,
 but it only translates channel inputs into the canonical `PromptContext` and
 delegates to `SystemPromptBuilder`. Identity-file ordering, AIEOS fallback,

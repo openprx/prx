@@ -433,26 +433,31 @@ pub(crate) fn is_unproven_page_error(error: &anyhow::Error) -> bool {
             .is_some()
 }
 
-/// Every own user/assistant row of the session (§3.1): the newest page, then
-/// older pages until a short page proves the session's first row was read.
-/// Every page, the newest included, is read through
-/// `load_session_context_before`, which reports rows it would have to drop.
-/// `Ok(Err(TurnAmbiguous))` when completeness cannot be proven: the rows read
-/// reached [`POOL_MAX_ROWS`], the backend cannot page, or a page is incomplete.
-pub(crate) async fn load_complete_pool(
-    mem: &dyn Memory,
-    principal: &MemoryPrincipal,
-    forms: &SourceForms,
-) -> Result<Result<CandidatePool, ProvenanceGap>> {
-    load_pool_within(mem, principal, forms, POOL_MAX_ROWS).await
+/// How a paged read of the session's rows ended.
+pub(crate) enum PoolRead {
+    /// A short page proved the session's first row was read.
+    Complete(CandidatePool),
+    /// The caller's stop condition held before the session's first row.
+    Stopped(CandidatePool),
+    /// The rows read reached the bound before either of the above.
+    Capped,
+    /// The backend cannot page, or a page is incomplete.
+    Unproven,
 }
 
-pub(crate) async fn load_pool_within(
+/// Every own user/assistant row of the session (§3.1): the newest page, then
+/// older pages until a short page proves the session's first row was read,
+/// `done` holds for the rows read so far, or `max_rows` rows were read.
+/// Every page, the newest included, is read through
+/// `load_session_context_before`, which reports rows it would have to drop.
+/// The pool is returned as read: [`CandidatePool::finish`] is the caller's.
+async fn page_pool(
     mem: &dyn Memory,
     principal: &MemoryPrincipal,
     forms: &SourceForms,
     max_rows: usize,
-) -> Result<Result<CandidatePool, ProvenanceGap>> {
+    mut done: impl FnMut(&CandidatePool) -> bool,
+) -> Result<PoolRead> {
     let query = || SessionContextQuery {
         principal: principal.clone(),
         since_event_id: None,
@@ -465,7 +470,7 @@ pub(crate) async fn load_pool_within(
     // The newest page is "below" the largest possible id.
     let mut page = match mem.load_session_context_before(query(), i64::MAX).await {
         Ok(page) => page,
-        Err(error) if is_unproven_page_error(&error) => return Ok(Err(ProvenanceGap::TurnAmbiguous)),
+        Err(error) if is_unproven_page_error(&error) => return Ok(PoolRead::Unproven),
         Err(error) => return Err(error),
     };
     loop {
@@ -476,22 +481,51 @@ pub(crate) async fn load_pool_within(
         }
         pool.absorb(page, principal.session_key.as_deref(), forms);
         if page_len < POOL_PAGE_ROWS {
-            break;
+            return Ok(PoolRead::Complete(pool));
+        }
+        if done(&pool) {
+            return Ok(PoolRead::Stopped(pool));
         }
         if rows_read >= max_rows {
-            return Ok(Err(ProvenanceGap::TurnAmbiguous));
+            return Ok(PoolRead::Capped);
         }
         let Some(before_id) = oldest else {
-            return Ok(Err(ProvenanceGap::TurnAmbiguous));
+            return Ok(PoolRead::Unproven);
         };
         page = match mem.load_session_context_before(query(), before_id).await {
             Ok(page) => page,
-            Err(error) if is_unproven_page_error(&error) => return Ok(Err(ProvenanceGap::TurnAmbiguous)),
+            Err(error) if is_unproven_page_error(&error) => return Ok(PoolRead::Unproven),
             Err(error) => return Err(error),
         };
     }
-    pool.finish();
-    Ok(Ok(pool))
+}
+
+/// The complete pool of the session (§3.1), or the gap when completeness
+/// cannot be proven: the rows read reached [`POOL_MAX_ROWS`], the backend
+/// cannot page, or a page is incomplete.
+#[cfg(test)]
+pub(crate) async fn load_complete_pool(
+    mem: &dyn Memory,
+    principal: &MemoryPrincipal,
+    forms: &SourceForms,
+) -> Result<Result<CandidatePool, ProvenanceGap>> {
+    load_pool_within(mem, principal, forms, POOL_MAX_ROWS).await
+}
+
+#[cfg(test)]
+pub(crate) async fn load_pool_within(
+    mem: &dyn Memory,
+    principal: &MemoryPrincipal,
+    forms: &SourceForms,
+    max_rows: usize,
+) -> Result<Result<CandidatePool, ProvenanceGap>> {
+    Ok(match page_pool(mem, principal, forms, max_rows, |_| false).await? {
+        PoolRead::Complete(mut pool) => {
+            pool.finish();
+            Ok(pool)
+        }
+        PoolRead::Stopped(_) | PoolRead::Capped | PoolRead::Unproven => Err(ProvenanceGap::TurnAmbiguous),
+    })
 }
 
 /// The group structure of a segment: for each message its role, the user that
@@ -790,6 +824,164 @@ pub(crate) fn resolve_in_pool(
     Ok(matched)
 }
 
+/// The pins of a joint resolution: the history's own recorded row for each
+/// durable message (P1, P2). `None` when the history cannot be pinned.
+struct PinPlan {
+    /// Index of the one handoff message, always 0 (P2).
+    handoff: Option<usize>,
+    /// Per joint message the one recorded event id; `None` for the handoff.
+    pins: Vec<Option<String>>,
+}
+
+impl PinPlan {
+    fn of(joint: &[&ChatMessage], recorded: &[&[String]]) -> Option<Self> {
+        let mut handoff = None;
+        for (index, message) in joint.iter().enumerate() {
+            if is_context_handoff_message(message) {
+                if index != 0 || handoff.is_some() {
+                    return None;
+                }
+                handoff = Some(index);
+            }
+        }
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut pins = Vec::with_capacity(joint.len());
+        for (index, ids) in recorded.iter().enumerate() {
+            if handoff == Some(index) {
+                pins.push(None);
+                continue;
+            }
+            let [id] = ids else {
+                return None;
+            };
+            if !seen.insert(id.as_str()) {
+                return None;
+            }
+            pins.push(Some(id.clone()));
+        }
+        (pins.len() == joint.len()).then_some(Self { handoff, pins })
+    }
+
+    /// Whether the rows read so far hold every pinned id and, with a handoff,
+    /// at least one switch row that matches its bytes (two or more end the
+    /// read too: the verification then refuses).
+    fn satisfied_by(&self, pool: &CandidatePool) -> bool {
+        let wanted = self.pins.iter().flatten().map(String::as_str).collect::<HashSet<_>>();
+        let seen = pool
+            .messages
+            .iter()
+            .filter(|row| wanted.contains(row.event_id.as_str()))
+            .count();
+        seen >= wanted.len()
+            && self
+                .handoff
+                .is_none_or(|index| pool.switches.iter().any(|row| row.matches.contains(&index)))
+    }
+}
+
+/// The `(row id, event id)` of every joint message, resolved from the rows
+/// the history itself recorded (the anchor-free fallback when the pool read
+/// reaches [`POOL_MAX_ROWS`], P1-P7 of the X4a design). Nothing is chosen
+/// among candidates: each message must be the recorded row, admissible by
+/// session key, role, persisted form, order (A1, A3-A5), not an echo and not
+/// folded by the handoff. `None` is a refusal.
+async fn resolve_pinned(
+    mem: &dyn Memory,
+    principal: &MemoryPrincipal,
+    forms: &SourceForms,
+    joint: &[&ChatMessage],
+    recorded: &[&[String]],
+) -> Result<Option<Vec<(i64, String)>>> {
+    let Some(plan) = PinPlan::of(joint, recorded) else {
+        return Ok(None);
+    };
+    let segment_start = usize::from(plan.handoff.is_some());
+    let segment = joint.get(segment_start..).unwrap_or_default();
+    if segment.len() > crate::tools::transcript_history_lookup::MAX_REFERENCED_EVENTS {
+        return Ok(None);
+    }
+    let mut pool = match page_pool(mem, principal, forms, POOL_MAX_ROWS, |pool| plan.satisfied_by(pool)).await? {
+        PoolRead::Stopped(pool) | PoolRead::Complete(pool) => pool,
+        PoolRead::Capped | PoolRead::Unproven => return Ok(None),
+    };
+    if !plan.satisfied_by(&pool) {
+        return Ok(None);
+    }
+    pool.finish();
+    Ok(verify_pins(&pool, &plan, joint, segment_start))
+}
+
+/// P4-P7 over the rows read.
+fn verify_pins(
+    pool: &CandidatePool,
+    plan: &PinPlan,
+    joint: &[&ChatMessage],
+    segment_start: usize,
+) -> Option<Vec<(i64, String)>> {
+    let by_event = pool
+        .messages
+        .iter()
+        .enumerate()
+        .map(|(row_index, row)| (row.event_id.as_str(), row_index))
+        .collect::<HashMap<_, _>>();
+    let handoff_row = match plan.handoff {
+        Some(index) => {
+            let [row] = pool
+                .switches
+                .iter()
+                .filter(|row| row.matches.contains(&index))
+                .collect::<Vec<_>>()
+                .try_into()
+                .ok()?;
+            // P6: a newer switch row means the history is stale against the log.
+            if pool.switches.iter().any(|other| other.id > row.id) {
+                return None;
+            }
+            // P7: a pinned row the handoff chain already folded.
+            let claimed = claimed_event_ids(pool, &[row]);
+            if plan.pins.iter().flatten().any(|id| claimed.contains(id)) {
+                return None;
+            }
+            Some(row)
+        }
+        None => None,
+    };
+    let shape = SegmentShape::new(joint.get(segment_start..)?)?;
+    let mut chosen: Vec<usize> = Vec::with_capacity(joint.len());
+    let mut taken = vec![false; pool.messages.len()];
+    let mut matched = Vec::with_capacity(joint.len());
+    if let Some(row) = handoff_row {
+        matched.push((row.id, row.event_id.clone()));
+    }
+    for (local, message) in joint.get(segment_start..)?.iter().enumerate() {
+        let joint_index = segment_start.saturating_add(local);
+        let pin = plan.pins.get(joint_index)?.as_deref()?;
+        let row_index = *by_event.get(pin)?;
+        let row = pool.messages.get(row_index)?;
+        if PoolRole::of(&message.role) != Some(row.role) || !row.matches.contains(&joint_index) {
+            return None;
+        }
+        if !shape.admits(local, row_index, &pool.messages, &chosen, &taken) {
+            return None;
+        }
+        if let Some(flag) = taken.get_mut(row_index) {
+            *flag = true;
+        }
+        chosen.push(row_index);
+        matched.push((row.id, row.event_id.clone()));
+    }
+    Some(matched)
+}
+
+/// Whether every message with recorded event ids resolved to one of them. A
+/// message without a recorded id is not checked.
+fn matches_recorded(matched: &[(i64, String)], recorded: &[&[String]]) -> bool {
+    recorded
+        .iter()
+        .zip(matched)
+        .all(|(ids, (_, event_id))| ids.is_empty() || ids.iter().any(|id| id == event_id))
+}
+
 pub(crate) async fn resolve_compaction_event_provenance(
     mem: &dyn Memory,
     principal: MemoryPrincipal,
@@ -813,7 +1005,7 @@ pub(crate) async fn resolve_compaction_event_provenance_detailed(
     source_messages: &[ChatMessage],
     companions: RoundCompanions<'_>,
 ) -> anyhow::Result<ProvenanceResolution> {
-    resolve_provenance_with_kept(mem, principal, source_messages, companions, &[]).await
+    resolve_provenance_with_kept(mem, principal, source_messages, companions, &[], &[]).await
 }
 
 /// [`resolve_compaction_event_provenance_detailed`] for `source_messages`
@@ -822,12 +1014,19 @@ pub(crate) async fn resolve_compaction_event_provenance_detailed(
 /// event ids recorded for it (empty when none). The assignment must be unique
 /// over source and `kept` together, and every kept message with a recorded id
 /// must claim exactly that row; only the source's rows are returned.
+///
+/// `source_recorded` gives the stored event ids of each source message, index
+/// for index (empty slice: none known). A source message with recorded ids
+/// must resolve to one of them, or the source is refused. When the pool read
+/// reaches [`POOL_MAX_ROWS`], the recorded ids of source and kept messages
+/// pin the rows instead ([`resolve_pinned`]).
 pub(crate) async fn resolve_provenance_with_kept(
     mem: &dyn Memory,
     principal: MemoryPrincipal,
     source_messages: &[ChatMessage],
     companions: RoundCompanions<'_>,
     kept: &[(&ChatMessage, Vec<String>)],
+    source_recorded: &[Vec<String>],
 ) -> anyhow::Result<ProvenanceResolution> {
     if principal.session_key.is_none() || source_messages.is_empty() {
         return Ok(ProvenanceResolution::Unavailable(ProvenanceGap::NoSessionKey));
@@ -845,6 +1044,23 @@ pub(crate) async fn resolve_provenance_with_kept(
         .filter(|(index, _)| !companions.is_companion(*index))
         .map(|(_, message)| message)
         .collect::<Vec<_>>();
+    // The recorded ids of the durable source messages (none without a full
+    // index-aligned slice), then of the kept messages.
+    let aligned = source_recorded.len() == source_messages.len();
+    let durable_recorded = (0..source_messages.len())
+        .filter(|index| !companions.is_companion(*index))
+        .map(|index| {
+            aligned
+                .then(|| source_recorded.get(index))
+                .flatten()
+                .map_or(&[][..], Vec::as_slice)
+        })
+        .collect::<Vec<&[String]>>();
+    let joint_recorded = durable_recorded
+        .iter()
+        .copied()
+        .chain(kept.iter().map(|(_, ids)| ids.as_slice()))
+        .collect::<Vec<&[String]>>();
     if durable_messages.is_empty()
         || durable_messages
             .iter()
@@ -864,13 +1080,22 @@ pub(crate) async fn resolve_provenance_with_kept(
     };
     let attachments = stored_attachments(mem, &principal).await;
     let forms = SourceForms::new(&joint_messages).with_attachments(attachments);
-    let pool = match load_complete_pool(mem, &principal, &forms).await? {
-        Ok(pool) => pool,
-        Err(gap) => return Ok(ProvenanceResolution::Unavailable(gap)),
-    };
-    let mut matched = match resolve_in_pool(&joint_messages, pool) {
-        Ok(matched) => matched,
-        Err(gap) => return Ok(ProvenanceResolution::Unavailable(gap)),
+    let mut matched = match page_pool(mem, &principal, &forms, POOL_MAX_ROWS, |_| false).await? {
+        PoolRead::Complete(mut pool) => {
+            pool.finish();
+            match resolve_in_pool(&joint_messages, pool) {
+                Ok(matched) => matched,
+                Err(gap) => return Ok(ProvenanceResolution::Unavailable(gap)),
+            }
+        }
+        // The pool is unproven complete: the recorded rows are the only proof.
+        PoolRead::Capped => match resolve_pinned(mem, &principal, &forms, &joint_messages, &joint_recorded).await? {
+            Some(matched) => matched,
+            None => return Ok(ProvenanceResolution::Unavailable(ProvenanceGap::TurnAmbiguous)),
+        },
+        PoolRead::Stopped(_) | PoolRead::Unproven => {
+            return Ok(ProvenanceResolution::Unavailable(ProvenanceGap::TurnAmbiguous));
+        }
     };
     // One row per message in history order: the source's rows lead.
     if matched.len() != joint_messages.len() {
@@ -891,6 +1116,11 @@ pub(crate) async fn resolve_provenance_with_kept(
         if claimed != expected {
             return Ok(ProvenanceResolution::Unavailable(ProvenanceGap::TurnAmbiguous));
         }
+    }
+    // Every source message with recorded event ids must have resolved to one of
+    // them: a different admissible row is a doubt, not an answer.
+    if !matches_recorded(&matched, joint_recorded.get(..source_count).unwrap_or_default()) {
+        return Ok(ProvenanceResolution::Unavailable(ProvenanceGap::TurnAmbiguous));
     }
     matched.truncate(source_count);
 
@@ -920,13 +1150,16 @@ pub(crate) async fn attach_compaction_event_provenance(
     source_messages: &[ChatMessage],
     companions: RoundCompanions<'_>,
     kept_acknowledged: &[(&ChatMessage, Vec<String>)],
+    source_recorded: &[Vec<String>],
     source: &mut CompactionAuditSource,
 ) {
-    let resolution = match resolve_compaction_event_provenance_detailed(
+    let resolution = match resolve_provenance_with_kept(
         &*audit.memory,
         audit.memory_principal(),
         source_messages,
         companions,
+        &[],
+        source_recorded,
     )
     .await
     {
@@ -940,6 +1173,7 @@ pub(crate) async fn attach_compaction_event_provenance(
                 source_messages,
                 companions,
                 kept_acknowledged,
+                source_recorded,
             )
             .await
             {

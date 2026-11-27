@@ -301,6 +301,7 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
             source_messages,
             compacted_companions,
             &kept_acknowledged,
+            recorded.get(start..compact_end).unwrap_or_default(),
             audit_source,
         )
         .await;
