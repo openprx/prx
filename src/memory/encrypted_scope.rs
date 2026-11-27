@@ -1230,6 +1230,25 @@ impl Memory for EncryptedScope {
             .collect())
     }
 
+    async fn session_transcript_rows(
+        &self,
+        principal: &MemoryPrincipal,
+        session_key: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<crate::memory::MessageEvent>> {
+        // Only rows this scope can open are returned, revealed; rows of other
+        // owners or unsealed rows stay in the store.
+        let events = self
+            .inner
+            .session_transcript_rows(principal, session_key, limit)
+            .await?;
+        Ok(events
+            .into_iter()
+            .filter(|event| self.owns_event(event))
+            .map(|event| self.reveal(event))
+            .collect())
+    }
+
     async fn excluded_transcript_rows(&self, row_ids: &[i64]) -> anyhow::Result<std::collections::HashSet<i64>> {
         self.inner.excluded_transcript_rows(row_ids).await
     }
