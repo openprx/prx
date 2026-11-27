@@ -371,6 +371,15 @@ impl ErasureStore for MemoryPool {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?
         };
+        // The memories are read while they still exist; their copies in tool
+        // results are rewritten after the delete, in this transaction.
+        let probes = super::derived_sweep::memory_probes(
+            &tx,
+            "SELECT workspace_id, owner_id, key, created_at FROM memories WHERE rowid IN (
+                SELECT record_rowid FROM ramflux_erase_index
+                WHERE account = ?1 AND conversation = ?2 AND message = ?3 AND table_name = 'memories')",
+            params![origin.account, origin.conversation, origin.message],
+        )?;
         let rebuild_fts = rows.iter().any(|(table, _)| table == "memories");
         for (table, rowid) in rows {
             anyhow::ensure!(TABLES.contains(&table.as_str()), "invalid erase index table");
@@ -387,6 +396,7 @@ impl ErasureStore for MemoryPool {
             // Drop obsolete FTS segments as well as their logical tombstones.
             tx.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')", [])?;
         }
+        super::derived_sweep::rewrite_memory_copies(&tx, &probes, &chrono::Utc::now().to_rfc3339())?;
         tx.commit()?;
         Ok(())
     }
