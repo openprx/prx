@@ -7,7 +7,9 @@
 //! attempts dropped as superseded, and older successful runs counted as
 //! `+k earlier`. The seen mark is a `schedule.result.seen` row holding the
 //! newest row id the note has read; the next turn reads only rows after it.
-//! Rows older than seven days are not shown but are covered by the mark.
+//! Rows older than seven days are not shown but are covered by the mark. A
+//! group whose newest row was delivered as a message is not shown; its older
+//! failed attempts are superseded, and the mark covers every row read.
 
 use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
@@ -90,7 +92,13 @@ pub(crate) async fn unseen_results_note(
             }),
         }
     }
-    let lines: Vec<String> = groups.iter().take(NOTE_MAX_LINES).map(Group::line).collect();
+    // A group whose newest row was sent as a message is already in the session.
+    let lines: Vec<String> = groups
+        .iter()
+        .filter(|group| !group.delivered())
+        .take(NOTE_MAX_LINES)
+        .map(Group::line)
+        .collect();
     let text = if lines.is_empty() {
         String::new()
     } else {
@@ -160,6 +168,11 @@ struct Group {
 }
 
 impl Group {
+    /// Whether the newest row of the group was delivered as a message.
+    fn delivered(&self) -> bool {
+        self.newest.get("delivered").and_then(Value::as_bool) == Some(true)
+    }
+
     /// `- <finished, to the minute> <name or id> <status>: <excerpt or error class> (transcript <session>)`
     fn line(&self) -> String {
         let payload = &self.newest;
