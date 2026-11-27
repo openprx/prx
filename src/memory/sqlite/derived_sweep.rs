@@ -312,15 +312,16 @@ impl MemoryProbe {
     }
 
     /// How the printed keys of a result (see [`printed_keys`]) name this
-    /// memory: by its key, or only by its redacted form.
-    fn naming(&self, printed: &[&HashSet<&str>]) -> Naming {
-        if printed.iter().any(|keys| keys.contains(self.key.as_str())) {
+    /// memory: by its key, or only by its redacted form. A key printed with
+    /// its separator swallowed by redaction can only be the redacted form.
+    fn naming(&self, printed: &[&PrintedKeys<'_>]) -> Naming {
+        if printed.iter().any(|keys| keys.exact.contains(self.key.as_str())) {
             Naming::Key
-        } else if self
-            .key_redacted
-            .as_deref()
-            .is_some_and(|key| printed.iter().any(|keys| keys.contains(key)))
-        {
+        } else if self.key_redacted.as_deref().is_some_and(|key| {
+            printed
+                .iter()
+                .any(|keys| keys.exact.contains(key) || keys.swallowed.contains(key))
+        }) {
             Naming::RedactedOnly
         } else {
             Naming::None
@@ -372,9 +373,13 @@ enum Naming {
     RedactedOnly,
 }
 
-/// True when a memory visible to a row of `workspace` and `owner` has a key
-/// whose redacted form is `redacted`. Redaction keeps the text before the first
-/// secret, so the candidates are the visible keys that start with that text.
+/// True when a memory visible to a row of `workspace` and `owner` may print
+/// as `redacted`: its key redacts to `redacted`, or `redacted` is its redacted
+/// key followed by `: ` (a `memory_recall` line of that memory whose content
+/// starts with a masked word, `- [core] k: [REDACTED] text`, also yields the
+/// key form `k: [REDACTED]`, see [`PrintedKeys::swallowed`]). Redaction keeps
+/// the text before the first secret, so the candidates are the visible keys
+/// that start with that text, or that `redacted` starts with before a `: `.
 fn redacted_form_survives(
     tx: &Connection,
     redacted: &str,
@@ -388,12 +393,20 @@ fn redacted_form_survives(
     let mut statement = tx.prepare(
         "SELECT key FROM memories
          WHERE (workspace_id IS NULL OR workspace_id = ?1) AND (owner_id IS NULL OR owner_id = ?2)
-           AND (?3 = '' OR instr(key, ?3) = 1)",
+           AND (?3 = '' OR instr(key, ?3) = 1 OR instr(?4, key || ': ') = 1)",
     )?;
-    let keys = statement.query_map(params![workspace, owner, prefix], |row| row.get::<_, Value>(0))?;
+    let keys = statement.query_map(params![workspace, owner, prefix, redacted], |row| {
+        row.get::<_, Value>(0)
+    })?;
     for key in keys {
-        if let Value::Text(key) = key?
-            && crate::security::redaction::redact_secrets(&key) == redacted
+        let Value::Text(key) = key? else {
+            continue;
+        };
+        let printed = crate::security::redaction::redact_secrets(&key);
+        if printed == redacted
+            || redacted
+                .strip_prefix(printed.as_str())
+                .is_some_and(|rest| rest.starts_with(": "))
         {
             return Ok(true);
         }
@@ -401,46 +414,81 @@ fn redacted_form_survives(
     Ok(false)
 }
 
+/// The keys a printed result holds (see [`printed_keys`]).
+#[derive(Default)]
+struct PrintedKeys<'a> {
+    /// Keys in the tool's own entry form.
+    exact: HashSet<&'a str>,
+    /// `memory_recall` keys that end in the redaction mask and whose `:`
+    /// separator the mask swallowed: redaction of the printed line carries an
+    /// unquoted value through the `:` that follows it, so
+    /// `- [core] token=<secret>: text` is stored as
+    /// `- [core] token=[REDACTED] text` (or `- [core] token=[REDACTED]` at
+    /// the end of the line). Only a redacted key form can match one.
+    swallowed: HashSet<&'a str>,
+}
+
+/// Start of a `memory_recall` entry line. An entry line may also start with
+/// the mask: an entry whose key names a credential and whose content is empty
+/// (`- [core] token:` at the end of its line) has the next line's `-` taken
+/// into the redacted value, so the next entry reads `[REDACTED] [core] key: text`.
+const RECALL_ENTRY_STARTS: [&str; 2] = ["- [", "[REDACTED] ["];
+
 /// The keys of the memory entries that the printed `output` of `tool` holds,
-/// each in the form the tool prints it; a key longer than `max_len` bytes is
-/// not collected (no probe has one). One pass over the output, so a result is
-/// parsed once however many probes there are:
+/// each in the form the tool prints it, as the stored (redacted) copy shows
+/// it; a key longer than `max_len` bytes is not collected (no probe has one).
+/// One pass over the output, so a result is parsed once however many probes
+/// there are:
 /// - `memory_recall` (`tools/memory_recall.rs`): `- [category] key: content`,
-///   or `- [category] key:` at the end of the line;
+///   or `- [category] key:` at the end of the line; a redacted key may have
+///   lost its `:` (see [`PrintedKeys::swallowed`]);
 /// - `memory_search` (`tools/memory_search.rs`): a line `- key: key`;
 /// - `memory_get` (`tools/memory_get.rs`, `render_range`): the output starts
 ///   with `key lines a-b:` (or `key is empty.`).
 ///
 /// A key may itself hold `] ` or `: `, so every split of a line that fits is
 /// collected; the probes decide which of them is a real key.
-fn printed_keys<'a>(tool: &str, output: &'a str, max_len: usize) -> HashSet<&'a str> {
-    let mut keys = HashSet::new();
+fn printed_keys<'a>(tool: &str, output: &'a str, max_len: usize) -> PrintedKeys<'a> {
+    let mut keys = PrintedKeys::default();
     match tool {
         "memory_recall" => {
-            for line in output.lines().filter(|line| line.starts_with("- [")) {
+            let mask = crate::security::redaction::REDACTED;
+            let ends_entry = |line: &str, at: usize| {
+                line.get(at..)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+            };
+            for line in output
+                .lines()
+                .filter(|line| RECALL_ENTRY_STARTS.iter().any(|start| line.starts_with(start)))
+            {
                 let ends: Vec<usize> = line
                     .match_indices(':')
                     .map(|(at, _)| at)
-                    .filter(|at| {
-                        line.get(at.saturating_add(1)..)
-                            .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
-                    })
+                    .filter(|at| ends_entry(line, at.saturating_add(1)))
+                    .collect();
+                let masked_ends: Vec<usize> = line
+                    .match_indices(mask)
+                    .map(|(at, _)| at.saturating_add(mask.len()))
+                    .filter(|end| ends_entry(line, *end))
                     .collect();
                 for (at, _) in line.match_indices("] ") {
                     let start = at.saturating_add(2);
-                    let first = ends.partition_point(|end| *end < start);
-                    for end in ends
-                        .iter()
-                        .skip(first)
-                        .take_while(|end| end.saturating_sub(start) <= max_len)
-                    {
-                        keys.extend(line.get(start..*end));
+                    for (found, set) in [(&ends, &mut keys.exact), (&masked_ends, &mut keys.swallowed)] {
+                        let first = found.partition_point(|end| *end < start);
+                        for end in found
+                            .iter()
+                            .skip(first)
+                            .take_while(|end| end.saturating_sub(start) <= max_len)
+                        {
+                            set.extend(line.get(start..*end));
+                        }
                     }
                 }
             }
         }
         "memory_search" => {
-            keys.extend(output.lines().filter_map(|line| line.strip_prefix("- key: ")));
+            keys.exact
+                .extend(output.lines().filter_map(|line| line.strip_prefix("- key: ")));
         }
         "memory_get" => {
             for marker in [" lines ", " is empty."] {
@@ -448,7 +496,7 @@ fn printed_keys<'a>(tool: &str, output: &'a str, max_len: usize) -> HashSet<&'a 
                     let rest = output.get(at..).unwrap_or_default();
                     let whole = marker != " is empty." || rest == marker || rest.starts_with(" is empty.\n");
                     if whole {
-                        keys.extend(output.get(..at));
+                        keys.exact.extend(output.get(..at));
                     }
                 }
             }
