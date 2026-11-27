@@ -6,6 +6,11 @@ use crate::agent::turn_contracts::ChatMode;
 use crate::agent::turn_engine::run_turn;
 use crate::agent::turn_request::{TurnDelivery, TurnRequest, TurnSchedule, TurnServices};
 use crate::agent::turn_tests::admission::AdmittedTurn;
+use crate::tools::capability::catalog::{CapabilityCatalog, CatalogSources, SurfacePolicy};
+use crate::tools::{
+    AdapterOwnedPreparation, DenyApprovalStrategy, SecurityEffectPolicy, ToolExecutionCommand, ToolExecutionService,
+    ToolExecutionStatus, TracingToolExecutionAudit,
+};
 
 fn workspace_config(workspace: &std::path::Path) -> crate::config::Config {
     let mut config = crate::config::Config::default();
@@ -25,6 +30,60 @@ fn project_tool_registry(dispatches: &Arc<Mutex<Vec<String>>>, names: &[&str]) -
             })
             .collect(),
     )
+}
+
+struct SurfaceProvider {
+    sends: AtomicUsize,
+}
+#[async_trait]
+impl Provider for SurfaceProvider {
+    async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+        anyhow::bail!("fixture requires a structured request")
+    }
+    async fn chat(&self, request: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+        self.sends.fetch_add(1, Ordering::SeqCst);
+        assert!(request.tools.expect("explicit publication").is_empty());
+        Ok(ChatResponse {
+            text: Some("ok".into()),
+            tool_calls: Vec::new(),
+            reasoning_content: None,
+        })
+    }
+}
+
+fn decision_free_surface(
+    tools: Vec<Box<dyn Tool>>,
+    tiering: crate::config::ToolTieringConfig,
+    channel: bool,
+    tool_calls_allowed: bool,
+) -> (ToolExecutionService, crate::tools::execution::admission::TurnSurface) {
+    let publication_policy = SurfacePolicy {
+        channel_allowed: channel,
+        ..SurfacePolicy::default()
+    };
+    let catalog = CapabilityCatalog::build(&tools, &CatalogSources::default(), &publication_policy).expect("catalog");
+    let security = crate::security::SecurityPolicy::default();
+    let service = ToolExecutionService::from_boxed(
+        tools,
+        Arc::new(SecurityEffectPolicy::new(Arc::new(security.clone()))),
+        Arc::new(DenyApprovalStrategy),
+        Arc::new(AdapterOwnedPreparation),
+        Arc::new(TracingToolExecutionAudit),
+    );
+    let surface = crate::tools::surface_owner::build(crate::tools::surface_owner::SurfaceParts {
+        execution: &service,
+        catalog: &catalog,
+        publication_policy: &publication_policy,
+        tiering: &tiering,
+        security: &security,
+        channel,
+        inherited_exclusions: &[],
+        sender: "prx_user",
+        channel_name: if channel { "wacli" } else { "cli" },
+        chat_type: if channel { "dm" } else { "private" },
+        tool_calls_allowed,
+    });
+    (service, surface)
 }
 
 /// An execution model outside the ingress binding is refused by `run_turn`
@@ -93,6 +152,61 @@ async fn execution_model_differs_from_bound_model_is_refused() {
         assert!(result.is_err(), "run_turn accepted {provider_name}/{model}");
         assert!(provider.requests().is_empty(), "a refused model reached the provider");
     }
+    assert!(dispatches.lock().unwrap().is_empty());
+}
+
+/// A source with tool calls disabled gets an empty surface from the
+/// production builder, so the provider sees no tools and a guessed name is denied.
+#[tokio::test]
+async fn source_without_tool_calls_gets_no_tool_surface() {
+    let dispatches = Arc::new(Mutex::new(Vec::new()));
+    let tools: Vec<Box<dyn Tool>> = vec![Box::new(RecordingTool {
+        name: "project_tool".to_owned(),
+        execution_order: Arc::clone(&dispatches),
+    })];
+    let (service, surface) = decision_free_surface(tools, crate::config::ToolTieringConfig::default(), false, false);
+    assert!(!surface.contains("project_tool"));
+    let specs: Vec<crate::tools::ToolSpec> = service
+        .descriptors()
+        .into_iter()
+        .filter(|descriptor| surface.contains(&descriptor.public_name))
+        .map(|descriptor| crate::tools::ToolSpec {
+            name: descriptor.public_name,
+            description: descriptor.description,
+            parameters: descriptor.parameters,
+        })
+        .collect();
+    assert!(specs.is_empty(), "no native-tool model may receive a tool schema");
+    let provider = SurfaceProvider {
+        sends: AtomicUsize::new(0),
+    };
+    provider
+        .chat(
+            ChatRequest {
+                messages: &[ChatMessage::user("reply")],
+                tools: Some(&specs),
+            },
+            "prx-local-model",
+            0.0,
+        )
+        .await
+        .expect("provider call with an empty surface");
+    let mut context = crate::tools::ToolExecutionContext::new(
+        crate::runtime::envelope::RuntimeEnvelope::agent("prx_workspace", "prx_session"),
+        "private",
+    )
+    .with_dispatch_origin(crate::tools::DispatchOrigin::ModelTurn);
+    assert!(context.admitted_binding.is_none());
+    context.turn_surface = Some(Arc::new(surface));
+    let outcome = service
+        .execute(
+            ToolExecutionCommand::new("project_tool", serde_json::json!({})),
+            context,
+            None,
+        )
+        .await;
+    assert_eq!(outcome.status, ToolExecutionStatus::Denied);
+    assert_eq!(provider.sends.load(Ordering::SeqCst), 1);
     assert!(dispatches.lock().unwrap().is_empty());
 }
 
