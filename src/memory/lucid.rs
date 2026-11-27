@@ -307,6 +307,10 @@ impl Memory for LucidMemory {
         self.local.excluded_transcript_rows(row_ids).await
     }
 
+    async fn newest_core_entries(&self, principal: &MemoryPrincipal, limit: usize) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.local.newest_core_entries(principal, limit).await
+    }
+
     async fn warm_transcript_index(&self) -> anyhow::Result<()> {
         self.local.warm_transcript_index().await
     }

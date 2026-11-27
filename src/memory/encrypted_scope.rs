@@ -335,6 +335,9 @@ impl Memory for EncryptedScope {
         self.inner.name()
     }
 
+    /// A re-store of unchanged content keeps the stored ciphertext. A fresh
+    /// nonce would make every re-store look like a content change to the inner
+    /// backend, which drops the session prefix rows of the owner.
     async fn store(
         &self,
         key: &str,
@@ -342,8 +345,13 @@ impl Memory for EncryptedScope {
         category: MemoryCategory,
         _session_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        let (stored_key, sealed, session, metadata) =
+        let (stored_key, mut sealed, session, metadata) =
             self.sealed_write(key, content, crate::memory::MemoryStoreMetadata::default())?;
+        if let Some(current) = self.inner.get(&stored_key).await?
+            && self.open_record(key, &current.content).as_deref() == Some(content)
+        {
+            sealed = current.content;
+        }
         self.inner
             .store_with_metadata(&stored_key, &sealed, category, Some(&session), metadata)
             .await

@@ -390,16 +390,31 @@ impl SqliteMemory {
 
                     // A core memory whose content, sensitivity or category changes
                     // leaves its owner's session prefix rows, so they go in this transaction.
+                    // A memory written without explicit metadata takes the workspace of the
+                    // trusted write context, so the row is found by the session memory index.
+                    let row_workspace = metadata.workspace_id.clone().or_else(|| ctx.workspace_id.clone());
+                    // Both the owner and workspace the row holds now and the ones it is written
+                    // under lose their prefix rows: an owner change moves the memory out of one index.
                     crate::memory::sqlite::rf_forget::drop_prefix_rows_of(
                         &tx,
                         "SELECT DISTINCT workspace_id, owner_id FROM memories
                          WHERE key = ?1 AND category = 'core'
-                           AND (content IS NOT ?2 OR sensitivity IS NOT ?3 OR ?4 <> 'core')",
-                        params![&key, &content, classified.sensitivity.as_str(), cat],
+                           AND (content IS NOT ?2 OR sensitivity IS NOT ?3 OR ?4 <> 'core'
+                                OR owner_id IS NOT ?5 OR workspace_id IS NOT ?6)
+                         UNION
+                         SELECT ?6, ?5 FROM memories
+                         WHERE key = ?1 AND category = 'core'
+                           AND (content IS NOT ?2 OR sensitivity IS NOT ?3 OR ?4 <> 'core'
+                                OR owner_id IS NOT ?5 OR workspace_id IS NOT ?6)",
+                        params![
+                            &key,
+                            &content,
+                            classified.sensitivity.as_str(),
+                            cat,
+                            owner_id.clone(),
+                            row_workspace.clone()
+                        ],
                     )?;
-                    // A memory written without explicit metadata takes the workspace of the
-                    // trusted write context, so the row is found by the session memory index.
-                    let row_workspace = metadata.workspace_id.clone().or_else(|| ctx.workspace_id.clone());
                     let changed = tx.execute(
                         &format!("INSERT INTO memories (
                         id, key, content, category, embedding, embedding_provider,
@@ -472,11 +487,25 @@ impl SqliteMemory {
                 } else {
                     let coalesce = super::agent_migration::scope_coalesce_set("memories");
                     let scope_guard = super::agent_migration::scope_conflict_guard("memories", false);
+                    // The owner and workspace the row holds now and the ones it is written under.
                     crate::memory::sqlite::rf_forget::drop_prefix_rows_of(
                         &tx,
                         "SELECT DISTINCT workspace_id, owner_id FROM memories
-                         WHERE key = ?1 AND category = 'core' AND (content IS NOT ?2 OR ?3 <> 'core')",
-                        params![&key, &content, cat],
+                         WHERE key = ?1 AND category = 'core'
+                           AND (content IS NOT ?2 OR ?3 <> 'core'
+                                OR owner_id IS NOT ?4 OR workspace_id IS NOT ?5)
+                         UNION
+                         SELECT ?5, ?4 FROM memories
+                         WHERE key = ?1 AND category = 'core'
+                           AND (content IS NOT ?2 OR ?3 <> 'core'
+                                OR owner_id IS NOT ?4 OR workspace_id IS NOT ?5)",
+                        params![
+                            &key,
+                            &content,
+                            cat,
+                            metadata.owner_id.clone(),
+                            metadata.workspace_id.clone()
+                        ],
                     )?;
                     let changed = tx.execute(
                         &format!(
