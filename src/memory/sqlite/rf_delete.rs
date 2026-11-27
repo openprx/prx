@@ -15,7 +15,8 @@
 //! compaction summaries (and the summaries built from those) and handoff
 //! notes built from a deleted event. A delete also takes the runs the turn
 //! spawned (child and grandchild sessions, by `parent_run_id`) with all their
-//! rows, each with its own `turn.deleted` record, and a message delete takes
+//! rows, each with its own `turn.deleted` record, the completion notices they
+//! sent to the parent session and the turns those notices woke there, and a message delete takes
 //! the scheduled-result rows of the job its message created (`correlation_id`).
 //! Every handoff note of a session created after the session's first deleted
 //! row goes, by position. Attachments that quoted deleted events, memories or
@@ -773,7 +774,27 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
     // The completion notices of the erased runs sit in the parent session; they
     // are deleted with the rows they report and count as direct sources, so the
     // memories, drafts and links made from them go too.
-    let announcements = announcement_events(tx, target, &children)?;
+    let mut announcements = announcement_events(tx, target, &children)?;
+    // The turn each deleted notice woke in the parent session reports the
+    // same result: its input, reply, tool rows and terminal go too.
+    let woken = {
+        let mut sources: Vec<&str> = rows.iter().map(|row| row.event_id.as_str()).collect();
+        sources.extend(announcements.iter().map(String::as_str));
+        announcement_turns(tx, target, &serde_json::to_string(&sources)?)?
+    };
+    for row in woken.iter().filter(|row| row.conversational()) {
+        for hash in [
+            SqliteMemory::scoped_content_hash(None, &row.content),
+            SqliteMemory::scoped_content_hash(row.scope.as_deref(), &row.content),
+        ] {
+            tx.execute("DELETE FROM embedding_cache WHERE content_hash = ?1", params![hash])?;
+        }
+        tx.execute(
+            "DELETE FROM retrieval_traces WHERE workspace_id = ?1 AND session_key = ?2 AND query = ?3",
+            params![target.workspace_id, target.session_key, row.content],
+        )?;
+    }
+    announcements.extend(woken.iter().map(|row| row.event_id.clone()));
     let mut direct_ids: Vec<String> = rows.iter().map(|row| row.event_id.clone()).collect();
     direct_ids.extend(announcements.iter().cloned());
     let direct = serde_json::to_string(&direct_ids)?;
@@ -788,6 +809,7 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
     )?;
     let contents = rows
         .iter()
+        .chain(woken.iter())
         .filter(|row| row.conversational() && !row.content.is_empty())
         .map(|row| row.content.as_str())
         .collect::<Vec<_>>();
@@ -922,12 +944,15 @@ fn announcement_events(tx: &Connection, target: &Target<'_>, children: &[Child])
         }
         done.push(&child.session_key);
         // The survival rule of `sweep_listings`, with the rows this delete
-        // rewrites not counted (the tombstone has not run yet). Accounting rows
-        // (`usage.settled`, written per metered run into the run's session and
-        // kept by this delete) are not content and do not make a session survive.
+        // rewrites not counted (the tombstone has not run yet). Rows the delete
+        // keeps that are not content do not make a session survive: accounting
+        // (`usage.settled`, written per metered run into the run's session) and
+        // the session prefix row (`context.prefix.recorded`, a fixed label with
+        // no run id, written once per session by `context/transcript/prefix_rows.rs`).
         let survives: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM message_events WHERE workspace_id = ?2 AND session_key = ?1
-                           AND event_type NOT IN ('message.deleted', 'turn.deleted', 'usage.settled')
+                           AND event_type NOT IN ('message.deleted', 'turn.deleted', 'usage.settled',
+                                                  'context.prefix.recorded')
                            AND event_id NOT IN (SELECT value FROM json_each(?3)))
                  OR EXISTS(SELECT 1 FROM conversation_turns c WHERE c.session_key = ?1 AND c.deleted_at IS NULL
                      AND (c.message_event_id IS NULL OR c.message_event_id NOT IN (SELECT value FROM json_each(?3)))
@@ -964,6 +989,49 @@ fn announcement_events(tx: &Connection, target: &Target<'_>, children: &[Child])
     Ok(found)
 }
 
+/// The rows of the turns that a deleted mailbox notice woke: among
+/// `sources` (a JSON array of the event ids this delete removes, the notices
+/// included), the rows of source `prx_mailbox`; a turn they woke has its input
+/// (`message.created`, role `user`) caused by the notice
+/// (`causation_event_id`, set from the adopted event by
+/// `gateway/api/sessions/mailbox.rs` and `RuntimeEnvelope::message_scope`) and
+/// its own run, and every row of that run goes: input, attachment, request
+/// and tool rows, reply, decision and terminal. The accounting row stays, as
+/// for the deleted run. Rows already among `sources` are left out. Matched by
+/// key only, never by text. Read before the tombstone.
+fn announcement_turns(tx: &Connection, target: &Target<'_>, sources: &str) -> anyhow::Result<Vec<EventRow>> {
+    let mut statement = tx.prepare(
+        "WITH notices(event_id) AS (
+             SELECT event_id FROM message_events
+             WHERE workspace_id = ?1 AND owner_id = ?2 AND source = 'prx_mailbox'
+               AND event_type = 'message.created' AND event_id IN (SELECT value FROM json_each(?3))),
+         woken(run_id) AS (
+             SELECT DISTINCT run_id FROM message_events
+             WHERE workspace_id = ?1 AND owner_id = ?2 AND event_type = 'message.created' AND role = 'user'
+               AND run_id IS NOT NULL AND causation_event_id IN (SELECT event_id FROM notices))
+         SELECT id, event_id, COALESCE(role, ''), COALESCE(content, ''), run_id, session_key, ma_scope_id
+         FROM message_events
+         WHERE workspace_id = ?1 AND owner_id = ?2 AND run_id IN (SELECT run_id FROM woken)
+           AND event_type NOT IN ('turn.deleted', 'usage.settled', 'message.deleted')
+           AND event_id NOT IN (SELECT value FROM json_each(?3))
+         ORDER BY id",
+    )?;
+    Ok(statement
+        .query_map(params![target.workspace_id, target.owner_id, sources], |row| {
+            Ok(EventRow {
+                id: row.get(0)?,
+                event_id: row.get(1)?,
+                role: row.get(2)?,
+                content: row.get(3)?,
+                run_id: row.get(4)?,
+                session_key: row.get(5)?,
+                scope: row.get(6)?,
+                schedule_result: false,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// Replace the printed text of listing results, workspace-wide and newer than
 /// the first erased row, that name an erased run id (and so its session key, as
 /// both are identifiers). A spawned run's session key is swept from the first
@@ -980,10 +1048,12 @@ fn sweep_listings(tx: &Connection, target: &Target<'_>, children: &[Child]) -> a
         }
         // The survival rule of `agent_erasure::erased_identifiers`, with the
         // tombstone event types not counted as rows (they are written here), and
-        // the kept accounting rows (`usage.settled`) not counted as content.
+        // the kept rows that are not content (`usage.settled` accounting, the
+        // `context.prefix.recorded` session prefix) not counted.
         let survives: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM message_events WHERE workspace_id = ?2 AND session_key = ?1
-                           AND event_type NOT IN ('message.deleted', 'turn.deleted', 'usage.settled'))
+                           AND event_type NOT IN ('message.deleted', 'turn.deleted', 'usage.settled',
+                                                  'context.prefix.recorded'))
                  OR EXISTS(SELECT 1 FROM conversation_turns c WHERE c.session_key = ?1 AND c.deleted_at IS NULL
                      AND (c.ma_scope_id IS NULL OR EXISTS(SELECT 1 FROM agent_scopes a
                          WHERE a.scope_id = c.ma_scope_id AND a.workspace_id = ?2)))",

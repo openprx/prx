@@ -24,6 +24,9 @@ pub(super) const MIN_IDENTIFIER_CHARS: usize = 32;
 
 /// Tool results of the memory tools that quote a memory's text.
 const MEMORY_TOOLS: [&str; 3] = ["memory_recall", "memory_search", "memory_get"];
+/// Tools whose call arguments carry a memory's key (`key`) and text
+/// (`content`), `tools/memory_store.rs`; it is the only memory write tool.
+const MEMORY_WRITE_TOOLS: [&str; 1] = ["memory_store"];
 pub(super) const MEMORY_REMOVED_TEXT: &str = "[output removed: it quoted a memory that was forgotten]";
 
 const TOOL_OUTPUT_KINDS: &str = "('tool_output', 'untrusted_external')";
@@ -341,9 +344,12 @@ pub(super) fn memory_probes(
 /// lies in the probe's workspace and owner, and prints the memory's key in the
 /// tool's own entry form (see [`MemoryProbe::named_in`]). A large output keeps
 /// its first part inline, so an entry printed past that part is not seen; the
-/// row is rewritten only when an entry it keeps names the key. Returns the
-/// number of rows rewritten. Not for age expiry: hygiene and retention do not
-/// call it.
+/// row is rewritten only when an entry it keeps names the key. The same
+/// transaction also rewrites the other rows that hold the memory's text by
+/// key: the execution terminal of each rewritten call (see
+/// [`rewrite_call_terminals`]) and the write calls that stored it (see
+/// [`rewrite_write_calls`]). Returns the number of rows rewritten. Not for age
+/// expiry: hygiene and retention do not call it.
 pub(super) fn rewrite_memory_copies(tx: &Connection, probes: &[MemoryProbe], now: &str) -> anyhow::Result<usize> {
     let Some(oldest) = probes.iter().map(|probe| probe.created_utc.as_str()).min() else {
         return Ok(0);
@@ -356,7 +362,8 @@ pub(super) fn rewrite_memory_copies(tx: &Connection, probes: &[MemoryProbe], now
     let tools = serde_json::to_string(&MEMORY_TOOLS)?;
     let mut statement = tx.prepare(
         "SELECT event_id, json_extract(raw_payload_json, '$.document.document_id'), content,
-                json_extract(raw_payload_json, '$.tool'), workspace_id, owner_id
+                json_extract(raw_payload_json, '$.tool'), workspace_id, owner_id, run_id,
+                json_extract(raw_payload_json, '$.call_id')
          FROM message_events
          WHERE event_type = 'tool.result.recorded'
            AND id >= COALESCE((SELECT MIN(id) FROM message_events WHERE created_at >= ?1), 9223372036854775807)
@@ -372,47 +379,158 @@ pub(super) fn rewrite_memory_copies(tx: &Connection, probes: &[MemoryProbe], now
     )?;
     let found = statement
         .query_map(params![oldest, probes_json, tools], |row| {
-            Ok((
+            Ok([
                 row.get::<_, Value>(0)?,
                 row.get::<_, Value>(1)?,
                 row.get::<_, Value>(2)?,
                 row.get::<_, Value>(3)?,
                 row.get::<_, Value>(4)?,
                 row.get::<_, Value>(5)?,
-            ))
+                row.get::<_, Value>(6)?,
+                row.get::<_, Value>(7)?,
+            ])
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(statement);
-    let rows: Vec<MatchedRow> = found
-        .into_iter()
-        .filter_map(|(event_id, document_id, content, tool, workspace, owner)| {
-            let (Value::Text(event_id), Value::Text(content), Value::Text(tool)) = (event_id, content, tool) else {
-                return None;
-            };
-            let workspace = match &workspace {
-                Value::Text(text) => Some(text.as_str()),
-                _ => None,
-            };
-            let owner = match &owner {
-                Value::Text(text) => Some(text.as_str()),
-                _ => None,
-            };
-            probes
-                .iter()
-                .any(|probe| probe.covers(workspace, owner) && probe.named_in(&tool, &content))
-                .then(|| MatchedRow {
-                    event_id,
-                    document_id: match document_id {
-                        Value::Text(text) => Some(text),
-                        _ => None,
-                    },
-                })
-        })
-        .collect();
-    if rows.is_empty() {
-        return Ok(0);
+    let mut rows: Vec<MatchedRow> = Vec::new();
+    let mut calls: Vec<CallRef> = Vec::new();
+    for [event_id, document_id, content, tool, workspace, owner, run_id, call_id] in found {
+        let (Value::Text(event_id), Value::Text(content), Value::Text(tool)) = (event_id, content, tool) else {
+            continue;
+        };
+        let (workspace, owner) = (text_of(workspace), text_of(owner));
+        if !probes
+            .iter()
+            .any(|probe| probe.covers(workspace.as_deref(), owner.as_deref()) && probe.named_in(&tool, &content))
+        {
+            continue;
+        }
+        if let (Some(workspace), Some(call_id)) = (workspace, text_of(call_id)) {
+            calls.push(CallRef {
+                workspace,
+                run_id: text_of(run_id),
+                call_id,
+            });
+        }
+        rows.push(MatchedRow {
+            event_id,
+            document_id: text_of(document_id),
+        });
     }
-    let documents = rewrite_rows(tx, &rows, MEMORY_REMOVED_TEXT, now)?;
-    delete_unquoted_documents(tx, &documents)?;
-    Ok(rows.len())
+    let mut rewritten = 0usize;
+    if !rows.is_empty() {
+        let documents = rewrite_rows(tx, &rows, MEMORY_REMOVED_TEXT, now)?;
+        delete_unquoted_documents(tx, &documents)?;
+        rewritten = rows.len();
+        rewritten = rewritten.saturating_add(rewrite_call_terminals(tx, &calls, now)?);
+    }
+    Ok(rewritten.saturating_add(rewrite_write_calls(tx, probes, now)?))
+}
+
+/// The text of a value, `None` for any other type.
+fn text_of(value: Value) -> Option<String> {
+    match value {
+        Value::Text(text) => Some(text),
+        _ => None,
+    }
+}
+
+/// The call of a rewritten tool result: its workspace, run and call id.
+struct CallRef {
+    workspace: String,
+    run_id: Option<String>,
+    call_id: String,
+}
+
+/// Replace the model text of the execution terminal of each call
+/// (`tool.execution.finalized`, written by `tools/execution/section_2.rs`
+/// `commit_idempotent_execution`; its payload keeps the outcome with
+/// `model_content` and the tool's `result.output`). The terminal is linked by
+/// key: same workspace and run, and `outcome.operation_id` equal to the call
+/// id (`agent/tool_scheduler.rs` uses the call id as operation id). A row with
+/// an unparseable payload or no outcome object is left as it is.
+fn rewrite_call_terminals(tx: &Connection, calls: &[CallRef], now: &str) -> anyhow::Result<usize> {
+    let mut rewritten = 0usize;
+    for call in calls {
+        let updated = tx.execute(
+            "UPDATE message_events SET
+                 raw_payload_json = CASE WHEN json_type(raw_payload_json, '$.outcome.result') = 'object'
+                     THEN json_set(raw_payload_json, '$.outcome.model_content', ?4, '$.outcome.result.output', ?4)
+                     ELSE json_set(raw_payload_json, '$.outcome.model_content', ?4) END,
+                 updated_at = ?5
+             WHERE workspace_id = ?1 AND event_type = 'tool.execution.finalized' AND run_id IS ?2
+               AND json_valid(raw_payload_json) AND json_type(raw_payload_json, '$.outcome') = 'object'
+               AND json_extract(raw_payload_json, '$.outcome.operation_id') = ?3",
+            params![call.workspace, call.run_id, call.call_id, MEMORY_REMOVED_TEXT, now],
+        )?;
+        rewritten = rewritten.saturating_add(updated);
+    }
+    Ok(rewritten)
+}
+
+/// Replace the stored text in the recorded calls of the memory write tools
+/// whose arguments name a forgotten key (`arguments.key`), in the probe's
+/// workspace and owner: `arguments.content` becomes the removed-text marker
+/// and the row's content (`<tool> <arguments>`, as `context/transcript/tool_rows.rs`
+/// writes it) is derived again from the rewritten arguments. The call stays a
+/// valid call for replay. No time bound: the call is recorded before the
+/// memory row exists, and every value stored under the key belongs to the
+/// forgotten memory. A row with an unparseable payload, non-object arguments
+/// or no `content` argument is left as it is; a row of a fenced scope too.
+fn rewrite_write_calls(tx: &Connection, probes: &[MemoryProbe], now: &str) -> anyhow::Result<usize> {
+    let mut keys: Vec<&str> = probes.iter().map(|probe| probe.key.as_str()).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    let mut statement = tx.prepare(
+        "SELECT event_id, workspace_id, owner_id, json_extract(raw_payload_json, '$.arguments.key')
+         FROM message_events
+         WHERE event_type = 'tool.call.recorded' AND json_valid(raw_payload_json)
+           AND json_extract(raw_payload_json, '$.tool') IN (SELECT value FROM json_each(?1))
+           AND json_type(raw_payload_json, '$.arguments.content') IS NOT NULL
+           AND json_extract(raw_payload_json, '$.arguments.key') IN (SELECT value FROM json_each(?2))
+           AND NOT EXISTS (SELECT 1 FROM agent_erase_fences f WHERE f.scope_id = message_events.ma_scope_id)",
+    )?;
+    let found = statement
+        .query_map(
+            params![
+                serde_json::to_string(&MEMORY_WRITE_TOOLS)?,
+                serde_json::to_string(&keys)?
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, Value>(0)?,
+                    row.get::<_, Value>(1)?,
+                    row.get::<_, Value>(2)?,
+                    row.get::<_, Value>(3)?,
+                ))
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    let mut rewritten = 0usize;
+    for (event_id, workspace, owner, key) in found {
+        let (Value::Text(event_id), Value::Text(key)) = (event_id, key) else {
+            continue;
+        };
+        let (workspace, owner) = (text_of(workspace), text_of(owner));
+        if !probes
+            .iter()
+            .any(|probe| key == probe.key && probe.covers(workspace.as_deref(), owner.as_deref()))
+        {
+            continue;
+        }
+        let updated = tx.execute(
+            "UPDATE message_events SET
+                 raw_payload_json = json_set(raw_payload_json, '$.arguments.content', ?2),
+                 content = json_extract(raw_payload_json, '$.tool') || ' '
+                     || json_extract(json_set(raw_payload_json, '$.arguments.content', ?2), '$.arguments'),
+                 content_hash = NULL, updated_at = ?3
+             WHERE event_id = ?1 AND event_type = 'tool.call.recorded' AND json_valid(raw_payload_json)
+               AND json_type(raw_payload_json, '$.arguments') = 'object'
+               AND typeof(json_extract(raw_payload_json, '$.tool')) = 'text'",
+            params![event_id, MEMORY_REMOVED_TEXT, now],
+        )?;
+        rewritten = rewritten.saturating_add(updated);
+    }
+    Ok(rewritten)
 }
