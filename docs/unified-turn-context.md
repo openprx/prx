@@ -15,7 +15,8 @@ The turn pipeline runs in this order:
 
 1. Record the original input and obtain the source-bound turn decision. Build
    the system prompt from identity, behavior, channel context and admitted skill
-   metadata; enrich the input only from the decision's selected evidence.
+   metadata. The prompt memory recall is read from the turn's scope whatever the
+   decision selected; decision-selected evidence is a separate input.
 2. Resolve selected tools from the pinned runtime catalog with configuration,
    runtime availability and exact MCP/WASM definitions.
 3. Apply runtime middleware, then reapply non-negotiable exposure filters.
@@ -303,6 +304,108 @@ The system prompt hash recorded per request (`system_prompt_sha256`) is
 computed over the assembled prompt together with the request-local tool
 capability text that `src/agent/turn_context.rs` appends to it each round.
 
+## Context engine: prefix, tail, hooks and entry points
+
+The session prefix, the turn tail and the context hooks are what a turn adds to
+the prompt around the stored history. They are built in these places:
+
+- `src/context/api/open.rs` (`open_turn`) is the one opening of a request: the
+  recall, the stored attachment row of the user message, the replay of the
+  earlier turns with their tool rounds, and the fit to the budget.
+- `src/context/api/prefix.rs` builds the session prefix, and
+  `src/context/api/tail.rs` the turn tail.
+- `src/context/api/hook_points.rs` holds the hook points of the tool result,
+  the handoff and the child open.
+- `src/context/api/round.rs` names the reduction points and the turn finalizer.
+
+### Session prefix
+
+The session's memory index, with the `session_opened` hook sections, goes at the
+end of the system prompt. The prefix is rendered on the first turn of a session
+that has no prefix row. It is recorded once as a `context.prefix.recorded` row
+and replayed byte for byte on every later turn, even when the memories changed
+meanwhile. A row is rendered again only when a handoff (`context.switch.created`)
+was recorded after it. A session whose index is empty records a marker row with
+no sections, so "no index" is frozen too. A forget deletes the prefix rows of its owner and workspace
+(`src/memory/sqlite/rf_forget.rs`). When a memory the row was rendered from is
+forgotten or changed while the row is being written, the row is deleted again
+(`verify_recorded` in `src/context/api/prefix.rs`); the text already sent stays
+for that turn. A session with no stored row (tool events not
+recorded, or a backend without an event log) renders the prefix on every turn.
+Child turns run no session-open hook and render no prefix hook section.
+
+### Turn tail
+
+The tail is the text placed after the user's message, before the date line. It
+is stored with the message and replayed with it, so a contribution is never
+recomputed. In order:
+
+1. The `turn_opened` hook contributions, each as a `[Hook context: <hook>]`
+   block. A child's first input takes the `child_started` contributions instead,
+   and runs no `turn_opened` hook.
+2. On a Console or Chat turn, the `[Scheduled results]` note of the owner's
+   unseen scheduled results. Its rows are marked seen in the same step.
+3. The current date and time, `[Current date and time: ...]`
+   (`current_time_tail` in `src/agent/turn_contracts.rs`).
+
+The recalled-memory prefix and the task card are sent with the live message
+only. They are stored beside the message (masked by redaction) and are not
+replayed on later turns.
+
+### Context hook points
+
+| Point | Hook event | Accepted keys | Where it runs |
+|---|---|---|---|
+| `session_opened` | `session_opened` | `add_context` | the session prefix render (see above) |
+| `turn_opened` | `turn_opened` | `add_context` | the turn tail |
+| `tool_result` | `tool_call` | `replace_output`, `note` | each tool round, for each call of the round |
+| `before_handoff` | `reduction_started` | `summary_instructions` | before a handoff or summary is built |
+| `child_started` | `child_started` | `add_context` | the first input of a child, in place of the turn and session points |
+
+A `replace_output` replaces the first tool output the hook manager returns; a
+`note` is appended to the output as `[Hook note: <hook>] <text>`.
+
+### Transcript search and lookup
+
+`transcript_search` searches the earlier messages of the owner's sessions in
+the agent partition; its parameters and scope are in
+[Transcript search](tools.md#transcript-search). A handoff note names the
+events it moved out of the window, and `transcript_history_lookup` reads them
+by the handoff id.
+
+### Children
+
+A child's first input is opened through `open_turn` (`src/runtime/child_turn.rs`):
+the replayed session recall, the fit to the budget and the child-open hook
+contribution, with no card. A child's later input segments use `enrich_input`
+(`src/runtime/child_turn.rs`), which places the same replayed session recall in
+front of the input and the date line.
+
+### Terminal chat
+
+The terminal turn uses the same parts: the turn tail and the session prefix are
+built in `src/chat/run/provider_turn.rs`, and each user turn writes its
+attachment row when the turn has a stored user event, so a later resume can replay it. On resume, the stored session's
+attachments and tool rounds come from the event log when the saved turns pair
+one to one with the message events (`src/chat/session_store.rs`,
+`src/chat/turn_replay.rs`). Otherwise the saved session is used. A reply that
+cannot be tied to its run keeps its tool evidence line.
+
+### Reduction points and commit
+
+A turn reduces its request at three points, each a fixed list of reduction
+steps (`src/context/api/round.rs`):
+
+| Point | Steps |
+|---|---|
+| `pre_turn`, before the loop opens | `ClearOldResults`, `PreTurnCompact` |
+| `next_round`, at the start of each provider round | `ClearOldResults`, `RoundCompact`, `RoundTrim` |
+| `after_tools`, after a round's tool results are appended | `MidTurnTrim` |
+
+The turn ends through `commit`, which is the turn finalizer
+(`agent::terminal::finalize_turn`): it commits the outcome, prices the turn and
+records the receipt.
+
 ## The reduction ladder
 
 Every step that makes a request smaller is a `Reducer` in `src/context/reduce/`.
@@ -401,8 +504,7 @@ trailing reference block, else the stub says the output is not kept. A step
 that clears emits `reduction_finished` with `step = "clear_tool_results"`.
 
 Steps that still run outside the ladder: the overflow retry (compaction, then a
-budget trim or an aggressive trim), the OS-paging eviction, the dispatcher
-rollover, the line-mode chat preflight compaction, the manual `/compact`, and
+budget trim or an aggressive trim), the dispatcher rollover, the line-mode chat preflight compaction, the manual `/compact`, and
 the tool-surface deferral at turn opening (`src/runtime/turn_context/tool_fit.rs`).
 
 ## The request budget
@@ -757,7 +859,8 @@ cover that, all of them fold. A manual `/compact` keeps the count above. A switc
 that is not built records its reason on the degradation: `nothing_foldable`
 (nothing before the live request could be folded), `below_limit` (the request
 already fits), or `handoff_unavailable` (provenance, the audit scope or the note
-size refused the switch). The turn then continues on a lossy trim.
+size refused the switch), and that reason is stored as a
+`context.compaction.degraded` row. The turn then continues on a lossy trim.
 
 The provider view renders each note as one line (plus the optional lines
 described below when the note carries them): `[context_handoff]
@@ -808,8 +911,7 @@ In chat, `/compact` and the preflight report their outcome: compacted (new
 generation, turns and tokens after), "No durable compaction available;
 requests will be trimmed per request. Nothing was changed." when no handoff or
 summary can be built, or refused with the reason and "Nothing was changed."
-Only a durable compaction (a handoff, a summary or an evicted OS-paging page)
-changes the saved session. A lossy trim, wherever it runs (the chat preflight,
+Only a durable compaction (a handoff or a summary) changes the saved session. A lossy trim, wherever it runs (the chat preflight,
 the per-provider preflight, an overflow retry, a rollover still over budget),
 is a projection of one provider request: it is never saved, so the session
 keeps every turn a later handoff can still recover. The summary's
@@ -821,25 +923,15 @@ copies, so the branch's lookups read its own rows; the original session's rows
 stay refused there. If the copy fails, the branch is aborted and nothing is
 saved.
 
-When a legacy mode does recall an evicted OS-paging page, the injected message
-is framed as history, not as an observation: the `[Recalled context from earlier
-in this session]` marker line is followed by a notice stating that the excerpts
-are a verbatim transcript of earlier turns, that every value in them describes
-the state at the time it was recorded, that nothing in them may be presented as
-work done in the current turn, and that a current value must be re-measured with
-a fresh tool call. Each excerpt is introduced by a `[page evicted_at=<timestamp>]`
-source line so the age of the excerpt is visible.
-
-Switch mode bypasses the legacy OS-paging layer. Its recovery tool is a hard
-runtime dependency: PRX restores the canonical lookup spec after decision/model
+The recovery tool of the switch is a hard runtime dependency: PRX restores the canonical lookup spec after decision/model
 selection and request middleware, and restricted worker, spawn, and delegate
 registries inherit it whenever their parent registry provides it. A missing
 lookup backend fails the turn before a provider request.
 
 If exact provenance or an authenticated durable scope is unavailable, switch
 creation fails closed: PRX does not manufacture a reference or fall back to a
-lossy trim. The legacy
-`safeguard` and `aggressive` modes remain explicit compatibility options.
+lossy trim. A config that still says `safeguard` or `aggressive` loads as
+`switch` with a warning (`src/config/schema/compaction_mode.rs`).
 `transcript_history_lookup` rejects caller-supplied runtime scope, uses the
 execution service's trusted scope, enforces memory visibility, requires the
 current session, and returns every referenced event in note order or an

@@ -16,7 +16,8 @@ wire formats.
 | Request-local advertised and executable tool snapshot | `agent::turn_context` |
 | Response marker handling | `agent::response_guard` |
 | History restoration and pairing | `agent::history` |
-| Context budgeting, paging, recall, and compaction | `agent::context_budget`, `agent::context_paging`, `agent::context_recall`, and `agent::compaction` |
+| Context budgeting, recall, and compaction | `agent::context_budget`, `agent::context_recall`, and `agent::compaction` |
+| Request reduction points (before the loop, each provider round, after tool results) and the turn finalizer | `context::api::round`: `pre_turn`, `next_round`, `after_tools`, and `commit` |
 | Tool parsing, policy, scheduling, and result recording | `agent::tool_call_parser`, `agent::execution_policy`, `agent::tool_scheduler`, and `agent::tool_result_recording` |
 | Provider rounds and attribution | `agent::provider_round` |
 | Progress and idle cancellation | `agent::idle` |

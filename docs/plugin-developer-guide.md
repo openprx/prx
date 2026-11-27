@@ -177,7 +177,9 @@ interface middleware-exports {
 
 `stage` is `inbound`, `outbound`, `llm_request` or `llm_response`. Return
 modified JSON. Invalid JSON keeps the original envelope. `outbound` runs once
-per accepted delivered turn. See [plugin-runtime-lifecycle.md](plugin-runtime-lifecycle.md).
+per accepted delivered turn. `inbound` and `llm_request` are request-only transforms: the
+messages (and, for `llm_request`, the tools) they return are the request the provider receives,
+and they are never written to the stored history or the message log. See [plugin-runtime-lifecycle.md](plugin-runtime-lifecycle.md).
 
 ### `cron` — `prx:plugin/cron-exports`
 
