@@ -66,9 +66,11 @@ pub(crate) async fn deliver_message(
     let Some(session) = event.session_key.as_deref() else {
         return Delivered::NoTarget;
     };
-    // A job created by a scheduled run or inside a child session carries that
-    // run's own inbound event. Its session is one nobody reads, so the result
-    // keeps its note for the task owner instead of a message into it.
+    // A job created by a scheduled run, a heartbeat or inside a child session
+    // carries that run's own inbound event. Its session is one nobody reads, so
+    // the result keeps its note for the task owner instead of a message into
+    // it. A delegate that copies its caller's creating event id leaves the
+    // caller's event here, whose source is the caller's, so delivery stays.
     if is_non_interactive_creator(session, &event.source) {
         return Delivered::NoTarget;
     }
@@ -113,12 +115,21 @@ pub(crate) async fn deliver_message(
     }
 }
 
-/// Whether the creating event belongs to a scheduled run or a child session.
+/// Whether the creating event belongs to a scheduled run, a heartbeat or a
+/// child session (spawned session, session worker or delegate).
 fn is_non_interactive_creator(session: &str, source: &MessageEventSource) -> bool {
     session.starts_with("cron:")
         || session.starts_with("xin:")
         || session.starts_with("spawn:")
-        || matches!(source, MessageEventSource::Cron | MessageEventSource::Xin)
+        || matches!(
+            source,
+            MessageEventSource::Cron
+                | MessageEventSource::Xin
+                | MessageEventSource::Heartbeat
+                | MessageEventSource::SessionsSpawn
+                | MessageEventSource::SessionWorker
+                | MessageEventSource::Delegate
+        )
 }
 
 /// The message body: a header naming the job and its finish time, the bounded
