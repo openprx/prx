@@ -2292,9 +2292,23 @@ is reported as declined, and PRX does not retry until a new subscribe.
   its subscribers, with no further attempt. A server that is removed from the configuration, retired
   by a reload, or no longer declares the capability loses its streams with one warning.
 - Subscriptions live in memory for the life of the PRX process. A restart forgets them, and nothing
-  is persisted. The update counts are kept per stream; notices into the subscribing session are
-  not delivered yet (a later lane). A session served by a process worker subscribes inside that
-  worker process, so its subscriptions live in that worker and end with it.
+  is persisted. The update counts are kept per stream. A session served by a process worker
+  subscribes inside that worker process, so its subscriptions live in that worker and end with it.
+- Notices reach the subscribing session's mailbox, so an idle session wakes and starts a turn, and a
+  busy one reads the notice after its turn. Each notice is a short text naming the server, the URI
+  and a count or a reason; it never carries resource contents. The sender is a notifier session
+  `mcp:notify:<agent>` of the same owner, and the message continues the chain of the subscribe call,
+  so a turn woken by a notice keeps the wake depth of that subscribe call plus one.
+  - Update notices are coalesced per subscriber and (server, URI): at most one per 2 s, and the
+    updates of a window are counted into the next notice. No update is dropped.
+  - After an outage the stream is back, each subscriber gets one "resumed" notice with the outage
+    length, and it should re-read the resource to catch up. When a subscription is ended by PRX
+    (declined on reconnect, server removed, legacy server, capability dropped) each subscriber gets
+    one "ended" notice; subscribe again to retry.
+  - A subscriber whose session no longer exists is removed from its subscription. Delivery needs the
+    SQLite memory backend and `inbound` enabled for the subscriber's agent; otherwise the notice is
+    not sent, `status` shows it under `undelivered` with the reason, and one warning is logged per
+    server and reason.
 - Unlike `call`, subscribe and unsubscribe skip the read-only autonomy check and the side-effect
   gate, as `read` does. No allowlist, confirmation or count limit applies. Logs carry server names,
   states and counts only, never a URI or notification content.
