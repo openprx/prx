@@ -2,7 +2,7 @@
 //!
 //! A discovered tool is exposed to the model as `<prefix>__<server>__<tool>`.
 //! Model providers accept function names only in `^[a-zA-Z0-9_-]{1,64}$`, so the
-//! server and tool parts are sanitized and an alias longer than 64 characters is
+//! prefix, server and tool parts are sanitized and an alias longer than 64 characters is
 //! shortened with a hash suffix. The original tool name is still what PRX sends to
 //! the server; an alias is resolved by exact lookup, never by reversing it.
 
@@ -50,9 +50,11 @@ struct Entry<'a> {
 pub(crate) fn alias_table<'a>(servers: impl IntoIterator<Item = (&'a str, &'a str, Vec<&'a str>)>) -> AliasTable {
     let mut entries: Vec<Entry<'a>> = Vec::new();
     for (server, prefix, tools) in servers {
+        // The prefix is operator or workspace text, so it is sanitized like the other parts.
+        let prefix_part = sanitize_part(prefix);
         let server_part = sanitize_part(server);
         for tool in tools {
-            let plain = format!("{prefix}__{server_part}__{}", sanitize_part(tool));
+            let plain = format!("{prefix_part}__{server_part}__{}", sanitize_part(tool));
             let candidate = if plain.len() <= MAX_ALIAS_LEN {
                 plain.clone()
             } else {
