@@ -154,28 +154,46 @@ pub(crate) async fn open_turn(input: OpenInput<'_>) -> TurnOpening {
     // K-H3: a child's first input takes the child-open contributions and runs
     // no turn-open or session-open hook; every other surface is unchanged.
     let child = hook_points::is_child_open(envelope.source);
-    let hook_tail = if child {
-        TurnTail {
-            text: hook_points::child_open_tail(TurnTailInput {
+    // The turn-open hooks and the session-open hooks are independent (the
+    // first turn of a session runs both), so they run concurrently: the first
+    // turn waits for the slower of the two, not for their sum. Each part has
+    // its own place in the request (the attachment tail, the system prompt
+    // prefix), so the output order does not depend on which finishes first.
+    // The session's frozen memory index goes at the end of the system prompt
+    // (the end of segment 4). Empty when the session has no index.
+    let compact = service.publication_scope().generation.effective.agent.compact_context;
+    let tail_future = async {
+        if child {
+            TurnTail {
+                text: hook_points::child_open_tail(TurnTailInput {
+                    memory,
+                    envelope,
+                    memory_config,
+                    visible_message,
+                    hooks,
+                })
+                .await,
+                ..TurnTail::default()
+            }
+        } else {
+            turn_tail(TurnTailInput {
                 memory,
                 envelope,
                 memory_config,
                 visible_message,
                 hooks,
             })
-            .await,
-            ..TurnTail::default()
+            .await
         }
-    } else {
-        turn_tail(TurnTailInput {
-            memory,
-            envelope,
-            memory_config,
-            visible_message,
-            hooks,
-        })
-        .await
     };
+    let prefix_future = session_prefix(SessionPrefixInput {
+        memory,
+        envelope,
+        memory_config,
+        compact,
+        hooks: if child { None } else { hooks },
+    });
+    let (hook_tail, prefix_text) = futures::future::join(tail_future, prefix_future).await;
     let attachment = Attachment {
         prefix,
         tail: format!(
@@ -200,17 +218,6 @@ pub(crate) async fn open_turn(input: OpenInput<'_>) -> TurnOpening {
         )
         .await;
     }
-    // The session's frozen memory index goes at the end of the system prompt
-    // (the end of segment 4). Empty when the session has no index.
-    let compact = service.publication_scope().generation.effective.agent.compact_context;
-    let prefix_text = session_prefix(SessionPrefixInput {
-        memory,
-        envelope,
-        memory_config,
-        compact,
-        hooks: if child { None } else { hooks },
-    })
-    .await;
     let system_prompt = if prefix_text.is_empty() {
         system_prompt
     } else {
