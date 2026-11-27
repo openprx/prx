@@ -14,13 +14,16 @@
 //!   double-quoted, the name kept, at any non-empty length, when the name is a
 //!   credential name ([`is_credential_key`]): a credential word or suffix
 //!   (`token`, `mytoken`, `PGPASSWORD`, `clientsecret`, `apikey`, ...) or any
-//!   name ending in `key` (`api_key`, `hmac_key`, `masterkey`, ...) unless its
-//!   stem is on the non-secret list (`sort_key`, `primary_key`, `public_key`,
-//!   `cache_key`, `idempotency_key`, ...); `tokenizer`, `secretary` and
-//!   `author` are not credential names either, and a `session_key` value is a
-//!   secret only when it looks like one (D-054 amendment 4). The bare names
-//!   `key` and `auth` count only as JSON object keys or in `key=` /
-//!   `--key=` form, not as `key:` in prose or YAML;
+//!   name ending in `key` (`api_key`, `hmac_key`, `masterkey`, `authkey`, ...)
+//!   unless its stem is on the non-secret list (`sort_key`, `primary_key`,
+//!   `public_key`, `cache_key`, `idempotency_key`, ...) or it is an English
+//!   word (`monkey`, `hotkey`); `tokenizer`, `secretary` and `author` are not
+//!   credential names either, and a `session_key`, pagination-token, cursor or
+//!   count value is a secret only when it looks like one (D-054 amendment 4).
+//!   The bare names `key` and `auth` count only as JSON object keys or in
+//!   `key=` / `--key=` form, not as `key:` in prose or YAML, and a bare `key`
+//!   value only when it looks like a key (`key=ABCDEF0123456789`, not
+//!   `"key": "PRX-58"`);
 //! - nested credential pairs after plain context names, including anyhow
 //!   error chains, and URL credential query values (with decoded names),
 //!   found before generic pair scanning using original input offsets;
@@ -47,6 +50,13 @@
 use regex::Regex;
 use std::ops::Range;
 use std::sync::LazyLock;
+
+mod names;
+
+use names::{
+    KEY_VALUE_MIN_LEN, KEY_VALUE_MIN_RUN, KeyName, classify_name, is_bare_auth, is_bare_key_or_auth, is_key_value_byte,
+    looks_like_a_key_value, looks_like_a_secret, names_a_credential,
+};
 
 /// What a redacted secret is replaced with.
 pub const REDACTED: &str = "[REDACTED]";
@@ -104,220 +114,6 @@ const AUTH_SCHEMES: [&str; 8] = [
     "apikey",
 ];
 
-/// Words that make a key a credential name when they are one of its segments.
-const CREDENTIAL_SEGMENTS: [&str; 14] = [
-    "token",
-    "secret",
-    "secrets",
-    "password",
-    "passwords",
-    "passwd",
-    "pwd",
-    "passphrase",
-    "credential",
-    "credentials",
-    "authorization",
-    "apikey",
-    "bearer",
-    "cookie",
-];
-
-/// Endings that make a run-together segment a credential name, as the
-/// pre-program detectors matched them unanchored: `mytoken`, `authtoken`,
-/// `PGPASSWORD`, `clientsecret`, `x_apikey`, `authheader`. `tokenizer`,
-/// `secretary` and `author` do not end with one.
-const CREDENTIAL_SUFFIXES: [&str; 9] = [
-    "token",
-    "secret",
-    "password",
-    "passwd",
-    "pwd",
-    "apikey",
-    "credential",
-    "credentials",
-    "authheader",
-];
-
-/// Stems before `key` that name a non-secret key (D-054 amendment 4): every
-/// other name ending in `key`, as a segment (`hmac_key`, `openai_key`) or run
-/// together (`masterkey`, `monkey`), is a credential name.
-const NON_SECRET_KEY_STEMS: [&str; 28] = [
-    "sort",
-    "primary",
-    "foreign",
-    "partition",
-    "cache",
-    "idempotency",
-    "public",
-    "dedup",
-    "dedupe",
-    "lookup",
-    "index",
-    "hash",
-    "row",
-    "map",
-    "group",
-    "shard",
-    "routing",
-    "cursor",
-    "sequence",
-    "order",
-    "unique",
-    "composite",
-    "natural",
-    "surrogate",
-    "object",
-    "bucket",
-    "message",
-    "conversation",
-];
-
-/// The stem whose key is a credential only when its value looks like one
-/// ([`looks_like_a_secret`]): a PRX session key (`telegram_sender-1`,
-/// `delegate:telegram:chat-1:alice`) is an identifier, a session secret is not.
-const SESSION_KEY_STEM: &str = "session";
-
-/// How a name ending in `key` classifies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KeyName {
-    Credential,
-    CredentialIfSecretShaped,
-    Plain,
-}
-
-/// Classify the stem before a `key` (a segment's prefix or the segment before).
-fn key_stem_class(stem: &str) -> KeyName {
-    if stem == SESSION_KEY_STEM {
-        KeyName::CredentialIfSecretShaped
-    } else if NON_SECRET_KEY_STEMS.contains(&stem) {
-        KeyName::Plain
-    } else {
-        KeyName::Credential
-    }
-}
-
-/// Whether a value has the shape of a secret rather than an identifier: 24+
-/// characters of a token alphabet (letters, digits, `+`, `/`, `=`, `-`), with
-/// both letters and digits, and not a canonical UUID.
-fn looks_like_a_secret(value: &str) -> bool {
-    let is_uuid = value.len() == 36
-        && value.char_indices().all(|(index, c)| {
-            if matches!(index, 8 | 13 | 18 | 23) {
-                c == '-'
-            } else {
-                c.is_ascii_hexdigit()
-            }
-        });
-    value.len() >= 24
-        && !is_uuid
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '-'))
-        && value.chars().any(|c| c.is_ascii_digit())
-        && value.chars().any(|c| c.is_ascii_alphabetic())
-}
-
-/// A key's segments, lower-cased: split on `_`, `-`, `.`, `:` and camelCase
-/// (`authToken` -> `auth`, `token`; `APIKey` -> `api`, `key`).
-fn key_segments(key: &str) -> Vec<String> {
-    let mut segments = Vec::new();
-    for part in key.split(['_', '-', '.', ':']).filter(|part| !part.is_empty()) {
-        let chars: Vec<char> = part.chars().collect();
-        let mut current = String::new();
-        for (index, c) in chars.iter().enumerate() {
-            let previous = index.checked_sub(1).and_then(|i| chars.get(i));
-            let next = chars.get(index + 1);
-            let boundary = c.is_ascii_uppercase()
-                && previous.is_some_and(|p| {
-                    p.is_ascii_lowercase()
-                        || p.is_ascii_digit()
-                        || (p.is_ascii_uppercase() && next.is_some_and(char::is_ascii_lowercase))
-                });
-            if boundary && !current.is_empty() {
-                segments.push(std::mem::take(&mut current));
-            }
-            current.push(c.to_ascii_lowercase());
-        }
-        if !current.is_empty() {
-            segments.push(current);
-        }
-    }
-    segments
-}
-
-/// Whether a segment names a credential on its own: a credential word or
-/// ending, or a run-together `…auth` (`oauth`, the audit log's `auth`
-/// suffix) other than the bare `auth` itself.
-fn is_credential_segment(segment: &str) -> bool {
-    CREDENTIAL_SEGMENTS.contains(&segment)
-        || CREDENTIAL_SUFFIXES.iter().any(|suffix| segment.ends_with(suffix))
-        || segment.strip_suffix("auth").is_some_and(|stem| !stem.is_empty())
-}
-
-/// How `key` classifies by its words, endings and `…key` compounds (the bare
-/// names `key` and `auth` are decided by where they appear).
-fn classify_name(key: &str) -> KeyName {
-    let segments = key_segments(key);
-    // Pagination tokens, count and budget names and cursors carry no
-    // credential unless the value looks like one (CE-64 follow-up).
-    if segments.iter().any(|segment| segment == "cursor")
-        || (segments.iter().any(|segment| segment == "token")
-            && segments.iter().any(|segment| {
-                matches!(
-                    segment.as_str(),
-                    "next" | "page" | "continuation" | "sync" | "count" | "limit" | "budget"
-                )
-            }))
-        || matches!(segments.as_slice(), [only] if only == "key")
-    {
-        return KeyName::CredentialIfSecretShaped;
-    }
-    let by_words = segments.iter().any(|segment| is_credential_segment(segment))
-        || segments
-            .windows(2)
-            .any(|pair| matches!(pair, [left, right] if left == "auth" && right == "header"))
-        // `x-auth`, `basic_auth`, `proxy_auth`: an `auth` segment after another
-        || (segments.len() > 1 && segments.last().is_some_and(|last| last == "auth"));
-    if by_words {
-        return KeyName::Credential;
-    }
-    // `…key` (D-054 amendment 4): a `key` word after another segment
-    // (`hmac_key`, `APIKey`), classified by its stem; the strongest
-    // classification among them wins. A run-together `monkey`, `hotkey` or
-    // `masterkey` is not a `key` word, so it is not a credential name.
-    let mut class = KeyName::Plain;
-    for (index, segment) in segments.iter().enumerate() {
-        if segment != "key" {
-            continue;
-        }
-        let stem = index
-            .checked_sub(1)
-            .and_then(|previous| segments.get(previous))
-            .map(String::as_str);
-        match stem.map(key_stem_class) {
-            Some(KeyName::Credential) => return KeyName::Credential,
-            Some(KeyName::CredentialIfSecretShaped) => class = KeyName::CredentialIfSecretShaped,
-            Some(KeyName::Plain) | None => {}
-        }
-    }
-    class
-}
-
-/// Whether `key` names a credential by its words, compounds and endings.
-fn names_a_credential(key: &str) -> bool {
-    classify_name(key) == KeyName::Credential
-}
-
-/// Whether the whole key is the bare name `key` or `auth`.
-fn is_bare_key_or_auth(key: &str) -> bool {
-    matches!(key_segments(key).as_slice(), [only] if only == "key" || only == "auth")
-}
-
-/// Whether the whole key is the bare name `auth`.
-fn is_bare_auth(key: &str) -> bool {
-    matches!(key_segments(key).as_slice(), [only] if only == "auth")
-}
-
 /// Whether `key`, as a JSON object key, names a credential (D-054 amendments
 /// 3 and 4): a credential word or ending, a `…key` name whose stem is not on
 /// the non-secret list, or the bare `auth`. A `session…key` and the bare `key`
@@ -328,12 +124,14 @@ pub fn is_credential_key(key: &str) -> bool {
 }
 
 /// Whether the value under `key` is a secret: always under a credential
-/// name, and under a `session…key` only when it looks like one.
+/// name, under a `session…key` or a pagination name only when it looks like
+/// one, and under the bare `key` only when it looks like a key.
 fn is_credential_value(key: &str, value: &str) -> bool {
     match classify_name(key) {
         KeyName::Credential => true,
         KeyName::CredentialIfSecretShaped => looks_like_a_secret(value),
-        KeyName::Plain => is_bare_key_or_auth(key),
+        KeyName::CredentialIfKeyShaped => looks_like_a_key_value(value),
+        KeyName::Plain => is_bare_auth(key),
     }
 }
 
@@ -450,10 +248,17 @@ struct PairValueScan {
     shape: Option<(usize, SecretShape)>,
 }
 
+/// What a value's bytes, read once up to its end, say about every suffix of
+/// it: a suffix starting at or after `valid_from` holds only token bytes.
 struct SecretShape {
     valid_from: usize,
     last_letter: Option<usize>,
     last_digit: Option<usize>,
+    /// The same for the alphabet of a bare `key` value.
+    key_valid_from: usize,
+    /// Where the last run of letters and digits long enough for a key, with
+    /// both a letter and a digit, starts.
+    last_key_run: Option<usize>,
 }
 
 impl PairValueScan {
@@ -478,6 +283,49 @@ impl PairValueScan {
         (body < self.end).then_some(body..self.end)
     }
 
+    /// The shape of the value ending at `value.end`, read once per end.
+    fn shape(&mut self, text: &str, value: &Range<usize>) -> Option<&SecretShape> {
+        if self.shape.as_ref().is_none_or(|(end, _)| *end != value.end) {
+            let source = text.get(value.clone())?;
+            let mut shape = SecretShape {
+                valid_from: value.start,
+                last_letter: None,
+                last_digit: None,
+                key_valid_from: value.start,
+                last_key_run: None,
+            };
+            let (mut run_start, mut run_letter, mut run_digit) = (value.start, false, false);
+            for (offset, byte) in source.bytes().enumerate() {
+                let position = value.start + offset;
+                if !byte.is_ascii_alphanumeric() && !matches!(byte, b'+' | b'/' | b'=' | b'-') {
+                    shape.valid_from = position + 1;
+                }
+                if !is_key_value_byte(byte) {
+                    shape.key_valid_from = position + 1;
+                }
+                if byte.is_ascii_alphabetic() {
+                    shape.last_letter = Some(position);
+                }
+                if byte.is_ascii_digit() {
+                    shape.last_digit = Some(position);
+                }
+                if byte.is_ascii_alphanumeric() {
+                    run_letter |= byte.is_ascii_alphabetic();
+                    run_digit |= byte.is_ascii_digit();
+                    if run_letter && run_digit && position + 1 - run_start >= KEY_VALUE_MIN_RUN {
+                        shape.last_key_run = Some(run_start);
+                    }
+                } else {
+                    (run_start, run_letter, run_digit) = (position + 1, false, false);
+                }
+            }
+            #[cfg(test)]
+            record_redaction_work(source.len());
+            self.shape = Some((value.end, shape));
+        }
+        self.shape.as_ref().map(|(_, shape)| shape)
+    }
+
     fn secret_shaped(&mut self, text: &str, value: &Range<usize>) -> bool {
         if value.len() < 24 {
             return false;
@@ -488,36 +336,86 @@ impl PairValueScan {
             record_redaction_work(4 * value.len());
             return text.get(value.clone()).is_some_and(looks_like_a_secret);
         }
-        if self.shape.as_ref().is_none_or(|(end, _)| *end != value.end) {
-            let Some(source) = text.get(value.clone()) else {
-                return false;
-            };
-            let mut shape = SecretShape {
-                valid_from: value.start,
-                last_letter: None,
-                last_digit: None,
-            };
-            for (offset, byte) in source.bytes().enumerate() {
-                let position = value.start + offset;
-                if !byte.is_ascii_alphanumeric() && !matches!(byte, b'+' | b'/' | b'=' | b'-') {
-                    shape.valid_from = position + 1;
-                }
-                if byte.is_ascii_alphabetic() {
-                    shape.last_letter = Some(position);
-                }
-                if byte.is_ascii_digit() {
-                    shape.last_digit = Some(position);
-                }
-            }
-            #[cfg(test)]
-            record_redaction_work(source.len());
-            self.shape = Some((value.end, shape));
-        }
-        self.shape.as_ref().is_some_and(|(_, shape)| {
+        self.shape(text, value).is_some_and(|shape| {
             shape.valid_from <= value.start
                 && shape.last_letter.is_some_and(|last| last >= value.start)
                 && shape.last_digit.is_some_and(|last| last >= value.start)
         })
+    }
+
+    /// [`looks_like_a_key_value`] on `value`, reading its bytes once per end.
+    /// A value starts after a separator, space or quote, so every run of
+    /// letters and digits that starts inside it is a whole run.
+    fn key_shaped(&mut self, text: &str, value: &Range<usize>) -> bool {
+        if value.len() < KEY_VALUE_MIN_LEN || text.get(value.start..).is_none_or(|tail| tail.starts_with(['/', '.'])) {
+            return false;
+        }
+        // UUID recognition reads at most 36 bytes, independently of nesting.
+        if value.len() == 36 {
+            #[cfg(test)]
+            record_redaction_work(4 * value.len());
+            return text.get(value.clone()).is_some_and(looks_like_a_key_value);
+        }
+        self.shape(text, value).is_some_and(|shape| {
+            shape.key_valid_from <= value.start && shape.last_key_run.is_some_and(|run| run >= value.start)
+        })
+    }
+}
+
+/// The first position at or after a query position where a byte predicate
+/// holds, cached: a query inside the last searched gap reuses its answer, so
+/// forward queries read each byte about once.
+#[derive(Default)]
+struct NextByte {
+    from: usize,
+    found: usize,
+}
+
+impl NextByte {
+    fn find(&mut self, text: &str, at: usize, stop: impl Fn(u8) -> bool) -> usize {
+        if self.from <= at && at <= self.found {
+            return self.found;
+        }
+        let tail = text.as_bytes().get(at..).unwrap_or_default();
+        let offset = tail.iter().position(|byte| stop(*byte)).unwrap_or(tail.len());
+        #[cfg(test)]
+        record_redaction_work(offset + 1);
+        self.from = at;
+        self.found = at + offset;
+        self.found
+    }
+}
+
+/// Where a bare value that stops at a quote (`String::from("abc123")`) ends
+/// once it takes the quoted literal with it: after the closing quote on the
+/// same line and whatever follows up to the next bare delimiter (whitespace,
+/// `,`, `;`, `{`, `}`), so `token = String::from("abc")` is masked whole and
+/// masking twice changes nothing. `None` when the quote does not close on
+/// its line.
+#[derive(Default)]
+struct QuotedTail {
+    double: NextByte,
+    single: NextByte,
+    delimiter: NextByte,
+}
+
+impl QuotedTail {
+    fn end(&mut self, text: &str, quote_at: usize) -> Option<usize> {
+        let quote = *text.as_bytes().get(quote_at)?;
+        let closes = match quote {
+            b'"' => &mut self.double,
+            b'\'' => &mut self.single,
+            _ => return None,
+        };
+        let close = closes.find(text, quote_at + 1, |byte| {
+            byte == quote || matches!(byte, b'\n' | b'\r')
+        });
+        if text.as_bytes().get(close) != Some(&quote) {
+            return None;
+        }
+        Some(self.delimiter.find(text, close + 1, |byte| {
+            byte.is_ascii_whitespace() || matches!(byte, b',' | b';' | b'{' | b'}')
+        }))
     }
 }
 
@@ -533,6 +431,7 @@ fn keyed_pair_spans(text: &str, url_parts: &[UrlPart], spans: &mut Vec<Range<usi
     #[cfg(test)]
     record_redaction_work(text.len());
     let mut values: [PairValueScan; 3] = std::array::from_fn(|_| PairValueScan::default());
+    let mut quoted_tail = QuotedTail::default();
     let mut covered_until = 0;
     let mut url_part = 0;
     // Only the header is consumed. In `failed: token = value` the next
@@ -585,10 +484,9 @@ fn keyed_pair_spans(text: &str, url_parts: &[UrlPart], spans: &mut Vec<Range<usi
         // A bare value that stops at a quote (`String::from("abc123")`) takes
         // the quoted literal with it, so the literal is masked too.
         if kind == 0
-            && let Some(quote @ ('"' | '\'')) = text.get(value.end..).and_then(|tail| tail.chars().next())
-            && let Some(close) = text.get(value.end + 1..).and_then(|tail| tail.find(quote))
+            && let Some(end) = quoted_tail.end(text, value.end)
         {
-            value.end += close + 2;
+            value.end = end;
         }
         if value.is_empty() {
             continue;
@@ -623,6 +521,7 @@ fn keyed_pair_spans(text: &str, url_parts: &[UrlPart], spans: &mut Vec<Range<usi
             && match class {
                 KeyName::Credential => true,
                 KeyName::CredentialIfSecretShaped => scan.secret_shaped(text, &value),
+                KeyName::CredentialIfKeyShaped => scan.key_shaped(text, &value),
                 KeyName::Plain => bare_key,
             };
         if credential && value.end > covered_until {
@@ -1268,7 +1167,6 @@ mod tests {
             "private.key",
             "passwordHash",
             "auth",
-            "key",
         ] {
             assert!(is_credential_key(key), "{key} is a credential name");
         }
@@ -1307,7 +1205,6 @@ mod tests {
         "openai_key",
         "hmacKey",
         "licensekey",
-        "monkey",
     ];
 
     const NON_SECRET_KEY_NAMES: &[&str] = &[
@@ -1446,12 +1343,12 @@ mod tests {
         }
         // the bare names in the forms that keep them (JSON keys, `=`)
         for text in [
-            "key=abcdefgh1234",
-            "--key=abcdefgh1234",
-            "auth=abcdefgh1234",
-            r#"{"key": "abcdefgh1234"}"#,
+            "key=abcdefgh12345678",
+            "--key=abcdefgh12345678",
+            "auth=abcdefgh12345678",
+            r#"{"key": "abcdefgh12345678"}"#,
         ] {
-            assert!(!redact_secrets(text).contains("abcdefgh1234"), "{text}");
+            assert!(!redact_secrets(text).contains("abcdefgh12345678"), "{text}");
         }
     }
 
