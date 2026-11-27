@@ -14,6 +14,8 @@ use base64::Engine;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+mod transcript_search;
+
 /// Encrypting view of `inner` for one `agent_account_id/conversation_id` scope.
 pub struct EncryptedScope {
     inner: Arc<dyn Memory>,
@@ -1226,6 +1228,17 @@ impl Memory for EncryptedScope {
             .filter(|event| self.owns_event(event))
             .map(|event| self.reveal(event))
             .collect())
+    }
+
+    async fn search_transcripts(
+        &self,
+        principal: &MemoryPrincipal,
+        query: &str,
+        session_key: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<crate::memory::traits::TranscriptHit>> {
+        self.search_sealed_transcripts(principal, query, session_key, limit)
+            .await
     }
 
     async fn load_session_context_before(
