@@ -149,6 +149,20 @@ turn has produced no text of its own; the first streamed token replaces it and
 progress notes stop. Channels that support typing indicators keep those
 refreshed throughout. Both are reports: neither can end anything.
 
+## Turn Opening On Channel Turns
+
+Every channel turn, the ramflux bridge included, opens through the same turn
+opening as the console, chat and gateway surfaces. The session's memory index
+goes into the system prompt, the `session_opened` and `turn_opened` hooks run,
+the unseen scheduled-results note is shown once, and the user message is stored
+with its attachment row (the memory preamble and the hook contributions, masked
+for secrets). Recall is bounded by the window of the model, as on those
+surfaces.
+
+The earlier turns of a channel conversation still come from the in-memory
+conversation cache, not from stored message events, so they carry no event ids.
+Group conversations keep the same visibility as before.
+
 ## Tools On Channel Turns
 
 In the current local candidate, an admitted channel input is recorded before

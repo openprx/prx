@@ -2473,7 +2473,7 @@ form. The stored tail is replayed byte for byte, so removing the hook does not
 change an earlier turn. Each contribution writes one audit row,
 `hook.contribution.recorded`, with the hook name, the point, the kind, the
 character count and the run id, never the text. Without a context action,
-nothing runs and nothing is stored. When tool events are not recorded the
+nothing runs and nothing is stored. Channel turns run these hooks too. When tool events are not recorded the
 prefix is not stored, so `session_opened` hooks run on every turn and a varying
 output changes the system prompt each turn.
 
