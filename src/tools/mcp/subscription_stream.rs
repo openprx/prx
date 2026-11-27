@@ -61,10 +61,20 @@ pub(super) async fn open(tool: &McpTool, server: &str, uri: &str) -> Result<Subs
         }
     };
     let era = tool.state.read().server_eras.get(server).copied();
-    if era != Some(McpEra::Modern) {
-        return Err(OpenFailure::Gone(anyhow!(
-            "server '{server}' speaks 2025-11-25; resource subscriptions need 2026-07-28 (legacy bridge M6e is planned)"
-        )));
+    match era {
+        Some(McpEra::Modern) => {}
+        Some(McpEra::Legacy) => {
+            return Err(OpenFailure::Gone(anyhow!(
+                "server '{server}' speaks 2025-11-25; resource subscriptions need 2026-07-28 (legacy bridge M6e is planned)"
+            )));
+        }
+        // Unknown is not legacy: the era is not recorded yet, so the attempt may be retried.
+        None => {
+            return Err(OpenFailure::Failed {
+                error: anyhow!("server '{server}' era not known yet; retry"),
+                retry_after: None,
+            });
+        }
     }
     if !declares_subscribe(attached.peer()) {
         return Err(OpenFailure::Gone(anyhow!(
@@ -112,14 +122,18 @@ pub(super) async fn run(hub: Arc<Hub>, key: (String, String), mut subscription: 
         let started = Instant::now();
         let reason = consume(&hub, &key, &mut subscription).await;
         drop(subscription);
-        if started.elapsed() >= STABLE_AFTER {
-            backoff = BACKOFF_FIRST;
-        }
+        // A stream that lived long enough was healthy: the next outage starts again at 1 s.
+        // A shorter one is still flapping, so its reopen waits longer even when it succeeds.
+        backoff = if started.elapsed() >= STABLE_AFTER {
+            BACKOFF_FIRST
+        } else {
+            backoff.saturating_mul(2).min(BACKOFF_MAX)
+        };
         let outage_started = Instant::now();
         hub.set_reconnecting(&key, reason);
         let mut retry_after = None;
         subscription = loop {
-            tokio::time::sleep(backoff.max(retry_after.unwrap_or_default())).await;
+            tokio::time::sleep(jittered(backoff).max(retry_after.unwrap_or_default())).await;
             match reconnect(&hub, &key).await {
                 Ok(next) => break next,
                 Err(OpenFailure::Declined) => {
@@ -175,6 +189,12 @@ async fn reconnect(hub: &Hub, key: &(String, String)) -> Result<Subscription, Op
         });
     };
     open(&tool, &key.0, &key.1).await
+}
+
+/// `base` with +/-20% random jitter, so reconnects of many streams do not align.
+fn jittered(base: Duration) -> Duration {
+    let factor = 0.8 + 0.4 * rand::random::<f64>();
+    Duration::try_from_secs_f64(base.as_secs_f64() * factor).unwrap_or(base)
 }
 
 /// Whether the server of `peer` declares `resources.subscribe`.
