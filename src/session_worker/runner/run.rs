@@ -4,8 +4,8 @@ use super::capability::{
     authenticate_worker_capability_with_key, compute_worker_capability_with_key, manifest_signing_payload,
 };
 use super::context::{
-    boxed_worker_segments, load_worker_shared_context, record_hybrid_worker_draft_if_needed,
-    with_manifest_spawn_context, worker_message_event_scope,
+    boxed_worker_segments, record_hybrid_worker_draft_if_needed, with_manifest_spawn_context,
+    worker_message_event_scope,
 };
 use super::paths::normalized_worker_memory_strategy;
 use super::prompt::{build_worker_system_prompt, build_worker_system_prompt_with_skills};
@@ -960,7 +960,6 @@ async fn run_owned_manifest(
         let security_ref = security.as_ref();
         let raw_task = manifest.task.as_str();
         let manifest_ref = &manifest;
-        let config_ref = &config;
         let prompt_config_ref = &tool_config;
         // The relay needs all three: the parent sealed it, the pipe is
         // authenticated, and the stdin reader that carries decisions is running.
@@ -1060,21 +1059,7 @@ async fn run_owned_manifest(
                             }
                         }
                         if initial_input {
-                            let mut user_task = if child_turn.is_some() {
-                                raw_task.to_owned()
-                            } else {
-                                let shared_context =
-                                    load_worker_shared_context(manifest_ref, config_ref, memory.as_ref()).await;
-                                if shared_context.trim().is_empty() {
-                                    raw_task.to_owned()
-                                } else {
-                                    format!("{shared_context}{raw_task}")
-                                }
-                            };
-                            if child_turn.is_none() {
-                                crate::agent::turn_contracts::push_current_time_tail(&mut user_task);
-                            }
-                            segment_history.push(crate::agent::turn_contracts::inbound_user_message(&user_task));
+                            segment_history.push(crate::agent::turn_contracts::inbound_user_message(raw_task));
                         }
                         if let (Some(turn), Some(segments)) = (child_turn.as_ref(), child_segments.as_ref()) {
                             if let Err(error) = turn.enrich_input(&mut segment_history).await {
