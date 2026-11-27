@@ -202,7 +202,7 @@ fn parse_context_arg(args: &serde_json::Value) -> Result<Option<ScheduledContext
 
 /// Parses the optional `deliver` argument. An unknown value is refused before any write.
 fn parse_deliver_arg(args: &serde_json::Value) -> Result<Option<ScheduledDeliver>, ToolResult> {
-    match args.get("deliver") {
+    match args.get("deliver").filter(|value| !value.is_null()) {
         None => Ok(None),
         Some(value) => serde_json::from_value::<ScheduledDeliver>(value.clone())
             .map(Some)

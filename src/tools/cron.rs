@@ -266,7 +266,7 @@ impl CronTool {
         let mut lineage = cron::lineage_from_trusted_scope(cfg, args);
         // A one-shot agent job an agent creates from a session reports back into
         // that session (K-R3b); every other job defaults to a note.
-        let deliver = match args.get("deliver") {
+        let deliver = match args.get("deliver").filter(|value| !value.is_null()) {
             None => {
                 // The default falls back to note on a store that cannot keep a
                 // message (Postgres); an explicit value is still refused by the store.
