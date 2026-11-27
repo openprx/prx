@@ -423,9 +423,10 @@ impl SqliteMemory {
                         embedding_model, embedding_dimensions, created_at, updated_at,
                         session_id, workspace_id, owner_id, channel, chat_type, chat_id,
                         sender_id, raw_sender, topic_id, visibility, sensitivity,
-                        risk_signals, policy_version, ma_scope_id
+                        risk_signals, policy_version, ma_scope_id,
+                        agent_id, persona_id, source_event_id, source
                      )
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)
                      ON CONFLICT(key) DO UPDATE SET
                         content = excluded.content,
                         category = excluded.category,
@@ -447,6 +448,10 @@ impl SqliteMemory {
                         sensitivity = excluded.sensitivity,
                         risk_signals = excluded.risk_signals,
                         policy_version = excluded.policy_version,
+                        agent_id = excluded.agent_id,
+                        persona_id = excluded.persona_id,
+                        source_event_id = excluded.source_event_id,
+                        source = excluded.source,
                         {coalesce}{owner_guard}{scope_guard}"),
                         params![
                             id,
@@ -473,6 +478,10 @@ impl SqliteMemory {
                             risk_json,
                             classified.policy_version,
                             bound_scope,
+                            metadata.agent_id.clone(),
+                            metadata.persona_id.clone(),
+                            metadata.source_event_id.clone(),
+                            metadata.source.clone(),
                         ],
                     )?;
                     if changed == 0 {
