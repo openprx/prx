@@ -2,7 +2,7 @@
 //! session-listing tool prints run ids and session keys; once the session or
 //! run is erased the printed text is replaced, in the erasing transaction.
 use super::rf_forget;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, params, types::Value};
 
 /// Tool results of the session-listing tools that name an erased run or session.
 pub(super) const LISTING_TOOLS: [&str; 8] = [
@@ -23,25 +23,57 @@ pub(super) const MIN_IDENTIFIER_CHARS: usize = 32;
 const TOOL_OUTPUT_KINDS: &str = "('tool_output', 'untrusted_external')";
 const UNTRUSTED_PREFIX: &str = "untrusted:";
 
+/// What an erase removed, for the listing sweep.
+pub(super) struct ErasedIdentifiers {
+    /// Run ids of the erased rows; a listing that names one was written after
+    /// `since_id`.
+    pub(super) run_ids: Vec<String>,
+    /// Smallest row id of the erased events.
+    pub(super) since_id: i64,
+    /// Session keys with no surviving row. Listings naming them are matched
+    /// from the first row: an earlier erase may have removed the session's
+    /// older rows while it still survived.
+    pub(super) swept_sessions: Vec<String>,
+}
+
 /// One tool-result row selected for rewriting.
 struct MatchedRow {
     event_id: String,
     document_id: Option<String>,
 }
 
-/// Replace the printed text of listing-tool results (in `workspace_id`, newer
-/// than `since_id`) that contain one of `identifiers`, then delete the stored
-/// tool-output documents that only those results named. Returns the number of
-/// rows rewritten. A row stays (the tool call and result pair must stay valid
-/// for replay); a row with an unparseable payload, a row of a fenced scope and
-/// a row of another tool are left as they are.
+/// Replace the printed text of listing-tool results in `workspace_id` that
+/// name an erased run (newer than `since_id`) or a swept session (any row),
+/// then delete the stored tool-output documents that only those results
+/// named. Returns the number of rows rewritten. A row stays (the tool call and
+/// result pair must stay valid for replay); a row with an unparseable payload
+/// or non-text content, a row of a fenced scope and a row of another tool are
+/// left as they are.
 pub(super) fn rewrite_listings(
     tx: &Connection,
     workspace_id: &str,
-    identifiers: &[String],
-    since_id: i64,
+    erased: &ErasedIdentifiers,
     now: &str,
 ) -> anyhow::Result<usize> {
+    let mut rows = select_listing_rows(tx, workspace_id, &usable(&erased.run_ids), erased.since_id)?;
+    rows.extend(select_listing_rows(
+        tx,
+        workspace_id,
+        &usable(&erased.swept_sessions),
+        0,
+    )?);
+    rows.sort_unstable_by(|left, right| left.event_id.cmp(&right.event_id));
+    rows.dedup_by(|left, right| left.event_id == right.event_id);
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let documents = rewrite_rows(tx, &rows, LISTING_REMOVED_TEXT, now)?;
+    delete_unquoted_documents(tx, &documents)?;
+    Ok(rows.len())
+}
+
+/// The identifiers long enough to match safely, sorted and without repeats.
+fn usable(identifiers: &[String]) -> Vec<&str> {
     let mut usable: Vec<&str> = identifiers
         .iter()
         .map(String::as_str)
@@ -49,13 +81,7 @@ pub(super) fn rewrite_listings(
         .collect();
     usable.sort_unstable();
     usable.dedup();
-    if usable.is_empty() {
-        return Ok(0);
-    }
-    let rows = select_listing_rows(tx, workspace_id, &usable, since_id)?;
-    let documents = rewrite_rows(tx, &rows, LISTING_REMOVED_TEXT, now)?;
-    delete_unquoted_documents(tx, &documents)?;
-    Ok(rows.len())
+    usable
 }
 
 fn select_listing_rows(
@@ -64,6 +90,9 @@ fn select_listing_rows(
     identifiers: &[&str],
     since_id: i64,
 ) -> anyhow::Result<Vec<MatchedRow>> {
+    if identifiers.is_empty() {
+        return Ok(Vec::new());
+    }
     let identifiers_json = serde_json::to_string(identifiers)?;
     let tools = serde_json::to_string(&LISTING_TOOLS)?;
     let mut statement = tx.prepare(
@@ -77,40 +106,75 @@ fn select_listing_rows(
     )?;
     let rows = statement
         .query_map(params![workspace_id, since_id, identifiers_json, tools], |row| {
+            let event_id: rusqlite::types::Value = row.get(0)?;
             let document_id: rusqlite::types::Value = row.get(1)?;
-            let content: String = row.get(2)?;
-            Ok((
-                MatchedRow {
-                    event_id: row.get(0)?,
-                    document_id: match document_id {
-                        rusqlite::types::Value::Text(text) => Some(text),
-                        _ => None,
-                    },
-                },
-                content,
-            ))
+            let content: rusqlite::types::Value = row.get(2)?;
+            Ok((event_id, document_id, content))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows
         .into_iter()
-        .filter(|(_, content)| identifiers.iter().any(|id| names_identifier(content, id)))
-        .map(|(row, _)| row)
+        .filter_map(|(event_id, document_id, content)| {
+            let (Value::Text(event_id), Value::Text(content)) = (event_id, content) else {
+                return None;
+            };
+            identifiers
+                .iter()
+                .any(|id| names_identifier(&content, id))
+                .then(|| MatchedRow {
+                    event_id,
+                    document_id: match document_id {
+                        Value::Text(text) => Some(text),
+                        _ => None,
+                    },
+                })
+        })
         .collect())
 }
 
+/// Characters an identifier is made of.
 fn is_identifier_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | ':' | '.' | '-')
 }
 
-/// True when `text` holds `identifier` followed by the end of the text or a
-/// character that cannot continue an identifier, so `child-segment:P:1` does
-/// not match `child-segment:P:12`.
+/// Characters that continue an identifier after a `.` or `:`.
+fn continues_after_separator(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '-')
+}
+
+/// True when `rest`, the text after a match, ends the identifier: the end of
+/// the text, a character outside the identifier set, or a `.` or `:` that
+/// closes a sentence or a label (`<id>.` at the end, `<id>: requested=...`).
+fn ends_identifier(rest: &str) -> bool {
+    let mut chars = rest.chars();
+    match chars.next() {
+        None => true,
+        Some('.' | ':') => chars.next().is_none_or(|next| !continues_after_separator(next)),
+        Some(next) => !is_identifier_char(next),
+    }
+}
+
+/// True when `text` holds `identifier` at a right boundary, so
+/// `child-segment:P:1` matches neither `child-segment:P:12` nor
+/// `child-segment:P:1:2`. Every occurrence is tried, overlapping ones too.
 fn names_identifier(text: &str, identifier: &str) -> bool {
-    text.match_indices(identifier).any(|(start, found)| {
-        text.get(start + found.len()..)
-            .and_then(|rest| rest.chars().next())
-            .is_none_or(|next| !is_identifier_char(next))
-    })
+    if identifier.is_empty() {
+        return false;
+    }
+    let mut from = 0;
+    while let Some(found) = text.get(from..).and_then(|tail| tail.find(identifier)) {
+        let start = from + found;
+        if text.get(start + identifier.len()..).is_some_and(ends_identifier) {
+            return true;
+        }
+        // Step one character past the start of this occurrence.
+        from = start
+            + text
+                .get(start..)
+                .and_then(|tail| tail.chars().next())
+                .map_or(1, char::len_utf8);
+    }
+    false
 }
 
 /// Replace the text of each row; returns the document ids the rows named.

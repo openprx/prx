@@ -410,35 +410,44 @@ fn verify(conn: &Connection, scopes: &str, keep_message_keys: bool, preserve_mem
 }
 
 /// Run ids and session keys of the rows an erase is about to delete, with the
-/// smallest of their row ids: the listing results that name them were written
-/// after that row. `None` when the scopes hold no rows. Session keys are only
-/// candidates here: a session shared with another agent survives the erase.
+/// smallest row id of its events: the listing results that name its runs were
+/// written after that row. `None` when the scopes hold no events or turns.
+/// Session keys are only candidates here: a session shared with another agent
+/// survives the erase. A value that is not text is skipped.
 fn listing_identifiers(conn: &Connection, scopes: &str) -> anyhow::Result<Option<ListingIdentifiers>> {
-    let Some(since_id) = conn.query_row(
+    let since_id = conn.query_row(
         "SELECT MIN(id) FROM message_events WHERE ma_scope_id IN (SELECT value FROM json_each(?1))",
         [scopes],
         |row| row.get::<_, Option<i64>>(0),
-    )?
-    else {
-        return Ok(None);
-    };
+    )?;
     let collect = |sql: &str| -> anyhow::Result<Vec<String>> {
         let mut statement = conn.prepare(sql)?;
-        Ok(statement
-            .query_map([scopes], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?)
+        let values = statement
+            .query_map([scopes], |row| row.get::<_, rusqlite::types::Value>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(values
+            .into_iter()
+            .filter_map(|value| match value {
+                rusqlite::types::Value::Text(text) => Some(text),
+                _ => None,
+            })
+            .collect())
     };
     let run_ids = collect(
         "SELECT DISTINCT run_id FROM message_events WHERE ma_scope_id IN (SELECT value FROM json_each(?1)) AND run_id IS NOT NULL",
     )?;
     let session_keys = collect(
-        "SELECT DISTINCT session_key FROM message_events WHERE ma_scope_id IN (SELECT value FROM json_each(?1))
-           AND session_key IS NOT NULL",
+        "SELECT session_key FROM message_events WHERE ma_scope_id IN (SELECT value FROM json_each(?1))
+           AND session_key IS NOT NULL
+         UNION SELECT session_key FROM conversation_turns WHERE ma_scope_id IN (SELECT value FROM json_each(?1))",
     )?;
+    if since_id.is_none() && session_keys.is_empty() {
+        return Ok(None);
+    }
     Ok(Some(ListingIdentifiers {
         run_ids,
         session_keys,
-        since_id,
+        since_id: since_id.unwrap_or(0),
     }))
 }
 
@@ -449,22 +458,35 @@ struct ListingIdentifiers {
     since_id: i64,
 }
 
-/// Run ids, plus the session keys that no `message_events` row names any more
-/// (call after the rows are erased): a session that still holds another
-/// agent's rows was not erased, so its listings stay.
-fn erased_identifiers(conn: &Connection, found: ListingIdentifiers) -> anyhow::Result<(Vec<String>, i64)> {
-    let mut identifiers = found.run_ids;
+/// The run ids of the erased rows, and the session keys that no row of
+/// `workspace_id` names any more (call after the rows are erased): a session
+/// that still holds another agent's events or turns was not erased, so its
+/// listings stay. A turn without a scope stamp cannot be placed in a
+/// workspace and keeps its session.
+fn erased_identifiers(
+    conn: &Connection,
+    workspace_id: &str,
+    found: ListingIdentifiers,
+) -> anyhow::Result<super::derived_sweep::ErasedIdentifiers> {
+    let mut swept_sessions = Vec::new();
     for key in found.session_keys {
         let survives: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM message_events WHERE session_key = ?1)",
-            [&key],
+            "SELECT EXISTS(SELECT 1 FROM message_events WHERE workspace_id = ?2 AND session_key = ?1)
+                 OR EXISTS(SELECT 1 FROM conversation_turns c WHERE c.session_key = ?1 AND c.deleted_at IS NULL
+                     AND (c.ma_scope_id IS NULL OR EXISTS(SELECT 1 FROM agent_scopes a
+                         WHERE a.scope_id = c.ma_scope_id AND a.workspace_id = ?2)))",
+            params![key, workspace_id],
             |row| row.get(0),
         )?;
         if !survives {
-            identifiers.push(key);
+            swept_sessions.push(key);
         }
     }
-    Ok((identifiers, found.since_id))
+    Ok(super::derived_sweep::ErasedIdentifiers {
+        run_ids: found.run_ids,
+        since_id: found.since_id,
+        swept_sessions,
+    })
 }
 
 pub(super) fn finish_history(memory: &SqliteMemory, work: &EraseWork) -> anyhow::Result<serde_json::Value> {
@@ -573,12 +595,11 @@ pub(super) fn finish_history(memory: &SqliteMemory, work: &EraseWork) -> anyhow:
             )
             .context(ErasureStep::EraseRows)?;
             if let Some(found) = listing {
-                let (identifiers, since_id) = erased_identifiers(&tx, found)?;
+                let erased = erased_identifiers(&tx, &work.workspace, found)?;
                 super::derived_sweep::rewrite_listings(
                     &tx,
                     &work.workspace,
-                    &identifiers,
-                    since_id,
+                    &erased,
                     &chrono::Utc::now().to_rfc3339(),
                 )?;
             }
