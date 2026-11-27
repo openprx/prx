@@ -684,7 +684,7 @@ struct Family {
     /// Completion notices of the erased runs.
     announcements: Vec<String>,
     /// Rows of the turns those notices woke, and of the turns woken by the
-    /// erased adopted rows an erased spawned run's session sent.
+    /// erased adopted rows an erased spawned run sent.
     woken: Vec<EventRow>,
 }
 
@@ -692,11 +692,11 @@ struct Family {
 /// the completion notices of those runs, the turns the notices woke and the
 /// runs those turns spawned, selected again until a pass finds no new run.
 /// Woken turns are followed from the notices of erased runs (found by sender
-/// session and the fixed notice head) and from the adopted rows in `rows` whose
-/// sender is the session of an erased spawned run (`child_adopted_rows`), never
-/// from an adopted row of any other sender that is in `rows` only because
-/// adoption stamped it with the run id. A woken
-/// turn's own session is never searched for notices, because only the spawned
+/// session and the fixed notice head) and from the adopted rows in `rows` that
+/// an erased spawned run sent while it was its session's run
+/// (`child_adopted_rows`), never from an adopted row of another sender or of a
+/// kept run that is in `rows` only because adoption stamped it with the run
+/// id. A woken turn's own session is never searched for notices, because only the spawned
 /// runs (`children`) name a sender session; so the messages the woken turn's
 /// session (usually the rf session) sends later are not family.
 fn select_family(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) -> anyhow::Result<Family> {
@@ -778,8 +778,8 @@ fn select_family(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Att
         let announcements = announcement_events(tx, target, &children)?;
         // The turn each deleted notice woke in the parent session reports the
         // same result: its input, reply, tool rows and terminal go too. So does
-        // the turn woken by an erased adopted row that an erased child's session
-        // sent (an interim message rather than the completion notice).
+        // the turn woken by an erased adopted row that an erased child run sent
+        // (an interim message rather than the completion notice).
         let woken = {
             let mut kept: Vec<&str> = rows.iter().map(|row| row.event_id.as_str()).collect();
             kept.extend(announcements.iter().map(String::as_str));
@@ -1159,7 +1159,7 @@ fn run_notices(tx: &Connection, target: &Target<'_>, child: &Child) -> anyhow::R
 
 /// The rows of the turns that a deleted completion notice woke: among
 /// `notices` (a JSON array of the event ids of the notices of erased runs and
-/// of the erased adopted rows an erased spawned run's session sent),
+/// of the erased adopted rows an erased spawned run sent),
 /// the rows of source `prx_mailbox`; a turn they woke has its input
 /// (`message.created`, role `user`) caused by the notice
 /// (`causation_event_id`, set from the adopted event by
@@ -1208,12 +1208,20 @@ fn announcement_turns(
 }
 
 /// The event ids of the adopted rows among `rows` (source `prx_mailbox`,
-/// `message.created`) whose sender is the session of an erased spawned run in
-/// `children`: a message such a run sent to another session, such as interim
-/// output that is not its completion notice. The turn each one woke reports the
-/// erased run's output and is followed like a notice's. An adopted row from any
-/// other sender is erased with the run (it is in `rows`) but the turn it woke is
-/// not followed. Matched by key only, never by text.
+/// `message.created`) that an erased spawned run in `children` sent while it
+/// was its session's run: a message such a run sent to another session, such
+/// as interim output that is not its completion notice. The turn each one woke
+/// reports the erased run's output and is followed like a notice's.
+///
+/// The adopted row carries the sender's session but not the sender's run
+/// (`Common::exec_run` is the recipient's live-run pin), so the run is found
+/// by row order (`id`, as the rest of this module orders rows): sender equal to
+/// the child's session, after the run's first row, and before the first row of
+/// the next run of that session that this delete keeps (no upper end when
+/// there is none). A message a kept later run of a continued child session
+/// sent is not followed, nor is an adopted row from any other sender; both are
+/// still erased when they are in `rows`. Matched by key and order only, never
+/// by text.
 fn child_adopted_rows(
     tx: &Connection,
     target: &Target<'_>,
@@ -1224,25 +1232,51 @@ fn child_adopted_rows(
         return Ok(Vec::new());
     }
     let ids = serde_json::to_string(&rows.iter().map(|row| row.event_id.as_str()).collect::<Vec<_>>())?;
-    let mut senders: Vec<&str> = children.iter().map(|child| child.session_key.as_str()).collect();
-    senders.sort_unstable();
-    senders.dedup();
-    let mut statement = tx.prepare(
-        "SELECT event_id FROM message_events
-         WHERE workspace_id = ?1 AND owner_id = ?2 AND source = 'prx_mailbox' AND event_type = 'message.created'
-           AND event_id IN (SELECT value FROM json_each(?3)) AND sender IN (SELECT value FROM json_each(?4))",
-    )?;
-    Ok(statement
-        .query_map(
+    let erased = serde_json::to_string(&children.iter().map(|child| child.run_id.as_str()).collect::<Vec<_>>())?;
+    let mut found: Vec<String> = Vec::new();
+    for child in children {
+        // The first row of a later run of the child session that the delete
+        // keeps: that run, not the erased one, is the session's run from there.
+        let next_kept: Option<i64> = tx.query_row(
+            "SELECT MIN(id) FROM message_events
+             WHERE workspace_id = ?1 AND owner_id = ?2 AND session_key = ?3 AND id > ?4
+               AND source <> 'prx_mailbox' AND run_id IS NOT NULL
+               AND run_id NOT IN (SELECT value FROM json_each(?5))
+               AND event_type NOT IN ('turn.deleted', 'message.deleted')",
             params![
                 target.workspace_id,
                 target.owner_id,
-                ids,
-                serde_json::to_string(&senders)?
+                child.session_key,
+                child.first_id,
+                erased
             ],
-            |row| row.get::<_, String>(0),
-        )?
-        .collect::<rusqlite::Result<Vec<_>>>()?)
+            |row| row.get(0),
+        )?;
+        let mut statement = tx.prepare(
+            "SELECT event_id FROM message_events
+             WHERE workspace_id = ?1 AND owner_id = ?2 AND source = 'prx_mailbox' AND event_type = 'message.created'
+               AND event_id IN (SELECT value FROM json_each(?3)) AND sender = ?4
+               AND id > ?5 AND (?6 IS NULL OR id < ?6)",
+        )?;
+        found.extend(
+            statement
+                .query_map(
+                    params![
+                        target.workspace_id,
+                        target.owner_id,
+                        ids,
+                        child.session_key,
+                        child.first_id,
+                        next_kept
+                    ],
+                    |row| row.get::<_, String>(0),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        );
+    }
+    found.sort_unstable();
+    found.dedup();
+    Ok(found)
 }
 
 /// Replace the printed text of listing results, workspace-wide and newer than
