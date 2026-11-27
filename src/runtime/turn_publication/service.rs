@@ -457,6 +457,25 @@ impl TurnRuntimeService {
         self.publication_scope().model_can_call_tools(proof)
     }
 
+    /// Whether the model of `proof` is served in the native tool wire format:
+    /// it may get tools, and the effective non-streaming capability the turn
+    /// engine uses for it is native. Otherwise tools travel as prompt text.
+    pub(crate) fn model_uses_native_tool_calls(
+        &self,
+        proof: &dyn TurnSourceProof,
+        provider: &dyn crate::providers::Provider,
+    ) -> bool {
+        let model = proof.model_name();
+        self.model_can_call_tools(proof)
+            && self
+                .effective_provider_capabilities(
+                    proof.provider_name(),
+                    model,
+                    provider.capabilities_for(model, crate::providers::traits::ProviderRequestMode::NonStreaming),
+                )
+                .native_tool_calling
+    }
+
     /// The pinned catalog entries this service's own executor serves with
     /// descriptor parity. A child's catalog is its parent's pinned one, so it
     /// can hold entries the child's executor does not run (interactive-only

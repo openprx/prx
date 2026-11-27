@@ -807,12 +807,16 @@ async fn run_owned_manifest(
         None
     };
     let native_tools = match (child_service.as_ref(), child_source_proof.as_ref()) {
-        (Some(service), Some(proof)) => service.model_can_call_tools(proof),
+        (Some(service), Some(proof)) => service.model_uses_native_tool_calls(proof, provider.as_ref()),
         (None, None) => {
-            provider
-                .capabilities_for(
+            crate::providers::selection::catalog_for(&config)
+                .effective_provider_capabilities(
+                    &manifest.provider_name,
                     &manifest.model,
-                    crate::providers::traits::ProviderRequestMode::NonStreaming,
+                    provider.capabilities_for(
+                        &manifest.model,
+                        crate::providers::traits::ProviderRequestMode::NonStreaming,
+                    ),
                 )
                 .native_tool_calling
         }

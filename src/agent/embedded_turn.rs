@@ -409,7 +409,7 @@ async fn run_work(
         skills: &skills,
         identity_config: Some(&agent.identity_config),
         bootstrap_max_chars: None,
-        native_tools: service.model_can_call_tools(source),
+        native_tools: service.model_uses_native_tool_calls(source, source.provider().as_ref()),
         autonomy: crate::runtime::turn_source::TurnSourceProof::child_scope(source).map_or_else(
             || service.security().autonomy,
             |scope| scope.gate_inputs().0.authority.level,
