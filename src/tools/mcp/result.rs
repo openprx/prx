@@ -5,9 +5,11 @@
 //! and blob content becomes a placeholder that states its type and size. No
 //! base64 payload is ever copied into the rendered text or into a log line.
 
+#[cfg(test)]
 use crate::tools::mcp::McpTool;
 use anyhow::bail;
 use rmcp::model::{CallToolResponse, CallToolResult, ContentBlock, ResourceContents};
+#[cfg(test)]
 use serde::Deserialize;
 
 /// Placeholder text for a result with neither content nor structured content.
@@ -51,8 +53,10 @@ pub(super) fn render_call_response(server_name: &str, response: CallToolResponse
     }
 }
 
+#[cfg(test)]
 impl McpTool {
     /// Value form of [`render_call_result`], for a result already held as JSON.
+    /// Only the tests use it: the call paths render the typed response.
     ///
     /// A value that is not a call result is reported as a failure with the
     /// parse error, never as a success with its raw JSON.

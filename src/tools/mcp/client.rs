@@ -5,6 +5,7 @@
 use super::http_session::{self, HttpSessionSlot, HttpSessions};
 use super::lifecycle::{self, McpEra};
 use super::listen::StaleSet;
+use super::result::render_call_response;
 use super::{DiscoveredToolMeta, McpClient, McpTool, mcp_http_client};
 use crate::config::McpServerConfig;
 use anyhow::bail;
@@ -189,16 +190,16 @@ impl McpTool {
 
         let outcome = tokio::time::timeout(
             request_timeout,
-            client.call_tool(Self::call_tool_params(tool_name, arguments)),
+            client.call_tool_once(Self::call_tool_params(tool_name, arguments)),
         )
         .await;
-        let result = match outcome {
-            Ok(Ok(result)) => result,
+        match outcome {
+            Ok(Ok(response)) => render_call_response(server_name, response),
             Ok(Err(error)) => {
                 if http_session::is_transport_failure(&error) {
                     http_session::reset_if_current(slot, &client).await;
                 }
-                return Err(http_session::with_authorization_hint(server_name, error.into()));
+                Err(http_session::with_authorization_hint(server_name, error.into()))
             }
             Err(_) => {
                 http_session::reset_if_current(slot, &client).await;
@@ -207,9 +208,6 @@ impl McpTool {
                     server.request_timeout_ms
                 );
             }
-        };
-
-        let value = serde_json::to_value(result)?;
-        Ok(Self::extract_call_success_and_output(&value))
+        }
     }
 }
