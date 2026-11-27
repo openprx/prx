@@ -6,6 +6,21 @@ use crate::providers::catalog::CatalogView as ProviderCatalogView;
 use crate::runtime::turn_publication::service::test_support::disabled_agent_service;
 use crate::runtime::turn_publication::service::{AgentDecisionBudgetError, TurnModelError};
 
+/// An adapter whose ceiling is native, so only the model's own
+/// `native_tools = false` declaration can make the wire format prompt-guided.
+struct NativeCeilingProvider;
+
+#[async_trait::async_trait]
+impl crate::providers::Provider for NativeCeilingProvider {
+    fn supports_native_tools(&self) -> bool {
+        true
+    }
+
+    async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+        anyhow::bail!("NativeCeilingProvider serves no requests")
+    }
+}
+
 #[tokio::test]
 async fn agent_budget_uses_pinned_route_and_read_only_spend_snapshot() {
     let workspace = tempfile::tempdir().expect("test workspace");
@@ -105,7 +120,7 @@ async fn agent_hint_route_drift_is_refused_before_credential_resolution() {
 }
 
 #[tokio::test]
-async fn verified_native_tools_requires_matching_source_selection() {
+async fn prompt_guided_model_can_call_tools_but_not_natively() {
     let workspace = tempfile::tempdir().expect("test workspace");
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.path().to_path_buf();
@@ -138,5 +153,6 @@ async fn verified_native_tools_requires_matching_source_selection() {
         .expect("configured model")
         .native_tools = Some(false);
     let stale = disabled_agent_service(&generation, &ProviderCatalogView::from_config(&foreign)).await;
-    assert!(!stale.model_can_call_tools(&proof));
+    assert!(stale.model_can_call_tools(&proof));
+    assert!(!stale.model_uses_native_tool_calls(&proof, &NativeCeilingProvider));
 }
