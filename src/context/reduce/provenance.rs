@@ -433,14 +433,22 @@ pub(crate) fn is_unproven_page_error(error: &anyhow::Error) -> bool {
             .is_some()
 }
 
+/// The rows a capped read holds and the oldest event id among them: a read
+/// continues below that id.
+pub(crate) struct PoolResume {
+    pool: CandidatePool,
+    oldest: i64,
+}
+
 /// How a paged read of the session's rows ended.
 pub(crate) enum PoolRead {
     /// A short page proved the session's first row was read.
     Complete(CandidatePool),
     /// The caller's stop condition held before the session's first row.
     Stopped(CandidatePool),
-    /// The rows read reached the bound before either of the above.
-    Capped,
+    /// The rows read reached the bound before either of the above: the rows
+    /// read so far, with the position to continue from.
+    Capped(PoolResume),
     /// The backend cannot page, or a page is incomplete.
     Unproven,
 }
@@ -451,11 +459,14 @@ pub(crate) enum PoolRead {
 /// Every page, the newest included, is read through
 /// `load_session_context_before`, which reports rows it would have to drop.
 /// The pool is returned as read: [`CandidatePool::finish`] is the caller's.
+/// With `resume`, the read continues below the capped read's oldest row and
+/// `max_rows` counts the rows read from there.
 async fn page_pool(
     mem: &dyn Memory,
     principal: &MemoryPrincipal,
     forms: &SourceForms,
     max_rows: usize,
+    resume: Option<PoolResume>,
     mut done: impl FnMut(&CandidatePool) -> bool,
 ) -> Result<PoolRead> {
     let query = || SessionContextQuery {
@@ -464,11 +475,18 @@ async fn page_pool(
         limit: POOL_PAGE_ROWS,
         include_roles: vec!["user".to_string(), "assistant".to_string()],
     };
-    let mut pool = CandidatePool::default();
     let mut rows_read = 0usize;
-    let mut oldest: Option<i64> = None;
-    // The newest page is "below" the largest possible id.
-    let mut page = match mem.load_session_context_before(query(), i64::MAX).await {
+    let (mut pool, mut oldest, first_before) = match resume {
+        Some(PoolResume { pool, oldest }) => {
+            if done(&pool) {
+                return Ok(PoolRead::Stopped(pool));
+            }
+            (pool, Some(oldest), oldest)
+        }
+        // The newest page is "below" the largest possible id.
+        None => (CandidatePool::default(), None, i64::MAX),
+    };
+    let mut page = match mem.load_session_context_before(query(), first_before).await {
         Ok(page) => page,
         Err(error) if is_unproven_page_error(&error) => return Ok(PoolRead::Unproven),
         Err(error) => return Err(error),
@@ -486,12 +504,15 @@ async fn page_pool(
         if done(&pool) {
             return Ok(PoolRead::Stopped(pool));
         }
-        if rows_read >= max_rows {
-            return Ok(PoolRead::Capped);
-        }
         let Some(before_id) = oldest else {
             return Ok(PoolRead::Unproven);
         };
+        if rows_read >= max_rows {
+            return Ok(PoolRead::Capped(PoolResume {
+                pool,
+                oldest: before_id,
+            }));
+        }
         page = match mem.load_session_context_before(query(), before_id).await {
             Ok(page) => page,
             Err(error) if is_unproven_page_error(&error) => return Ok(PoolRead::Unproven),
@@ -519,13 +540,15 @@ pub(crate) async fn load_pool_within(
     forms: &SourceForms,
     max_rows: usize,
 ) -> Result<Result<CandidatePool, ProvenanceGap>> {
-    Ok(match page_pool(mem, principal, forms, max_rows, |_| false).await? {
-        PoolRead::Complete(mut pool) => {
-            pool.finish();
-            Ok(pool)
-        }
-        PoolRead::Stopped(_) | PoolRead::Capped | PoolRead::Unproven => Err(ProvenanceGap::TurnAmbiguous),
-    })
+    Ok(
+        match page_pool(mem, principal, forms, max_rows, None, |_| false).await? {
+            PoolRead::Complete(mut pool) => {
+                pool.finish();
+                Ok(pool)
+            }
+            PoolRead::Stopped(_) | PoolRead::Capped(_) | PoolRead::Unproven => Err(ProvenanceGap::TurnAmbiguous),
+        },
+    )
 }
 
 /// The group structure of a segment: for each message its role, the user that
@@ -881,7 +904,7 @@ impl PinPlan {
 
 /// The `(row id, event id)` of every joint message, resolved from the rows
 /// the history itself recorded (the anchor-free fallback when the pool read
-/// reaches [`POOL_MAX_ROWS`], P1-P7 of the X4a design). Nothing is chosen
+/// reaches the row cap, P1-P7 of the X4a design). Nothing is chosen
 /// among candidates: each message must be the recorded row, admissible by
 /// session key, role, persisted form, order (A1, A3-A5), not an echo and not
 /// folded by the handoff. `None` is a refusal.
@@ -889,6 +912,8 @@ async fn resolve_pinned(
     mem: &dyn Memory,
     principal: &MemoryPrincipal,
     forms: &SourceForms,
+    capped: PoolResume,
+    max_rows: usize,
     joint: &[&ChatMessage],
     recorded: &[&[String]],
 ) -> Result<Option<Vec<(i64, String)>>> {
@@ -900,9 +925,15 @@ async fn resolve_pinned(
     if segment.len() > crate::tools::transcript_history_lookup::MAX_REFERENCED_EVENTS {
         return Ok(None);
     }
-    let mut pool = match page_pool(mem, principal, forms, POOL_MAX_ROWS, |pool| plan.satisfied_by(pool)).await? {
+    // The capped pool is verified as read; the read pages further (up to
+    // `max_rows` more rows) only while a pin or the handoff is still unseen.
+    let mut pool = match page_pool(mem, principal, forms, max_rows, Some(capped), |pool| {
+        plan.satisfied_by(pool)
+    })
+    .await?
+    {
         PoolRead::Stopped(pool) | PoolRead::Complete(pool) => pool,
-        PoolRead::Capped | PoolRead::Unproven => return Ok(None),
+        PoolRead::Capped(_) | PoolRead::Unproven => return Ok(None),
     };
     if !plan.satisfied_by(&pool) {
         return Ok(None);
@@ -1028,6 +1059,29 @@ pub(crate) async fn resolve_provenance_with_kept(
     kept: &[(&ChatMessage, Vec<String>)],
     source_recorded: &[Vec<String>],
 ) -> anyhow::Result<ProvenanceResolution> {
+    resolve_provenance_within(
+        mem,
+        principal,
+        source_messages,
+        companions,
+        kept,
+        source_recorded,
+        POOL_MAX_ROWS,
+    )
+    .await
+}
+
+/// [`resolve_provenance_with_kept`] with the pool row cap given: production
+/// passes [`POOL_MAX_ROWS`], tests a small one.
+pub(crate) async fn resolve_provenance_within(
+    mem: &dyn Memory,
+    principal: MemoryPrincipal,
+    source_messages: &[ChatMessage],
+    companions: RoundCompanions<'_>,
+    kept: &[(&ChatMessage, Vec<String>)],
+    source_recorded: &[Vec<String>],
+    pool_max_rows: usize,
+) -> anyhow::Result<ProvenanceResolution> {
     if principal.session_key.is_none() || source_messages.is_empty() {
         return Ok(ProvenanceResolution::Unavailable(ProvenanceGap::NoSessionKey));
     }
@@ -1080,7 +1134,7 @@ pub(crate) async fn resolve_provenance_with_kept(
     };
     let attachments = stored_attachments(mem, &principal).await;
     let forms = SourceForms::new(&joint_messages).with_attachments(attachments);
-    let mut matched = match page_pool(mem, &principal, &forms, POOL_MAX_ROWS, |_| false).await? {
+    let mut matched = match page_pool(mem, &principal, &forms, pool_max_rows, None, |_| false).await? {
         PoolRead::Complete(mut pool) => {
             pool.finish();
             match resolve_in_pool(&joint_messages, pool) {
@@ -1089,10 +1143,22 @@ pub(crate) async fn resolve_provenance_with_kept(
             }
         }
         // The pool is unproven complete: the recorded rows are the only proof.
-        PoolRead::Capped => match resolve_pinned(mem, &principal, &forms, &joint_messages, &joint_recorded).await? {
-            Some(matched) => matched,
-            None => return Ok(ProvenanceResolution::Unavailable(ProvenanceGap::TurnAmbiguous)),
-        },
+        PoolRead::Capped(capped) => {
+            match resolve_pinned(
+                mem,
+                &principal,
+                &forms,
+                capped,
+                pool_max_rows,
+                &joint_messages,
+                &joint_recorded,
+            )
+            .await?
+            {
+                Some(matched) => matched,
+                None => return Ok(ProvenanceResolution::Unavailable(ProvenanceGap::TurnAmbiguous)),
+            }
+        }
         PoolRead::Stopped(_) | PoolRead::Unproven => {
             return Ok(ProvenanceResolution::Unavailable(ProvenanceGap::TurnAmbiguous));
         }
