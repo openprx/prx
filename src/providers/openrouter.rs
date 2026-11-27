@@ -176,9 +176,9 @@ struct NativeResponseMessage {
 
 /// Mark the system message (when its text is over the cache threshold) and
 /// the conversation breakpoints, by the shared K-P1 rule. Native messages map
-/// one-to-one onto `messages`. A breakpoint on a message that is not plain text
-/// (a tool result, an assistant tool-call message, an empty message) is
-/// skipped, never reshaped.
+/// one-to-one onto `messages`. A breakpoint on a tool result marks its content;
+/// one on a message that cannot carry it (an assistant tool-call message
+/// without text, an empty message) moves to the nearest earlier message that can.
 fn apply_cache_marks(messages: &[ChatMessage], native: &mut [NativeMessage]) {
     if let Some((message, target)) = messages
         .iter()
@@ -205,13 +205,46 @@ fn apply_cache_marks(messages: &[ChatMessage], native: &mut [NativeMessage]) {
         .map(|message| message.role.as_str())
         .collect();
     for position in cache_breakpoints::conversation_breakpoint_indices(&roles) {
-        let Some(message_index) = non_system.get(position) else {
-            continue;
-        };
-        if let Some(target) = native.get_mut(*message_index) {
-            mark_plain_text(target);
+        // The breakpoint's own message first; an assistant tool-call message
+        // with no text cannot carry it, so walk back to the nearest earlier
+        // non-system message that can.
+        for message_index in non_system.iter().take(position + 1).rev() {
+            if let Some(target) = native.get_mut(*message_index) {
+                if mark_message(target) {
+                    break;
+                }
+            }
         }
     }
+}
+
+/// Mark one message when it can carry a breakpoint: plain text (see
+/// `mark_plain_text`) or a tool result with non-empty text, which is sent as
+/// the marked array form (Anthropic accepts `cache_control` on tool_result
+/// content). Returns whether the message now carries a mark.
+fn mark_message(message: &mut NativeMessage) -> bool {
+    if message.role == "tool" && message.tool_call_id.is_some() && message.tool_calls.is_none() {
+        return match message.content.take() {
+            Some(MessageContent::Text(text)) if !text.is_empty() => {
+                message.content = Some(MessageContent::Marked(vec![MarkedTextBlock {
+                    kind: "text",
+                    text,
+                    cache_control: CacheControl::ephemeral(),
+                }]));
+                true
+            }
+            Some(marked @ MessageContent::Marked(_)) => {
+                message.content = Some(marked);
+                true
+            }
+            other => {
+                message.content = other;
+                false
+            }
+        };
+    }
+    mark_plain_text(message);
+    matches!(message.content, Some(MessageContent::Marked(_)))
 }
 
 /// Switch a plain-text message to the marked array form. Only system, user and
