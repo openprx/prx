@@ -903,7 +903,16 @@ pub(super) async fn run_channel_turn(
         previous_turns,
         replay: crate::context::api::open::ReplayMode::FitToBudget,
         recall: crate::context::api::open::OpenRecall::ReplayedSession,
-        current_input_key: Some(channel_source.current_input_key.as_str()),
+        // The input is stored twice: the autosaved memory and, on scopes that keep
+        // conversation turns as memories (ramflux), the `convturn:` row that
+        // carries no source event. Both stay out of the recall of their own turn.
+        current_input_key: Some(
+            crate::agent::context_recall::join_input_keys(&[
+                channel_source.current_input_key.as_str(),
+                format!("convturn:{}:user:{}", history_key.canonical, channel_source.message_id).as_str(),
+            ])
+            .as_str(),
+        ),
         excluded_session: None,
         system_prompt,
         hooks: Some(ctx.hooks.as_ref()),

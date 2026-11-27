@@ -316,6 +316,19 @@ impl AgentContextBundle {
     }
 }
 
+/// Separator between the several stored keys one current input can have (its
+/// autosaved memory, its conversation-turn row).
+const INPUT_KEY_SEPARATOR: char = '\u{1f}';
+
+/// The `current_input_key` of a turn whose input is stored under several keys.
+pub(crate) fn join_input_keys(keys: &[&str]) -> String {
+    keys.join(&INPUT_KEY_SEPARATOR.to_string())
+}
+
+fn input_key_excluded(excluded: Option<&str>, key: &str) -> bool {
+    excluded.is_some_and(|excluded| excluded.split(INPUT_KEY_SEPARATOR).any(|own| own == key))
+}
+
 /// Shared identity for the live input across CLI, chat and embedded turns.
 pub(crate) fn current_input_memory_key(run_id: &str) -> String {
     format!("user_msg:{run_id}")
@@ -452,7 +465,7 @@ async fn build_semantic_context(
         .unwrap_or_default()
         .into_iter()
         .filter(|entry| entry.score.map_or(true, |score| score >= min_relevance_score))
-        .filter(|entry| excluded_key != Some(entry.key.as_str()))
+        .filter(|entry| !input_key_excluded(excluded_key, &entry.key))
         .filter(|entry| excluded_event.is_none() || entry.source_event_id.as_deref() != excluded_event)
         .filter(|entry| !unscoped_remote_hit(entry.origin, entry.source_event_id.as_deref()))
         .collect::<Vec<_>>();
@@ -524,7 +537,7 @@ async fn build_semantic_context(
         })
         .unwrap_or_default()
         .into_iter()
-        .filter(|hit| excluded_key != Some(hit.key.as_str()))
+        .filter(|hit| !input_key_excluded(excluded_key, &hit.key))
         .filter(|hit| excluded_event.is_none() || hit.source_event_id.as_deref() != excluded_event)
         .map(|hit| {
             let content = crate::memory::artifact_summary::bounded_artifact_summary(&hit.content).0;
