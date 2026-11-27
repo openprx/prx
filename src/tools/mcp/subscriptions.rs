@@ -33,9 +33,9 @@ fn registry() -> &'static Mutex<HashMap<PathBuf, Arc<Hub>>> {
 /// the `mcp_call` receipt.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct SubscriberKey {
-    owner: String,
-    session: String,
-    agent: String,
+    pub(super) owner: String,
+    pub(super) session: String,
+    pub(super) agent: String,
 }
 
 /// One subscriber of a stream, with the time it subscribed and the chain event

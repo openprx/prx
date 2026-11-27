@@ -1731,6 +1731,7 @@ mod lifecycle;
 mod listen;
 mod resources;
 pub(super) mod subscription_stream;
+mod notify;
 pub(super) mod subscriptions;
 mod result;
 mod workspace_overlay;
