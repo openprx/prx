@@ -352,6 +352,9 @@ async fn run_internal(
             super::message_inbox::pin_epoch(&config, &chat_session_key).await?;
             // The terminal session exists from here: its start carries the session key.
             let agent_started_at = std::time::Instant::now();
+            // Emits `agent_end` when an early error leaves this scope; disarmed at the normal end.
+            let mut agent_end_guard =
+                startup::AgentEndGuard::new(Arc::clone(&hooks), chat_session_key.clone(), agent_started_at);
             hooks
                 .emit_for(
                     &crate::hooks::HookIdentity::for_session_key(chat_session_key.clone(), "terminal"),
@@ -1082,6 +1085,7 @@ async fn run_internal(
                     }),
                 )
                 .await;
+            agent_end_guard.disarm();
             hooks
                 .emit_for(
                     &crate::hooks::HookIdentity::for_session_key(chat_session_key.clone(), "terminal"),

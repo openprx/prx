@@ -956,3 +956,47 @@ mod tests {
         );
     }
 }
+
+/// Emits the terminal `agent_end` hook when the run leaves its scope before the
+/// normal exit path did (an early `?` after `agent_start`). The normal exit path
+/// emits `agent_end` with the session's final state and calls [`Self::disarm`],
+/// so the event is emitted exactly once on every path. The emit only queues the
+/// event (the queue is drained at shutdown), so it is safe from `drop`.
+pub(super) struct AgentEndGuard {
+    hooks: Arc<crate::hooks::HookManager>,
+    session_key: String,
+    started_at: std::time::Instant,
+    armed: bool,
+}
+
+impl AgentEndGuard {
+    pub(super) fn new(hooks: Arc<crate::hooks::HookManager>, session_key: String, started_at: std::time::Instant) -> Self {
+        Self {
+            hooks,
+            session_key,
+            started_at,
+            armed: true,
+        }
+    }
+
+    /// The normal exit path emits `agent_end` itself.
+    pub(super) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for AgentEndGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        drop(self.hooks.emit_for(
+            &crate::hooks::HookIdentity::for_session_key(self.session_key.clone(), "terminal"),
+            crate::hooks::HookEvent::AgentEnd,
+            serde_json::json!({
+                "duration_ms": u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "tokens_used": serde_json::Value::Null,
+            }),
+        ));
+    }
+}
