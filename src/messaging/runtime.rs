@@ -125,6 +125,12 @@ impl MessagingRuntime {
         Ok(runtime)
     }
 
+    /// The runtime already serving `workspace_dir` in this process, if any,
+    /// without replacing its configuration (unlike [`Self::for_config`]).
+    pub(crate) fn running(workspace_dir: &std::path::Path) -> Option<Arc<Self>> {
+        RUNTIMES.get()?.lock().get(workspace_dir).and_then(Weak::upgrade)
+    }
+
     pub fn address(&self, owner: &str, session: &str, agent: &str) -> SessionAddr {
         SessionAddr::new(&self.instance, owner, session, Some(agent))
     }
