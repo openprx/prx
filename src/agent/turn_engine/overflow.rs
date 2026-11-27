@@ -129,11 +129,12 @@ pub(super) async fn recover_from_overflow(
                     degraded_reason = Some("over_hard_limit_after_handoff");
                 }
                 if !switch_mode || budget.over_hard_limit {
-                    let floor = replacement_floor.saturating_add(turn_history.replacement_offset());
                     turn_history.reshape(history, |view| {
                         let request = capture_current_turn_request(view);
                         trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
-                            view, config, floor,
+                            view,
+                            config,
+                            replacement_floor,
                         );
                         restore_current_turn_request(view, request, "overflow_retry", RestoredRequestPosition::Tail);
                     });

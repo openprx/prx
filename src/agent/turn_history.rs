@@ -74,8 +74,7 @@ enum MessageOrigin {
 /// It is the only history guards are built over, durable compactions (a
 /// handoff, a summary, an evicted page) are applied to, reducer patches are
 /// sourced from and the session is persisted from. It never holds a
-/// projection: no request enrichment, refresh note, recalled page,
-/// skill-metadata suppression, middleware rewrite or lossy trim. A
+/// projection: no request enrichment, refresh note, skill-metadata suppression, middleware rewrite or lossy trim. A
 /// `Vec<ChatMessage>` cannot become one: it is built from acknowledged turns
 /// ([`Self::from_acknowledged`]), and changed only by appending this turn's
 /// messages or by a durable compaction of itself.
@@ -577,15 +576,13 @@ pub(crate) struct RefreshNotes {
 
 /// Everything the provider view adds to, or takes from, the canonical history
 /// for one request: the current request's enrichment, the refresh aside of
-/// the last durable compaction, the recalled context page and the
-/// skill-metadata suppression. The inbound middleware rewrite (async) and the
+/// the last durable compaction and the skill-metadata suppression. The inbound middleware rewrite (async) and the
 /// per-request trims are applied to the projected view by the turn engine.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ProjectionInputs {
     /// The canonical plain request and the enriched form that replaces it.
     enriched_request: Option<(ChatMessage, ChatMessage)>,
     refresh_notes: Vec<(usize, ChatMessage)>,
-    recalled_page: Option<ChatMessage>,
     suppress_skill_metadata: bool,
     /// Keep every context handoff as stored instead of rendering it
     /// compactly: set for a caller without an acknowledged session, whose
@@ -947,13 +944,6 @@ impl TurnHistory {
     #[cfg(feature = "wasm-plugins")]
     pub(crate) const fn inbound_middleware_applied(&self) -> bool {
         self.inbound_middleware_applied
-    }
-
-    /// How many messages the projection inserts ahead of a compaction's
-    /// replacement (the recalled page sits right after the system prompt), so a
-    /// trim of the view preserves the same replacement.
-    pub(crate) fn replacement_offset(&self) -> usize {
-        usize::from(self.projection.recalled_page.is_some())
     }
 
     /// The provider view of the canonical history ([`project`]) before any

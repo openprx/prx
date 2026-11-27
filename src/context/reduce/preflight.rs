@@ -88,7 +88,6 @@ pub(crate) async fn preflight_durable_compaction(
         return Ok(PreflightCompaction::default());
     }
     let is_switch = matches!(config.mode, crate::config::AgentCompactionMode::Switch);
-    let replacement_offset = turn_history.replacement_offset();
     let canonical = turn_history.canonical_mut(view);
     let before = canonical.clone();
     // The request is the turn's own message: summary compaction cuts at the
@@ -108,7 +107,7 @@ pub(crate) async fn preflight_durable_compaction(
             canonical.restore_request_at_tail(request, trigger);
             Ok(PreflightCompaction {
                 source: Some(before),
-                replacement_len: Some(replacement_len.saturating_add(replacement_offset)),
+                replacement_len: Some(replacement_len),
                 degraded_reason: None,
             })
         }
