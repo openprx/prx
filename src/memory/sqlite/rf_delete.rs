@@ -499,22 +499,18 @@ fn children_of(rows: &[EventRow], descendants: &[String], target: &Target<'_>) -
         let Some(run) = row.run_id.as_deref().filter(|run| descendants.iter().any(|d| d == run)) else {
             continue;
         };
-        let index = match children.iter().position(|child| child.run_id == run) {
-            Some(index) => index,
-            None => {
-                children.push(Child {
-                    run_id: run.to_owned(),
-                    session_key: row.session_key.clone().unwrap_or_else(|| target.session_key.to_owned()),
-                    scope: row.scope.clone(),
-                    first_id: row.id,
-                    first_user: None,
-                    event_ids: Vec::new(),
-                    contents: Vec::new(),
-                });
-                children.len() - 1
-            }
-        };
-        if let Some(child) = children.get_mut(index) {
+        if !children.iter().any(|child| child.run_id == run) {
+            children.push(Child {
+                run_id: run.to_owned(),
+                session_key: row.session_key.clone().unwrap_or_else(|| target.session_key.to_owned()),
+                scope: row.scope.clone(),
+                first_id: row.id,
+                first_user: None,
+                event_ids: Vec::new(),
+                contents: Vec::new(),
+            });
+        }
+        if let Some(child) = children.iter_mut().find(|child| child.run_id == run) {
             child.first_id = child.first_id.min(row.id);
             if child.first_user.is_none() && row.role == "user" {
                 child.first_user = Some(row.event_id.clone());
@@ -698,7 +694,7 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
             child
                 .first_user
                 .as_deref()
-                .or(child.event_ids.first().map(String::as_str))
+                .or_else(|| child.event_ids.first().map(String::as_str))
                 .unwrap_or_default(),
             &child_contents,
         )?;
@@ -722,7 +718,7 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
     // A summary of a summary: each pass matches the deleted ids plus the
     // summary events found so far and handles only the compaction runs no
     // earlier pass found, so the loop ends when a pass finds none new.
-    let mut summary_sources = direct_ids.clone();
+    let mut summary_sources = direct_ids;
     let mut handled_runs: Vec<String> = Vec::new();
     loop {
         let found = erase_compactions(
@@ -1077,7 +1073,7 @@ fn record_deleted(
         let fields = DeletedHeader {
             session_key: target.session_key,
             agent: &attempt.agent_key,
-            incarnation,
+            incarnation: &incarnation,
             run_id: attempt.run_id.as_deref(),
             event_id: &event_id,
             message_id: &message_id,
