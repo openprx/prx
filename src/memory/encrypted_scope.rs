@@ -666,6 +666,30 @@ impl Memory for EncryptedScope {
             .map(|event| self.reveal(event)))
     }
 
+    /// Statuses of the final rows of the runs, read from the inner rows: a row
+    /// this scope can open is revealed; a sealed row of another scope is
+    /// dropped; a plaintext row (a turn of a plain surface, which a seen mark
+    /// may name) is read as stored. Only statuses leave, never content.
+    async fn turn_final_statuses(
+        &self,
+        workspace_id: &str,
+        owner_id: &str,
+        run_ids: &[String],
+    ) -> anyhow::Result<std::collections::HashMap<String, String>> {
+        let rows = self.inner.turn_final_rows(workspace_id, owner_id, run_ids).await?;
+        Ok(crate::memory::traits::final_statuses_of(rows.into_iter().filter_map(
+            |event| {
+                if self.owns_event(&event) {
+                    Some(self.reveal(event))
+                } else if self.looks_sealed(&event.content) {
+                    None
+                } else {
+                    Some(event)
+                }
+            },
+        )))
+    }
+
     async fn find_owned_message_event(
         &self,
         workspace_id: &str,

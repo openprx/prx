@@ -1238,6 +1238,15 @@ impl Memory for SqliteMemory {
             .filter(|event| event.owner_id.as_deref() == Some(owner_id)))
     }
 
+    async fn turn_final_rows(
+        &self,
+        workspace_id: &str,
+        owner_id: &str,
+        run_ids: &[String],
+    ) -> anyhow::Result<Vec<MessageEvent>> {
+        self.turn_final_rows_impl(workspace_id, owner_id, run_ids).await
+    }
+
     async fn find_owned_message_event(
         &self,
         workspace_id: &str,

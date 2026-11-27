@@ -18,6 +18,25 @@ pub use types::{
     MessageEvent, TranscriptHit
 };
 
+/// Run id and status of each `turn.finalized` row, from the key
+/// `turn:<run>:final` and the `status` of its payload. Rows whose key or
+/// payload does not read are left out.
+pub(crate) fn final_statuses_of(rows: impl IntoIterator<Item = MessageEvent>) -> HashMap<String, String> {
+    rows.into_iter()
+        .filter_map(|row| {
+            let run_id = row
+                .idempotency_key
+                .as_deref()?
+                .strip_prefix("turn:")?
+                .strip_suffix(":final")?
+                .to_owned();
+            let payload: serde_json::Value = serde_json::from_str(row.raw_payload_json.as_deref()?).ok()?;
+            let status = payload.get("status")?.as_str()?.to_owned();
+            Some((run_id, status))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod message_event_contract_tests;
 
@@ -1138,6 +1157,45 @@ pub trait Memory: Send + Sync {
         Err(crate::memory::fabric::fail_fast(
             self.name(),
             "find_owned_message_event_by_idempotency_key",
+        ))
+    }
+
+    /// The `turn.finalized` rows of the runs in `run_ids` (idempotency key
+    /// `turn:<run>:final`) of one owner, as stored. Runs with no row are absent.
+    /// Storage-level read for [`Self::turn_final_statuses`]; callers outside
+    /// the memory layer read statuses, never these rows. The default looks the
+    /// keys up one by one, so a backend with no indexed lookup keeps working.
+    async fn turn_final_rows(
+        &self,
+        workspace_id: &str,
+        owner_id: &str,
+        run_ids: &[String],
+    ) -> anyhow::Result<Vec<MessageEvent>> {
+        let mut rows = Vec::new();
+        for run_id in run_ids {
+            let key = format!("turn:{run_id}:final");
+            if let Some(row) = self
+                .find_owned_message_event_by_idempotency_key(workspace_id, owner_id, &key)
+                .await?
+            {
+                rows.push(row);
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Terminal status (`"completed"`, `"silent"`, `"failed"`, `"cancelled"`) of
+    /// each run in `run_ids` that has a readable `turn.finalized` row of
+    /// `owner_id`, keyed by run id. Runs with no readable final row are absent.
+    /// Only statuses are returned, never row content.
+    async fn turn_final_statuses(
+        &self,
+        workspace_id: &str,
+        owner_id: &str,
+        run_ids: &[String],
+    ) -> anyhow::Result<HashMap<String, String>> {
+        Ok(final_statuses_of(
+            self.turn_final_rows(workspace_id, owner_id, run_ids).await?,
         ))
     }
 
