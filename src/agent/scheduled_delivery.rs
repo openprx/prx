@@ -86,7 +86,10 @@ pub(crate) async fn deliver_message(
     );
     let target = runtime.address(&owner, session, event.agent_id.as_deref().unwrap_or("main"));
     let text = message_text(meta, envelope, reply);
-    let sender = match runtime.bind(source, None) {
+    // The message continues the creating turn's mailbox chain under the same
+    // owner, so a turn woken by a delivered result keeps its wake depth. A
+    // creating turn not woken by a mailbox message has no chain and starts one.
+    let sender = match runtime.bind(source, Some(source_event_id)) {
         Ok(sender) => sender,
         Err(error) => {
             tracing::warn!(error = %error_class(&error), "Scheduled result sender refused");
