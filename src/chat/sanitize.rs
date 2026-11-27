@@ -135,6 +135,28 @@ fn redact_string_values(value: &mut serde_json::Value) {
     }
 }
 
+/// Placeholder stored in place of memory text in a saved chat record.
+const MEMORY_TEXT_NOT_KEPT: &str = "[memory text not kept]";
+
+/// A `memory_store` preview with its `content` replaced; the memory row holds
+/// the text. A preview that is not a JSON object (for example one cut short)
+/// is replaced whole.
+fn memory_store_preview_without_text(preview: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(preview) {
+        Ok(mut value) => match value.as_object_mut() {
+            Some(object) => {
+                if let Some(content) = object.get_mut("content") {
+                    *content = serde_json::Value::String(MEMORY_TEXT_NOT_KEPT.to_string());
+                }
+                let rendered = serde_json::to_string(&value).unwrap_or_else(|_| MEMORY_TEXT_NOT_KEPT.to_string());
+                sanitize_text_or_json(&rendered)
+            }
+            None => MEMORY_TEXT_NOT_KEPT.to_string(),
+        },
+        Err(_) => MEMORY_TEXT_NOT_KEPT.to_string(),
+    }
+}
+
 /// Apply the authoritative persistence/export content policy to a session
 /// clone while preserving its schema and non-content metadata.
 pub fn sanitize_session_content(session: &super::session::ChatSession) -> super::session::ChatSession {
@@ -144,11 +166,17 @@ pub fn sanitize_session_content(session: &super::session::ChatSession) -> super:
         turn.content = sanitize_turn_content(turn);
         // What was put around a request is stored masked, like its text.
         if let Some(sent) = turn.tool_evidence.as_mut().and_then(|evidence| evidence.sent.as_mut()) {
-            sent.prefix = redact_secrets(&sent.prefix);
+            // The recalled-memory prefix is never replayed from a saved
+            // record; keeping it would keep text the user can later forget.
+            sent.prefix.clear();
             sent.tail = redact_secrets(&sent.tail);
         }
         for tool_call in &mut turn.tool_calls {
-            tool_call.args_preview = sanitize_text_or_json(&tool_call.args_preview);
+            tool_call.args_preview = if tool_call.name == "memory_store" {
+                memory_store_preview_without_text(&tool_call.args_preview)
+            } else {
+                sanitize_text_or_json(&tool_call.args_preview)
+            };
         }
     }
     for background in &mut sanitized.background_sessions {

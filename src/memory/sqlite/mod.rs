@@ -4,6 +4,7 @@ mod agent_purge;
 mod agent_registry;
 mod approval_grants;
 mod branch_copy;
+mod chat_record_scrub;
 mod child_sessions;
 mod child_turns;
 mod derived_sweep;

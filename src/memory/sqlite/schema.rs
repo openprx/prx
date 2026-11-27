@@ -29,6 +29,7 @@ const MIGRATION_SOURCES: &[&str] = &[
     include_str!("rf_delete.rs"),
     include_str!("write_log.rs"),
     include_str!("rf_forget.rs"),
+    include_str!("chat_record_scrub.rs"),
     include_str!("rf_attachments.rs"),
     include_str!("agent_erasure.rs"),
     include_str!("agent_purge.rs"),
@@ -1226,6 +1227,7 @@ impl SqliteMemory {
         super::rf_delete::init_schema(conn)?;
         super::write_log::init_schema(conn)?;
         super::rf_forget::init_schema(conn)?;
+        super::chat_record_scrub::init_schema(conn)?;
         super::rf_attachments::init_schema(conn)?;
         super::agent_erasure::init_schema(conn)?;
         super::agent_purge::init_schema(conn)?;
