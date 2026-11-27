@@ -43,6 +43,11 @@ pub(crate) struct DumpFacts<'a> {
     pub(crate) tool_names: Vec<&'a str>,
 }
 
+/// Whether the variable is set; callers check it before building the facts.
+pub(crate) fn enabled() -> bool {
+    dump_dir().is_some()
+}
+
 /// Writes the dump of one request when the variable is set.
 pub(crate) fn dump_request(facts: &DumpFacts<'_>) {
     let Some(dir) = dump_dir() else {
