@@ -25,14 +25,17 @@ pub(crate) struct TurnTailInput<'a> {
 }
 
 /// The text placed after the user's message on this turn: the `turn_opened`
-/// hook blocks, then, on an interactive turn (Console or Chat), the unseen
-/// scheduled-results note. The note's rows are marked seen in the same step.
+/// hook blocks, then, on an interactive turn (Console, Chat or Channel), the
+/// unseen scheduled-results note. The note's rows are marked seen in the same step.
 pub(crate) async fn turn_tail(input: TurnTailInput<'_>) -> String {
     let memory = input.memory;
     let envelope = input.envelope;
     let memory_config = input.memory_config;
     let mut tail = hook_tail(input).await;
-    if !matches!(envelope.source, RuntimeSource::Console | RuntimeSource::Chat) {
+    if !matches!(
+        envelope.source,
+        RuntimeSource::Console | RuntimeSource::Chat | RuntimeSource::Channel
+    ) {
         return tail;
     }
     let principal = envelope.memory_principal();
