@@ -123,17 +123,30 @@ fn wire_id(call_id: &str) -> String {
 impl ReplayLog {
     /// Read the session's tool, attachment and message rows. A read that fails
     /// leaves the log empty, so the turn replays as it did before these rows.
-    pub(super) async fn load(mem: &dyn crate::memory::Memory, principal: &MemoryPrincipal) -> Self {
-        Self::load_rows(mem, principal, true).await
+    ///
+    /// `replay_floor` is the id of the oldest turn that will be replayed, when the
+    /// caller knows its turns: attachments are paged back to it. Without it the
+    /// oldest user or assistant row read stands in.
+    pub(super) async fn load(
+        mem: &dyn crate::memory::Memory,
+        principal: &MemoryPrincipal,
+        replay_floor: Option<i64>,
+    ) -> Self {
+        Self::load_rows(mem, principal, true, replay_floor).await
     }
 
     /// As [`Self::load`] without the user and assistant rows: enough to build
     /// [`Self::replay_of_run`].
     pub(super) async fn load_tool_rows(mem: &dyn crate::memory::Memory, principal: &MemoryPrincipal) -> Self {
-        Self::load_rows(mem, principal, false).await
+        Self::load_rows(mem, principal, false, None).await
     }
 
-    async fn load_rows(mem: &dyn crate::memory::Memory, principal: &MemoryPrincipal, with_messages: bool) -> Self {
+    async fn load_rows(
+        mem: &dyn crate::memory::Memory,
+        principal: &MemoryPrincipal,
+        with_messages: bool,
+        replay_floor: Option<i64>,
+    ) -> Self {
         let query = |roles: &[&str]| SessionContextQuery {
             principal: principal.clone(),
             since_event_id: None,
@@ -155,7 +168,8 @@ impl ReplayLog {
                 // attachment of a message still wins.
                 let window_full = tool_rows.len() >= REPLAY_ROW_LIMIT || message_rows.len() >= REPLAY_ROW_LIMIT;
                 if with_messages && tool_rows.len() >= REPLAY_ROW_LIMIT {
-                    let mut rows = Self::attachment_rows_outside(mem, principal, &tool_rows, &message_rows).await;
+                    let replay_from = replay_floor.or_else(|| message_rows.iter().map(|event| event.id).min());
+                    let mut rows = Self::attachment_rows_outside(mem, principal, &tool_rows, replay_from).await;
                     rows.append(&mut tool_rows);
                     tool_rows = rows;
                 }
@@ -174,9 +188,10 @@ impl ReplayLog {
     }
 
     /// The attachment rows older than the tool window `tool_rows` that the
-    /// replayed messages of `message_rows` may need, oldest first. An
-    /// attachment is written after its user message, so every attachment the
-    /// replay needs has a row id above the oldest message row read: the window
+    /// replayed turns may need, oldest first. An attachment is written after its
+    /// user message, so every attachment the replay needs has a row id above
+    /// `replay_from`, the id of the oldest replayed turn (the oldest message row
+    /// read when the caller has no turns): the window
     /// is paged back to that id with `load_session_context_before`, so no
     /// attachment is lost however many attachment rows the session holds. A
     /// backend without the read, or a failed page, keeps what was read so far.
@@ -184,12 +199,9 @@ impl ReplayLog {
         mem: &dyn crate::memory::Memory,
         principal: &MemoryPrincipal,
         tool_rows: &[MessageEvent],
-        message_rows: &[MessageEvent],
+        replay_from: Option<i64>,
     ) -> Vec<MessageEvent> {
-        let (Some(window_oldest), Some(replay_from)) = (
-            tool_rows.iter().map(|event| event.id).min(),
-            message_rows.iter().map(|event| event.id).min(),
-        ) else {
+        let (Some(window_oldest), Some(replay_from)) = (tool_rows.iter().map(|event| event.id).min(), replay_from) else {
             return Vec::new();
         };
         let mut rows = Vec::new();

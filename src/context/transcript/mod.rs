@@ -137,7 +137,7 @@ impl<'a> Transcript<'a> {
     /// The tool, attachment and message rows of the session. A failed read
     /// leaves the log empty, so history is then replayed without them.
     pub(crate) async fn replay_log(&self) -> ReplayLog {
-        ReplayLog::load(self.memory, &self.principal).await
+        ReplayLog::load(self.memory, &self.principal, None).await
     }
 
     /// As [`Self::replay_log`] without the user and assistant rows: enough to
@@ -156,7 +156,13 @@ impl<'a> Transcript<'a> {
     /// The stored `turns` as model-facing history: each user message with its
     /// stored attachment, each reply preceded by the tool rounds of its run.
     pub(crate) async fn expand_turns(&self, turns: Vec<ConversationTurn>) -> History {
-        self.replay_log().await.expand_turns(turns)
+        // Attachments are read back to the oldest turn replayed, whatever the
+        // newest message rows of the session hold (deleted turns, continuation
+        // inputs).
+        let replay_floor = turns.iter().map(|turn| turn.id).min();
+        ReplayLog::load(self.memory, &self.principal, replay_floor)
+            .await
+            .expand_turns(turns)
     }
 
     /// As [`Self::expand_turns`], with whether a read window came back full
