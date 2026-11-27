@@ -21,8 +21,7 @@ mod tool_rows;
 
 pub(crate) use hook_rows::append_hook_contributions;
 pub(crate) use prefix_rows::{
-    HOOK_SOURCE_PREFIX, MEMORY_INDEX_SOURCE, PrefixSection, append_session_prefix, newest_session_prefix,
-    render_prefix,
+    HOOK_SOURCE_PREFIX, MEMORY_INDEX_SOURCE, PrefixSection, append_session_prefix, newest_session_prefix, render_prefix,
 };
 pub(crate) use replay::{Attachment, History, ReplayLog, TurnReplay, stub_replayed_results};
 pub(crate) use schedule_rows::{SCHEDULE_SEEN_EVENT_TYPE, mark_results_seen, unseen_results_note};
@@ -117,10 +116,30 @@ impl<'a> Transcript<'a> {
         let Some((event, handoff)) = found else {
             return loaded.turns;
         };
-        let covered_through = handoff.last_row_id;
+        // A chained switch's `last_row_id` is the parent switch row, which lies
+        // above messages the parent kept. The rows the handoff moved are told
+        // apart by their event ids: the turns after the newest of them stay,
+        // except the ones the note itself lists. When none of the listed rows is
+        // loaded any more (all deleted), the recorded row id stands.
+        let folded: std::collections::HashSet<&str> = handoff.event_ids.iter().map(String::as_str).collect();
+        let is_folded =
+            |turn: &ConversationTurn| turn.message_event_id.as_deref().is_some_and(|id| folded.contains(id));
+        let covered_through = loaded
+            .turns
+            .iter()
+            .filter(|turn| is_folded(turn))
+            .map(|turn| turn.id)
+            .max()
+            .unwrap_or(handoff.last_row_id);
         let mut model = Vec::with_capacity(loaded.turns.len() + 1);
         model.push(turn_of_event(event));
-        model.extend(loaded.turns.into_iter().filter(|turn| turn.id > covered_through));
+        model.extend(
+            loaded
+                .turns
+                .iter()
+                .filter(|turn| turn.id > covered_through && !is_folded(turn))
+                .cloned(),
+        );
         model
     }
 

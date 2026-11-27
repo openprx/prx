@@ -1,6 +1,6 @@
 //! Spawn-session persistence shares the source event transaction and scope.
 use super::SqliteMemory;
-use crate::agent::compaction::validated_context_handoff;
+use crate::agent::compaction::{ValidatedContextHandoff, validated_context_handoff};
 use crate::memory::branch_copy::CONTEXT_SWITCH_EVENT_TYPE;
 use crate::memory::child_sessions::{ChildSessionError, ChildSessionRecord, ChildTurn};
 use crate::memory::{AgentPartition, MessageEvent, PartitionKey};
@@ -142,12 +142,12 @@ pub(super) fn sessions(memory: &SqliteMemory, workspace: &str, owner: &str) -> a
 const HANDOFF_CANDIDATE_ROWS: i64 = 8;
 
 /// The newest switch row of the child, after its last context reset, that
-/// validates as a handoff: the turn a history starts with, and the row id its
-/// handoff covers up to.
+/// validates as a handoff: the turn a history starts with, and its validated
+/// values (the rows it covers).
 fn newest_handoff(
     conn: &rusqlite::Connection,
     record: &ChildSessionRecord,
-) -> anyhow::Result<Option<(ChildTurn, i64)>> {
+) -> anyhow::Result<Option<(ChildTurn, ValidatedContextHandoff)>> {
     let mut query = conn.prepare("SELECT e.content,e.created_at,e.event_id FROM message_events e
         JOIN child_sessions c ON c.key=e.session_key AND c.ma_scope_id=e.ma_scope_id
         JOIN agent_scopes s ON s.scope_id=c.ma_scope_id
@@ -180,9 +180,33 @@ fn newest_handoff(
             timestamp,
             event_id: Some(event_id),
         };
-        return Ok(Some((turn, handoff.last_row_id)));
+        return Ok(Some((turn, handoff)));
     }
     Ok(None)
+}
+
+/// The highest row id among the child's `message.created` rows whose event ids
+/// the handoff lists (same scope joins as the history read); `None` when none of
+/// them is left. Rows after it that the note does not list were kept by the
+/// parent handoff and stay in the history.
+fn folded_through(
+    conn: &rusqlite::Connection,
+    record: &ChildSessionRecord,
+    handoff: &ValidatedContextHandoff,
+) -> anyhow::Result<Option<i64>> {
+    let ids = serde_json::to_string(&handoff.event_ids)?;
+    let newest = conn.query_row(
+        "SELECT MAX(e.id) FROM message_events e
+        JOIN child_sessions c ON c.key=e.session_key AND c.ma_scope_id=e.ma_scope_id
+        JOIN agent_scopes s ON s.scope_id=c.ma_scope_id
+        WHERE c.key=?1 AND c.workspace_id=?2 AND c.owner_id=?3 AND e.workspace_id=?2 AND e.owner_id=?3
+        AND NOT EXISTS(SELECT 1 FROM agent_erase_fences f WHERE f.scope_id=s.scope_id)
+        AND e.role IN('user','assistant','tool') AND e.event_type='message.created'
+        AND e.event_id IN(SELECT value FROM json_each(?4))",
+        params![record.session_key, record.workspace, record.owner, ids],
+        |r| r.get::<_, Option<i64>>(0),
+    )?;
+    Ok(newest)
 }
 
 /// The partition of the child's own rows, read from the agent scope its
@@ -226,9 +250,12 @@ pub(super) fn history(memory: &SqliteMemory, record: &ChildSessionRecord) -> any
     // A handoff newer than the last context reset starts the history; rows the
     // handoff covers are not loaded again. Without one, the history is exactly
     // the stored context plus the rows after it.
-    let (mut result, after) = match newest_handoff(conn, record)? {
-        Some((turn, last_row_id)) => (vec![turn], record.context_after.max(last_row_id)),
-        None => (record.context.clone(), record.context_after),
+    let (mut result, after, folded) = match newest_handoff(conn, record)? {
+        Some((turn, handoff)) => {
+            let after = folded_through(conn, record, &handoff)?.unwrap_or(handoff.last_row_id);
+            (vec![turn], record.context_after.max(after), handoff.event_ids)
+        }
+        None => (record.context.clone(), record.context_after, Vec::new()),
     };
     let mut query = conn.prepare("SELECT e.role,e.content,e.created_at,e.event_id FROM message_events e
         JOIN child_sessions c ON c.key=e.session_key AND c.ma_scope_id=e.ma_scope_id
@@ -254,6 +281,10 @@ pub(super) fn history(memory: &SqliteMemory, record: &ChildSessionRecord) -> any
                 ))
             },
         )?
+        .filter(|row| {
+            row.as_ref()
+                .map_or(true, |(_, _, _, event_id)| !folded.contains(event_id))
+        })
         .map(|row| {
             let (role, content, timestamp, event_id) = row?;
             Ok(ChildTurn {
