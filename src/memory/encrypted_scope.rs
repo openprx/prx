@@ -1208,6 +1208,26 @@ impl Memory for EncryptedScope {
             .collect())
     }
 
+    async fn newest_session_events_of_type(
+        &self,
+        principal: &crate::memory::MemoryPrincipal,
+        session_key: &str,
+        event_type: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<crate::memory::MessageEvent>> {
+        // Rows of this event type written by other owners stay in the store:
+        // only rows this scope can open are returned, revealed.
+        let events = self
+            .inner
+            .newest_session_events_of_type(principal, session_key, event_type, limit)
+            .await?;
+        Ok(events
+            .into_iter()
+            .filter(|event| self.owns_event(event))
+            .map(|event| self.reveal(event))
+            .collect())
+    }
+
     async fn load_session_context_before(
         &self,
         query: crate::memory::SessionContextQuery,
