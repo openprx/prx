@@ -1324,6 +1324,18 @@ impl Memory for SqliteMemory {
             .await
     }
 
+    async fn session_events_of_type_before(
+        &self,
+        principal: &MemoryPrincipal,
+        session_key: &str,
+        event_type: &str,
+        before_id: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MessageEvent>> {
+        self.session_events_of_type_before_impl(principal, session_key, event_type, before_id, limit)
+            .await
+    }
+
     async fn newest_owner_events_of_type(
         &self,
         principal: &MemoryPrincipal,

@@ -1338,6 +1338,51 @@ pub trait Memory: Send + Sync {
         ))
     }
 
+    /// The rows of `event_type` in the session of `session_key` with
+    /// `id < before_id`, newest first, at most `limit`, read with the visibility
+    /// and agent partition filters of `principal`. The default pages
+    /// [`Memory::load_session_context_before`] and keeps the rows of the type, so
+    /// a backend with that read answers it (and an unreadable row stops it as it
+    /// stops that read); a backend with an ordered event log reads the type
+    /// directly.
+    async fn session_events_of_type_before(
+        &self,
+        principal: &MemoryPrincipal,
+        session_key: &str,
+        event_type: &str,
+        before_id: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MessageEvent>> {
+        const PAGE_ROWS: usize = 500;
+        let mut scoped = principal.clone();
+        scoped.session_key = Some(session_key.to_owned());
+        let mut found = Vec::new();
+        let mut cursor = before_id;
+        while found.len() < limit {
+            let query = SessionContextQuery {
+                principal: scoped.clone(),
+                since_event_id: None,
+                limit: PAGE_ROWS,
+                include_roles: Vec::new(),
+            };
+            let page = self.load_session_context_before(query, cursor).await?;
+            let page_len = page.len();
+            let Some(oldest) = page.iter().map(|event| event.id).min() else {
+                break;
+            };
+            if oldest >= cursor {
+                break;
+            }
+            found.extend(page.into_iter().filter(|event| event.event_type == event_type));
+            if page_len < PAGE_ROWS {
+                break;
+            }
+            cursor = oldest;
+        }
+        found.truncate(limit);
+        Ok(found)
+    }
+
     /// The newest `limit` rows of `event_type` of the principal's owner and
     /// workspace, in the agent partition of the principal (no partition means
     /// Main), across every session, newest first by row id. Rows with an id at

@@ -191,17 +191,19 @@ impl ReplayLog {
     /// replayed turns may need, oldest first. An attachment is written after its
     /// user message, so every attachment the replay needs has a row id above
     /// `replay_from`, the id of the oldest replayed turn (the oldest message row
-    /// read when the caller has no turns): the window
-    /// is paged back to that id with `load_session_context_before`, so no
-    /// attachment is lost however many attachment rows the session holds. A
-    /// backend without the read, or a failed page, keeps what was read so far.
+    /// read when the caller has no turns): only attachment rows are read, paged
+    /// back from the window to that id with `session_events_of_type_before`, so
+    /// no attachment is lost however many tool rows the session holds. A backend
+    /// without the read, or a failed page (an unreadable row of an encrypted
+    /// scope among them), keeps what was read so far.
     async fn attachment_rows_outside(
         mem: &dyn crate::memory::Memory,
         principal: &MemoryPrincipal,
         tool_rows: &[MessageEvent],
         replay_from: Option<i64>,
     ) -> Vec<MessageEvent> {
-        let (Some(window_oldest), Some(replay_from)) = (tool_rows.iter().map(|event| event.id).min(), replay_from) else {
+        let (Some(window_oldest), Some(replay_from)) = (tool_rows.iter().map(|event| event.id).min(), replay_from)
+        else {
             return Vec::new();
         };
         let mut rows = Vec::new();

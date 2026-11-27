@@ -1,5 +1,6 @@
-//! SQL of `Memory::newest_session_events_of_type`: the newest rows of one event
-//! type in one session. The workspace, session, owner, visibility and agent
+//! SQL of `Memory::newest_session_events_of_type` and
+//! `Memory::session_events_of_type_before`: the newest rows of one event type in
+//! one session, optionally below a row id. The workspace, session, owner, visibility and agent
 //! partition filters are those of `session_context_page` (the read behind
 //! `load_session_context_before`), with the same placeholder layout; the role
 //! filter is left out, and `event_type` is added.
@@ -15,6 +16,19 @@ impl SqliteMemory {
         principal: &MemoryPrincipal,
         session_key: &str,
         event_type: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MessageEvent>> {
+        self.session_events_of_type_before_impl(principal, session_key, event_type, i64::MAX, limit)
+            .await
+    }
+
+    /// Rows of `event_type` with `id < before_id`, newest first.
+    pub(super) async fn session_events_of_type_before_impl(
+        &self,
+        principal: &MemoryPrincipal,
+        session_key: &str,
+        event_type: &str,
+        before_id: i64,
         limit: usize,
     ) -> anyhow::Result<Vec<MessageEvent>> {
         let pool = self.pool.clone();
@@ -49,6 +63,7 @@ impl SqliteMemory {
         let event_index = owner_index + usize::from(owner_required_fragment.bound_owner);
         let shared_tiers_arm = crate::memory::owner_predicate::session_context_shared_tiers(&owner_fragment);
         let (partition_sql, partition_values) = agent_partition_clause(&principal, event_index + 1);
+        let before_index = event_index + 1 + partition_values.len();
         let sql = format!(
             "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                     parent_session_key, run_id, parent_run_id, agent_id, persona_id,
@@ -60,6 +75,7 @@ impl SqliteMemory {
                AND workspace_id = ?2
                AND {session_fragment}
                AND event_type = ?{event_index}
+               AND id < ?{before_index}
                AND (
                    {shared_tiers_arm}
                    OR (visibility = 'agent' AND (
@@ -106,6 +122,7 @@ impl SqliteMemory {
             for value in &partition_values {
                 bind.push(value);
             }
+            bind.push(&before_id);
             let rows = stmt.query_map(bind.as_slice(), Self::message_event_from_row)?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
