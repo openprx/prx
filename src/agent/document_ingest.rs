@@ -45,8 +45,7 @@ pub(crate) struct DocumentIngestRuntime {
     pub(crate) agent_id: Option<String>,
     pub(crate) persona_id: Option<String>,
     pub(crate) channel: Option<String>,
-    /// Originating sender. Retained so OS-paging recall (FIX-P3-05) can rebuild
-    /// the exact owner-scoped `MemoryPrincipal` used when pages were ingested.
+    /// Originating sender of the turn that ingested the document.
     pub(crate) sender: Option<String>,
     pub(crate) config_generation_id: Option<u64>,
     pub(crate) config_source_revision: Option<String>,
