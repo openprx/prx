@@ -1,5 +1,5 @@
 //! Model admission owned by the ingress binding, without decision state.
-use crate::providers::catalog::{CatalogView, Feature, Requirement, UnknownPolicy, Verification};
+use crate::providers::catalog::{CatalogView, Requirement, UnknownPolicy, Verification};
 use crate::runtime::turn_source::TurnSourceProof;
 
 pub(crate) fn validate_execution(proof: &dyn TurnSourceProof, provider: &str, model: &str) -> anyhow::Result<()> {
@@ -25,7 +25,7 @@ pub(crate) fn can_call_tools(
             proof.provider_name(),
             proof.model_name(),
             credential,
-            &Requirement::chat().with(Feature::NativeTools),
+            &Requirement::chat(),
             UnknownPolicy::Invocation,
         )
         .is_ok_and(|resolved| {
