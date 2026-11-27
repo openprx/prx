@@ -336,7 +336,7 @@ Child turns run no session-open hook and render no prefix hook section.
 
 ### Turn tail
 
-The tail is the text placed after the user's message, before the date line. It
+The tail is the text placed after the user's message; it ends with the date line. It
 is stored with the message and replayed with it, so a contribution is never
 recomputed. In order:
 
@@ -362,8 +362,9 @@ replayed on later turns.
 | `before_handoff` | `reduction_started` | `summary_instructions` | before a handoff or summary is built |
 | `child_started` | `child_started` | `add_context` | the first input of a child, in place of the turn and session points |
 
-A `replace_output` replaces the first tool output the hook manager returns; a
-`note` is appended to the output as `[Hook note: <hook>] <text>`.
+The first `replace_output` contribution, in the order the hook manager returns
+them (priority descending, then name), replaces the tool output; later ones are
+ignored. Each `note` is appended to the output as `[Hook note: <hook>] <text>`.
 
 ### Transcript search and lookup
 

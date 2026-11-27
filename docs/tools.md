@@ -1870,7 +1870,8 @@ current agent. It reads the user and assistant messages of every session in the
 agent partition of the calling turn (the main agent's partition for a main-agent
 turn). Other owners, workspaces and agent partitions are never searched, and
 in an encrypted ramflux channel conversation the search covers the current
-conversation only, and scans at most 2,000 rows.
+conversation only, scans at most 2,000 rows, and matches the query against the
+redacted message text.
 
 Parameters:
 
