@@ -93,30 +93,35 @@ pub(super) fn compact_tool_result_for_history_with_status(
     max_inline_chars: usize,
     status: &str,
 ) -> String {
+    // The model reads the masked form (CE-63). The whole output is masked before
+    // the cut, so a secret that straddles the cut (a PEM block, a JWT) cannot
+    // leak as a preview. The cut itself is decided by the raw size, as the
+    // document store decides it, and the document id and digest stay those of
+    // the raw output.
     if content.len() <= max_inline_chars {
-        return content.to_string();
+        return crate::security::redaction::redact_secrets(content);
     }
-
-    let boundary = content
+    let masked = crate::security::redaction::redact_secrets(content);
+    let boundary = masked
         .char_indices()
         .map(|(i, _)| i)
         .take_while(|&i| i <= max_inline_chars)
         .last()
         .unwrap_or(0);
-    let preview = &content[..boundary];
+    let preview = &masked[..boundary];
     // A reference is written only for a document that was stored. Without a
     // stored copy the cut is stated plainly and nothing points at a document.
     if status != PERSISTED_DOCUMENT_STATUS {
-        return format!(
+        return crate::security::redaction::redact_secrets(&format!(
             "{preview}\n\n[output truncated: {boundary} of {} bytes shown; the full output was not stored]",
             content.len()
-        );
+        ));
     }
     let (document_id, sha256) = tool_output_document_id(tool_name, content);
     let chunk_count = crate::memory::chunker::chunk_markdown(content, TOOL_OUTPUT_DOCUMENT_CHUNK_TOKENS)
         .len()
         .max(1);
-    format!(
+    crate::security::redaction::redact_secrets(&format!(
         "{preview}\n\n[document_ingest_ref]\n\
 document_id: {document_id}\n\
 source: tool_output\n\
@@ -129,7 +134,7 @@ vector_anchor: vector://{document_id}\n\
 status: {status}\n\
 [/document_ingest_ref]",
         content.len()
-    )
+    ))
 }
 
 /// Text substituted for a tool call that never got to run, or that was still

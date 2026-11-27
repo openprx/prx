@@ -410,14 +410,13 @@ pub(super) async fn run_tools(
         // FIX-P2-02: record the status so the native-history branch can reuse
         // it without persisting the same document a second time.
         document_statuses.push(document_status);
-        // CE-63: the model reads the masked form, the same text the stored row keeps.
-        let truncated_result =
-            crate::security::redaction::redact_secrets(&compact_tool_result_for_history_with_status(
-                &call.name,
-                &observed.content,
-                max_inline_chars,
-                document_status,
-            ));
+        // CE-63: the compacted text is masked, so the model reads the form the stored row keeps.
+        let truncated_result = compact_tool_result_for_history_with_status(
+            &call.name,
+            &observed.content,
+            max_inline_chars,
+            document_status,
+        );
         if let Some(log) = round_log.as_ref() {
             let call_id = call_id_for(&call.name, index, &native_tool_calls);
             log.append_result(&call_id, &call.name, observed, &truncated_result, document_status)
@@ -462,14 +461,12 @@ pub(super) async fn run_tools(
                 .get(index)
                 .and_then(Option::as_ref)
                 .unwrap_or(&result.content);
-            // CE-63: masked, as in the prompt-mode branch above.
-            let truncated_result =
-                crate::security::redaction::redact_secrets(&compact_tool_result_for_history_with_status(
-                    &native_call.name,
-                    effective,
-                    max_inline_chars,
-                    document_status,
-                ));
+            let truncated_result = compact_tool_result_for_history_with_status(
+                &native_call.name,
+                effective,
+                max_inline_chars,
+                document_status,
+            );
             let tool_msg = serde_json::json!({
                 "tool_call_id": native_call.id,
                 "content": truncated_result,
