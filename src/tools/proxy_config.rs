@@ -398,16 +398,16 @@ impl ProxyConfigTool {
                             "description": "Proxy scope. Canonical values: prx, services. 'environment' (alias 'env') is refused by 'set': it is inactive because PRX never modifies the process environment."
                         },
                         "http_proxy": {
-                            "type": "string",
-                            "description": "HTTP proxy URL"
+                            "type": ["string", "null"],
+                            "description": "HTTP proxy URL. Empty string or null clears it"
                         },
                         "https_proxy": {
-                            "type": "string",
-                            "description": "HTTPS proxy URL"
+                            "type": ["string", "null"],
+                            "description": "HTTPS proxy URL. Empty string or null clears it"
                         },
                         "all_proxy": {
-                            "type": "string",
-                            "description": "Fallback proxy URL for all protocols"
+                            "type": ["string", "null"],
+                            "description": "Fallback proxy URL for all protocols. Empty string or null clears it"
                         },
                         "no_proxy": {
                             "description": "Comma-separated string or array of NO_PROXY entries",
