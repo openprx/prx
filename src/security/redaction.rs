@@ -481,6 +481,9 @@ fn keyed_pair_spans(text: &str, url_parts: &[UrlPart], spans: &mut Vec<Range<usi
                 value.end = value.end.min(part.range.end);
             }
         }
+        // The value as scanned, before any quoted tail: a shape check reads
+        // only this, so a tail of quotes cannot hide a secret-shaped value.
+        let scanned = value.clone();
         // A bare value that stops at a quote (`String::from("abc123")`) takes
         // the quoted literal with it, so the literal is masked too.
         if kind == 0
@@ -520,8 +523,8 @@ fn keyed_pair_spans(text: &str, url_parts: &[UrlPart], spans: &mut Vec<Range<usi
         let credential = !code_shape
             && match class {
                 KeyName::Credential => true,
-                KeyName::CredentialIfSecretShaped => scan.secret_shaped(text, &value),
-                KeyName::CredentialIfKeyShaped => scan.key_shaped(text, &value),
+                KeyName::CredentialIfSecretShaped => scan.secret_shaped(text, &scanned),
+                KeyName::CredentialIfKeyShaped => scan.key_shaped(text, &scanned),
                 KeyName::Plain => bare_key,
             };
         if credential && value.end > covered_until {
