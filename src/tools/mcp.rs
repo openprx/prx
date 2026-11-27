@@ -1371,7 +1371,7 @@ impl McpTool {
                 // and schemas are supplied only by turn-scoped capability discovery.
                 let server_schema = json!({
                     "type": "string",
-                    "description": "Configured MCP server name; required for 'call', 'resources' and 'read'"
+                    "description": "Configured MCP server name; required for 'call', 'resources', 'read', 'subscribe' and 'unsubscribe'"
                 });
                 let tool_schema = json!({
                     "type": "string",
@@ -1379,7 +1379,7 @@ impl McpTool {
                 });
                 let uri_schema = json!({
                     "type": "string",
-                    "description": "Resource URI for 'read'"
+                    "description": "Resource URI for 'read', 'subscribe' and 'unsubscribe'"
                 });
 
                 crate::tools::schema::with_default_action_requirements(
@@ -1388,9 +1388,9 @@ impl McpTool {
                         "properties": {
                             "action": {
                                 "type": "string",
-                                "enum": ["call", "list", "status", "refresh", "resources", "read"],
+                                "enum": ["call", "list", "status", "refresh", "resources", "read", "subscribe", "unsubscribe"],
                                 "default": "call",
-                                "description": "'call' invokes a remote tool; 'list' and 'status' inspect discovery state and errors; 'refresh' forces rediscovery; 'resources' lists a server's resources and templates; 'read' returns one resource by uri"
+                                "description": "'call' invokes a remote tool; 'list' and 'status' inspect discovery state and errors; 'refresh' forces rediscovery; 'resources' lists a server's resources and templates; 'read' returns one resource by uri; 'subscribe' and 'unsubscribe' change this session's update subscription to a resource"
                             },
                             "server": server_schema,
                             "tool": tool_schema,
@@ -1419,6 +1419,14 @@ impl McpTool {
                             action: "read",
                             required: &["server", "uri"],
                         },
+                        crate::tools::schema::ActionRequirement {
+                            action: "subscribe",
+                            required: &["server", "uri"],
+                        },
+                        crate::tools::schema::ActionRequirement {
+                            action: "unsubscribe",
+                            required: &["server", "uri"],
+                        },
                     ],
                 )
             })
@@ -1436,7 +1444,8 @@ impl Tool for McpTool {
     fn description(&self) -> &str {
         "Call tools exposed by configured MCP servers: 'call' invokes a remote tool, \
          'list' and 'status' report discovery results and errors, 'refresh' forces rediscovery, \
-         and 'resources' and 'read' list a server's resources or read one by uri. \
+         and 'resources' and 'read' list a server's resources or read one by uri, \
+         and 'subscribe' and 'unsubscribe' follow updates of one resource. \
          Supports hot config reload from workspace/mcp.json and dynamic aliases."
     }
 
@@ -1516,18 +1525,25 @@ impl Tool for McpTool {
         };
         if name == MCP_ROOT_NAME && matches!(action, "list" | "status" | "refresh") {
             self.refresh_runtime_state(action == "refresh").await;
+            let mut output = json!({
+                "initialized": self.state.read().initialized,
+                "config_error": self.config_error(),
+                "servers": self.server_runtime_info(),
+            });
+            if let Some(subscriptions) = self.subscriptions_view() {
+                output["subscriptions"] = subscriptions;
+            }
             return Ok(ToolResult {
                 success: true,
-                output: serde_json::to_string_pretty(&json!({
-                    "initialized": self.state.read().initialized,
-                    "config_error": self.config_error(),
-                    "servers": self.server_runtime_info(),
-                }))?,
+                output: serde_json::to_string_pretty(&output)?,
                 error: None,
             });
         }
         if name == MCP_ROOT_NAME && matches!(action, "resources" | "read") {
             return self.execute_resource_action(action, &args).await;
+        }
+        if name == MCP_ROOT_NAME && matches!(action, "subscribe" | "unsubscribe") {
+            return self.execute_subscription_action(action, &args).await;
         }
         if action != "call" {
             return Ok(ToolResult {
@@ -1714,6 +1730,7 @@ pub(super) mod level_view;
 mod lifecycle;
 mod listen;
 mod resources;
+pub(super) mod subscription_stream;
 pub(super) mod subscriptions;
 mod result;
 mod workspace_overlay;
