@@ -398,33 +398,10 @@ impl Default for SkillsConfig {
     }
 }
 
-/// Dynamic skill retrieval configuration (`[skill_rag]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct SkillRagConfig {
-    /// How many skills the system prompt may advertise.
-    ///
-    /// The section lists metadata only (instruction bodies stay behind
-    /// `skill_read`), so a catalog at or below this size is published whole and
-    /// the section becomes a pure function of the installed skills — which is
-    /// what keeps the provider's cacheable prefix identical across turns.
-    /// Larger catalogs fall back to relevance retrieval, which does move with
-    /// the wording; entry points that hold a session narrow that churn with a
-    /// session-scoped union (`SessionSkillExposure`).
-    #[serde(default = "default_skill_rag_top_k")]
-    pub top_k: usize,
-}
-
-pub(super) const fn default_skill_rag_top_k() -> usize {
-    32
-}
-
-impl Default for SkillRagConfig {
-    fn default() -> Self {
-        Self {
-            top_k: default_skill_rag_top_k(),
-        }
-    }
-}
+/// Dynamic skill retrieval configuration (`[skill_rag]` section). It has no
+/// keys: the prompt publishes the skill catalog whole.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SkillRagConfig {}
 
 impl SkillRagConfig {
     pub const fn available(&self) -> bool {

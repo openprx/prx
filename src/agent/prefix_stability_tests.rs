@@ -23,7 +23,7 @@
     clippy::indexing_slicing
 )]
 
-use crate::agent::runtime_prompt::{build_runtime_system_prompt, select_prompt_skills};
+use crate::agent::runtime_prompt::build_runtime_system_prompt;
 use crate::agent::turn_contracts::{ChatMode, ToolLoopOutcome};
 use crate::agent::turn_engine::run_turn;
 use crate::agent::turn_request::ToolLoopMemory;
@@ -62,8 +62,7 @@ fn skill(name: &str, description: &str) -> Skill {
     }
 }
 
-/// Eight skills whose descriptions pull in different directions, so top_k = 5
-/// retrieval genuinely re-ranks between rewordings of one question.
+/// Eight skills whose descriptions pull in different directions.
 async fn catalog() -> Vec<Skill> {
     let mut skills = vec![
         skill("pdf-report", "extract tables and text out of PDF report files"),
@@ -181,158 +180,6 @@ fn fixture_config(workspace: &std::path::Path) -> Config {
         config_path: workspace.join("config.toml"),
         ..Config::default()
     }
-}
-
-/// Four turns of one session: two wordings of one request, one turn that
-/// reaches a genuinely new capability, and one that goes back to the first
-/// subject. The system prompt must be byte-identical throughout and the
-/// published tool set must move exactly once.
-///
-/// MUTATION GUARD: make `SessionToolExposure::sticky_surface` return
-/// `base.clone()` and the last two tool-set assertions go red; drop the
-/// catalog short-circuit in `select_prompt_skills` and the prompt assertions
-/// go red.
-#[tokio::test]
-async fn one_session_holds_its_request_prefix_still_across_rewordings() {
-    let workspace = tempfile::TempDir::new().expect("fixture workspace");
-    let config = fixture_config(workspace.path());
-    let skills = catalog().await;
-    let tools = registry();
-    let embedder = LocalHashEmbedding::new("local-hash", 128);
-    let base = ToolTieringConfig::default();
-
-    let mut skill_exposure = SessionSkillExposure::new();
-    let tool_exposure = SessionToolExposure::new();
-
-    let turns = [
-        "search the web for the current rustls release notes",
-        "can you search online and tell me what changed in rustls lately",
-        "set a timer so cron reminds me about it tomorrow",
-        "have a look at the rustls website again and search for the changelog",
-    ];
-
-    let mut prompts = Vec::new();
-    let mut sticky_tools = Vec::new();
-    let mut raw_tools = Vec::new();
-    for message in turns {
-        let retrieved = select_prompt_skills(message, &skills, &config, &embedder).await;
-        let exposed = skill_exposure.absorb(&skills, &retrieved);
-        prompts.push(build_runtime_system_prompt(&config, MODEL, &exposed, true));
-        let surface = tool_exposure.sticky_surface(&base, &tools, message);
-        sticky_tools.push(session_names(&tools, message, &surface));
-        raw_tools.push(exposed_names(&tools, message, &base));
-    }
-
-    for (index, prompt) in prompts.iter().enumerate().skip(1) {
-        assert_eq!(
-            prompt.len(),
-            prompts[0].len(),
-            "turn {index} moved the system prompt byte count"
-        );
-        assert_eq!(prompt, &prompts[0], "turn {index} changed the system prompt");
-    }
-
-    assert_eq!(
-        sticky_tools[0], sticky_tools[1],
-        "a rewording of the same request must publish the same tools"
-    );
-    assert!(
-        sticky_tools[0].iter().any(|name| name == "fixture_web_search"),
-        "the fixture must route the named capability: {:?}",
-        sticky_tools[0]
-    );
-    assert!(
-        !sticky_tools[0].iter().any(|name| name == "fixture_cron"),
-        "an unreached capability must stay off the early turns: {:?}",
-        sticky_tools[0]
-    );
-
-    // Fixture proof: routing this turn alone drops the web tools.
-    assert!(
-        !raw_tools[2].iter().any(|name| name == "fixture_web_search"),
-        "fixture is useless unless turn 3 would have dropped the web tools: {:?}",
-        raw_tools[2]
-    );
-    assert!(
-        sticky_tools[2].iter().any(|name| name == "fixture_cron"),
-        "a new capability must reach its tool: {:?}",
-        sticky_tools[2]
-    );
-    assert!(
-        sticky_tools[2].iter().any(|name| name == "fixture_web_search"),
-        "and must not drop what earlier turns already published: {:?}",
-        sticky_tools[2]
-    );
-
-    // Fixture proof: routing turn 4 alone drops the scheduling tool again.
-    assert!(
-        !raw_tools[3].iter().any(|name| name == "fixture_cron"),
-        "fixture is useless unless turn 4 would have dropped cron: {:?}",
-        raw_tools[3]
-    );
-    assert_eq!(
-        sticky_tools[3], sticky_tools[2],
-        "the published set must settle after the one capability it gained"
-    );
-
-    println!(
-        "prefix stability: system prompt {} bytes across {} turns, tools {:?}",
-        prompts[0].len(),
-        turns.len(),
-        sticky_tools[3]
-    );
-}
-
-/// A catalog larger than `[skill_rag] top_k` cannot be published whole, so
-/// retrieval does move with the wording. The session union is what stops that
-/// from re-prefilling the conversation on every turn: the section may grow,
-/// never shrink, and it settles as soon as a subject comes back.
-#[tokio::test]
-async fn an_oversized_skill_catalog_grows_into_a_stable_section() {
-    let workspace = tempfile::TempDir::new().expect("fixture workspace");
-    let mut config = fixture_config(workspace.path());
-    config.skill_rag.top_k = 3;
-    let skills = catalog().await;
-    let embedder = LocalHashEmbedding::new("local-hash", 128);
-
-    let messages = [
-        "extract the tables out of this PDF report",
-        "crop the screenshot before we publish it",
-        "pull the tables out of that PDF again",
-    ];
-
-    let mut raw = Vec::new();
-    let mut prompts = Vec::new();
-    let mut exposure = SessionSkillExposure::new();
-    for message in messages {
-        let retrieved = select_prompt_skills(message, &skills, &config, &embedder).await;
-        assert_eq!(retrieved.len(), 3, "an oversized catalog must still be narrowed");
-        raw.push(crate::skills::skills_to_prompt(&retrieved, workspace.path()));
-        let exposed = exposure.absorb(&skills, &retrieved);
-        prompts.push(build_runtime_system_prompt(&config, MODEL, &exposed, true));
-    }
-
-    assert_ne!(
-        raw[0], raw[1],
-        "fixture is useless unless retrieval moves between these two subjects"
-    );
-    assert!(
-        prompts[1].len() >= prompts[0].len(),
-        "the section may only grow inside one session"
-    );
-    assert_eq!(
-        prompts[2], prompts[1],
-        "returning to an earlier subject must not move the prefix again"
-    );
-
-    exposure.reset();
-    let retrieved = select_prompt_skills(messages[0], &skills, &config, &embedder).await;
-    let exposed = exposure.absorb(&skills, &retrieved);
-    assert_eq!(
-        build_runtime_system_prompt(&config, MODEL, &exposed, true),
-        prompts[0],
-        "a session boundary must start the union over"
-    );
 }
 
 /// The system prompt built from one skill set must not depend on the order
