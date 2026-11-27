@@ -770,7 +770,12 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
             params![target.workspace_id, session_key, scope, window_start, target.now],
         )?;
     }
+    // The completion notices of the erased runs sit in the parent session; they
+    // are deleted with the rows they report and count as direct sources, so the
+    // memories, drafts and links made from them go too.
+    let announcements = announcement_events(tx, target, &children)?;
     let mut direct_ids: Vec<String> = rows.iter().map(|row| row.event_id.clone()).collect();
+    direct_ids.extend(announcements.iter().cloned());
     let direct = serde_json::to_string(&direct_ids)?;
     // The rows of the deleted conversation itself; a scheduled job's result
     // excerpt belongs to the job's session, whose later runs are kept.
@@ -811,11 +816,7 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
         )?;
     }
     let mut ids = rows.into_iter().map(|row| row.event_id).collect::<Vec<_>>();
-    // The completion notices of the erased runs sit in the parent session; they
-    // are deleted with the rows they report and count as sources of summaries.
-    let announcements = announcement_events(tx, target, &children)?;
-    ids.extend(announcements.iter().cloned());
-    direct_ids.extend(announcements);
+    ids.extend(announcements);
     rf_forget::drop_prefix_rows_of(
         tx,
         "SELECT DISTINCT workspace_id, owner_id FROM memories WHERE source_event_id IN (SELECT value FROM json_each(?1))",
