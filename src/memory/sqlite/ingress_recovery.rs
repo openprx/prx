@@ -924,6 +924,7 @@ mod local {
 
     /// The kernel reported a filesystem magic number that is not a valid
     /// unsigned value, so it cannot match any admitted local filesystem.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[derive(Debug, thiserror::Error)]
     #[error("filesystem type reported by the kernel is out of range")]
     struct FilesystemTypeOutOfRange;
