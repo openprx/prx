@@ -59,6 +59,29 @@ pub(super) fn drop_links(tx: &Connection, events_json: &str) -> rusqlite::Result
     )
 }
 
+/// Whether the lazily created `ingress_recovery` table exists.
+pub(super) fn has_ingress(tx: &Connection) -> rusqlite::Result<bool> {
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'ingress_recovery')",
+        [],
+        |row| row.get(0),
+    )
+}
+
+/// Ingress recovery records of the deleted rows (by input, evidence or cursor).
+/// Their foreign keys to `message_events` have no delete action, so they go
+/// first; the eligibility check keeps every unit whose input row still has an
+/// unreconciled record. Recovery attestations of the deleted rows follow by
+/// `ON DELETE CASCADE`.
+pub(super) fn drop_ingress(tx: &Connection, events_json: &str, ids_json: &str) -> rusqlite::Result<usize> {
+    tx.execute(
+        "DELETE FROM ingress_recovery WHERE input_event_id IN (SELECT value FROM json_each(?1))
+            OR evidence_event_id IN (SELECT value FROM json_each(?1))
+            OR cursor IN (SELECT value FROM json_each(?2))",
+        params![events_json, ids_json],
+    )
+}
+
 /// The age-based copies, once per pass after the batches.
 pub(super) fn pass(tx: &Connection, cutoff: &str) -> anyhow::Result<PassCopies> {
     let documents = documents(tx, cutoff)?;

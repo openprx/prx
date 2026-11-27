@@ -1697,11 +1697,12 @@ it does not decide which rows the window holds.
 keeps everything, and an absent key changes nothing. When it is `N > 0`, each
 message-log run whose rows are all older than `N` days (by their UTC
 `created_at`) is deleted together with its derived copies: conversation turns,
-the full-text index, run attempts, memory links, tool-output documents, traces
-and compaction runs. Deletion works run by run, for every event type, in short
-write batches. Each run is kept while any of these holds: its session is in use
-(its newest handoff summary and prefix stay), an rf message in it is not yet
-settled, it is under agent erasure, a newer row names it as its cause, or a
+the full-text index, run attempts, ingress recovery records, memory links,
+tool-output documents, traces and compaction runs. Deletion works run by run,
+for every event type, in short write batches. Each run is kept while any of
+these holds: its session is in use (its newest handoff summary and prefix
+stay), an rf message in it is not yet settled, its input still awaits ingress
+recovery, it is under agent erasure, a newer row names it as its cause, or a
 child run still names it as its parent.
 
 Values `1` to `14` run as `15`, the effective minimum, because the rf sync

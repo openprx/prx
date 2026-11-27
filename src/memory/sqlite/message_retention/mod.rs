@@ -184,6 +184,7 @@ pub(super) fn trim(
 fn batch(memory: &SqliteMemory, cutoff: &str, cursor: &mut i64, trim: &mut MessageTrim) -> anyhow::Result<bool> {
     let writer = memory.pool.write();
     let tx = begin_immediate(&writer)?;
+    let ingress = copies::has_ingress(&tx)?;
     let rows = {
         let mut statement = tx.prepare(
             "SELECT e.id, e.workspace_id, e.run_id FROM message_events e
@@ -213,7 +214,7 @@ fn batch(memory: &SqliteMemory, cutoff: &str, cursor: &mut i64, trim: &mut Messa
             None => Unit::Row { id, workspace },
         };
         if !decided.contains_key(&unit) {
-            let keep = eligible(&tx, &unit, cutoff)?;
+            let keep = eligible(&tx, &unit, cutoff, ingress)?;
             if keep && units.len() >= BATCH_UNITS {
                 break;
             }
@@ -263,9 +264,13 @@ fn batch(memory: &SqliteMemory, cutoff: &str, cursor: &mut i64, trim: &mut Messa
         trim.attempts += u64::try_from(copies::drop_attempts(&tx, workspace, &runs_json, &set_events)?)?;
     }
     trim.links += u64::try_from(copies::drop_links(&tx, &events_json)?)?;
+    let ids_json = serde_json::to_string(&ids)?;
+    if ingress {
+        copies::drop_ingress(&tx, &events_json, &ids_json)?;
+    }
     let deleted = tx.execute(
         "DELETE FROM message_events WHERE id IN (SELECT value FROM json_each(?1))",
-        params![serde_json::to_string(&ids)?],
+        params![ids_json],
     )?;
     trim.events += u64::try_from(deleted)?;
     trim.runs += u64::try_from(units.len())?;
@@ -280,11 +285,21 @@ fn batch(memory: &SqliteMemory, cutoff: &str, cursor: &mut i64, trim: &mut Messa
 }
 
 /// Rules E1-E7 for one unit, evaluated inside the batch transaction. A run
-/// also needs E3 (no unsettled attempt) and E7 (no descendant run).
-fn eligible(tx: &Connection, unit: &Unit, cutoff: &str) -> anyhow::Result<bool> {
+/// also needs E3 (no unsettled attempt) and E7 (no descendant run). When the
+/// lazily created `ingress_recovery` table exists (`ingress`), E3 also covers
+/// ingress recovery: a unit whose input row still has an unreconciled
+/// recovery record is kept, so a restart can still recover it.
+fn eligible(tx: &Connection, unit: &Unit, cutoff: &str, ingress: bool) -> anyhow::Result<bool> {
     let keep = match unit {
         Unit::Run { workspace, run } => {
             let keep = keep_row(true);
+            let recovering = if ingress {
+                "AND NOT EXISTS(SELECT 1 FROM message_events r
+                     JOIN ingress_recovery i ON i.input_event_id = r.event_id
+                     WHERE r.workspace_id = :workspace AND r.run_id = :run AND i.state <> 'reconciled')"
+            } else {
+                ""
+            };
             let sql = format!(
                 "SELECT NOT EXISTS(SELECT 1 FROM message_events r
                      WHERE r.workspace_id = :workspace AND r.run_id = :run AND ({keep}))
@@ -297,7 +312,8 @@ fn eligible(tx: &Connection, unit: &Unit, cutoff: &str) -> anyhow::Result<bool> 
                                                           'turn:' || a.run_id || ':admission-failed')))))
                  AND NOT EXISTS(SELECT 1 FROM message_events d
                      WHERE d.workspace_id = :workspace AND d.parent_run_id = :run
-                       AND COALESCE(d.run_id, '') <> :run)"
+                       AND COALESCE(d.run_id, '') <> :run)
+                 {recovering}"
             );
             tx.query_row(
                 &sql,
@@ -307,7 +323,15 @@ fn eligible(tx: &Connection, unit: &Unit, cutoff: &str) -> anyhow::Result<bool> 
         }
         Unit::Row { id, .. } => {
             let keep = keep_row(false);
-            let sql = format!("SELECT NOT EXISTS(SELECT 1 FROM message_events r WHERE r.id = :id AND ({keep}))");
+            let recovering = if ingress {
+                "AND NOT EXISTS(SELECT 1 FROM message_events r
+                     JOIN ingress_recovery i ON i.input_event_id = r.event_id
+                     WHERE r.id = :id AND i.state <> 'reconciled')"
+            } else {
+                ""
+            };
+            let sql =
+                format!("SELECT NOT EXISTS(SELECT 1 FROM message_events r WHERE r.id = :id AND ({keep})) {recovering}");
             tx.query_row(&sql, named_params! {":id": id, ":cutoff": cutoff}, |r| {
                 r.get::<_, bool>(0)
             })?
