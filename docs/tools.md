@@ -2264,6 +2264,37 @@ cleared. An open terminal chat discards the erased conversation and starts a
 fresh chat; its previous cached history cannot be saved again. Rows written
 before session scoping was introduced are outside this erase contract.
 
+## MCP resource subscriptions
+
+`mcp_call` with `"action":"subscribe"` or `"action":"unsubscribe"` takes `server` and `uri`.
+A subscribe asks the server for `notifications/resources/updated` on that URI and records the
+calling session (owner, session and agent of the tool call) as a subscriber. The server must
+speak protocol 2026-07-28 and declare `resources.subscribe`; a legacy server or one without
+that capability is refused with an error and no stream is opened. A server that does not
+acknowledge the URI on its `subscriptions/listen` answer (for example at its stream limit)
+is reported as declined, and PRX does not retry until a new subscribe.
+
+- One `subscriptions/listen` stream serves every session of the process that subscribed to the
+  same (server, URI). A second subscriber gets `"shared": true`. The last unsubscribe ends the
+  stream and cancels its request on the wire.
+- `list` and `status` add a `subscriptions` array for the calling session: one entry per
+  subscription with `server`, `uri`, `state` (`active`, `reconnecting` or `declined`), `since`,
+  `updates`, `last_update_at`, and `last_error` while reconnecting. Without a session context
+  (a direct tool call with no receipt) subscribe and unsubscribe fail with "subscribe needs a
+  session context", and the field is omitted.
+- A stream that ends (graceful or abrupt end, or an error) is reopened with backoff: 1 s,
+  doubling up to 60 s, and reset to 1 s after a stream that lived at least 60 s. A failed attempt
+  waits at least its `Retry-After` (seconds or an HTTP date) when the server sent one with a 429 or
+  5xx answer. A reconnect whose acknowledgment lacks the URI marks the stream `declined` and keeps
+  its subscribers, with no further attempt. A server that is removed from the configuration, retired
+  by a reload, or no longer declares the capability loses its streams with one warning.
+- Subscriptions live in memory for the life of the PRX process. A restart forgets them, and nothing
+  is persisted. The update counts are kept per stream; notices into the subscribing session are
+  not delivered yet (a later lane).
+- Unlike `call`, subscribe and unsubscribe skip the read-only autonomy check and the side-effect
+  gate, as `read` does. No allowlist, confirmation or count limit applies. Logs carry server names,
+  states and counts only, never a URI or notification content.
+
 ## MCP alias naming
 
 Discovered MCP tools are exposed as `<prefix>__<server>__<tool>` aliases (`tool_name_prefix`, default `mcp`). Every character of the prefix, server and tool parts outside `[A-Za-z0-9_-]` becomes `_`, and an alias longer than 64 characters is cut and ends in `_` plus eight hex characters of SHA-256, so every provider accepts the name; a tool whose alias would be shared with another tool on any server gets the same suffix. Skill manifests must use the sanitized alias in `required-tools`; a stale alias resolves as an unknown tool, and calls still send the original tool name to the server.
