@@ -160,14 +160,6 @@ pub(crate) fn latest_user_query_index(history: &[ChatMessage]) -> Option<usize> 
         .rposition(|m| m.role == "user" && !m.content.is_empty() && !is_loop_written_user_note(&m.content))
 }
 
-/// Extract the latest real user turn to use as the recall query, skipping
-/// internal bookkeeping messages (tool results, compaction/paging breadcrumbs).
-pub(super) fn latest_user_query(history: &[ChatMessage]) -> Option<&str> {
-    latest_user_query_index(history)
-        .and_then(|index| history.get(index))
-        .map(|m| m.content.as_str())
-}
-
 /// Build assistant history entry in JSON format for native tool-call APIs.
 /// `convert_messages` in the OpenRouter provider parses this JSON to reconstruct
 /// the proper `NativeMessage` with structured `tool_calls`.

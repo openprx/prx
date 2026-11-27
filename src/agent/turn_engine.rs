@@ -28,13 +28,9 @@ use crate::agent::context_budget::budgeted_request_tool_tokens;
 #[cfg(test)]
 use crate::agent::context_budget::{APPENDED_SECTION_FRAMING_TOKENS, TOKEN_HEURISTIC_BUDGET_MULTIPLIER};
 use crate::agent::context_budget::{PRE_TURN_FLUSH_THRESHOLD, plan_context_budget};
-use crate::agent::context_paging::{
-    context_mode_uses_os_paging, inject_recalled_context, plan_os_paging, recall_context_pages,
-};
 #[cfg(test)]
 use crate::agent::document_ingest::drop_untrusted_external_results;
 use crate::agent::execution_policy::{AgentToolRuntimeInputs, build_agent_tool_runtime_adapter};
-use crate::agent::history::latest_user_query;
 use crate::agent::provider_round::is_stream_failure_after_model_output;
 use crate::agent::response_guard::strip_assistant_fabricated_tool_markers;
 #[cfg(test)]
@@ -50,7 +46,7 @@ use crate::agent::turn_contracts::{ToolCallNotification, ToolLoopCancelled, Tool
 use crate::agent::turn_history::{TurnHistory, same_messages};
 use crate::agent::turn_request::{ToolLoopMemory, TurnDecision, TurnDelivery, TurnRequest, TurnSchedule, TurnServices};
 use crate::context::budget::anchor;
-use crate::context::reduce::engine::{PreTurn, Services, history_before_change, report_durable_compaction};
+use crate::context::reduce::engine::{PreTurn, Services};
 #[cfg(test)]
 use crate::memory::{DocumentSearchResult, MemoryPrincipal};
 #[cfg(test)]
@@ -606,15 +602,9 @@ async fn run_turn_unguarded(
     let mode_capabilities =
         service.effective_provider_capabilities(provider_name, model, provider.capabilities_for(model, provider_mode));
 
-    // FIX-P3-05: Letta/MemGPT-style OS-paging for legacy compaction modes.
-    // Exact context switching bypasses this block so the durable handoff owns
-    // every cold message before the provider projection changes. When active:
-    //   1. Recall — semantically retrieve relevant evicted pages and inject them
-    //      (proactive_retrieval) so the model can see paged-out history again.
-    //   2. Evict — page the oldest cold context out to the durable document
-    //      store (non-destructively), shrinking the hot window before the turn.
-    // Legacy compaction below still runs as a backstop if paging left a legacy
-    // mode above the 0.85 threshold.
+    // Context switch recovery: a switched session needs the transcript lookup
+    // tool. Exact context switching bypasses legacy compaction, so the durable
+    // handoff owns every cold message before the provider projection changes.
     if let Some(config) = compaction_config {
         let switch_needs_lookup = matches!(config.mode, crate::config::AgentCompactionMode::Switch)
             && (turn_history.holds_context_handoff(history)
@@ -628,49 +618,6 @@ async fn run_turn_unguarded(
                 tool = crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME,
                 "context switch recovery tool is not registered; continuing without it"
             );
-        }
-    }
-
-    if let Some(config) = compaction_config
-        && context_mode_uses_os_paging(config)
-    {
-        if let Some(query) = latest_user_query(history).map(ToString::to_string) {
-            if let Some(recalled) = recall_context_pages(&query, config, document_ingest.as_ref()).await {
-                // A projection: the canonical history never holds the page.
-                turn_history.reshape(history, |view| inject_recalled_context(view, recalled.clone()));
-                turn_history.record_recalled_page(recalled);
-            }
-        }
-        // Gated on the provider view, evicted from the canonical history.
-        if plan_context_budget(history, config, config.os_paging.eviction_threshold).over_warning {
-            let canonical = turn_history.canonical_mut(history);
-            let before = history_before_change(&runtime_adapter, canonical);
-            match plan_os_paging(
-                canonical.messages(),
-                canonical.sources(),
-                config,
-                document_ingest.as_ref(),
-            )
-            .await
-            {
-                Ok(Some(eviction)) if canonical.apply_page_eviction(&eviction) => {
-                    crate::agent::idle::beat(crate::agent::idle::ProgressKind::Compaction);
-                    tracing::debug!("os-paging: pre-turn eviction applied");
-                    report_durable_compaction(
-                        &runtime_adapter,
-                        before,
-                        turn_history.finish_durable_compaction(history),
-                        config,
-                    )
-                    .await?;
-                    rederive_provider_view(&mut turn_history, history, hooks, channel_name).await;
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
-                    tracing::warn!(error_len, error_sha256, "os-paging: pre-turn eviction error (soft)");
-                }
-            }
         }
     }
 

@@ -268,11 +268,6 @@ impl CanonicalHistory {
         canonical
     }
 
-    /// Per message, index for index, the event ids it derives from.
-    pub(crate) fn sources(&self) -> &[MessageSources] {
-        &self.sources
-    }
-
     pub(crate) fn messages(&self) -> &[ChatMessage] {
         &self.messages
     }
