@@ -24,6 +24,9 @@
 //!   `key=` / `--key=` form, not as `key:` in prose or YAML, and a bare `key`
 //!   value only when it looks like a key (`key=ABCDEF0123456789`, not
 //!   `"key": "PRX-58"`);
+//!   The same pairs are masked with escaped quotes (`{\"password\":\"x\"}`, a JSON
+//!   fragment inside a string or log line), and a double-quoted value takes a
+//!   backslash-escaped quote (`"a b\"c"`) with it;
 //! - nested credential pairs after plain context names, including anyhow
 //!   error chains, and URL credential query values (with decoded names),
 //!   found before generic pair scanning using original input offsets;
@@ -240,6 +243,90 @@ fn prefixed_token_spans(text: &str, spans: &mut Vec<Range<usize>>) {
     }
 }
 
+/// The offset of the first `"` in `tail` that no backslash escapes: a
+/// backslash takes the byte after it with it.
+fn closing_double_quote(tail: &[u8]) -> Option<usize> {
+    let mut at = 0;
+    while let Some(&byte) = tail.get(at) {
+        match byte {
+            b'"' => return Some(at),
+            b'\\' => at += 2,
+            _ => at += 1,
+        }
+    }
+    None
+}
+
+/// Opens an escaped JSON pair, `\"name\":\"`, as found in a JSON fragment
+/// that sits inside a JSON string or other text: capture 1 is the name.
+static ESCAPED_PAIR: LazyLock<Option<Regex>> =
+    LazyLock::new(|| Regex::new(r#"\\"([A-Za-z0-9_.-]+)\\"\s*:\s*\\""#).ok());
+
+/// Where the value of an escaped pair that starts at `start` ends: the
+/// backslash of the first `\"` (one backslash, then the quote). Three
+/// backslashes before a quote are an escaped quote inside the value
+/// (`\\\"`) and stay in it. A value with no single-backslash close ends at
+/// the first quote run instead. `None` when no quote follows at all.
+fn escaped_value_end(text: &str, start: usize) -> Option<usize> {
+    let bytes = text.as_bytes().get(start..)?;
+    let mut at = 0;
+    let mut first_run = None;
+    while let Some(&byte) = bytes.get(at) {
+        if byte != b'\\' {
+            at += 1;
+            continue;
+        }
+        let run = bytes.get(at..)?.iter().take_while(|&&b| b == b'\\').count();
+        if bytes.get(at + run) == Some(&b'"') {
+            if run == 1 {
+                return Some(start + at);
+            }
+            first_run.get_or_insert(start + at);
+            at += run + 1;
+        } else {
+            at += run;
+        }
+    }
+    first_run
+}
+
+/// The values of credential pairs whose quotes are escaped, as in
+/// `config {\"password\":\"hunter22\"} ok`, masked exactly as the unescaped
+/// JSON pair is: the name decides ([`is_credential_value`]), the name is kept.
+fn escaped_pair_spans(text: &str, spans: &mut Vec<Range<usize>>) {
+    #[cfg(test)]
+    record_redaction_work(text.len());
+    if !text.contains("\\\"") {
+        return;
+    }
+    let Some(pair) = ESCAPED_PAIR.as_ref() else {
+        return;
+    };
+    #[cfg(test)]
+    record_redaction_work(text.len());
+    let mut covered_until = 0;
+    for captures in pair.captures_iter(text) {
+        let (Some(header), Some(name)) = (captures.get(0), captures.get(1)) else {
+            continue;
+        };
+        if header.start() < covered_until {
+            continue;
+        }
+        let Some(end) = escaped_value_end(text, header.end()) else {
+            continue;
+        };
+        #[cfg(test)]
+        record_redaction_work(end - header.end() + 1);
+        let Some(value) = text.get(header.end()..end) else {
+            continue;
+        };
+        if !value.is_empty() && is_credential_value(name.as_str(), value) {
+            covered_until = end;
+            spans.push(header.end()..end);
+        }
+    }
+}
+
 /// Cached value boundaries and token-shape summaries. Header positions only
 /// advance, so each quote/bare boundary is searched once per disjoint region.
 #[derive(Default)]
@@ -266,12 +353,19 @@ impl PairValueScan {
         let body = start + usize::from(quote.is_some());
         if self.end <= start {
             let tail = text.get(body..)?;
-            let offset = tail.find(|character: char| {
-                quote.map_or_else(
-                    || character.is_whitespace() || matches!(character, '"' | '\'' | ',' | ';' | '{' | '}'),
-                    |quote| character == quote,
-                )
-            });
+            // A double-quoted value steps over a backslash-escaped quote
+            // (`"a b\"c"`); one with no closing quote that way ends at the
+            // first quote, as before.
+            let offset = if quote == Some('"') {
+                closing_double_quote(tail.as_bytes()).or_else(|| tail.find('"'))
+            } else {
+                tail.find(|character: char| {
+                    quote.map_or_else(
+                        || character.is_whitespace() || matches!(character, '"' | '\'' | ',' | ';' | '{' | '}'),
+                        |quote| character == quote,
+                    )
+                })
+            };
             self.end = offset.map_or(text.len(), |offset| body + offset);
             self.shape = None;
             #[cfg(test)]
@@ -641,6 +735,7 @@ pub fn find_secrets(text: &str) -> Vec<Range<usize>> {
     let mut spans = Vec::new();
     let url_parts = url_secret_spans(text, &mut spans);
     keyed_pair_spans(text, &url_parts, &mut spans);
+    escaped_pair_spans(text, &mut spans);
     for pattern in [AUTHORIZATION_HEADER.as_ref(), BARE_BEARER.as_ref()]
         .into_iter()
         .flatten()
