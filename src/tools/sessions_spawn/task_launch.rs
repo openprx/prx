@@ -490,6 +490,13 @@ impl SessionsSpawnTool {
                 }
                 let announce = format_announce_message(&rid, &status, &result_text);
                 let task_completed = matches!(status, SubAgentStatus::Completed(_));
+                // Read before the result row is written: the scope moves into it.
+                let task_documents = match &task_mailbox_announce {
+                    Some(_) if announce_result => {
+                        super::mailbox_announce::run_document_refs(&task_memory_fabric, &task_result_scope, &rid).await
+                    }
+                    _ => Vec::new(),
+                };
                 record_spawn_result_event(
                     Some(&task_memory_fabric),
                     task_result_scope,
@@ -513,7 +520,9 @@ impl SessionsSpawnTool {
 
                 // A gateway parent session receives the completion through its mailbox.
                 let task_mailbox_delivered = match &task_mailbox_announce {
-                    Some(mailbox) if announce_result => mailbox.deliver(&rid, task_completed, &result_text).await,
+                    Some(mailbox) if announce_result => {
+                        mailbox.deliver(&rid, task_completed, &result_text, &task_documents).await
+                    }
                     _ => false,
                 };
                 // Announce result back to channel if we have a recipient

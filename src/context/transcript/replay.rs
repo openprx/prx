@@ -293,6 +293,29 @@ impl ReplayLog {
         (!replay.messages.is_empty()).then_some(replay)
     }
 
+    /// The document ids the tool results of `run_id` point at (a result that
+    /// was stored as a document), in call order and without repeats.
+    pub(crate) fn document_ids_of_run(&self, run_id: &str) -> Vec<String> {
+        let mut ids: Vec<String> = Vec::new();
+        let Some(rounds) = self.rounds.get(run_id) else {
+            return ids;
+        };
+        for round in rounds.values() {
+            for call in round.calls.values() {
+                let document = round
+                    .results
+                    .get(&call.call_id)
+                    .and_then(|result| result.document_id.as_ref());
+                if let Some(id) = document
+                    && !ids.contains(id)
+                {
+                    ids.push(id.clone());
+                }
+            }
+        }
+        ids
+    }
+
     /// The run of each reply in `replies` (oldest first), matched with the
     /// stored assistant messages from the newest back by their text. A reply
     /// that does not match its stored message, and every older one, gets

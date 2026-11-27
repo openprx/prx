@@ -642,6 +642,13 @@ impl SessionsSpawnTool {
                         if finalization == ProcessFinalization::Unconfirmed || owner_exiting {
                             return;
                         }
+                        // Read before the result row is written: the scope moves into it.
+                        let process_documents = match (&process_mailbox_announce, process_memory_fabric.as_ref()) {
+                            (Some(_), Some(fabric)) if announce_result => {
+                                super::mailbox_announce::run_document_refs(fabric, &process_result_scope, &rid).await
+                            }
+                            _ => Vec::new(),
+                        };
                         // One result row per run: the worker's own row, if it wrote one,
                         // already holds the run's key and this write adds nothing.
                         record_spawn_result_event_keyed(
@@ -660,7 +667,12 @@ impl SessionsSpawnTool {
                         let process_mailbox_delivered = match &process_mailbox_announce {
                             Some(mailbox) if announce_result => {
                                 mailbox
-                                    .deliver(&rid, matches!(status, SubAgentStatus::Completed(_)), &result_text)
+                                    .deliver(
+                                        &rid,
+                                        matches!(status, SubAgentStatus::Completed(_)),
+                                        &result_text,
+                                        &process_documents,
+                                    )
                                     .await
                             }
                             _ => false,

@@ -12,6 +12,8 @@
 //! user typed.
 
 use crate::config::Config;
+use crate::context::transcript::Transcript;
+use crate::memory::{MemoryFabric, MemoryPrincipal, MessageEventScope};
 use crate::messaging::mailbox::MailboxSendState;
 use crate::messaging::runtime::MessagingRuntime;
 use crate::messaging::send::MailboxSender as _;
@@ -22,6 +24,30 @@ use std::sync::Arc;
 /// Result text carried in one announcement; the full result stays retrievable
 /// through `join` and `sessions_list`.
 const ANNOUNCE_RESULT_MAX_CHARS: usize = 16_000;
+
+/// Document references listed in one announcement; the rest is counted.
+const ANNOUNCE_DOCUMENT_MAX_REFS: usize = 20;
+
+/// The documents a finished run stored, read from its own tool rows in the
+/// child session (the principal is the child's scope: owner, session and
+/// agent partition). A failed read gives none.
+pub(super) async fn run_document_refs(fabric: &MemoryFabric, scope: &MessageEventScope, run_id: &str) -> Vec<String> {
+    let principal = MemoryPrincipal {
+        workspace_id: fabric.workspace_id().to_owned(),
+        agent_id: scope.agent_id.clone(),
+        persona_id: scope.persona_id.clone(),
+        session_key: scope.session_key.clone(),
+        channel: scope.channel.clone(),
+        sender: scope.sender.clone(),
+        owner_id: scope.owner_id.clone(),
+        agent_partition: scope.agent_partition.clone(),
+        ..MemoryPrincipal::default()
+    };
+    let memory = fabric.memory();
+    Transcript::new(memory.as_ref(), principal)
+        .run_document_ids(run_id)
+        .await
+}
 
 /// Where a run's completion goes: the parent session that launched it.
 #[derive(Clone)]
@@ -78,8 +104,8 @@ impl MailboxAnnouncement {
 
     /// Send the completion to the parent session. `false` leaves the run's
     /// own channel as the fallback; the result stays retrievable either way.
-    pub(super) async fn deliver(&self, run_id: &str, completed: bool, result_text: &str) -> bool {
-        let text = announcement_text(run_id, completed, result_text, &self.child_session);
+    pub(super) async fn deliver(&self, run_id: &str, completed: bool, result_text: &str, documents: &[String]) -> bool {
+        let text = announcement_text(run_id, completed, result_text, &self.child_session, documents);
         let runtime = Arc::clone(&self.runtime);
         let source = runtime.address(&self.owner, &self.child_session, &self.child_agent);
         let target = runtime.address(&self.owner, &self.parent_session, &self.parent_agent);
@@ -115,15 +141,31 @@ impl MailboxAnnouncement {
 
 /// The inbound message the parent session reads: which run finished, how, and
 /// its result (bounded).
-fn announcement_text(run_id: &str, completed: bool, result_text: &str, child_session: &str) -> String {
+fn announcement_text(
+    run_id: &str,
+    completed: bool,
+    result_text: &str,
+    child_session: &str,
+    documents: &[String],
+) -> String {
     let outcome = if completed { "completed" } else { "FAILED" };
     let head = format!(
         "Sub-agent `{run_id}` has finished ({outcome}). This is an automatic completion notice for a run you already started, not a new request; that run's task is done. Report this result to the user if useful; the request that started the run is already done, do not start it again."
     );
     let detail = result_text.trim();
-    let references = format!(
+    let mut references = format!(
         "\n\n[References]\n- transcript {child_session}: read it with sessions_spawn action=history run_id={run_id} transcript=true, or search it with transcript_search session_key={child_session}"
     );
+    let mut document_lines: Vec<String> = documents
+        .iter()
+        .take(ANNOUNCE_DOCUMENT_MAX_REFS)
+        .map(|id| format!("\n- document {id}: find its chunks with document_search"))
+        .collect();
+    let omitted = documents.len().saturating_sub(ANNOUNCE_DOCUMENT_MAX_REFS);
+    if omitted > 0 {
+        document_lines.push(format!("\n+{omitted} more"));
+    }
+    references.extend(document_lines);
     if detail.is_empty() {
         return format!("{head}\nResult: (empty){references}");
     }

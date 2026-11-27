@@ -139,6 +139,13 @@ impl<'a> Transcript<'a> {
         ReplayLog::load_tool_rows(self.memory, &self.principal).await
     }
 
+    /// The document ids that the tool results of `run_id` in this session's
+    /// log point at, in call order. Read from the tool rows only; a failed read
+    /// gives none.
+    pub(crate) async fn run_document_ids(&self, run_id: &str) -> Vec<String> {
+        self.tool_log().await.document_ids_of_run(run_id)
+    }
+
     /// The stored `turns` as model-facing history: each user message with its
     /// stored attachment, each reply preceded by the tool rounds of its run.
     pub(crate) async fn expand_turns(&self, turns: Vec<ConversationTurn>) -> History {
