@@ -28,7 +28,6 @@
 
 use crate::agent::compaction::render_context_handoff_for_provider;
 use crate::agent::context_budget::{budgeted_tokens, estimate_history_tokens_with_source};
-use crate::agent::context_paging::inject_recalled_context;
 use crate::agent::page_sources::MessageSources;
 use crate::agent::tool_evidence::{TurnToolEvidence, render_assistant_content, render_user_content};
 use crate::agent::turn_contracts::{inbound_user_message, stored_turn_message};
@@ -437,35 +436,6 @@ impl CanonicalHistory {
         restored
     }
 
-    /// Apply an OS-paging eviction planned over `self`: the breadcrumb takes
-    /// the evicted range, and a `role="tool"` result left directly behind it
-    /// is dropped. Whether it was applied.
-    pub(super) fn apply_page_eviction(&mut self, eviction: &crate::agent::context_paging::OsPagingEviction) -> bool {
-        if !self.splice(
-            eviction.start,
-            eviction.end,
-            std::slice::from_ref(&eviction.breadcrumb),
-            MessageOrigin::Acknowledged,
-            &MessageSources::default(),
-        ) {
-            return false;
-        }
-        let behind = eviction.start.saturating_add(1);
-        while self.messages.get(behind).is_some_and(|message| message.role == "tool") {
-            self.messages.remove(behind);
-            if behind < self.origins.len() {
-                self.origins.remove(behind);
-            }
-            if behind < self.evidence.len() {
-                self.evidence.remove(behind);
-            }
-            if behind < self.sources.len() {
-                self.sources.remove(behind);
-            }
-        }
-        true
-    }
-
     /// Move every refresh aside a durable compaction step wrote into the
     /// history out of it: the asides are a projection.
     fn lift_refresh_notes(&mut self) -> Vec<(usize, ChatMessage)> {
@@ -751,9 +721,6 @@ pub(crate) fn project(canonical: &CanonicalHistory, inputs: &ProjectionInputs) -
         let index = at.saturating_add(offset).min(messages.len());
         messages.insert(index, note.clone());
     }
-    if let Some(page) = &inputs.recalled_page {
-        inject_recalled_context(&mut messages, page.clone());
-    }
     if inputs.suppress_skill_metadata {
         crate::agent::runtime_prompt::suppress_unreadable_skill_metadata(&mut messages);
     }
@@ -961,12 +928,6 @@ impl TurnHistory {
     /// untracked caller's view was never reshaped.
     pub(crate) fn canonical<'a>(&'a self, view: &'a [ChatMessage]) -> &'a [ChatMessage] {
         self.canonical.as_ref().map_or(view, CanonicalHistory::messages)
-    }
-
-    /// The recalled context page this turn shows the model; it is a projection
-    /// and never part of the canonical history.
-    pub(crate) fn record_recalled_page(&mut self, page: ChatMessage) {
-        self.projection.recalled_page = Some(page);
     }
 
     /// Whether this request strips the skill metadata from the system prompt.

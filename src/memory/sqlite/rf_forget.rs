@@ -26,7 +26,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 /// The most write-log rows one forget reads.
 const FAMILY_MAX_ROWS: i64 = 20_000;
 
-/// The source kind of OS-paging context pages (`agent/context_paging.rs`).
+/// The source kind of context pages written by the removed OS paging.
 const CONTEXT_PAGE_KIND: &str = "context_page";
 
 /// The longest text probe a context-page match uses, in characters.
