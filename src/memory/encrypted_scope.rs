@@ -1230,6 +1230,10 @@ impl Memory for EncryptedScope {
             .collect())
     }
 
+    async fn excluded_transcript_rows(&self, row_ids: &[i64]) -> anyhow::Result<std::collections::HashSet<i64>> {
+        self.inner.excluded_transcript_rows(row_ids).await
+    }
+
     async fn search_transcripts(
         &self,
         principal: &MemoryPrincipal,
