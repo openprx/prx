@@ -59,11 +59,11 @@ pub(super) fn drop_links(tx: &Connection, events_json: &str) -> rusqlite::Result
     )
 }
 
-/// Whether the lazily created `ingress_recovery` table exists.
-pub(super) fn has_ingress(tx: &Connection) -> rusqlite::Result<bool> {
+/// Whether the table `name` exists; the optional tables are created lazily.
+pub(super) fn has_table(tx: &Connection, name: &str) -> rusqlite::Result<bool> {
     tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'ingress_recovery')",
-        [],
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
+        [name],
         |row| row.get(0),
     )
 }

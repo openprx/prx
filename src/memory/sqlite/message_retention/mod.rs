@@ -1,7 +1,7 @@
-//! Age-based deletion of the message log, run by run. Each batch evaluates its
-//! units, appends their rf retention notices and deletes them with their
-//! derived copies in one IMMEDIATE transaction, so a crash leaves all or
-//! nothing. The per-pass copies, the state row and the WAL scrub follow.
+//! Age-based deletion of the message log, run by run. Each batch reads its
+//! candidate units on a reader connection; one IMMEDIATE transaction re-checks
+//! them, appends their rf retention notices and deletes them with their
+//! derived copies, so a crash leaves all or nothing. The per-pass copies, the state row and the WAL scrub follow.
 mod copies;
 
 use super::{SqliteMemory, rf_delete, rf_messages::RESTART_INTERRUPTED, sync_journal, sync_retained};
@@ -10,8 +10,11 @@ use crate::runtime::sqlite_pool::begin_immediate;
 use rusqlite::{Connection, OptionalExtension, named_params, params};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-/// A pass that started less than this many seconds ago does nothing.
+/// A start-up pass does nothing when a pass completed less than this many seconds ago.
 const THROTTLE_SECS: i64 = 55 * 60;
+/// A start-up pass does nothing when any pass started less than this many seconds ago,
+/// so a pass that keeps failing is retried at most every 15 minutes, not at every start.
+const BACKOFF_SECS: i64 = 15 * 60;
 /// Effective minimum retention: the rf journal keeps 14 days, plus one day of margin.
 const MIN_RETENTION_DAYS: u64 = 15;
 /// Rows scanned per batch.
@@ -76,6 +79,25 @@ fn keep_row(run_unit: bool) -> String {
     )
 }
 
+/// E8 for a run unit: a pending recovery attestation names one of its rows.
+const PENDING_ATTESTATION_RUN: &str = "
+                 AND NOT EXISTS(SELECT 1 FROM message_events r
+                     JOIN recovery_attestations a ON (a.input_event_id = r.event_id OR a.terminal_event_id = r.event_id)
+                     WHERE r.workspace_id = :workspace AND r.run_id = :run AND a.state = 'pending')";
+
+/// E8 for a runless unit.
+const PENDING_ATTESTATION_ROW: &str = "
+                 AND NOT EXISTS(SELECT 1 FROM message_events r
+                     JOIN recovery_attestations a ON (a.input_event_id = r.event_id OR a.terminal_event_id = r.event_id)
+                     WHERE r.id = :id AND a.state = 'pending')";
+
+/// Which optional tables exist in this store, checked once per batch.
+#[derive(Clone, Copy)]
+struct Tables {
+    ingress: bool,
+    attestations: bool,
+}
+
 /// One deletion unit: every row of a run, or a runless row.
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum Unit {
@@ -117,14 +139,19 @@ pub(super) fn trim(
     {
         let writer = memory.pool.write();
         let tx = begin_immediate(&writer)?;
-        let last: Option<i64> = tx
+        ensure_attempt_column(&tx)?;
+        let state: Option<(i64, Option<i64>)> = tx
             .query_row(
-                "SELECT last_run FROM message_retention_state WHERE singleton = 1",
+                "SELECT last_run, last_attempt FROM message_retention_state WHERE singleton = 1",
                 [],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        if mode == TrimMode::Startup && last.is_some_and(|last| now - last < THROTTLE_SECS) {
+        if mode == TrimMode::Startup
+            && state.is_some_and(|(last_run, last_attempt)| {
+                now - last_run < THROTTLE_SECS || last_attempt.is_some_and(|at| now - at < BACKOFF_SECS)
+            })
+        {
             trim.skipped = TrimSkipped::Throttled;
             return Ok(trim);
         }
@@ -137,6 +164,12 @@ pub(super) fn trim(
             trim.skipped = TrimSkipped::SnapshotOpen;
             return Ok(trim);
         }
+        // Recorded before any delete, so a pass that fails later still starts the back-off.
+        tx.execute(
+            "INSERT INTO message_retention_state(singleton, last_run, last_attempt) VALUES(1, 0, ?1)
+             ON CONFLICT(singleton) DO UPDATE SET last_attempt = excluded.last_attempt",
+            params![now],
+        )?;
         tx.execute_batch(INDEXES)?;
         sync_journal::prune(&tx)?;
         tx.commit()?;
@@ -191,20 +224,27 @@ pub(super) fn trim(
     Ok(trim)
 }
 
-/// One batch in its own IMMEDIATE transaction. Returns `false` when the scan
-/// reached the last row older than the cutoff (the sweep is complete).
-fn batch(memory: &SqliteMemory, cutoff: &str, cursor: &mut i64, trim: &mut MessageTrim) -> anyhow::Result<bool> {
-    let writer = memory.pool.write();
-    let tx = begin_immediate(&writer)?;
-    let ingress = copies::has_ingress(&tx)?;
+/// Candidate units of one batch, read on a reader connection.
+struct Scan {
+    candidates: Vec<Unit>,
+    more: bool,
+    next: i64,
+}
+
+/// Reads the rows older than the cutoff after `cursor` (at most `SCAN_ROWS`) and
+/// decides each unit with [`eligible`] on this reader, up to `BATCH_UNITS`
+/// candidates. The decision is provisional: the writer re-checks every candidate.
+/// Returns `None` when no row is left (the sweep is complete).
+fn scan(conn: &Connection, cutoff: &str, cursor: i64) -> anyhow::Result<Option<Scan>> {
+    let tables = tables(conn)?;
     let rows = {
-        let mut statement = tx.prepare(
+        let mut statement = conn.prepare(
             "SELECT e.id, e.workspace_id, e.run_id FROM message_events e
              WHERE e.id > ?1 AND julianday(e.created_at) < julianday(?2)
              ORDER BY e.id LIMIT ?3",
         )?;
         statement
-            .query_map(params![*cursor, cutoff, SCAN_ROWS], |row| {
+            .query_map(params![cursor, cutoff, SCAN_ROWS], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
@@ -214,30 +254,63 @@ fn batch(memory: &SqliteMemory, cutoff: &str, cursor: &mut i64, trim: &mut Messa
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
     if rows.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
     let mut more = i64::try_from(rows.len())? >= SCAN_ROWS;
-    trim.batches += 1;
-    let mut units = Vec::new();
+    let mut candidates = Vec::new();
     let mut decided: HashMap<Unit, bool> = HashMap::new();
-    let mut next = *cursor;
+    let mut next = cursor;
     for (id, workspace, run) in rows {
         let unit = match run {
             Some(run) => Unit::Run { workspace, run },
             None => Unit::Row { id, workspace },
         };
         if !decided.contains_key(&unit) {
-            let keep = eligible(&tx, &unit, cutoff, ingress)?;
-            if keep && units.len() >= BATCH_UNITS {
+            let keep = eligible(conn, &unit, cutoff, tables)?;
+            if keep && candidates.len() >= BATCH_UNITS {
                 more = true;
                 break;
             }
             decided.insert(unit.clone(), keep);
             if keep {
-                units.push(unit);
+                candidates.push(unit);
             }
         }
         next = id;
+    }
+    Ok(Some(Scan { candidates, more, next }))
+}
+
+/// The optional tables of this store, read on the given connection.
+fn tables(conn: &Connection) -> anyhow::Result<Tables> {
+    Ok(Tables {
+        ingress: copies::has_table(conn, "ingress_recovery")?,
+        attestations: copies::has_table(conn, "recovery_attestations")?,
+    })
+}
+
+/// One batch. The candidates are read without the write lock; then one IMMEDIATE
+/// transaction re-checks each candidate (its rows must still exist and E1-E8 must
+/// still hold) and deletes those that pass, so the delete decision is made under
+/// the writer. Returns `false` when the scan reached the last row older than the
+/// cutoff (the sweep is complete).
+fn batch(memory: &SqliteMemory, cutoff: &str, cursor: &mut i64, trim: &mut MessageTrim) -> anyhow::Result<bool> {
+    let scanned = {
+        let reader = memory.pool.read()?;
+        scan(reader.connection()?, cutoff, *cursor)?
+    };
+    let Some(Scan { candidates, more, next }) = scanned else {
+        return Ok(false);
+    };
+    trim.batches += 1;
+    let writer = memory.pool.write();
+    let tx = begin_immediate(&writer)?;
+    let tables = tables(&tx)?;
+    let mut units = Vec::new();
+    for unit in candidates {
+        if !members(&tx, &unit)?.is_empty() && eligible(&tx, &unit, cutoff, tables)? {
+            units.push(unit);
+        }
     }
     if units.is_empty() {
         tx.commit()?;
@@ -279,7 +352,7 @@ fn batch(memory: &SqliteMemory, cutoff: &str, cursor: &mut i64, trim: &mut Messa
     }
     trim.links += u64::try_from(copies::drop_links(&tx, &events_json)?)?;
     let ids_json = serde_json::to_string(&ids)?;
-    if ingress {
+    if tables.ingress {
         copies::drop_ingress(&tx, &events_json, &ids_json)?;
     }
     let deleted = tx.execute(
@@ -298,22 +371,30 @@ fn batch(memory: &SqliteMemory, cutoff: &str, cursor: &mut i64, trim: &mut Messa
     Ok(more)
 }
 
-/// Rules E1-E7 for one unit, evaluated inside the batch transaction. A run
+/// Rules E1-E8 for one unit, evaluated by the scan and again in the batch
+/// transaction, which alone decides the delete. A run
 /// also needs E3 (no unsettled attempt) and E7 (no descendant run). When the
 /// lazily created `ingress_recovery` table exists (`ingress`), E3 also covers
 /// ingress recovery: a unit whose input or evidence row still has an
 /// unreconciled recovery record is kept, so a restart can still recover it.
-fn eligible(tx: &Connection, unit: &Unit, cutoff: &str, ingress: bool) -> anyhow::Result<bool> {
+/// E8: when `recovery_attestations` exists (`attestations`), a unit with a
+/// pending attestation naming one of its rows is kept; the attestation's
+/// foreign keys to `message_events` cascade on delete.
+fn eligible(tx: &Connection, unit: &Unit, cutoff: &str, tables: Tables) -> anyhow::Result<bool> {
     let keep = match unit {
         Unit::Run { workspace, run } => {
             let keep = keep_row(true);
-            let recovering = if ingress {
+            let mut recovering = if tables.ingress {
                 "AND NOT EXISTS(SELECT 1 FROM message_events r
                      JOIN ingress_recovery i ON (i.input_event_id = r.event_id OR i.evidence_event_id = r.event_id)
                      WHERE r.workspace_id = :workspace AND r.run_id = :run AND i.state <> 'reconciled')"
+                    .to_owned()
             } else {
-                ""
+                String::new()
             };
+            if tables.attestations {
+                recovering.push_str(PENDING_ATTESTATION_RUN);
+            }
             let sql = format!(
                 "SELECT NOT EXISTS(SELECT 1 FROM message_events r
                      WHERE r.workspace_id = :workspace AND r.run_id = :run AND ({keep}))
@@ -337,13 +418,17 @@ fn eligible(tx: &Connection, unit: &Unit, cutoff: &str, ingress: bool) -> anyhow
         }
         Unit::Row { id, .. } => {
             let keep = keep_row(false);
-            let recovering = if ingress {
+            let mut recovering = if tables.ingress {
                 "AND NOT EXISTS(SELECT 1 FROM message_events r
                      JOIN ingress_recovery i ON (i.input_event_id = r.event_id OR i.evidence_event_id = r.event_id)
                      WHERE r.id = :id AND i.state <> 'reconciled')"
+                    .to_owned()
             } else {
-                ""
+                String::new()
             };
+            if tables.attestations {
+                recovering.push_str(PENDING_ATTESTATION_ROW);
+            }
             let sql =
                 format!("SELECT NOT EXISTS(SELECT 1 FROM message_events r WHERE r.id = :id AND ({keep})) {recovering}");
             tx.query_row(&sql, named_params! {":id": id, ":cutoff": cutoff}, |r| {
@@ -383,11 +468,26 @@ fn members(tx: &Connection, unit: &Unit) -> anyhow::Result<Vec<(i64, String, Opt
     Ok(rows)
 }
 
+/// Adds the `last_attempt` column to a state row created before it existed.
+/// Literals only; no request data reaches the DDL.
+fn ensure_attempt_column(tx: &Connection) -> anyhow::Result<()> {
+    let present: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('message_retention_state') WHERE name = 'last_attempt')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !present {
+        tx.execute_batch("ALTER TABLE message_retention_state ADD COLUMN last_attempt INTEGER")?;
+    }
+    Ok(())
+}
+
 /// Writes the state row: `cutoff` only ever rises (fixed-width text, so the
 /// comparison is chronological) and `deleted_total` accumulates. Callers invoke
 /// it only when rows were deleted. `last_run` is left to the end of the pass; a
 /// first row starts at 0 (no completed pass), so a pass that fails after this
-/// batch is not throttled.
+/// batch is not throttled by the 55-minute rule. `last_attempt` is written at
+/// the start of every pass and is not touched here.
 fn record_deleted(tx: &Connection, cutoff: &str, deleted: usize) -> anyhow::Result<()> {
     tx.execute(
         "INSERT INTO message_retention_state(singleton, last_run, cutoff, deleted_total) VALUES(1, 0, ?1, ?2)

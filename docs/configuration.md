@@ -1700,7 +1700,8 @@ tool-output documents, traces and compaction runs. Deletion works run by run,
 for every event type, in short write batches. Each run is kept while any of
 these holds: its session is in use (its newest handoff summary and prefix
 stay), an rf message in it is not yet settled, its input still awaits ingress
-recovery, it is under agent erasure, a newer row names it as its cause, or a
+recovery, a pending recovery attestation names one of its rows, it is under
+agent erasure, a newer row names it as its cause, or a
 child run still names it as its parent.
 
 Values `1` to `14` run as `15`, the effective minimum, because the rf sync
@@ -1711,8 +1712,10 @@ backends it has no effect and logs one debug line.
 The pass runs at the start of each process that builds the memory backend
 (at most 2 batches), and hourly in the gateway (at most 20 batches, reading the
 live configuration each hour). A start-up pass is skipped when a pass completed
-less than 55 minutes ago; a pass that failed does not count, so the next start
-or hourly tick retries it. A pass is skipped while an rf snapshot is open. A
+less than 55 minutes ago, and also when any pass started less than 15 minutes
+ago, so a pass that keeps failing is retried at most every 15 minutes rather
+than at every start. The hourly tick is not held back by that rule. A pass is
+skipped while an rf snapshot is open. A
 pass that deleted rows sweeps once more from the oldest row, because a run kept
 only by a newer row that names it as its cause becomes eligible once that row
 is gone. It is never called from
