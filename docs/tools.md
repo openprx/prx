@@ -2301,11 +2301,15 @@ is reported as declined, and PRX does not retry until a new subscribe.
   so a turn woken by a notice keeps the wake depth of that subscribe call plus one.
   - Update notices are coalesced per subscriber and (server, URI): at most one per 2 s, and the
     updates of a window are counted into the next notice. No update is dropped.
+    A turn that changes the resource it watches gets the next notice at most every 2 s.
+  - A subscription made in a mailbox chain at depth 7 or more is stored, but its notices do not start
+    a turn (the existing depth below 8 rule); the subscriber reads them with its next turn.
   - After an outage the stream is back, each subscriber gets one "resumed" notice with the outage
     length, and it should re-read the resource to catch up. When a subscription is ended by PRX
     (declined on reconnect, server removed, legacy server, capability dropped) each subscriber gets
     one "ended" notice; subscribe again to retry.
-  - A subscriber whose session no longer exists is removed from its subscription. Delivery needs the
+  - A subscriber whose session is not found is removed from its subscription only when the second
+    attempt in a row also finds no session; the first records `receiver not found`. Delivery needs the
     SQLite memory backend and `inbound` enabled for the subscriber's agent; otherwise the notice is
     not sent, `status` shows it under `undelivered` with the reason, and one warning is logged per
     server and reason.

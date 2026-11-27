@@ -5,6 +5,7 @@
 use super::subscriptions::SubscriberKey;
 use crate::config::Config;
 use crate::messaging::SessionAddr;
+use crate::messaging::mailbox::MailboxError;
 use crate::messaging::runtime::{MessagingRuntime, RuntimeSender};
 use parking_lot::Mutex;
 use std::collections::HashSet;
@@ -91,20 +92,27 @@ fn prepare(
     subscriber: &SubscriberKey,
     chain_event: Option<&str>,
 ) -> Result<(RuntimeSender, SessionAddr), Delivery> {
-    let runtime = MessagingRuntime::for_config(config)
-        .map_err(|_| Delivery::Undelivered("messaging needs the SQLite backend"))?;
+    if config.memory.backend != "sqlite" {
+        return Err(Delivery::Undelivered("messaging needs the SQLite backend"));
+    }
+    let runtime =
+        MessagingRuntime::for_config(config).map_err(|_| Delivery::Undelivered("messaging runtime unavailable"))?;
     let target = runtime.address(&subscriber.owner, &subscriber.session, &subscriber.agent);
     if !runtime.inbound(&target) {
         return Err(Delivery::Undelivered("inbound disabled"));
     }
-    if runtime.resolve_scope(&target).is_err() {
-        return Err(Delivery::SessionGone);
+    match runtime.resolve_scope(&target) {
+        Ok(_) => {}
+        // Only an unknown or unauthorized receiver counts as gone; a storage
+        // failure leaves the subscriber in place.
+        Err(MailboxError::Unauthorized) => return Err(Delivery::SessionGone),
+        Err(_) => return Err(Delivery::Undelivered("mailbox storage unavailable")),
     }
     let notifier = format!("mcp:notify:{}", subscriber.agent);
     let source = runtime.address(&subscriber.owner, &notifier, &subscriber.agent);
     let sender = runtime
         .bind(source, chain_event)
-        .map_err(|_| Delivery::Undelivered("mailbox refused the sender"))?;
+        .map_err(|_| Delivery::Undelivered("mailbox storage unavailable"))?;
     Ok((sender, target))
 }
 

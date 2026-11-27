@@ -55,6 +55,8 @@ pub(super) struct SubscriberState {
     timer: Option<AbortHandle>,
     /// The last notice that could not be delivered to this subscriber.
     undelivered: Option<Undelivered>,
+    /// Consecutive `SessionGone` outcomes; the subscriber is removed at two.
+    gone: u32,
 }
 
 /// A notice that could not be delivered, with how many were lost so far.
@@ -135,6 +137,7 @@ impl UriStream {
             last_sent: None,
             timer: None,
             undelivered: None,
+            gone: 0,
         });
         subscriber.chain_event = chain_event;
         self.subscribers.len() > 1
@@ -428,36 +431,55 @@ impl Hub {
     /// Record the outcome of one delivery on its subscriber.
     fn apply(&self, key: &(String, String), caller: &SubscriberKey, outcome: Delivery) {
         match outcome {
-            Delivery::SessionGone => self.remove_subscriber(caller, key),
-            Delivery::Delivered => self.with_subscriber(key, caller, |subscriber| subscriber.undelivered = None),
-            Delivery::Undelivered(reason) => {
-                self.with_subscriber(key, caller, |subscriber| {
-                    let count = subscriber.undelivered.as_ref().map_or(0, |missed| missed.count) + 1;
-                    subscriber.undelivered = Some(Undelivered {
-                        count,
-                        reason,
-                        last_at: SystemTime::now(),
-                    });
+            Delivery::SessionGone => {
+                // The receiver can be briefly absent (for example while the config
+                // file is rewritten): remove the subscriber only on a second outcome in a row.
+                let streak = self.with_subscriber(key, caller, |subscriber| {
+                    subscriber.gone += 1;
+                    subscriber.gone
                 });
-                notify::warn_undelivered(&key.0, reason);
+                if streak.is_some_and(|streak| streak >= 2) {
+                    self.remove_subscriber(caller, key);
+                } else {
+                    self.record_undelivered(key, caller, "receiver not found");
+                }
+            }
+            Delivery::Delivered => {
+                self.with_subscriber(key, caller, |subscriber| {
+                    subscriber.gone = 0;
+                    subscriber.undelivered = None;
+                });
+            }
+            Delivery::Undelivered(reason) => {
+                self.with_subscriber(key, caller, |subscriber| subscriber.gone = 0);
+                self.record_undelivered(key, caller, reason);
             }
         }
     }
 
-    fn with_subscriber(
+    fn record_undelivered(&self, key: &(String, String), caller: &SubscriberKey, reason: &'static str) {
+        self.with_subscriber(key, caller, |subscriber| {
+            let count = subscriber.undelivered.as_ref().map_or(0, |missed| missed.count) + 1;
+            subscriber.undelivered = Some(Undelivered {
+                count,
+                reason,
+                last_at: SystemTime::now(),
+            });
+        });
+        notify::warn_undelivered(&key.0, reason);
+    }
+
+    fn with_subscriber<R>(
         &self,
         key: &(String, String),
         caller: &SubscriberKey,
-        change: impl FnOnce(&mut SubscriberState),
-    ) {
-        if let Some(subscriber) = self
-            .streams
+        change: impl FnOnce(&mut SubscriberState) -> R,
+    ) -> Option<R> {
+        self.streams
             .lock()
             .get_mut(key)
             .and_then(|stream| stream.subscribers.get_mut(caller))
-        {
-            change(subscriber);
-        }
+            .map(change)
     }
 }
 
