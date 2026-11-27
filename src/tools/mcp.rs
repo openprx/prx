@@ -466,16 +466,6 @@ impl McpTool {
             [0, 1, 2, 16, 17, 64, 65, 256, 257, 512, 513].contains(&count),
             "unsupported fixture inventory"
         );
-        let mut state = self.state.write();
-        let config = state
-            .effective_config
-            .servers
-            .get(server)
-            .ok_or_else(|| anyhow::anyhow!("fixture server missing"))?;
-        anyhow::ensure!(
-            config.command.is_none() && config.url.is_none(),
-            "fixture transport must be absent"
-        );
         let tools = (0..count)
             .map(|index| {
                 (
@@ -490,6 +480,41 @@ impl McpTool {
                 )
             })
             .collect();
+        self.test_publish_discovery(server, tools)
+    }
+
+    /// Publish fixture discovery of the named tools on one server, through the
+    /// same producer as [`Self::test_publish_inventory`].
+    #[cfg(test)]
+    pub(crate) fn test_publish_tools(&self, server: &str, names: &[&str]) -> anyhow::Result<()> {
+        let tools = names
+            .iter()
+            .map(|name| {
+                (
+                    (*name).to_owned(),
+                    DiscoveredToolMeta {
+                        description: Some("Neutral fixture tool".into()),
+                        input_schema: Some(json!({"type":"object","properties":{}})),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        self.test_publish_discovery(server, tools)
+    }
+
+    #[cfg(test)]
+    fn test_publish_discovery(&self, server: &str, tools: HashMap<String, DiscoveredToolMeta>) -> anyhow::Result<()> {
+        let mut state = self.state.write();
+        let config = state
+            .effective_config
+            .servers
+            .get(server)
+            .ok_or_else(|| anyhow::anyhow!("fixture server missing"))?;
+        anyhow::ensure!(
+            config.command.is_none() && config.url.is_none(),
+            "fixture transport must be absent"
+        );
         state.discovered_tools.insert(server.to_owned(), tools);
         state.mcp_state_epoch = state
             .mcp_state_epoch

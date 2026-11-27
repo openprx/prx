@@ -1262,14 +1262,11 @@ async fn call_allowed_with_matching_grant() {
 #[tokio::test]
 async fn alias_grant_is_refused_for_other_aliases_and_the_root() {
     let mut cfg = McpConfig::default();
-    cfg.servers.insert(
-        "srv".into(),
-        McpServerConfig {
-            tool_name_prefix: "mcp".into(),
-            ..McpServerConfig::default()
-        },
-    );
+    // The default `tool_name_prefix` is `mcp`.
+    cfg.servers.insert("srv".into(), McpServerConfig::default());
     let tool = McpTool::new(mcp_gate_security(), cfg, std::env::temp_dir());
+    // An alias resolves only once its tool is discovered.
+    tool.test_publish_tools("srv", &["act", "other"]).unwrap();
     let op = op_id::op_id(MCP_ROOT_NAME, "call", &["srv", "act"]);
     let grant_for = |name: &str| ApprovalGrant::for_resource_operation(name, &op, "test", None);
     let gate_denied = |result: &ToolResult| {

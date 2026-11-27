@@ -533,6 +533,8 @@ async fn pinned_mcp_alias_uses_catalog_operation_and_rejects_changed_live_target
         ..SecurityPolicy::default()
     });
     let mcp = crate::tools::mcp::McpTool::new(Arc::clone(&security), live, path.path().to_owned());
+    // The live server discovers `nested__action`, so the alias resolves to it.
+    mcp.test_publish_tools("prx_server", &["nested__action"]).unwrap();
     let refused = mcp.execute_named(alias, args).await.unwrap();
     assert!(!refused.success);
     assert!(
