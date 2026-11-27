@@ -877,6 +877,19 @@ impl Memory for LucidMemory {
         self.local.load_session_context_before(query, before_id).await
     }
 
+    async fn session_events_of_type_before(
+        &self,
+        principal: &crate::memory::MemoryPrincipal,
+        session_key: &str,
+        event_type: &str,
+        before_id: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MessageEvent>> {
+        self.local
+            .session_events_of_type_before(principal, session_key, event_type, before_id, limit)
+            .await
+    }
+
     async fn append_memory_event(&self, input: MemoryEventInput) -> anyhow::Result<MemoryEvent> {
         self.local.append_memory_event(input).await
     }
