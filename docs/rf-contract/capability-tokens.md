@@ -479,8 +479,9 @@ rows, and each such run gets its own `turn.deleted` record (same `side` as the
 delete, `message_id` `null`, `run_id` the spawned run) in the spawned run's own
 session stream. A spawned run that is still running defers the whole delete as
 a running turn does (`deferred` lists the parent run). Tool results in later
-runs of the session that listed an erased run or session by its id are replaced
-by a fixed text.
+runs of the workspace (any session) that listed an erased run or session by its
+id are replaced by a fixed text; a spawned run's session counts as erased only
+when no row of it survives.
 
 **Scheduled jobs.** Deleting the message that created a scheduled job (a message
 delete, not a reply delete) removes the job's stored result rows (the excerpts

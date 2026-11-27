@@ -458,6 +458,9 @@ struct EventRow {
     run_id: Option<String>,
     session_key: Option<String>,
     scope: Option<String>,
+    /// A scheduled job's stored result excerpt, matched by correlation and
+    /// kept out of the positional anchor of the handoff-note rule.
+    schedule_result: bool,
 }
 
 impl EventRow {
@@ -496,19 +499,20 @@ fn children_of(rows: &[EventRow], descendants: &[String], target: &Target<'_>) -
         let Some(run) = row.run_id.as_deref().filter(|run| descendants.iter().any(|d| d == run)) else {
             continue;
         };
-        let index = if let Some(index) = children.iter().position(|child| child.run_id == run) {
-            index
-        } else {
-            children.push(Child {
-                run_id: run.to_owned(),
-                session_key: row.session_key.clone().unwrap_or_else(|| target.session_key.to_owned()),
-                scope: row.scope.clone(),
-                first_id: row.id,
-                first_user: None,
-                event_ids: Vec::new(),
-                contents: Vec::new(),
-            });
-            children.len() - 1
+        let index = match children.iter().position(|child| child.run_id == run) {
+            Some(index) => index,
+            None => {
+                children.push(Child {
+                    run_id: run.to_owned(),
+                    session_key: row.session_key.clone().unwrap_or_else(|| target.session_key.to_owned()),
+                    scope: row.scope.clone(),
+                    first_id: row.id,
+                    first_user: None,
+                    event_ids: Vec::new(),
+                    contents: Vec::new(),
+                });
+                children.len() - 1
+            }
         };
         if let Some(child) = children.get_mut(index) {
             child.first_id = child.first_id.min(row.id);
@@ -553,7 +557,8 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
     // delete's own record and rows already tombstoned are never rewritten.
     let sql = match side {
         Side::Message => {
-            "SELECT id, event_id, role, content, run_id, session_key, ma_scope_id FROM message_events
+            "SELECT id, event_id, role, content, run_id, session_key, ma_scope_id,
+                    event_type = 'schedule.result.recorded' FROM message_events
              WHERE workspace_id = ?1 AND owner_id = ?2
                AND (event_id = ?3 OR (?4 IS NOT NULL AND run_id = ?4)
                     OR run_id IN (SELECT value FROM json_each(?5))
@@ -567,7 +572,8 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
              ORDER BY id"
         }
         Side::Reply => {
-            "SELECT id, event_id, role, content, run_id, session_key, ma_scope_id FROM message_events
+            "SELECT id, event_id, role, content, run_id, session_key, ma_scope_id,
+                    event_type = 'schedule.result.recorded' FROM message_events
              WHERE workspace_id = ?1 AND owner_id = ?2 AND event_id <> ?3
                AND (run_id IN (SELECT value FROM json_each(?5))
                     OR ((run_id = ?4
@@ -598,6 +604,7 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
                         run_id: row.get(4)?,
                         session_key: row.get(5)?,
                         scope: row.get(6)?,
+                        schedule_result: row.get(7)?,
                     })
                 },
             )?
@@ -658,6 +665,15 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
     }
     let direct_ids: Vec<String> = rows.iter().map(|row| row.event_id.clone()).collect();
     let direct = serde_json::to_string(&direct_ids)?;
+    // The rows of the deleted conversation itself; a scheduled job's result
+    // excerpt belongs to the job's session, whose later runs are kept.
+    let anchor = serde_json::to_string(
+        &rows
+            .iter()
+            .filter(|row| !row.schedule_result)
+            .map(|row| row.event_id.as_str())
+            .collect::<Vec<_>>(),
+    )?;
     let contents = rows
         .iter()
         .filter(|row| row.conversational() && !row.content.is_empty())
@@ -732,7 +748,7 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
     // A handoff note summarizes the window before it, so every note of a
     // session created after its first deleted row can hold deleted content
     // without naming the row (position, not text).
-    ids.extend(later_handoff_notes(tx, target, &direct)?);
+    ids.extend(later_handoff_notes(tx, target, &anchor)?);
     let all = serde_json::to_string(&ids)?;
     // Read before the rewrite: the payload of a tool result names the stored
     // document that holds its large output.
@@ -757,24 +773,51 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
     for child in &children {
         record_child_deleted(tx, target, side, child)?;
     }
-    if let Some(since_id) = children.iter().map(|child| child.first_id).min() {
-        // Listings in later runs of the session may name the erased runs and
-        // their sessions (run ids and `child-` keys are both identifiers).
-        let erased = derived_sweep::ErasedIdentifiers {
-            run_ids: children
-                .iter()
-                .flat_map(|child| [child.run_id.clone(), child.session_key.clone()])
-                .collect(),
-            since_id,
-            swept_sessions: Vec::new(),
-        };
-        derived_sweep::rewrite_listings(tx, target.workspace_id, &erased, target.now)?;
+    tombstone_turns(tx, &ids, target.now)?;
+    sweep_listings(tx, target, &children)
+}
+
+/// Replace the printed text of listing results, workspace-wide and newer than
+/// the first erased row, that name an erased run id (and so its session key, as
+/// both are identifiers). A spawned run's session key is swept from the first
+/// row only when the tombstone left no row of that session: a later run may
+/// have continued it. Call after the tombstone.
+fn sweep_listings(tx: &Connection, target: &Target<'_>, children: &[Child]) -> anyhow::Result<()> {
+    let Some(since_id) = children.iter().map(|child| child.first_id).min() else {
+        return Ok(());
+    };
+    let mut swept_sessions: Vec<String> = Vec::new();
+    for child in children {
+        if swept_sessions.contains(&child.session_key) {
+            continue;
+        }
+        // The survival rule of `agent_erasure::erased_identifiers`, with the
+        // tombstone event types not counted as rows (they are written here).
+        let survives: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM message_events WHERE workspace_id = ?2 AND session_key = ?1
+                           AND event_type NOT IN ('message.deleted', 'turn.deleted'))
+                 OR EXISTS(SELECT 1 FROM conversation_turns c WHERE c.session_key = ?1 AND c.deleted_at IS NULL
+                     AND (c.ma_scope_id IS NULL OR EXISTS(SELECT 1 FROM agent_scopes a
+                         WHERE a.scope_id = c.ma_scope_id AND a.workspace_id = ?2)))",
+            params![child.session_key, target.workspace_id],
+            |row| row.get(0),
+        )?;
+        if !survives {
+            swept_sessions.push(child.session_key.clone());
+        }
     }
-    tombstone_turns(tx, &ids, target.now)
+    let erased = derived_sweep::ErasedIdentifiers {
+        run_ids: children.iter().map(|child| child.run_id.clone()).collect(),
+        since_id,
+        swept_sessions,
+    };
+    derived_sweep::rewrite_listings(tx, target.workspace_id, &erased, target.now)?;
+    Ok(())
 }
 
 /// The handoff notes created after the first deleted row of their session
-/// (`direct`, a JSON array of the directly deleted event ids), except the
+/// (`direct`, a JSON array of the event ids of the deleted conversation: its
+/// rows in the target session and the rows of its spawned runs), except the
 /// notes already among them.
 fn later_handoff_notes(tx: &Connection, target: &Target<'_>, direct: &str) -> anyhow::Result<Vec<String>> {
     let mut statement = tx.prepare(
@@ -1034,7 +1077,7 @@ fn record_deleted(
         let fields = DeletedHeader {
             session_key: target.session_key,
             agent: &attempt.agent_key,
-            incarnation: &incarnation,
+            incarnation,
             run_id: attempt.run_id.as_deref(),
             event_id: &event_id,
             message_id: &message_id,
@@ -1072,7 +1115,7 @@ fn record_child_deleted(tx: &Connection, target: &Target<'_>, side: Side, child:
         let fields = DeletedHeader {
             session_key: &child.session_key,
             agent: name,
-            incarnation: &incarnation,
+            incarnation,
             run_id: Some(&child.run_id),
             event_id: &event_id,
             message_id: anchor,
