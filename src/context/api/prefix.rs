@@ -26,7 +26,7 @@ use crate::hooks::context::{ContextPoint, HookContribution};
 use crate::hooks::{HookIdentity, HookManager};
 use crate::memory::branch_copy::CONTEXT_SWITCH_EVENT_TYPE;
 use crate::memory::{Memory, MemoryEntry, MemoryFabric, MemoryPrincipal};
-use crate::runtime::envelope::RuntimeEnvelope;
+use crate::runtime::envelope::{RuntimeEnvelope, RuntimeSource};
 
 /// What a session prefix reads, borrowed from the turn's state.
 pub(crate) struct SessionPrefixInput<'a> {
@@ -63,6 +63,12 @@ pub(crate) async fn session_prefix(input: SessionPrefixInput<'_>) -> String {
     // with a direct chat must not carry a row from one into the other.
     if super::tail::is_group_shared_channel(envelope) {
         return group_hook_prefix(memory, envelope, memory_config, hooks).await;
+    }
+    // Delegate children share one session key per chat sender, so a frozen row
+    // would show the index of the first delegate call to every later one. They
+    // render the index fresh and neither read nor record a prefix row.
+    if envelope.source == RuntimeSource::Delegate {
+        return delegate_prefix(memory, envelope, compact, hooks).await;
     }
     let principal = envelope.memory_principal();
     let session_key = envelope.session_key.as_str();
@@ -139,6 +145,49 @@ pub(crate) async fn session_prefix(input: SessionPrefixInput<'_>) -> String {
         verify_recorded(store, &principal, &entries, row_id).await;
     }
     rendered
+}
+
+/// The prefix of a delegate call: the memory index and the `session_opened`
+/// hook blocks rendered on every call. Nothing is read from or written to the
+/// shared delegate session key, so no stale row can be replayed.
+async fn delegate_prefix(
+    memory: &Arc<dyn Memory>,
+    envelope: &RuntimeEnvelope,
+    compact: bool,
+    hooks: Option<&HookManager>,
+) -> String {
+    let principal = envelope.memory_principal();
+    let entries = match memory.newest_core_entries(&principal, STORE_INDEX_FETCH).await {
+        Ok(entries) => entries,
+        Err(error) => {
+            log_read_failure(&error, "memory index could not be read");
+            return String::new();
+        }
+    };
+    let truncated = entries.len() >= STORE_INDEX_FETCH;
+    let max_chars = if compact {
+        STORE_INDEX_COMPACT_MAX_CHARS
+    } else {
+        STORE_INDEX_MAX_CHARS
+    };
+    let text = render_store_index(&entries, max_chars, truncated)
+        .map(|rendered| crate::security::redaction::redact_secrets(&rendered))
+        .unwrap_or_default();
+    let mut sections = Vec::new();
+    if !text.is_empty() {
+        sections.push(PrefixSection {
+            source: MEMORY_INDEX_SOURCE.to_owned(),
+            text,
+        });
+    }
+    if let Some(hooks) = hooks {
+        let contributions = session_opened_contributions(hooks, envelope, false).await;
+        sections.extend(contributions.into_iter().map(|contribution| PrefixSection {
+            source: format!("{HOOK_SOURCE_PREFIX}{}", contribution.hook),
+            text: contribution.text,
+        }));
+    }
+    render_prefix(&sections)
 }
 
 /// The prefix of a group-shared channel turn: only the `session_opened` hook
