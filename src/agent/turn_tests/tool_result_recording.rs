@@ -12,41 +12,9 @@
 
 use super::*;
 #[cfg(test)]
-use crate::agent::compaction::extract_document_ingest_refs;
 use crate::agent::context_budget::{PRE_TURN_FLUSH_THRESHOLD, plan_context_budget};
 use crate::agent::diagnostics::TOOL_PARSE_LOG_PREVIEW_CHARS;
 use crate::providers::ChatMessage;
-
-#[test]
-fn extract_document_ingest_refs_parses_large_output_markers() {
-    // Size off the constant so it exceeds MAX_TOOL_RESULT_INLINE_CHARS after
-    // Behavior-limits Phase 1 raised it.
-    let segment = "document reference body ";
-    let large = segment.repeat(MAX_TOOL_RESULT_INLINE_CHARS / segment.len() + 100);
-    let marker = compact_tool_result_for_history_with_status(
-        "shell",
-        &large,
-        MAX_TOOL_RESULT_INLINE_CHARS,
-        "persisted_document_backend",
-    );
-    let refs = extract_document_ingest_refs(&[ChatMessage::assistant(marker)]);
-    assert_eq!(refs.len(), 1);
-    assert_eq!(refs[0]["source"].as_str(), Some("tool_output"));
-    assert_eq!(refs[0]["tool"].as_str(), Some("shell"));
-    assert_eq!(refs[0]["status"].as_str(), Some("persisted_document_backend"));
-    assert!(
-        refs[0]["document_id"]
-            .as_str()
-            .unwrap_or_default()
-            .starts_with("tool-output:shell:")
-    );
-    assert!(
-        refs[0]["content_sha256"]
-            .as_str()
-            .is_some_and(|value| value.len() == 64)
-    );
-    assert!(refs[0]["chunks"].as_u64().unwrap_or_default() >= 1);
-}
 
 #[test]
 fn compact_tool_result_for_history_emits_document_reference_for_large_output() {

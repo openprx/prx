@@ -415,7 +415,6 @@ fn without_feature_gated_test_items(text: &str) -> String {
 /// history, one entry per construction, with the reason.
 const USER_MESSAGE_CONSTRUCTION_SITES: &[&str] = &[
     // Loop-written notes: the reserved markers themselves, and the corrective aside.
-    "src/context/reduce/patch.rs::post_compaction_refresh_aside",
     "src/agent/response_guard.rs::append_corrective_aside",
     "src/agent/tool_result_recording.rs::drop",
     "src/agent/turn_engine/tool_round.rs::run_tools",
@@ -425,7 +424,6 @@ const USER_MESSAGE_CONSTRUCTION_SITES: &[&str] = &[
     "src/agent/dispatcher.rs::to_provider_messages",
     // Copies of messages already in a history (content truncated or normalised,
     // role kept): compaction and audit projections, multimodal normalisation.
-    "src/context/reduce/summary.rs::bounded_compaction_projection",
     "src/chat/compaction.rs::bounded_legacy_chat_compaction_audit_source",
     "src/multimodal.rs::prepare_messages_for_provider",
     // One-shot provider calls that build no loop history.

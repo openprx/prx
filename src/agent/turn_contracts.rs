@@ -160,10 +160,9 @@ pub enum CompactionPatchError {
 /// mentioning the marker; ingress still neutralizes reserved prefixes.
 pub(crate) const TOOL_RESULTS_PREFIX: &str = "[Tool results]";
 
-/// The marker opening the refresh aside summary compaction appends after a
-/// replaced range. The producer (`post_compaction_refresh_aside`) and every
-/// matcher ([`is_loop_written_user_note`]) share it, so the matchers recognise
-/// exactly what compaction writes.
+/// The marker opening the refresh aside that the removed summary modes once
+/// appended after a replaced range. The matcher ([`is_loop_written_user_note`])
+/// still recognises it in stored history.
 pub(crate) const POST_COMPACTION_REFRESH_MARKER: &str = "[Post-compaction context refresh]";
 
 /// Marker prefix used for recalled page content injected back into history.

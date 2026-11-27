@@ -1,7 +1,7 @@
 //! Building and applying the compaction patch: the demand that triggers a
 //! compaction, the summary or handoff it writes, and the replacement it applies.
 
-use super::audit::{persist_compaction_audit, persist_context_switch, switch_refusal_reason};
+use super::audit::{persist_context_switch, switch_refusal_reason};
 use super::handoff_note::{
     MAX_HANDOFF_MESSAGE_BYTES, context_handoff_lineage, format_context_handoff_message, validated_context_handoff_note,
 };
@@ -15,18 +15,12 @@ use super::roundtrips::{
 };
 #[cfg(test)]
 use super::summary::apply_compaction_patch_exact;
-use super::summary::{
-    COMPACTION_MAX_SUMMARY_CHARS, MEMORY_FLUSH_MAX_CHARS, bounded_compaction_projection, build_compaction_audit_source,
-    build_compaction_transcript, compaction_patch_guard_for, compaction_summary_fidelity_status,
-};
+use super::summary::{build_compaction_audit_source, compaction_patch_guard_for};
 use crate::agent::context_budget::planning_history_tokens;
 use crate::agent::document_ingest::DocumentIngestRuntime;
-use crate::agent::response_guard::strip_assistant_fabricated_tool_markers;
 use crate::agent::turn_contracts::CompactionPatch;
-use crate::agent::turn_contracts::POST_COMPACTION_REFRESH_MARKER;
 use crate::providers::ChatMessage;
 use crate::providers::Provider;
-use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use uuid::Uuid;
 
@@ -473,159 +467,7 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
         }));
     }
 
-    let source_projection = source_history
-        .get(start..compact_end)
-        .map(bounded_compaction_projection)
-        .unwrap_or_default();
-    if source_projection.is_empty() {
-        return Ok(CompactionBuild::NotNeeded(NotNeededReason::NothingFoldable));
-    }
-
-    // FU-02c-AUX-SENDS: compaction summarizer is exempt from admit_provider_send.
-    // (a) tools is None (`chat_with_system`). (b) input is capped by
-    // COMPACTION_MAX_SOURCE_CHARS and stored output by COMPACTION_MAX_SUMMARY_CHARS
-    // / MEMORY_FLUSH_MAX_CHARS. (c) `compaction_aux_send_exemption_caps_input_and_output`
-    // pins both literals. (d) the follow-up stays open for spend settlement.
-    let mut replacement = Vec::new();
-    if config.memory_flush {
-        let flush_prompt = format!(
-            "Write a concise memory flush message (max 6 bullets) capturing durable facts, decisions, and unresolved tasks from this history:\n\n{}",
-            build_compaction_transcript(&source_projection)
-        );
-        let flush_note = provider
-            .chat_with_system(
-                Some("You write memory flush notes before context compaction."),
-                &flush_prompt,
-                model,
-                0.1,
-            )
-            .await
-            .unwrap_or_else(|_| "Memory flush fallback: key context retained.".to_string());
-        replacement.push(ChatMessage::assistant(format!(
-            "[Memory flush at {timestamp}: {}]",
-            truncate_with_ellipsis(&flush_note, MEMORY_FLUSH_MAX_CHARS)
-        )));
-    }
-
-    let summary = match config.mode {
-        crate::config::AgentCompactionMode::Safeguard => {
-            let transcript = build_compaction_transcript(&source_projection);
-            let structured_prompt = format!(
-                "Summarize this conversation into a structured context summary. \
-                 You MUST include ALL of these sections (use ## headers):\n\
-                 ## Decisions\n\
-                 ## Open TODOs\n\
-                 ## Constraints/Rules\n\
-                 ## Pending user asks\n\
-                 ## Exact identifiers\n\
-                 Preserve all UUIDs, hashes, file paths, URLs, port numbers, and \
-                 IP addresses EXACTLY as written. Never paraphrase identifiers.\n\n\
-                 ## Progress\n\
-                 ### Done\n\
-                 ### In Progress\n\
-                 ### Blocked\n\n\
-                 ## Recent turns preserved verbatim\n\
-                 Include the last 2-3 user/assistant exchanges word-for-word.\n\n\
-                 ## Critical Context\n\
-                 Key technical details that would be lost if forgotten.\n\n\
-                 Conversation to summarize:\n{}",
-                transcript
-            );
-            let raw = provider
-                .chat_with_system(
-                    Some("You are a context compaction summarizer."),
-                    &structured_prompt,
-                    model,
-                    0.2,
-                )
-                .await
-                .unwrap_or_else(|_| "Summary unavailable; compacted conservatively.".to_string());
-            // Validate: require at least 3 of the expected ## headers.
-            let required_headers = [
-                "## Decisions",
-                "## Open TODOs",
-                "## Constraints",
-                "## Pending",
-                "## Exact",
-                "## Progress",
-                "## Critical Context",
-            ];
-            let found_count = required_headers.iter().filter(|h| raw.contains(*h)).count();
-            let validated = if found_count < 3 {
-                tracing::warn!(
-                    found_count,
-                    "Compaction summary missing required sections; retrying with explicit prompt"
-                );
-                let retry_prompt = format!(
-                    "The previous summary was missing required sections. \
-                     You MUST produce a summary with these exact ## headers: \
-                     ## Decisions, ## Open TODOs, ## Constraints/Rules, ## Pending user asks, \
-                     ## Exact identifiers, ## Progress, ## Critical Context. \
-                     Do not skip any. Conversation:\n{}",
-                    transcript
-                );
-                provider
-                    .chat_with_system(
-                        Some("You are a context compaction summarizer. Always include all required ## sections."),
-                        &retry_prompt,
-                        model,
-                        0.1,
-                    )
-                    .await
-                    .unwrap_or(raw)
-            } else {
-                raw
-            };
-            truncate_with_ellipsis(&validated, COMPACTION_MAX_SUMMARY_CHARS)
-        }
-        crate::config::AgentCompactionMode::Aggressive => {
-            let mut summary = format!(
-                "Aggressive compaction removed {} older messages; retained {} recent messages.",
-                compact_count, keep_recent
-            );
-            if let Some(last_user) = source_projection.iter().rev().find(|m| m.role == "user") {
-                summary.push_str(" Last preserved user intent: ");
-                summary.push_str(&truncate_with_ellipsis(&last_user.content, 240));
-            }
-            truncate_with_ellipsis(&summary, COMPACTION_MAX_SUMMARY_CHARS)
-        }
-        crate::config::AgentCompactionMode::Switch | crate::config::AgentCompactionMode::Off => {
-            return Ok(CompactionBuild::NotNeeded(NotNeededReason::NothingFoldable));
-        }
-    };
-    // The summarizer reads the very turns that may still carry a fabricated
-    // marker and is free to copy one into its output — the "recent turns
-    // preserved verbatim" section asks it to. A summary is replayed on every
-    // later turn and is persisted as compaction audit, so clean it in both
-    // grains before it is measured, stored or inserted.
-    let summary = strip_assistant_fabricated_tool_markers(&summary);
-    let summary = crate::agent::tool_evidence::strip_model_written_tool_evidence(&summary).into_owned();
-    let original_source = source_history.get(start..compact_end).unwrap_or(&[]);
-    let fidelity_status = compaction_summary_fidelity_status(&summary, config.mode, original_source);
-    persist_compaction_audit(
-        audit,
-        trigger,
-        &config.mode,
-        audit_source.as_ref(),
-        &summary,
-        fidelity_status,
-    )
-    .await;
-
-    replacement.insert(
-        0,
-        ChatMessage::assistant(format!("[Context compacted at {timestamp}. Summary: {summary}]")),
-    );
-
-    // P1-1: Inject post-compaction context refresh so the model knows critical
-    // rules may have been summarized and should re-read workspace instructions.
-    let append_after = vec![post_compaction_refresh_aside()];
-
-    Ok(CompactionBuild::Patch(CompactionPatch {
-        replacement,
-        append_after,
-        guard,
-    }))
+    Ok(CompactionBuild::NotNeeded(NotNeededReason::NothingFoldable))
 }
 
 #[cfg(test)]
@@ -708,14 +550,4 @@ pub(crate) async fn apply_configurable_compaction(
             .await?
             .is_some(),
     )
-}
-
-/// The `user` aside summary compaction appends so the model knows critical
-/// rules may have been summarized.
-pub(crate) fn post_compaction_refresh_aside() -> ChatMessage {
-    ChatMessage::user(format!(
-        "{POST_COMPACTION_REFRESH_MARKER}\n\
-         Session was just compacted. Critical rules may have been summarized.\n\
-         Re-read workspace instructions if available."
-    ))
 }
