@@ -81,11 +81,16 @@ pub(crate) async fn session_prefix(input: SessionPrefixInput<'_>) -> String {
         return text;
     }
 
-    let entries = match store.newest_core_entries(&principal, STORE_INDEX_FETCH).await {
-        Ok(entries) => entries,
-        Err(error) => {
-            log_read_failure(&error, "memory index could not be read");
-            return String::new();
+    // A group-shared channel chat keeps its memory index out of the prompt.
+    let entries = if super::tail::is_group_shared_channel(envelope) {
+        Vec::new()
+    } else {
+        match store.newest_core_entries(&principal, STORE_INDEX_FETCH).await {
+            Ok(entries) => entries,
+            Err(error) => {
+                log_read_failure(&error, "memory index could not be read");
+                return String::new();
+            }
         }
     };
     let truncated = entries.len() >= STORE_INDEX_FETCH;

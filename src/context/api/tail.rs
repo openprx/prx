@@ -10,8 +10,16 @@ use crate::config::MemoryConfig;
 use crate::context::transcript::{append_hook_contributions, mark_results_seen, unseen_results_note};
 use crate::hooks::context::ContextPoint;
 use crate::hooks::{HookIdentity, HookManager};
-use crate::memory::{Memory, MemoryFabric};
+use crate::memory::{Memory, MemoryFabric, MemoryVisibility};
 use crate::runtime::envelope::{RuntimeEnvelope, RuntimeSource};
+
+/// Whether this turn is a channel turn of a group-like (session-shared) chat.
+/// Its memory index and scheduled-results note stay out of the prompt, for
+/// privacy; its hooks still run. Other surfaces that use the session-shared
+/// visibility are unaffected.
+pub(crate) fn is_group_shared_channel(envelope: &RuntimeEnvelope) -> bool {
+    envelope.source == RuntimeSource::Channel && envelope.visibility == MemoryVisibility::Session
+}
 
 /// What the turn tail reads, borrowed from the turn's state.
 pub(crate) struct TurnTailInput<'a> {
@@ -25,8 +33,9 @@ pub(crate) struct TurnTailInput<'a> {
 }
 
 /// The text placed after the user's message on this turn: the `turn_opened`
-/// hook blocks, then, on an interactive turn (Console, Chat or Channel), the
-/// unseen scheduled-results note. The note's rows are marked seen in the same step.
+/// hook blocks, then, on an interactive turn (Console, Chat or Channel, but not
+/// a group-shared channel chat), the unseen scheduled-results note. The note's
+/// rows are marked seen in the same step.
 pub(crate) async fn turn_tail(input: TurnTailInput<'_>) -> String {
     let memory = input.memory;
     let envelope = input.envelope;
@@ -35,7 +44,8 @@ pub(crate) async fn turn_tail(input: TurnTailInput<'_>) -> String {
     if !matches!(
         envelope.source,
         RuntimeSource::Console | RuntimeSource::Chat | RuntimeSource::Channel
-    ) {
+    ) || is_group_shared_channel(envelope)
+    {
         return tail;
     }
     let principal = envelope.memory_principal();
