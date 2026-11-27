@@ -61,6 +61,10 @@
 //! overwritten on disk instead of lingering in older segments. It is stored in
 //! the index's `%_config` table (format version 5), so later connections keep
 //! it without setting it. Erasure therefore needs no rebuild.
+//!
+//! The stored definition names the tokenizer (`tokenize='trigram'`). A complete
+//! index whose definition names another one is treated as missing: it is
+//! dropped and rebuilt through the chunked path, with one warn line.
 
 use super::erasure_pool::MemoryPool;
 use crate::runtime::sqlite_pool::begin_immediate;
@@ -74,6 +78,11 @@ pub(super) const INDEX_TABLE: &str = "message_events_fts";
 /// Name of the one-row table that holds the fill cursor while the initial fill
 /// runs. It exists exactly while the fill is unfinished.
 const FILL_TABLE: &str = "transcript_index_fill";
+
+/// The tokenizer clause of this build's index definition (`CREATE_TABLE_SQL`).
+/// A complete index whose stored definition lacks it was built by another
+/// tokenizer and is rebuilt.
+const TOKENIZER_CLAUSE: &str = "tokenize='trigram'";
 
 /// Most rows one batch transaction indexes.
 const BATCH_ROWS: i64 = 2_000;
@@ -169,7 +178,20 @@ pub(super) fn index_state(conn: &Connection) -> anyhow::Result<IndexState> {
     if table_exists(conn, FILL_TABLE)? {
         return Ok(IndexState::Filling);
     }
+    if !has_expected_tokenizer(conn)? {
+        return Ok(IndexState::Missing);
+    }
     Ok(IndexState::Complete)
+}
+
+/// Whether the stored definition of the index names this build's tokenizer.
+fn has_expected_tokenizer(conn: &Connection) -> anyhow::Result<bool> {
+    let sql: String = conn.query_row(
+        "SELECT sql FROM sqlite_schema WHERE type='table' AND name=?1",
+        [INDEX_TABLE],
+        |row| row.get(0),
+    )?;
+    Ok(sql.contains(TOKENIZER_CLAUSE))
 }
 
 /// Create the index if the database lacks it, then fill it in batches until it
@@ -230,6 +252,10 @@ fn create_index(pool: &MemoryPool) -> anyhow::Result<IndexState> {
         return Ok(state);
     }
     tx.execute_batch(CLEAR_SQL)?;
+    if table_exists(&tx, INDEX_TABLE)? {
+        tracing::warn!("transcript index was built with another tokenizer; rebuilding it");
+        tx.execute_batch(&format!("DROP TABLE {INDEX_TABLE};"))?;
+    }
     tx.execute_batch(CREATE_TABLE_SQL)?;
     let boundary: Option<i64> = tx.query_row("SELECT max(id) FROM message_events", [], |row| row.get(0))?;
     let state = if let Some(boundary) = boundary {
