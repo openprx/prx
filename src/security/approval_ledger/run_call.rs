@@ -420,17 +420,34 @@ impl ApprovalLedgerPort<'_> {
                     .as_str()
                     .to_owned()
             } else {
-                let server = arguments
-                    .get("server")
+                // Same default as the dispatch in `mcp.rs`: a missing or non-string action is `call`.
+                let action = arguments
+                    .get("action")
                     .and_then(serde_json::Value::as_str)
-                    .filter(|value| !value.is_empty())
-                    .context("MCP approval server missing")?;
-                let target = arguments
-                    .get("tool")
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|value| !value.is_empty())
-                    .context("MCP approval tool missing")?;
-                crate::security::op_id::op_id("mcp_call", "call", &[server, target])
+                    .unwrap_or("call");
+                let server = || {
+                    arguments
+                        .get("server")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|value| !value.is_empty())
+                        .context("MCP approval server missing")
+                };
+                match action {
+                    "call" => {
+                        let server = server()?;
+                        let target = arguments
+                            .get("tool")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|value| !value.is_empty())
+                            .context("MCP approval tool missing")?;
+                        crate::security::op_id::op_id("mcp_call", "call", &[server, target])
+                    }
+                    "resources" | "read" | "subscribe" | "unsubscribe" => {
+                        crate::security::op_id::op_id("mcp_call", action, &[server()?])
+                    }
+                    "list" | "status" | "refresh" => crate::security::op_id::op_id("mcp_call", action, &[]),
+                    _ => anyhow::bail!("MCP approval action unknown"),
+                }
             };
             (operation, OpIdMatch::Exact, RiskLevel::High)
         } else {
