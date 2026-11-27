@@ -380,10 +380,16 @@ impl SessionsSpawnTool {
             terminal_usage,
         ));
         let driver_terminal_journal = Arc::clone(&terminal_journal);
+        // The launching turn's hook identity, read on the spawning task: the
+        // spawned task has no task-locals, so the child's `child_started` and
+        // `child_finished` events would otherwise be lost (`notify` needs the
+        // identity). `run_sub_agent_task` reads it again on this task and
+        // re-installs it across its own spawn.
+        let launch_hook_identity = crate::hooks::current_identity();
         // Spawn async task (fire-and-forget); capture handle to support kill
         let jh = crate::agent::channel_approval::spawn(crate::runtime::registry::scope_current(
             sub_agent_work_id,
-            SPAWN_EXECUTION_CONTEXT.scope(task_execution_ctx, async move {
+            crate::hooks::identity_scope_optional(launch_hook_identity, SPAWN_EXECUTION_CONTEXT.scope(task_execution_ctx, async move {
                 let _message_permit = message_permit;
                 let _message_input = message_input;
                 let _message_turn = message_turn;
@@ -556,7 +562,7 @@ impl SessionsSpawnTool {
                         "Sub-agent completed but no recipient configured for announcement"
                     );
                 }
-            }),
+            })),
         ));
 
         // Install the external owner before the first suspension after spawn.

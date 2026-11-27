@@ -970,7 +970,11 @@ pub(super) struct AgentEndGuard {
 }
 
 impl AgentEndGuard {
-    pub(super) fn new(hooks: Arc<crate::hooks::HookManager>, session_key: String, started_at: std::time::Instant) -> Self {
+    pub(super) fn new(
+        hooks: Arc<crate::hooks::HookManager>,
+        session_key: String,
+        started_at: std::time::Instant,
+    ) -> Self {
         Self {
             hooks,
             session_key,
