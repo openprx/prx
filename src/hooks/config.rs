@@ -119,6 +119,9 @@ pub(super) struct RuntimeState {
     pub(super) rejected_digest: Option<[u8; 32]>,
     /// Whether the warning for `rejected_digest` has been logged.
     pub(super) rejection_reported: bool,
+    /// Whether the warning for the current read or size error has been
+    /// logged. Cleared by the next successful read.
+    pub(super) read_reported: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -238,9 +238,9 @@ impl HookCore {
         finished: &std::sync::atomic::AtomicUsize,
     ) {
         if let Err(err) = self.refresh_if_changed() {
-            // Every event would repeat this for the same file; log it once per content.
-            let first = !std::mem::replace(&mut self.state.write().rejection_reported, true);
-            if first {
+            // Every event would repeat this for the same file; each class of
+            // failure logs once per episode.
+            if self.first_refresh_failure(&err) {
                 tracing::warn!(error = %err, "hooks refresh failed");
             } else {
                 tracing::debug!(error = %err, "hooks refresh failed (already reported)");
@@ -316,10 +316,27 @@ impl HookCore {
         }
     }
 
-    pub(super) fn refresh_if_changed(&self) -> anyhow::Result<()> {
-        let Some(raw) = read_bounded_file(&self.hooks_json_path, MAX_HOOKS_FILE_BYTES)? else {
+    /// Whether a refresh failure is the first of its class since the file
+    /// last changed. Read and size errors and parse errors each have their own
+    /// flag, so neither class silences the other.
+    fn first_refresh_failure(&self, err: &RefreshError) -> bool {
+        let mut state = self.state.write();
+        let reported = match err {
+            RefreshError::Read(_) => &mut state.read_reported,
+            RefreshError::Parse(_) => &mut state.rejection_reported,
+        };
+        !std::mem::replace(reported, true)
+    }
+
+    pub(super) fn refresh_if_changed(&self) -> Result<(), RefreshError> {
+        let raw = read_bounded_file(&self.hooks_json_path, MAX_HOOKS_FILE_BYTES).map_err(RefreshError::Read)?;
+        // A successful read ends a read-error episode: the next failure is reported.
+        if self.state.read().read_reported {
+            self.state.write().read_reported = false;
+        }
+        let Some(raw) = raw else {
             let mut state = self.state.write();
-            if state.hooks_json_digest.is_some() {
+            if state.hooks_json_digest.is_some() || state.rejected_digest.is_some() || state.rejection_reported {
                 *state = RuntimeState::default();
             }
             return Ok(());
@@ -327,6 +344,10 @@ impl HookCore {
 
         let digest: [u8; 32] = Sha256::digest(&raw).into();
         if self.state.read().hooks_json_digest == Some(digest) {
+            // Back at the active content: a later invalid content is new, so its warning is due again.
+            let mut state = self.state.write();
+            state.rejected_digest = None;
+            state.rejection_reported = false;
             return Ok(());
         }
 
@@ -339,7 +360,7 @@ impl HookCore {
                     state.rejected_digest = Some(digest);
                     state.rejection_reported = false;
                 }
-                return Err(err);
+                return Err(RefreshError::Parse(err));
             }
         };
 
@@ -349,7 +370,27 @@ impl HookCore {
             hooks_json_digest: Some(digest),
             rejected_digest: None,
             rejection_reported: false,
+            read_reported: false,
         };
         Ok(())
     }
 }
+
+/// Why [`HookCore::refresh_if_changed`] failed. Each class warns once per episode.
+#[derive(Debug)]
+pub(super) enum RefreshError {
+    /// `hooks.json` could not be read, or is over its size limit.
+    Read(anyhow::Error),
+    /// `hooks.json` was read but does not parse or validate.
+    Parse(anyhow::Error),
+}
+
+impl std::fmt::Display for RefreshError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read(error) | Self::Parse(error) => std::fmt::Display::fmt(error, f),
+        }
+    }
+}
+
+impl std::error::Error for RefreshError {}
