@@ -1892,7 +1892,8 @@ interrupted build resumes at the next start. Until it is complete, every word is
 matched as a substring of the message and the newest matches come first; while
 the build is unfinished that substring match folds ASCII letters only, so a
 non-ASCII capital and its lowercase form (for example Cyrillic) match only once
-the index is complete. Each hit prints its time,
+the index is complete, and only for words of 3 or more characters (shorter words
+are always matched as ASCII-folded substrings). Each hit prints its time,
 session, role and an excerpt. Excerpts are cut from redacted text: secrets are
 redacted on the whole message first, and only then is the excerpt cut, so the
 cut cannot hide the prefix or label that identifies a secret. An excerpt is 200
