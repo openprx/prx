@@ -86,6 +86,64 @@ pub(super) fn init_schema(conn: &Connection) -> anyhow::Result<()> {
         "CREATE INDEX IF NOT EXISTS rf_message_attempts_forgotten_run
              ON rf_message_attempts(run_id) WHERE forget_requested = 1;",
     )?;
+    init_topic_orphan_trigger(conn)
+}
+
+/// Unreferenced topics: no memory, document, chunk or incoming alias.
+macro_rules! orphan_topic_ids {
+    () => {
+        "SELECT t.id FROM topics t
+          WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.topic_id = t.id)
+            AND NOT EXISTS (SELECT 1 FROM documents d WHERE d.topic_id = t.id)
+            AND NOT EXISTS (SELECT 1 FROM document_chunks c WHERE c.topic_id = t.id)
+            AND NOT EXISTS (SELECT 1 FROM topic_aliases a WHERE a.to_topic_id = t.id)"
+    };
+}
+
+/// A memory delete on any path removes the topic it leaves unreferenced, with
+/// the topic's participants and outgoing aliases (`topics_ad` drops the index
+/// entry). The trigger's absence marks a database from before it: topics
+/// orphaned by earlier deletes are removed once, right before it is created.
+fn init_topic_orphan_trigger(conn: &Connection) -> anyhow::Result<()> {
+    let present: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'trigger' AND name = 'memory_topic_orphaned')",
+        [],
+        |row| row.get(0),
+    )?;
+    if present {
+        return Ok(());
+    }
+    // An alias target freed by removing its alias source is orphaned in the
+    // next pass.
+    loop {
+        conn.execute_batch(concat!(
+            "DELETE FROM topic_participants WHERE topic_id IN (",
+            orphan_topic_ids!(),
+            "); DELETE FROM topic_aliases WHERE from_topic_id IN (",
+            orphan_topic_ids!(),
+            ");"
+        ))?;
+        let removed = conn.execute(
+            concat!("DELETE FROM topics WHERE id IN (", orphan_topic_ids!(), ")"),
+            [],
+        )?;
+        if removed == 0 {
+            break;
+        }
+    }
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS memory_topic_orphaned AFTER DELETE ON memories
+         WHEN OLD.topic_id IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM memories WHERE topic_id = OLD.topic_id)
+          AND NOT EXISTS (SELECT 1 FROM documents WHERE topic_id = OLD.topic_id)
+          AND NOT EXISTS (SELECT 1 FROM document_chunks WHERE topic_id = OLD.topic_id)
+          AND NOT EXISTS (SELECT 1 FROM topic_aliases WHERE to_topic_id = OLD.topic_id)
+         BEGIN
+           DELETE FROM topic_participants WHERE topic_id = OLD.topic_id;
+           DELETE FROM topic_aliases WHERE from_topic_id = OLD.topic_id;
+           DELETE FROM topics WHERE id = OLD.topic_id;
+         END;",
+    )?;
     Ok(())
 }
 
