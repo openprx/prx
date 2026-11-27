@@ -8,8 +8,9 @@
 //! `+k earlier`. The seen mark is a `schedule.result.seen` row holding the
 //! newest row id the note has read; the next turn reads only rows after it.
 //! Rows older than seven days are not shown but are covered by the mark. A
-//! group whose newest row was delivered as a message is not shown; its older
-//! failed attempts are superseded, and the mark covers every row read.
+//! group whose newest row was delivered as a message is not shown, unless an
+//! older successful run of it was not delivered; its older failed attempts are
+//! superseded, and the mark covers every row read.
 
 use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
@@ -79,20 +80,24 @@ pub(crate) async fn unseen_results_note(
             .unwrap_or(row.event_id.as_str())
             .to_owned();
         let ok = payload.get("status").and_then(Value::as_str) == Some("ok");
+        let undelivered_ok = ok && payload.get("delivered").and_then(Value::as_bool) != Some(true);
         match groups.iter_mut().find(|group| group.key == key) {
             Some(group) => {
                 if ok {
                     group.earlier += 1;
                 }
+                group.undelivered_ok_earlier |= undelivered_ok;
             }
             None => groups.push(Group {
                 key,
                 newest: payload,
                 earlier: 0,
+                undelivered_ok_earlier: undelivered_ok,
             }),
         }
     }
-    // A group whose newest row was sent as a message is already in the session.
+    // A group whose newest row was sent as a message is already in the session,
+    // unless an older successful run of it was never delivered.
     let lines: Vec<String> = groups
         .iter()
         .filter(|group| !group.delivered())
@@ -160,17 +165,20 @@ fn payload_of(row: &MessageEvent) -> Option<Value> {
         .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
 }
 
-/// One scheduled session: its newest row, and the count of older successful rows.
+/// One scheduled session: its newest row, the count of older successful rows,
+/// and whether an older successful row was not delivered as a message.
 struct Group {
     key: String,
     newest: Value,
     earlier: usize,
+    undelivered_ok_earlier: bool,
 }
 
 impl Group {
-    /// Whether the newest row of the group was delivered as a message.
+    /// Whether the group is already in the session: its newest row was
+    /// delivered as a message and no older successful run is still undelivered.
     fn delivered(&self) -> bool {
-        self.newest.get("delivered").and_then(Value::as_bool) == Some(true)
+        self.newest.get("delivered").and_then(Value::as_bool) == Some(true) && !self.undelivered_ok_earlier
     }
 
     /// `- <finished, to the minute> <name or id> <status>: <excerpt or error class> (transcript <session>)`
