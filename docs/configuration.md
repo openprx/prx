@@ -1177,6 +1177,25 @@ Local recovery failures show the run and store filenames in the chat reply.
 Full store paths stay in the redacted error chain in `chat.log`. Invalid
 quarantine markers warn once per marker per run with recovery guidance.
 
+### Debug dump of compiled requests
+
+Set `OPENPRX_DEBUG_REQUEST_DUMP=<dir>` to write one JSON file per compiled
+model request. It is an environment variable only (no config key), read once
+per process; unset or empty writes nothing. The directory is created with mode
+`0700` when missing and files are created with mode `0600`.
+
+Files are named `<run>-<round>.json`: `<run>` is the run id with every byte
+outside `[A-Za-z0-9_-]` replaced by `_` (`norun-<unix millis>` when the request
+has no run id) and `<round>` is the round number in the run, starting at 1. An
+existing name is never overwritten; `-<n>` is appended instead. Each file holds
+`model`, `provider`, `system`, `messages` (role and content; tool calls and
+tool results are part of the content as sent) and `tools` (names only).
+
+Every string value is masked with the same secret redaction the rest of PRX
+uses, but the files still contain user text in masked form. Delete them after
+use. A write failure logs one warning per process with the error kind only and
+never affects the turn.
+
 ### `[chat.daemon]`
 
 `prx chat` deliberately opens no IM connection: a second listener on the same
