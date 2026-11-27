@@ -92,9 +92,18 @@ leaves no job behind.
 
 Scheduled jobs and Xin tasks also store a `deliver`: `note` (default), `message`
 or `none`. It says how the owner hears about a finished run. `note` is a one-line
-notice at the owner's next interactive turn. `message` sends the result into the
-session that created the job; delivery is added in a later change, so until then
-`message` behaves like `note`. `none` writes no notice and no result row. A
+notice at the owner's next interactive turn. `message` sends the reply of each
+successful run as a mailbox message into the session that created the job, which
+wakes a turn there. The message is from the job's scheduled session
+(`xin:{task id}` or `cron:{job id}`) and starts with `[Scheduled result]`, the
+job name or id, the finish time in RFC 3339 UTC, the reply after redaction (cut
+at 16,000 characters with ` [truncated]`) and the transcript session. Its id is
+derived from the job and the run, so a run recorded twice sends one message. An
+error run sends nothing and stays a note. A `message` job with no creating
+session falls back to a note: an owner-less job (operator CLI), a job whose
+creating message is no longer stored, a job created through a route, a
+non-SQLite backend, or a send refused by the inbound setting. A note that was
+delivered as a message is not repeated at the next turn. `none` writes no notice and no result row. A
 one-off agent task created from a session (the xin tool with an agent task that is
 not recurring and has a `message_event_id` in the trusted scope; the cron tool
 with an agent job on an `at` schedule and a `message_event_id`) defaults to `message`; everything else
