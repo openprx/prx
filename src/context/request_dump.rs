@@ -2,13 +2,14 @@
 //!
 //! `OPENPRX_DEBUG_REQUEST_DUMP=<dir>` makes the engine write one masked JSON
 //! file per compiled request into `<dir>`. The variable is read once per
-//! process; unset or empty means nothing happens. Every string that holds
-//! text or arguments goes through the secret redaction before serialising.
+//! process; unset or empty means nothing happens. Every string goes through
+//! the secret redaction before serialising; JSON content (native tool calls and results) is
+//! masked field by field.
 //! A write failure logs one warning per process (error kind only) and never
 //! affects the turn.
 
 use crate::providers::ChatMessage;
-use crate::security::redaction::redact_secrets;
+use crate::security::redaction::{redact_json_value, redact_secrets};
 use serde_json::{Value, json};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -80,18 +81,65 @@ fn masked(text: &str) -> String {
     redact_secrets(text)
 }
 
+/// Parses `text` when it is a JSON object or array.
+fn parse_container(text: &str) -> Option<Value> {
+    let trimmed = text.trim_start();
+    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+        return None;
+    }
+    serde_json::from_str::<Value>(trimmed)
+        .ok()
+        .filter(|value| value.is_object() || value.is_array())
+}
+
+/// Masks every JSON string that itself holds a JSON object or array (tool
+/// call `arguments`, tool results echoing JSON), field by field, and writes
+/// it back as a string.
+fn mask_nested(value: &mut Value) {
+    match value {
+        Value::Object(object) => object.values_mut().for_each(mask_nested),
+        Value::Array(items) => items.iter_mut().for_each(mask_nested),
+        Value::String(text) => {
+            if let Some(mut inner) = parse_container(text) {
+                mask_nested(&mut inner);
+                redact_json_value(&mut inner);
+                if let Ok(rendered) = serde_json::to_string(&inner) {
+                    *text = rendered;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// One message content: a JSON object or array is masked field by field and
+/// written as structure; anything else is masked as text.
+fn masked_content(text: &str) -> Value {
+    match parse_container(text) {
+        Some(mut value) => {
+            mask_nested(&mut value);
+            redact_json_value(&mut value);
+            value
+        }
+        None => Value::String(masked(text)),
+    }
+}
+
 fn dump_json(facts: &DumpFacts<'_>) -> Value {
     let system: Vec<String> = facts
         .messages
         .iter()
         .filter(|message| message.role == "system")
-        .map(|message| masked(&message.content))
+        .map(|message| match masked_content(&message.content) {
+            Value::String(text) => text,
+            other => other.to_string(),
+        })
         .collect();
     let messages: Vec<Value> = facts
         .messages
         .iter()
         .filter(|message| message.role != "system")
-        .map(|message| json!({ "role": masked(&message.role), "content": masked(&message.content) }))
+        .map(|message| json!({ "role": masked(&message.role), "content": masked_content(&message.content) }))
         .collect();
     let tools: Vec<String> = facts.tool_names.iter().map(|name| masked(name)).collect();
     json!({
