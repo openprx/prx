@@ -30,6 +30,28 @@ pub(super) async fn record_request_context(
     let tool_snapshot = round.compiled_tool_context.fingerprint();
     let system_prompt_sha256 = &round.system_prompt_sha256;
     let system_prompt_chars = round.system_prompt_chars;
+    // Opt-in masked dump of the compiled request, independent of the event.
+    crate::context::request_dump::dump_request(&crate::context::request_dump::DumpFacts {
+        run_id: request_event_scope
+            .as_ref()
+            .and_then(|scope| scope.run_id.as_deref())
+            .or(round
+                .execution_adapter
+                .tool_execution_context
+                .envelope
+                .run_id
+                .as_deref()),
+        round: state.iteration,
+        provider: provider_name,
+        model,
+        messages: &round.prepared_messages.messages,
+        tool_names: round
+            .compiled_tool_context
+            .tool_specs()
+            .iter()
+            .map(|spec| spec.name.as_str())
+            .collect(),
+    });
     // How much of this request is prompt and how much is native tool
     // schema. Sizes, counts and estimates only: this is emitted into a
     // durable event, so no schema body, prompt body or tool argument may
