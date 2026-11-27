@@ -2279,18 +2279,22 @@ is reported as declined, and PRX does not retry until a new subscribe.
   stream and cancels its request on the wire.
 - `list` and `status` add a `subscriptions` array for the calling session: one entry per
   subscription with `server`, `uri`, `state` (`active`, `reconnecting` or `declined`), `since`,
-  `updates`, `last_update_at`, and `last_error` while reconnecting. Without a session context
+  `updates`, `last_update_at`, `last_error` while reconnecting, and `last_outage_secs` once the
+  stream has come back after an outage (the length of that outage, in whole seconds). Without a session context
   (a direct tool call with no receipt) subscribe and unsubscribe fail with "subscribe needs a
   session context", and the field is omitted.
 - A stream that ends (graceful or abrupt end, or an error) is reopened with backoff: 1 s,
-  doubling up to 60 s, and reset to 1 s after a stream that lived at least 60 s. A failed attempt
+  doubling up to 60 s, and reset to 1 s after a stream that lived at least 60 s. A stream that lived
+  less than 60 s doubles the next wait even when its reopen succeeded. Each wait has +/-20% random
+  jitter. A failed attempt
   waits at least its `Retry-After` (seconds or an HTTP date) when the server sent one with a 429 or
   5xx answer. A reconnect whose acknowledgment lacks the URI marks the stream `declined` and keeps
   its subscribers, with no further attempt. A server that is removed from the configuration, retired
   by a reload, or no longer declares the capability loses its streams with one warning.
 - Subscriptions live in memory for the life of the PRX process. A restart forgets them, and nothing
   is persisted. The update counts are kept per stream; notices into the subscribing session are
-  not delivered yet (a later lane).
+  not delivered yet (a later lane). A session served by a process worker subscribes inside that
+  worker process, so its subscriptions live in that worker and end with it.
 - Unlike `call`, subscribe and unsubscribe skip the read-only autonomy check and the side-effect
   gate, as `read` does. No allowlist, confirmation or count limit applies. Logs carry server names,
   states and counts only, never a URI or notification content.
