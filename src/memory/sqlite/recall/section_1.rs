@@ -211,7 +211,7 @@ impl SqliteMemory {
             let tx = begin_immediate(&conn)?;
             let probes = crate::memory::sqlite::derived_sweep::memory_probes(
                 &tx,
-                "SELECT workspace_id, content, created_at FROM memories WHERE key LIKE ?1 ESCAPE '\\'",
+                "SELECT workspace_id, owner_id, key, created_at FROM memories WHERE key LIKE ?1 ESCAPE '\\'",
                 params![pattern],
             )?;
             crate::memory::sqlite::rf_forget::drop_prefix_rows_of(

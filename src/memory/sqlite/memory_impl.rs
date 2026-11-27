@@ -504,7 +504,7 @@ impl Memory for SqliteMemory {
             let tx = begin_immediate(&conn)?;
             let probes = super::derived_sweep::memory_probes(
                 &tx,
-                "SELECT workspace_id, content, created_at FROM memories WHERE key = ?1",
+                "SELECT workspace_id, owner_id, key, created_at FROM memories WHERE key = ?1",
                 params![key],
             )?;
             super::rf_forget::drop_prefix_rows_of(

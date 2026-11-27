@@ -589,7 +589,7 @@ pub(super) fn finish_history(memory: &SqliteMemory, work: &EraseWork) -> anyhow:
             let probes = super::derived_sweep::memory_probes(
                 &tx,
                 &format!(
-                    "SELECT workspace_id, content, created_at FROM memories WHERE {}",
+                    "SELECT workspace_id, owner_id, key, created_at FROM memories WHERE {}",
                     erase_condition("memories", &["ma_scope_id".into()], !work.purge && !work.forget_writes)
                 ),
                 [&scopes],

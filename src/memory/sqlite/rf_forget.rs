@@ -242,7 +242,7 @@ pub(super) fn forget_family(
         if kind == "memory" {
             probes.extend(super::derived_sweep::memory_probes(
                 tx,
-                "SELECT workspace_id, content, created_at FROM memories WHERE id = ?1",
+                "SELECT workspace_id, owner_id, key, created_at FROM memories WHERE id = ?1",
                 params![target_id],
             )?);
         }

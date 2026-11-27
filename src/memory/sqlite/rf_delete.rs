@@ -823,7 +823,7 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
     )?;
     let probes = derived_sweep::memory_probes(
         tx,
-        "SELECT workspace_id, content, created_at FROM memories WHERE source_event_id IN (SELECT value FROM json_each(?1))",
+        "SELECT workspace_id, owner_id, key, created_at FROM memories WHERE source_event_id IN (SELECT value FROM json_each(?1))",
         params![direct],
     )?;
     let mut forgotten = tx.execute(

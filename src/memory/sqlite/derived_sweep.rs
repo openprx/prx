@@ -1,8 +1,8 @@
 //! Sweeps of derived copies that name erased data. A tool result of a
 //! session-listing tool prints run ids and session keys; once the session or
 //! run is erased the printed text is replaced, in the erasing transaction. A
-//! tool result of a memory tool quotes the text of a memory; once the memory is
-//! forgotten the printed text is replaced the same way.
+//! tool result of a memory tool prints the key of each memory it quotes; once
+//! the memory is forgotten the printed text is replaced the same way.
 use super::rf_forget;
 use rusqlite::{Connection, params, types::Value};
 
@@ -25,10 +25,6 @@ pub(super) const MIN_IDENTIFIER_CHARS: usize = 32;
 /// Tool results of the memory tools that quote a memory's text.
 const MEMORY_TOOLS: [&str; 3] = ["memory_recall", "memory_search", "memory_get"];
 pub(super) const MEMORY_REMOVED_TEXT: &str = "[output removed: it quoted a memory that was forgotten]";
-/// The longest probe taken from a memory's text, in characters.
-const PROBE_MAX_CHARS: usize = 48;
-/// A shorter probe would match unrelated text.
-const PROBE_MIN_CHARS: usize = 12;
 
 const TOOL_OUTPUT_KINDS: &str = "('tool_output', 'untrusted_external')";
 const UNTRUSTED_PREFIX: &str = "untrusted:";
@@ -236,35 +232,76 @@ fn delete_unquoted_documents(tx: &Connection, documents: &[String]) -> anyhow::R
     rf_forget::rebuild_indexes(tx, false, deleted)
 }
 
-/// What a forgotten memory leaves to look for in tool results.
+/// What a forgotten memory leaves to look for in tool results: its key, in the
+/// workspace and of the owner it was stored for.
 pub(super) struct MemoryProbe {
-    /// The memory's workspace; `None` matches results of every workspace.
+    /// The memory's workspace; `None` matches results of every workspace of
+    /// the owner.
     workspace_id: Option<String>,
-    /// First non-blank line of the memory, trimmed, at most
-    /// [`PROBE_MAX_CHARS`] characters.
-    text: String,
-    /// Creation time of the memory; no result older than it can quote it.
-    created_at: String,
+    /// The memory's owner; `None` matches results of every owner of the
+    /// workspace.
+    owner_id: Option<String>,
+    key: String,
+    /// Creation time of the memory in UTC, cut to whole seconds (a prefix of
+    /// every later UTC timestamp of the same second); empty when it does not
+    /// parse, which widens the time bound to every row. No result older than
+    /// it can quote the memory.
+    created_utc: String,
 }
 
 impl MemoryProbe {
-    /// The probe of a memory's text; `None` when the first non-blank line is
-    /// shorter than [`PROBE_MIN_CHARS`] characters.
-    fn new(workspace_id: Option<String>, content: &str, created_at: String) -> Option<Self> {
-        let line = content.lines().map(str::trim).find(|line| !line.is_empty())?;
-        let text: String = line.chars().take(PROBE_MAX_CHARS).collect();
-        let text = text.trim_end().to_owned();
-        (text.chars().count() >= PROBE_MIN_CHARS).then_some(Self {
+    /// The probe of a memory; `None` for an empty key, and for a memory with
+    /// neither workspace nor owner (no result can be attributed to it safely,
+    /// and a match would reach other owners' history).
+    fn new(workspace_id: Option<String>, owner_id: Option<String>, key: String, created_at: &str) -> Option<Self> {
+        if key.is_empty() || (workspace_id.is_none() && owner_id.is_none()) {
+            return None;
+        }
+        let created_utc = chrono::DateTime::parse_from_rfc3339(created_at)
+            .map(|time| time.with_timezone(&chrono::Utc).format("%Y-%m-%dT%H:%M:%S").to_string())
+            .unwrap_or_default();
+        Some(Self {
             workspace_id,
-            text,
-            created_at,
+            owner_id,
+            key,
+            created_utc,
         })
+    }
+
+    /// True when a result row of `workspace` and `owner` may quote this memory.
+    fn covers(&self, workspace: Option<&str>, owner: Option<&str>) -> bool {
+        self.workspace_id.as_deref().is_none_or(|own| workspace == Some(own))
+            && self.owner_id.as_deref().is_none_or(|own| owner == Some(own))
+    }
+
+    /// True when the printed `output` of `tool` holds a memory entry of this
+    /// key in the form the tool prints it:
+    /// - `memory_recall` (`tools/memory_recall.rs`): `- [category] key: content`;
+    /// - `memory_search` (`tools/memory_search.rs`): a line `- key: key`;
+    /// - `memory_get` (`tools/memory_get.rs`, `render_range`): the output starts
+    ///   with `key lines a-b:` (or `key is empty.`).
+    fn named_in(&self, tool: &str, output: &str) -> bool {
+        let key = self.key.as_str();
+        match tool {
+            "memory_recall" => {
+                let entry = format!("] {key}: ");
+                let bare = format!("] {key}:");
+                output
+                    .lines()
+                    .any(|line| line.starts_with("- [") && (line.contains(&entry) || line.ends_with(&bare)))
+            }
+            "memory_search" => output.lines().any(|line| line.strip_prefix("- key: ") == Some(key)),
+            "memory_get" => output.strip_prefix(key).is_some_and(|rest| {
+                rest.starts_with(" lines ") || rest == " is empty." || rest.starts_with(" is empty.\n")
+            }),
+            _ => false,
+        }
     }
 }
 
 /// The probes of the memories selected by `memories_sql`, a constant statement
-/// selecting `workspace_id, content, created_at` with bound `values`. Call
-/// before the memories are deleted. A row whose content or creation time is
+/// selecting `workspace_id, owner_id, key, created_at` with bound `values`.
+/// Call before the memories are deleted. A row whose key or creation time is
 /// not text is skipped.
 pub(super) fn memory_probes(
     conn: &Connection,
@@ -278,71 +315,98 @@ pub(super) fn memory_probes(
                 row.get::<_, Value>(0)?,
                 row.get::<_, Value>(1)?,
                 row.get::<_, Value>(2)?,
+                row.get::<_, Value>(3)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    let text = |value: Value| match value {
+        Value::Text(text) => Some(text),
+        _ => None,
+    };
     Ok(rows
         .into_iter()
-        .filter_map(|(workspace, content, created_at)| {
-            let (Value::Text(content), Value::Text(created_at)) = (content, created_at) else {
+        .filter_map(|(workspace, owner, key, created_at)| {
+            let (Value::Text(key), Value::Text(created_at)) = (key, created_at) else {
                 return None;
             };
-            let workspace_id = match workspace {
-                Value::Text(text) => Some(text),
-                _ => None,
-            };
-            MemoryProbe::new(workspace_id, &content, created_at)
+            MemoryProbe::new(text(workspace), text(owner), key, &created_at)
         })
         .collect())
 }
 
-/// Replace the printed text of memory-tool results that quote a forgotten
+/// Replace the printed text of memory-tool results that name a forgotten
 /// memory, in one scan for all `probes`, then delete the stored tool-output
 /// documents that only those results named. A result is rewritten when it was
 /// recorded no earlier than the first row created at the oldest probe's time,
-/// lies in the probe's workspace (or the probe has none) and contains the probe
-/// text. Returns the number of rows rewritten. Not for age expiry: hygiene and
-/// retention do not call it.
+/// lies in the probe's workspace and owner, and prints the memory's key in the
+/// tool's own entry form (see [`MemoryProbe::named_in`]). A large output keeps
+/// its first part inline, so an entry printed past that part is not seen; the
+/// row is rewritten only when an entry it keeps names the key. Returns the
+/// number of rows rewritten. Not for age expiry: hygiene and retention do not
+/// call it.
 pub(super) fn rewrite_memory_copies(tx: &Connection, probes: &[MemoryProbe], now: &str) -> anyhow::Result<usize> {
-    let Some(oldest) = probes.iter().map(|probe| probe.created_at.as_str()).min() else {
+    let Some(oldest) = probes.iter().map(|probe| probe.created_utc.as_str()).min() else {
         return Ok(0);
     };
     let wanted: Vec<serde_json::Value> = probes
         .iter()
-        .map(|probe| serde_json::json!({ "workspace": probe.workspace_id, "text": probe.text }))
+        .map(|probe| serde_json::json!({ "workspace": probe.workspace_id, "owner": probe.owner_id, "key": probe.key }))
         .collect();
     let probes_json = serde_json::to_string(&wanted)?;
     let tools = serde_json::to_string(&MEMORY_TOOLS)?;
     let mut statement = tx.prepare(
-        "SELECT event_id, json_extract(raw_payload_json, '$.document.document_id')
+        "SELECT event_id, json_extract(raw_payload_json, '$.document.document_id'), content,
+                json_extract(raw_payload_json, '$.tool'), workspace_id, owner_id
          FROM message_events
          WHERE event_type = 'tool.result.recorded'
            AND id >= COALESCE((SELECT MIN(id) FROM message_events WHERE created_at >= ?1), 9223372036854775807)
            AND typeof(content) = 'text' AND json_valid(raw_payload_json)
            AND json_extract(raw_payload_json, '$.tool') IN (SELECT value FROM json_each(?3))
            AND EXISTS (SELECT 1 FROM json_each(?2) j
-                       WHERE instr(message_events.content, json_extract(j.value, '$.text')) > 0
+                       WHERE instr(message_events.content, json_extract(j.value, '$.key')) > 0
                          AND (json_extract(j.value, '$.workspace') IS NULL
-                              OR message_events.workspace_id = json_extract(j.value, '$.workspace')))
+                              OR message_events.workspace_id = json_extract(j.value, '$.workspace'))
+                         AND (json_extract(j.value, '$.owner') IS NULL
+                              OR message_events.owner_id = json_extract(j.value, '$.owner')))
            AND NOT EXISTS (SELECT 1 FROM agent_erase_fences f WHERE f.scope_id = message_events.ma_scope_id)",
     )?;
     let found = statement
         .query_map(params![oldest, probes_json, tools], |row| {
-            Ok((row.get::<_, Value>(0)?, row.get::<_, Value>(1)?))
+            Ok((
+                row.get::<_, Value>(0)?,
+                row.get::<_, Value>(1)?,
+                row.get::<_, Value>(2)?,
+                row.get::<_, Value>(3)?,
+                row.get::<_, Value>(4)?,
+                row.get::<_, Value>(5)?,
+            ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(statement);
     let rows: Vec<MatchedRow> = found
         .into_iter()
-        .filter_map(|(event_id, document_id)| match event_id {
-            Value::Text(event_id) => Some(MatchedRow {
-                event_id,
-                document_id: match document_id {
-                    Value::Text(text) => Some(text),
-                    _ => None,
-                },
-            }),
-            _ => None,
+        .filter_map(|(event_id, document_id, content, tool, workspace, owner)| {
+            let (Value::Text(event_id), Value::Text(content), Value::Text(tool)) = (event_id, content, tool) else {
+                return None;
+            };
+            let workspace = match &workspace {
+                Value::Text(text) => Some(text.as_str()),
+                _ => None,
+            };
+            let owner = match &owner {
+                Value::Text(text) => Some(text.as_str()),
+                _ => None,
+            };
+            probes
+                .iter()
+                .any(|probe| probe.covers(workspace, owner) && probe.named_in(&tool, &content))
+                .then(|| MatchedRow {
+                    event_id,
+                    document_id: match document_id {
+                        Value::Text(text) => Some(text),
+                        _ => None,
+                    },
+                })
         })
         .collect();
     if rows.is_empty() {
