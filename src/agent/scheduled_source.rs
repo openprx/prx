@@ -39,6 +39,9 @@ pub(crate) struct ScheduledResultMeta {
     pub(crate) task_id: String,
     pub(crate) name: Option<String>,
     pub(crate) deliver: crate::cron::ScheduledDeliver,
+    /// Whether the creator was the local operator (`prx xin add`, `prx cron`, or
+    /// an agent in the terminal).
+    pub(crate) local_operator: bool,
 }
 
 /// The result-row metadata of the scheduled invocation this call runs inside.
@@ -48,6 +51,7 @@ pub(crate) fn current_result_meta() -> Option<ScheduledResultMeta> {
             task_id: origin.task_id.clone(),
             name: origin.name.clone(),
             deliver: origin.deliver,
+            local_operator: origin.origin.is_local_operator(),
         })
         .ok()
 }

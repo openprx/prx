@@ -203,6 +203,15 @@ impl RuntimeEnvelope {
         format!("chat:terminal:local-user:{chat_session_id}")
     }
 
+    /// The owner id of the terminal (`prx chat`) principal of a workspace.
+    ///
+    /// Derived through the same [`Self::owner_principal`] path a chat envelope
+    /// resolves its owner by, so it equals the owner the terminal reads with.
+    #[must_use]
+    pub fn terminal_owner_id(workspace_id: &str) -> String {
+        Self::chat_canonical(workspace_id, "", MemoryVisibility::Workspace).resolved_owner_id()
+    }
+
     /// `Chat` envelope with a stable durable-canonical `session_key` plus the
     /// legacy `chat:{id}` key carried for read-merge (D4 C6).
     ///
