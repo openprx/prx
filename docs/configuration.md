@@ -227,7 +227,9 @@ prx init --provider openrouter --model vendor/custom-chat --native-tools --from-
 
 Init records `[[providers.models]]` with the selected `provider`, `model`,
 `operations = ["chat"]` and `native_tools = true` (or `false` for
-`--no-native-tools`). Without either flag it fails nonzero with the typed
+`--no-native-tools`). `native_tools = false` does not remove tools: the model
+receives the turn's tools as prompt text (prompt-guided tool calling) instead of
+a native tools array. Without either flag it fails nonzero with the typed
 `model_capabilities_unknown` message naming both flags; nothing is written.
 Catalog models keep their existing behavior and require neither flag.
 Agent creation/replacement and Main model changes through management APIs

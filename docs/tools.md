@@ -2075,7 +2075,9 @@ filesystem owner/workspace matching remain mandatory. A changed live registry,
 backend binding or schema, or availability below Configured, returns
 `StaleCapability` before policy or backend execution. Ingress model bindings
 reject a different execution provider/model. Models without verified native tool
-support, and sources with tool calls disabled, receive an empty tool surface.
+support receive the same tools as prompt text (prompt-guided tool calling): the
+tool definitions are rendered into the prompt and tool calls are parsed from the
+reply. Sources with tool calls disabled receive an empty tool surface.
 This check prevents a model from invoking a withheld tool by guessing its name.
 
 ### Built-in pattern failures
