@@ -34,6 +34,21 @@ agent runs and terminal `prx chat` have separate histories and do not implicitly
 Console sessions. The existing Console list continues to show these persisted
 records; the API is available to clients without manually inserting database rows.
 
+### Compacting a session
+
+A message whose whole text, trimmed, is exactly `/compact` is the compaction
+command, as in the terminal. It forces a context switch over the older turns of
+the session now, runs no model turn, and answers
+`{"status": "ok", "reply": "<notice>"}` with the same notice the terminal shows
+(for example `Compacted context: 12 -> 3 turns, ...`, or `Nothing to compact: ...`
+when the session is short). The switch writes its own `context.switch.created`
+row and the next message opens on it. The command and the notice are not stored,
+so the console history does not show them. The switch asks the model for one
+handoff summary, which is not a turn. Any other text, such as `/compact now`,
+`please /compact`, a message with uploads, or an rf message, is a normal
+message. Token counts in the notice are measured on the stored turns, so they can
+differ slightly from the terminal's.
+
 ## Tech Stack
 
 - Svelte SPA (Vite)
