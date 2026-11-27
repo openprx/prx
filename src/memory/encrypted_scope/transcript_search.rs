@@ -72,11 +72,17 @@ impl EncryptedScope {
                 if hits.len() >= limit {
                     break;
                 }
-                if !matches!(event.role.as_str(), "user" | "assistant") || !self.owns_event(&event) {
+                if event.event_type != "message.created"
+                    || !matches!(event.role.as_str(), "user" | "assistant")
+                    || !self.owns_event(&event)
+                {
                     continue;
                 }
                 let event = self.reveal(event);
-                let lowered = event.content.to_ascii_lowercase();
+                // Redact the whole row first: a query matches the redacted text
+                // only, so it cannot probe inside a secret.
+                let redacted = redact_secrets(&event.content);
+                let lowered = redacted.to_ascii_lowercase();
                 if !folded_words.iter().all(|word| lowered.contains(word.as_str())) {
                     continue;
                 }
@@ -85,7 +91,7 @@ impl EncryptedScope {
                     event_id: event.event_id,
                     role: event.role,
                     created_at: event.created_at,
-                    excerpt: excerpt(&event.content, anchor),
+                    excerpt: cut_excerpt(&redacted, anchor),
                 });
             }
         }
@@ -103,14 +109,13 @@ fn distinct_words(query: &str) -> Vec<&str> {
         .collect()
 }
 
-/// The excerpt of a row: its secrets are redacted on the whole text first, then
-/// the text is cut the way the SQLite index cuts a row. A row of at most
-/// [`WHOLE_ROW_MAX_CHARS`] characters is returned whole; a longer one is cut to
-/// [`REGION_SIDE_CHARS`] characters on each side of the first case-insensitive
-/// match of `anchor`, or from its start when the match is not in the redacted
-/// text (for example when it lay inside a secret).
-fn excerpt(content: &str, anchor: &str) -> String {
-    let redacted: Vec<char> = redact_secrets(content).chars().collect();
+/// The excerpt of a redacted row: a row of at most [`WHOLE_ROW_MAX_CHARS`]
+/// characters is returned whole; a longer one is cut to [`REGION_SIDE_CHARS`]
+/// characters on each side of the first case-insensitive match of `anchor`, or
+/// from its start when the match is not in the text (for example when it lay
+/// inside a secret, which the text no longer shows).
+fn cut_excerpt(redacted: &str, anchor: &str) -> String {
+    let redacted: Vec<char> = redacted.chars().collect();
     if redacted.len() <= WHOLE_ROW_MAX_CHARS {
         return redacted.into_iter().collect();
     }
