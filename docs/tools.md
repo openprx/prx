@@ -741,6 +741,15 @@ real effect (`readonly` or `act`) rather than assuming the list is read-only,
 and a side-effecting entry in `mcp_server.exposed_tools` is warned about at
 config load.
 
+The ledger records a call's execution before any tool-result hook runs, so a
+crash between the execution and the hook cannot run the side effect again. The
+stored record is the pre-hook output, masked by the secret redactor before it is
+written. A `replace_output` hook does not change that record: the text it removes
+stays in the ledger and is never sent to the model. A replay returns the stored
+record without running the tool again, and the tool-result hooks run again on
+it, so the model receives the hook's output for the stored text, not the text
+it first saw.
+
 An exposed name also has to be *resolvable*. Discovery projects the admissible
 part of `mcp_server.exposed_tools` — the entries on the owner-isolation-aware
 list — from configuration, while
