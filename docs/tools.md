@@ -1885,8 +1885,10 @@ message, on the hits of the longer words. When every word is shorter than 3
 characters, the newest matches come first. Messages whose rf message or reply
 was deleted are not searched, also before the deletion is settled.
 
-The index is built on the first search, or at process start by a background
-warm-up, so a search does not pay for building it. Each hit prints its time,
+The index is built at process start by a background warm-up, in short write
+batches so other writers are never held up for long; an interrupted build
+resumes at the next start. Until it is complete, every word is matched as a
+substring of the message and the newest matches come first. Each hit prints its time,
 session, role and an excerpt. Excerpts are cut from redacted text: secrets are
 redacted on the whole message first, and only then is the excerpt cut, so the
 cut cannot hide the prefix or label that identifies a secret. An excerpt is 200

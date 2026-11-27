@@ -36,6 +36,7 @@ mod sync_journal;
 mod sync_lifecycle;
 mod sync_woken;
 mod transcript_rows;
+mod transcript_index;
 mod transcript_search;
 mod sync_projection;
 mod sync_retained;

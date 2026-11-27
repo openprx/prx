@@ -35,9 +35,10 @@ impl TranscriptSearchTool {
     }
 }
 
-/// Build the transcript index in the background, once per process, so the first
-/// search does not build it. Without a Tokio runtime nothing is started and the
-/// first search builds the index as before.
+/// Build the transcript index in the background, once per process: create it
+/// if missing and fill it in short batches (resuming an interrupted fill).
+/// Searches match on the rows themselves until the index is complete. Without a
+/// Tokio runtime nothing is started.
 pub(crate) fn warm_index_in_background(memory: Arc<dyn Memory>) {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return;
@@ -49,7 +50,7 @@ pub(crate) fn warm_index_in_background(memory: Arc<dyn Memory>) {
         if let Err(error) = memory.warm_transcript_index().await {
             tracing::warn!(
                 error = %error_class(&error),
-                "transcript index warm-up failed; the first search builds it"
+                "transcript index warm-up failed; searches match without the index until a later start completes it"
             );
         }
     });

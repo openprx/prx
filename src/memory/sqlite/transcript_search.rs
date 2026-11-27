@@ -1,31 +1,15 @@
-//! Full-text index over transcript rows (`message_events.content`) and the
-//! search over it.
-//!
-//! The FTS5 table and its three triggers are not in `schema.rs`, so the schema
-//! stamp is unchanged. They are created by the warm-up at process start, which
-//! every process that registers tools runs in the background. From then on
-//! every message insert pays the trigger cost. When the warm-up did not run (no
-//! runtime, or a failure), the first search creates them instead. The index is
-//! external-content: it stores no copy
-//! of the text, only the FTS5 structures, and it indexes every row. It uses the
-//! trigram tokenizer, so Chinese and other scripts without spaces match as
-//! substrings. Filters (owner, workspace, agent partition, erased scopes,
-//! inactive incarnations, rf-deleted messages, message role and type) are
-//! applied at query time, never in the triggers, so a row's index entry always
-//! matches its `content` and the `delete` command always removes what was
-//! indexed.
+//! Search over the full-text index of transcript rows
+//! (`message_events.content`). The index itself, its creation and its initial
+//! fill are in [`super::transcript_index`]. Until that fill is complete a search
+//! matches every word with `LIKE` on the rows, so it never misses a row the
+//! index does not cover yet.
 
 use super::SqliteMemory;
-use super::erasure_pool::MemoryPool;
 use super::events::{MA_SCOPE_COLUMN, numbered_placeholders, partition_conjunct};
+use super::transcript_index::{INDEX_TABLE, IndexState, build_index, index_state};
 use crate::memory::traits::{MemoryPrincipal, TranscriptHit};
 use crate::memory::{AgentPartition, PartitionKey};
-use crate::runtime::sqlite_pool::begin_immediate;
-use rusqlite::Connection;
 use std::collections::HashSet;
-
-/// Name of the FTS5 table over `message_events`.
-const INDEX_TABLE: &str = "message_events_fts";
 
 /// Shortest term (in characters) the trigram tokenizer can match. Shorter terms
 /// are matched with `LIKE` instead.
@@ -60,44 +44,6 @@ const SEARCHABLE_ROW_SQL: &str = "NOT EXISTS (SELECT 1 FROM agent_erase_fences f
                             OR (a.reply_deleted_at IS NOT NULL AND a.run_id = e.run_id
                                 AND a.message_event_id <> e.event_id)))";
 
-/// Index objects and their initial fill, run once in one write transaction.
-///
-/// Failure semantics: an error inside a trigger aborts the statement that fired
-/// it, as a storage error on `message_events` itself would. A failing FTS write
-/// therefore fails the message write (fail-closed); it is never swallowed.
-///
-/// `INSERT OR REPLACE` on `message_events` would delete the old row without
-/// firing the delete trigger and so corrupt the index: never use it there. A
-/// table rebuild migration must recreate these triggers.
-///
-/// The `rebuild` indexes the rows that exist when the index is created; its cost
-/// is proportional to the number of `message_events` rows. So the first search
-/// builds the index over all transcript rows of the database, under the write
-/// lock. The first search or the process-start warm-up builds it, whichever
-/// comes first.
-///
-/// `secure-delete` is FTS5's own option: a deleted or blanked row's terms are
-/// overwritten on disk instead of lingering in older segments. It is stored in
-/// the index's `%_config` table (format version 5), so later connections keep
-/// it without setting it. Erasure therefore needs no rebuild.
-const CREATE_INDEX_SQL: &str = "
-    CREATE VIRTUAL TABLE IF NOT EXISTS message_events_fts USING fts5(
-        content, content='message_events', content_rowid='id', tokenize='trigram');
-    CREATE TRIGGER IF NOT EXISTS message_events_fts_ai AFTER INSERT ON message_events BEGIN
-        INSERT INTO message_events_fts(rowid, content) VALUES (new.id, new.content);
-    END;
-    CREATE TRIGGER IF NOT EXISTS message_events_fts_ad AFTER DELETE ON message_events BEGIN
-        INSERT INTO message_events_fts(message_events_fts, rowid, content)
-            VALUES ('delete', old.id, old.content);
-    END;
-    CREATE TRIGGER IF NOT EXISTS message_events_fts_au AFTER UPDATE OF content ON message_events BEGIN
-        INSERT INTO message_events_fts(message_events_fts, rowid, content)
-            VALUES ('delete', old.id, old.content);
-        INSERT INTO message_events_fts(rowid, content) VALUES (new.id, new.content);
-    END;
-    INSERT INTO message_events_fts(message_events_fts, rank) VALUES ('secure-delete', 1);
-    INSERT INTO message_events_fts(message_events_fts) VALUES ('rebuild');";
-
 /// The query terms and how they are matched against `message_events.content`.
 struct QueryMatch {
     /// The first word of the query; it occurs in every hit. A row longer than
@@ -108,12 +54,25 @@ struct QueryMatch {
 
 /// How the query terms are matched against `message_events.content`.
 enum TermMatch {
-    /// One FTS5 `MATCH` over the quoted long terms, ANDed, and a `LIKE` filter
-    /// per short term.
-    Fts { match_text: String, short: Vec<String> },
+    /// One FTS5 `MATCH` over the long terms, quoted and ANDed (see
+    /// [`fts_match_text`]), and a `LIKE` filter per short term.
+    Fts { long: Vec<String>, short: Vec<String> },
     /// `LIKE` per term, ANDed, when no term is long enough for the trigram
-    /// index.
+    /// index or the index is not complete yet.
     Like { terms: Vec<String> },
+}
+
+impl TermMatch {
+    /// The same terms matched without the index: `LIKE` per term, ANDed.
+    fn without_index(self) -> Self {
+        match self {
+            Self::Fts { mut long, short } => {
+                long.extend(short);
+                Self::Like { terms: long }
+            }
+            like @ Self::Like { .. } => like,
+        }
+    }
 }
 
 impl SqliteMemory {
@@ -149,14 +108,20 @@ impl SqliteMemory {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let pool = self.pool.clone();
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<TranscriptHit>> {
-            ensure_index(&pool)?;
             let reader = pool.read()?;
             let conn = reader.connection()?;
             let mut values: Vec<rusqlite::types::Value> = Vec::new();
             let QueryMatch { anchor, terms } = matcher;
+            // Before the index is complete it does not cover every row, so
+            // every word is matched on the rows themselves.
+            let terms = if index_state(conn)? == IndexState::Complete {
+                terms
+            } else {
+                terms.without_index()
+            };
             let (from_sql, term_sql, order_sql) = match terms {
-                TermMatch::Fts { match_text, short } => {
-                    values.push(rusqlite::types::Value::from(match_text));
+                TermMatch::Fts { long, short } => {
+                    values.push(rusqlite::types::Value::from(fts_match_text(&long)));
                     let mut conditions = vec![format!("{INDEX_TABLE} MATCH ?1")];
                     for term in short {
                         values.push(like_pattern(&term));
@@ -269,11 +234,10 @@ impl SqliteMemory {
         .await?
     }
 
-    /// Build the index now, so the first search does not. Same creation and
-    /// fill as the first search; a no-op when the index exists.
+    /// Create the index if missing and fill it in short batches until it is
+    /// complete (resuming an interrupted fill); a no-op on a complete index.
     pub(super) async fn warm_transcript_index_impl(&self) -> anyhow::Result<()> {
-        let pool = self.pool.clone();
-        crate::runtime::blocking::spawn_blocking(move || ensure_index(&pool)).await?
+        build_index(self.pool.clone()).await
     }
 }
 
@@ -295,12 +259,11 @@ fn term_match(query: &str) -> Option<QueryMatch> {
             },
         });
     }
-    let match_text = words
+    let long = words
         .iter()
         .filter(|word| is_long_term(word))
-        .map(|word| format!("\"{}\"", word.replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join(" ");
+        .map(|word| (*word).to_owned())
+        .collect();
     let short = words
         .iter()
         .filter(|word| !is_long_term(word))
@@ -308,8 +271,17 @@ fn term_match(query: &str) -> Option<QueryMatch> {
         .collect();
     Some(QueryMatch {
         anchor,
-        terms: TermMatch::Fts { match_text, short },
+        terms: TermMatch::Fts { long, short },
     })
+}
+
+/// The FTS5 query of the long terms: each double-quoted (embedded quotes
+/// doubled), ANDed.
+fn fts_match_text(long: &[String]) -> String {
+    long.iter()
+        .map(|word| format!("\"{}\"", word.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Whether a word is long enough for the trigram index.
@@ -348,31 +320,4 @@ fn escape_like(term: &str) -> String {
         escaped.push(ch);
     }
     escaped
-}
-
-/// Create the index if the database does not have it. The check is a read; the
-/// write lock is taken only when the table is missing, and the check is repeated
-/// under the lock, so the creation and its fill run once per database.
-fn ensure_index(pool: &MemoryPool) -> anyhow::Result<()> {
-    {
-        let reader = pool.read()?;
-        if index_exists(reader.connection()?)? {
-            return Ok(());
-        }
-    }
-    let guard = pool.write();
-    let tx = begin_immediate(&guard)?;
-    if !index_exists(&tx)? {
-        tx.execute_batch(CREATE_INDEX_SQL)?;
-    }
-    tx.commit()?;
-    Ok(())
-}
-
-fn index_exists(conn: &Connection) -> anyhow::Result<bool> {
-    Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
-        [INDEX_TABLE],
-        |row| row.get(0),
-    )?)
 }

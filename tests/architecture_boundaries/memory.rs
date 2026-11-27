@@ -189,6 +189,8 @@ const SQLITE_SEPARATE_MODULES: &[&str] = &[
     "recovery_keys.rs",
     "recovery_outbox.rs",
     "recovery_terminal.rs",
+    // Transcript full-text index creation and chunked fill; SQL on the backend's pool, opens nothing.
+    "transcript_index.rs",
     // AC-1b2b rf message and reply deletes; SQL on connections the backend passes in, opens nothing.
     "rf_delete.rs",
     // W2 forget of a deleted run family's writes; SQL on transactions the backend passes in, opens nothing.
