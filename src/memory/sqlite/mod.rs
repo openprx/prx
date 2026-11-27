@@ -6,6 +6,7 @@ mod approval_grants;
 mod branch_copy;
 mod child_sessions;
 mod child_turns;
+mod derived_sweep;
 mod documents;
 mod drafts;
 mod event_append;

@@ -409,6 +409,29 @@ fn verify(conn: &Connection, scopes: &str, keep_message_keys: bool, preserve_mem
     Ok(())
 }
 
+/// Run ids and session keys of the rows an erase is about to delete, with the
+/// smallest of their row ids: the listing results that name them were written
+/// after that row. `None` when the scopes hold no rows.
+fn listing_identifiers(conn: &Connection, scopes: &str) -> anyhow::Result<Option<(Vec<String>, i64)>> {
+    let Some(since_id) = conn.query_row(
+        "SELECT MIN(id) FROM message_events WHERE ma_scope_id IN (SELECT value FROM json_each(?1))",
+        [scopes],
+        |row| row.get::<_, Option<i64>>(0),
+    )?
+    else {
+        return Ok(None);
+    };
+    let mut statement = conn.prepare(
+        "SELECT run_id FROM message_events WHERE ma_scope_id IN (SELECT value FROM json_each(?1)) AND run_id IS NOT NULL
+         UNION SELECT session_key FROM message_events WHERE ma_scope_id IN (SELECT value FROM json_each(?1))
+           AND session_key IS NOT NULL",
+    )?;
+    let identifiers = statement
+        .query_map([scopes], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(Some((identifiers, since_id)))
+}
+
 pub(super) fn finish_history(memory: &SqliteMemory, work: &EraseWork) -> anyhow::Result<serde_json::Value> {
     // Re-read durable work: a retry may race another finisher. Refresh child
     // attribution after cancellation, before deleting its parent events.
@@ -504,6 +527,7 @@ pub(super) fn finish_history(memory: &SqliteMemory, work: &EraseWork) -> anyhow:
                     forgotten.documents_touched += found.documents_touched;
                 }
             }
+            let listing = listing_identifiers(&tx, &scopes)?;
             erase_rows(
                 &tx,
                 &scopes,
@@ -513,6 +537,15 @@ pub(super) fn finish_history(memory: &SqliteMemory, work: &EraseWork) -> anyhow:
                 !work.purge && !work.forget_writes,
             )
             .context(ErasureStep::EraseRows)?;
+            if let Some((identifiers, since_id)) = listing {
+                super::derived_sweep::rewrite_listings(
+                    &tx,
+                    &work.workspace,
+                    &identifiers,
+                    since_id,
+                    &chrono::Utc::now().to_rfc3339(),
+                )?;
+            }
             // Session previews are shared by agents; derive them again from survivors.
             tx.execute("UPDATE sessions SET last_message_preview=COALESCE((SELECT substr(c.content,1,200) FROM conversation_turns c
                 WHERE c.session_key=sessions.session_key AND c.deleted_at IS NULL ORDER BY c.id DESC LIMIT 1),''),
