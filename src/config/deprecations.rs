@@ -167,6 +167,12 @@ pub(crate) const DEPRECATED_CONFIG_KEYS: &[DeprecatedKey] = &[
         shape: DeprecatedShape::Field,
         reason: REASON_ROLLOUT_RETIRED,
     },
+    // ── [agent.compaction]: OS paging was removed ─────────────────────────
+    DeprecatedKey {
+        path: &["agent", "compaction", "os_paging"],
+        shape: DeprecatedShape::Section,
+        reason: "OS paging was removed; long sessions are handed off by the context switch",
+    },
     // ── [sessions_spawn]: the former anti-fork-bomb valves ─────────────────
     DeprecatedKey {
         path: &["sessions_spawn", "max_concurrent"],

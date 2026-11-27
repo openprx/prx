@@ -359,12 +359,8 @@ pub(super) fn agent_template(spec: Spec) -> String {
         Spec::Minimal => r#"# Agent configuration (minimal)
 # Context retention follows the model-aware token budget.
 
-# OS-paging (non-destructive history eviction + semantic recall) on by default so
-# the agent "remembers" long conversations instead of hard-dropping old messages.
 [agent.compaction]
 mode = "switch"                        # exact transcript refs; off | switch
-[agent.compaction.os_paging]
-max_recalled_pages = 10
 "#
         .into(),
 
@@ -375,9 +371,6 @@ max_recalled_pages = 10
 [agent.compaction]
 mode = "switch"                        # exact transcript refs; off | switch
 # max_context_tokens = 128000          # optional explicit override; omitted means derive from model metadata
-# OS-paging: non-destructive eviction + semantic recall of paged-out history.
-[agent.compaction.os_paging]
-max_recalled_pages = 10
 
 [sessions_spawn]
 # process_memory_strategy = "shared_fabric" # shared_fabric | isolated_private
@@ -403,9 +396,6 @@ min_coverage = 0.60
 [agent.compaction]
 mode = "switch"                       # exact transcript refs; off | switch
 # max_context_tokens = 128000         # optional explicit override; omitted means derive from model metadata
-# OS-paging: non-destructive eviction + semantic recall of paged-out history.
-[agent.compaction.os_paging]
-max_recalled_pages = 10
 
 # Session spawning for parallel task execution. Concurrency, nesting depth and
 # children per session are uncapped; live runs are listed and ended with
