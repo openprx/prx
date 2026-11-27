@@ -180,13 +180,11 @@ async fn overflow_turn(
 }
 
 fn overflow_config(mode: AgentCompactionMode) -> AgentCompactionConfig {
-    let mut config = AgentCompactionConfig {
+    AgentCompactionConfig {
         mode,
         memory_flush: false,
         ..AgentCompactionConfig::default()
-    };
-    config.os_paging.proactive_retrieval = false;
-    config
+    }
 }
 
 #[tokio::test]

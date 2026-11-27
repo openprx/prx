@@ -62,7 +62,6 @@ fn switch_config() -> crate::config::AgentCompactionConfig {
         memory_flush: false,
         max_context_tokens: 50,
         max_context_tokens_explicit: true,
-        os_paging: crate::config::OsPagingConfig::default(),
     }
 }
 

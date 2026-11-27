@@ -50,29 +50,23 @@ fn a_caller_supplied_canonical_history_is_the_canonical_history() {
 }
 
 #[test]
-fn the_projection_reapplies_the_recalled_page_and_the_skill_suppression() {
+fn the_projection_reapplies_the_skill_suppression() {
     let system = "intro\n## Available Skills\n<available_skills>s</available_skills>";
     let view = vec![ChatMessage::system(system), ChatMessage::user("request")];
     let mut turn_history = TurnHistory::new(&view, None, false);
-    turn_history.record_recalled_page(ChatMessage::system("recalled"));
     turn_history.set_skill_metadata_suppressed(true);
 
     let projected = turn_history.project(&view);
 
     assert_eq!(
         contents(&projected),
-        vec!["intro\n", "recalled", "request"],
-        "the projection strips the skill metadata and inserts the recalled page after the system prompt"
+        vec!["intro\n", "request"],
+        "the projection strips the skill metadata"
     );
     assert_eq!(
         contents(turn_history.canonical(&view))[0],
         system,
         "the canonical system prompt keeps the skill metadata"
-    );
-    assert_eq!(
-        turn_history.replacement_offset(),
-        1,
-        "the recalled page shifts a compaction's replacement by one message"
     );
 }
 
@@ -390,7 +384,7 @@ fn project_renders_evidence_only_on_acknowledged_assistant_messages() {
 }
 
 #[test]
-fn splice_eviction_and_lift_keep_evidence_aligned() {
+fn splice_and_lift_keep_evidence_aligned() {
     let evidence = shell_ok();
 
     // A durable patch over [q1, a1] keeps a2's evidence at its new index.
@@ -419,31 +413,6 @@ fn splice_eviction_and_lift_keep_evidence_aligned() {
         vec!["sys", "summary", "q2", "a2\n\n[tool evidence: none]", "request"],
         "the replacement has no evidence and the retained reply keeps its own after the lift"
     );
-
-    // A page eviction of [q1, a1] (and a tool result behind it) shifts the
-    // evidence with its message.
-    let mut evicted = canonical_with_evidence(&evidence);
-    evicted.messages.insert(
-        3,
-        ChatMessage {
-            role: "tool".to_owned(),
-            content: "orphan result".to_owned(),
-        },
-    );
-    evicted.origins.insert(3, MessageOrigin::TurnRound);
-    evicted.evidence.insert(3, None);
-    let eviction = crate::agent::context_paging::OsPagingEviction {
-        start: 1,
-        end: 3,
-        breadcrumb: ChatMessage::assistant("breadcrumb"),
-    };
-    assert!(evicted.apply_page_eviction(&eviction), "test: the eviction applies");
-    assert_eq!(
-        contents(&projected(&evicted)),
-        vec!["sys", "breadcrumb", "q2", "a2\n\n[tool evidence: none]", "request"],
-        "the evicted reply's evidence leaves with it and the kept reply keeps its own"
-    );
-    assert_eq!(evicted.evidence.len(), evicted.messages.len(), "slots stay aligned");
 
     // A splice whose lists disagree in length is refused.
     let mut broken = canonical_with_evidence(&evidence);

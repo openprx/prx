@@ -512,21 +512,3 @@ pub(super) fn context_budget_fixture_config(
         ..crate::config::AgentCompactionConfig::default()
     }
 }
-
-pub(super) fn paging_test_config(_enabled: bool) -> crate::config::AgentCompactionConfig {
-    crate::config::AgentCompactionConfig {
-        mode: crate::config::AgentCompactionMode::Safeguard,
-        reserve_tokens: 1,
-        keep_recent_messages: 12,
-        memory_flush: false,
-        max_context_tokens: 50,
-        max_context_tokens_explicit: true,
-        os_paging: crate::config::OsPagingConfig {
-            eviction_threshold: 0.70,
-            proactive_retrieval: true,
-            max_recalled_pages: 3,
-            retrieval_injection_role: crate::config::RetrievalInjectionRole::System,
-            keep_recent_messages: 1,
-        },
-    }
-}

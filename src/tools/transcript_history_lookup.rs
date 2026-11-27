@@ -330,7 +330,6 @@ mod tests {
             memory_flush: false,
             max_context_tokens: 50,
             max_context_tokens_explicit: true,
-            os_paging: crate::config::OsPagingConfig::default(),
         };
         let audit = DocumentIngestRuntime::from_envelope(Arc::clone(memory), envelope);
         let patch = crate::agent::compaction::build_configurable_compaction_patch(

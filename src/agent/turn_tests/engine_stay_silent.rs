@@ -1312,7 +1312,6 @@ async fn a_compaction_summary_carrying_a_marker_is_stripped_in_both_grains() {
         memory_flush: false,
         max_context_tokens: 120,
         max_context_tokens_explicit: true,
-        os_paging: crate::config::OsPagingConfig::default(),
     };
 
     let patch = build_configurable_compaction_patch(

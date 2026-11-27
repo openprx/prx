@@ -63,19 +63,6 @@ async fn agent_config_defaults() {
 }
 
 #[test]
-async fn empty_agent_compaction_section_keeps_os_paging_enabled() {
-    // Phase 1: an empty `[agent.compaction]` table (no `os_paging` key) must
-    // still deserialize with os_paging enabled, because the field's
-    // `#[serde(default)]` resolves to `OsPagingConfig::default()` (enabled = true).
-    let raw = r#"
-default_temperature = 0.7
-[agent.compaction]
-"#;
-    let parsed: Config = toml::from_str(raw).unwrap();
-    assert_eq!(parsed.agent.compaction.os_paging.max_recalled_pages, 10);
-}
-
-#[test]
 async fn agent_config_deserializes() {
     let raw = r#"
 default_temperature = 0.7

@@ -11,8 +11,6 @@
 )]
 
 use super::*;
-use crate::agent::context_paging::recall_context_pages;
-use crate::agent::turn_tests::paging_test_config;
 use crate::memory::principal::{OwnerPrincipal, Role};
 use crate::memory::{DocumentIngestInput, Memory, MemoryPrincipal, MemoryVisibility, SqliteMemory};
 use crate::runtime::envelope::RuntimeEnvelope;
@@ -43,23 +41,6 @@ fn document_ingest_runtime_inherits_envelope_lineage() {
     assert_eq!(runtime.persona_id.as_deref(), Some("persona-a"));
     assert!(runtime.require_owner_match);
     assert!(runtime.memory_principal().require_owner_match);
-}
-
-#[tokio::test]
-async fn os_paging_recall_disabled_returns_none() {
-    let tmp = TempDir::new().unwrap();
-    let workspace = tmp.path().to_string_lossy().to_string();
-    let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
-    let envelope = RuntimeEnvelope::agent(workspace, "run-paging-2");
-    let runtime = DocumentIngestRuntime::from_envelope(mem, &envelope);
-
-    let mut config = paging_test_config(true);
-    config.os_paging.proactive_retrieval = false;
-    let recalled = recall_context_pages("anything", &config, Some(&runtime)).await;
-    assert!(
-        recalled.is_none(),
-        "recall must be skipped when proactive_retrieval is off"
-    );
 }
 
 /// Build a DocumentIngestRuntime over `memory` scoped to the given
@@ -96,7 +77,6 @@ fn untrusted_test_runtime(memory: Arc<dyn Memory>) -> DocumentIngestRuntime {
         config_generation_id: Some(0),
         config_source_revision: None,
         visibility: MemoryVisibility::Workspace,
-        child_turn: false,
         write_provenance: None,
     }
 }

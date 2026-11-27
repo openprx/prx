@@ -910,7 +910,6 @@ async fn redux_switch_without_exact_provenance_degrades_instead_of_failing_the_t
         memory_flush: false,
         max_context_tokens: 50,
         max_context_tokens_explicit: true,
-        os_paging: crate::config::OsPagingConfig::default(),
     };
     let (action_tx, mut action_rx) = mpsc::channel(2);
 

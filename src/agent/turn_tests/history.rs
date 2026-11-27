@@ -248,7 +248,12 @@ fn latest_user_query_skips_internal_messages() {
         ChatMessage::user("[Post-compaction context refresh] noise"),
         ChatMessage::user("[Recalled context from earlier in this session]\npage"),
     ];
-    assert_eq!(latest_user_query(&history), Some("real question one"));
+    assert_eq!(
+        latest_user_query_index(&history)
+            .and_then(|index| history.get(index))
+            .map(|m| m.content.as_str()),
+        Some("real question one")
+    );
 }
 
 /// Only the loop's exact markers are bookkeeping. A user turn that merely
@@ -269,7 +274,13 @@ fn a_user_turn_that_only_resembles_a_loop_note_is_the_question() {
             ChatMessage::assistant("answer"),
             ChatMessage::user(text),
         ];
-        assert_eq!(latest_user_query(&history), Some(text), "{text}");
+        assert_eq!(
+            latest_user_query_index(&history)
+                .and_then(|index| history.get(index))
+                .map(|m| m.content.as_str()),
+            Some(text),
+            "{text}"
+        );
         assert_eq!(latest_user_query_index(&history), Some(3), "{text}");
     }
 }

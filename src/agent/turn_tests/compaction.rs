@@ -220,7 +220,6 @@ async fn configurable_compaction_safeguard_inserts_summary_marker() {
         memory_flush: false,
         max_context_tokens: 50,
         max_context_tokens_explicit: true,
-        os_paging: crate::config::OsPagingConfig::default(),
     };
     let compacted = apply_configurable_compaction(&mut history, &provider, "model", &config, None, "test")
         .await
@@ -275,7 +274,6 @@ async fn configurable_context_switch_emits_exact_handoff_without_summary() {
         memory_flush: true,
         max_context_tokens: 50,
         max_context_tokens_explicit: true,
-        os_paging: crate::config::OsPagingConfig::default(),
     };
 
     let compacted =
@@ -359,7 +357,6 @@ async fn configurable_context_switch_can_roll_over_repeatedly_with_generation_li
         memory_flush: false,
         max_context_tokens: 50,
         max_context_tokens_explicit: true,
-        os_paging: crate::config::OsPagingConfig::default(),
     };
 
     assert!(
@@ -473,7 +470,6 @@ async fn configurable_context_switch_fails_closed_without_exact_provenance() {
         memory_flush: false,
         max_context_tokens: 50,
         max_context_tokens_explicit: true,
-        os_paging: crate::config::OsPagingConfig::default(),
     };
 
     let compacted = apply_configurable_compaction(&mut history, &provider, "model", &config, None, "test")
@@ -584,7 +580,6 @@ async fn switch_handoff_states_how_many_tool_roundtrips_it_folded() {
         memory_flush: true,
         max_context_tokens: 50,
         max_context_tokens_explicit: true,
-        os_paging: crate::config::OsPagingConfig::default(),
     };
     let compacted = apply_configurable_compaction(
         &mut history,
@@ -651,7 +646,6 @@ async fn context_switch_resolves_provenance_across_tool_roundtrips() {
         memory_flush: true,
         max_context_tokens: 50,
         max_context_tokens_explicit: true,
-        os_paging: crate::config::OsPagingConfig::default(),
     };
 
     let cold_window = history.get(1..37).expect("cold window slice").to_vec();
@@ -760,7 +754,6 @@ async fn context_switch_preflight_degrades_to_trim_instead_of_failing_the_turn()
         memory_flush: false,
         max_context_tokens: 400,
         max_context_tokens_explicit: true,
-        os_paging: crate::config::OsPagingConfig::default(),
     };
 
     let budget = preflight_context_budget_before_provider_call(
@@ -1031,7 +1024,6 @@ async fn a_cold_window_of_only_tool_roundtrips_still_folds_into_one_handoff() {
         memory_flush: true,
         max_context_tokens: 50,
         max_context_tokens_explicit: true,
-        os_paging: crate::config::OsPagingConfig::default(),
     };
     let before_len = history.len();
     let compacted = apply_configurable_compaction(
@@ -1144,7 +1136,6 @@ async fn switch_provenance_holds_when_tool_events_are_recorded() {
             memory_flush: true,
             max_context_tokens: 50,
             max_context_tokens_explicit: true,
-            os_paging: crate::config::OsPagingConfig::default(),
         },
         Some(&audit),
         "test_tool_events",
@@ -1182,7 +1173,6 @@ async fn configurable_compaction_aggressive_adds_memory_flush_note() {
         memory_flush: true,
         max_context_tokens: 40,
         max_context_tokens_explicit: true,
-        os_paging: crate::config::OsPagingConfig::default(),
     };
     let compacted = apply_configurable_compaction(&mut history, &provider, "model", &config, None, "test")
         .await
@@ -1251,7 +1241,6 @@ async fn configurable_compaction_records_run_and_summary_memory() {
         memory_flush: false,
         max_context_tokens: 50,
         max_context_tokens_explicit: true,
-        os_paging: crate::config::OsPagingConfig::default(),
     };
 
     let compacted = apply_configurable_compaction(&mut history, &provider, "model", &config, Some(&audit), "pre_turn")
@@ -1419,7 +1408,6 @@ async fn named_compaction_stamps_the_summary_memory() {
         memory_flush: false,
         max_context_tokens: 50,
         max_context_tokens_explicit: true,
-        os_paging: crate::config::OsPagingConfig::default(),
     };
 
     let compacted = apply_configurable_compaction(&mut history, &provider, "model", &config, Some(&audit), "pre_turn")
@@ -1655,7 +1643,6 @@ async fn the_preflight_builds_its_durable_compaction_from_the_canonical_history_
             memory_flush: false,
             max_context_tokens: 400,
             max_context_tokens_explicit: true,
-            os_paging: crate::config::OsPagingConfig::default(),
         };
         // An earlier trim of this turn took the two oldest rounds out of the view.
         let mut view = original.clone();
@@ -1834,7 +1821,6 @@ impl ProvenanceStore {
             memory_flush: false,
             max_context_tokens: 50,
             max_context_tokens_explicit: true,
-            os_paging: crate::config::OsPagingConfig::default(),
         };
         let audit = self.audit();
         build_configurable_compaction_patch(history, &provider, "model", &config, Some(&audit), "test_provenance")

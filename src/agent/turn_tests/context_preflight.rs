@@ -33,7 +33,6 @@ async fn safeguard_compaction_over_tool_roundtrips_keeps_pairs_and_shrinks() {
         memory_flush: false,
         max_context_tokens: 400,
         max_context_tokens_explicit: true,
-        os_paging: crate::config::OsPagingConfig::default(),
     };
 
     let budget = preflight_context_budget_before_provider_call(
@@ -77,7 +76,6 @@ async fn legacy_preflight_preserving_trim_keeps_compaction_summary_when_recent_s
         memory_flush: false,
         max_context_tokens: 120,
         max_context_tokens_explicit: true,
-        os_paging: crate::config::OsPagingConfig::default(),
     };
 
     let budget = preflight_context_budget_before_provider_call(

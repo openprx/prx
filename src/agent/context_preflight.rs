@@ -278,9 +278,8 @@ pub(crate) fn restore_current_turn_request(
         RestoredRequestPosition::AboveEverythingLeftStanding => {
             // `history_non_system_start` inspects `history[0]` only, so "the
             // front of the non-system region" is exact for the leading system
-            // prompt and no more. With OS-paging recall active and the default
-            // `RetrievalInjectionRole::System`, `inject_recalled_context` puts a
-            // *second* system message at index 1 and the request is inserted
+            // prompt and no more. A second system message at index 1 (a
+            // notice the system prompt does not own) makes the request insert
             // above it. That is safe only because
             // `coalesce_system_messages_at_front` hoists and merges it on the
             // prepared copy before the request is serialized — without that

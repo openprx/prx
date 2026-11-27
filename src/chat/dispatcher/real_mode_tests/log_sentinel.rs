@@ -408,7 +408,6 @@ async fn a_compaction_whose_audit_storage_fails_logs_no_stored_content() {
             memory_flush: false,
             max_context_tokens: 50,
             max_context_tokens_explicit: true,
-            os_paging: crate::config::OsPagingConfig::default(),
         };
 
         let patch = crate::agent::compaction::build_configurable_compaction_patch(
@@ -506,7 +505,6 @@ async fn a_switch_rollover_whose_handoff_insert_fails_logs_no_stored_content() {
             memory_flush: false,
             max_context_tokens: 50,
             max_context_tokens_explicit: true,
-            os_paging: crate::config::OsPagingConfig::default(),
         };
         let mut provider_view = source.clone();
         let mut guard_view = crate::agent::turn_history::CanonicalHistory::from_test_messages(source.clone());

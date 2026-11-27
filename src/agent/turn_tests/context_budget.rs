@@ -48,7 +48,6 @@ async fn context_switch_degradation_writes_one_event_per_turn() {
         memory_flush: false,
         max_context_tokens: 400,
         max_context_tokens_explicit: true,
-        os_paging: crate::config::OsPagingConfig::default(),
     };
 
     async fn degrade_once(
@@ -135,7 +134,6 @@ fn token_aware_trim_never_strands_a_tool_result() {
             memory_flush: false,
             max_context_tokens,
             max_context_tokens_explicit: true,
-            os_paging: crate::config::OsPagingConfig::default(),
         };
         let mut history = fixture.clone();
         trim_history_to_context_budget(&mut history, &config);
@@ -174,7 +172,6 @@ async fn legacy_preflight_preserving_trim_falls_back_when_summary_alone_exceeds_
         memory_flush: false,
         max_context_tokens: 90,
         max_context_tokens_explicit: true,
-        os_paging: crate::config::OsPagingConfig::default(),
     };
 
     let budget = preflight_context_budget_before_provider_call(
@@ -243,7 +240,6 @@ async fn configurable_compaction_1m_window_does_not_compact_above_128k() {
         memory_flush: false,
         max_context_tokens: 1_000_000,
         max_context_tokens_explicit: false,
-        os_paging: crate::config::OsPagingConfig::default(),
     };
     let compacted = apply_configurable_compaction(&mut history, &provider, "model", &config, None, "test")
         .await
