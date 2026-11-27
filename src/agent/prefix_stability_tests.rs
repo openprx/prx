@@ -28,7 +28,6 @@ use crate::agent::turn_contracts::{ChatMode, ToolLoopOutcome};
 use crate::agent::turn_engine::run_turn;
 use crate::agent::turn_request::ToolLoopMemory;
 use crate::config::Config;
-use crate::memory::embeddings::LocalHashEmbedding;
 use crate::providers::traits::{ChatMessage, ChatRequest, ChatResponse, Provider};
 use crate::skills::{Skill, SkillTool};
 use crate::tools::traits::{Tool, ToolCategory, ToolResult, ToolTier};
@@ -60,8 +59,8 @@ fn skill(name: &str, description: &str) -> Skill {
 }
 
 /// Eight skills whose descriptions pull in different directions.
-async fn catalog() -> Vec<Skill> {
-    let mut skills = vec![
+fn catalog() -> Vec<Skill> {
+    let skills = vec![
         skill("pdf-report", "extract tables and text out of PDF report files"),
         skill("web-research", "search the open web and summarise the pages found"),
         skill("git-release", "cut a release branch, tag it and push the commit"),
@@ -71,10 +70,6 @@ async fn catalog() -> Vec<Skill> {
         skill("inbox-triage", "sort an email inbox and draft short replies"),
         skill("meeting-notes", "turn a raw transcript into decisions and actions"),
     ];
-    let embedder = LocalHashEmbedding::new("local-hash", 128);
-    crate::skills::hydrate_skill_embeddings(&mut skills, &embedder)
-        .await
-        .expect("fixture embeddings");
     skills
 }
 
@@ -127,7 +122,7 @@ fn fixture_config(workspace: &std::path::Path) -> Config {
 async fn the_real_system_prompt_is_a_pure_function_of_the_exposed_skill_set() {
     let workspace = tempfile::TempDir::new().expect("fixture workspace");
     let config = fixture_config(workspace.path());
-    let skills = catalog().await;
+    let skills = catalog();
 
     let forward: Vec<Skill> = skills.iter().take(5).cloned().collect();
     let mut shuffled = forward.clone();

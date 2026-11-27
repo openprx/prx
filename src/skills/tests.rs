@@ -1116,25 +1116,6 @@ fn openclaw_skills_loads_from_local_dir_via_config() {
     assert!(skills[0].prompts.is_empty(), "must be lazy (no prompts)");
 }
 
-struct TestEmbeddingProvider {
-    response: Vec<f32>,
-}
-
-#[async_trait]
-impl crate::memory::embeddings::EmbeddingProvider for TestEmbeddingProvider {
-    fn name(&self) -> &str {
-        "test"
-    }
-
-    fn dimensions(&self) -> usize {
-        self.response.len()
-    }
-
-    async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
-        Ok(texts.iter().map(|_| self.response.clone()).collect())
-    }
-}
-
 struct CountingEmbeddingProvider {
     calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -1183,62 +1164,4 @@ async fn process_catalog_reuses_hydrated_embeddings() {
     assert!(first[0].embedding.is_some());
     assert_eq!(first[0].embedding, second[0].embedding);
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
-async fn hydrate_skill_embeddings_populates_missing_vectors() {
-    let mut skills = vec![Skill {
-        name: "ops".to_string(),
-        description: "Deployment and release workflows".to_string(),
-        version: "1.0.0".to_string(),
-        author: None,
-        tags: vec![],
-        tools: vec![],
-        prompts: vec![],
-        location: None,
-        embedding: None,
-    }];
-
-    let embedder = TestEmbeddingProvider {
-        response: vec![0.25, 0.75],
-    };
-    hydrate_skill_embeddings(&mut skills, &embedder).await.unwrap();
-
-    assert_eq!(skills[0].embedding, Some(vec![0.25, 0.75]));
-}
-
-#[tokio::test]
-async fn select_skills_by_relevance_prefers_closest_embedding() {
-    let skills = vec![
-        Skill {
-            name: "deploy".to_string(),
-            description: "Deployment workflows".to_string(),
-            version: "1.0.0".to_string(),
-            author: None,
-            tags: vec![],
-            tools: vec![],
-            prompts: vec![],
-            location: None,
-            embedding: Some(vec![1.0, 0.0]),
-        },
-        Skill {
-            name: "docs".to_string(),
-            description: "Documentation workflows".to_string(),
-            version: "1.0.0".to_string(),
-            author: None,
-            tags: vec![],
-            tools: vec![],
-            prompts: vec![],
-            location: None,
-            embedding: Some(vec![0.0, 1.0]),
-        },
-    ];
-
-    let embedder = TestEmbeddingProvider {
-        response: vec![1.0, 0.0],
-    };
-    let selected = select_skills_by_relevance("ship release", &skills, 1, &embedder).await;
-
-    assert_eq!(selected.len(), 1);
-    assert_eq!(selected[0].name, "deploy");
 }

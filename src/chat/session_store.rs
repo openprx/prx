@@ -483,8 +483,7 @@ pub(super) fn upsert_leading_system_prompt(history: &mut Vec<ChatMessage>, syste
     }
 }
 
-/// The system prompt a loaded session's provider view starts with: none for
-/// Skill-RAG sessions (they rebuild it per turn), else the runtime prompt.
+/// The runtime system prompt a loaded session's provider view starts with.
 /// Every load hands the same value to the reducer (`SessionLoaded`) and to
 /// [`provider_view_for_session`], so both histories open identically.
 pub(super) fn leading_system_prompt_for_session(
@@ -492,11 +491,8 @@ pub(super) fn leading_system_prompt_for_session(
     model_name: &str,
     skills: &[crate::skills::Skill],
     native_tools: bool,
-) -> Option<String> {
-    if config.skill_rag.available() {
-        return None;
-    }
-    Some(build_chat_system_prompt(config, model_name, skills, native_tools))
+) -> String {
+    build_chat_system_prompt(config, model_name, skills, native_tools)
 }
 
 /// The provider view of `session`: `leading_system_prompt` (if any) followed

@@ -403,12 +403,6 @@ impl Default for SkillsConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct SkillRagConfig {}
 
-impl SkillRagConfig {
-    pub const fn available(&self) -> bool {
-        true
-    }
-}
-
 /// Multimodal (image) handling configuration (`[multimodal]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MultimodalConfig {

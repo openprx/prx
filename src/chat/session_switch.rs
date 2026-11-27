@@ -319,7 +319,7 @@ pub(super) async fn apply_chat_session_switch(
             crate::chat::action::Action::SessionLoaded {
                 session: loaded_session,
                 persist,
-                leading_system_prompt: leading_system_prompt.clone(),
+                leading_system_prompt: Some(leading_system_prompt.clone()),
             },
             ctx.commits,
         )
@@ -356,7 +356,7 @@ pub(super) async fn apply_chat_session_switch(
         .iter()
         .filter(|turn| turn.role == "user")
         .fold(0_u64, |acc, _| acc.saturating_add(1));
-    *ctx.history = provider_view_for_session(&loaded, leading_system_prompt.as_deref());
+    *ctx.history = provider_view_for_session(&loaded, Some(leading_system_prompt.as_str()));
 
     let _ = ctx.chat_dispatcher.dispatch_or_log(
         crate::chat::action::Action::SessionFocusChanged {

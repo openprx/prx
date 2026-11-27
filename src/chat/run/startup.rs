@@ -325,7 +325,7 @@ pub(super) fn initial_conversation(
 
     // ── Conversation history ─────────────────────────────────────
     let leading_system_prompt = leading_system_prompt_for_session(config, model_name, skills, native_tools);
-    let history = provider_view_for_session(chat_session, leading_system_prompt.as_deref());
+    let history = provider_view_for_session(chat_session, Some(leading_system_prompt.as_str()));
 
     (chat_session_key, fabric_turn_seq, banner, history)
 }
