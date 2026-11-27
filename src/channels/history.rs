@@ -116,9 +116,11 @@ pub(super) fn merged_history(
 ///
 /// `cached` is the CH1 cache view (cut before the current message, normalized,
 /// no ids). The log is read under `session_key` with the turn's principal and
-/// cut at the current message the same way. It is used only when the logged
-/// turns match the cache role for role and text for text, in order, and have
-/// the same count: the parity rule the terminal applies on resume. Any other
+/// cut at the current message the same way, and a leading reply is dropped as
+/// the cache normalization does. It is used only when the newest `cached.len()`
+/// logged turns equal the cache role for role and text for text, in order (an
+/// exact suffix match), and then only those turns are returned. The log rows are
+/// the raw rows, not the handoff view. Any other
 /// outcome, including a read failure or a display-projection read, returns
 /// `None` and the cache is replayed.
 pub(super) async fn logged_turns_matching_cache(
@@ -152,17 +154,27 @@ pub(super) async fn logged_turns_matching_cache(
     {
         logged.truncate(index);
     }
-    // The cache is already normalized, so equal length and equal role and text
-    // in order mean the log needs no merge, drop or stripping to match it.
-    let matches = logged.len() == cached.len()
-        && logged
+    // The cache normalization drops a leading reply, so the log window does too
+    // (the 200-row window can start in the middle of an exchange).
+    let first_user = logged
+        .iter()
+        .position(|turn| turn.role != "assistant")
+        .unwrap_or(logged.len());
+    logged.drain(..first_user);
+    // The cache is already normalized, so the newest `cached.len()` log turns
+    // equal to it, role for role and text for text in order, mean the log needs
+    // no merge, drop or stripping to match it.
+    let start = logged.len().checked_sub(cached.len())?;
+    let suffix = logged.split_off(start);
+    let matches = !suffix.is_empty()
+        && suffix
             .iter()
             .zip(cached)
             .all(|(log, cache)| log.role == cache.role && log.content == cache.content);
     if !matches {
         return None;
     }
-    Some(logged)
+    Some(suffix)
 }
 
 pub(super) fn clear_sender_history(ctx: &ChannelRuntimeContext, key: &ConversationKey) {
