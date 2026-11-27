@@ -1714,6 +1714,7 @@ pub(super) mod level_view;
 mod lifecycle;
 mod listen;
 mod resources;
+pub(super) mod subscriptions;
 mod result;
 mod workspace_overlay;
 

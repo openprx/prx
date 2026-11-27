@@ -36,6 +36,13 @@ pub(super) struct AttachedPeer<'a> {
     _lifecycle: RwLockReadGuard<'a, ()>,
 }
 
+impl AttachedPeer<'_> {
+    /// The live peer of this attachment.
+    pub(super) fn peer(&self) -> &Peer<RoleClient> {
+        &self.peer
+    }
+}
+
 enum Attachment {
     /// The stdio slot and the generation of the session attached to.
     Stdio { slot: StdioSessionSlot, generation: u64 },
@@ -163,7 +170,7 @@ impl McpTool {
 /// that is the connection (`reset_if_current`); for stdio it is the session
 /// of the same generation. A newer replacement in the slot is left alone.
 /// The slot lock is held only for the check and the take, never across a read.
-async fn reset_attached(attached: &AttachedPeer<'_>) {
+pub(super) async fn reset_attached(attached: &AttachedPeer<'_>) {
     match &attached.attachment {
         Attachment::Http { slot, client } => http_session::reset_if_current(slot, client).await,
         Attachment::Stdio { slot, generation } => {
@@ -183,7 +190,7 @@ async fn reset_attached(attached: &AttachedPeer<'_>) {
 
 /// Reset after a failed request if the failure means the transport is gone
 /// or stuck. Application-level errors keep the session.
-async fn reset_after_failure(attached: &AttachedPeer<'_>, error: &ServiceError) {
+pub(super) async fn reset_after_failure(attached: &AttachedPeer<'_>, error: &ServiceError) {
     if http_session::is_transport_failure(error) {
         reset_attached(attached).await;
     }
@@ -262,7 +269,7 @@ async fn read_resource(
     }
 }
 
-fn declares_resources(peer: &Peer<RoleClient>) -> bool {
+pub(super) fn declares_resources(peer: &Peer<RoleClient>) -> bool {
     peer.peer_info()
         .is_some_and(|info| info.capabilities.resources.is_some())
 }
@@ -276,7 +283,7 @@ async fn list_items(peer: &Peer<RoleClient>) -> Result<(Vec<Resource>, Vec<Resou
 
 /// The error returned to the model for a failed request. HTTP failures get the
 /// same authorization hint as the call path.
-fn request_error(server: &str, attached: &AttachedPeer<'_>, error: anyhow::Error) -> anyhow::Error {
+pub(super) fn request_error(server: &str, attached: &AttachedPeer<'_>, error: anyhow::Error) -> anyhow::Error {
     match attached.attachment {
         Attachment::Http { .. } => http_session::with_authorization_hint(server, error),
         Attachment::Stdio { .. } => error,

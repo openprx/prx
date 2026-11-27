@@ -646,6 +646,7 @@ pub fn all_tools_with_runtime_ext_and_extensions(
     let mcp = Arc::new(mcp_tool);
     tool_arcs.push(mcp.clone());
     tool_arcs.push(Arc::new(McpStatusTool::new(mcp.clone())));
+    mcp::subscriptions::adopt(&mcp, workspace_dir);
     let mcp_tool_ref = Some(mcp);
 
     if let Some(key) = composio_key {
