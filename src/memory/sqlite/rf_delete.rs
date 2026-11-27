@@ -188,7 +188,7 @@ pub(super) fn delete_message(conn: &Connection, request: &RfMessageDelete) -> an
     )?;
     let mut agents: Vec<RfDeletedAgent> = Vec::new();
     for attempt in &attempts {
-        let live = is_live(&tx, &target, attempt, &request.live_runs)?;
+        let (live, family) = live_family(&tx, &target, attempt, &request.live_runs)?;
         // Before the erase, so a memory the erase would remove by its source
         // event is counted as forgotten.
         let forget = if request.forget_writes {
@@ -204,6 +204,10 @@ pub(super) fn delete_message(conn: &Connection, request: &RfMessageDelete) -> an
                 "UPDATE rf_message_attempts SET erase_pending = 1 WHERE workspace_id = ?1 AND run_id = ?2",
                 params![request.workspace_id, attempt.run_id],
             )?;
+        } else if let Some(family) = family {
+            // The forget above changes memories, documents and session prefix
+            // rows only, none of which the selection reads.
+            erase_family(&tx, &target, Side::Message, attempt, family)?;
         } else {
             erase(&tx, &target, Side::Message, attempt)?;
         }
@@ -537,22 +541,35 @@ fn descendant_runs(tx: &Connection, workspace_id: &str, owner_id: &str, run_id: 
 /// rewrites), is still live in this process (`live_runs`). The message-side
 /// selection is a superset of the reply side.
 fn is_live(tx: &Connection, target: &Target<'_>, attempt: &Attempt, live_runs: &[String]) -> anyhow::Result<bool> {
+    Ok(live_family(tx, target, attempt, live_runs)?.0)
+}
+
+/// [`is_live`], and the message-side [`Family`] when the check selected it,
+/// so a message delete that is not deferred erases from that selection
+/// instead of selecting again.
+fn live_family(
+    tx: &Connection,
+    target: &Target<'_>,
+    attempt: &Attempt,
+    live_runs: &[String],
+) -> anyhow::Result<(bool, Option<Family>)> {
     let Some(run) = attempt.run_id.as_deref() else {
-        return Ok(false);
+        return Ok((false, None));
     };
     if live_runs.is_empty() {
-        return Ok(false);
+        return Ok((false, None));
     }
     if live_runs.iter().any(|live| live == run) {
-        return Ok(true);
+        return Ok((true, None));
     }
     let family = select_family(tx, target, Side::Message, attempt)?;
-    Ok(family
+    let live = family
         .descendants
         .iter()
         .map(String::as_str)
         .chain(family.woken.iter().filter_map(|row| row.run_id.as_deref()))
-        .any(|member| live_runs.iter().any(|live| live == member)))
+        .any(|member| live_runs.iter().any(|live| live == member));
+    Ok((live, Some(family)))
 }
 
 /// The event ids of a run's rows.
@@ -666,16 +683,19 @@ struct Family {
     children: Vec<Child>,
     /// Completion notices of the erased runs.
     announcements: Vec<String>,
-    /// Rows of the turns those notices woke.
+    /// Rows of the turns those notices woke, and of the turns woken by the
+    /// erased adopted rows an erased spawned run's session sent.
     woken: Vec<EventRow>,
 }
 
 /// Select what a delete of `attempt` reaches: the run, the runs it spawned,
 /// the completion notices of those runs, the turns the notices woke and the
 /// runs those turns spawned, selected again until a pass finds no new run.
-/// Woken turns are followed only from the notices of erased runs (found by
-/// sender session and the fixed notice head), never from an adopted row that
-/// is in `rows` only because adoption stamped it with the run id. A woken
+/// Woken turns are followed from the notices of erased runs (found by sender
+/// session and the fixed notice head) and from the adopted rows in `rows` whose
+/// sender is the session of an erased spawned run (`child_adopted_rows`), never
+/// from an adopted row of any other sender that is in `rows` only because
+/// adoption stamped it with the run id. A woken
 /// turn's own session is never searched for notices, because only the spawned
 /// runs (`children`) name a sender session; so the messages the woken turn's
 /// session (usually the rf session) sends later are not family.
@@ -757,14 +777,20 @@ fn select_family(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Att
         // memories, drafts and links made from them go too.
         let announcements = announcement_events(tx, target, &children)?;
         // The turn each deleted notice woke in the parent session reports the
-        // same result: its input, reply, tool rows and terminal go too.
+        // same result: its input, reply, tool rows and terminal go too. So does
+        // the turn woken by an erased adopted row that an erased child's session
+        // sent (an interim message rather than the completion notice).
         let woken = {
             let mut kept: Vec<&str> = rows.iter().map(|row| row.event_id.as_str()).collect();
             kept.extend(announcements.iter().map(String::as_str));
+            let mut notices = announcements.clone();
+            notices.extend(child_adopted_rows(tx, target, &rows, &children)?);
+            notices.sort_unstable();
+            notices.dedup();
             announcement_turns(
                 tx,
                 target,
-                &serde_json::to_string(&announcements)?,
+                &serde_json::to_string(&notices)?,
                 &serde_json::to_string(&kept)?,
             )?
         };
@@ -804,13 +830,25 @@ fn select_family(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Att
 /// them. The attachments and listings that quoted them are rewritten by the
 /// store's triggers and `derived_sweep`.
 fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) -> anyhow::Result<()> {
+    let family = select_family(tx, target, side, attempt)?;
+    erase_family(tx, target, side, attempt, family)
+}
+
+/// [`erase`] from a `family` already selected for `side` in this transaction.
+fn erase_family(
+    tx: &Connection,
+    target: &Target<'_>,
+    side: Side,
+    attempt: &Attempt,
+    family: Family,
+) -> anyhow::Result<()> {
     let Family {
         descendants,
         rows,
         children,
         mut announcements,
         woken,
-    } = select_family(tx, target, side, attempt)?;
+    } = family;
     if rows.is_empty() {
         return Ok(());
     }
@@ -1120,7 +1158,8 @@ fn run_notices(tx: &Connection, target: &Target<'_>, child: &Child) -> anyhow::R
 }
 
 /// The rows of the turns that a deleted completion notice woke: among
-/// `notices` (a JSON array of the event ids of the notices of erased runs),
+/// `notices` (a JSON array of the event ids of the notices of erased runs and
+/// of the erased adopted rows an erased spawned run's session sent),
 /// the rows of source `prx_mailbox`; a turn they woke has its input
 /// (`message.created`, role `user`) caused by the notice
 /// (`causation_event_id`, set from the adopted event by
@@ -1165,6 +1204,44 @@ fn announcement_turns(
                 schedule_result: false,
             })
         })?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// The event ids of the adopted rows among `rows` (source `prx_mailbox`,
+/// `message.created`) whose sender is the session of an erased spawned run in
+/// `children`: a message such a run sent to another session, such as interim
+/// output that is not its completion notice. The turn each one woke reports the
+/// erased run's output and is followed like a notice's. An adopted row from any
+/// other sender is erased with the run (it is in `rows`) but the turn it woke is
+/// not followed. Matched by key only, never by text.
+fn child_adopted_rows(
+    tx: &Connection,
+    target: &Target<'_>,
+    rows: &[EventRow],
+    children: &[Child],
+) -> anyhow::Result<Vec<String>> {
+    if children.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids = serde_json::to_string(&rows.iter().map(|row| row.event_id.as_str()).collect::<Vec<_>>())?;
+    let mut senders: Vec<&str> = children.iter().map(|child| child.session_key.as_str()).collect();
+    senders.sort_unstable();
+    senders.dedup();
+    let mut statement = tx.prepare(
+        "SELECT event_id FROM message_events
+         WHERE workspace_id = ?1 AND owner_id = ?2 AND source = 'prx_mailbox' AND event_type = 'message.created'
+           AND event_id IN (SELECT value FROM json_each(?3)) AND sender IN (SELECT value FROM json_each(?4))",
+    )?;
+    Ok(statement
+        .query_map(
+            params![
+                target.workspace_id,
+                target.owner_id,
+                ids,
+                serde_json::to_string(&senders)?
+            ],
+            |row| row.get::<_, String>(0),
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
