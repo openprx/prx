@@ -607,7 +607,7 @@ static IN_FLIGHT: LazyLock<parking_lot::Mutex<HashSet<String>>> = LazyLock::new(
 pub(super) struct RunInFlight(String);
 
 impl RunInFlight {
-    fn enter(workspace: &str, run_id: &str) -> Self {
+    pub(super) fn enter(workspace: &str, run_id: &str) -> Self {
         let key = format!("{workspace}\0{run_id}");
         IN_FLIGHT.lock().insert(key.clone());
         Self(key)

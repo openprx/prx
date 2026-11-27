@@ -240,6 +240,13 @@ async fn run(
         (parent, None)
     };
     let run_id = uuid::Uuid::new_v4().to_string();
+    // A woken turn counts as live for the whole turn, so an rf delete of the
+    // run family that woke it waits for its end (`rf_delete::is_live`) and the
+    // settle runs when this guard drops.
+    let _in_flight = super::rf_message::RunInFlight::enter(
+        &turn_runtime.config_generation.effective.workspace_dir.to_string_lossy(),
+        &run_id,
+    );
     let root = receiver_root(&runtime, &input, &run_id).await?;
     let sender_session = input.message.from.session.clone();
     envelope.run_id = Some(run_id);

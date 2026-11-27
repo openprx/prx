@@ -532,8 +532,57 @@ fn descendant_runs(tx: &Connection, workspace_id: &str, owner_id: &str, run_id: 
         .collect::<rusqlite::Result<Vec<String>>>()?)
 }
 
-/// Whether the attempt's run, or a run it spawned, is still live in this
-/// process (`live_runs`).
+/// Every run an erase of `run` can reach, for liveness: the runs it spawned,
+/// the runs the completion notices of those wake in their parent session, and
+/// the runs those woken turns spawned, repeated until no run is new. The
+/// attempt run itself is not in the result. The set only grows and is finite,
+/// so the loop ends. It ignores the survival rule of a continued child session
+/// (an over-approximation), because it is used only to decide whether a delete
+/// waits.
+fn erased_runs(tx: &Connection, workspace_id: &str, owner_id: &str, run_id: &str) -> anyhow::Result<Vec<String>> {
+    let mut runs = descendant_runs(tx, workspace_id, owner_id, run_id)?;
+    let mut statement = tx.prepare(
+        "SELECT DISTINCT w.run_id FROM message_events w
+         WHERE w.workspace_id = ?1 AND w.owner_id = ?2 AND w.event_type = 'message.created'
+           AND w.role = 'user' AND w.run_id IS NOT NULL
+           AND w.causation_event_id IN (
+               SELECT n.event_id FROM message_events n
+               JOIN (SELECT session_key AS key, MIN(id) AS first_id FROM message_events
+                     WHERE workspace_id = ?1 AND owner_id = ?2 AND session_key IS NOT NULL
+                       AND run_id IN (SELECT value FROM json_each(?3))
+                     GROUP BY session_key) s ON n.sender = s.key AND n.id > s.first_id
+               WHERE n.workspace_id = ?1 AND n.owner_id = ?2 AND n.source = 'prx_mailbox'
+                 AND n.event_type = 'message.created')",
+    )?;
+    loop {
+        let woken = statement
+            .query_map(params![workspace_id, owner_id, serde_json::to_string(&runs)?], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        let mut grew = false;
+        for woken_run in woken {
+            if woken_run == run_id || runs.contains(&woken_run) {
+                continue;
+            }
+            for run in
+                std::iter::once(woken_run.clone()).chain(descendant_runs(tx, workspace_id, owner_id, &woken_run)?)
+            {
+                if run != run_id && !runs.contains(&run) {
+                    runs.push(run);
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            return Ok(runs);
+        }
+    }
+}
+
+/// Whether the attempt's run, or a run its erase reaches ([`erased_runs`]:
+/// spawned runs, woken turns and their spawns), is still live in this process
+/// (`live_runs`).
 fn is_live(tx: &Connection, target: &Target<'_>, attempt: &Attempt, live_runs: &[String]) -> anyhow::Result<bool> {
     let Some(run) = attempt.run_id.as_deref() else {
         return Ok(false);
@@ -544,7 +593,7 @@ fn is_live(tx: &Connection, target: &Target<'_>, attempt: &Attempt, live_runs: &
     if live_runs.iter().any(|live| live == run) {
         return Ok(true);
     }
-    Ok(descendant_runs(tx, target.workspace_id, target.owner_id, run)?
+    Ok(erased_runs(tx, target.workspace_id, target.owner_id, run)?
         .iter()
         .any(|descendant| live_runs.contains(descendant)))
 }
@@ -657,7 +706,7 @@ fn scope_agent(tx: &Connection, scope: Option<&str>) -> anyhow::Result<Option<(S
 /// them. The attachments and listings that quoted them are rewritten by the
 /// store's triggers and `derived_sweep`.
 fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) -> anyhow::Result<()> {
-    let descendants = match attempt.run_id.as_deref() {
+    let mut descendants = match attempt.run_id.as_deref() {
         Some(run) => descendant_runs(tx, target.workspace_id, target.owner_id, run)?,
         None => Vec::new(),
     };
@@ -692,36 +741,69 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
              ORDER BY id"
         }
     };
-    let rows = {
-        let mut statement = tx.prepare(sql)?;
-        statement
-            .query_map(
-                params![
-                    target.workspace_id,
-                    target.owner_id,
-                    attempt.input_event_id,
-                    attempt.run_id,
-                    serde_json::to_string(&descendants)?
-                ],
-                |row| {
-                    Ok(EventRow {
-                        id: row.get(0)?,
-                        event_id: row.get(1)?,
-                        role: row.get(2)?,
-                        content: row.get(3)?,
-                        run_id: row.get(4)?,
-                        session_key: row.get(5)?,
-                        scope: row.get(6)?,
-                        schedule_result: row.get(7)?,
-                    })
-                },
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?
+    // A turn woken by a notice can itself spawn runs (their notices wake more
+    // turns), so the rows are selected again with those runs added until a pass
+    // finds no new run.
+    let (rows, children, mut announcements, woken) = loop {
+        let rows = {
+            let mut statement = tx.prepare(sql)?;
+            statement
+                .query_map(
+                    params![
+                        target.workspace_id,
+                        target.owner_id,
+                        attempt.input_event_id,
+                        attempt.run_id,
+                        serde_json::to_string(&descendants)?
+                    ],
+                    |row| {
+                        Ok(EventRow {
+                            id: row.get(0)?,
+                            event_id: row.get(1)?,
+                            role: row.get(2)?,
+                            content: row.get(3)?,
+                            run_id: row.get(4)?,
+                            session_key: row.get(5)?,
+                            scope: row.get(6)?,
+                            schedule_result: row.get(7)?,
+                        })
+                    },
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let children = children_of(&rows, &descendants, target);
+        // The completion notices of the erased runs sit in the parent session; they
+        // are deleted with the rows they report and count as direct sources, so the
+        // memories, drafts and links made from them go too.
+        let announcements = announcement_events(tx, target, &children)?;
+        // The turn each deleted notice woke in the parent session reports the
+        // same result: its input, reply, tool rows and terminal go too.
+        let woken = {
+            let mut sources: Vec<&str> = rows.iter().map(|row| row.event_id.as_str()).collect();
+            sources.extend(announcements.iter().map(String::as_str));
+            announcement_turns(tx, target, &serde_json::to_string(&sources)?)?
+        };
+        // Runs the woken turns spawned, in their own sessions, join the erase
+        // exactly like the attempt's own descendants.
+        let mut extra: Vec<String> = Vec::new();
+        for run in woken.iter().filter_map(|row| row.run_id.as_deref()) {
+            for spawned in descendant_runs(tx, target.workspace_id, target.owner_id, run)? {
+                if attempt.run_id.as_deref() != Some(spawned.as_str())
+                    && !descendants.contains(&spawned)
+                    && !extra.contains(&spawned)
+                {
+                    extra.push(spawned);
+                }
+            }
+        }
+        if extra.is_empty() {
+            break (rows, children, announcements, woken);
+        }
+        descendants.extend(extra);
     };
-    if rows.is_empty() {
-        return Ok(());
-    }
-    let children = children_of(&rows, &descendants, target);
     let window_start: Option<String> = tx
         .query_row(
             "SELECT created_at FROM message_events WHERE workspace_id = ?1 AND event_id = ?2",
@@ -771,17 +853,6 @@ fn erase(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Attempt) ->
             params![target.workspace_id, session_key, scope, window_start, target.now],
         )?;
     }
-    // The completion notices of the erased runs sit in the parent session; they
-    // are deleted with the rows they report and count as direct sources, so the
-    // memories, drafts and links made from them go too.
-    let mut announcements = announcement_events(tx, target, &children)?;
-    // The turn each deleted notice woke in the parent session reports the
-    // same result: its input, reply, tool rows and terminal go too.
-    let woken = {
-        let mut sources: Vec<&str> = rows.iter().map(|row| row.event_id.as_str()).collect();
-        sources.extend(announcements.iter().map(String::as_str));
-        announcement_turns(tx, target, &serde_json::to_string(&sources)?)?
-    };
     for row in woken.iter().filter(|row| row.conversational()) {
         for hash in [
             SqliteMemory::scoped_content_hash(None, &row.content),
