@@ -443,12 +443,15 @@ impl SessionsSpawnTool {
                 message_event_id: turn.event_id.clone(),
             })
             .collect();
-        let history = if partition.is_ok() {
+        let (history, window_full) = if partition.is_ok() {
             crate::context::transcript::Transcript::new(memory.as_ref(), principal)
-                .expand_turns(conversation)
+                .expand_turns_noted(conversation)
                 .await
         } else {
-            crate::context::transcript::Transcript::expand_turns_plain(conversation)
+            (
+                crate::context::transcript::Transcript::expand_turns_plain(conversation),
+                false,
+            )
         };
         let stamps: std::collections::HashMap<&str, String> = window
             .iter()
@@ -467,6 +470,11 @@ impl SessionsSpawnTool {
                 render_history_message(message, stamp, max_chars_per_entry)
             })
             .collect();
+        let tool_rows_note = if window_full {
+            "\n\n[older tool rows not shown: the read window of 500 rows is full]"
+        } else {
+            ""
+        };
         let omitted = if skipped > 0 {
             format!("\n\n[history omitted: {skipped} older entries; use last_n/max_chars_per_entry to adjust]")
         } else {
@@ -475,11 +483,12 @@ impl SessionsSpawnTool {
         Ok(ToolResult {
             success: true,
             output: format!(
-                "Stored transcript of child session `{}` ({} turns, showing last {retained}):\n\n{}{}",
+                "Stored transcript of child session `{}` ({} turns, showing last {retained}):\n\n{}{}{}",
                 record.session_key,
                 turns.len(),
                 lines.join("\n\n"),
-                omitted
+                omitted,
+                tool_rows_note
             ),
             error: None,
         })

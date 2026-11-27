@@ -152,6 +152,14 @@ impl<'a> Transcript<'a> {
         self.replay_log().await.expand_turns(turns)
     }
 
+    /// As [`Self::expand_turns`], with whether a read window came back full
+    /// (older tool rows may then be missing). For displays only.
+    pub(crate) async fn expand_turns_noted(&self, turns: Vec<ConversationTurn>) -> (History, bool) {
+        let log = self.replay_log().await;
+        let full = log.window_full();
+        (log.expand_turns(turns), full)
+    }
+
     /// The stored `turns` as history without any tool rows.
     pub(crate) fn expand_turns_plain(turns: Vec<ConversationTurn>) -> History {
         ReplayLog::default().expand_turns(turns)

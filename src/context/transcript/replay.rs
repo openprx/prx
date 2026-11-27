@@ -89,6 +89,9 @@ pub(crate) struct ReplayLog {
     run_of_event: HashMap<String, String>,
     /// The stored assistant replies, oldest first: text and run.
     assistant_runs: Vec<(String, String)>,
+    /// Whether the tool-row or the message-row read came back full, so older
+    /// rows of the session may not be in the log.
+    window_full: bool,
 }
 
 fn payload_of(event: &MessageEvent) -> Option<serde_json::Value> {
@@ -150,13 +153,16 @@ impl ReplayLog {
                 // they are read on their own. They come newest first and are all
                 // older than the window, so they go in front, oldest first: the
                 // newest attachment of a message still wins.
+                let window_full = tool_rows.len() >= REPLAY_ROW_LIMIT || message_rows.len() >= REPLAY_ROW_LIMIT;
                 if with_messages && tool_rows.len() >= REPLAY_ROW_LIMIT {
                     let mut rows = Self::attachment_rows_outside(mem, principal, &tool_rows).await;
                     rows.reverse();
                     rows.append(&mut tool_rows);
                     tool_rows = rows;
                 }
-                Self::from_rows(&tool_rows, &message_rows)
+                let mut log = Self::from_rows(&tool_rows, &message_rows);
+                log.window_full = window_full;
+                log
             }
             (Err(error), _) | (_, Err(error)) => {
                 tracing::warn!(
@@ -357,6 +363,11 @@ impl ReplayLog {
     /// its stored attachment's tail (the prefix is not replayed), each assistant
     /// reply preceded by the tool rounds of its run. Event ids line up with the
     /// messages, `None` for a replayed tool message.
+    /// Whether a read window of [`REPLAY_ROW_LIMIT`] rows came back full.
+    pub(crate) const fn window_full(&self) -> bool {
+        self.window_full
+    }
+
     pub(crate) fn expand_turns(&self, turns: Vec<ConversationTurn>) -> History {
         let mut out = History::default();
         let mut replayed_runs: HashSet<&str> = HashSet::new();
