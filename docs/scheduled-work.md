@@ -135,6 +135,8 @@ so a turn that fails after showing the note shows it again at the next turn. A
 turn with no source message event id gets no note: the note is stored with the
 user message only when that message has an id, so a note that could not be
 replayed is not sent and stays unseen.
+A scheduled run's result row names its admission input event as
+`causation_event_id`.
 
 ## HEARTBEAT.md materialization
 
