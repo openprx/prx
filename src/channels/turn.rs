@@ -32,6 +32,7 @@ use super::{
     DocumentIngestRuntime, Instant, MemoryFabric, MemoryWriteContext, Result, SIGNAL_IMAGE_UNCERTAINTY_FALLBACK,
     ScopeContext, SendMessage, memory, pre_gate, providers, traits, truncate_with_ellipsis, turn_source,
 };
+use sha2::{Digest, Sha256};
 
 /// Authenticated pending approval id returned by the execution ledger.
 /// The channel keeps the same turn.status payload for run-keyed approvals and
@@ -1028,11 +1029,14 @@ pub(super) async fn run_channel_turn(
             }
             match notif {
                 crate::agent::turn_contracts::ToolCallNotification::Started { name, args_summary, .. } => {
+                    // Arguments can carry user text or secrets: log their length and digest only.
+                    let args_digest = hex::encode(Sha256::digest(args_summary.as_bytes()));
                     tracing::info!(
                         channel = %tool_event_channel_name,
                         sender = %tool_event_sender_name,
                         tool = %name,
-                        args = %args_summary,
+                        args_len = args_summary.len(),
+                        args_sha256 = %args_digest,
                         "Tool call started"
                     );
                 }
