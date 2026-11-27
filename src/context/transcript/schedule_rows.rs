@@ -28,6 +28,7 @@ use serde_json::Value;
 use crate::agent::diagnostics::error_log_digest;
 use crate::agent::scheduled_result::SCHEDULE_RESULT_EVENT_TYPE;
 use crate::memory::{Memory, MemoryFabric, MemoryPrincipal, MessageEvent, MessageEventScope, MessageEventSource};
+use crate::security::redaction::redact_secrets;
 
 /// The event type of the seen mark.
 pub(crate) const SCHEDULE_SEEN_EVENT_TYPE: &str = "schedule.result.seen";
@@ -299,18 +300,22 @@ impl Group {
         let payload = &self.newest;
         let field = |name: &str| payload.get(name).and_then(Value::as_str).unwrap_or_default();
         let finished: String = flatten(field("finished_at")).chars().take(16).collect();
+        // Fields that carry free text are masked after `flatten`, so the note
+        // is already redacted and a second redaction of the tail leaves it as is.
         let name = match field("name") {
-            "" => flatten(field("id")),
-            name => flatten(name),
+            "" => redact_secrets(&flatten(field("id"))),
+            name => redact_secrets(&flatten(name)),
         };
         let status = flatten(field("status"));
         let detail = if field("status") == "ok" {
-            flatten(field("excerpt"))
-                .chars()
-                .take(NOTE_EXCERPT_CHARS)
-                .collect::<String>()
+            redact_secrets(
+                &flatten(field("excerpt"))
+                    .chars()
+                    .take(NOTE_EXCERPT_CHARS)
+                    .collect::<String>(),
+            )
         } else {
-            flatten(field("error_class"))
+            redact_secrets(&flatten(field("error_class")))
         };
         let earlier = if self.earlier > 0 {
             format!(" (+{} earlier)", self.earlier)
