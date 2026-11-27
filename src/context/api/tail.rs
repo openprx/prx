@@ -32,17 +32,31 @@ pub(crate) struct TurnTailInput<'a> {
     pub(crate) hooks: Option<&'a HookManager>,
 }
 
+/// The turn tail and what its scheduled-results note was built from.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TurnTail {
+    /// The whole tail: hook blocks, then the note.
+    pub(crate) text: String,
+    /// The note appended to `text` (empty when none).
+    pub(crate) note: String,
+    /// Event ids of the result rows the note shows, in note order.
+    pub(crate) results: Vec<String>,
+}
+
 /// The text placed after the user's message on this turn: the `turn_opened`
 /// hook blocks, then, on an interactive turn (Console, Chat or Channel, but not
 /// a group-shared channel chat), the unseen scheduled-results note. The note's
 /// rows are marked seen in the same step. A turn with no source message event
 /// id gets no note: the tail is stored with that message only when it has an
 /// id, so a note that cannot be stored is not sent either, and stays unseen.
-pub(crate) async fn turn_tail(input: TurnTailInput<'_>) -> String {
+pub(crate) async fn turn_tail(input: TurnTailInput<'_>) -> TurnTail {
     let memory = input.memory;
     let envelope = input.envelope;
     let memory_config = input.memory_config;
-    let mut tail = hook_tail(input).await;
+    let mut tail = TurnTail {
+        text: hook_tail(input).await,
+        ..TurnTail::default()
+    };
     if !matches!(
         envelope.source,
         RuntimeSource::Console | RuntimeSource::Chat | RuntimeSource::Channel
@@ -52,11 +66,13 @@ pub(crate) async fn turn_tail(input: TurnTailInput<'_>) -> String {
         return tail;
     }
     let principal = envelope.memory_principal();
-    let Some((note, mark)) = unseen_results_note(memory.as_ref(), &principal, chrono::Utc::now()).await else {
+    let Some(unseen) = unseen_results_note(memory.as_ref(), &principal, chrono::Utc::now()).await else {
         return tail;
     };
-    tail.push_str(&note);
-    let Some(mark) = mark else {
+    tail.text.push_str(&unseen.text);
+    tail.note = unseen.text;
+    tail.results = unseen.results;
+    let Some(mark) = unseen.mark else {
         return tail;
     };
     let fabric = MemoryFabric::new(Arc::clone(memory), envelope.workspace_id.clone())

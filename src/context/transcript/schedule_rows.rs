@@ -51,6 +51,17 @@ pub(crate) struct SeenMark {
     pub(crate) floor: Option<i64>,
 }
 
+/// The unseen scheduled-results note of a turn.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct UnseenNote {
+    /// The note text, empty when nothing is shown.
+    pub(crate) text: String,
+    /// Event ids of the newest row of each shown group, in note order.
+    pub(crate) results: Vec<String>,
+    /// The seen mark to write, when the read advanced past the seen point.
+    pub(crate) mark: Option<SeenMark>,
+}
+
 /// The note for the owner's unseen scheduled results, and the mark to write.
 /// `None` when there is no result after the seen point or the read fails (logged
 /// by digest). The mark is `Some` only when its row id is above the seen point. The text is empty when every row read is too old or
@@ -59,7 +70,7 @@ pub(crate) async fn unseen_results_note(
     memory: &dyn Memory,
     principal: &MemoryPrincipal,
     now: DateTime<Utc>,
-) -> Option<(String, Option<SeenMark>)> {
+) -> Option<UnseenNote> {
     let seen = read_rows(memory, principal, SCHEDULE_SEEN_EVENT_TYPE, None, SEEN_ROWS_READ).await?;
     let seen_through = seen_point(memory, principal, &seen).await;
     let rows = read_rows(
@@ -107,6 +118,7 @@ pub(crate) async fn unseen_results_note(
             None => groups.push(Group {
                 key,
                 newest: payload,
+                newest_event_id: row.event_id.clone(),
                 earlier: 0,
                 undelivered_ok_earlier: undelivered_ok,
             }),
@@ -119,12 +131,17 @@ pub(crate) async fn unseen_results_note(
     if pending.len() > NOTE_MAX_LINES {
         lines.push(format!("+{} more", pending.len() - NOTE_MAX_LINES));
     }
+    let results: Vec<String> = pending
+        .iter()
+        .take(NOTE_MAX_LINES)
+        .map(|group| group.newest_event_id.clone())
+        .collect();
     let text = if lines.is_empty() {
         String::new()
     } else {
         format!("\n\n[Scheduled results]\n{}", lines.join("\n"))
     };
-    Some((text, mark))
+    Some(UnseenNote { text, results, mark })
 }
 
 /// Whether the aborted (failed or cancelled) user message of a turn from this
@@ -265,6 +282,7 @@ fn payload_of(row: &MessageEvent) -> Option<Value> {
 struct Group {
     key: String,
     newest: Value,
+    newest_event_id: String,
     earlier: usize,
     undelivered_ok_earlier: bool,
 }

@@ -548,15 +548,21 @@ async fn run_work(
     .await;
     let attachment = crate::context::transcript::Attachment {
         prefix,
-        tail: format!("{hook_tail}{}", crate::agent::turn_contracts::current_time_tail()),
+        tail: format!(
+            "{}{}",
+            hook_tail.text,
+            crate::agent::turn_contracts::current_time_tail()
+        ),
     };
     if let Some(user_event_id) = source.envelope().source_message_event_id.as_deref() {
+        attachment_sources.results.clone_from(&hook_tail.results);
         crate::context::transcript::append_attachment(
             source.fabric(),
             source.envelope().message_scope(),
             user_event_id,
             &attachment,
             &attachment_sources,
+            &hook_tail.note,
         )
         .await;
     }

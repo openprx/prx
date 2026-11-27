@@ -51,6 +51,9 @@ pub(crate) async fn record(
     if let Some(input_event_id) = input_event_id {
         scope.causation_event_id = Some(input_event_id.to_owned());
     }
+    // The job's creating message is the row's correlation, so deleting that
+    // message finds the results the job produced.
+    scope.correlation_id.clone_from(&meta.source_event_id);
     let (status, excerpt, failure) = match outcome {
         Ok(reply) => ("ok", Some(excerpt(reply)), None),
         Err(error) => ("error", None, Some(error_class(error).to_string())),

@@ -258,6 +258,7 @@ async fn recall_with_session(
         memories: bundle.recalled_memory_ids.clone(),
         events: bundle.source_events.clone(),
         documents: bundle.source_documents.clone(),
+        results: Vec::new(),
     };
     let mut ids = bundle.recalled_memory_ids;
     if preamble.len() > budget {

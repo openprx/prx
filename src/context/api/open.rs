@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use super::hook_points;
 use super::prefix::{SessionPrefixInput, session_prefix};
-use super::tail::{TurnTailInput, turn_tail};
+use super::tail::{TurnTail, TurnTailInput, turn_tail};
 use crate::agent::context_recall::{RECALL_CONTEXT_BUDGET, RecallScope, replayed_session_recall, scoped_recall};
 use crate::config::{AgentCompactionConfig, MemoryConfig};
 use crate::context::request_provenance::{LiveAttachment, note_live_attachment};
@@ -155,14 +155,17 @@ pub(crate) async fn open_turn(input: OpenInput<'_>) -> TurnOpening {
     // no turn-open or session-open hook; every other surface is unchanged.
     let child = hook_points::is_child_open(envelope.source);
     let hook_tail = if child {
-        hook_points::child_open_tail(TurnTailInput {
-            memory,
-            envelope,
-            memory_config,
-            visible_message,
-            hooks,
-        })
-        .await
+        TurnTail {
+            text: hook_points::child_open_tail(TurnTailInput {
+                memory,
+                envelope,
+                memory_config,
+                visible_message,
+                hooks,
+            })
+            .await,
+            ..TurnTail::default()
+        }
     } else {
         turn_tail(TurnTailInput {
             memory,
@@ -175,18 +178,25 @@ pub(crate) async fn open_turn(input: OpenInput<'_>) -> TurnOpening {
     };
     let attachment = Attachment {
         prefix,
-        tail: format!("{}{}", hook_tail, crate::agent::turn_contracts::current_time_tail()),
+        tail: format!(
+            "{}{}",
+            hook_tail.text,
+            crate::agent::turn_contracts::current_time_tail()
+        ),
     };
     let enriched_message = attachment.compose(visible_message);
     let replay_fabric = MemoryFabric::new(Arc::clone(memory), envelope.workspace_id.clone())
         .with_event_recording(memory_config.event_recording_config());
     if let Some(user_event_id) = envelope.source_message_event_id.as_deref() {
+        let mut sources = mem_context.sources.clone();
+        sources.results.clone_from(&hook_tail.results);
         append_attachment(
             &replay_fabric,
             envelope.message_scope(),
             user_event_id,
             &attachment,
-            &mem_context.sources,
+            &sources,
+            &hook_tail.note,
         )
         .await;
     }

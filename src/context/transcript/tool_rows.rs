@@ -180,7 +180,8 @@ async fn append(
 
 /// Append the attachment row of a user message: `prefix` and `tail` are the
 /// text put before and after it and `sources` the ids that text was built from
-/// (see [`AttachmentSources`]). Nothing is written when tool events are not
+/// (see [`AttachmentSources`]). `note` is the scheduled-results note contained
+/// verbatim in the tail (empty when none). Nothing is written when tool events are not
 /// recorded; the message is then replayed plain, as before.
 pub(crate) async fn append_attachment(
     fabric: &MemoryFabric,
@@ -188,6 +189,7 @@ pub(crate) async fn append_attachment(
     user_event_id: &str,
     attachment: &Attachment,
     sources: &AttachmentSources,
+    note: &str,
 ) {
     let payload = serde_json::json!({
         "schema_version": ATTACHMENT_SCHEMA_VERSION,
@@ -196,6 +198,7 @@ pub(crate) async fn append_attachment(
         "prefix": attachment.prefix,
         "tail": attachment.tail,
         "sources": sources,
+        "note": note,
     });
     if let Err(error) = fabric
         .record_tool_round_event(

@@ -25,4 +25,8 @@ pub struct AttachmentSources {
     /// Ids of the documents quoted in the document evidence.
     #[serde(default)]
     pub documents: Vec<String>,
+    /// Event ids of the `schedule.result.recorded` rows whose line the
+    /// scheduled-results note of the turn shows (the newest row of each shown group).
+    #[serde(default)]
+    pub results: Vec<String>,
 }
