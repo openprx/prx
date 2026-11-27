@@ -165,16 +165,16 @@ impl EncryptedScope {
         String::from_utf8(plain).ok()
     }
 
-    /// Whether `stored` is ciphertext sealed by this account (any scope), as
-    /// `seal` writes it. Plaintext rows never pass this check.
+    /// Whether `stored` is a scope record as `seal` writes it in either mode:
+    /// RF1 ciphertext (encryption on) or the JSON wrapper with a `scope` key
+    /// (encryption off). Both forms are checked whatever the current mode, so a
+    /// record written by another scope before the mode changed is never taken
+    /// for a plaintext row. Plaintext rows never pass this check.
     fn looks_sealed(&self, stored: &str) -> bool {
-        if self.crypto.encryption_enabled() {
-            base64::engine::general_purpose::STANDARD
-                .decode(stored.as_bytes())
-                .is_ok_and(|blob| blob.starts_with(b"RF1"))
-        } else {
-            serde_json::from_str::<serde_json::Value>(stored).is_ok_and(|value| value.get("scope").is_some())
-        }
+        let ciphertext = base64::engine::general_purpose::STANDARD
+            .decode(stored.as_bytes())
+            .is_ok_and(|blob| blob.starts_with(b"RF1"));
+        ciphertext || serde_json::from_str::<serde_json::Value>(stored).is_ok_and(|value| value.get("scope").is_some())
     }
 
     fn owns_event(&self, event: &crate::memory::MessageEvent) -> bool {
