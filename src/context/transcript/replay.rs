@@ -150,13 +150,12 @@ impl ReplayLog {
             (Ok(mut tool_rows), Ok(message_rows)) => {
                 // Attachment rows share the tool window with the calls and results
                 // of many runs; a full window may have pushed older ones out, so
-                // they are read on their own. They come newest first and are all
-                // older than the window, so they go in front, oldest first: the
-                // newest attachment of a message still wins.
+                // they are read on their own. They come oldest first and are all
+                // older than the window, so they go in front: the newest
+                // attachment of a message still wins.
                 let window_full = tool_rows.len() >= REPLAY_ROW_LIMIT || message_rows.len() >= REPLAY_ROW_LIMIT;
                 if with_messages && tool_rows.len() >= REPLAY_ROW_LIMIT {
                     let mut rows = Self::attachment_rows_outside(mem, principal, &tool_rows, &message_rows).await;
-                    rows.reverse();
                     rows.append(&mut tool_rows);
                     tool_rows = rows;
                 }
