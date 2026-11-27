@@ -5,7 +5,7 @@
 //! the memory is forgotten the printed text is replaced the same way.
 use super::rf_forget;
 use rusqlite::{Connection, params, types::Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Tool results of the session-listing tools that name an erased run or session.
 pub(super) const LISTING_TOOLS: [&str; 8] = [
@@ -311,15 +311,15 @@ impl MemoryProbe {
         Ok(!survives)
     }
 
-    /// How `output` of `tool` names this memory: by its key, or only by its
-    /// redacted form.
-    fn named_in(&self, tool: &str, output: &str) -> Naming {
-        if named_key(&self.key, tool, output) {
+    /// How the printed keys of a result (see [`printed_keys`]) name this
+    /// memory: by its key, or only by its redacted form.
+    fn naming(&self, printed: &[&HashSet<&str>]) -> Naming {
+        if printed.iter().any(|keys| keys.contains(self.key.as_str())) {
             Naming::Key
         } else if self
             .key_redacted
             .as_deref()
-            .is_some_and(|key| named_key(key, tool, output))
+            .is_some_and(|key| printed.iter().any(|keys| keys.contains(key)))
         {
             Naming::RedactedOnly
         } else {
@@ -401,27 +401,61 @@ fn redacted_form_survives(
     Ok(false)
 }
 
-/// True when the printed `output` of `tool` holds a memory entry of `key` in
-/// the form the tool prints it:
-/// - `memory_recall` (`tools/memory_recall.rs`): `- [category] key: content`;
+/// The keys of the memory entries that the printed `output` of `tool` holds,
+/// each in the form the tool prints it; a key longer than `max_len` bytes is
+/// not collected (no probe has one). One pass over the output, so a result is
+/// parsed once however many probes there are:
+/// - `memory_recall` (`tools/memory_recall.rs`): `- [category] key: content`,
+///   or `- [category] key:` at the end of the line;
 /// - `memory_search` (`tools/memory_search.rs`): a line `- key: key`;
 /// - `memory_get` (`tools/memory_get.rs`, `render_range`): the output starts
 ///   with `key lines a-b:` (or `key is empty.`).
-fn named_key(key: &str, tool: &str, output: &str) -> bool {
+///
+/// A key may itself hold `] ` or `: `, so every split of a line that fits is
+/// collected; the probes decide which of them is a real key.
+fn printed_keys<'a>(tool: &str, output: &'a str, max_len: usize) -> HashSet<&'a str> {
+    let mut keys = HashSet::new();
     match tool {
         "memory_recall" => {
-            let entry = format!("] {key}: ");
-            let bare = format!("] {key}:");
-            output
-                .lines()
-                .any(|line| line.starts_with("- [") && (line.contains(&entry) || line.ends_with(&bare)))
+            for line in output.lines().filter(|line| line.starts_with("- [")) {
+                let ends: Vec<usize> = line
+                    .match_indices(':')
+                    .map(|(at, _)| at)
+                    .filter(|at| {
+                        line.get(at.saturating_add(1)..)
+                            .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+                    })
+                    .collect();
+                for (at, _) in line.match_indices("] ") {
+                    let start = at.saturating_add(2);
+                    let first = ends.partition_point(|end| *end < start);
+                    for end in ends
+                        .iter()
+                        .skip(first)
+                        .take_while(|end| end.saturating_sub(start) <= max_len)
+                    {
+                        keys.extend(line.get(start..*end));
+                    }
+                }
+            }
         }
-        "memory_search" => output.lines().any(|line| line.strip_prefix("- key: ") == Some(key)),
-        "memory_get" => output.strip_prefix(key).is_some_and(|rest| {
-            rest.starts_with(" lines ") || rest == " is empty." || rest.starts_with(" is empty.\n")
-        }),
-        _ => false,
+        "memory_search" => {
+            keys.extend(output.lines().filter_map(|line| line.strip_prefix("- key: ")));
+        }
+        "memory_get" => {
+            for marker in [" lines ", " is empty."] {
+                for (at, _) in output.match_indices(marker).take_while(|(at, _)| *at <= max_len) {
+                    let rest = output.get(at..).unwrap_or_default();
+                    let whole = marker != " is empty." || rest == marker || rest.starts_with(" is empty.\n");
+                    if whole {
+                        keys.extend(output.get(..at));
+                    }
+                }
+            }
+        }
+        _ => {}
     }
+    keys
 }
 
 /// The probes of the memories selected by `memories_sql`, a constant statement
@@ -464,7 +498,7 @@ pub(super) fn memory_probes(
 /// documents that only those results named. A result is rewritten when it was
 /// recorded no earlier than the first row created at the oldest probe's time,
 /// lies in the probe's workspace and owner, and prints the memory's key in the
-/// tool's own entry form (see [`MemoryProbe::named_in`]). A large output keeps
+/// tool's own entry form (see [`printed_keys`]). A large output keeps
 /// its first part inline, so an entry printed past that part is not seen; the
 /// row is rewritten only when an entry it keeps names the key. The same
 /// transaction also rewrites the other rows that hold the memory's text by
@@ -500,7 +534,7 @@ pub(super) fn rewrite_memory_copies(tx: &Connection, probes: &[MemoryProbe], now
            AND json_extract(raw_payload_json, '$.tool') IN (SELECT value FROM json_each(?3))
            AND EXISTS (SELECT 1 FROM json_each(?2) j
                        WHERE (instr(message_events.content, json_extract(j.value, '$.key')) > 0
-                              OR instr(message_events.content, COALESCE(json_extract(j.value, '$.key_redacted'), '\u{1}')) > 0
+                              OR instr(message_events.content, json_extract(j.value, '$.key_redacted')) > 0
                               OR json_type(message_events.raw_payload_json, '$.document.document_id') = 'text')
                          AND (json_extract(j.value, '$.workspace') IS NULL
                               OR message_events.workspace_id = json_extract(j.value, '$.workspace'))
@@ -525,35 +559,39 @@ pub(super) fn rewrite_memory_copies(tx: &Connection, probes: &[MemoryProbe], now
     drop(statement);
     let mut rows: Vec<MatchedRow> = Vec::new();
     let mut clear = HashMap::new();
+    let max_key_len = probes
+        .iter()
+        .map(|probe| probe.key.len().max(probe.key_redacted.as_deref().map_or(0, str::len)))
+        .max()
+        .unwrap_or_default();
     for [event_id, document_id, content, tool, workspace, owner, run_id, call_id] in found {
         let (Value::Text(event_id), Value::Text(content), Value::Text(tool)) = (event_id, content, tool) else {
             continue;
         };
         let document_id = text_of(document_id);
         let (workspace_text, owner) = (text_of(workspace.clone()), text_of(owner));
-        let mut document_text: Option<Option<String>> = None;
+        if !probes
+            .iter()
+            .any(|probe| probe.covers(workspace_text.as_deref(), owner.as_deref()))
+        {
+            continue;
+        }
+        // The entry may sit past the inline part: the stored document is read
+        // once per row and parsed once, whatever the number of probes.
+        let document_text = document_id
+            .as_deref()
+            .and_then(|document| stored_document_text(tx, document));
+        let inline_keys = printed_keys(&tool, &content, max_key_len);
+        let document_keys = document_text
+            .as_deref()
+            .map(|text| printed_keys(&tool, text, max_key_len))
+            .unwrap_or_default();
         let mut matched = false;
         for probe in probes {
             if !probe.covers(workspace_text.as_deref(), owner.as_deref()) {
                 continue;
             }
-            let mut naming = probe.named_in(&tool, &content);
-            if naming != Naming::Key
-                && let Some(document) = document_id.as_deref()
-            {
-                // The entry may sit past the inline part: read the stored
-                // document once per row, only when the inline text does not
-                // name the key.
-                if document_text.is_none() {
-                    document_text = Some(stored_document_text(tx, document));
-                }
-                if let Some(text) = document_text.as_ref().and_then(Option::as_deref) {
-                    let in_document = probe.named_in(&tool, text);
-                    if in_document != Naming::None {
-                        naming = in_document;
-                    }
-                }
-            }
+            let naming = probe.naming(&[&inline_keys, &document_keys]);
             if probe.applies_to(tx, naming, workspace_text.as_deref(), owner.as_deref(), &mut clear)? {
                 matched = true;
                 break;
