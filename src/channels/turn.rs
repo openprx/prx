@@ -746,7 +746,6 @@ pub(super) async fn run_channel_turn(
     // shares one run_id.
     let runtime_envelope = channel_source.envelope().clone();
     let route_decision = decision_turn.route.clone();
-    let memory_context = decision_turn.memory_context();
     let chat_profile = match turn_memory.get_chat_profile(&msg.channel, &msg.reply_target).await {
         Ok(profile) => profile,
         Err(error) => {
@@ -802,31 +801,6 @@ pub(super) async fn run_channel_turn(
     if let Some(rich) = target_channel.as_ref().and_then(|channel| channel.as_rich()) {
         system_prompt = rich.augment_prompt(&system_prompt, &msg.reply_target);
     }
-    let rebuild_history = || {
-        // Read the canonical ∪ legacy union (FIX-P1-25b read-merge) so pre-cutover
-        // turns stored under the legacy key remain visible alongside new canonical
-        // turns; `merged_history` concatenates (legacy first) and truncates to the window.
-        let prior_turns_raw = merged_history(&ctx.conversation_histories.lock(), &history_key);
-        let mut prior_turns = normalize_cached_channel_turns(prior_turns_raw);
-
-        if let Some(last_turn) = prior_turns.last_mut() {
-            if last_turn.role == "user" {
-                if !memory_context.is_empty() {
-                    last_turn.content = format!("{memory_context}{}", last_turn.content);
-                }
-                if let Some(context) = signal_vision_context.as_deref() {
-                    last_turn.content.push('\n');
-                    last_turn.content.push_str(context);
-                }
-                crate::agent::turn_contracts::push_current_time_tail(&mut last_turn.content);
-            }
-        }
-
-        let mut next_history = vec![ChatMessage::system(system_prompt.clone())];
-        next_history.extend(prior_turns);
-        next_history
-    };
-
     // ── Outbound side-effect gate (FIX-P0-10/11/12) ─────────────────────────
     // Driving the LLM tool-call loop and sending the reply is the outbound side
     // effect; it gets its own op-id so autonomy can suppress replies
@@ -855,7 +829,51 @@ pub(super) async fn run_channel_turn(
         }
     }
 
-    let mut history = rebuild_history();
+    // The earlier turns are the conversation cache without the current message,
+    // which admission pushed as the newest user entry. Cache turns carry no event
+    // ids, so the opening replays them as plain messages.
+    let previous_turns = {
+        let mut cached = merged_history(&ctx.conversation_histories.lock(), &history_key);
+        if cached.last().is_some_and(|turn| turn.role == "user") {
+            cached.pop();
+        }
+        normalize_cached_channel_turns(cached)
+            .into_iter()
+            .map(|turn| crate::memory::ConversationTurn {
+                id: 0,
+                session_key: runtime_envelope.session_key.clone(),
+                role: turn.role,
+                content: turn.content,
+                timestamp: String::new(),
+                message_id: None,
+                message_event_id: None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let crate::context::api::open::TurnOpening {
+        mut history,
+        history_event_ids,
+        ..
+    } = crate::context::api::open::open_turn(crate::context::api::open::OpenInput {
+        memory: &turn_memory,
+        envelope: &runtime_envelope,
+        memory_config: &config_generation.effective.memory,
+        chat_type: inferred_chat_type,
+        visible_message: &msg.content,
+        card: signal_vision_context.as_deref(),
+        previous_turns,
+        replay: crate::context::api::open::ReplayMode::FitToBudget,
+        recall: crate::context::api::open::OpenRecall::ReplayedSession,
+        current_input_key: Some(channel_source.current_input_key.as_str()),
+        excluded_session: None,
+        system_prompt,
+        hooks: Some(ctx.hooks.as_ref()),
+        service: decision_turn.service(),
+        context: decision_turn.context(),
+        provider_label: &route.provider,
+        model: &route.model,
+    })
+    .await;
     let rich_stream = target_channel
         .as_ref()
         .is_some_and(|channel| channel.as_rich().is_some());
@@ -1207,7 +1225,9 @@ pub(super) async fn run_channel_turn(
                                                 ctx.workspace_dir.as_path().to_string_lossy().to_string(),
                                             )
                                             .with_event_recording(ctx.memory_event_recording),
-                                        ),
+                                        )
+                                        .with_request_event_scope(runtime_envelope.message_scope())
+                                        .with_history_event_ids(history_event_ids),
                                 },
                                 crate::agent::turn_request::TurnDelivery {
                                     cancellation: Some(cancellation_token.clone()),

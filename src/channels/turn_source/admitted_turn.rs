@@ -12,7 +12,6 @@ pub(in crate::channels) struct ChannelAdmittedTurn {
     advice: Option<crate::decision_engine::IntentAnalysis>,
     terminal: crate::runtime::turn_terminal::TurnTerminalGuard,
     envelope: crate::runtime::envelope::RuntimeEnvelope,
-    recalled_context: String,
     config: Arc<crate::config::Config>,
     generation: Arc<crate::config::ConfigGeneration>,
     trace: Arc<crate::agent::turn_contracts::RetainedProviderTrace>,
@@ -143,23 +142,6 @@ impl ChannelAdmittedTurn {
             None,
         )?
         .with_provider_trace(Arc::clone(&trace), route.clone());
-        let recalled_context = if context.is_run() {
-            crate::agent::context_recall::scoped_recall(
-                turn_memory.as_ref(),
-                &crate::agent::context_recall::RecallScope::from_envelope(
-                    &envelope,
-                    &generation.effective.memory,
-                    proof.policy_chat_type(),
-                )
-                .with_current_input_key(Some(source.current_input_key.clone())),
-                proof.routing_input(),
-                crate::agent::context_recall::RECALL_CONTEXT_BUDGET,
-            )
-            .await
-            .preamble
-        } else {
-            String::new()
-        };
         Ok(Self {
             service,
             proof,
@@ -167,7 +149,6 @@ impl ChannelAdmittedTurn {
             advice,
             terminal,
             envelope,
-            recalled_context,
             config: Arc::clone(&generation.effective),
             generation: Arc::clone(generation),
             trace,
@@ -282,8 +263,13 @@ impl ChannelAdmittedTurn {
     pub(in crate::channels) fn prompt_skills(&self) -> anyhow::Result<Vec<crate::skills::Skill>> {
         self.service.agent_prompt_skills(&self.proof, &self.context)
     }
-    pub(in crate::channels) fn memory_context(&self) -> String {
-        self.recalled_context.clone()
+    /// The service that publishes this turn's context, for the turn opening.
+    pub(in crate::channels) fn service(&self) -> &TurnRuntimeService {
+        &self.service
+    }
+    /// The opened turn context, for the turn opening.
+    pub(in crate::channels) fn context(&self) -> &OpenedTurn {
+        &self.context
     }
     pub(in crate::channels) fn adapter(&self) -> crate::agent::turn_contracts::ToolLoopRuntimeAdapter {
         let mut execution =
