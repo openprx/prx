@@ -318,6 +318,34 @@ fn is_credential_value(key: &str, value: &str) -> bool {
     }
 }
 
+/// Declared type names a `name: Type` annotation can carry (Rust). A bare
+/// value after `:` that is one of them is code, not a credential (CE-64).
+const TYPE_ANNOTATION_NAMES: &[&str] = &[
+    "String", "str", "bool", "char", "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128",
+    "isize", "f32", "f64", "Option", "Vec", "Box", "Arc", "Rc", "HashMap", "BTreeMap", "HashSet", "BTreeSet",
+    "PathBuf", "Path", "Duration", "Instant", "Cow", "Result", "Self",
+];
+
+/// Whether a bare value is a declared type (`String`, `&str`, `Option<String>`).
+fn is_type_annotation(value: &str) -> bool {
+    let value = value.strip_prefix('&').unwrap_or(value);
+    let base = value.split(['<', '[']).next().unwrap_or(value);
+    TYPE_ANNOTATION_NAMES.contains(&base)
+}
+
+/// Whether a bare value is a call (`compute()`, `self.get(key)`): an identifier
+/// path followed by a parenthesised argument list (CE-64).
+fn is_call(value: &str) -> bool {
+    value.strip_suffix(')').is_some_and(|head| {
+        head.split_once('(').is_some_and(|(callee, _)| {
+            !callee.is_empty()
+                && callee
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':'))
+        })
+    })
+}
+
 /// Token formats recognised by their prefix, with the shortest body each
 /// needs; the whole token is the secret. Longer prefixes come first so the
 /// most specific one names the match. The minimums are the union of what the
@@ -549,12 +577,16 @@ fn keyed_pair_spans(text: &str, url_parts: &[UrlPart], spans: &mut Vec<Range<usi
                 continue;
             }
         }
-        let credential = bare_key
-            || match class {
-                KeyName::Credential => true,
-                KeyName::CredentialIfSecretShaped => scan.secret_shaped(text, &value),
-                KeyName::Plain => false,
-            };
+        // A bare code shape is not a credential: `token = compute()` and
+        // `pub token: String` keep their code (CE-64). Quoted values stay masked.
+        let code_shape = kind == 0 && (is_call(source) || (separator.as_str() == ":" && is_type_annotation(source)));
+        let credential = !code_shape
+            && (bare_key
+                || match class {
+                    KeyName::Credential => true,
+                    KeyName::CredentialIfSecretShaped => scan.secret_shaped(text, &value),
+                    KeyName::Plain => false,
+                });
         if credential && value.end > covered_until {
             covered_until = value.end;
             spans.push(value);
