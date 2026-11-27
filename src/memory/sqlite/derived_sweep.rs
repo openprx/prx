@@ -650,25 +650,37 @@ fn rewrite_call_terminals(tx: &Connection, calls: &[CallRef], text: &str, now: &
 }
 
 /// Replace the stored text in the recorded calls of the memory write tools
-/// whose arguments name a forgotten key (`arguments.key`), in the probe's
-/// workspace and owner: `arguments.content` becomes the removed-text marker
-/// and the row's content (`<tool> <arguments>`, as `context/transcript/tool_rows.rs`
-/// writes it) is derived again from the rewritten arguments. The call stays a
-/// valid call for replay. No time bound: the call is recorded before the
-/// memory row exists, and every value stored under the key belongs to the
-/// forgotten memory. A row with an unparseable payload, non-object arguments
-/// or no `content` argument is left as it is; a row of a fenced scope too.
+/// that stored a forgotten memory: `arguments.content` becomes the removed-text
+/// marker and the row's content (`<tool> <arguments>`, as
+/// `context/transcript/tool_rows.rs` writes it) is derived again from the
+/// rewritten arguments. The call stays a valid call for replay. A call is
+/// rewritten only when all of these hold: `arguments.key` equals the probe's
+/// key; its workspace and owner are covered by the probe; it was recorded at
+/// or after the memory's creation time (an earlier call stored a different,
+/// earlier memory of the key); and its execution terminal (see
+/// [`rewrite_call_terminals`] for the link) shows success, status `succeeded`
+/// with `result.success` true, so a refused or failed write, whose text never
+/// became the memory, is left alone. A row with an unparseable payload,
+/// non-object arguments or no `content` argument is left as it is; a row of a
+/// fenced scope too.
 fn rewrite_write_calls(tx: &Connection, probes: &[MemoryProbe], now: &str) -> anyhow::Result<usize> {
     let mut keys: Vec<&str> = probes.iter().map(|probe| probe.key.as_str()).collect();
     keys.sort_unstable();
     keys.dedup();
     let mut statement = tx.prepare(
-        "SELECT event_id, workspace_id, owner_id, json_extract(raw_payload_json, '$.arguments.key')
+        "SELECT event_id, workspace_id, owner_id, json_extract(raw_payload_json, '$.arguments.key'), created_at
          FROM message_events
          WHERE event_type = 'tool.call.recorded' AND json_valid(raw_payload_json)
            AND json_extract(raw_payload_json, '$.tool') IN (SELECT value FROM json_each(?1))
            AND json_type(raw_payload_json, '$.arguments.content') IS NOT NULL
            AND json_extract(raw_payload_json, '$.arguments.key') IN (SELECT value FROM json_each(?2))
+           AND EXISTS (SELECT 1 FROM message_events t
+                       WHERE t.workspace_id IS message_events.workspace_id AND t.run_id IS message_events.run_id
+                         AND t.event_type = 'tool.execution.finalized' AND json_valid(t.raw_payload_json)
+                         AND json_extract(t.raw_payload_json, '$.outcome.operation_id')
+                             = json_extract(message_events.raw_payload_json, '$.call_id')
+                         AND json_extract(t.raw_payload_json, '$.outcome.status') = 'succeeded'
+                         AND json_extract(t.raw_payload_json, '$.outcome.result.success') = 1)
            AND NOT EXISTS (SELECT 1 FROM agent_erase_fences f WHERE f.scope_id = message_events.ma_scope_id)",
     )?;
     let found = statement
