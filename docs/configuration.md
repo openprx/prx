@@ -1475,7 +1475,7 @@ records.
 Prompt memory recall is produced independently of decision selection. Each turn
 uses its authenticated owner, workspace and session scope, including owner
 isolation for external origins. The composed recalled context is capped at
-24,576 bytes. When `memory.events.record_user_messages = false`, historical user-message
+24,576 bytes. On a small window (a recall budget of 8,192 bytes or less, which callers derive from a window of about 16k tokens), the semantic memory block is placed before the shared events, so the shared block is the first to be cut. When `memory.events.record_user_messages = false`, historical user-message
 recall is suppressed; semantic facts, documents and assistant history remain
 available. Scoped recall excludes stale and future-dated rows and projects image
 markers before bounding the retrieval query to 1024 bytes, including in traces.

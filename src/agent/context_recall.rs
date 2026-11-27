@@ -177,6 +177,11 @@ async fn child_chunk_admitted(mem: &dyn Memory, gate: &ChildRecallGate<'_>, resu
 
 pub(crate) const RECALL_CONTEXT_BUDGET: usize = MAX_MEMORY_PREAMBLE_BYTES;
 
+/// A recall budget at or below this comes from a window of about 16k tokens
+/// (callers pass half the window); there the semantic memory is ordered before
+/// the shared events, so the clip cuts the shared block first.
+const SMALL_WINDOW_RECALL_BUDGET: usize = 8_192;
+
 /// Recall authenticated context without consulting a decision's retrieved set.
 /// The budget is in bytes and is clamped to the existing context ceiling.
 pub(crate) async fn scoped_recall(
@@ -236,9 +241,16 @@ async fn recall_with_session(
         scope.excluded_session.as_deref(),
     )
     .await;
-    let semantic_start = bundle.current_session_context.len() + bundle.recent_shared_context.len();
+    let semantic_first = budget <= SMALL_WINDOW_RECALL_BUDGET;
+    let (mut preamble, semantic_start) = if semantic_first {
+        (bundle.preamble_semantic_first(), bundle.current_session_context.len())
+    } else {
+        (
+            bundle.preamble(),
+            bundle.current_session_context.len() + bundle.recent_shared_context.len(),
+        )
+    };
     let semantic_end = semantic_start + bundle.semantic_memory_context.len();
-    let mut preamble = bundle.preamble();
     let budget = budget.min(RECALL_CONTEXT_BUDGET);
     // Every id the preamble was built from, kept even when the clip below
     // drops the ones it cannot attribute: a delete may then blank more, never less.
@@ -287,6 +299,17 @@ impl AgentContextBundle {
             self.current_session_context,
             self.recent_shared_context,
             self.semantic_memory_context,
+            self.document_context
+        )
+    }
+
+    /// The preamble with the semantic memory block ahead of the shared events.
+    fn preamble_semantic_first(&self) -> String {
+        format!(
+            "{}{}{}{}",
+            self.current_session_context,
+            self.semantic_memory_context,
+            self.recent_shared_context,
             self.document_context
         )
     }
