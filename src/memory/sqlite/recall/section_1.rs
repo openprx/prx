@@ -392,21 +392,9 @@ impl SqliteMemory {
                     // leaves its owner's session prefix rows, so they go in this transaction.
                     // A memory written without explicit metadata takes the workspace of the
                     // trusted write context, so the row is found by the session memory index.
-                    // The metadata UPDATE below runs when any metadata field is set and then
-                    // overwrites the workspace with `metadata.workspace_id` (NULL when only the
-                    // context carried one), so the row ends under that value, not the insert's.
-                    let metadata_update_runs = metadata.workspace_id.is_some()
-                        || metadata.owner_id.is_some()
-                        || metadata.agent_id.is_some()
-                        || metadata.persona_id.is_some()
-                        || metadata.source_event_id.is_some()
-                        || metadata.source.is_some();
+                    // The metadata UPDATE below keeps the inserted workspace when no workspace
+                    // is given, so the row ends under `insert_workspace` in every case.
                     let insert_workspace = metadata.workspace_id.clone().or_else(|| ctx.workspace_id.clone());
-                    let final_workspace = if metadata_update_runs {
-                        metadata.workspace_id.clone()
-                    } else {
-                        insert_workspace.clone()
-                    };
                     // Both the owner and workspace the row holds now and the ones it is written
                     // under lose their prefix rows: an owner change moves the memory out of one index.
                     crate::memory::sqlite::rf_forget::drop_prefix_rows_of(
@@ -426,7 +414,7 @@ impl SqliteMemory {
                             classified.sensitivity.as_str(),
                             cat,
                             owner_id.clone(),
-                            final_workspace
+                            insert_workspace.clone()
                         ],
                     )?;
                     let changed = tx.execute(
@@ -600,7 +588,7 @@ impl SqliteMemory {
                     let updated = tx.execute(
                         &format!(
                             "UPDATE memories
-                     SET workspace_id = ?1,
+                     SET workspace_id = COALESCE(?1, workspace_id),
                          owner_id = COALESCE(?2, owner_id),
                          agent_id = ?3,
                          persona_id = ?4,
