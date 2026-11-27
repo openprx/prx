@@ -84,8 +84,8 @@ impl PostgresMemory {
     /// `workspace` **or** when the chunk's owner matches the caller. The first
     /// disjunct short-circuits the second, and a document's visibility defaults
     /// to `workspace`, so an owner-isolated caller was handed a snippet of every
-    /// other owner's documents — including the conversation transcript the
-    /// OS-paging evictor ingests verbatim.
+    /// other owner's documents — including the conversation transcripts that
+    /// the removed OS-paging evictor ingested verbatim.
     ///
     /// `document_search` renders chunk content to its caller, so it has to agree
     /// with `document_get_chunk`'s `chunk_visible_to_principal`, which is

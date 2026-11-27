@@ -13,8 +13,8 @@ pub(crate) struct DocumentIngestRuntime {
     /// Whether document reads for this turn must match `owner_id` exactly.
     ///
     /// Authenticated external entrypoints set this on their runtime envelope;
-    /// retaining it here keeps ingest provenance and context-page recall on
-    /// the same owner boundary as the rest of the turn.
+    /// retaining it here keeps ingest provenance and recall on the same owner
+    /// boundary as the rest of the turn.
     pub(crate) require_owner_match: bool,
     pub(crate) topic_id: Option<String>,
     pub(crate) task_id: Option<String>,

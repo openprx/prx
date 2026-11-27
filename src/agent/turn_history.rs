@@ -7,15 +7,14 @@
 //!   this turn appended. Guards, durable compaction patches, reducer sources,
 //!   sink initialisation, turn seeding and persistence take only this type.
 //! - [`ProviderView`]: the canonical history with this turn's projection
-//!   ([`ProjectionInputs`]: request enrichment, the refresh aside, the recalled
-//!   page, the skill-metadata suppression). [`project`] is the one conversion;
+//!   ([`ProjectionInputs`]: request enrichment, the refresh aside, the
+//!   skill-metadata suppression). [`project`] is the one conversion;
 //!   nothing converts a view back. The inbound middleware rewrite and the
 //!   per-request trims are applied to the projected messages afterwards and
 //!   never reach the canonical history either.
 //!
 //! [`TurnHistory`] carries one turn's canonical history next to its provider
-//! view. Every durable in-turn compaction (a handoff, a summary or an evicted
-//! page) is built from and guarded by the canonical history, so a trim that
+//! view. Every durable in-turn compaction (a handoff or a summary) is built from and guarded by the canonical history, so a trim that
 //! ran earlier in the same turn can never make a durable replacement lose the
 //! turns that trim left out. The view is re-derived from the canonical
 //! history after every durable compaction, and the turn's per-provider
@@ -50,7 +49,7 @@ pub(crate) fn same_messages(left: &[ChatMessage], right: &[ChatMessage]) -> bool
 enum MessageOrigin {
     /// An acknowledged session turn (or the leading system prompt), or a
     /// message a durable compaction wrote in place of turns (a handoff note, a
-    /// summary, a memory flush, a page breadcrumb).
+    /// summary).
     Acknowledged,
     /// The turn's raw request: canonical, but pending until the ordered commit.
     Request,
@@ -72,7 +71,7 @@ enum MessageOrigin {
 /// results).
 ///
 /// It is the only history guards are built over, durable compactions (a
-/// handoff, a summary, an evicted page) are applied to, reducer patches are
+/// handoff, a summary) are applied to, reducer patches are
 /// sourced from and the session is persisted from. It never holds a
 /// projection: no request enrichment, refresh note, skill-metadata suppression, middleware rewrite or lossy trim. A
 /// `Vec<ChatMessage>` cannot become one: it is built from acknowledged turns
@@ -96,8 +95,8 @@ pub(crate) struct CanonicalHistory {
     /// One evidence slot per message, index for index; only an acknowledged
     /// message's slot can be filled.
     evidence: Vec<Option<Arc<TurnToolEvidence>>>,
-    /// One set of source event ids per message, index for index; an evicted
-    /// context page records the union over its messages.
+    /// One set of source event ids per message, index for index; a durable
+    /// replacement message records the union over the messages it replaces.
     sources: Vec<MessageSources>,
 }
 
@@ -669,8 +668,7 @@ impl CanonicalHistory {
 /// The one conversion between the two: the provider view of `canonical`
 /// under `inputs`. The enriched request replaces the canonical plain request,
 /// the refresh aside follows the replacement it
-/// was written after, the recalled page follows the system prompt, and the
-/// skill metadata is stripped when suppressed.
+/// was written after, and the skill metadata is stripped when suppressed.
 pub(crate) fn project(canonical: &CanonicalHistory, inputs: &ProjectionInputs) -> ProviderView {
     let mut messages = canonical.messages.clone();
     // Each context handoff is shown in its compact form, by the one renderer,

@@ -56,7 +56,7 @@
 //!
 //! Progress is *observable activity attributable to this turn*: provider stream
 //! chunks, a completed provider round-trip, a tool call starting or finishing,
-//! completed serving-request preparation, history compaction/paging, a durable
+//! completed serving-request preparation, history compaction, a durable
 //! write the turn owed coming back, and output emitted to a channel or event sink.
 //! Any single one of them resets the window; see [`ProgressKind`].
 //!
@@ -214,7 +214,7 @@ pub enum ProgressKind {
     ToolStart,
     /// A tool call produced its result.
     ToolEnd,
-    /// History compaction, summarisation, or OS-paging ran.
+    /// History compaction or summarisation ran.
     Compaction,
     /// Output was handed to a channel, TUI, or event sink.
     ChannelOutput,

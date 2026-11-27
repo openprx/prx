@@ -165,12 +165,15 @@ pub(crate) const TOOL_RESULTS_PREFIX: &str = "[Tool results]";
 /// still recognises it in stored history.
 pub(crate) const POST_COMPACTION_REFRESH_MARKER: &str = "[Post-compaction context refresh]";
 
-/// Marker prefix used for recalled page content injected back into history.
+/// Marker of a recalled OS-paging page. OS paging is removed and no code
+/// writes this marker any more; it stays reserved so that a note stored by an
+/// earlier build keeps its meaning and user text cannot reproduce it.
 pub(crate) const OS_PAGING_RECALL_MARKER: &str = "[Recalled context from earlier in this session]";
 
 /// Every marker the loop opens one of its own `user`-role notes with: the
 /// prompt-guided tool-result block ([`TOOL_RESULTS_PREFIX`]),
-/// the post-compaction refresh aside and a recalled OS-paging page.
+/// the post-compaction refresh aside and a recalled OS-paging page (stored
+/// by an earlier build).
 ///
 /// A `user` message that starts with one of them is read as the loop's
 /// bookkeeping, never as the user's question: the recall query, the preflight

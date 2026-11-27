@@ -175,14 +175,18 @@ pub(super) fn build_channel_system_prompt(
 
 /// Load workspace identity files and build a system prompt.
 ///
-/// Follows the `OpenClaw` framework structure by default:
+/// Follows the `OpenClaw` framework structure by default. The sections come in
+/// the order of `crate::context::layout::Layout::standard`:
 /// 1. Task-mode guidance
-/// 2. Safety — guardrail reminder
-/// 3. Skills — lazy catalog metadata; instructions are read with `skill_read`
-/// 4. Workspace — working directory
-/// 5. Bootstrap files — AGENTS, SOUL, TOOLS, IDENTITY, USER, BOOTSTRAP, MEMORY
-/// 6. Date & Time — timezone for cache stability
-/// 7. Runtime — host, OS, model
+/// 2. Context handoff — how to look up earlier turns moved out of the window
+/// 3. Safety — guardrail reminder
+/// 4. Orchestration
+/// 5. Skills — lazy catalog metadata; instructions are read with `skill_read`
+/// 6. Workspace — working directory
+/// 7. Identity — workspace files SOUL, AGENTS, IDENTITY, USER, TOOLS, MEMORY,
+///    THINKING, then BOOTSTRAP while it is pending
+/// 8. Date & Time — timezone for cache stability
+/// 9. Runtime — host, OS, model
 ///
 /// When `identity_config` is set to AIEOS format, the bootstrap files section
 /// is replaced with the AIEOS identity data loaded from file or inline JSON.

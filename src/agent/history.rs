@@ -6,8 +6,8 @@ use crate::providers::{ChatMessage, ToolCall};
 /// templates require one system message at the beginning of the transcript.
 ///
 /// History remains untouched: callers run this on the prepared request copy.
-/// That matters for corrective retries and OS-paging recall, both of which may
-/// add request-local system context after ordinary conversation turns.
+/// That matters for corrective retries, which may add request-local system
+/// context after ordinary conversation turns.
 pub(super) fn coalesce_system_messages_at_front(messages: &mut Vec<ChatMessage>) {
     let system_count = messages.iter().filter(|message| message.role == "system").count();
     if system_count == 0 || system_count == 1 && messages.first().is_some_and(|message| message.role == "system") {
@@ -148,8 +148,9 @@ pub(super) fn apply_aggressive_trim(history: &mut Vec<ChatMessage>, keep_recent:
 
 /// Position of the latest real user turn, skipping internal bookkeeping
 /// messages: the `[Tool results]` block a prompt-guided tool round feeds back,
-/// the post-compaction refresh aside, and a recalled OS-paging page — matched
-/// exactly ([`is_loop_written_user_note`]); a user turn cannot open with one,
+/// the post-compaction refresh aside, and a recalled-page note stored by an
+/// earlier build (OS paging is removed) — matched exactly
+/// ([`is_loop_written_user_note`]); a user turn cannot open with one,
 /// because inbound text is neutralised on entry.
 ///
 /// One predicate for "the user actually asked this", used both to build a
