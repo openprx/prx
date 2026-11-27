@@ -417,18 +417,47 @@ impl SessionsSpawnTool {
         let turns = store.history(&record)?;
         let retained = last_n.unwrap_or(DEFAULT_HISTORY_LAST_N).min(turns.len());
         let skipped = turns.len().saturating_sub(retained);
-        let lines: Vec<String> = turns
+        let window: Vec<&crate::memory::child_sessions::ChildTurn> = turns.iter().skip(skipped).collect();
+        // The child's own partition, so its tool rows are read with the rows
+        // its turns were written under; the turns are expanded by event id.
+        let principal = crate::memory::MemoryPrincipal {
+            workspace_id: record.workspace.clone(),
+            owner_id: Some(record.owner.clone()),
+            session_key: Some(record.session_key.clone()),
+            agent_partition: store.partition(&record)?,
+            ..crate::memory::MemoryPrincipal::default()
+        };
+        let conversation: Vec<crate::memory::ConversationTurn> = window
             .iter()
-            .skip(skipped)
-            .map(|turn| {
-                let ts = turn.timestamp.format("%H:%M:%S").to_string();
-                let preview: String = turn.content.chars().take(max_chars_per_entry).collect();
-                let ellipsis = if turn.content.chars().count() > max_chars_per_entry {
-                    "\n[entry truncated]"
-                } else {
-                    ""
-                };
-                format!("[{ts}] **{}**: {}{}", turn.role, preview, ellipsis)
+            .enumerate()
+            .map(|(index, turn)| crate::memory::ConversationTurn {
+                id: i64::try_from(index).unwrap_or(i64::MAX),
+                session_key: record.session_key.clone(),
+                role: turn.role.clone(),
+                content: turn.content.clone(),
+                timestamp: turn.timestamp.to_rfc3339(),
+                message_id: turn.event_id.clone(),
+                message_event_id: turn.event_id.clone(),
+            })
+            .collect();
+        let history = crate::context::transcript::Transcript::new(memory.as_ref(), principal)
+            .expand_turns(conversation)
+            .await;
+        let stamps: std::collections::HashMap<&str, String> = window
+            .iter()
+            .filter_map(|turn| {
+                turn.event_id
+                    .as_deref()
+                    .map(|id| (id, turn.timestamp.format("%H:%M:%S").to_string()))
+            })
+            .collect();
+        let lines: Vec<String> = history
+            .messages
+            .iter()
+            .zip(history.event_ids.iter())
+            .map(|(message, event_id)| {
+                let stamp = event_id.as_deref().and_then(|id| stamps.get(id)).map(String::as_str);
+                render_history_message(message, stamp, max_chars_per_entry)
             })
             .collect();
         let omitted = if skipped > 0 {
@@ -600,4 +629,64 @@ pub(crate) const STEER_CHANNEL_CAPACITY: usize = 1024;
 /// `sessions_history` whichever way it was spawned.
 pub(crate) fn steering_instruction(message: &str) -> String {
     format!("[Steering instruction from operator] {message}")
+}
+
+/// One history message as the transcript read shows it: a turn with its
+/// time, a tool call of an assistant envelope, or a tool result. Tool text is
+/// the redacted form (stored rows are redacted; it is redacted again here),
+/// cut to `max_chars` with a marker.
+fn render_history_message(message: &crate::providers::ChatMessage, stamp: Option<&str>, max_chars: usize) -> String {
+    let parsed: Option<serde_json::Value> = serde_json::from_str(&message.content).ok();
+    match (message.role.as_str(), parsed.as_ref()) {
+        ("tool", Some(value)) => {
+            let text = value
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            format!("**tool result**: {}", bounded_display(text, max_chars))
+        }
+        ("assistant", Some(value)) if value.get("tool_calls").is_some_and(serde_json::Value::is_array) => {
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(text) = value.get("content").and_then(serde_json::Value::as_str)
+                && !text.trim().is_empty()
+            {
+                parts.push(format!("**assistant**: {}", bounded_display(text, max_chars)));
+            }
+            for call in value
+                .get("tool_calls")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let name = call.get("name").and_then(serde_json::Value::as_str).unwrap_or("tool");
+                let arguments = call
+                    .get("arguments")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("{}");
+                parts.push(format!(
+                    "**tool call** `{name}`: {}",
+                    bounded_display(arguments, max_chars)
+                ));
+            }
+            parts.join("\n\n")
+        }
+        (role, _) => {
+            let body = bounded_display(&message.content, max_chars);
+            match stamp {
+                Some(ts) => format!("[{ts}] **{role}**: {body}"),
+                None => format!("**{role}**: {body}"),
+            }
+        }
+    }
+}
+
+/// Redact, then cut to `max_chars` characters, marking the cut.
+fn bounded_display(text: &str, max_chars: usize) -> String {
+    let redacted = crate::security::redaction::redact_secrets(text);
+    if redacted.chars().count() > max_chars {
+        let preview: String = redacted.chars().take(max_chars).collect();
+        format!("{preview}\n[entry truncated]")
+    } else {
+        redacted
+    }
 }

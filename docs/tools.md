@@ -2171,8 +2171,9 @@ other batch-level defaults do.
 `history` with `transcript: true` reads a child's stored turns instead of the
 live run history. It finds the child session by its session key or a run id,
 among the sessions the caller's owner started, and returns the last `last_n`
-turns. Stored turns are available after a restart and for finished runs. Only
-text turns are returned; replayed tool rows are not. An unknown run answers
+turns. Stored turns are available after a restart and for finished runs. The
+turns come with the tool calls and tool results of their runs, in the redacted
+form a model replay shows. An unknown run answers
 `no stored child session for run <run_id>`. The read boundary is the owner:
 the parent-session match that `continue` applies is not required.
 
@@ -2182,6 +2183,9 @@ A completed child's notice to a Console, rf or webhook parent ends with a
 ```text
 - transcript <session_key>: read it with sessions_spawn action=history run_id=<run_id> transcript=true, or search it with transcript_search session_key=<session_key>
 ```
+
+Each document the run stored is listed as a `- document <id>` line after it (at
+most 20, then `+N more`), read from the run's tool results.
 
 ## Messages between sessions
 
