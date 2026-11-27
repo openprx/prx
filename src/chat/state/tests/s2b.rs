@@ -240,13 +240,14 @@ fn t3_3d_both_mode_history_byte_level_parity() {
 
     for (role, text) in inputs {
         if role == "user" {
-            let _ = state.reduce(Action::RecordUserTurn(text.to_string()));
+            let _ = state.reduce(Action::RecordUserTurn(text.to_string(), None));
             legacy.add_user_turn(text);
         } else {
             // every role in the test input is "user" / "assistant", so the else branch is assistant
             let _ = state.reduce(Action::RecordAssistantTurn {
                 task_id: None,
                 content: text.to_string(),
+                event_id: None,
             });
             legacy.add_assistant_turn(text, Vec::new());
         }
@@ -295,7 +296,7 @@ fn t3_3_fix_b_both_parity_system_history() {
     legacy.push(ChatMessage::system("rules v1"));
 
     // 2) RecordUserTurn → append user
-    let _ = state.reduce(Action::RecordUserTurn("u1".to_string()));
+    let _ = state.reduce(Action::RecordUserTurn("u1".to_string(), None));
     legacy.push(ChatMessage::user("u1"));
 
     // 3) SetLeadingSystemPrompt on a non-empty history → replace history[0]
@@ -310,6 +311,7 @@ fn t3_3_fix_b_both_parity_system_history() {
     let _ = state.reduce(Action::RecordAssistantTurn {
         task_id: None,
         content: "a1".to_string(),
+        event_id: None,
     });
     legacy.push(ChatMessage::assistant("a1"));
 
@@ -345,7 +347,7 @@ fn redux_record_turns_single_write_no_duplicate_session_turns() {
     let mut state = s();
     assert_eq!(state.session.turns.len(), 0);
 
-    let _ = state.reduce(Action::RecordUserTurn("hello".to_string()));
+    let _ = state.reduce(Action::RecordUserTurn("hello".to_string(), None));
     assert_eq!(state.session.turns.len(), 1);
     assert_eq!(
         state.session.history.len(),
@@ -356,6 +358,7 @@ fn redux_record_turns_single_write_no_duplicate_session_turns() {
     let _ = state.reduce(Action::RecordAssistantTurn {
         task_id: None,
         content: "hi back".to_string(),
+        event_id: None,
     });
     assert_eq!(
         state.session.turns.len(),
@@ -366,7 +369,7 @@ fn redux_record_turns_single_write_no_duplicate_session_turns() {
 
     // Key regression guard: dispatch the same content again; turns must grow to 4, not be deduped to 2
     // (the reducer is not idempotent — dedup is the caller's job; this confirms it is append-only)
-    let _ = state.reduce(Action::RecordUserTurn("hello".to_string()));
+    let _ = state.reduce(Action::RecordUserTurn("hello".to_string(), None));
     assert_eq!(state.session.turns.len(), 3, "a second dispatch must append one more");
 }
 

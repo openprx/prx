@@ -89,6 +89,7 @@
             format!("chat:{}:{turn_run_id}:{fabric_turn_seq}:user", chat_session.session().id),
             child_cleanup.register(cancellation.clone())?, entry::prepare_origin(terminal_origin,&msg,&user_input)?,
         ).await?;
+        let user_event_id = chat_user_event.as_ref().map(|event| event.event_id.clone());
         let admission = admitted_binding
             .issue_decision(&turn_service, &cancellation)
             .await;
@@ -567,14 +568,14 @@
                 admission = None;
                 provider_history_len_before_assistant = history_for_provider.len();
             } else {
-                admission = Some(record_user_turn_at_admission(&chat_dispatcher, &turn_signal, &user_input).await?);
+                admission = Some(record_user_turn_at_admission(&chat_dispatcher, &turn_signal, &user_input, user_event_id.as_deref()).await?);
                 history.push(history_user_message.clone());
                 provider_history_len_before_assistant = history.len();
             }
         }
         #[cfg(not(feature = "terminal-tui"))]
         {
-            admission = Some(record_user_turn_at_admission(&chat_dispatcher, &turn_signal, &user_input).await?);
+            admission = Some(record_user_turn_at_admission(&chat_dispatcher, &turn_signal, &user_input, user_event_id.as_deref()).await?);
             history.push(history_user_message.clone());
             provider_history_len_before_assistant = history.len();
         }
@@ -752,6 +753,7 @@
                             draft_updater,
                             tool_event_forwarder: Some(tool_event_forwarder),
                             user_input: user_input.clone(),
+                            user_event_id: user_event_id.clone(),
                             sent: sent_form.clone(),
                             turn_run_id: turn_run_id.clone(),
                             route_scope: route_scope.clone(),
@@ -1683,6 +1685,7 @@
                 "",
                 true,
                 false,
+                TurnEventIds::default(),
             )
             .await
             {
@@ -1735,7 +1738,7 @@
             Some(last) if last.role == "assistant" => *last = ChatMessage::assistant(&response),
             _ => history.push(ChatMessage::assistant(&response)),
         }
-        let terminal_usage = match finalize_chat_success_turn(
+        let (terminal_usage, assistant_event_id) = match finalize_chat_success_turn(
             chat_turn_binding.as_deref(),
             &memory_fabric,
             &chat_session_key,
@@ -1752,7 +1755,10 @@
         )
         .await
         {
-            Ok(receipt) => receipt.into_session_usage(),
+            Ok(receipt) => {
+                let assistant_event_id = receipt.assistant_event_id();
+                (receipt.into_session_usage(), assistant_event_id)
+            }
             Err(error) => {
                 tracing::error!(error = %crate::agent::diagnostics::error_class(&error), "Chat terminal persistence is unconfirmed");
                 return Err(error);
@@ -1795,6 +1801,7 @@
             &response,
             false,
             false,
+            TurnEventIds { user: None, assistant: assistant_event_id.as_deref() },
         )
         .await
         {

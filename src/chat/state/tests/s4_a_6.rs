@@ -130,7 +130,7 @@ fn s4_b_created_at_stable_across_turns() {
     state.session.id = "sess1".to_string();
     assert!(state.session.created_at.is_none(), "created_at must start as None");
 
-    let _ = state.reduce(Action::RecordUserTurn("q1".to_string()));
+    let _ = state.reduce(Action::RecordUserTurn("q1".to_string(), None));
     let created_first = state
         .session
         .created_at
@@ -138,7 +138,7 @@ fn s4_b_created_at_stable_across_turns() {
 
     // a second RecordUserTurn must not overwrite created_at
     std::thread::sleep(std::time::Duration::from_millis(2));
-    let _ = state.reduce(Action::RecordUserTurn("q2".to_string()));
+    let _ = state.reduce(Action::RecordUserTurn("q2".to_string(), None));
     assert_eq!(
         state.session.created_at,
         Some(created_first),

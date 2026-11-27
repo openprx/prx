@@ -244,7 +244,7 @@ async fn redux_driver_preserve_trim_floor_preserves_fitting_summary_and_matches_
         compaction_config: config,
     });
     let pending_user = original_history.last().expect("pending user fixture").content.clone();
-    let _ = reducer_state.reduce(Action::RecordUserTurn(pending_user));
+    let _ = reducer_state.reduce(Action::RecordUserTurn(pending_user, None));
 
     assert!(
         driver_history
@@ -399,7 +399,7 @@ async fn redux_driver_preserve_trim_floor_drops_unfit_summary_and_matches_reduce
         "pending-user timing must not turn an exact rollover into a stale-patch fallback"
     );
     let pending_user = original_history.last().expect("pending user fixture").content.clone();
-    let _ = reducer_state.reduce(Action::RecordUserTurn(pending_user.clone()));
+    let _ = reducer_state.reduce(Action::RecordUserTurn(pending_user.clone(), None));
     assert!(
         reducer_state
             .session

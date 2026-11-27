@@ -1081,6 +1081,7 @@ fn provider_turn_finalizer_n3_out_of_order_releases_ordered_persistence_actions(
                 draft_updater: None,
                 tool_event_forwarder: None,
                 user_input: user_input.to_string(),
+                user_event_id: None,
                 sent: None,
                 turn_run_id: format!("test-run-{}", task_id.get()),
                 route_scope: crate::memory::MessageEventScope::new("chat", crate::memory::MemoryVisibility::Workspace),
@@ -1128,6 +1129,7 @@ fn provider_turn_finalizer_n3_out_of_order_releases_ordered_persistence_actions(
                 &reasoning,
                 empty_response,
                 true,
+                crate::chat::provider_turns::TurnEventIds::default(),
             )
             .expect("ordered history dispatch");
         }
@@ -1262,11 +1264,11 @@ fn provider_turn_finalizer_n3_out_of_order_releases_ordered_persistence_actions(
         ("charlie prompt", "charlie answer", "draft-charlie", third),
     ] {
         match rx.try_recv().expect("ordered user action") {
-            Action::RecordUserTurn(content) => assert_eq!(content, expected_user),
+            Action::RecordUserTurn(content, _) => assert_eq!(content, expected_user),
             other => panic!("expected RecordUserTurn, got {other:?}"),
         }
         match rx.try_recv().expect("ordered assistant action") {
-            Action::RecordAssistantTurn { task_id, content } => {
+            Action::RecordAssistantTurn { task_id, content, .. } => {
                 assert_eq!(task_id, Some(expected_task));
                 assert_eq!(content, expected_assistant);
             }

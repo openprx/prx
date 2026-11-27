@@ -41,7 +41,7 @@ fn redux_history_append_order_user_assistant_stable() {
     assert_eq!(h0v2.content, "system-rules-v2");
 
     // RecordUserTurn → append user
-    let _ = state.reduce(Action::RecordUserTurn("user-q1".to_string()));
+    let _ = state.reduce(Action::RecordUserTurn("user-q1".to_string(), None));
     assert_eq!(state.session.history.len(), 2);
     let h1 = state.session.history.get(1).expect("test: history[1] = user");
     assert_eq!(h1.role, "user");
@@ -52,6 +52,7 @@ fn redux_history_append_order_user_assistant_stable() {
     let _ = state.reduce(Action::RecordAssistantTurn {
         task_id: None,
         content: "assistant-r1".to_string(),
+        event_id: None,
     });
     assert_eq!(state.session.history.len(), 3);
     let h2 = state.session.history.get(2).expect("test: history[2] = assistant");
@@ -60,10 +61,11 @@ fn redux_history_append_order_user_assistant_stable() {
     assert_eq!(state.session.turns.len(), 2, "session.turns +1 (assistant)");
 
     // one more round — the order must still be system, user, assistant, user, assistant
-    let _ = state.reduce(Action::RecordUserTurn("user-q2".to_string()));
+    let _ = state.reduce(Action::RecordUserTurn("user-q2".to_string(), None));
     let _ = state.reduce(Action::RecordAssistantTurn {
         task_id: None,
         content: "assistant-r2".to_string(),
+        event_id: None,
     });
     assert_eq!(state.session.history.len(), 5);
     let roles: Vec<&str> = state.session.history.iter().map(|m| m.role.as_str()).collect();

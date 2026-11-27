@@ -123,6 +123,7 @@ fn p3a_record_assistant_turn_drains_only_requested_task_calls() {
     let _ = state.reduce(Action::RecordAssistantTurn {
         task_id: Some(task_b),
         content: "b answer".to_string(),
+        event_id: None,
     });
 
     let last = state.session.turns.last().expect("test: assistant turn");
@@ -194,6 +195,7 @@ fn p3a_legacy_primary_tool_buffer_path_still_records_tool_calls() {
     let _ = state.reduce(Action::RecordAssistantTurn {
         task_id: None,
         content: "primary answer".to_string(),
+        event_id: None,
     });
 
     let last = state.session.turns.last().expect("test: primary assistant turn");

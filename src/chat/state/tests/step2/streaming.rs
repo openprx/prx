@@ -652,6 +652,7 @@ fn stream_failed_removes_trailing_answerless_user_turn() {
     let _ = state.reduce(Action::UserTurnAdmitted {
         admission: crate::chat::action::AdmissionId::next(),
         content: "failed question".to_string(),
+        event_id: None,
     });
     let _ = state.reduce(Action::TurnStarted {
         draft_id: "d-failed".to_string(),
@@ -689,6 +690,7 @@ fn stream_cancelled_removes_trailing_answerless_user_turn() {
     let _ = state.reduce(Action::UserTurnAdmitted {
         admission: crate::chat::action::AdmissionId::next(),
         content: "cancelled question".to_string(),
+        event_id: None,
     });
     let _ = state.reduce(Action::TurnStarted {
         draft_id: "d-cancelled".to_string(),
@@ -720,6 +722,7 @@ fn failed_turn_orphan_is_absent_from_background_and_later_success_snapshots() {
     let _ = state.reduce(Action::UserTurnAdmitted {
         admission: crate::chat::action::AdmissionId::next(),
         content: "orphan candidate".to_string(),
+        event_id: None,
     });
     let _ = state.reduce(Action::TurnStarted {
         draft_id: "d-failed".to_string(),
@@ -749,7 +752,7 @@ fn failed_turn_orphan_is_absent_from_background_and_later_success_snapshots() {
         "GP-9: background save snapshot must not persist the failed user turn"
     );
 
-    let _ = state.reduce(Action::RecordUserTurn("real question".to_string()));
+    let _ = state.reduce(Action::RecordUserTurn("real question".to_string(), None));
     let _ = state.reduce(Action::TurnStarted {
         draft_id: "d-ok".to_string(),
         cancel: CancellationToken::new(),
@@ -757,6 +760,7 @@ fn failed_turn_orphan_is_absent_from_background_and_later_success_snapshots() {
     let _ = state.reduce(Action::RecordAssistantTurn {
         task_id: None,
         content: "real answer".to_string(),
+        event_id: None,
     });
     let completion_effects = state.reduce(Action::StreamCompleted {
         draft_id: "d-ok".to_string(),
@@ -796,6 +800,7 @@ fn a_failed_request_never_removes_an_earlier_committed_request_with_the_same_tex
     let _ = state.reduce(Action::UserTurnAdmitted {
         admission: first,
         content: "Q".to_string(),
+        event_id: None,
     });
     let task_id = crate::chat::turn_scheduler::TurnScheduler::new().enqueue(
         "Q",
@@ -810,6 +815,7 @@ fn a_failed_request_never_removes_an_earlier_committed_request_with_the_same_tex
     let _ = state.reduce(Action::UserTurnAdmitted {
         admission: second,
         content: "Q".to_string(),
+        event_id: None,
     });
     let _ = state.reduce(Action::TurnStarted {
         draft_id: "d-second".to_string(),
@@ -847,11 +853,12 @@ fn a_failed_request_never_removes_an_earlier_committed_request_with_the_same_tex
 #[test]
 fn a_snapshot_during_an_open_admission_names_its_request_by_position() {
     let mut state = s();
-    let _ = state.reduce(Action::RecordUserTurn("Q".to_string()));
+    let _ = state.reduce(Action::RecordUserTurn("Q".to_string(), None));
     let admission = crate::chat::action::AdmissionId::next();
     let _ = state.reduce(Action::UserTurnAdmitted {
         admission,
         content: "Q".to_string(),
+        event_id: None,
     });
 
     assert_eq!(

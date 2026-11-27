@@ -33,7 +33,7 @@ async fn queued_save_acknowledgement_preserves_loaded_session_and_next_snapshot_
     });
     let _ = state.reduce(acknowledgement);
     assert_eq!(state.session.id, "prx-new-session");
-    let _ = state.reduce(Action::RecordUserTurn("new request".into()));
+    let _ = state.reduce(Action::RecordUserTurn("new request".into(), None));
     let _ = state.reduce(Action::TurnStarted {
         draft_id: "prx-new-draft".into(),
         cancel: CancellationToken::new(),
@@ -41,6 +41,7 @@ async fn queued_save_acknowledgement_preserves_loaded_session_and_next_snapshot_
     let _ = state.reduce(Action::RecordAssistantTurn {
         task_id: None,
         content: "new reply".into(),
+        event_id: None,
     });
     let effects = state.reduce(Action::StreamCompleted {
         draft_id: "prx-new-draft".into(),
@@ -83,7 +84,7 @@ async fn real_mode_save_session_triggers_memory_store() {
     let pre_truncate_len = crate::security::redaction::redact_secrets(&long_content).len();
     let mut state = crate::chat::state::ChatState::new(Arc::from("prov"), Arc::from("model"), CancellationToken::new());
     state.session.id = "dispatcher-sanitize-session".to_string();
-    let _ = state.reduce(Action::RecordUserTurn(long_content));
+    let _ = state.reduce(Action::RecordUserTurn(long_content, None));
     let effects = state.reduce(Action::BackgroundSessionRecorded {
         summary: crate::chat::sessions::PersistedSessionSummary {
             id: "child".to_string(),
@@ -226,7 +227,7 @@ async fn t3_3_fix_a_exit_after_completed_persistence_parity() {
         state.session.id = format!("sess-fixA-{tag}");
 
         // complete turn: user → turn started → assistant recorded → stream completed
-        let _ = state.reduce(Action::RecordUserTurn("q".to_string()));
+        let _ = state.reduce(Action::RecordUserTurn("q".to_string(), None));
         let _ = state.reduce(Action::TurnStarted {
             draft_id: format!("d-{tag}"),
             cancel: CancellationToken::new(),
@@ -234,6 +235,7 @@ async fn t3_3_fix_a_exit_after_completed_persistence_parity() {
         let _ = state.reduce(Action::RecordAssistantTurn {
             task_id: None,
             content: "a".to_string(),
+            event_id: None,
         });
         let effects = state.reduce(Action::StreamCompleted {
             draft_id: format!("d-{tag}"),
@@ -290,7 +292,7 @@ async fn t3_3_fix_a_exit_while_streaming_no_partial_save() {
         state.session.id = format!("sess-stream-{tag}");
 
         // user already recorded, turn already streaming, but the stream never completed (mid-exit window)
-        let _ = state.reduce(Action::RecordUserTurn("q".to_string()));
+        let _ = state.reduce(Action::RecordUserTurn("q".to_string(), None));
         let user_effects: Vec<Effect> = state
             .reduce(Action::TurnStarted {
                 draft_id: format!("d-{tag}"),
@@ -373,7 +375,7 @@ async fn t3_3_fix_b_driver_path_save_session_includes_assistant() {
     );
     state.session.id = "sess-fixB-B5".to_string();
     // the user turn is dispatched by the chat::run main loop before the driver starts, so add it by hand here.
-    let _ = state.reduce(Action::RecordUserTurn("q".to_string()));
+    let _ = state.reduce(Action::RecordUserTurn("q".to_string(), None));
     let _ = state.reduce(Action::TurnStarted {
         draft_id: "draft-fixB-B5".to_string(),
         cancel: CancellationToken::new(),
@@ -393,6 +395,7 @@ async fn t3_3_fix_b_driver_path_save_session_includes_assistant() {
                 let _ = state.reduce(Action::RecordAssistantTurn {
                     task_id: None,
                     content: text,
+                    event_id: None,
                 });
             }
             Action::StreamCompleted {

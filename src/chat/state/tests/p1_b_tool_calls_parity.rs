@@ -13,7 +13,7 @@ fn s() -> ChatState {
 #[test]
 fn s2_5_p1_b_assistant_turn_carries_tool_calls() {
     let mut state = s();
-    let _ = state.reduce(Action::RecordUserTurn("question".to_string()));
+    let _ = state.reduce(Action::RecordUserTurn("question".to_string(), None));
     let _ = state.reduce(Action::TurnStarted {
         draft_id: "d-p1b-1".to_string(),
         cancel: CancellationToken::new(),
@@ -37,6 +37,7 @@ fn s2_5_p1_b_assistant_turn_carries_tool_calls() {
     let _ = state.reduce(Action::RecordAssistantTurn {
         task_id: None,
         content: "answer".to_string(),
+        event_id: None,
     });
 
     let last = state.session.turns.last().expect("test: assistant turn");
@@ -85,6 +86,7 @@ fn s2_5_p1_b_multi_tool_aggregates_in_turn() {
     let _ = state.reduce(Action::RecordAssistantTurn {
         task_id: None,
         content: "a".to_string(),
+        event_id: None,
     });
 
     let last = state.session.turns.last().expect("test: assistant turn");
@@ -150,6 +152,7 @@ fn s2_5_p1_b_turn_boundary_clears_buffer() {
     let _ = state.reduce(Action::RecordAssistantTurn {
         task_id: None,
         content: "clean".to_string(),
+        event_id: None,
     });
     let last = state.session.turns.last().expect("test: turn 2 assistant");
     assert_eq!(
@@ -221,7 +224,7 @@ fn s2_5_p1_b_stream_cancelled_clears_buffer() {
 fn s2_5_p1_b_both_parity_includes_tool_calls() {
     let mut state = s();
     // simulate a full turn package: user → turn started → several tools → assistant.
-    let _ = state.reduce(Action::RecordUserTurn("ask".to_string()));
+    let _ = state.reduce(Action::RecordUserTurn("ask".to_string(), None));
     let _ = state.reduce(Action::TurnStarted {
         draft_id: "d-parity".to_string(),
         cancel: CancellationToken::new(),
@@ -261,6 +264,7 @@ fn s2_5_p1_b_both_parity_includes_tool_calls() {
     let _ = state.reduce(Action::RecordAssistantTurn {
         task_id: None,
         content: "done".to_string(),
+        event_id: None,
     });
     let _ = state.reduce(Action::StreamCompleted {
         draft_id: "d-parity".to_string(),

@@ -300,7 +300,7 @@ impl ChatState {
     /// - `updated_at` is set by the effect executor when it builds the `SaveSession` snapshot
     /// - on the first user turn, if title is empty, set_title runs automatically (first 50 chars, as
     ///   ChatSession does); tool_calls stays empty, tool sync is done by `ToolStarted`/`ToolFinished`
-    pub(super) fn reduce_record_user_turn(&mut self, content: String) -> Vec<Effect> {
+    pub(super) fn reduce_record_user_turn(&mut self, content: String, event_id: Option<String>) -> Vec<Effect> {
         // A user turn must not read as the loop's own bookkeeping later on.
         let content = match crate::agent::turn_contracts::neutralize_reserved_markers(&content) {
             std::borrow::Cow::Borrowed(_) => content,
@@ -318,7 +318,7 @@ impl ChatState {
             tool_calls: Vec::new(),
             context_handoff: false,
             tool_evidence: None,
-            event_id: None,
+            event_id,
         });
         // On the first user turn with an empty title, set it automatically (as session.add_user_turn does)
         if self.session.title.is_empty() {
@@ -340,8 +340,9 @@ impl ChatState {
         &mut self,
         admission: crate::chat::action::AdmissionId,
         content: String,
+        event_id: Option<String>,
     ) -> Vec<Effect> {
-        let effects = self.reduce_record_user_turn(content);
+        let effects = self.reduce_record_user_turn(content, event_id);
         self.control.open_admission = Some(admission);
         effects
     }
@@ -354,38 +355,11 @@ impl ChatState {
     pub(super) fn reduce_turn_records_attached(
         &mut self,
         user_text: &str,
-        event_ids: (Option<String>, Option<String>),
         sent: Option<crate::context::transcript::Attachment>,
         reply: Option<&str>,
         replay: Option<std::sync::Arc<crate::context::transcript::TurnReplay>>,
     ) -> Vec<Effect> {
         let user_text = crate::agent::turn_contracts::neutralize_reserved_markers(user_text);
-        let (user_event_id, reply_event_id) = event_ids;
-        let mut ids_attached = false;
-        if let Some(event_id) = user_event_id
-            && let Some(turn) = self
-                .session
-                .turns
-                .iter_mut()
-                .rev()
-                .find(|turn| turn.role == "user" && turn.content == user_text)
-                .filter(|turn| turn.event_id.is_none())
-        {
-            turn.event_id = Some(event_id);
-            ids_attached = true;
-        }
-        if let Some(event_id) = reply_event_id
-            && let Some(turn) = self
-                .session
-                .turns
-                .iter_mut()
-                .rev()
-                .find(|turn| turn.role == "assistant")
-                .filter(|turn| Some(turn.content.as_str()) == reply && turn.event_id.is_none())
-        {
-            turn.event_id = Some(event_id);
-            ids_attached = true;
-        }
         let mut sent_attached = false;
         if let Some(sent) = sent
             && let Some(turn) = self.session.turns.iter_mut().rev().find(|turn| {
@@ -410,7 +384,7 @@ impl ChatState {
             turn.tool_evidence.get_or_insert_with(Default::default).replay = Some(replay);
             replay_attached = true;
         }
-        if sent_attached || ids_attached {
+        if sent_attached {
             vec![Effect::SaveSession(self.session_commit())]
         } else if replay_attached {
             vec![Effect::PublishSession(self.session_commit())]
@@ -429,6 +403,7 @@ impl ChatState {
         &mut self,
         task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
         content: String,
+        event_id: Option<String>,
     ) -> Vec<Effect> {
         let (tool_calls, tool_evidence) = self.control.take_tool_record(ToolTaskKey::from_task_id(task_id));
         self.session.turns.push(crate::chat::session::ChatTurn {
@@ -438,7 +413,7 @@ impl ChatState {
             tool_calls,
             context_handoff: false,
             tool_evidence,
-            event_id: None,
+            event_id,
         });
         self.session.history.push(ChatMessage::assistant(content));
         vec![Effect::LogTrace {

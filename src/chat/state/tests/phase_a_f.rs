@@ -770,7 +770,7 @@ fn test_t3_3c_stream_completed_emits_save_session() {
     let mut state = s();
     state.session.id = "sess-T3-3c".to_string();
     // record a user turn first so session.turns is non-empty and the snapshot really carries turns
-    let _ = state.reduce(Action::RecordUserTurn("question".to_string()));
+    let _ = state.reduce(Action::RecordUserTurn("question".to_string(), None));
     let _ = state.reduce(Action::TurnStarted {
         draft_id: "draft-T3-3c".to_string(),
         cancel: CancellationToken::new(),
@@ -778,6 +778,7 @@ fn test_t3_3c_stream_completed_emits_save_session() {
     let _ = state.reduce(Action::RecordAssistantTurn {
         task_id: None,
         content: "answer".to_string(),
+        event_id: None,
     });
     let effects = state.reduce(Action::StreamCompleted {
         draft_id: "draft-T3-3c".to_string(),
@@ -876,7 +877,7 @@ fn t3_3_fix_a_dispatch_order_snapshot_contract() {
     // ── forward: RecordAssistantTurn → StreamCompleted ──
     let mut state_a = s();
     state_a.session.id = "sess-fwd".to_string();
-    let _ = state_a.reduce(Action::RecordUserTurn("q".to_string()));
+    let _ = state_a.reduce(Action::RecordUserTurn("q".to_string(), None));
     let _ = state_a.reduce(Action::TurnStarted {
         draft_id: "d-fwd".to_string(),
         cancel: CancellationToken::new(),
@@ -884,6 +885,7 @@ fn t3_3_fix_a_dispatch_order_snapshot_contract() {
     let _ = state_a.reduce(Action::RecordAssistantTurn {
         task_id: None,
         content: "a-fwd".to_string(),
+        event_id: None,
     });
     let fwd_effects = state_a.reduce(Action::StreamCompleted {
         draft_id: "d-fwd".to_string(),
@@ -910,7 +912,7 @@ fn t3_3_fix_a_dispatch_order_snapshot_contract() {
     // ── reverse: StreamCompleted → RecordAssistantTurn ──
     let mut state_b = s();
     state_b.session.id = "sess-rev".to_string();
-    let _ = state_b.reduce(Action::RecordUserTurn("q".to_string()));
+    let _ = state_b.reduce(Action::RecordUserTurn("q".to_string(), None));
     let _ = state_b.reduce(Action::TurnStarted {
         draft_id: "d-rev".to_string(),
         cancel: CancellationToken::new(),
@@ -923,6 +925,7 @@ fn t3_3_fix_a_dispatch_order_snapshot_contract() {
     let _ = state_b.reduce(Action::RecordAssistantTurn {
         task_id: None,
         content: "a-rev".to_string(),
+        event_id: None,
     });
     let rev_snap = rev_effects
         .iter()
@@ -1238,7 +1241,7 @@ fn test_s2a_tool_call_chunk_interleave_consistency() {
 #[test]
 fn start_turn_default_guard_includes_the_uncommitted_request() {
     let mut state = s();
-    state.reduce(Action::RecordUserTurn("older input".into()));
+    state.reduce(Action::RecordUserTurn("older input".into(), None));
     let mut worker = state.session.history.clone();
     worker.push(ChatMessage::user("pending input"));
     let effects = state.reduce(Action::StartLLMTurn {

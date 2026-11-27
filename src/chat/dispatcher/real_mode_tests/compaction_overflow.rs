@@ -567,7 +567,7 @@ async fn resumed_compacted_session_does_not_call_summarizer_again() {
         PMsg::assistant(format!("old assistant {}", "long context ".repeat(80))),
     ];
     state.session.turns = durable_test_turns(&state.session.history);
-    let _ = state.reduce(Action::RecordUserTurn(current_question.to_string()));
+    let _ = state.reduce(Action::RecordUserTurn(current_question.to_string(), None));
     let guard = crate::agent::compaction::compaction_patch_guard_for(&state.session.history, 1, 3)
         .expect("test: compaction guard");
     let patch = crate::agent::turn_contracts::CompactionPatch {
@@ -1085,7 +1085,7 @@ async fn redux_compaction_guard_uses_persisted_source_when_provider_history_is_e
         }),
         "persisted guard source must not log a guard mismatch"
     );
-    let _ = reducer_state.reduce(Action::RecordUserTurn("current visible user".to_string()));
+    let _ = reducer_state.reduce(Action::RecordUserTurn("current visible user".to_string(), None));
     // The refresh aside lives only in the driver's provider projection.
     assert_eq!(
         driver_history
@@ -1215,7 +1215,7 @@ async fn redux_compaction_guard_source_is_inert_when_provider_history_is_not_enr
         compaction_config: config,
     });
     assert!(effects.iter().any(|effect| matches!(effect, Effect::SaveSession(_))));
-    let _ = reducer_state.reduce(Action::RecordUserTurn("current user".to_string()));
+    let _ = reducer_state.reduce(Action::RecordUserTurn("current user".to_string(), None));
     // The refresh aside lives only in the driver's provider projection.
     assert_eq!(
         driver_history

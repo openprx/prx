@@ -1367,14 +1367,15 @@ fn p4b1_ready_signal_is_noop_until_ordered_commit_dispatches_save() {
         "reason",
         false,
         true,
+        crate::chat::provider_turns::TurnEventIds::default(),
     )
     .expect("ordered history dispatch");
 
     let user = rx.try_recv().expect("ordered RecordUserTurn action");
     match user {
-        Action::RecordUserTurn(content) => {
+        Action::RecordUserTurn(content, event_id) => {
             assert_eq!(content, "question");
-            let effects = state.reduce(Action::RecordUserTurn(content));
+            let effects = state.reduce(Action::RecordUserTurn(content, event_id));
             assert!(
                 !effects.iter().any(|effect| matches!(effect, Effect::SaveSession(_))),
                 "RecordUserTurn alone must not save before terminal commit"
@@ -1385,10 +1386,18 @@ fn p4b1_ready_signal_is_noop_until_ordered_commit_dispatches_save() {
 
     let record = rx.try_recv().expect("ordered RecordAssistantTurn action");
     match record {
-        Action::RecordAssistantTurn { task_id: seen, content } => {
+        Action::RecordAssistantTurn {
+            task_id: seen,
+            content,
+            event_id,
+        } => {
             assert_eq!(seen, Some(task_id));
             assert_eq!(content, "answer");
-            let effects = state.reduce(Action::RecordAssistantTurn { task_id: seen, content });
+            let effects = state.reduce(Action::RecordAssistantTurn {
+                task_id: seen,
+                content,
+                event_id,
+            });
             assert!(
                 !effects.iter().any(|effect| matches!(effect, Effect::SaveSession(_))),
                 "RecordAssistantTurn alone must not save before terminal commit"

@@ -308,6 +308,7 @@ pub(super) async fn record_user_turn_at_admission(
     chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
     commits: &crate::chat::dispatcher::TurnCompletionSignal,
     user_input: &str,
+    user_event_id: Option<&str>,
 ) -> anyhow::Result<crate::chat::action::AdmissionId> {
     let admission = crate::chat::action::AdmissionId::next();
     chat_dispatcher
@@ -315,6 +316,7 @@ pub(super) async fn record_user_turn_at_admission(
             crate::chat::action::Action::UserTurnAdmitted {
                 admission,
                 content: user_input.to_owned(),
+                event_id: user_event_id.map(str::to_owned),
             },
             commits,
         )

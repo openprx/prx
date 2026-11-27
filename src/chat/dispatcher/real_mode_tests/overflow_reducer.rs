@@ -118,11 +118,11 @@ async fn overflow_patch_and_ordered_commit_preserve_one_pending_request() {
             let mut state = ChatState::new(Arc::from("ollama"), Arc::from("test-model"), CancellationToken::new());
             state.reduce(Action::RecordSystemMessage { content: "sys".into() });
             // An identical old input must not stand in for the pending request.
-            state.reduce(Action::RecordUserTurn(REQUEST.into()));
-            state.reduce(Action::RecordAssistantTurn { task_id: None, content: "older completed turn".into() });
+            state.reduce(Action::RecordUserTurn(REQUEST.into(), None));
+            state.reduce(Action::RecordAssistantTurn { task_id: None, content: "older completed turn".into(), event_id: None });
             for i in 0..12 {
-                state.reduce(Action::RecordUserTurn(format!("old input {i}")));
-                state.reduce(Action::RecordAssistantTurn { task_id: None, content: format!("old reply {i}") });
+                state.reduce(Action::RecordUserTurn(format!("old input {i}"), None));
+                state.reduce(Action::RecordAssistantTurn { task_id: None, content: format!("old reply {i}"), event_id: None });
             }
             let base = state.session.history.clone();
             let mut worker = base.clone();
@@ -161,7 +161,7 @@ async fn overflow_patch_and_ordered_commit_preserve_one_pending_request() {
             };
             assert!(saw_patch);
             let (dispatcher, mut commits) = ChatDispatcher::new();
-            crate::chat::provider_turns::dispatch_ordered_provider_turn_commit(&dispatcher, task, "prx-overflow-reducer", REQUEST, &final_text, &reasoning, false, true).expect("real ordered commit producer");
+            crate::chat::provider_turns::dispatch_ordered_provider_turn_commit(&dispatcher, task, "prx-overflow-reducer", REQUEST, &final_text, &reasoning, false, true, crate::chat::provider_turns::TurnEventIds::default()).expect("real ordered commit producer");
             let mut saved = None;
             while let Ok(action) = commits.try_recv() {
                 for effect in state.reduce(action) { if let Effect::SaveSession(session) = effect { saved = Some(session); } }
@@ -296,18 +296,20 @@ async fn redux_rollover_then_overflow_persists_one_switch_per_admitted_turn() {
                 let executor = EffectExecutor::new_with_deps(deps);
                 let mut state = ChatState::new(Arc::from("ollama"), Arc::from("test-model"), CancellationToken::new());
                 state.reduce(Action::RecordSystemMessage { content: "sys".into() });
-                state.reduce(Action::RecordUserTurn("older question".into()));
+                state.reduce(Action::RecordUserTurn("older question".into(), None));
                 state.reduce(Action::RecordAssistantTurn {
                     task_id: None,
                     content: "older completed turn".into(),
+                    event_id: None,
                 });
                 // Large old turns, so the cold window is a substantial part of
                 // the history the redux rollover replaces.
                 for i in 0..12 {
-                    state.reduce(Action::RecordUserTurn(format!("old input {i} ").repeat(60)));
+                    state.reduce(Action::RecordUserTurn(format!("old input {i} ").repeat(60), None));
                     state.reduce(Action::RecordAssistantTurn {
                         task_id: None,
                         content: format!("old reply {i} ").repeat(60),
+                        event_id: None,
                     });
                 }
                 let base = state.session.history.clone();

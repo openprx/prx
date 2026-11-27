@@ -308,6 +308,7 @@ async fn a_panicking_stream_fails_its_turn_once_and_the_chat_keeps_working() {
                     ANSWER,
                     false,
                     true,
+                    crate::chat::provider_turns::TurnEventIds::default(),
                 )
                 .await
                 .map_err(anyhow::Error::msg)?;
@@ -584,6 +585,7 @@ async fn a_panic_after_phase_two_keeps_the_committed_outcome_and_retires_the_lea
             ANSWER,
             false,
             true,
+            crate::chat::provider_turns::TurnEventIds::default(),
         )
         .await
         .expect("phase 2 commit acknowledged");
@@ -735,6 +737,7 @@ async fn a_cancel_between_the_commit_phases_lets_the_commit_finish() {
             ANSWER,
             false,
             true,
+            crate::chat::provider_turns::TurnEventIds::default(),
         ),
     )
     .await

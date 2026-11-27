@@ -67,7 +67,7 @@ fn s4_a_1_ui_dirty_true_on_record_user_turn_via_runtime_fallback() {
         effects: _effects,
         ui_dirty: dirty,
         ..
-    } = state.reduce_tracked(Action::RecordUserTurn("q".into()));
+    } = state.reduce_tracked(Action::RecordUserTurn("q".into(), None));
     assert!(!dirty, "RecordUserTurn must not set ui_dirty");
 }
 

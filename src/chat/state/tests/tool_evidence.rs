@@ -45,7 +45,7 @@ fn record_outcome(state: &mut ChatState, task_id: Option<TurnTaskId>, call: Call
 fn driver_exchange(state: &mut ChatState, scheduler: &mut TurnScheduler, question: &str, reply: &str, calls: &[Call]) {
     let task_id = scheduler.enqueue(question, TurnPriority::Normal, state.session.history.len());
     let sequence = scheduler.task(task_id).expect("test: scheduled task").sequence;
-    let _ = state.reduce(Action::RecordUserTurn(question.to_owned()));
+    let _ = state.reduce(Action::RecordUserTurn(question.to_owned(), None));
     start_driver_turn(state, task_id, sequence);
     for call in calls {
         let _ = record_outcome(state, Some(task_id), *call);
@@ -53,6 +53,7 @@ fn driver_exchange(state: &mut ChatState, scheduler: &mut TurnScheduler, questio
     let _ = state.reduce(Action::RecordAssistantTurn {
         task_id: Some(task_id),
         content: reply.to_owned(),
+        event_id: None,
     });
 }
 
@@ -158,7 +159,7 @@ fn driver_turn_records_outcomes_into_the_assistant_turn() {
 #[test]
 fn turn_without_start_llm_turn_records_no_evidence() {
     let mut state = s();
-    let _ = state.reduce(Action::RecordUserTurn("question".to_owned()));
+    let _ = state.reduce(Action::RecordUserTurn("question".to_owned(), None));
     let _ = state.reduce(Action::TurnStarted {
         draft_id: "legacy".to_owned(),
         cancel: CancellationToken::new(),
@@ -168,6 +169,7 @@ fn turn_without_start_llm_turn_records_no_evidence() {
     let _ = state.reduce(Action::RecordAssistantTurn {
         task_id: None,
         content: "answer".to_owned(),
+        event_id: None,
     });
 
     assert!(

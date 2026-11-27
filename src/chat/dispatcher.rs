@@ -3335,6 +3335,7 @@ async fn drive_start_turn_stream(
             .send(Action::RecordAssistantTurn {
                 task_id: provider_turn_task_id,
                 content: final_text.clone(),
+                event_id: None,
             })
             .await
             .is_err()

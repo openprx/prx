@@ -115,6 +115,13 @@ pub struct TurnTerminalReceipt {
 }
 
 impl TurnTerminalReceipt {
+    /// The event id of the assistant `message.created` row this terminal
+    /// stored (none when it stored no reply).
+    #[must_use]
+    pub fn assistant_event_id(&self) -> Option<String> {
+        self.assistant_event.as_ref().map(|event| event.event_id.clone())
+    }
+
     /// The turn's usage as a chat session records it, tagged with the class
     /// its cost settled as (CF-R8).
     #[must_use]

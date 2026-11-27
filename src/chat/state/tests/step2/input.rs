@@ -82,7 +82,7 @@ fn a_recorded_user_turn_opening_with_a_reserved_marker_stays_the_users() {
     ] {
         let text = format!("{marker} what about X?");
         let mut state = s();
-        let _ = state.reduce(Action::RecordUserTurn(text.clone()));
+        let _ = state.reduce(Action::RecordUserTurn(text.clone(), None));
         let last = state.session.history.last().expect("the recorded user turn");
         assert_eq!(last.role, "user");
         assert!(!last.content.starts_with(marker), "{marker}: `{}`", last.content);

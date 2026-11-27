@@ -62,9 +62,9 @@ pub(super) async fn attach_turn_records(
     sent: Option<&Attachment>,
     reply: Option<&str>,
 ) {
-    let principal = chat_runtime_envelope(workspace_id, chat_session_key).memory_principal();
     let replay = if reply.is_some() {
-        Transcript::new(memory, principal.clone())
+        let principal = chat_runtime_envelope(workspace_id, chat_session_key).memory_principal();
+        Transcript::new(memory, principal)
             .tool_log()
             .await
             .replay_of_run(run_id)
@@ -72,8 +72,7 @@ pub(super) async fn attach_turn_records(
     } else {
         None
     };
-    let (user_event_id, reply_event_id) = message_event_ids_of_run(memory, principal, run_id, reply.is_some()).await;
-    if sent.is_none() && replay.is_none() && user_event_id.is_none() && reply_event_id.is_none() {
+    if sent.is_none() && replay.is_none() {
         return;
     }
     // A failed acknowledgement latches the unconfirmed-commit stop itself.
@@ -81,8 +80,6 @@ pub(super) async fn attach_turn_records(
         .dispatch_awaited(
             super::action::Action::TurnRecordsAttached {
                 user_text: user_text.to_owned(),
-                user_event_id,
-                reply_event_id,
                 sent: sent.cloned(),
                 reply: reply.map(str::to_owned),
                 replay,
@@ -91,52 +88,6 @@ pub(super) async fn attach_turn_records(
         )
         .await;
 }
-
-/// The event ids of the user and assistant `message.created` rows run `run_id`
-/// stored, read from the newest rows of the session. A row is taken only when
-/// it carries the run id, so a turn never claims another turn's row; a read
-/// that fails or finds none gives `None`, and the turn keeps no id (its
-/// provenance then resolves by text, as before).
-async fn message_event_ids_of_run(
-    memory: &dyn Memory,
-    principal: crate::memory::MemoryPrincipal,
-    run_id: &str,
-    with_reply: bool,
-) -> (Option<String>, Option<String>) {
-    let rows = match memory
-        .load_recent_session_context(crate::memory::SessionContextQuery {
-            principal,
-            since_event_id: None,
-            limit: RUN_MESSAGE_ROW_WINDOW,
-            include_roles: vec!["user".to_owned(), "assistant".to_owned()],
-        })
-        .await
-    {
-        Ok(rows) => rows,
-        Err(error) => {
-            tracing::debug!(
-                error = %crate::agent::diagnostics::error_class(&error),
-                "message rows of the turn unavailable; its turns record no event id"
-            );
-            return (None, None);
-        }
-    };
-    let newest_of = |role: &str| {
-        rows.iter()
-            .filter(|event| {
-                event.event_type == "message.created" && event.role == role && event.run_id.as_deref() == Some(run_id)
-            })
-            .max_by_key(|event| event.id)
-            .map(|event| event.event_id.clone())
-    };
-    (
-        newest_of("user"),
-        if with_reply { newest_of("assistant") } else { None },
-    )
-}
-
-/// Newest user and assistant rows read to find the rows of one turn.
-const RUN_MESSAGE_ROW_WINDOW: usize = 16;
 
 /// A loaded session, projected from its MessageEvent rows: the sent form of
 /// each user turn and the tool rounds of each reply come from the durable log.

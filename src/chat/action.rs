@@ -555,32 +555,36 @@ pub enum Action {
     /// Switch to the given session
     SessionSwitched { id: String },
     /// Ask the reducer to persist the user turn (writes session.turns + LLM history)
-    RecordUserTurn(String),
+    /// `event_id` is the id of the stored `message.created` row of the request,
+    /// when the caller has it; the turn keeps it.
+    RecordUserTurn(String, Option<String>),
     /// Record a turn's request at admission, before the turn runs (the
     /// inline path). The admission stays open until the turn commits; a
     /// failed or cancelled turn removes exactly this request, once.
-    UserTurnAdmitted { admission: AdmissionId, content: String },
+    UserTurnAdmitted {
+        admission: AdmissionId,
+        content: String,
+        event_id: Option<String>,
+    },
     /// After a turn's commit: attach what the runtime kept of the turn to the
     /// stored turns it just recorded, so the provider view replays them as the
     /// turn had them. `sent` is the form the user's request was sent in; it goes
     /// to the newest user turn holding `user_text` that has none. `replay` holds
     /// the tool rounds of the run that made `reply`; it goes to the newest
-    /// assistant turn when that turn is exactly `reply`. `user_event_id` and
-    /// `reply_event_id` are the event ids of the turn's stored rows; each
-    /// goes to the same turn as the text it belongs to, and only when that
-    /// turn has no event id yet.
+    /// assistant turn when that turn is exactly `reply`.
     TurnRecordsAttached {
         user_text: String,
-        user_event_id: Option<String>,
-        reply_event_id: Option<String>,
         sent: Option<crate::context::transcript::Attachment>,
         reply: Option<String>,
         replay: Option<std::sync::Arc<crate::context::transcript::TurnReplay>>,
     },
     /// Ask the reducer to persist the assistant turn (writes session.turns + LLM history)
+    /// `event_id` is the id of the stored `message.created` row of the reply,
+    /// when the caller has it; the turn keeps it.
     RecordAssistantTurn {
         task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
         content: String,
+        event_id: Option<String>,
     },
     /// Ask the reducer to append one system message to `session.history` (for cases such as rebuilding
     /// the system prompt after `/clear`).
@@ -780,7 +784,7 @@ impl Action {
             Self::Awaited { action, .. } => action.kind(),
             Self::SessionSaved { .. } => "SessionSaved",
             Self::SessionSwitched { .. } => "SessionSwitched",
-            Self::RecordUserTurn(_) => "RecordUserTurn",
+            Self::RecordUserTurn(..) => "RecordUserTurn",
             Self::UserTurnAdmitted { .. } => "UserTurnAdmitted",
             Self::TurnRecordsAttached { .. } => "TurnRecordsAttached",
             Self::RecordAssistantTurn { .. } => "RecordAssistantTurn",

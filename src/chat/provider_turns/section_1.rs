@@ -78,6 +78,8 @@ pub(super) struct PerTurnContext {
     pub(super) draft_updater: Option<tokio::task::JoinHandle<()>>,
     pub(super) tool_event_forwarder: Option<tokio::task::JoinHandle<()>>,
     pub(super) user_input: String,
+    /// The event id of the stored `message.created` row of the request.
+    pub(super) user_event_id: Option<String>,
     /// The form the request was sent in (see [`crate::chat::turn_replay`]).
     pub(super) sent: Option<crate::context::transcript::Attachment>,
     pub(super) turn_run_id: String,
@@ -857,6 +859,15 @@ pub(super) fn enqueue_provider_turn_finalizer_event(
     queue.push_back(ProviderTurnFinalizerEvent { task_id, plan });
 }
 
+/// The event ids of the stored `message.created` rows of one turn, known when
+/// its records are committed: the turn records them with their text, so no
+/// later step has to find the row again.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct TurnEventIds<'a> {
+    pub(super) user: Option<&'a str>,
+    pub(super) assistant: Option<&'a str>,
+}
+
 /// The terminal action of an ordered provider-turn commit.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum OrderedCommitTerminal<'a> {
@@ -878,10 +889,11 @@ fn dispatch_ordered_turn_records(
     final_text: &str,
     empty_response: bool,
     record_user: bool,
+    event_ids: TurnEventIds<'_>,
 ) -> std::result::Result<(), String> {
     if record_user {
         let result = chat_dispatcher.dispatch_or_log(
-            crate::chat::action::Action::RecordUserTurn(user_input.to_string()),
+            crate::chat::action::Action::RecordUserTurn(user_input.to_string(), event_ids.user.map(str::to_owned)),
             "chat.ordered_record_user_turn",
         );
         if !matches!(result, dispatcher::DispatchResult::Sent) {
@@ -893,6 +905,7 @@ fn dispatch_ordered_turn_records(
             crate::chat::action::Action::RecordAssistantTurn {
                 task_id: Some(task_id),
                 content: final_text.to_string(),
+                event_id: event_ids.assistant.map(str::to_owned),
             },
             "chat.ordered_record_assistant_turn",
         );
@@ -913,6 +926,7 @@ pub(super) fn dispatch_ordered_provider_turn_commit(
     reasoning: &str,
     empty_response: bool,
     record_user: bool,
+    event_ids: TurnEventIds<'_>,
 ) -> std::result::Result<(), String> {
     dispatch_ordered_turn_records(
         chat_dispatcher,
@@ -921,6 +935,7 @@ pub(super) fn dispatch_ordered_provider_turn_commit(
         final_text,
         empty_response,
         record_user,
+        event_ids,
     )?;
     let result = chat_dispatcher.dispatch_or_log(
         crate::chat::action::Action::StreamCompleted {
@@ -945,6 +960,7 @@ pub(super) async fn dispatch_ordered_provider_turn_commit_and_wait(
     final_text: &str,
     empty_response: bool,
     record_user: bool,
+    event_ids: TurnEventIds<'_>,
 ) -> std::result::Result<(), String> {
     let result = match terminal {
         #[cfg(feature = "terminal-tui")]
@@ -959,6 +975,7 @@ pub(super) async fn dispatch_ordered_provider_turn_commit_and_wait(
                 reasoning,
                 empty_response,
                 record_user,
+                event_ids,
             )
             .await
         }
@@ -972,6 +989,7 @@ pub(super) async fn dispatch_ordered_provider_turn_commit_and_wait(
                 final_text,
                 empty_response,
                 record_user,
+                event_ids,
             )
             .await
         }
@@ -996,6 +1014,7 @@ async fn dispatch_stream_completed_commit_and_wait(
     reasoning: &str,
     empty_response: bool,
     record_user: bool,
+    event_ids: TurnEventIds<'_>,
 ) -> std::result::Result<(), String> {
     // The first task-scoped notification means the provider produced its
     // terminal payload. The ordered StreamCompleted below is a distinct phase:
@@ -1023,6 +1042,7 @@ async fn dispatch_stream_completed_commit_and_wait(
         reasoning,
         empty_response,
         record_user,
+        event_ids,
     ) {
         turn_signal.unregister_turn(task_id);
         turn_signal.fail_history_commit(error.clone());
@@ -1071,6 +1091,7 @@ async fn dispatch_turn_commit_requested_and_wait(
     final_text: &str,
     empty_response: bool,
     record_user: bool,
+    event_ids: TurnEventIds<'_>,
 ) -> std::result::Result<(), String> {
     if let Err(error) = dispatch_ordered_turn_records(
         chat_dispatcher,
@@ -1079,6 +1100,7 @@ async fn dispatch_turn_commit_requested_and_wait(
         final_text,
         empty_response,
         record_user,
+        event_ids,
     ) {
         turn_signal.fail_history_commit(error.clone());
         return Err(error);
@@ -1146,7 +1168,7 @@ async fn commit_completed_provider_turn(
     // finalizer runs. Re-reading the live disposition here would therefore
     // reject every successful provider-backed turn. Use the immutable
     // pre-execution classification carried with the turn instead.
-    let (provider_outcome, terminal_usage) = {
+    let (provider_outcome, terminal_usage, assistant_event_id) = {
         let provider_outcome = if let Some(binding) = pending.turn_binding.as_ref() {
             match binding.provider_outcome(&pending.route_decision, pending.provider_started_at) {
                 Ok(outcome) => outcome,
@@ -1162,7 +1184,7 @@ async fn commit_completed_provider_turn(
                 redux_tokens_used.clone(),
             )
         };
-        let terminal_usage = match finalize_chat_success_turn(
+        let (terminal_usage, assistant_event_id) = match finalize_chat_success_turn(
             pending.turn_binding.as_deref(),
             memory_fabric,
             chat_session_key,
@@ -1183,13 +1205,20 @@ async fn commit_completed_provider_turn(
         )
         .await
         {
-            Ok(receipt) => receipt.into_session_usage(),
+            Ok(receipt) => {
+                let assistant_event_id = receipt.assistant_event_id();
+                (receipt.into_session_usage(), assistant_event_id)
+            }
             Err(error) => {
                 tracing::error!(error = %crate::agent::diagnostics::error_class(&error), "Chat terminal persistence is unconfirmed");
                 return false;
             }
         };
-        (Some(provider_outcome), terminal_usage)
+        (Some(provider_outcome), terminal_usage, assistant_event_id)
+    };
+    let event_ids = TurnEventIds {
+        user: pending.user_event_id.as_deref(),
+        assistant: assistant_event_id.as_deref(),
     };
     let finished_at = provider_outcome
         .as_ref()
@@ -1233,6 +1262,7 @@ async fn commit_completed_provider_turn(
             &final_text,
             empty_response,
             true,
+            event_ids,
         )
         .await;
         if let Err(error) = persistence_result {
@@ -1303,6 +1333,7 @@ async fn commit_completed_provider_turn(
         &final_text,
         empty_response,
         true,
+        event_ids,
     )
     .await;
     if let Err(error) = persistence_result {

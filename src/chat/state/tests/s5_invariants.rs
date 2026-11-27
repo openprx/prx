@@ -18,7 +18,7 @@ fn s5_invariant_determinism_same_actions_same_state() {
                 text: "banner".to_string(),
             },
             Action::UserMessageEchoed("hi".to_string()),
-            Action::RecordUserTurn("hi".to_string()),
+            Action::RecordUserTurn("hi".to_string(), None),
             Action::TurnStarted {
                 draft_id: "d1".to_string(),
                 cancel: CancellationToken::new(),
@@ -26,6 +26,7 @@ fn s5_invariant_determinism_same_actions_same_state() {
             Action::RecordAssistantTurn {
                 task_id: None,
                 content: "ok".to_string(),
+                event_id: None,
             },
             Action::StreamCompleted {
                 draft_id: "d1".to_string(),
@@ -62,11 +63,11 @@ fn s5_invariant_determinism_same_actions_same_state() {
 #[test]
 fn s5_invariant_idempotent_duplicate_dispatch() {
     let mut state = fresh_state();
-    let _ = state.reduce(Action::RecordUserTurn("q".to_string()));
+    let _ = state.reduce(Action::RecordUserTurn("q".to_string(), None));
     let turns_after_first = state.session.turns.len();
     let history_after_first = state.session.history.len();
     // in the real architecture a repeated dispatch double-writes — the reducer's current contract
-    let _ = state.reduce(Action::RecordUserTurn("q".to_string()));
+    let _ = state.reduce(Action::RecordUserTurn("q".to_string(), None));
     assert!(
         state.session.turns.len() > turns_after_first,
         "RecordUserTurn is not idempotent: a repeated dispatch appends a turn (chat::run avoids repeats)"
@@ -81,7 +82,7 @@ fn s5_invariant_idempotent_duplicate_dispatch() {
 #[test]
 fn s5_invariant_cancel_no_partial_save() {
     let mut state = fresh_state();
-    let _ = state.reduce(Action::RecordUserTurn("q".to_string()));
+    let _ = state.reduce(Action::RecordUserTurn("q".to_string(), None));
     let _ = state.reduce(Action::TurnStarted {
         draft_id: "d-cancel".to_string(),
         cancel: CancellationToken::new(),

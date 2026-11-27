@@ -32,7 +32,7 @@ use super::output::{print_fallback_chat_output, render_response, should_resend_o
 use super::plain_queue::{lines_queued_since, settle_queued_lines};
 use super::provider_turns::{
     OrderedCommitTerminal, PROVIDER_TURN_LIFECYCLE_CHANNEL_CAPACITY, ProviderTurnCompletionContext,
-    ProviderTurnCompletionEvent, acknowledged_session_barrier, dispatch_final_usage,
+    ProviderTurnCompletionEvent, TurnEventIds, acknowledged_session_barrier, dispatch_final_usage,
     dispatch_ordered_provider_turn_commit_and_wait, finish_inline_provider_turn,
     gate_cancelled_provider_turn_finalization, gate_failed_provider_turn_finalization, inline_provider_turn_payload,
     mark_provider_turn_completed, provider_turn_visible_admission, provider_view_after_settled_abort,

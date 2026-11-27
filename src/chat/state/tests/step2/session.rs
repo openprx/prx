@@ -452,7 +452,7 @@ fn test_redux_record_user_turn_grows_history() {
     assert_eq!(state.session.turns.len(), 0);
     assert_eq!(state.session.history.len(), 0);
     assert!(state.session.title.is_empty(), "the initial title is empty");
-    let effects = state.reduce(Action::RecordUserTurn("what is Rust?".to_string()));
+    let effects = state.reduce(Action::RecordUserTurn("what is Rust?".to_string(), None));
     assert_eq!(state.session.turns.len(), 1, "turns grew");
     assert_eq!(state.session.history.len(), 1, "history grew");
     assert_eq!(
@@ -483,7 +483,7 @@ fn test_redux_record_user_turn_grows_history() {
 fn test_redux_record_user_turn_no_overwrite_existing_title() {
     let mut state = s();
     state.session.title = "My Chat".to_string();
-    let _ = state.reduce(Action::RecordUserTurn("second question".to_string()));
+    let _ = state.reduce(Action::RecordUserTurn("second question".to_string(), None));
     assert_eq!(
         state.session.title, "My Chat",
         "an existing title must not be overwritten"
@@ -494,10 +494,11 @@ fn test_redux_record_user_turn_no_overwrite_existing_title() {
 #[test]
 fn test_redux_record_assistant_turn_grows_history() {
     let mut state = s();
-    let _ = state.reduce(Action::RecordUserTurn("hello".to_string()));
+    let _ = state.reduce(Action::RecordUserTurn("hello".to_string(), None));
     let effects = state.reduce(Action::RecordAssistantTurn {
         task_id: None,
         content: "Rust is fast.".to_string(),
+        event_id: None,
     });
     assert_eq!(state.session.turns.len(), 2, "turns grew to 2");
     assert_eq!(state.session.history.len(), 2, "history grew to 2");
@@ -770,7 +771,7 @@ fn post_compaction_refresh_not_persisted_as_session_turn() {
         crate::providers::ChatMessage::user("old user"),
         crate::providers::ChatMessage::assistant("old assistant"),
     ];
-    let _ = state.reduce(Action::RecordUserTurn(current_question.to_string()));
+    let _ = state.reduce(Action::RecordUserTurn(current_question.to_string(), None));
     let guard = crate::agent::compaction::compaction_patch_guard_for(&state.session.history, 1, 3).expect("guard");
     let patch = crate::agent::turn_contracts::CompactionPatch {
         replacement: vec![crate::providers::ChatMessage::assistant(
@@ -796,6 +797,7 @@ fn post_compaction_refresh_not_persisted_as_session_turn() {
     let _ = state.reduce(Action::RecordAssistantTurn {
         task_id: None,
         content: assistant_reply.to_string(),
+        event_id: None,
     });
 
     assert_eq!(

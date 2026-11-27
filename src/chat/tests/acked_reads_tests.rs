@@ -77,20 +77,23 @@ fn state_with_sanitized_content() -> ChatState {
         Action::SetLeadingSystemPrompt {
             content: SYSTEM.to_owned(),
         },
-        Action::RecordUserTurn(format!("deploy key {SECRET}")),
+        Action::RecordUserTurn(format!("deploy key {SECRET}"), None),
         Action::RecordAssistantTurn {
             task_id: None,
             content: oversized_reply(),
+            event_id: None,
         },
-        Action::RecordUserTurn("q2".to_owned()),
+        Action::RecordUserTurn("q2".to_owned(), None),
         Action::RecordAssistantTurn {
             task_id: None,
             content: "a2".to_owned(),
+            event_id: None,
         },
-        Action::RecordUserTurn(format!("rotate {SECRET}")),
+        Action::RecordUserTurn(format!("rotate {SECRET}"), None),
         Action::RecordAssistantTurn {
             task_id: None,
             content: oversized_reply(),
+            event_id: None,
         },
     ];
     for action in actions {
@@ -290,7 +293,7 @@ async fn two_summary_compactions_in_a_row_are_both_compacted() {
         for (question, answer) in [("q4", "a4"), ("q5", "a5"), ("q6", "a6")] {
             let _ = harness
                 .dispatcher
-                .dispatch_awaited(Action::RecordUserTurn(question.to_owned()), &harness.commits)
+                .dispatch_awaited(Action::RecordUserTurn(question.to_owned(), None), &harness.commits)
                 .await
                 .expect("test: question recorded");
             let _ = harness
@@ -299,6 +302,7 @@ async fn two_summary_compactions_in_a_row_are_both_compacted() {
                     Action::RecordAssistantTurn {
                         task_id: None,
                         content: answer.to_owned(),
+                        event_id: None,
                     },
                     &harness.commits,
                 )
@@ -365,9 +369,10 @@ async fn preflight_compaction_over_sanitized_past_turns_is_acknowledged_with_the
         let request = "q4";
         let enriched = ChatMessage::user(format!("[Memory context]\n{request}"));
         // The run loop queues the request before the preflight.
-        let _ = harness
-            .dispatcher
-            .dispatch_or_log(Action::RecordUserTurn(request.to_owned()), "test.record_user_turn");
+        let _ = harness.dispatcher.dispatch_or_log(
+            Action::RecordUserTurn(request.to_owned(), None),
+            "test.record_user_turn",
+        );
         let source = persisted_history_for_current_turn(&saved.session, SYSTEM, request);
         let mut provider_view = source.messages().to_vec();
         if let Some(last) = provider_view.last_mut() {
@@ -405,7 +410,7 @@ async fn preflight_compaction_over_sanitized_past_turns_is_acknowledged_with_the
         );
         let mut reference = state_with_sanitized_content();
         let _ = reference.reduce(Action::ModeChanged(crate::agent::turn_contracts::ChatMode::Plan));
-        let _ = reference.reduce(Action::RecordUserTurn(request.to_owned()));
+        let _ = reference.reduce(Action::RecordUserTurn(request.to_owned(), None));
         let _ = reference.reduce(Action::HistoryCompactionPatchApplied {
             reason: CompactReason::ContextOverflow,
             patch,
@@ -440,7 +445,7 @@ async fn reads_right_after_the_seed_a_resume_and_a_mode_change_see_the_new_value
     tokio::time::timeout(DEADLINE, async {
         let (_dir, memory) = sqlite_memory();
         let mut state = TestSessionDispatcher::state_with_history(Vec::new());
-        let _ = state.reduce(Action::RecordUserTurn("seeded turn".to_owned()));
+        let _ = state.reduce(Action::RecordUserTurn("seeded turn".to_owned(), None));
         let seeded_id = state.session.id.clone();
         let harness = TestSessionDispatcher::spawn(memory, state);
         let mut reader = harness.dispatcher.session_reader();
@@ -527,15 +532,17 @@ fn first_load_state() -> ChatState {
         Action::SetLeadingSystemPrompt {
             content: SYSTEM.to_owned(),
         },
-        Action::RecordUserTurn("first q1".to_owned()),
+        Action::RecordUserTurn("first q1".to_owned(), None),
         Action::RecordAssistantTurn {
             task_id: None,
             content: "first a1".to_owned(),
+            event_id: None,
         },
-        Action::RecordUserTurn("first q2".to_owned()),
+        Action::RecordUserTurn("first q2".to_owned(), None),
         Action::RecordAssistantTurn {
             task_id: None,
             content: "first a2".to_owned(),
+            event_id: None,
         },
     ] {
         let _ = state.reduce(action);
@@ -1021,6 +1028,7 @@ async fn the_admission_record_waits_for_a_full_channel_and_the_commit_includes_t
             &dispatcher,
             &commits,
             "the admitted request",
+            None,
         ));
         let waits_while_full = futures::poll!(admission.as_mut()).is_pending();
         let harness = parked.start();
@@ -1034,6 +1042,7 @@ async fn the_admission_record_waits_for_a_full_channel_and_the_commit_includes_t
             "the reply",
             false,
             false,
+            crate::chat::provider_turns::TurnEventIds::default(),
         )
         .await;
         let published = harness.dispatcher.session_publisher().current();
@@ -1089,6 +1098,7 @@ async fn an_admission_record_the_full_channel_never_accepts_fails_the_turn_once(
             &parked.dispatcher,
             &parked.commits,
             "the refused request",
+            None,
         )
         .await;
         let latched = parked.commits.ensure_history_commits_healthy();
@@ -1144,6 +1154,7 @@ async fn a_draftless_failure_after_an_in_turn_compaction_is_settled_saved_and_pu
             &harness.dispatcher,
             &harness.commits,
             ABORTED_REQUEST,
+            None,
         )
         .await
         .expect("test: admission recorded");
@@ -1222,12 +1233,13 @@ async fn a_settlement_after_the_draft_terminal_removes_nothing_more_and_saves() 
             TestSessionDispatcher::state_with_history(vec![ChatMessage::system("sys")]),
         );
         let dispatch = |action: Action| harness.dispatcher.dispatch_awaited(action, &harness.commits);
-        dispatch(Action::RecordUserTurn("the earlier question".to_owned()))
+        dispatch(Action::RecordUserTurn("the earlier question".to_owned(), None))
             .await
             .expect("test: earlier question");
         dispatch(Action::RecordAssistantTurn {
             task_id: None,
             content: "the earlier answer".to_owned(),
+            event_id: None,
         })
         .await
         .expect("test: earlier answer");
@@ -1235,6 +1247,7 @@ async fn a_settlement_after_the_draft_terminal_removes_nothing_more_and_saves() 
         dispatch(Action::UserTurnAdmitted {
             admission,
             content: ABORTED_REQUEST.to_owned(),
+            event_id: None,
         })
         .await
         .expect("test: admission");
@@ -1304,6 +1317,7 @@ async fn a_turn_with_identity_shapes_is_acknowledged_and_saved_byte_identical() 
             IDENTITY_SHAPED_REPLY_TEXT,
             false,
             true,
+            crate::chat::provider_turns::TurnEventIds::default(),
         )
         .await;
         let acknowledged = harness.commits.history_commit_acknowledged(task_id);

@@ -36,7 +36,7 @@ async fn full_chat_flow_input_to_exit() {
         DispatchResult::Sent
     );
     assert_eq!(
-        dispatcher.try_dispatch(Action::RecordUserTurn("hello".to_string())),
+        dispatcher.try_dispatch(Action::RecordUserTurn("hello".to_string(), None)),
         DispatchResult::Sent
     );
 
@@ -74,6 +74,7 @@ async fn full_chat_flow_input_to_exit() {
         dispatcher.try_dispatch(Action::RecordAssistantTurn {
             task_id: None,
             content: "hello user, response complete".to_string(),
+            event_id: None,
         }),
         DispatchResult::Sent
     );

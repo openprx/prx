@@ -744,7 +744,7 @@ async fn redux_driver_preflight_emits_injection_overbudget_diagnostic_without_hi
             Action::StreamCompleted { final_text, .. } => {
                 saw_completion = final_text.contains("diagnostic-ok");
             }
-            Action::RecordUserTurn(content) => {
+            Action::RecordUserTurn(content, _) => {
                 assert!(
                     !content.contains("HIDDEN_FILE_SENTINEL"),
                     "driver must not persist enriched user content"

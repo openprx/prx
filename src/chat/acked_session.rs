@@ -439,7 +439,7 @@ mod tests {
             let mut state = TestSessionDispatcher::state_with_history(Vec::new());
             let _ = state.reduce(crate::chat::action::Action::RecordUserTurn(format!(
                 "deploy key {secret}"
-            )));
+            ), None));
             let session_id = state.session.id.clone();
             let harness = TestSessionDispatcher::spawn(Arc::clone(&memory), state);
             let mut reader = harness.dispatcher.session_reader();
@@ -542,7 +542,7 @@ mod tests {
             let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
             let task_id = scheduler.enqueue("q", crate::chat::turn_scheduler::TurnPriority::Normal, 0);
             let mut state = TestSessionDispatcher::state_with_history(Vec::new());
-            let _ = state.reduce(crate::chat::action::Action::RecordUserTurn("q".to_owned()));
+            let _ = state.reduce(crate::chat::action::Action::RecordUserTurn("q".to_owned(), None));
             let harness = TestSessionDispatcher::spawn(memory, state);
             let commit = crate::chat::action::Action::TurnCommitRequested {
                 task_id,
@@ -578,7 +578,7 @@ mod tests {
             let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
             let task_id = scheduler.enqueue("q", crate::chat::turn_scheduler::TurnPriority::Normal, 0);
             let mut state = TestSessionDispatcher::state_with_history(Vec::new());
-            let _ = state.reduce(crate::chat::action::Action::RecordUserTurn("q".to_owned()));
+            let _ = state.reduce(crate::chat::action::Action::RecordUserTurn("q".to_owned(), None));
             let harness = TestSessionDispatcher::spawn(memory, state);
             let acknowledged_before = harness.commits.history_commit_acknowledged(task_id);
 
@@ -591,6 +591,7 @@ mod tests {
                 "pong",
                 false,
                 false,
+                crate::chat::provider_turns::TurnEventIds::default(),
             )
             .await;
             let acknowledged_after = harness.commits.history_commit_acknowledged(task_id);
