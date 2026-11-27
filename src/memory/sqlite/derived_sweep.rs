@@ -49,6 +49,8 @@ pub(super) struct ErasedIdentifiers {
 struct MatchedRow {
     event_id: String,
     document_id: Option<String>,
+    /// The call the result answers, when the row names it.
+    call: Option<CallRef>,
 }
 
 /// Replace the printed text of listing-tool results in `workspace_id` that
@@ -78,6 +80,8 @@ pub(super) fn rewrite_listings(
     }
     let documents = rewrite_rows(tx, &rows, LISTING_REMOVED_TEXT, now)?;
     delete_unquoted_documents(tx, &documents)?;
+    let calls: Vec<CallRef> = rows.iter().filter_map(|row| row.call.clone()).collect();
+    rewrite_call_terminals(tx, &calls, LISTING_REMOVED_TEXT, now)?;
     Ok(rows.len())
 }
 
@@ -105,7 +109,8 @@ fn select_listing_rows(
     let identifiers_json = serde_json::to_string(identifiers)?;
     let tools = serde_json::to_string(&LISTING_TOOLS)?;
     let mut statement = tx.prepare(
-        "SELECT event_id, json_extract(raw_payload_json, '$.document.document_id'), content
+        "SELECT event_id, json_extract(raw_payload_json, '$.document.document_id'), content,
+                workspace_id, run_id, json_extract(raw_payload_json, '$.call_id')
          FROM message_events
          WHERE workspace_id = ?1 AND event_type = 'tool.result.recorded' AND id > ?2
            AND json_valid(raw_payload_json)
@@ -118,12 +123,15 @@ fn select_listing_rows(
             let event_id: rusqlite::types::Value = row.get(0)?;
             let document_id: rusqlite::types::Value = row.get(1)?;
             let content: rusqlite::types::Value = row.get(2)?;
-            Ok((event_id, document_id, content))
+            let workspace: rusqlite::types::Value = row.get(3)?;
+            let run_id: rusqlite::types::Value = row.get(4)?;
+            let call_id: rusqlite::types::Value = row.get(5)?;
+            Ok((event_id, document_id, content, workspace, run_id, call_id))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows
         .into_iter()
-        .filter_map(|(event_id, document_id, content)| {
+        .filter_map(|(event_id, document_id, content, workspace, run_id, call_id)| {
             let (Value::Text(event_id), Value::Text(content)) = (event_id, content) else {
                 return None;
             };
@@ -132,10 +140,8 @@ fn select_listing_rows(
                 .any(|id| names_identifier(&content, id))
                 .then(|| MatchedRow {
                     event_id,
-                    document_id: match document_id {
-                        Value::Text(text) => Some(text),
-                        _ => None,
-                    },
+                    document_id: text_of(document_id),
+                    call: call_ref(workspace, run_id, call_id),
                 })
         })
         .collect())
@@ -245,6 +251,12 @@ pub(super) struct MemoryProbe {
     /// workspace.
     owner_id: Option<String>,
     key: String,
+    /// `redact_secrets(key)` when redaction changes the key: the stored copy of
+    /// a result prints the key in that form.
+    key_redacted: Option<String>,
+    /// True for a memory with neither workspace nor owner: its copies are
+    /// rewritten only when no surviving memory of the key is visible to the row.
+    unscoped: bool,
     /// Creation time of the memory in UTC, cut to whole seconds (a prefix of
     /// every later UTC timestamp of the same second); empty when it does not
     /// parse, which widens the time bound to every row. No result older than
@@ -253,13 +265,14 @@ pub(super) struct MemoryProbe {
 }
 
 impl MemoryProbe {
-    /// The probe of a memory; `None` for an empty key, and for a memory with
-    /// neither workspace nor owner (no result can be attributed to it safely,
-    /// and a match would reach other owners' history).
+    /// The probe of a memory; `None` for an empty key.
     fn new(workspace_id: Option<String>, owner_id: Option<String>, key: String, created_at: &str) -> Option<Self> {
-        if key.is_empty() || (workspace_id.is_none() && owner_id.is_none()) {
+        if key.is_empty() {
             return None;
         }
+        let redacted = crate::security::redaction::redact_secrets(&key);
+        let key_redacted = (redacted != key && !redacted.is_empty()).then_some(redacted);
+        let unscoped = workspace_id.is_none() && owner_id.is_none();
         let created_utc = chrono::DateTime::parse_from_rfc3339(created_at)
             .map(|time| time.with_timezone(&chrono::Utc).format("%Y-%m-%dT%H:%M:%S").to_string())
             .unwrap_or_default();
@@ -267,6 +280,8 @@ impl MemoryProbe {
             workspace_id,
             owner_id,
             key,
+            key_redacted,
+            unscoped,
             created_utc,
         })
     }
@@ -277,28 +292,55 @@ impl MemoryProbe {
             && self.owner_id.as_deref().is_none_or(|own| owner == Some(own))
     }
 
-    /// True when the printed `output` of `tool` holds a memory entry of this
-    /// key in the form the tool prints it:
-    /// - `memory_recall` (`tools/memory_recall.rs`): `- [category] key: content`;
-    /// - `memory_search` (`tools/memory_search.rs`): a line `- key: key`;
-    /// - `memory_get` (`tools/memory_get.rs`, `render_range`): the output starts
-    ///   with `key lines a-b:` (or `key is empty.`).
-    fn named_in(&self, tool: &str, output: &str) -> bool {
-        let key = self.key.as_str();
-        match tool {
-            "memory_recall" => {
-                let entry = format!("] {key}: ");
-                let bare = format!("] {key}:");
-                output
-                    .lines()
-                    .any(|line| line.starts_with("- [") && (line.contains(&entry) || line.ends_with(&bare)))
-            }
-            "memory_search" => output.lines().any(|line| line.strip_prefix("- key: ") == Some(key)),
-            "memory_get" => output.strip_prefix(key).is_some_and(|rest| {
-                rest.starts_with(" lines ") || rest == " is empty." || rest.starts_with(" is empty.\n")
-            }),
-            _ => false,
+    /// True when a row of `workspace` and `owner` that names this memory
+    /// should be rewritten: always for a scoped probe; for an unscoped one only
+    /// when no memory of the key survives that the row's owner can see (the
+    /// output can then only have quoted the forgotten one). Call after the
+    /// memory is deleted.
+    fn applies(&self, tx: &Connection, workspace: Option<&str>, owner: Option<&str>) -> anyhow::Result<bool> {
+        if !self.unscoped {
+            return Ok(true);
         }
+        let survives: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM memories WHERE key = ?1
+                 AND (workspace_id IS NULL OR workspace_id = ?2) AND (owner_id IS NULL OR owner_id = ?3))",
+            params![self.key, workspace, owner],
+            |row| row.get(0),
+        )?;
+        Ok(!survives)
+    }
+
+    /// True when `output` of `tool` holds an entry of this memory, by its key
+    /// or by its redacted form.
+    fn named_in(&self, tool: &str, output: &str) -> bool {
+        named_key(&self.key, tool, output)
+            || self
+                .key_redacted
+                .as_deref()
+                .is_some_and(|key| named_key(key, tool, output))
+    }
+}
+
+/// True when the printed `output` of `tool` holds a memory entry of `key` in
+/// the form the tool prints it:
+/// - `memory_recall` (`tools/memory_recall.rs`): `- [category] key: content`;
+/// - `memory_search` (`tools/memory_search.rs`): a line `- key: key`;
+/// - `memory_get` (`tools/memory_get.rs`, `render_range`): the output starts
+///   with `key lines a-b:` (or `key is empty.`).
+fn named_key(key: &str, tool: &str, output: &str) -> bool {
+    match tool {
+        "memory_recall" => {
+            let entry = format!("] {key}: ");
+            let bare = format!("] {key}:");
+            output
+                .lines()
+                .any(|line| line.starts_with("- [") && (line.contains(&entry) || line.ends_with(&bare)))
+        }
+        "memory_search" => output.lines().any(|line| line.strip_prefix("- key: ") == Some(key)),
+        "memory_get" => output.strip_prefix(key).is_some_and(|rest| {
+            rest.starts_with(" lines ") || rest == " is empty." || rest.starts_with(" is empty.\n")
+        }),
+        _ => false,
     }
 }
 
@@ -356,7 +398,14 @@ pub(super) fn rewrite_memory_copies(tx: &Connection, probes: &[MemoryProbe], now
     };
     let wanted: Vec<serde_json::Value> = probes
         .iter()
-        .map(|probe| serde_json::json!({ "workspace": probe.workspace_id, "owner": probe.owner_id, "key": probe.key }))
+        .map(|probe| {
+            serde_json::json!({
+                "workspace": probe.workspace_id,
+                "owner": probe.owner_id,
+                "key": probe.key,
+                "key_redacted": probe.key_redacted,
+            })
+        })
         .collect();
     let probes_json = serde_json::to_string(&wanted)?;
     let tools = serde_json::to_string(&MEMORY_TOOLS)?;
@@ -370,7 +419,9 @@ pub(super) fn rewrite_memory_copies(tx: &Connection, probes: &[MemoryProbe], now
            AND typeof(content) = 'text' AND json_valid(raw_payload_json)
            AND json_extract(raw_payload_json, '$.tool') IN (SELECT value FROM json_each(?3))
            AND EXISTS (SELECT 1 FROM json_each(?2) j
-                       WHERE instr(message_events.content, json_extract(j.value, '$.key')) > 0
+                       WHERE (instr(message_events.content, json_extract(j.value, '$.key')) > 0
+                              OR instr(message_events.content, COALESCE(json_extract(j.value, '$.key_redacted'), '\u{1}')) > 0
+                              OR json_type(message_events.raw_payload_json, '$.document.document_id') = 'text')
                          AND (json_extract(j.value, '$.workspace') IS NULL
                               OR message_events.workspace_id = json_extract(j.value, '$.workspace'))
                          AND (json_extract(j.value, '$.owner') IS NULL
@@ -393,36 +444,51 @@ pub(super) fn rewrite_memory_copies(tx: &Connection, probes: &[MemoryProbe], now
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(statement);
     let mut rows: Vec<MatchedRow> = Vec::new();
-    let mut calls: Vec<CallRef> = Vec::new();
     for [event_id, document_id, content, tool, workspace, owner, run_id, call_id] in found {
         let (Value::Text(event_id), Value::Text(content), Value::Text(tool)) = (event_id, content, tool) else {
             continue;
         };
-        let (workspace, owner) = (text_of(workspace), text_of(owner));
-        if !probes
-            .iter()
-            .any(|probe| probe.covers(workspace.as_deref(), owner.as_deref()) && probe.named_in(&tool, &content))
-        {
-            continue;
+        let document_id = text_of(document_id);
+        let (workspace_text, owner) = (text_of(workspace.clone()), text_of(owner));
+        let mut document_text: Option<Option<String>> = None;
+        let mut matched = false;
+        for probe in probes {
+            if !probe.covers(workspace_text.as_deref(), owner.as_deref()) {
+                continue;
+            }
+            let names = probe.named_in(&tool, &content)
+                || document_id.as_deref().is_some_and(|document| {
+                    // The entry may sit past the inline part: read the stored
+                    // document once per row, only when the inline text does not
+                    // name the memory.
+                    if document_text.is_none() {
+                        document_text = Some(stored_document_text(tx, document));
+                    }
+                    document_text
+                        .as_ref()
+                        .and_then(Option::as_deref)
+                        .is_some_and(|text| probe.named_in(&tool, text))
+                });
+            if names && probe.applies(tx, workspace_text.as_deref(), owner.as_deref())? {
+                matched = true;
+                break;
+            }
         }
-        if let (Some(workspace), Some(call_id)) = (workspace, text_of(call_id)) {
-            calls.push(CallRef {
-                workspace,
-                run_id: text_of(run_id),
-                call_id,
+        if matched {
+            rows.push(MatchedRow {
+                event_id,
+                document_id,
+                call: call_ref(workspace, run_id, call_id),
             });
         }
-        rows.push(MatchedRow {
-            event_id,
-            document_id: text_of(document_id),
-        });
     }
     let mut rewritten = 0usize;
     if !rows.is_empty() {
         let documents = rewrite_rows(tx, &rows, MEMORY_REMOVED_TEXT, now)?;
         delete_unquoted_documents(tx, &documents)?;
         rewritten = rows.len();
-        rewritten = rewritten.saturating_add(rewrite_call_terminals(tx, &calls, now)?);
+        let calls: Vec<CallRef> = rows.iter().filter_map(|row| row.call.clone()).collect();
+        rewritten = rewritten.saturating_add(rewrite_call_terminals(tx, &calls, MEMORY_REMOVED_TEXT, now)?);
     }
     Ok(rewritten.saturating_add(rewrite_write_calls(tx, probes, now)?))
 }
@@ -435,7 +501,37 @@ fn text_of(value: Value) -> Option<String> {
     }
 }
 
+/// The stored tool-output document of a result, its chunks joined in order;
+/// the `untrusted:` variant is read too. `None` when there is none or it
+/// cannot be read: the row is then judged by its inline text only.
+fn stored_document_text(tx: &Connection, document_id: &str) -> Option<String> {
+    let mut statement = tx
+        .prepare(
+            "SELECT content FROM document_chunks
+             WHERE document_id IN (?1, 'untrusted:' || ?1) ORDER BY document_id, chunk_index",
+        )
+        .ok()?;
+    let chunks = statement
+        .query_map(params![document_id], |row| row.get::<_, Value>(0))
+        .ok()?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .ok()?;
+    let texts: Vec<String> = chunks.into_iter().filter_map(text_of).collect();
+    (!texts.is_empty()).then(|| texts.join("\n"))
+}
+
+/// The call of a tool result: its workspace, run and call id; `None` without
+/// a workspace and call id.
+fn call_ref(workspace: Value, run_id: Value, call_id: Value) -> Option<CallRef> {
+    Some(CallRef {
+        workspace: text_of(workspace)?,
+        run_id: text_of(run_id),
+        call_id: text_of(call_id)?,
+    })
+}
+
 /// The call of a rewritten tool result: its workspace, run and call id.
+#[derive(Clone)]
 struct CallRef {
     workspace: String,
     run_id: Option<String>,
@@ -449,7 +545,7 @@ struct CallRef {
 /// key: same workspace and run, and `outcome.operation_id` equal to the call
 /// id (`agent/tool_scheduler.rs` uses the call id as operation id). A row with
 /// an unparseable payload or no outcome object is left as it is.
-fn rewrite_call_terminals(tx: &Connection, calls: &[CallRef], now: &str) -> anyhow::Result<usize> {
+fn rewrite_call_terminals(tx: &Connection, calls: &[CallRef], text: &str, now: &str) -> anyhow::Result<usize> {
     let mut rewritten = 0usize;
     for call in calls {
         let updated = tx.execute(
@@ -461,7 +557,7 @@ fn rewrite_call_terminals(tx: &Connection, calls: &[CallRef], now: &str) -> anyh
              WHERE workspace_id = ?1 AND event_type = 'tool.execution.finalized' AND run_id IS ?2
                AND json_valid(raw_payload_json) AND json_type(raw_payload_json, '$.outcome') = 'object'
                AND json_extract(raw_payload_json, '$.outcome.operation_id') = ?3",
-            params![call.workspace, call.run_id, call.call_id, MEMORY_REMOVED_TEXT, now],
+            params![call.workspace, call.run_id, call.call_id, text, now],
         )?;
         rewritten = rewritten.saturating_add(updated);
     }
@@ -513,10 +609,17 @@ fn rewrite_write_calls(tx: &Connection, probes: &[MemoryProbe], now: &str) -> an
             continue;
         };
         let (workspace, owner) = (text_of(workspace), text_of(owner));
-        if !probes
-            .iter()
-            .any(|probe| key == probe.key && probe.covers(workspace.as_deref(), owner.as_deref()))
-        {
+        let mut applies = false;
+        for probe in probes {
+            if key == probe.key
+                && probe.covers(workspace.as_deref(), owner.as_deref())
+                && probe.applies(tx, workspace.as_deref(), owner.as_deref())?
+            {
+                applies = true;
+                break;
+            }
+        }
+        if !applies {
             continue;
         }
         let updated = tx.execute(
