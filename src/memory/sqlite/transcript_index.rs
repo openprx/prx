@@ -24,8 +24,9 @@
 //!    `next_after = 0` in [`FILL_TABLE`], and creates the three triggers. From
 //!    then on new and changed rows are kept in the index by the triggers.
 //! 2. Each batch transaction indexes the next rows with ids in
-//!    `(next_after, boundary]` (at most [`BATCH_ROWS`] rows and about
-//!    [`BATCH_CHARS`] characters) from their current content and moves the
+//!    `(next_after, boundary]` (at most 500 rows, [`BATCH_ROWS`], and about
+//!    256 KiB of content, [`BATCH_CHARS`], whichever comes first) from their
+//!    current content and moves the
 //!    cursor past them. The cursor is persisted with the batch, so a restart
 //!    resumes where the last committed batch ended.
 //! 3. The transaction that finds no row left drops [`FILL_TABLE`] and replaces
@@ -85,11 +86,11 @@ const FILL_TABLE: &str = "transcript_index_fill";
 const TOKENIZER_CLAUSE: &str = "tokenize='trigram'";
 
 /// Most rows one batch transaction indexes.
-const BATCH_ROWS: i64 = 2_000;
+const BATCH_ROWS: i64 = 500;
 
 /// Characters of content after which a batch stops taking further rows (it
 /// always takes at least one), so a run of very long rows keeps the batch short.
-const BATCH_CHARS: i64 = 2 * 1024 * 1024;
+const BATCH_CHARS: i64 = 256 * 1024;
 
 /// Shortest and longest pause between two batches. The pause is the last
 /// batch's duration within these bounds, so the fill holds the write lock at
