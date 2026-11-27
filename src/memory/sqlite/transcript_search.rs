@@ -38,6 +38,28 @@ const WHOLE_ROW_MAX_CHARS: usize = 65_536;
 /// first match (the region starts at the row start when no match is found).
 const REGION_SIDE_CHARS: usize = 4_096;
 
+/// The deletion exclusions of a transcript row aliased `e`: the row is not in
+/// an erase-fenced scope, its scope (if any) belongs to an active incarnation,
+/// and no rf delete covers it (a message delete covers the input and every row
+/// of its run; a reply delete covers the run's rows except the input). A delete
+/// of a live run sets `deleted_at` at once and only defers the row rewrite
+/// (`erase_pending`), so the row is excluded from that moment. Shared by the
+/// search and by [`SqliteMemory::excluded_transcript_rows_impl`], so both apply
+/// the same predicate.
+const SEARCHABLE_ROW_SQL: &str = "NOT EXISTS (SELECT 1 FROM agent_erase_fences f WHERE f.scope_id = e.ma_scope_id)
+                   AND (e.ma_scope_id IS NULL OR EXISTS (
+                        SELECT 1 FROM agent_scopes s
+                        JOIN agent_incarnations i
+                          ON i.workspace_id = s.workspace_id AND i.owner_id = s.owner_id
+                         AND i.agent_key = s.agent_key AND i.incarnation = s.incarnation
+                        WHERE s.scope_id = e.ma_scope_id AND i.state = 'active'))
+                   AND NOT EXISTS (SELECT 1 FROM rf_message_attempts a
+                        WHERE a.workspace_id = e.workspace_id AND a.owner_id = e.owner_id
+                          AND ((a.deleted_at IS NOT NULL
+                                AND (a.message_event_id = e.event_id OR a.run_id = e.run_id))
+                            OR (a.reply_deleted_at IS NOT NULL AND a.run_id = e.run_id
+                                AND a.message_event_id <> e.event_id)))";
+
 /// Index objects and their initial fill, run once in one write transaction.
 ///
 /// Failure semantics: an error inside a trigger aborts the statement that fired
@@ -187,19 +209,7 @@ impl SqliteMemory {
                    AND (?{session_marker} IS NULL OR e.session_key = ?{session_marker})
                    AND e.event_type = 'message.created'
                    AND e.role IN ('user', 'assistant')
-                   AND NOT EXISTS (SELECT 1 FROM agent_erase_fences f WHERE f.scope_id = e.ma_scope_id)
-                   AND (e.ma_scope_id IS NULL OR EXISTS (
-                        SELECT 1 FROM agent_scopes s
-                        JOIN agent_incarnations i
-                          ON i.workspace_id = s.workspace_id AND i.owner_id = s.owner_id
-                         AND i.agent_key = s.agent_key AND i.incarnation = s.incarnation
-                        WHERE s.scope_id = e.ma_scope_id AND i.state = 'active'))
-                   AND NOT EXISTS (SELECT 1 FROM rf_message_attempts a
-                        WHERE a.workspace_id = e.workspace_id AND a.owner_id = e.owner_id
-                          AND ((a.deleted_at IS NOT NULL
-                                AND (a.message_event_id = e.event_id OR a.run_id = e.run_id))
-                            OR (a.reply_deleted_at IS NOT NULL AND a.run_id = e.run_id
-                                AND a.message_event_id <> e.event_id))){partition_sql}
+                   AND {SEARCHABLE_ROW_SQL}{partition_sql}
                  ORDER BY {order_sql}
                  LIMIT ?{limit_marker}",
                 owner_marker = first + 1,
@@ -221,6 +231,40 @@ impl SqliteMemory {
                 })
             })?;
             rows.collect::<rusqlite::Result<Vec<_>>>().map_err(anyhow::Error::from)
+        })
+        .await?
+    }
+
+    /// The ids among `row_ids` (`message_events.id`) of rows the search leaves
+    /// out for deletion: [`SEARCHABLE_ROW_SQL`] does not hold for them. Ids
+    /// with no row are not returned. Reads no content.
+    pub(super) async fn excluded_transcript_rows_impl(&self, row_ids: &[i64]) -> anyhow::Result<HashSet<i64>> {
+        if row_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let row_ids = row_ids.to_vec();
+        let pool = self.pool.clone();
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<HashSet<i64>> {
+            let reader = pool.read()?;
+            let conn = reader.connection()?;
+            let mut excluded = HashSet::new();
+            // Chunks stay far below SQLite's bound-variable limit.
+            for chunk in row_ids.chunks(500) {
+                let markers = (1..=chunk.len())
+                    .map(|at| format!("?{at}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "SELECT e.id FROM message_events e
+                     WHERE e.id IN ({markers}) AND NOT ({SEARCHABLE_ROW_SQL})"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| row.get::<_, i64>(0))?;
+                for row in rows {
+                    excluded.insert(row?);
+                }
+            }
+            Ok(excluded)
         })
         .await?
     }

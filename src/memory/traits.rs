@@ -1,7 +1,7 @@
 pub(crate) const MESSAGE_EVENT_BATCH_LIMIT: usize = 32;
 
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::memory::backend::MemoryBackendKind;
 use crate::memory::principal::MemoryWriteContext;
@@ -1315,6 +1315,18 @@ pub trait Memory: Send + Sync {
     ) -> anyhow::Result<Vec<TranscriptHit>> {
         let _ = (principal, query, session_key, limit);
         Ok(Vec::new())
+    }
+
+    /// The ids among `row_ids` (`MessageEvent::id`) of transcript rows that
+    /// [`Memory::search_transcripts`] leaves out for deletion: rows whose rf
+    /// message or reply was deleted (also while the deleted run is still live
+    /// and its rows keep their content), rows of erased scopes and rows of
+    /// inactive incarnations. A scan that searches pages of rows itself (the
+    /// encrypted scope) skips these. Reads no content. Backends without rf
+    /// deletes or agent erasure (Postgres among them) exclude nothing.
+    async fn excluded_transcript_rows(&self, row_ids: &[i64]) -> anyhow::Result<HashSet<i64>> {
+        let _ = row_ids;
+        Ok(HashSet::new())
     }
 
     /// Build the transcript index now, so the first search does not. Backends

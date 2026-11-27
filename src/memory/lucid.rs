@@ -303,6 +303,10 @@ impl Memory for LucidMemory {
             .await
     }
 
+    async fn excluded_transcript_rows(&self, row_ids: &[i64]) -> anyhow::Result<std::collections::HashSet<i64>> {
+        self.local.excluded_transcript_rows(row_ids).await
+    }
+
     async fn warm_transcript_index(&self) -> anyhow::Result<()> {
         self.local.warm_transcript_index().await
     }

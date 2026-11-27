@@ -1336,6 +1336,10 @@ impl Memory for SqliteMemory {
         self.search_transcripts_impl(principal, query, session_key, limit).await
     }
 
+    async fn excluded_transcript_rows(&self, row_ids: &[i64]) -> anyhow::Result<std::collections::HashSet<i64>> {
+        self.excluded_transcript_rows_impl(row_ids).await
+    }
+
     async fn warm_transcript_index(&self) -> anyhow::Result<()> {
         self.warm_transcript_index_impl().await
     }

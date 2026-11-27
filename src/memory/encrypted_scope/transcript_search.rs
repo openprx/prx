@@ -68,12 +68,19 @@ impl EncryptedScope {
             if let Some(oldest) = page.iter().map(|event| event.id).min() {
                 before_id = oldest;
             }
+            // Rows the store's own search leaves out for deletion (rf message
+            // or reply deletes, including those of a still-live run whose rows
+            // keep their sealed content, erased scopes, inactive incarnations)
+            // are left out here too.
+            let row_ids: Vec<i64> = page.iter().map(|event| event.id).collect();
+            let excluded = self.inner.excluded_transcript_rows(&row_ids).await?;
             for event in page {
                 if hits.len() >= limit {
                     break;
                 }
                 if event.event_type != "message.created"
                     || !matches!(event.role.as_str(), "user" | "assistant")
+                    || excluded.contains(&event.id)
                     || !self.owns_event(&event)
                 {
                     continue;
