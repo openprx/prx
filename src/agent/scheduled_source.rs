@@ -42,6 +42,10 @@ pub(crate) struct ScheduledResultMeta {
     /// Whether the creator was the local operator (`prx xin add`, `prx cron`, or
     /// an agent in the terminal).
     pub(crate) local_operator: bool,
+    /// Whether the stored task row names an owner. An empty or blank owner
+    /// counts as none; the admission envelope always carries a resolved owner,
+    /// so the row's owner must be read from the task itself.
+    pub(crate) has_owner: bool,
 }
 
 /// The result-row metadata of the scheduled invocation this call runs inside.
@@ -52,6 +56,7 @@ pub(crate) fn current_result_meta() -> Option<ScheduledResultMeta> {
             name: origin.name.clone(),
             deliver: origin.deliver,
             local_operator: origin.origin.is_local_operator(),
+            has_owner: origin.owner_id.as_deref().is_some_and(|owner| !owner.trim().is_empty()),
         })
         .ok()
 }

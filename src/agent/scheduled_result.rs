@@ -19,10 +19,11 @@ const EXCERPT_CHARS: usize = 400;
 /// Writes the result row of the scheduled invocation this call runs inside.
 ///
 /// Nothing is written outside a scheduled invocation or for a job or task whose
-/// deliver mode is `none`. A run with no owner writes only when the local
-/// operator created it: its row goes to the terminal owner's Main partition, so
-/// `prx chat` shows it. The row carries the reply excerpt on success and only
-/// the error class on failure.
+/// deliver mode is `none`. The owner is chosen from the task's stored owner: a
+/// task with an owner writes under the run's envelope scope. A task with no
+/// owner writes only when the local operator created it: its row goes to the
+/// terminal owner's Main partition, so `prx chat` shows it. The row carries the
+/// reply excerpt on success and only the error class on failure.
 pub(crate) async fn record(
     memory: &Arc<dyn Memory>,
     config: &Config,
@@ -36,7 +37,7 @@ pub(crate) async fn record(
     if meta.deliver == ScheduledDeliver::None || envelope.task_id.as_deref() != Some(meta.task_id.as_str()) {
         return;
     }
-    let scope = if envelope.owner_id.is_some() {
+    let scope = if meta.has_owner {
         envelope.message_scope()
     } else if meta.local_operator {
         terminal_result_envelope(envelope).message_scope()
