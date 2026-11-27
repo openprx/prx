@@ -359,15 +359,15 @@ impl ReplayLog {
         self.run_of_event.get(event_id).map(String::as_str)
     }
 
-    /// The stored turns as history messages, in order: each user message with
-    /// its stored attachment's tail (the prefix is not replayed), each assistant
-    /// reply preceded by the tool rounds of its run. Event ids line up with the
-    /// messages, `None` for a replayed tool message.
     /// Whether a read window of [`REPLAY_ROW_LIMIT`] rows came back full.
     pub(crate) const fn window_full(&self) -> bool {
         self.window_full
     }
 
+    /// The stored turns as history messages, in order: each user message with
+    /// its stored attachment's tail (the prefix is not replayed), each assistant
+    /// reply preceded by the tool rounds of its run. Event ids line up with the
+    /// messages, `None` for a replayed tool message.
     pub(crate) fn expand_turns(&self, turns: Vec<ConversationTurn>) -> History {
         let mut out = History::default();
         let mut replayed_runs: HashSet<&str> = HashSet::new();

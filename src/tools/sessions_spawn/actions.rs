@@ -471,7 +471,7 @@ impl SessionsSpawnTool {
             })
             .collect();
         let tool_rows_note = if window_full {
-            "\n\n[older tool rows not shown: the read window of 500 rows is full]"
+            "\n\n[older tool rows may not be shown: the read window of 500 rows is full]"
         } else {
             ""
         };
