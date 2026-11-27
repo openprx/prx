@@ -235,14 +235,14 @@ impl ChildSegmentTurn {
             self.proof.policy_chat_type(),
         );
         let recall_budget = crate::context::api::open::replayed_recall_budget(self.compaction().max_context_tokens);
-        let mut enriched = crate::agent::context_recall::replayed_session_recall(
+        let recall = crate::agent::context_recall::replayed_session_recall(
             self.recall_memory.as_ref(),
             &scope,
             self.proof.routing_input(),
             recall_budget,
         )
-        .await
-        .preamble;
+        .await;
+        let mut enriched = crate::security::redaction::redact_secrets(&recall.preamble);
         enriched.push_str(&input.content);
         crate::agent::turn_contracts::push_current_time_tail(&mut enriched);
         *input = crate::agent::turn_contracts::inbound_user_message(&enriched);
