@@ -876,6 +876,7 @@ impl ToolExecutionService {
             "delegate" => Some("delegate"),
             "sessions_spawn" => Some("sessions_spawn"),
             "sessions_send" => Some("sessions_send"),
+            "mcp_call" => Some("mcp_call"),
             _ => None,
         };
         let child_call_context = child_tool_name.map(|tool_name| ChildCallContext {
