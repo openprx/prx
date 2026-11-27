@@ -639,6 +639,8 @@ objects, array items, `patternProperties`, an `additionalProperties` schema and
 the taken side of an `if` / `then` / `else` are all covered. A non-integral
 value is a violation and is rejected, never rewritten.
 
+Before validation the service drops every `null` on a declared property that is not in its object's `required` list and whose own schema does not accept `null`, so the validator and the tool both see the key as absent; a `null` on a required property is still rejected.
+
 Compilation is bounded. `$ref` resolution unwinds its stack, so a non-cyclic
 document that references the same definition from many places can expand
 exponentially, and MCP or WASM contracts are caller-supplied. Past the node and

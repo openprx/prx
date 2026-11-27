@@ -1450,6 +1450,9 @@ pub fn strip_runtime_only_args(root: &mut serde_json::Map<String, serde_json::Va
 /// keys are removed first because the runtime authors them after validation and
 /// they are intentionally absent from public schemas.
 ///
+/// Before validation, `null` on non-required declared properties is dropped (see
+/// [`crate::tools::schema::CompiledToolSchema::drop_null_optional_properties`]).
+///
 /// On success the arguments are normalized in place — see
 /// [`crate::tools::schema::CompiledToolSchema::normalize_integral_numbers`].
 /// That is why this takes `&mut`: enforcement is not only a verdict.
@@ -1469,6 +1472,9 @@ pub(crate) fn enforce_command_contract(
     if !arguments.is_object() {
         return Err("tool arguments must be a JSON object".to_string());
     }
+    // A `null` on an optional property means "not sent": drop it so the
+    // validator and the tool both see the key as absent.
+    compiled.drop_null_optional_properties(arguments);
     let issues =
         crate::tools::schema::with_public_arguments(arguments, |public| compiled.validate_tool_arguments(public));
     if !issues.is_empty() {
@@ -1586,4 +1592,3 @@ fn insert_optional(map: &mut serde_json::Map<String, serde_json::Value>, key: &s
         map.insert(key.to_string(), serde_json::Value::String(value.to_string()));
     }
 }
-
