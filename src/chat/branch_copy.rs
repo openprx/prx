@@ -100,6 +100,13 @@ pub(super) async fn copy_branch_transcript(
                 tracing::debug!("memory backend has no branch copy; branch keeps no transcript rows");
                 Ok(())
             }
+            Err(error) if missing_source_row(&error).is_some() => {
+                warn_missing_row(
+                    &error,
+                    "a retained row is missing from the source session; the branch starts without transcript copies",
+                );
+                Ok(())
+            }
             Err(error) => Err(error),
         };
     };
@@ -113,7 +120,17 @@ pub(super) async fn copy_branch_transcript(
     let newest_handoff_id = note_str(&newest_note, "handoff_event_id")
         .ok_or(BranchCopyError::HandoffNote("the branch handoff has no event id"))?
         .to_string();
-    plan.handoff_batches = handoff_chain_batches(mem, &source, &plan, newest_note).await?;
+    plan.handoff_batches = match handoff_chain_batches(mem, &source, &plan, newest_note).await {
+        Ok(batches) => batches,
+        Err(error) if missing_source_row(&error).is_some() => {
+            warn_missing_row(
+                &error,
+                "a handoff row is missing from the source session; the branch is created from its visible turns without a copied handoff chain",
+            );
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     plan.final_batch.original_event_ids.push(newest_handoff_id.clone());
     match retained_turn_event_ids(mem, &source, branch, Some(handoff_index), &recorded_ids).await {
         Ok(retained) => plan.final_batch.original_event_ids.extend(retained),
@@ -129,7 +146,45 @@ pub(super) async fn copy_branch_transcript(
     }
     plan.check_bounds()?;
 
-    let result = mem.copy_events_for_branch(plan).await?;
+    let result = match mem.copy_events_for_branch(plan.clone()).await {
+        Ok(result) => result,
+        Err(error) => {
+            let Some(missing) = missing_source_row(&error) else {
+                return Err(error);
+            };
+            // The failed copy rolled back. A missing retained row only costs
+            // the retained-turn copies; a missing handoff-chain row leaves the
+            // branch without a copied chain.
+            let retained_missing = plan
+                .final_batch
+                .original_event_ids
+                .get(1..)
+                .is_some_and(|retained| retained.contains(&missing));
+            if !retained_missing {
+                warn_missing_row(
+                    &error,
+                    "a handoff row is missing from the source session; the branch is created from its visible turns without a copied handoff chain",
+                );
+                return Ok(());
+            }
+            warn_missing_row(
+                &error,
+                "a retained row is missing from the source session; the branch keeps its handoff chain without retained-turn copies",
+            );
+            plan.final_batch.original_event_ids.truncate(1);
+            match mem.copy_events_for_branch(plan).await {
+                Ok(result) => result,
+                Err(error) if missing_source_row(&error).is_some() => {
+                    warn_missing_row(
+                        &error,
+                        "a handoff row is missing from the source session; the branch is created from its visible turns without a copied handoff chain",
+                    );
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    };
     let copied = result
         .newest_handoff
         .filter(|copied| copied.original_event_id == newest_handoff_id)
@@ -140,6 +195,20 @@ pub(super) async fn copy_branch_transcript(
         .ok_or(BranchCopyError::InvalidPlan("the handoff turn is out of range"))?;
     turn.content = copied.content;
     Ok(())
+}
+
+/// The id of the row a branch copy reported missing from the source session.
+fn missing_source_row(error: &anyhow::Error) -> Option<String> {
+    match error.downcast_ref::<BranchCopyError>() {
+        Some(BranchCopyError::SourceRowMissing { event_id }) => Some(event_id.clone()),
+        _ => None,
+    }
+}
+
+/// One payload-free warning for a row the source session does not hold.
+fn warn_missing_row(error: &anyhow::Error, message: &str) {
+    let (error_len, error_sha256) = crate::agent::diagnostics::tool_parse_log_digest(&error.to_string());
+    tracing::warn!(error_len, error_sha256, "{message}");
 }
 
 fn is_handoff_turn(turn: &session::ChatTurn) -> bool {
