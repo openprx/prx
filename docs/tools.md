@@ -2275,12 +2275,18 @@ acknowledge the URI on its `subscriptions/listen` answer (for example at its str
 is reported as declined, and PRX does not retry until a new subscribe.
 
 - One `subscriptions/listen` stream serves every session of the process that subscribed to the
-  same (server, URI). A second subscriber gets `"shared": true`. The last unsubscribe ends the
+  same (server, URI). A subscribe gets `"shared": true` when another session of the same owner
+  already subscribed to it; subscribers of other owners are never revealed. A subscribe, also one
+  that joins a live stream, is refused when the calling registry no longer serves the server
+  (removed from the configuration or retired by a reload). The last unsubscribe ends the
   stream and cancels its request on the wire.
 - `list` and `status` add a `subscriptions` array for the calling session: one entry per
   subscription with `server`, `uri`, `state` (`active`, `reconnecting` or `declined`), `since`,
   `updates`, `last_update_at`, `last_error` while reconnecting, and `last_outage_secs` once the
-  stream has come back after an outage (the length of that outage, in whole seconds). Without a session context
+  stream has come back after an outage (the length of that outage, in whole seconds). `updates`,
+  `last_update_at` and `last_outage_secs` count only the time since this session subscribed. The
+  `uri` in `status` has its credentials redacted (userinfo, query values and fragment); notices keep
+  the URI as subscribed so their suggested read call works. Without a session context
   (a direct tool call with no receipt) subscribe and unsubscribe fail with "subscribe needs a
   session context", and the field is omitted.
 - A stream that ends (graceful or abrupt end, or an error) is reopened with backoff: 1 s,
@@ -2290,18 +2296,24 @@ is reported as declined, and PRX does not retry until a new subscribe.
   waits at least its `Retry-After` (seconds or an HTTP date) when the server sent one with a 429 or
   5xx answer. A reconnect whose acknowledgment lacks the URI marks the stream `declined` and keeps
   its subscribers, with no further attempt. A server that is removed from the configuration, retired
-  by a reload, or no longer declares the capability loses its streams with one warning.
+  by a reload, or no longer declares the capability loses its streams with one warning. When no live
+  registry serves the workspace any more (for example after `workspace_dir` changed on reload), its
+  streams end at the next reconnect or within 30 s, and their subscribers get an "ended" notice.
 - Subscriptions live in memory for the life of the PRX process. A restart forgets them, and nothing
-  is persisted. The update counts are kept per stream. A session served by a process worker
+  is persisted. The update counts are kept per subscriber. A session served by a process worker
   subscribes inside that worker process, so its subscriptions live in that worker and end with it.
 - Notices reach the subscribing session's mailbox, so an idle session wakes and starts a turn, and a
   busy one reads the notice after its turn. Each notice is a short text naming the server, the URI
-  and a count or a reason; it never carries resource contents. The sender is a notifier session
+  and a count or a reason; it never carries resource contents. The server and URI appear as JSON
+  strings and the suggested `mcp_call` arguments are serialized JSON, so a quote or line break in a
+  URI cannot change the text around it. The sender is a notifier session
   `mcp:notify:<agent>` of the same owner, and the message continues the chain of the subscribe call,
   so a turn woken by a notice keeps the wake depth of that subscribe call plus one.
   - Update notices are coalesced per subscriber and (server, URI): at most one per 2 s, and the
     updates of a window are counted into the next notice. No update is dropped.
-    A turn that changes the resource it watches gets the next notice at most every 2 s.
+    A session that changes a resource it watches wakes itself with the next notice at most every
+    2 s, and that self-wake has no depth limit of its own (accepted design: each notice continues the
+    chain of the subscribe call, not of the turn it wakes).
   - A subscription made in a mailbox chain at depth 7 or more is stored, but its notices do not start
     a turn (the existing depth below 8 rule); the subscriber reads them with its next turn.
   - After an outage the stream is back, each subscriber gets one "resumed" notice with the outage
@@ -2309,7 +2321,8 @@ is reported as declined, and PRX does not retry until a new subscribe.
     (declined on reconnect, server removed, legacy server, capability dropped) each subscriber gets
     one "ended" notice; subscribe again to retry.
   - A subscriber whose session is not found is removed from its subscription only when the second
-    attempt in a row also finds no session; the first records `receiver not found`. Delivery needs the
+    attempt in a row also finds no session; the first records `receiver not found`. Notices that were
+    in flight together count as one attempt, and a re-subscribe clears the count. Delivery needs the
     SQLite memory backend and `inbound` enabled for the subscriber's agent; otherwise the notice is
     not sent, `status` shows it under `undelivered` with the reason, and one warning is logged per
     server and reason.
