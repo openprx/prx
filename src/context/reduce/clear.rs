@@ -54,8 +54,9 @@ fn stub_tool_name(name: &str) -> Option<&str> {
 }
 
 /// A stored-document id as `tool_output_document_id` writes it:
-/// `tool-output:<tool name>:<16 lowercase hex digits>`, the tool name the one
-/// the stub names.
+/// `tool-output:<name part>:<16 lowercase hex digits>`, the name part the one
+/// `tool_output_id_name` gives for the raw tool name (the name itself when it is
+/// safe, a hash of it otherwise).
 fn is_tool_output_document_id(id: &str, tool: &str) -> bool {
     let Some(rest) = id.strip_prefix("tool-output:") else {
         return false;
@@ -63,9 +64,11 @@ fn is_tool_output_document_id(id: &str, tool: &str) -> bool {
     let Some((name, digest)) = rest.rsplit_once(':') else {
         return false;
     };
-    name == tool
+    name == crate::agent::document_ingest::tool_output_id_name(tool)
         && digest.len() == 16
-        && digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// The one-line text a cleared result is replaced by, on every surface. The
@@ -73,18 +76,17 @@ fn is_tool_output_document_id(id: &str, tool: &str) -> bool {
 /// PRX writes them in; otherwise the name is `unknown` and the output is said
 /// not to be kept.
 pub(crate) fn cleared_result_text(tool: &str, status: &str, bytes: u64, document_id: Option<&str>) -> String {
-    let tool = stub_tool_name(tool);
+    let shown = stub_tool_name(tool);
     let status = if status == "error" { "error" } else { "ok" };
     let lookup = document_id
-        .zip(tool)
-        .filter(|(id, tool)| is_tool_output_document_id(id, tool))
+        .filter(|id| is_tool_output_document_id(id, tool))
         .map_or_else(
             || "the output is not kept in view; run the tool again if it is needed".to_owned(),
-            |(id, _)| format!("full output stored as document {id}, read it with document_get_chunk"),
+            |id| format!("full output stored as document {id}, read it with document_get_chunk"),
         );
     format!(
         "{CLEARED_PREFIX} tool {}, status {status}, {bytes} bytes; {lookup}]",
-        tool.unwrap_or("unknown")
+        shown.unwrap_or("unknown")
     )
 }
 

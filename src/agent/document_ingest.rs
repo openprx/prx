@@ -216,6 +216,25 @@ impl DocumentIngestRuntime {
     }
 }
 
+/// The longest tool name a document id carries as written.
+const MAX_ID_TOOL_NAME_BYTES: usize = 64;
+
+/// The tool-name part of a tool-output document id. A safe name (1..=64 bytes
+/// of `[A-Za-z0-9_.-]`) is written as it is; any other name becomes
+/// `t-<first 16 hex digits of sha256(name)>`, so the id never carries free text.
+pub(crate) fn tool_output_id_name(tool_name: &str) -> String {
+    let safe = !tool_name.is_empty()
+        && tool_name.len() <= MAX_ID_TOOL_NAME_BYTES
+        && tool_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'));
+    if safe {
+        return tool_name.to_owned();
+    }
+    let digest = hex::encode(sha2::Sha256::digest(tool_name.as_bytes()));
+    format!("t-{}", digest.get(..16).unwrap_or(&digest))
+}
+
 pub(crate) fn tool_output_document_id(tool_name: &str, content: &str) -> (String, String) {
     let mut hasher = sha2::Sha256::new();
     hasher.update(tool_name.as_bytes());
@@ -224,7 +243,10 @@ pub(crate) fn tool_output_document_id(tool_name: &str, content: &str) -> (String
     let digest = hasher.finalize();
     let sha256 = hex::encode(digest);
     let short = sha256.get(..16).unwrap_or(&sha256);
-    (format!("tool-output:{tool_name}:{short}"), sha256)
+    (
+        format!("tool-output:{}:{short}", tool_output_id_name(tool_name)),
+        sha256,
+    )
 }
 
 pub(crate) async fn persist_tool_output_document(
