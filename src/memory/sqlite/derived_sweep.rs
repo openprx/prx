@@ -5,6 +5,7 @@
 //! the memory is forgotten the printed text is replaced the same way.
 use super::rf_forget;
 use rusqlite::{Connection, params, types::Value};
+use std::collections::HashMap;
 
 /// Tool results of the session-listing tools that name an erased run or session.
 pub(super) const LISTING_TOOLS: [&str; 8] = [
@@ -310,15 +311,94 @@ impl MemoryProbe {
         Ok(!survives)
     }
 
-    /// True when `output` of `tool` holds an entry of this memory, by its key
-    /// or by its redacted form.
-    fn named_in(&self, tool: &str, output: &str) -> bool {
-        named_key(&self.key, tool, output)
-            || self
-                .key_redacted
-                .as_deref()
-                .is_some_and(|key| named_key(key, tool, output))
+    /// How `output` of `tool` names this memory: by its key, or only by its
+    /// redacted form.
+    fn named_in(&self, tool: &str, output: &str) -> Naming {
+        if named_key(&self.key, tool, output) {
+            Naming::Key
+        } else if self
+            .key_redacted
+            .as_deref()
+            .is_some_and(|key| named_key(key, tool, output))
+        {
+            Naming::RedactedOnly
+        } else {
+            Naming::None
+        }
     }
+
+    /// True when a result of a row of `workspace` and `owner` that names this
+    /// memory in the form `naming` should be rewritten. A row that names the
+    /// key follows [`MemoryProbe::applies`]. A row that names only the
+    /// redacted form (every key `token=<secret>` redacts to the same text) is
+    /// rewritten only when no surviving memory visible to the row has a key
+    /// that redacts to that text: the printed entry may be that memory's.
+    fn applies_to(
+        &self,
+        tx: &Connection,
+        naming: Naming,
+        workspace: Option<&str>,
+        owner: Option<&str>,
+        clear: &mut HashMap<(String, Option<String>, Option<String>), bool>,
+    ) -> anyhow::Result<bool> {
+        match naming {
+            Naming::None => Ok(false),
+            Naming::Key => self.applies(tx, workspace, owner),
+            Naming::RedactedOnly => {
+                let Some(redacted) = self.key_redacted.as_deref() else {
+                    return Ok(false);
+                };
+                let cache_key = (
+                    redacted.to_string(),
+                    workspace.map(str::to_string),
+                    owner.map(str::to_string),
+                );
+                if let Some(known) = clear.get(&cache_key) {
+                    return Ok(*known);
+                }
+                let known = !redacted_form_survives(tx, redacted, workspace, owner)?;
+                clear.insert(cache_key, known);
+                Ok(known)
+            }
+        }
+    }
+}
+
+/// How a printed result names a forgotten memory.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Naming {
+    None,
+    Key,
+    RedactedOnly,
+}
+
+/// True when a memory visible to a row of `workspace` and `owner` has a key
+/// whose redacted form is `redacted`. Redaction keeps the text before the first
+/// secret, so the candidates are the visible keys that start with that text.
+fn redacted_form_survives(
+    tx: &Connection,
+    redacted: &str,
+    workspace: Option<&str>,
+    owner: Option<&str>,
+) -> anyhow::Result<bool> {
+    let prefix = redacted
+        .split(crate::security::redaction::REDACTED)
+        .next()
+        .unwrap_or_default();
+    let mut statement = tx.prepare(
+        "SELECT key FROM memories
+         WHERE (workspace_id IS NULL OR workspace_id = ?1) AND (owner_id IS NULL OR owner_id = ?2)
+           AND (?3 = '' OR instr(key, ?3) = 1)",
+    )?;
+    let keys = statement.query_map(params![workspace, owner, prefix], |row| row.get::<_, Value>(0))?;
+    for key in keys {
+        if let Value::Text(key) = key?
+            && crate::security::redaction::redact_secrets(&key) == redacted
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// True when the printed `output` of `tool` holds a memory entry of `key` in
@@ -444,6 +524,7 @@ pub(super) fn rewrite_memory_copies(tx: &Connection, probes: &[MemoryProbe], now
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(statement);
     let mut rows: Vec<MatchedRow> = Vec::new();
+    let mut clear = HashMap::new();
     for [event_id, document_id, content, tool, workspace, owner, run_id, call_id] in found {
         let (Value::Text(event_id), Value::Text(content), Value::Text(tool)) = (event_id, content, tool) else {
             continue;
@@ -456,20 +537,24 @@ pub(super) fn rewrite_memory_copies(tx: &Connection, probes: &[MemoryProbe], now
             if !probe.covers(workspace_text.as_deref(), owner.as_deref()) {
                 continue;
             }
-            let names = probe.named_in(&tool, &content)
-                || document_id.as_deref().is_some_and(|document| {
-                    // The entry may sit past the inline part: read the stored
-                    // document once per row, only when the inline text does not
-                    // name the memory.
-                    if document_text.is_none() {
-                        document_text = Some(stored_document_text(tx, document));
+            let mut naming = probe.named_in(&tool, &content);
+            if naming != Naming::Key
+                && let Some(document) = document_id.as_deref()
+            {
+                // The entry may sit past the inline part: read the stored
+                // document once per row, only when the inline text does not
+                // name the key.
+                if document_text.is_none() {
+                    document_text = Some(stored_document_text(tx, document));
+                }
+                if let Some(text) = document_text.as_ref().and_then(Option::as_deref) {
+                    let in_document = probe.named_in(&tool, text);
+                    if in_document != Naming::None {
+                        naming = in_document;
                     }
-                    document_text
-                        .as_ref()
-                        .and_then(Option::as_deref)
-                        .is_some_and(|text| probe.named_in(&tool, text))
-                });
-            if names && probe.applies(tx, workspace_text.as_deref(), owner.as_deref())? {
+                }
+            }
+            if probe.applies_to(tx, naming, workspace_text.as_deref(), owner.as_deref(), &mut clear)? {
                 matched = true;
                 break;
             }
