@@ -3,13 +3,12 @@
 //! `OPENPRX_DEBUG_REQUEST_DUMP=<dir>` makes the engine write one masked JSON
 //! file per compiled request into `<dir>`. The variable is read once per
 //! process; unset or empty means nothing happens. Every string goes through
-//! the secret redaction before serialising; JSON content (native tool calls and results) is
-//! masked field by field.
-//! A write failure logs one warning per process (error kind only) and never
+//! the secret redaction before serialising; JSON content (native tool calls
+//! and results) is masked field by field. A write failure logs one warning per process (error kind only) and never
 //! affects the turn.
 
 use crate::providers::ChatMessage;
-use crate::security::redaction::{redact_json_value, redact_secrets};
+use crate::security::redaction::{redact_json_value, redact_provider_text, redact_secrets};
 use serde_json::{Value, json};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -144,7 +143,7 @@ fn dump_json(facts: &DumpFacts<'_>) -> Value {
     let tools: Vec<String> = facts.tool_names.iter().map(|name| masked(name)).collect();
     json!({
         "model": masked(facts.model),
-        "provider": masked(facts.provider),
+        "provider": redact_provider_text(facts.provider),
         "system": system.join("\n\n"),
         "messages": messages,
         "tools": tools,
