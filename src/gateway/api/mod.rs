@@ -564,10 +564,17 @@ async fn api_rate_limit_middleware(State(state): State<AppState>, request: Reque
         .extensions()
         .get::<ConnectInfo<std::net::SocketAddr>>()
         .map(|value| value.0);
-    let rate_key = if token.is_empty() {
-        super::client_key_from_request(peer_addr, request.headers(), state.trust_forwarded_headers)
-    } else {
+    // Authenticated traffic is not limited unless the operator opts in; the
+    // quota then guards only requests that fail authentication, per client
+    // address (a guessed token never gets a fresh key of its own).
+    let authenticated = authenticated_principal(&state, request.headers()).is_some();
+    if authenticated && !state.config.load().gateway.api_rate_limit_authenticated {
+        return next.run(request).await;
+    }
+    let rate_key = if authenticated && !token.is_empty() {
         format!("token:{}", super::hash_webhook_secret(&token))
+    } else {
+        super::client_key_from_request(peer_addr, request.headers(), state.trust_forwarded_headers)
     };
 
     if !state.rate_limiter.allow_api(&rate_key) {

@@ -906,6 +906,7 @@ async fn checklist_gateway_serde_roundtrip() {
         pair_rate_limit_per_minute: 12,
         webhook_rate_limit_per_minute: 80,
         api_rate_limit_per_minute: 90,
+        api_rate_limit_authenticated: false,
         trust_forwarded_headers: true,
         rate_limit_max_keys: 2048,
         idempotency_ttl_secs: 600,

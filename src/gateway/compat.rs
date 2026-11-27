@@ -320,8 +320,13 @@ fn mcp_rate_limiter(rate_limit_rps: u32) -> Arc<super::SlidingWindowRateLimiter>
 ///
 /// The key is the issuer-qualified owner id, so one bot token cannot spend
 /// another's budget. `0` disables the budget, as it does for every other
-/// gateway limiter.
+/// gateway limiter. The budget applies only when
+/// `mcp_server.rate_limit_authenticated` is set; by default an authenticated
+/// caller is never limited.
 fn mcp_rate_limit_allows(config: &crate::config::Config, caller: &str) -> bool {
+    if !config.mcp_server.rate_limit_authenticated {
+        return true;
+    }
     mcp_rate_limiter(config.mcp_server.rate_limit_rps).allow(caller)
 }
 

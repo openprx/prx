@@ -1250,7 +1250,8 @@ mod tests {
         const API_LIMIT: u32 = 4;
 
         let workspace = TempDir::new().expect("test: workspace");
-        let config = config_with(workspace.path(), vec![], &[]);
+        let mut config = config_with(workspace.path(), vec![], &[]);
+        config.gateway.api_rate_limit_authenticated = true;
         let (base_url, server) = serve(test_app_state_with_api_limit(config, API_LIMIT)).await;
 
         // Registering spends the first of the four.

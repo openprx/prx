@@ -115,10 +115,15 @@ pub struct McpServerRuntimeConfig {
     #[serde(default = "default_mcp_allowed_origins")]
     pub allowed_origins: Vec<String>,
     /// Per-caller request budget, in requests per second, enforced on
-    /// `POST /mcp/v1/tools/call` and keyed by the authenticated owner id.
-    /// `0` disables the budget.
+    /// `POST /mcp/v1/tools/call` and keyed by the authenticated owner id. It
+    /// applies only when `rate_limit_authenticated` is true. `0` disables the
+    /// budget.
     #[serde(default = "default_mcp_server_rate_limit_rps")]
     pub rate_limit_rps: u32,
+    /// Apply `rate_limit_rps` to authenticated callers. Default false:
+    /// authenticated MCP callers are not limited.
+    #[serde(default)]
+    pub rate_limit_authenticated: bool,
     /// Expected `iss` claim for inbound bearer JWTs. When unset, bearer JWT
     /// verification is disabled and bearer tokens are rejected.
     #[serde(default)]
@@ -240,6 +245,7 @@ impl Default for McpServerRuntimeConfig {
             exposed_tools: default_mcp_server_exposed_tools(),
             allowed_origins: default_mcp_allowed_origins(),
             rate_limit_rps: default_mcp_server_rate_limit_rps(),
+            rate_limit_authenticated: false,
             jwt_issuer: None,
             jwt_audience: None,
             jwt_jwks: None,

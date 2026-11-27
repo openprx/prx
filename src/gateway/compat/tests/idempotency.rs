@@ -325,6 +325,7 @@ fn mcp_rate_limit_budget_is_enforced_per_caller() {
     let mut config = crate::config::Config::default();
     let first_caller = "owner:ws-1:agent:issuer-a.example:alice";
     let second_caller = "owner:ws-1:agent:issuer-b.example:alice";
+    config.mcp_server.rate_limit_authenticated = true;
     config.mcp_server.rate_limit_rps = 2;
 
     assert!(mcp_rate_limit_allows(&config, first_caller));

@@ -133,11 +133,11 @@ and the module-gate family are absorbed on load; they are not live switches.
 | `[[user_policies]]` | `user_id` required; `role = "guest"`; `projects = []`; `visibility_ceiling = "private"`; `blocked_patterns = []` |
 | `[storage.provider.config]` | `provider = ""`; `db_url` unset (aliases `dbURL`, `database_url`, `databaseUrl`); `schema = "public"`; `table = "memories"`; `connect_timeout_secs` unset (15s handshake); `pool_max_size = 32` |
 | `[tunnel]` | `provider = "none"`; `cloudflare`/`tailscale`/`ngrok`/`custom` unset. Cloudflare needs `token`; Tailscale `funnel = false`, `hostname` unset; ngrok `auth_token` required, `domain` unset; custom `start_command` required, `health_url`/`url_pattern` unset |
-| `[gateway]` | `port = 16830`; `host = "127.0.0.1"`; `require_pairing = true`; `allow_public_bind = false`; `paired_tokens = []`; `pair_rate_limit_per_minute = 10`; `webhook_rate_limit_per_minute = 60`; `api_rate_limit_per_minute = 60`; `trust_forwarded_headers = false`; `rate_limit_max_keys = 10000`; `idempotency_ttl_secs = 300`; `idempotency_max_keys = 10000`; `channel_webhook_dedup_ttl_secs = 86400`; `targeted_agents = true` |
+| `[gateway]` | `port = 16830`; `host = "127.0.0.1"`; `require_pairing = true`; `allow_public_bind = false`; `paired_tokens = []`; `pair_rate_limit_per_minute = 10`; `webhook_rate_limit_per_minute = 60`; `api_rate_limit_per_minute = 60`; `api_rate_limit_authenticated = false`; `trust_forwarded_headers = false`; `rate_limit_max_keys = 10000`; `idempotency_ttl_secs = 300`; `idempotency_max_keys = 10000`; `channel_webhook_dedup_ttl_secs = 86400`; `targeted_agents = true` |
 | `[webhook]` | `bind = "0.0.0.0:16899"`; `token` unset (required when enabled); `signing_secret` unset |
 | `[composio]` | `api_key` unset; `entity_id = "default"` |
 | `[mcp]` | `servers = {}`; `workspace_servers = "off"` (`http_only` or `stdio` to widen). A server: `transport = "stdio"`; `command`/`url` unset; `args = []`; `env = {}`; `headers = {}`; `startup_timeout_ms = 10000`; `request_timeout_ms = 30000`; `tool_name_prefix = "mcp"`; `allow_tools`/`deny_tools = []`; `working_dir` unset |
-| `[mcp_server]` | `bind = "127.0.0.1:16831"`; `require_auth = true`; `exposed_tools` the read-only set (`memory_search`, `memory_recall`, `memory_get`, `document_search`, `document_get_chunk`, `sessions_list`, `sessions_history`); `allowed_origins = ["claude.ai", "openai.com", "localhost"]`; `rate_limit_rps = 10`; JWT fields unset; `jwt_jwks_cache_ttl_secs = 300`; `jwt_algorithms = ["RS256"]` |
+| `[mcp_server]` | `bind = "127.0.0.1:16831"`; `require_auth = true`; `exposed_tools` the read-only set (`memory_search`, `memory_recall`, `memory_get`, `document_search`, `document_get_chunk`, `sessions_list`, `sessions_history`); `allowed_origins = ["claude.ai", "openai.com", "localhost"]`; `rate_limit_rps = 10`; `rate_limit_authenticated = false`; JWT fields unset; `jwt_jwks_cache_ttl_secs = 300`; `jwt_algorithms = ["RS256"]` |
 | `[a2a]` | Messaging is disabled by default (`messaging_enabled = false`). `bind = "127.0.0.1:16832"`, `trust_domain = "prx.local"`. Run `prx a2a init` before enabling messaging. The dedicated listener always requires pinned mutual TLS, including on loopback. `[a2a.peers.<name>]` has `spiffe_id`, `fingerprints` (one or two full SHA-256 certificate fingerprints), `address` (`host:port`), `owner`, `sessions` and `agents` (default `["*"]`). Legacy discovery/card fields retain their existing behavior. |
 | `[auth]` | `codex_auth_json_auto_import = false`; `codex_auth_json_path` the platform Codex `auth.json` |
 | `[secrets]` | `encrypt = true` |
@@ -1246,13 +1246,18 @@ chat that tried anyway would announce a refusal on every start.
   handed back is announced too.
 - **The poller is ordinary in-flight work.** `/sessions` lists it and
   `/kill --daemon d<N>` ends it, the same as any other daemon request.
-- **The mailbox is not rate limited.** `gateway.api_rate_limit_per_minute`
-  bounds what a caller may spend on the API; the two mailbox endpoints
-  (`POST /api/chat-sessions/{id}/inbox/pull` and `.../result`) are exempt from
-  it, because they are one local process polling for work already addressed to
-  it rather than a caller reaching in. What guards a mailbox is the per-session
-  token, not a quota. Every other route keeps its quota, `assign` included, so
-  raising the number of open chats no longer costs the operator theirs.
+- **The mailbox is not rate limited.** By default no authenticated `/api`
+  request is rate limited (`gateway.api_rate_limit_authenticated = false`);
+  `gateway.api_rate_limit_per_minute` then bounds only requests that fail
+  authentication, per client address. Setting `api_rate_limit_authenticated =
+  true` restores the older per-token quota on authenticated routes. The two
+  mailbox endpoints (`POST /api/chat-sessions/{id}/inbox/pull` and
+  `.../result`) stay outside the quota layer either way, because they are one
+  local process polling for work already addressed to it rather than a caller
+  reaching in. What guards a mailbox is the per-session token, not a quota.
+  Migration: `api_rate_limit_authenticated` is an additive key; a config that
+  sets `api_rate_limit_per_minute` keeps that value, which now applies to
+  failed-authentication traffic only unless the new key is set.
 - **Exiting withdraws the session.** Nothing on the daemon side expires a chat
   session, so a chat killed with `SIGKILL` leaves a row listed as `silent` until
   an operator reaps it with `DELETE /api/chat-sessions/{id}`. The row survives a

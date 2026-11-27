@@ -28,7 +28,9 @@ tokens it does not know.
 These codes can answer any `/api` route, in the coded shape:
 
 - `429 rate_limited` `{"error":{"code","message","retry_after_ms"}}`: the
-  shared API rate limit. The response also carries `Retry-After` in seconds.
+  shared API rate limit. It answers requests that fail authentication (per
+  client address); an authenticated request is not rate limited unless the
+  operator sets `gateway.api_rate_limit_authenticated`. The response also carries `Retry-After` in seconds.
   Both give the limiter window (60 s) as an upper bound: retry after at most
   this long. `POST /pair` and `POST /webhook` (and the standalone webhook
   listener) answer their own limits in the same coded shape with `Retry-After`;
@@ -50,7 +52,7 @@ These codes can answer any `/api` route, in the coded shape:
 ## Routes: capabilities and catalog
 
 Both routes use the same bearer check as the other `/api` routes and the
-shared API rate limit (`429 rate_limited`, see General errors). Both are reads: they
+shared API rate limit for requests that fail authentication (`429 rate_limited`, see General errors). Both are reads: they
 change no configuration, write no store and are not gated by autonomy. No body
 carries a credential, a key id or a URL with userinfo.
 

@@ -31,9 +31,17 @@ pub struct GatewayConfig {
     #[serde(default = "default_webhook_rate_limit")]
     pub webhook_rate_limit_per_minute: u32,
 
-    /// Max `/api/*` requests per minute per authenticated token.
+    /// Max `/api/*` requests per minute per client address for requests that
+    /// fail authentication (and per token for authenticated requests when
+    /// `api_rate_limit_authenticated` is set). 0 disables it.
     #[serde(default = "default_api_rate_limit")]
     pub api_rate_limit_per_minute: u32,
+
+    /// Apply `api_rate_limit_per_minute` to authenticated requests too (per
+    /// token). Default false: authenticated requests are not limited; the limit
+    /// applies to requests that fail authentication, per client address.
+    #[serde(default)]
+    pub api_rate_limit_authenticated: bool,
 
     /// Trust headers that a reverse proxy in front of the gateway asserts: the
     /// client IP (`X-Forwarded-For`, `X-Real-IP`) for rate limiting, and the
@@ -126,6 +134,7 @@ impl Default for GatewayConfig {
             pair_rate_limit_per_minute: default_pair_rate_limit(),
             webhook_rate_limit_per_minute: default_webhook_rate_limit(),
             api_rate_limit_per_minute: default_api_rate_limit(),
+            api_rate_limit_authenticated: false,
             trust_forwarded_headers: false,
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
