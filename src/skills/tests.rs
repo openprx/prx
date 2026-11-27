@@ -10,7 +10,6 @@
     clippy::unreadable_literal
 )]
 use super::*;
-use async_trait::async_trait;
 use std::fs;
 
 /// Community skill roots pinned inside a fixture's own temporary directory.
@@ -168,7 +167,6 @@ fn skills_to_prompt_with_skills() {
         tools: vec![],
         prompts: vec!["Do the thing.".to_string()],
         location: None,
-        embedding: None,
     }];
     let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
     assert!(prompt.contains("<available_skills>"));
@@ -189,7 +187,6 @@ fn skills_prompt_is_stable_when_instruction_bodies_change() {
         tools: vec![],
         prompts: vec![instructions.to_string()],
         location: Some(PathBuf::from("/tmp/office/SKILL.md")),
-        embedding: None,
     };
 
     let short = skills_to_prompt(&[make_skill("short")], Path::new("/tmp"));
@@ -211,7 +208,6 @@ fn skills_prompt_is_bounded_and_well_formed() {
             tools: vec![],
             prompts: vec!["<&>".repeat(MAX_INSTRUCTION_BYTES)],
             location: None,
-            embedding: None,
         })
         .collect::<Vec<_>>();
 
@@ -703,7 +699,6 @@ fn skills_to_prompt_includes_tools() {
         }],
         prompts: vec![],
         location: None,
-        embedding: None,
     }];
     let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
     assert!(prompt.contains("weather"));
@@ -723,7 +718,6 @@ fn skills_to_prompt_escapes_xml_content() {
         tools: vec![],
         prompts: vec!["Use <tool> & check \"quotes\".".to_string()],
         location: None,
-        embedding: None,
     }];
 
     let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
@@ -1114,54 +1108,4 @@ fn openclaw_skills_loads_from_local_dir_via_config() {
     assert_eq!(skills[0].name, "my-oc-skill");
     assert_eq!(skills[0].description, "OpenClaw test skill");
     assert!(skills[0].prompts.is_empty(), "must be lazy (no prompts)");
-}
-
-struct CountingEmbeddingProvider {
-    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-}
-
-#[async_trait]
-impl crate::memory::embeddings::EmbeddingProvider for CountingEmbeddingProvider {
-    fn name(&self) -> &str {
-        "counting"
-    }
-
-    fn dimensions(&self) -> usize {
-        2
-    }
-
-    async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
-        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(texts.iter().map(|_| vec![0.5, 0.5]).collect())
-    }
-}
-
-#[tokio::test]
-async fn process_catalog_reuses_hydrated_embeddings() {
-    let dir = tempfile::tempdir().unwrap();
-    let workspace_dir = dir.path().join("workspace");
-    let skill_dir = workspace_dir.join("skills").join("cached");
-    fs::create_dir_all(&skill_dir).unwrap();
-    let description = format!("unique embedding description {}", uuid::Uuid::new_v4());
-    fs::write(skill_dir.join("SKILL.md"), format!("# Cached\n{description}\n")).unwrap();
-
-    let mut config = crate::config::Config::default();
-    config.workspace_dir = workspace_dir.clone();
-    CommunityRoots::absent(dir.path()).apply(&mut config);
-    config.memory.embedding_provider = "counting".into();
-    config.memory.embedding_model = uuid::Uuid::new_v4().to_string();
-    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let embedder = CountingEmbeddingProvider {
-        calls: std::sync::Arc::clone(&calls),
-    };
-
-    let (first, second) = tokio::join!(
-        load_skills_with_embeddings(&workspace_dir, &config, &embedder),
-        load_skills_with_embeddings(&workspace_dir, &config, &embedder)
-    );
-    let first = first.unwrap();
-    let second = second.unwrap();
-    assert!(first[0].embedding.is_some());
-    assert_eq!(first[0].embedding, second[0].embedding);
-    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 }

@@ -105,7 +105,6 @@ async fn session_switch_fail_closes_pending_approvals_and_resets_mirror() {
     let mut attached_follow = None;
     let mut attached_follow_seq = Some(7);
     let config = Config::default();
-    let skills: Vec<crate::skills::Skill> = Vec::new();
     let chat_mirror = Arc::new(parking_lot::Mutex::new(tui::TuiState::new("p", "m")));
     {
         let mut mirror = chat_mirror.lock();
@@ -148,8 +147,6 @@ async fn session_switch_fail_closes_pending_approvals_and_resets_mirror() {
             config: &config,
             provider_name: "p",
             model_name: "m",
-            skills: &skills,
-            native_tools: false,
             chat_mirror: &chat_mirror,
         },
         loaded_session,

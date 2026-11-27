@@ -1,8 +1,7 @@
 //! Chat session switching: resume, new session and approval clearing.
 
 use super::session_store::{
-    bind_session_to_runtime_provider_model, leading_system_prompt_for_session, load_session_by_id_with_message_events,
-    provider_view_for_session,
+    bind_session_to_runtime_provider_model, load_session_by_id_with_message_events, provider_view_for_session,
 };
 #[cfg(feature = "terminal-tui")]
 use super::tui;
@@ -40,8 +39,6 @@ pub(super) struct ChatSwitchCtx<'a> {
     pub(super) config: &'a Config,
     pub(super) provider_name: &'a str,
     pub(super) model_name: &'a str,
-    pub(super) skills: &'a [crate::skills::Skill],
-    pub(super) native_tools: bool,
     #[cfg(feature = "terminal-tui")]
     pub(super) chat_mirror: &'a Arc<parking_lot::Mutex<tui::TuiState>>,
 }
@@ -311,15 +308,13 @@ pub(super) async fn apply_chat_session_switch(
     super::message_inbox::pin_epoch(ctx.config, &key).await?;
     // The reducer history and the provider view open with the same system
     // prompt from the acknowledged load on.
-    let leading_system_prompt =
-        leading_system_prompt_for_session(ctx.config, ctx.model_name, ctx.skills, ctx.native_tools);
     let acked = match ctx
         .chat_dispatcher
         .dispatch_awaited(
             crate::chat::action::Action::SessionLoaded {
                 session: loaded_session,
                 persist,
-                leading_system_prompt: Some(leading_system_prompt.clone()),
+                leading_system_prompt: None,
             },
             ctx.commits,
         )
@@ -356,7 +351,7 @@ pub(super) async fn apply_chat_session_switch(
         .iter()
         .filter(|turn| turn.role == "user")
         .fold(0_u64, |acc, _| acc.saturating_add(1));
-    *ctx.history = provider_view_for_session(&loaded, Some(leading_system_prompt.as_str()));
+    *ctx.history = provider_view_for_session(&loaded, None);
 
     let _ = ctx.chat_dispatcher.dispatch_or_log(
         crate::chat::action::Action::SessionFocusChanged {

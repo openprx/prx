@@ -188,7 +188,6 @@ pub(crate) fn prompt_skills(
             tags: Vec::new(),
             tools: Vec::new(),
             prompts: Vec::new(),
-            embedding: None,
         });
     }
     // Advertising installed metadata is not a skill selection receipt.

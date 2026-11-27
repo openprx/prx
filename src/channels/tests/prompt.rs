@@ -340,7 +340,6 @@ fn prompt_skills_are_lazy_and_include_declared_tools() {
         }],
         prompts: vec!["Always run cargo test before final response.".into()],
         location: None,
-        embedding: None,
     }];
 
     let prompt = build_system_prompt(
@@ -383,7 +382,6 @@ fn prompt_skills_escape_reserved_xml_chars() {
         }],
         prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
         location: None,
-        embedding: None,
     }];
 
     let prompt = build_system_prompt(

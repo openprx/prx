@@ -69,10 +69,10 @@ use super::session_glue::{
 use super::session_store::rewound_chat_session_from;
 use super::session_store::{
     bind_session_to_runtime_provider_model, branched_chat_session_from, format_saved_chat_sessions,
-    format_turn_boundaries, leading_system_prompt_for_session, list_saved_sessions,
-    load_latest_session_with_message_events, load_session_by_id_with_message_events, parse_turn_boundary,
-    persisted_history_for_current_turn, provider_view_for_session, save_session, saved_chat_sessions,
-    session_turns_to_history, upsert_leading_system_prompt,
+    format_turn_boundaries, list_saved_sessions, load_latest_session_with_message_events,
+    load_session_by_id_with_message_events, parse_turn_boundary, persisted_history_for_current_turn,
+    provider_view_for_session, save_session, saved_chat_sessions, session_turns_to_history,
+    upsert_leading_system_prompt,
 };
 #[cfg(feature = "terminal-tui")]
 use super::session_switch::request_diff_apply_approval;
@@ -247,7 +247,8 @@ async fn run_internal(
     });
 
     // ── Skills ────────────────────────────────────────────────────
-    let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
+    // Warm the process skill catalog cache.
+    drop(crate::skills::load_skills_with_config(&config.workspace_dir, &config));
 
     // Computed once, at startup, for the mode the chat TUI streams in. The
     // agent loop recomputes the same question per turn at the mode that turn
@@ -346,14 +347,8 @@ async fn run_internal(
             )
             .await?;
             bind_session_to_runtime_provider_model(&mut initial_session, provider_name, model_name);
-            let (mut chat_session_key, mut fabric_turn_seq, banner, mut history) = startup::initial_conversation(
-                &initial_session,
-                &config,
-                provider_name,
-                model_name,
-                &skills,
-                native_tools,
-            );
+            let (mut chat_session_key, mut fabric_turn_seq, banner, mut history) =
+                startup::initial_conversation(&initial_session, &config, provider_name, model_name);
             super::message_inbox::pin_epoch(&config, &chat_session_key).await?;
             // The terminal session exists from here: its start carries the session key.
             let agent_started_at = std::time::Instant::now();

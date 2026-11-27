@@ -522,7 +522,6 @@ fn embedded_builder_rejects_unpublished_skill_bodies() {
         tools: Vec::new(),
         prompts: vec!["PRX_UNSELECTED_SKILL_BODY".to_owned()],
         location: None,
-        embedding: None,
     };
     let result = embedded_builder(workspace.path()).skills(vec![skill]).build();
     assert!(matches!(result, Err(error) if error.to_string().contains("workspace capability catalog")));

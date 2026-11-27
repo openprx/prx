@@ -32,8 +32,6 @@ const MAX_DESCRIPTION_BYTES: usize = 1024;
 #[cfg(test)]
 const MAX_INSTRUCTION_BYTES: usize = 16 * 1024;
 const MAX_SKILLS_PROMPT_BYTES: usize = 64 * 1024;
-const MAX_EMBEDDING_CACHE_ENTRIES: usize = 2048;
-const MAX_HYDRATION_LOCKS: usize = 64;
 const UNTRUSTED_ORIGIN_MARKER: &str = ".openprx-untrusted-origin.json";
 const DISABLED_SKILL_MARKER: &str = ".openprx-disabled";
 
@@ -46,11 +44,6 @@ struct CatalogKey {
 
 static SKILL_CATALOGS: LazyLock<Mutex<HashMap<CatalogKey, (u64, Arc<Vec<Skill>>)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-static SKILL_EMBEDDINGS: LazyLock<Mutex<HashMap<String, Vec<f32>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
-static SKILL_HYDRATION_LOCKS: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-static SKILL_HYDRATION_OVERFLOW_LOCK: LazyLock<Arc<tokio::sync::Mutex<()>>> =
-    LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(())));
 
 /// A skill is a user-defined or community-built capability.
 /// Skills live in `~/.openprx/workspace/skills/<name>/SKILL.md`
@@ -70,8 +63,6 @@ pub struct Skill {
     pub prompts: Vec<String>,
     #[serde(skip)]
     pub location: Option<PathBuf>,
-    #[serde(default, skip)]
-    pub embedding: Option<Vec<f32>>,
 }
 
 /// Metadata available to capability discovery before a skill is selected.
@@ -330,92 +321,6 @@ pub fn invalidate_skill_catalog(workspace_dir: &Path) {
     SKILL_CATALOGS
         .lock()
         .retain(|key, _| key.workspace_dir != workspace_dir);
-}
-
-/// Load a catalog snapshot and reuse process-level description embeddings.
-pub async fn load_skills_with_embeddings(
-    workspace_dir: &Path,
-    config: &crate::config::Config,
-    embedder: &dyn crate::memory::embeddings::EmbeddingProvider,
-) -> Result<Vec<Skill>> {
-    let mut skills = load_skills_with_config(workspace_dir, config);
-    if skills.is_empty() || embedder.dimensions() == 0 {
-        return Ok(skills);
-    }
-
-    let mut namespace = format!(
-        "{}\u{1f}{}\u{1f}{}\u{1f}{}",
-        config.memory.embedding_provider,
-        config.memory.embedding_model,
-        embedder.name(),
-        embedder.dimensions()
-    );
-    for route in &config.embedding_routes {
-        namespace.push_str(&format!(
-            "\u{1e}{}\u{1f}{}\u{1f}{}\u{1f}{:?}",
-            route.hint, route.provider, route.model, route.dimensions
-        ));
-    }
-    let hydration_lock = {
-        let mut locks = SKILL_HYDRATION_LOCKS.lock();
-        let existing = locks.get(&namespace).cloned();
-        existing.unwrap_or_else(|| {
-            if locks.len() >= MAX_HYDRATION_LOCKS {
-                locks.retain(|_, lock| Arc::strong_count(lock) > 1);
-            }
-            if locks.len() >= MAX_HYDRATION_LOCKS {
-                Arc::clone(&SKILL_HYDRATION_OVERFLOW_LOCK)
-            } else {
-                let lock = Arc::new(tokio::sync::Mutex::new(()));
-                locks.insert(namespace.clone(), Arc::clone(&lock));
-                lock
-            }
-        })
-    };
-    let _hydration_guard = hydration_lock.lock().await;
-    let mut pending = Vec::new();
-    {
-        let cache = SKILL_EMBEDDINGS.lock();
-        for (index, skill) in skills.iter_mut().enumerate() {
-            if skill.description.trim().is_empty() {
-                continue;
-            }
-            let key = embedding_cache_key(&namespace, &skill.description);
-            if let Some(embedding) = cache.get(&key) {
-                skill.embedding = Some(embedding.clone());
-            } else {
-                pending.push((index, key, skill.description.clone()));
-            }
-        }
-    }
-
-    if !pending.is_empty() {
-        let descriptions: Vec<&str> = pending.iter().map(|(_, _, text)| text.as_str()).collect();
-        let embeddings = embedder.embed(&descriptions).await?;
-        if embeddings.len() != pending.len() {
-            bail!(
-                "embedding provider returned {} vectors for {} skill descriptions",
-                embeddings.len(),
-                pending.len()
-            );
-        }
-        let mut cache = SKILL_EMBEDDINGS.lock();
-        if cache.len().saturating_add(pending.len()) > MAX_EMBEDDING_CACHE_ENTRIES {
-            cache.clear();
-        }
-        for ((index, key, _), embedding) in pending.into_iter().zip(embeddings) {
-            if let Some(skill) = skills.get_mut(index) {
-                skill.embedding = Some(embedding.clone());
-            }
-            cache.insert(key, embedding);
-        }
-    }
-
-    Ok(skills)
-}
-
-fn embedding_cache_key(namespace: &str, description: &str) -> String {
-    format!("{namespace}\u{1f}{description}")
 }
 
 fn load_skills_with_open_skills_config(
@@ -732,7 +637,6 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
         // catalog snapshot metadata-only even for workspace-owned manifests.
         prompts: Vec::new(),
         location: Some(path.to_path_buf()),
-        embedding: None,
     })
 }
 
@@ -751,7 +655,6 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
         // skill_read owns instruction hydration for every origin and entrypoint.
         prompts: Vec::new(),
         location: Some(path.to_path_buf()),
-        embedding: None,
     })
 }
 
@@ -772,7 +675,6 @@ fn load_open_skill_md(path: &Path) -> Result<Skill> {
         tools: Vec::new(),
         prompts: Vec::new(),
         location: Some(path.to_path_buf()),
-        embedding: None,
     })
 }
 
@@ -1015,7 +917,6 @@ fn load_openclaw_skills_from_dir(skills_dir: &Path) -> Vec<Skill> {
             tools: Vec::new(),
             prompts: Vec::new(), // EMPTY — lazy mode: no content injected
             location: Some(md_path),
-            embedding: None,
         });
     }
     skills

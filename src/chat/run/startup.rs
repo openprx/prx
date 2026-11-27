@@ -2,8 +2,8 @@
 use super::{
     Arc, AtomicU64, Channel, Config, DOUBLE_CTRLC_WINDOW_MS, Memory, Ordering, Result, TerminalChannel, Tool,
     TracingChatGuard, dispatcher, ensure_chat_tracing_to_file, initial_chat_dispatcher_state,
-    leading_system_prompt_for_session, load_latest_session_with_message_events, load_session_by_id_with_message_events,
-    mpsc, now_ms, provider_view_for_session, providers, session, startup_banner,
+    load_latest_session_with_message_events, load_session_by_id_with_message_events, mpsc, now_ms,
+    provider_view_for_session, providers, session, startup_banner,
 };
 #[cfg(feature = "terminal-tui")]
 use super::{
@@ -291,8 +291,6 @@ pub(super) fn initial_conversation(
     config: &Config,
     provider_name: &str,
     model_name: &str,
-    skills: &[crate::skills::Skill],
-    native_tools: bool,
 ) -> (String, u64, String, Vec<super::ChatMessage>) {
     // D8-2: run_id is per-turn, not per-session. It is generated inside the turn
     // loop (see `turn_run_id` below) so each user/assistant exchange gets a fresh
@@ -324,8 +322,7 @@ pub(super) fn initial_conversation(
     );
 
     // ── Conversation history ─────────────────────────────────────
-    let leading_system_prompt = leading_system_prompt_for_session(config, model_name, skills, native_tools);
-    let history = provider_view_for_session(chat_session, Some(leading_system_prompt.as_str()));
+    let history = provider_view_for_session(chat_session, None);
 
     (chat_session_key, fabric_turn_seq, banner, history)
 }

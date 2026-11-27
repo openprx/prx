@@ -2,8 +2,6 @@
 
 use super::chat_events::chat_runtime_envelope;
 use super::{sanitize, session};
-use crate::agent::runtime_prompt::build_chat_system_prompt;
-use crate::config::Config;
 use crate::llm::route_decision::ProviderExecutionOutcome;
 use crate::memory::Memory;
 use crate::memory::MemoryCategory;
@@ -481,18 +479,6 @@ pub(super) fn upsert_leading_system_prompt(history: &mut Vec<ChatMessage>, syste
         // shift context-switch patch indices away from their audit source.
         Some(_) => history.insert(0, system_message),
     }
-}
-
-/// The runtime system prompt a loaded session's provider view starts with.
-/// Every load hands the same value to the reducer (`SessionLoaded`) and to
-/// [`provider_view_for_session`], so both histories open identically.
-pub(super) fn leading_system_prompt_for_session(
-    config: &Config,
-    model_name: &str,
-    skills: &[crate::skills::Skill],
-    native_tools: bool,
-) -> String {
-    build_chat_system_prompt(config, model_name, skills, native_tools)
 }
 
 /// The provider view of `session`: `leading_system_prompt` (if any) followed

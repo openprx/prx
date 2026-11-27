@@ -84,8 +84,6 @@ loop {
                         config: &config,
                         provider_name,
                         model_name,
-                        skills: &skills,
-                        native_tools,
                         #[cfg(feature = "terminal-tui")]
                         chat_mirror: &chat_mirror,
                     },
@@ -457,8 +455,6 @@ loop {
                             config: &config,
                             provider_name,
                             model_name,
-                            skills: &skills,
-                            native_tools,
                             #[cfg(feature = "terminal-tui")]
                             chat_mirror: &chat_mirror,
                         }, pending.target_session, true).await {

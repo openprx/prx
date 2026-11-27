@@ -54,7 +54,6 @@ fn skill(name: &str, description: &str) -> Skill {
         }],
         prompts: Vec::new(),
         location: Some(std::path::PathBuf::from(format!("/skills/{name}/SKILL.md"))),
-        embedding: None,
     }
 }
 
