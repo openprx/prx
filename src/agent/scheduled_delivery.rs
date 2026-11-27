@@ -146,12 +146,13 @@ fn bounded_reply(reply: &str) -> String {
 }
 
 /// A message id derived from the job and the run, so a run recorded twice
-/// (a retry of the record path) sends one message.
+/// (a retry of the record path) sends one message. The id is a version 8
+/// (custom) UUID over the first 16 bytes of a SHA-256 digest.
 fn delivery_id(task_id: &str, run_id: &str) -> Uuid {
     let digest = Sha256::digest(format!("prx-scheduled-result:{task_id}:{run_id}").as_bytes());
     let mut bytes = [0_u8; 16];
     for (slot, byte) in bytes.iter_mut().zip(digest.iter()) {
         *slot = *byte;
     }
-    Uuid::from_bytes(bytes)
+    uuid::Builder::from_custom_bytes(bytes).into_uuid()
 }
