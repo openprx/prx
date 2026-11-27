@@ -1031,6 +1031,14 @@ Existing callers that supplied only `AgentConfig` must supply a complete runtime
 configuration and matching provider label. This interface migration remains
 subject to the public API regression suite and the program acceptance gates.
 
+Every `Agent::turn` opens its request the way the shared turn opening does: the
+recall budget is half the window of the model (the same `replayed_recall_budget`
+as the other surfaces), the recalled preamble is redacted before it is sent, the
+session prefix is appended to the system prompt and the turn-open hook
+contributions go in the tail. When the input has a stored event, its attachment
+row (prefix and tail) is written beside it. The in-memory Agent history keeps
+the message as it was composed for the request.
+
 Embedded user-memory promotion respects `memory.auto_save`,
 `memory.semantic.auto_promote_user_messages`, and `memory.semantic.min_chars`.
 It stores original input under `user_msg:<run-id>` with the source session,
