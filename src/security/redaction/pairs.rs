@@ -1,4 +1,5 @@
 use regex::Regex;
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::LazyLock;
 
@@ -12,60 +13,176 @@ use super::{
     looks_like_a_secret,
 };
 
-/// The offset of the first `"` in `tail` that no backslash escapes: a
-/// backslash takes the byte after it with it.
-fn closing_double_quote(tail: &[u8]) -> Option<usize> {
+/// Whether the unescaped quote at `quote_at` in `tail` opens the next field
+/// instead of closing the value: `name="` (the name after whitespace or a
+/// separator, an `=` and optional blanks before the quote) or `"name":` (the
+/// quote followed by a name, a quote and a colon). The second field of the
+/// result is the number of bytes read.
+fn opens_next_field(tail: &[u8], quote_at: usize) -> (bool, usize) {
+    let is_name = |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-');
+    let starts_name = |at: usize| {
+        at.checked_sub(1)
+            .and_then(|before| tail.get(before))
+            .is_some_and(|&byte| byte.is_ascii_whitespace() || matches!(byte, b',' | b';' | b'{' | b'('))
+    };
+    let mut read = 1;
+    // `name="`
+    let mut at = quote_at;
+    while at > 0 && matches!(tail.get(at - 1), Some(b' ' | b'\t')) {
+        at -= 1;
+        read += 1;
+    }
+    if at > 0 && tail.get(at - 1) == Some(&b'=') {
+        let name_end = at - 1;
+        let mut name_start = name_end;
+        while name_start > 0 && tail.get(name_start - 1).copied().is_some_and(is_name) {
+            name_start -= 1;
+            read += 1;
+        }
+        if name_start < name_end && starts_name(name_start) {
+            return (true, read);
+        }
+    }
+    // `"name":`
+    let name_start = quote_at + 1;
+    let mut at = name_start;
+    while tail.get(at).copied().is_some_and(is_name) {
+        at += 1;
+        read += 1;
+    }
+    if at > name_start && tail.get(at) == Some(&b'"') {
+        let mut after = at + 1;
+        while matches!(tail.get(after), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            after += 1;
+            read += 1;
+        }
+        if tail.get(after) == Some(&b':') {
+            return (true, read);
+        }
+    }
+    (false, read)
+}
+
+/// The offset of the first `"` in `tail` that no backslash escapes (a
+/// backslash takes the byte after it with it) and the number of bytes read.
+/// When that quote opens the next field (`token="C:\temp\" password="x"`) the
+/// value ended at the last escaped quote before it, so the name is not eaten.
+fn closing_double_quote(tail: &[u8]) -> (Option<usize>, usize) {
     let mut at = 0;
+    let mut last_escaped_quote = None;
+    let mut read = 0;
     while let Some(&byte) = tail.get(at) {
         match byte {
-            b'"' => return Some(at),
-            b'\\' => at += 2,
+            b'"' => {
+                if let Some(escaped) = last_escaped_quote {
+                    let (opens, extra) = opens_next_field(tail, at);
+                    read += extra;
+                    if opens {
+                        return (Some(escaped), read + at + 1);
+                    }
+                }
+                return (Some(at), read + at + 1);
+            }
+            b'\\' => {
+                if tail.get(at + 1) == Some(&b'"') {
+                    last_escaped_quote = Some(at + 1);
+                }
+                at += 2;
+            }
             _ => at += 1,
         }
     }
-    None
+    (None, read + tail.len())
 }
 
-/// Opens an escaped JSON pair, `\"name\":\"`, as found in a JSON fragment
-/// that sits inside a JSON string or other text: capture 1 is the name.
+/// Opens an escaped pair, `\"name\":\"` or `\'name\':\'`, as found in a
+/// fragment that sits inside a string or other text. The runs of backslashes
+/// are checked in code (the regex crate has no backreferences): captures are
+/// 1 the opening quote, 2 the name, 3 the run before the name's closing
+/// quote, 4 that quote, 5 the run before the value's opening quote, 6 that
+/// quote.
 static ESCAPED_PAIR: LazyLock<Option<Regex>> =
-    LazyLock::new(|| Regex::new(r#"\\"([A-Za-z0-9_.-]+)\\"\s*:\s*\\""#).ok());
+    LazyLock::new(|| Regex::new(r#"(["'])([A-Za-z0-9_.-]+)(\\+)(["'])\s*:\s*(\\+)(["'])"#).ok());
 
-/// Where the value of an escaped pair that starts at `start` ends: the
-/// backslash of the first `\"` (one backslash, then the quote). Three
-/// backslashes before a quote are an escaped quote inside the value
-/// (`\\\"`) and stay in it. A value with no single-backslash close ends at
-/// the first quote run instead. `None` when no quote follows at all.
-fn escaped_value_end(text: &str, start: usize) -> Option<usize> {
-    let bytes = text.as_bytes().get(start..)?;
-    let mut at = 0;
-    let mut first_run = None;
-    while let Some(&byte) = bytes.get(at) {
-        if byte != b'\\' {
-            at += 1;
-            continue;
+/// The most distinct run lengths one text may use for escaped pairs. A
+/// nesting level k encodes a quote as 2^k - 1 backslashes, so real text has a
+/// few; the cap keeps the cost linear against a text built from many.
+const MAX_ESCAPE_RUNS: usize = 32;
+
+/// The first run of backslashes followed by a quote, at or after a query
+/// position, cached: forward queries inside the last answered gap reuse it.
+#[derive(Default)]
+struct RunSearch {
+    from: usize,
+    found: Option<usize>,
+}
+
+/// Where escaped values end, one cached search per quote character and
+/// run length.
+#[derive(Default)]
+struct EscapedEnds {
+    searches: HashMap<(u8, usize), Option<RunSearch>>,
+}
+
+impl EscapedEnds {
+    /// Where a value ends: the first run of backslashes before `quote` at or
+    /// after `at` that closes a value whose pair uses `pair_run` backslashes
+    /// (the value ends before the last `pair_run` of them): its
+    /// length is `pair_run` modulo twice `pair_run + 1` (an escaped
+    /// backslash is `pair_run + 1` of them at that level), so a value may
+    /// end in backslashes. `pair_run == 0` takes any run.
+    fn find(&mut self, bytes: &[u8], at: usize, quote: u8, pair_run: usize) -> Option<usize> {
+        if !self.searches.contains_key(&(quote, pair_run)) && self.searches.len() >= MAX_ESCAPE_RUNS + 2 {
+            return None;
         }
-        let run = bytes.get(at..)?.iter().take_while(|&&b| b == b'\\').count();
-        if bytes.get(at + run) == Some(&b'"') {
-            if run == 1 {
-                return Some(start + at);
+        let slot = self.searches.entry((quote, pair_run)).or_default();
+        if let Some(search) = slot
+            && search.from <= at
+            && search.found.is_none_or(|found| at <= found)
+        {
+            return search.found;
+        }
+        let mut position = at;
+        let mut found = None;
+        while let Some(&byte) = bytes.get(position) {
+            if byte != b'\\' {
+                position += 1;
+                continue;
             }
-            first_run.get_or_insert(start + at);
-            at += run + 1;
-        } else {
-            at += run;
+            let run = bytes
+                .get(position..)
+                .map_or(0, |rest| rest.iter().take_while(|&&b| b == b'\\').count());
+            if bytes.get(position + run) == Some(&quote) && (pair_run == 0 || run % (2 * pair_run + 2) == pair_run) {
+                // The value's own trailing backslashes belong to the value.
+                found = Some(position + run - pair_run);
+                break;
+            }
+            position += run + usize::from(bytes.get(position + run) == Some(&quote));
         }
+        #[cfg(test)]
+        record_redaction_work(found.unwrap_or(bytes.len()) - at.min(bytes.len()) + 1);
+        *slot = Some(RunSearch { from: at, found });
+        found
     }
-    first_run
+}
+
+/// Where the value of an escaped pair that starts at `start` ends: the first
+/// run that closes it, else the first quote run of any length. `None` when
+/// no quote follows at all.
+fn escaped_value_end(ends: &mut EscapedEnds, text: &str, start: usize, quote: u8, pair_run: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    ends.find(bytes, start, quote, pair_run)
+        .or_else(|| ends.find(bytes, start, quote, 0))
 }
 
 /// The values of credential pairs whose quotes are escaped, as in
-/// `config {\"password\":\"hunter22\"} ok`, masked exactly as the unescaped
-/// JSON pair is: the name decides ([`is_credential_value`]), the name is kept.
+/// `config {\"password\":\"hunter22\"} ok` (also at deeper nesting, with
+/// 3, 7, ... backslashes, and with `'`), masked exactly as the unescaped
+/// pair is: the name decides ([`is_credential_value`]), the name is kept.
 pub(super) fn escaped_pair_spans(text: &str, spans: &mut Vec<Range<usize>>) {
     #[cfg(test)]
     record_redaction_work(text.len());
-    if !text.contains("\\\"") {
+    if !text.contains("\\\"") && !text.contains("\\'") {
         return;
     }
     let Some(pair) = ESCAPED_PAIR.as_ref() else {
@@ -73,19 +190,49 @@ pub(super) fn escaped_pair_spans(text: &str, spans: &mut Vec<Range<usize>>) {
     };
     #[cfg(test)]
     record_redaction_work(text.len());
+    let bytes = text.as_bytes();
+    let mut ends = EscapedEnds::default();
     let mut covered_until = 0;
     for captures in pair.captures_iter(text) {
-        let (Some(header), Some(name)) = (captures.get(0), captures.get(1)) else {
+        let (Some(header), Some(name), Some(open), Some(close), Some(value_open)) = (
+            captures.get(0),
+            captures.get(2),
+            captures.get(1),
+            captures.get(3),
+            captures.get(5),
+        ) else {
             continue;
         };
         if header.start() < covered_until {
             continue;
         }
-        let Some(end) = escaped_value_end(text, header.end()) else {
+        let run = close.len();
+        if run % 2 == 0 || value_open.len() != run {
+            continue;
+        }
+        let (Some(quote), Some(closing), Some(value_quote)) = (
+            captures.get(4).and_then(|quote| quote.as_str().bytes().next()),
+            open.as_str().bytes().next(),
+            captures.get(6).and_then(|quote| quote.as_str().bytes().next()),
+        ) else {
             continue;
         };
+        if quote != closing || quote != value_quote {
+            continue;
+        }
+        // The run before the opening quote is the pair's own, or longer when
+        // an escaped backslash precedes it.
+        let lead = bytes
+            .get(..header.start())
+            .map_or(0, |before| before.iter().rev().take_while(|&&b| b == b'\\').count());
         #[cfg(test)]
-        record_redaction_work(end - header.end() + 1);
+        record_redaction_work(lead + 1);
+        if lead < run {
+            continue;
+        }
+        let Some(end) = escaped_value_end(&mut ends, text, header.end(), quote, run) else {
+            continue;
+        };
         let Some(value) = text.get(header.end()..end) else {
             continue;
         };
@@ -125,20 +272,22 @@ impl PairValueScan {
             // A double-quoted value steps over a backslash-escaped quote
             // (`"a b\"c"`); one with no closing quote that way ends at the
             // first quote, as before.
-            let offset = if quote == Some('"') {
-                closing_double_quote(tail.as_bytes()).or_else(|| tail.find('"'))
+            let (offset, _read) = if quote == Some('"') {
+                let (closing, read) = closing_double_quote(tail.as_bytes());
+                (closing.or_else(|| tail.find('"')), read)
             } else {
-                tail.find(|character: char| {
+                let found = tail.find(|character: char| {
                     quote.map_or_else(
                         || character.is_whitespace() || matches!(character, '"' | '\'' | ',' | ';' | '{' | '}'),
                         |quote| character == quote,
                     )
-                })
+                });
+                (found, 0)
             };
             self.end = offset.map_or(text.len(), |offset| body + offset);
             self.shape = None;
             #[cfg(test)]
-            record_redaction_work(self.end - body + usize::from(offset.is_some()));
+            record_redaction_work(_read.max(self.end - body + usize::from(offset.is_some())));
         }
         if quote.is_some() && self.end == text.len() {
             return None;
