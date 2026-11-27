@@ -23,7 +23,7 @@
 //! ([`History::fit`]). The stored rows are never touched.
 
 use super::tool_rows::{ATTACHMENT_EVENT_TYPE, TOOL_CALL_EVENT_TYPE, TOOL_RESULT_EVENT_TYPE};
-use crate::agent::context_budget::{PRE_TURN_FLUSH_THRESHOLD, estimate_history_tokens, plan_context_budget};
+use crate::agent::context_budget::{PRE_TURN_FLUSH_THRESHOLD, plan_context_budget};
 use crate::agent::history::build_native_assistant_history;
 use crate::memory::{ConversationTurn, MemoryPrincipal, MessageEvent, SessionContextQuery};
 use crate::providers::{ChatMessage, ToolCall};
@@ -155,7 +155,7 @@ impl ReplayLog {
                 // newest attachment of a message still wins.
                 let window_full = tool_rows.len() >= REPLAY_ROW_LIMIT || message_rows.len() >= REPLAY_ROW_LIMIT;
                 if with_messages && tool_rows.len() >= REPLAY_ROW_LIMIT {
-                    let mut rows = Self::attachment_rows_outside(mem, principal, &tool_rows).await;
+                    let mut rows = Self::attachment_rows_outside(mem, principal, &tool_rows, &message_rows).await;
                     rows.reverse();
                     rows.append(&mut tool_rows);
                     tool_rows = rows;
@@ -174,35 +174,61 @@ impl ReplayLog {
         }
     }
 
-    /// The newest attachment rows of the session that `tool_rows` does not hold.
-    /// A backend without the read, or a failed read, adds none.
+    /// The attachment rows older than the tool window `tool_rows` that the
+    /// replayed messages of `message_rows` may need, oldest first. An
+    /// attachment is written after its user message, so every attachment the
+    /// replay needs has a row id above the oldest message row read: the window
+    /// is paged back to that id with `load_session_context_before`, so no
+    /// attachment is lost however many attachment rows the session holds. A
+    /// backend without the read, or a failed page, keeps what was read so far.
     async fn attachment_rows_outside(
         mem: &dyn crate::memory::Memory,
         principal: &MemoryPrincipal,
         tool_rows: &[MessageEvent],
+        message_rows: &[MessageEvent],
     ) -> Vec<MessageEvent> {
-        let Some(session_key) = principal.session_key.as_deref() else {
+        let (Some(window_oldest), Some(replay_from)) = (
+            tool_rows.iter().map(|event| event.id).min(),
+            message_rows.iter().map(|event| event.id).min(),
+        ) else {
             return Vec::new();
         };
-        match mem
-            .newest_session_events_of_type(principal, session_key, ATTACHMENT_EVENT_TYPE, REPLAY_ROW_LIMIT)
-            .await
-        {
-            Ok(rows) => {
-                let held: HashSet<&str> = tool_rows.iter().map(|event| event.event_id.as_str()).collect();
-                rows.into_iter()
-                    .filter(|event| !held.contains(event.event_id.as_str()))
-                    .collect()
+        let mut rows = Vec::new();
+        let mut before = window_oldest;
+        while replay_from < before {
+            let query = SessionContextQuery {
+                principal: principal.clone(),
+                since_event_id: None,
+                limit: REPLAY_ROW_LIMIT,
+                include_roles: vec!["tool".to_owned()],
+            };
+            let page = match mem.load_session_context_before(query, before).await {
+                Ok(page) => page,
+                Err(error) => {
+                    if !error.is::<crate::memory::erasure::Unsupported>() {
+                        tracing::warn!(
+                            error = %crate::agent::diagnostics::error_class(&error),
+                            "attachment replay rows unavailable; older attachments are replayed without their stored text"
+                        );
+                    }
+                    break;
+                }
+            };
+            let page_len = page.len();
+            let Some(page_oldest) = page.iter().map(|event| event.id).min() else {
+                break;
+            };
+            rows.extend(
+                page.into_iter()
+                    .filter(|event| event.event_type == ATTACHMENT_EVENT_TYPE),
+            );
+            if page_len < REPLAY_ROW_LIMIT {
+                break;
             }
-            Err(error) if error.is::<crate::memory::erasure::Unsupported>() => Vec::new(),
-            Err(error) => {
-                tracing::warn!(
-                    error = %crate::agent::diagnostics::error_class(&error),
-                    "attachment replay rows unavailable; older attachments are replayed without their stored text"
-                );
-                Vec::new()
-            }
+            before = page_oldest;
         }
+        rows.reverse();
+        rows
     }
 
     fn from_rows(tool_rows: &[MessageEvent], message_rows: &[MessageEvent]) -> Self {
@@ -549,6 +575,8 @@ fn fit_results(
     if !budget.over_warning {
         return 0;
     }
+    // `excess` is in planned units (the calibration in force applies); each
+    // saving is measured the same way, so both sides of the comparison agree.
     let mut excess = budget.used_tokens.saturating_sub(budget.warning_threshold_tokens);
     let mut stubbed = 0;
     for result in results {
@@ -559,8 +587,7 @@ fn fit_results(
             continue;
         };
         let stub = result_message(&result.wire_id, &stub_text(result));
-        let saved = estimate_history_tokens(std::slice::from_ref(message))
-            .saturating_sub(estimate_history_tokens(std::slice::from_ref(&stub)));
+        let saved = planned_message_tokens(message, config).saturating_sub(planned_message_tokens(&stub, config));
         if saved == 0 {
             continue;
         }
@@ -569,6 +596,12 @@ fn fit_results(
         stubbed += 1;
     }
     stubbed
+}
+
+/// One message's tokens in the units [`plan_context_budget`] compares with its
+/// limit, so a saving is subtracted from the same measure as the excess.
+fn planned_message_tokens(message: &ChatMessage, config: &crate::config::AgentCompactionConfig) -> usize {
+    plan_context_budget(std::slice::from_ref(message), config, PRE_TURN_FLUSH_THRESHOLD).used_tokens
 }
 
 /// Terminal chat: replace the oldest replayed results held in `view` by a
