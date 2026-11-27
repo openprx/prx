@@ -1,6 +1,6 @@
 use crate::agent::context_budget::{PRE_TURN_FLUSH_THRESHOLD, plan_context_budget};
 use crate::agent::diagnostics::TOOL_PARSE_LOG_PREVIEW_CHARS;
-use crate::agent::document_ingest::{TOOL_OUTPUT_DOCUMENT_CHUNK_TOKENS, tool_output_document_id};
+use crate::agent::document_ingest::tool_output_document_id;
 use crate::agent::tool_call_parser::ParsedToolCall;
 use crate::providers::{ChatMessage, ToolCall};
 use crate::util::truncate_with_ellipsis;
@@ -118,7 +118,7 @@ pub(super) fn compact_tool_result_for_history_with_status(
         ));
     }
     let (document_id, sha256) = tool_output_document_id(tool_name, content);
-    let chunk_count = crate::memory::chunker::chunk_markdown(content, TOOL_OUTPUT_DOCUMENT_CHUNK_TOKENS)
+    let chunk_count = crate::memory::chunker::chunk_markdown(content, crate::memory::chunker::DOCUMENT_CHUNK_TOKENS)
         .len()
         .max(1);
     crate::security::redaction::redact_secrets(&format!(

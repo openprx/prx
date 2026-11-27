@@ -2986,7 +2986,7 @@ impl Memory for PostgresMemory {
         let embedding_model = self.embedding_model_name();
         let embedding_dimensions = self.embedding_dimensions_i64();
         let raw_chunks: Vec<(usize, Option<String>, String)> =
-            super::super::chunker::chunk_markdown(&input.content, 1_000)
+            super::super::chunker::chunk_markdown(&input.content, super::super::chunker::DOCUMENT_CHUNK_TOKENS)
                 .into_iter()
                 .map(|chunk| {
                     (

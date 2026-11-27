@@ -187,6 +187,9 @@ fn anchor_prefix(heading_path: &[String]) -> String {
     }
 }
 
+/// Chunk size the document stores use, and the one a reference counts with.
+pub(crate) const DOCUMENT_CHUNK_TOKENS: usize = 1_000;
+
 /// Split Markdown into chunks under the approximate token target where
 /// possible, without breaking atomic code/list/table blocks.
 pub fn chunk_markdown(text: &str, max_tokens: usize) -> Vec<Chunk> {

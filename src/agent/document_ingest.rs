@@ -216,10 +216,6 @@ impl DocumentIngestRuntime {
     }
 }
 
-/// Approximate chunk size for large tool-output document references.
-/// 🟡 Behavior-limits Phase 1: raised 2048 -> 4096 (fewer chunks per big output).
-pub(crate) const TOOL_OUTPUT_DOCUMENT_CHUNK_TOKENS: usize = 4_096;
-
 pub(crate) fn tool_output_document_id(tool_name: &str, content: &str) -> (String, String) {
     let mut hasher = sha2::Sha256::new();
     hasher.update(tool_name.as_bytes());

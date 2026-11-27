@@ -101,7 +101,7 @@ impl SqliteMemory {
         let embedding_model = self.embedding_model_name();
         let embedding_dimensions = self.embedding_dimensions_i64();
         let raw_chunks: Vec<(usize, Option<String>, String)> =
-            crate::memory::chunker::chunk_markdown(&input.content, 1_000)
+            crate::memory::chunker::chunk_markdown(&input.content, crate::memory::chunker::DOCUMENT_CHUNK_TOKENS)
                 .into_iter()
                 .map(|chunk| {
                     (
