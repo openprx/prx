@@ -465,22 +465,34 @@ impl Memory for EncryptedScope {
         }
         let entries = self.inner.list_key_prefix(&self.prefix(), usize::MAX).await?;
         let needle = query.to_lowercase();
-        let mut matched = Vec::new();
+        let words: Vec<&str> = needle.split_whitespace().collect();
+        let mut whole = Vec::new();
+        let mut words_only = Vec::new();
         for mut entry in entries {
             let Some((record_id, plain)) = self.open_stored(&entry.key, &entry.content) else {
                 continue;
             };
-            if !needle.is_empty() && !plain.to_lowercase().contains(&needle) {
-                continue;
+            let mut whole_match = true;
+            if !words.is_empty() {
+                let text = plain.to_lowercase();
+                whole_match = text.contains(&needle);
+                if !whole_match && !words.iter().all(|word| text.contains(word)) {
+                    continue;
+                }
             }
             entry.content = plain;
             entry.key = record_id;
             entry.session_id = Some(self.scope.clone());
-            matched.push(entry);
-            if matched.len() >= limit {
-                break;
+            if whole_match {
+                whole.push(entry);
+            } else {
+                words_only.push(entry);
             }
         }
+        // Whole-query matches take the limited slots before word-only matches.
+        let mut matched = whole;
+        matched.append(&mut words_only);
+        matched.truncate(limit);
         Ok(matched)
     }
 
