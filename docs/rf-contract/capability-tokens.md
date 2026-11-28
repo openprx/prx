@@ -478,8 +478,11 @@ JSON does not change.
 turn spawned (child and grandchild sessions, found through the parent-run link
 of their rows): every row of those runs is tombstoned like the deleted run's
 rows, and each such run gets its own `turn.deleted` record (same `side` as the
-delete, `message_id` `null`, `run_id` the spawned run) in the spawned run's own
-session stream. A spawned run that is still running defers the whole delete as
+delete, `run_id` the spawned run, `message_id` never `null`: it is the
+spawned run's anchor event id, its first user event, else the id of the deleted
+row) in the spawned run's own session stream. A task child's segment run
+(`run_id` `child-segment:<authority>:<n>`) gets its own record. A client
+removes every mirror row of the record's `run_id`. A spawned run that is still running defers the whole delete as
 a running turn does (the response is the same `"status":"deleted"` body as an
 immediate delete; no extra field is added): the deleted turn's
 conversation rows are hidden at once, and every row of the turn and of the runs
