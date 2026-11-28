@@ -213,6 +213,14 @@ key lives only in process memory. `agent_offline` and shutdown zeroize it;
 the next `bridge.hello` unwraps it again. The wrapped key stays on disk until account removal. Associated data is the account id
 and the conversation id, so ciphertext cannot be moved between conversations.
 
+The memory access audit log (`access_audit_log`) holds no clear memory key or
+query text of this channel: a view read writes no audit row, and a base-store
+access of an `rf:` scoped key is logged under the SHA-256 hex of the key, with
+the same decision a missing key gets. The first open after upgrade rewrites
+existing `rf:` ids in the log to that form once; rows that hold a clear model
+key without the `rf:` prefix cannot be identified and are left as they are. The
+log is not part of a conversation erase.
+
 The vector index is not given plaintext. If a backend cannot store an
 encrypted vector, this namespace is not indexed.
 
