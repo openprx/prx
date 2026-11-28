@@ -41,7 +41,9 @@ use crate::runtime::sqlite_pool::begin_immediate;
 use rusqlite::{Connection, OptionalExtension, params};
 
 mod mailbox_family;
-use mailbox_family::{announcement_events, announcement_turns, child_adopted_rows, erase_mailbox_bodies};
+use mailbox_family::{
+    announcement_events, announcement_turns, child_adopted_rows, erase_mailbox_bodies, erase_pending_messages,
+};
 
 /// Idempotent DDL, run after the attempt table exists.
 pub(super) fn init_schema(conn: &Connection) -> anyhow::Result<()> {
@@ -1016,6 +1018,8 @@ fn erase_family(
     // The mailbox bodies of the adopted rows being tombstoned (receiver row and
     // sender outbox), found by the receipt's adopted event id.
     erase_mailbox_bodies(tx, target, &all)?;
+    // The messages the erased runs sent that no one has adopted yet.
+    erase_pending_messages(tx, target, attempt.run_id.as_deref(), &descendants)?;
     // Read before the rewrite: the payload of a tool result names the stored
     // document that holds its large output.
     let output_documents = tool_output_document_ids(tx, target, &all)?;

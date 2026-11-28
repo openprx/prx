@@ -229,6 +229,84 @@ pub(in crate::memory::sqlite) fn erase_adopted_bodies(
     Ok(handled)
 }
 
+/// Erase the messages that the runs in `runs_json` (a JSON array of run ids)
+/// sent and that no one has adopted yet: receipts still accepted or delivered
+/// whose recorded `sender_run_id` is one of them. Each slot is closed the way a
+/// stale slot is (`receipt::terminal_stale_slot`: the body row goes, the receipt
+/// gets `body_erased_at`, the slot becomes a skipped hole so later messages of
+/// the stream still flow, and the sender's outbox slot is nacked), then the
+/// body of the sender's outbox row of the same message in the same stream is
+/// erased. A later adopt of the receipt is refused as stale, so no conversation
+/// row and no woken turn appears. A receipt or outbox row whose metadata does
+/// not decode is skipped. Returns the number of receipts handled.
+pub(in crate::memory::sqlite) fn erase_pending_from_runs(
+    tx: &rusqlite::Connection,
+    workspace_id: &str,
+    owner_id: &str,
+    runs_json: &str,
+    now: i64,
+) -> anyhow::Result<usize> {
+    let ids = {
+        let mut query = tx.prepare(
+            "SELECT id FROM prx_mailbox_receipts
+             WHERE workspace_id = ?1 AND owner_id = ?2 AND state IN (0, 1)
+               AND sender_run_id IN (SELECT value FROM json_each(?3)) ORDER BY id",
+        )?;
+        query
+            .query_map(params![workspace_id, owner_id, runs_json], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut handled = 0usize;
+    for id in ids {
+        let Ok(mut saved) = receipt::load(tx, id) else {
+            continue;
+        };
+        if saved.meta.body_erased_at.is_some() {
+            continue;
+        }
+        let closed = match stream::load(tx, saved.stream_id) {
+            Ok(mut slot) => receipt::terminal_stale_slot(tx, &mut slot, &mut saved, now),
+            Err(error) => Err(error),
+        };
+        if closed.is_err() {
+            // The slot could not be closed as a hole (for example the stream's
+            // hole table is full): the body still goes.
+            saved.meta.body_erased_at.get_or_insert(now);
+            saved.meta.updated_at = now;
+            tx.execute("DELETE FROM prx_mailbox_messages WHERE id = ?1", [id])?;
+            tx.execute(
+                "UPDATE prx_mailbox_receipts SET receipt_meta = ?1 WHERE id = ?2",
+                params![encode(&saved.meta)?, id],
+            )?;
+        }
+        let outboxes = {
+            let mut query = tx.prepare(
+                "SELECT id, envelope_meta, state FROM prx_mailbox_outbox
+                 WHERE workspace_id = ?1 AND owner_id = ?2 AND message_id = ?3 AND stream_id = ?4",
+            )?;
+            query
+                .query_map(
+                    params![
+                        workspace_id,
+                        owner_id,
+                        saved.message_id.as_bytes().as_slice(),
+                        saved.stream_id
+                    ],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (outbox_id, json, state) in outboxes {
+            match erase_outbox_body(tx, outbox_id, &json, state, now) {
+                Ok(()) | Err(MailboxError::InvalidMetadata | MailboxError::CorruptState) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        handled += 1;
+    }
+    Ok(handled)
+}
+
 fn verify_coverage(conn: &rusqlite::Connection, scope: &MailboxScope) -> MailboxResult<i64> {
     let mut remaining = 0i64;
     for (table, extra) in [

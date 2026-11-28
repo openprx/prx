@@ -14,7 +14,9 @@ use rusqlite::{Connection, params};
 /// first row. A child session that still holds a row the delete keeps may have
 /// announced another run, so only the notices of the erased runs go, found by
 /// sender and the fixed notice head that PRX writes around the run id
-/// ([`run_notices`]). Read before the tombstone.
+/// ([`run_notices`]). Every adopted row whose recorded sender run is an erased
+/// run of its own session ([`sent_by_erased_runs`]) goes as well, whatever
+/// recipient run adoption stamped it with. Read before the tombstone.
 pub(super) fn announcement_events(
     tx: &Connection,
     target: &Target<'_>,
@@ -79,8 +81,40 @@ pub(super) fn announcement_events(
                 .collect::<rusqlite::Result<Vec<_>>>()?,
         );
     }
+    found.extend(sent_by_erased_runs(tx, target, children)?);
     found.sort_unstable();
     found.dedup();
+    Ok(found)
+}
+
+/// The adopted rows (source `prx_mailbox`, `message.created`) that an erased
+/// run in `children` sent, found by the sender run the sending runtime recorded
+/// in the row's payload (`sender_run_id`, written by `mailbox/adopt.rs`) and by
+/// the child's session as sender; both must match. The row's text is the erased
+/// run's output wherever adoption placed it: it is found whatever run the
+/// recipient session stamped it with, before or after a kept run's first row.
+/// A row whose recorded run is a kept run of the same child session is not
+/// matched, nor is a row of another sender, a remote peer's row or a row
+/// written before the field existed (those have no `sender_run_id`). Matched by
+/// key only, never by text. Read before the tombstone.
+fn sent_by_erased_runs(tx: &Connection, target: &Target<'_>, children: &[Child]) -> anyhow::Result<Vec<String>> {
+    let mut statement = tx.prepare(
+        "SELECT event_id FROM message_events
+         WHERE workspace_id = ?1 AND owner_id = ?2 AND source = 'prx_mailbox' AND event_type = 'message.created'
+           AND sender = ?3 AND json_valid(raw_payload_json)
+           AND json_extract(raw_payload_json, '$.sender_run_id') = ?4",
+    )?;
+    let mut found: Vec<String> = Vec::new();
+    for child in children {
+        found.extend(
+            statement
+                .query_map(
+                    params![target.workspace_id, target.owner_id, child.session_key, child.run_id],
+                    |row| row.get::<_, String>(0),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        );
+    }
     Ok(found)
 }
 
@@ -188,6 +222,12 @@ pub(super) fn announcement_turns(
 /// sent is not followed, nor is an adopted row from any other sender; both are
 /// still erased when they are in `rows`. Matched by key and order only, never
 /// by text.
+///
+/// The order window is the rule for rows without a recorded sender run (written
+/// before `sender_run_id` existed). A row that records its sender run is judged
+/// by that run alone ([`sent_by_erased_runs`]): one recorded with a kept run
+/// is not followed here even inside the window, and one recorded with an erased
+/// run is already among the announcements.
 pub(super) fn child_adopted_rows(
     tx: &Connection,
     target: &Target<'_>,
@@ -222,7 +262,9 @@ pub(super) fn child_adopted_rows(
             "SELECT event_id FROM message_events
              WHERE workspace_id = ?1 AND owner_id = ?2 AND source = 'prx_mailbox' AND event_type = 'message.created'
                AND event_id IN (SELECT value FROM json_each(?3)) AND sender = ?4
-               AND id > ?5 AND (?6 IS NULL OR id < ?6)",
+               AND id > ?5 AND (?6 IS NULL OR id < ?6)
+               AND CASE WHEN json_valid(raw_payload_json)
+                        THEN json_type(raw_payload_json, '$.sender_run_id') END IS NULL",
         )?;
         found.extend(
             statement
@@ -251,5 +293,34 @@ pub(super) fn erase_mailbox_bodies(tx: &Connection, target: &Target<'_>, event_i
     let now = chrono::DateTime::parse_from_rfc3339(target.now)
         .map_or_else(|_| chrono::Utc::now().timestamp(), |time| time.timestamp());
     super::super::mailbox::erase_adopted_bodies(tx, target.workspace_id, target.owner_id, event_ids, now)?;
+    Ok(())
+}
+
+/// Erase the messages that the erased runs (`attempt_run` and `descendants`)
+/// sent and that no one has adopted yet (`mailbox::erase_pending_from_runs`). A later adoption of such
+/// a message is refused as stale, so no row and no woken turn appears after the
+/// delete. Messages without a recorded sender run are not reached.
+pub(super) fn erase_pending_messages(
+    tx: &Connection,
+    target: &Target<'_>,
+    attempt_run: Option<&str>,
+    descendants: &[String],
+) -> anyhow::Result<()> {
+    let runs: Vec<&str> = attempt_run
+        .into_iter()
+        .chain(descendants.iter().map(String::as_str))
+        .collect();
+    if runs.is_empty() {
+        return Ok(());
+    }
+    let now = chrono::DateTime::parse_from_rfc3339(target.now)
+        .map_or_else(|_| chrono::Utc::now().timestamp(), |time| time.timestamp());
+    super::super::mailbox::erase_pending_from_runs(
+        tx,
+        target.workspace_id,
+        target.owner_id,
+        &serde_json::to_string(&runs)?,
+        now,
+    )?;
     Ok(())
 }
