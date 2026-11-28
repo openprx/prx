@@ -192,6 +192,22 @@ any of those rows rewrites the attachment (empty recalled text, `blanked: true`,
 date line kept); version 1 rows have no `sources` and are matched by text. Replay
 reads `prefix` and `tail` only, so a blanked row replays as plain input.
 
+## Channel history after an interrupted turn
+
+A channel turn replays its earlier turns from the durable log only when the
+newest logged user row is the current message and the newest turns of the log
+equal the cached turns, role for role and text for text. The cache folds
+consecutive user messages (a turn interrupted before its reply was stored) into
+one turn, while the log keeps them as separate rows. While such a folded pair is
+inside the 200-row window, the two views differ, the log is not used and the
+cache is replayed; the provenance of the request names this as
+`unavailable:turn_unmatched`. The turn is answered normally. Once the folded
+pair has left the window, the log is used again. The log rows are not merged to
+remove the difference: a merged turn would carry two event ids, and the source id
+check cannot attribute a turn to two events. The same applies when the current
+message's own row is not in the log: nothing is cut at an older identical
+message, and the cache is replayed.
+
 ## Replayed history in terminal chat
 
 `prx chat` (TUI and `--plain`) replays the same two things, carried on the
