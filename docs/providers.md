@@ -1471,14 +1471,18 @@ test drives a tool without a model request.
   `prx chat --message` turn (streaming) emits it on its first model call. A
   non-streaming turn emits it once per provider instance, only when the tool is
   offered and the latest user text names it, so it does not suit channel turns.
-  Use the calls file below for channel (ramflux) and gateway turns.
+  Use the calls file below for channel (ramflux) turns and for gateway turns
+  of a Console session.
 - `OPENPRX_MOCK_TOOL_CALLS_FILE=<path>` points at a JSON array of
   `{"name":"memory_store","args":{"key":"home","content":"12 Main St"}}`
-  entries. On non-streaming turns (channels, gateway) each tool-carrying turn
-  consumes the next
-  entry, counted across the whole process, so one daemon serves several scripted
+  entries. On non-streaming turns (channel turns, and gateway turns of a Console
+  session) each tool-carrying turn consumes the next entry, counted across the whole process, so one daemon serves several scripted
   turns. The follow-up model call after a tool result does not consume an entry.
   The named tool need not be offered; if the turn did not expose it, the engine
   reports that instead of running it. When the file is set it takes precedence
-  over `OPENPRX_MOCK_TOOL_CALL` on non-streaming turns, and terminal streaming
-  turns ignore it.
+  over `OPENPRX_MOCK_TOOL_CALL` on non-streaming turns. Streaming turns ignore
+  it: terminal `prx chat` turns and gateway turns of an rf-route session, which
+  stream to the rf client; script those with `OPENPRX_MOCK_SCRIPT`.
+- `OPENPRX_MOCK_SCRIPT=<json>` holds `{"chunks":[...]}` (tool chunks
+  `{"tool":{"id","name","args"}}` and text chunks `{"delta":"text"}`) and
+  drives streaming turns.
