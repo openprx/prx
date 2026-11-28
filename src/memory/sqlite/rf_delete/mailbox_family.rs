@@ -21,7 +21,6 @@ pub(super) fn announcement_events(
     tx: &Connection,
     target: &Target<'_>,
     children: &[Child],
-    own_run: Option<&str>,
 ) -> anyhow::Result<Vec<String>> {
     let deleted = serde_json::to_string(
         &children
@@ -82,7 +81,7 @@ pub(super) fn announcement_events(
                 .collect::<rusqlite::Result<Vec<_>>>()?,
         );
     }
-    found.extend(sent_by_erased_runs(tx, target, children, own_run)?);
+    found.extend(sent_by_erased_runs(tx, target, children)?);
     found.sort_unstable();
     found.dedup();
     Ok(found)
@@ -96,15 +95,9 @@ pub(super) fn announcement_events(
 /// recipient session stamped it with, before or after a kept run's first row.
 /// A row whose recorded run is a kept run of the same child session is not
 /// matched, nor is a row of another sender, a remote peer's row or a row
-/// written before the field existed (those have no `sender_run_id`). The deleted
-/// turn's own run (`own_run`) is followed the same way, with the target session
-/// as sender. Matched by key only, never by text. Read before the tombstone.
-fn sent_by_erased_runs(
-    tx: &Connection,
-    target: &Target<'_>,
-    children: &[Child],
-    own_run: Option<&str>,
-) -> anyhow::Result<Vec<String>> {
+/// written before the field existed (those have no `sender_run_id`). Matched by
+/// key only, never by text. Read before the tombstone.
+fn sent_by_erased_runs(tx: &Connection, target: &Target<'_>, children: &[Child]) -> anyhow::Result<Vec<String>> {
     let mut statement = tx.prepare(
         "SELECT event_id FROM message_events
          WHERE workspace_id = ?1 AND owner_id = ?2 AND source = 'prx_mailbox' AND event_type = 'message.created'
@@ -112,16 +105,11 @@ fn sent_by_erased_runs(
            AND json_extract(raw_payload_json, '$.sender_run_id') = ?4",
     )?;
     let mut found: Vec<String> = Vec::new();
-    let runs = own_run.map(|run| (target.session_key, run)).into_iter().chain(
-        children
-            .iter()
-            .map(|child| (child.session_key.as_str(), child.run_id.as_str())),
-    );
-    for (session_key, run_id) in runs {
+    for child in children {
         found.extend(
             statement
                 .query_map(
-                    params![target.workspace_id, target.owner_id, session_key, run_id],
+                    params![target.workspace_id, target.owner_id, child.session_key, child.run_id],
                     |row| row.get::<_, String>(0),
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?,

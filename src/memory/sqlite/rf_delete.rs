@@ -780,7 +780,7 @@ fn select_family(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Att
         // The completion notices of the erased runs sit in the parent session; they
         // are deleted with the rows they report and count as direct sources, so the
         // memories, drafts and links made from them go too.
-        let announcements = announcement_events(tx, target, &children, attempt.run_id.as_deref())?;
+        let announcements = announcement_events(tx, target, &children)?;
         // The turn each deleted notice woke in the parent session reports the
         // same result: its input, reply, tool rows and terminal go too. So does
         // the turn woken by an erased adopted row that an erased child run sent
