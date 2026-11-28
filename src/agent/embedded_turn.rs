@@ -579,7 +579,12 @@ async fn run_work(
     let guard = guard.with_child_cleanup(confirmed);
     let memory = crate::agent::turn_request::ToolLoopMemory::new(&agent.memory, &agent.workspace_dir, None)
         .with_event_fabric(source.fabric().clone())
-        .with_request_event_scope(source.envelope().message_scope());
+        .with_request_event_scope(source.envelope().message_scope())
+        .with_tool_surface_reserve(
+            crate::context::budget::session_reserves::session_tool_surface_reserve(
+                &source.envelope().session_key,
+            ),
+        );
     let result = child_cleanup
         .run(Box::pin(crate::agent::turn_engine::run_turn(
             &mut history.wire,
