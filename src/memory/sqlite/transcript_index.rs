@@ -326,27 +326,36 @@ pub(super) async fn build_index(pool: Arc<MemoryPool>) -> anyhow::Result<()> {
 
 /// Create the index objects when the table is missing, in one short
 /// transaction, and return the state after it. The check is a read; the write
-/// lock is taken only when the table is missing (or the purge queue is, see
-/// below), and the check is repeated under the lock, so the creation runs once
-/// per database. An empty table is complete at once.
+/// lock is taken only when the table is missing, the purge queue is missing, or
+/// the triggers are not the set this build creates, and the check is repeated
+/// under the lock, so each of them runs once per database. An empty table is
+/// complete at once.
 ///
 /// An index built by an earlier build has no purge queue and carries the
 /// triggers that delete from the index themselves. It is upgraded here, in one
 /// short transaction: the queue is created and the triggers are replaced by
 /// the form of its state (complete or filling). The absence of the queue is
 /// the marker; the schema stamp does not cover the index objects.
+///
+/// With the queue present, the `message_events_fts_*` triggers must be exactly
+/// the set this build creates for the state (same names, same text). An older
+/// binary run on an upgraded store, or a table rebuild that dropped the
+/// triggers, leaves another set, and the index can no longer be trusted: the
+/// store is then handled as if the index were missing (dropped and refilled in
+/// batches). The check is one read of `sqlite_schema`.
 fn create_index(pool: &MemoryPool) -> anyhow::Result<IndexState> {
     {
         let reader = pool.read()?;
         let conn = reader.connection()?;
         let state = index_state(conn)?;
-        if state != IndexState::Missing && table_exists(conn, PURGE_TABLE)? {
+        if state != IndexState::Missing && table_exists(conn, PURGE_TABLE)? && trigger_set_matches(conn, state)? {
             return Ok(state);
         }
     }
     let guard = pool.write();
     let tx = begin_immediate(&guard)?;
     let state = index_state(&tx)?;
+    let mut repairing = false;
     if state != IndexState::Missing {
         if !table_exists(&tx, PURGE_TABLE)? {
             tx.execute_batch(PURGE_TABLE_SQL)?;
@@ -356,16 +365,32 @@ fn create_index(pool: &MemoryPool) -> anyhow::Result<IndexState> {
             } else {
                 TRIGGERS_SQL
             })?;
+            tx.commit()?;
+            return Ok(state);
         }
-        tx.commit()?;
-        return Ok(state);
+        if trigger_set_matches(&tx, state)? {
+            tx.commit()?;
+            return Ok(state);
+        }
+        let found: i64 = tx.query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND name GLOB 'message_events_fts_*'",
+            [],
+            |row| row.get(0),
+        )?;
+        tracing::warn!(
+            found,
+            "transcript index triggers are not the expected set; rebuilding the index"
+        );
+        repairing = true;
     }
     tx.execute_batch(CLEAR_SQL)?;
     // The queue refers to the index being dropped, if any.
     tx.execute_batch(PURGE_TABLE_SQL)?;
     tx.execute_batch(&format!("DELETE FROM {PURGE_TABLE};"))?;
     if table_exists(&tx, INDEX_TABLE)? {
-        tracing::warn!("transcript index was built with another tokenizer; rebuilding it");
+        if !repairing {
+            tracing::warn!("transcript index was built with another tokenizer; rebuilding it");
+        }
         tx.execute_batch(&format!("DROP TABLE {INDEX_TABLE};"))?;
     }
     tx.execute_batch(CREATE_TABLE_SQL)?;
@@ -384,6 +409,53 @@ fn create_index(pool: &MemoryPool) -> anyhow::Result<IndexState> {
     };
     tx.commit()?;
     Ok(state)
+}
+
+/// Whitespace collapsed, so stored trigger text compares with the constants.
+fn normalise_sql(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The triggers a script of `CREATE TRIGGER` statements creates, as
+/// (name, normalised text without the trailing semicolon), sorted by name.
+fn expected_triggers(script: &str) -> Vec<(String, String)> {
+    let mut triggers: Vec<(String, String)> = script
+        .split("CREATE TRIGGER ")
+        .skip(1)
+        .map(|statement| {
+            let text = normalise_sql(&format!("CREATE TRIGGER {statement}"));
+            let text = text.trim_end_matches(';').trim_end().to_owned();
+            let name = statement.split_whitespace().next().unwrap_or_default().to_owned();
+            (name, text)
+        })
+        .collect();
+    triggers.sort();
+    triggers
+}
+
+/// Whether the `message_events_fts_*` triggers of `conn` are exactly the set
+/// this build creates for `state`: the same names and the same text. A read.
+fn trigger_set_matches(conn: &Connection, state: IndexState) -> anyhow::Result<bool> {
+    let mut stmt =
+        conn.prepare("SELECT name, sql FROM sqlite_schema WHERE type='trigger' AND name GLOB 'message_events_fts_*'")?;
+    let mut actual = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .map(|(name, sql)| (name, normalise_sql(&sql)))
+        .collect::<Vec<_>>();
+    actual.sort();
+    let expected = expected_triggers(if state == IndexState::Filling {
+        FILLING_TRIGGERS_SQL
+    } else {
+        TRIGGERS_SQL
+    });
+    Ok(actual == expected)
 }
 
 /// One fill transaction: index the next batch of the unfilled range and move
