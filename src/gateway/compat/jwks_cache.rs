@@ -52,6 +52,27 @@ fn in_fetch_backoff(uri: &str) -> bool {
         .is_some_and(|failed_at| failed_at.elapsed() < JWKS_FETCH_BACKOFF)
 }
 
+fn record_fetch_failure(uri: &str) {
+    JWKS_FETCH_FAILURES.lock().insert(uri.to_string(), Instant::now());
+}
+
+/// Records a fetch failure when the request future holding the fetch lock is
+/// dropped before the fetch completes (for example a client disconnect), so a
+/// hanging endpoint still starts the back-off. Disarmed on every completed
+/// outcome. Takes only the failure-map lock and logs nothing.
+struct FetchCancelGuard<'a> {
+    uri: &'a str,
+    armed: bool,
+}
+
+impl Drop for FetchCancelGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            record_fetch_failure(self.uri);
+        }
+    }
+}
+
 /// Return the cached JWKS for `uri` if a fresh (within `ttl_secs`) copy exists.
 ///
 /// Synchronous and never performs network I/O — refreshing is the job of
@@ -115,7 +136,10 @@ pub(super) async fn prewarm_remote_jwks(config: &crate::config::McpServerRuntime
         return;
     }
 
-    match fetch_remote_jwks(&uri).await {
+    let mut guard = FetchCancelGuard { uri: &uri, armed: true };
+    let outcome = fetch_remote_jwks(&uri).await;
+    guard.armed = false;
+    match outcome {
         Ok(jwks) => {
             REMOTE_JWKS_CACHE.write().insert(
                 uri.clone(),
@@ -127,7 +151,7 @@ pub(super) async fn prewarm_remote_jwks(config: &crate::config::McpServerRuntime
             JWKS_FETCH_FAILURES.lock().remove(&uri);
         }
         Err(error) => {
-            JWKS_FETCH_FAILURES.lock().insert(uri, Instant::now());
+            record_fetch_failure(&uri);
             tracing::warn!(error = %error, "remote jwks refresh failed; relying on existing cache (fail-closed if stale)");
         }
     }
