@@ -231,7 +231,7 @@ a TRUNCATE checkpoint empties the WAL, so VACUUM is unnecessary.
 
 Sealed tool rows of the memory tools (a `memory_recall`, `memory_search` or
 `memory_get` result and its execution record, and a `memory_store` call) carry
-up to three plaintext fields beside the sealed payload. A printed split that is
+up to two plaintext fields beside the sealed payload. A printed split that is
 not a stored key is never hashed, so no memory text is.
 
 - `memory_key_hashes`: the SHA-256 of each printed key that exists as a sealed
@@ -240,23 +240,22 @@ not a stored key is never hashed, so no memory text is.
 - `memory_scope`: the SHA-256 of the memory scope (the account and
   conversation, or the account alone under cross-conversation retrieval). It
   is the middle segment of every stored memory key of that scope.
-- `memory_plain_key_hashes`: the SHA-256 of each printed key that exists as a
-  plaintext memory of the base store, which `memory_search` and `memory_get`
-  can print into an encrypted conversation. Plaintext keys are already in
-  clear text in the memories table.
 
-A stored sealed key already holds the first two values, and a plaintext key the
-third, with one exception: a `memory_store` call row is written before the tool
-runs, so a write that failed or was refused leaves the hash of a key that was
-never stored. No content is kept with it, and it stays until the conversation
-is erased (or a forget of that key in the same scope replaces the row).
+A stored sealed key already holds both values, with one exception: a
+`memory_store` call row is written before the tool runs, so a write that
+failed or was refused leaves the hash of a key that was never stored. No
+content is kept with it, and it stays until the conversation is erased (or a
+forget of that key in the same scope replaces the row).
 
 The row also holds a replacement of itself sealed in advance by the same
 scope. When a memory is forgotten, by any delete path, the replacement is
 swapped in within the deleting transaction, so the conversation no longer
 replays the forgotten text to the model. A sealed memory matches the rows of
-its own scope that name its key; a plaintext memory matches the rows that name
-its key and whose workspace and owner the memory covers, as in plaintext mode.
+its own scope that name its key. `memory_search` and `memory_get` read the
+conversation's own scope through the turn's memory view, as `memory_recall`
+does, so a plaintext memory of the base store is never printed into the
+conversation and has no sealed copies. A key of another scope is answered like a
+missing key.
 A rewrite of the execution record after a hook does not write over a swapped
 row. Known limits:
 

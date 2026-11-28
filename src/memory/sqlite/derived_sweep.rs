@@ -586,14 +586,13 @@ const SEALED_COPY_TYPES: &str = "('tool.result.recorded', 'tool.call.recorded', 
 /// `removed_payload`, both sealed by the scope for the row's own record ids,
 /// so the row still opens and the call and result pair stays valid for replay.
 /// Sealed (`rf:`) memories are matched by scope (see
-/// [`rewrite_scoped_sealed_copies`]), plaintext memories printed into an
-/// encrypted conversation by owner and workspace (see
-/// [`rewrite_plain_sealed_copies`]). A fenced scope is skipped. A row written
+/// [`rewrite_scoped_sealed_copies`]); a plaintext memory has no sealed copies,
+/// because the tools of an encrypted conversation read only its own scope.
+/// A fenced scope is skipped. A row written
 /// before the wrapper existed has no hashes and stays (residual r-E1).
 /// Returns the number of rows swapped.
 fn rewrite_sealed_copies(tx: &Connection, probes: &[MemoryProbe], oldest: &str, now: &str) -> anyhow::Result<usize> {
-    Ok(rewrite_scoped_sealed_copies(tx, probes, oldest, now)?
-        .saturating_add(rewrite_plain_sealed_copies(tx, probes, now)?))
+    rewrite_scoped_sealed_copies(tx, probes, oldest, now)
 }
 
 /// The sealed rows of the forgotten sealed (`rf:`) memories. A row matches
@@ -651,78 +650,6 @@ fn rewrite_scoped_sealed_copies(
             .iter()
             .any(|hash| wanted.contains(&(scope.as_str(), hash.as_str())))
         {
-            swapped = swapped.saturating_add(swap_sealed_row(tx, &event_id, now)?);
-        }
-    }
-    Ok(swapped)
-}
-
-/// The sealed rows that printed a forgotten plaintext memory: an encrypted
-/// conversation can read the base store (`memory_search`, `memory_get`), and
-/// its sealed result and terminal rows then carry `memory_plain_key_hashes`.
-/// A row matches when that list holds `id_hash` of the memory's key and the
-/// row's own workspace and owner are covered by the memory, exactly as the
-/// plaintext sweep decides ([`MemoryProbe::covers`], [`MemoryProbe::applies`]).
-/// Rows are bound by the memory's creation time (a row cannot print a memory
-/// before it existed); calls never carry the field. Cost on a plaintext
-/// forget: one scan of the result and terminal rows recorded since the
-/// memory's creation, the same window the plaintext sweep scans; a row without
-/// the field is dropped by a substring test before any JSON is parsed.
-fn rewrite_plain_sealed_copies(tx: &Connection, probes: &[MemoryProbe], now: &str) -> anyhow::Result<usize> {
-    let plain: Vec<(&MemoryProbe, String)> = probes
-        .iter()
-        .filter(|probe| probe.sealed_ref().is_none())
-        .map(|probe| (probe, crate::security::ramflux_aead::id_hash(&probe.key)))
-        .collect();
-    let Some(oldest) = plain.iter().map(|(probe, _)| probe.created_utc.as_str()).min() else {
-        return Ok(0);
-    };
-    let mut hashes: Vec<&str> = plain.iter().map(|(_, hash)| hash.as_str()).collect();
-    hashes.sort_unstable();
-    hashes.dedup();
-    let mut statement = tx.prepare(
-        "SELECT event_id, workspace_id, owner_id,
-                (SELECT json_group_array(value) FROM json_each(raw_payload_json, '$.memory_plain_key_hashes'))
-         FROM message_events
-         WHERE event_type IN ('tool.result.recorded', 'tool.execution.finalized')
-           AND id >= COALESCE((SELECT MIN(id) FROM message_events WHERE created_at >= ?1), 9223372036854775807)
-           AND instr(raw_payload_json, 'memory_plain_key_hashes') > 0
-           AND json_valid(raw_payload_json)
-           AND json_type(raw_payload_json, '$.removed_content') = 'text'
-           AND json_type(raw_payload_json, '$.removed_payload') = 'text'
-           AND EXISTS (SELECT 1 FROM json_each(raw_payload_json, '$.memory_plain_key_hashes') h
-                       WHERE h.value IN (SELECT value FROM json_each(?2)))
-           AND NOT EXISTS (SELECT 1 FROM agent_erase_fences f WHERE f.scope_id = message_events.ma_scope_id)",
-    )?;
-    let found = statement
-        .query_map(params![oldest, serde_json::to_string(&hashes)?], |row| {
-            Ok([
-                row.get::<_, Value>(0)?,
-                row.get::<_, Value>(1)?,
-                row.get::<_, Value>(2)?,
-                row.get::<_, Value>(3)?,
-            ])
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    drop(statement);
-    let mut swapped = 0usize;
-    for [event_id, workspace, owner, stored] in found {
-        let (Value::Text(event_id), Value::Text(stored)) = (event_id, stored) else {
-            continue;
-        };
-        let (workspace, owner) = (text_of(workspace), text_of(owner));
-        let stored: HashSet<String> = serde_json::from_str(&stored).unwrap_or_default();
-        let mut matched = false;
-        for (probe, hash) in &plain {
-            if stored.contains(hash)
-                && probe.covers(workspace.as_deref(), owner.as_deref())
-                && probe.applies(tx, workspace.as_deref(), owner.as_deref())?
-            {
-                matched = true;
-                break;
-            }
-        }
-        if matched {
             swapped = swapped.saturating_add(swap_sealed_row(tx, &event_id, now)?);
         }
     }

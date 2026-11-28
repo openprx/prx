@@ -257,7 +257,9 @@ impl Tool for MemoryGetTool {
         } else {
             MemoryReadMode::Observe
         };
-        match self.memory.get_with_context_mode(path, Some(&scope_ctx), mode).await? {
+        // The turn's memory view (a rich channel conversation), else this tool's own handle.
+        let memory = crate::memory::active_view::current().unwrap_or_else(|| Arc::clone(&self.memory));
+        match memory.get_with_context_mode(path, Some(&scope_ctx), mode).await? {
             Some(entry) => Ok(ToolResult {
                 success: true,
                 output: render_range(&entry.key, &entry.content, from, requested_lines),

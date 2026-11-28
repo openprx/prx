@@ -185,8 +185,9 @@ impl Tool for MemorySearchTool {
             MemoryReadMode::Observe
         };
         let terms = tokenize_query(trimmed_query);
-        let mut entries = self
-            .memory
+        // The turn's memory view (a rich channel conversation), else this tool's own handle.
+        let memory = crate::memory::active_view::current().unwrap_or_else(|| Arc::clone(&self.memory));
+        let mut entries = memory
             .recall_with_context_mode(
                 trimmed_query,
                 max_results.saturating_mul(3),

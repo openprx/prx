@@ -8,7 +8,7 @@ use crate::security::ramflux_aead::id_hash;
 
 /// Most printed candidates looked up in the store for one row, taken in the
 /// order of `printed_memory_keys` (first split of every entry first). Each
-/// candidate costs two indexed reads: the sealed key and the plaintext key.
+/// candidate costs one indexed read: the sealed key.
 const MAX_CANDIDATES: usize = 256;
 
 /// Add `fields` beside the sealed payload: `sealed` is either the ciphertext
@@ -50,31 +50,22 @@ impl EncryptedScope {
         )
     }
 
-    /// The keys among `candidates` that name a memory now: `(sealed, plain)`,
-    /// the candidates stored as a sealed memory of this scope and those
-    /// stored as a plaintext memory of the base store (a plaintext key is in
-    /// clear text in `memories.key` already). A printed line can be split in
-    /// several ways and some splits run into the memory's text; only a split
-    /// that is a real key is kept, so no hash of text is ever stored. A failed
-    /// lookup counts as "not a key" and ends the lookups: the row is still
-    /// written, with fewer hashes (its copy is then not swappable).
-    async fn existing_keys(&self, candidates: Vec<String>) -> (Vec<String>, Vec<String>) {
-        let (mut sealed, mut plain) = (Vec::new(), Vec::new());
+    /// The keys among `candidates` that name a sealed memory of this scope. A
+    /// printed line can be split in several ways and some splits run into the
+    /// memory's text; only a split that is a real key is kept, so no hash of
+    /// text is ever stored. A failed lookup counts as "not a key" and ends the
+    /// lookups: the row is still written, with fewer hashes (its copy is then
+    /// not swappable).
+    async fn existing_keys(&self, candidates: Vec<String>) -> Vec<String> {
+        let mut sealed = Vec::new();
         for candidate in candidates.into_iter().take(MAX_CANDIDATES) {
-            let in_scope = self.inner.get(&self.stored_key(&candidate)).await;
-            let in_base = self.inner.get(&candidate).await;
-            let failed = in_scope.is_err() || in_base.is_err();
-            if matches!(in_scope, Ok(Some(_))) {
-                sealed.push(candidate.clone());
-            }
-            if matches!(in_base, Ok(Some(_))) {
-                plain.push(candidate);
-            }
-            if failed {
-                break;
+            match self.inner.get(&self.stored_key(&candidate)).await {
+                Ok(Some(_)) => sealed.push(candidate),
+                Ok(None) => {}
+                Err(_) => break,
             }
         }
-        (sealed, plain)
+        sealed
     }
 
     /// The cleartext fields of a memory-tool row, written for a
@@ -87,9 +78,6 @@ impl EncryptedScope {
     /// - `memory_scope`: `id_hash(scope)`, the value already in clear text in
     ///   the stored key `rf:<scope hash>:<key hash>`; both only when
     ///   `memory_key_hashes` is not empty;
-    /// - `memory_plain_key_hashes`: `id_hash` of each printed key that exists
-    ///   as a plaintext memory of the base store (`memory_search` and
-    ///   `memory_get` read it), only when not empty;
     /// - `removed_content` and `removed_payload`: the row rewritten the way the
     ///   plaintext sweep rewrites it, sealed by this scope for the row's own
     ///   record ids.
@@ -183,20 +171,17 @@ impl EncryptedScope {
             }
             _ => return Ok(None),
         };
-        let (mut keys, plain) = self.existing_keys(printed).await;
+        let mut keys = self.existing_keys(printed).await;
         keys.extend(written);
-        if keys.is_empty() && plain.is_empty() {
+        if keys.is_empty() {
             return Ok(None);
         }
-        let hashes = |keys: &[String]| keys.iter().map(|key| id_hash(key)).collect::<Vec<_>>();
         let mut fields = serde_json::Map::new();
-        if !keys.is_empty() {
-            fields.insert("memory_key_hashes".into(), hashes(&keys).into());
-            fields.insert("memory_scope".into(), id_hash(&self.scope).into());
-        }
-        if !plain.is_empty() {
-            fields.insert("memory_plain_key_hashes".into(), hashes(&plain).into());
-        }
+        fields.insert(
+            "memory_key_hashes".into(),
+            keys.iter().map(|key| id_hash(key)).collect::<Vec<_>>().into(),
+        );
+        fields.insert("memory_scope".into(), id_hash(&self.scope).into());
         fields.insert("removed_content".into(), self.seal(key, &removed_content)?.into());
         fields.insert(
             "removed_payload".into(),

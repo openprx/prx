@@ -909,6 +909,12 @@ unattributable and therefore reaches no owner-isolated caller either. Nothing is
 migrated or rewritten to make that true, so a rollback restores the previous
 visibility immediately.
 
+When a turn has a memory view installed (a ramflux conversation, and its task-mode
+children), `memory_search`, `memory_get` and `memory_recall` all read that view
+instead of the base store: they see the memories of the conversation's scope
+only, and a key outside it is answered exactly like a missing key. Every
+surface without a view reads the base store as before.
+
 An embedded agent's legacy `MemoryLoader` callback runs when authenticated
 scoped semantic recall finds memory. It receives a bounded read view tied to
 the authenticated source workspace and owner. Non-public rows must match that
