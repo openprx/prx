@@ -295,32 +295,3 @@ pub(super) fn erase_mailbox_bodies(tx: &Connection, target: &Target<'_>, event_i
     super::super::mailbox::erase_adopted_bodies(tx, target.workspace_id, target.owner_id, event_ids, now)?;
     Ok(())
 }
-
-/// Erase the messages that the erased runs (`attempt_run` and `descendants`)
-/// sent and that no one has adopted yet (`mailbox::erase_pending_from_runs`). A later adoption of such
-/// a message is refused as stale, so no row and no woken turn appears after the
-/// delete. Messages without a recorded sender run are not reached.
-pub(super) fn erase_pending_messages(
-    tx: &Connection,
-    target: &Target<'_>,
-    attempt_run: Option<&str>,
-    descendants: &[String],
-) -> anyhow::Result<()> {
-    let runs: Vec<&str> = attempt_run
-        .into_iter()
-        .chain(descendants.iter().map(String::as_str))
-        .collect();
-    if runs.is_empty() {
-        return Ok(());
-    }
-    let now = chrono::DateTime::parse_from_rfc3339(target.now)
-        .map_or_else(|_| chrono::Utc::now().timestamp(), |time| time.timestamp());
-    super::super::mailbox::erase_pending_from_runs(
-        tx,
-        target.workspace_id,
-        target.owner_id,
-        &serde_json::to_string(&runs)?,
-        now,
-    )?;
-    Ok(())
-}

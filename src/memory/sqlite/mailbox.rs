@@ -19,7 +19,7 @@ mod erase;
 mod gc;
 pub use deliver::{MailboxDelivery, MailboxExecution};
 pub use erase::MailboxErasure;
-pub(super) use erase::{erase_adopted_bodies, erase_pending_from_runs};
+pub(super) use erase::erase_adopted_bodies;
 pub use gc::MailboxGc;
 pub(super) mod runtime;
 
