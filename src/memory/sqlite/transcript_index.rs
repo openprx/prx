@@ -1,7 +1,7 @@
 //! The full-text index over transcript rows (`message_events.content`): its
 //! creation and its initial fill.
 //!
-//! The FTS5 table and its three triggers are not in `schema.rs`, so the schema
+//! The FTS5 table, its four triggers and the purge queue are not in `schema.rs`, so the schema
 //! stamp is unchanged. They are created by the warm-up at process start, which
 //! every process that registers tools runs in the background. From then on
 //! every message insert pays the trigger cost. The index is external-content:
@@ -21,7 +21,7 @@
 //!
 //! 1. One short transaction creates the FTS5 table, sets `secure-delete`,
 //!    records `boundary` (the largest row id at that moment) and a cursor
-//!    `next_after = 0` in [`FILL_TABLE`], and creates the three triggers. From
+//!    `next_after = 0` in [`FILL_TABLE`], and creates the four triggers and the purge queue. From
 //!    then on new and changed rows are kept in the index by the triggers.
 //! 2. Each batch transaction indexes the next rows with ids in
 //!    `(next_after, boundary]` (at most 500 rows, [`BATCH_ROWS`], and about
@@ -54,9 +54,38 @@
 //! it, as a storage error on `message_events` itself would. A failing FTS write
 //! therefore fails the message write (fail-closed); it is never swallowed.
 //!
+//! # Purge queue
+//!
+//! Removing a row's terms from the index (FTS5 `secure-delete`) costs tens of
+//! milliseconds per row and is paid when the write transaction commits. The
+//! transaction that deletes or blanks rows therefore does not pay it: its
+//! triggers record the indexed text of each row in [`PURGE_TABLE`], and short
+//! follow-up transactions remove the entries.
+//! The rules the triggers keep:
+//!
+//! - A queued row's terms in the index are exactly its queue `content`. `ON
+//!   CONFLICT DO NOTHING` keeps the first, indexed text when a blanked row is
+//!   later deleted.
+//! - A non-empty rewrite of a queued row removes the queued text from the index
+//!   synchronously, drops the queue entry and indexes the new text, so an id
+//!   never has two live entries (that would corrupt an external-content
+//!   index).
+//! - `UPDATE ... SET content = ''` on an already empty row queues nothing.
+//! - Each of the three triggers that touch the queue also carries the unfilled
+//!   range guard while the fill runs: a row in that range was never indexed,
+//!   and queueing it would later issue an FTS5 `delete` of terms never inserted
+//!   and corrupt the index.
+//! - A row that survives a blank keeps an (empty) index document, as the
+//!   earlier blank trigger left it: FTS5 `delete` also removes the row's
+//!   document-size entry, and an external-content row without one fails the
+//!   integrity check. Whatever removes a queued entry must index the row's
+//!   current (empty) content again after the `delete`; for a deleted row that
+//!   inserts nothing.
+//! - The triggers are four: insert, delete, blank, and non-empty rewrite. A
+//!   table rebuild migration must recreate all of them.
+//!
 //! `INSERT OR REPLACE` on `message_events` would delete the old row without
-//! firing the delete trigger and so corrupt the index: never use it there. A
-//! table rebuild migration must recreate these triggers.
+//! firing the delete trigger and so corrupt the index: never use it there.
 //!
 //! `secure-delete` is FTS5's own option: a deleted or blanked row's terms are
 //! overwritten on disk instead of lingering in older segments. It is stored in
@@ -99,11 +128,31 @@ const BATCH_CHARS: i64 = 256 * 1024;
 const MIN_BATCH_PAUSE: Duration = Duration::from_millis(50);
 const MAX_BATCH_PAUSE: Duration = Duration::from_millis(500);
 
+/// Name of the purge queue: the ids of deleted or blanked rows whose terms are
+/// still in the index, with the exact text that was indexed for each.
+pub(super) const PURGE_TABLE: &str = "message_events_fts_purge";
+
+/// The purge queue (see the module doc, "Purge queue").
+const PURGE_TABLE_SQL: &str = "
+    CREATE TABLE IF NOT EXISTS message_events_fts_purge (
+        row_id  INTEGER PRIMARY KEY,
+        content TEXT NOT NULL
+    ) STRICT;";
+
+/// Drops the four triggers of either form and nothing else.
+const DROP_TRIGGERS_SQL: &str = "
+    DROP TRIGGER IF EXISTS message_events_fts_ai;
+    DROP TRIGGER IF EXISTS message_events_fts_ad;
+    DROP TRIGGER IF EXISTS message_events_fts_au_blank;
+    DROP TRIGGER IF EXISTS message_events_fts_au;";
+
 /// Drops whatever trigger or fill table a previous, interrupted creation could
-/// not have left (creation is one transaction, so normally nothing).
+/// not have left (creation is one transaction, so normally nothing). The purge
+/// queue is not dropped: its rows are index entries still to remove.
 const CLEAR_SQL: &str = "
     DROP TRIGGER IF EXISTS message_events_fts_ai;
     DROP TRIGGER IF EXISTS message_events_fts_ad;
+    DROP TRIGGER IF EXISTS message_events_fts_au_blank;
     DROP TRIGGER IF EXISTS message_events_fts_au;
     DROP TABLE IF EXISTS transcript_index_fill;";
 
@@ -118,22 +167,34 @@ const TRIGGERS_SQL: &str = "
         INSERT INTO message_events_fts(rowid, content) VALUES (new.id, new.content);
     END;
     CREATE TRIGGER message_events_fts_ad AFTER DELETE ON message_events BEGIN
-        INSERT INTO message_events_fts(message_events_fts, rowid, content)
-            VALUES ('delete', old.id, old.content);
+        INSERT INTO message_events_fts_purge(row_id, content) VALUES (old.id, old.content)
+            ON CONFLICT(row_id) DO NOTHING;
     END;
-    CREATE TRIGGER message_events_fts_au AFTER UPDATE OF content ON message_events BEGIN
+    CREATE TRIGGER message_events_fts_au_blank AFTER UPDATE OF content ON message_events
+    WHEN new.content = '' AND old.content <> '' BEGIN
+        INSERT INTO message_events_fts_purge(row_id, content) VALUES (old.id, old.content)
+            ON CONFLICT(row_id) DO NOTHING;
+    END;
+    CREATE TRIGGER message_events_fts_au AFTER UPDATE OF content ON message_events
+    WHEN new.content <> '' BEGIN
         INSERT INTO message_events_fts(message_events_fts, rowid, content)
-            VALUES ('delete', old.id, old.content);
+            VALUES ('delete', old.id, COALESCE(
+                (SELECT p.content FROM message_events_fts_purge p WHERE p.row_id = old.id), old.content));
+        DELETE FROM message_events_fts_purge WHERE row_id = old.id;
         INSERT INTO message_events_fts(rowid, content) VALUES (new.id, new.content);
     END;";
 
-/// The fill table and the triggers used while the fill runs: the same bodies,
-/// skipping rows in the unfilled range (see the module doc).
-const FILLING_TRIGGERS_SQL: &str = "
+/// The fill cursor table.
+const FILL_TABLE_SQL: &str = "
     CREATE TABLE transcript_index_fill (
         id         INTEGER PRIMARY KEY CHECK(id = 1),
         next_after INTEGER NOT NULL,
-        boundary   INTEGER NOT NULL);
+        boundary   INTEGER NOT NULL);";
+
+/// The triggers used while the fill runs: the same bodies, skipping rows in the
+/// unfilled range (see the module doc). The three that write the queue carry
+/// the guard combined with their own condition.
+const FILLING_TRIGGERS_SQL: &str = "
     CREATE TRIGGER message_events_fts_ai AFTER INSERT ON message_events
     WHEN NOT EXISTS (SELECT 1 FROM transcript_index_fill f
                      WHERE new.id > f.next_after AND new.id <= f.boundary) BEGIN
@@ -142,14 +203,24 @@ const FILLING_TRIGGERS_SQL: &str = "
     CREATE TRIGGER message_events_fts_ad AFTER DELETE ON message_events
     WHEN NOT EXISTS (SELECT 1 FROM transcript_index_fill f
                      WHERE old.id > f.next_after AND old.id <= f.boundary) BEGIN
-        INSERT INTO message_events_fts(message_events_fts, rowid, content)
-            VALUES ('delete', old.id, old.content);
+        INSERT INTO message_events_fts_purge(row_id, content) VALUES (old.id, old.content)
+            ON CONFLICT(row_id) DO NOTHING;
+    END;
+    CREATE TRIGGER message_events_fts_au_blank AFTER UPDATE OF content ON message_events
+    WHEN new.content = '' AND old.content <> ''
+         AND NOT EXISTS (SELECT 1 FROM transcript_index_fill f
+                         WHERE old.id > f.next_after AND old.id <= f.boundary) BEGIN
+        INSERT INTO message_events_fts_purge(row_id, content) VALUES (old.id, old.content)
+            ON CONFLICT(row_id) DO NOTHING;
     END;
     CREATE TRIGGER message_events_fts_au AFTER UPDATE OF content ON message_events
-    WHEN NOT EXISTS (SELECT 1 FROM transcript_index_fill f
-                     WHERE old.id > f.next_after AND old.id <= f.boundary) BEGIN
+    WHEN new.content <> ''
+         AND NOT EXISTS (SELECT 1 FROM transcript_index_fill f
+                         WHERE old.id > f.next_after AND old.id <= f.boundary) BEGIN
         INSERT INTO message_events_fts(message_events_fts, rowid, content)
-            VALUES ('delete', old.id, old.content);
+            VALUES ('delete', old.id, COALESCE(
+                (SELECT p.content FROM message_events_fts_purge p WHERE p.row_id = old.id), old.content));
+        DELETE FROM message_events_fts_purge WHERE row_id = old.id;
         INSERT INTO message_events_fts(rowid, content) VALUES (new.id, new.content);
     END;";
 
@@ -234,14 +305,21 @@ pub(super) async fn build_index(pool: Arc<MemoryPool>) -> anyhow::Result<()> {
 
 /// Create the index objects when the table is missing, in one short
 /// transaction, and return the state after it. The check is a read; the write
-/// lock is taken only when the table is missing, and the check is repeated
-/// under the lock, so the creation runs once per database. An empty table is
-/// complete at once.
+/// lock is taken only when the table is missing (or the purge queue is, see
+/// below), and the check is repeated under the lock, so the creation runs once
+/// per database. An empty table is complete at once.
+///
+/// An index built by an earlier build has no purge queue and carries the
+/// triggers that delete from the index themselves. It is upgraded here, in one
+/// short transaction: the queue is created and the triggers are replaced by
+/// the form of its state (complete or filling). The absence of the queue is
+/// the marker; the schema stamp does not cover the index objects.
 fn create_index(pool: &MemoryPool) -> anyhow::Result<IndexState> {
     {
         let reader = pool.read()?;
-        let state = index_state(reader.connection()?)?;
-        if state != IndexState::Missing {
+        let conn = reader.connection()?;
+        let state = index_state(conn)?;
+        if state != IndexState::Missing && table_exists(conn, PURGE_TABLE)? {
             return Ok(state);
         }
     }
@@ -249,10 +327,22 @@ fn create_index(pool: &MemoryPool) -> anyhow::Result<IndexState> {
     let tx = begin_immediate(&guard)?;
     let state = index_state(&tx)?;
     if state != IndexState::Missing {
+        if !table_exists(&tx, PURGE_TABLE)? {
+            tx.execute_batch(PURGE_TABLE_SQL)?;
+            tx.execute_batch(DROP_TRIGGERS_SQL)?;
+            tx.execute_batch(if state == IndexState::Filling {
+                FILLING_TRIGGERS_SQL
+            } else {
+                TRIGGERS_SQL
+            })?;
+        }
         tx.commit()?;
         return Ok(state);
     }
     tx.execute_batch(CLEAR_SQL)?;
+    // The queue refers to the index being dropped, if any.
+    tx.execute_batch(PURGE_TABLE_SQL)?;
+    tx.execute_batch(&format!("DELETE FROM {PURGE_TABLE};"))?;
     if table_exists(&tx, INDEX_TABLE)? {
         tracing::warn!("transcript index was built with another tokenizer; rebuilding it");
         tx.execute_batch(&format!("DROP TABLE {INDEX_TABLE};"))?;
@@ -260,6 +350,7 @@ fn create_index(pool: &MemoryPool) -> anyhow::Result<IndexState> {
     tx.execute_batch(CREATE_TABLE_SQL)?;
     let boundary: Option<i64> = tx.query_row("SELECT max(id) FROM message_events", [], |row| row.get(0))?;
     let state = if let Some(boundary) = boundary {
+        tx.execute_batch(FILL_TABLE_SQL)?;
         tx.execute_batch(FILLING_TRIGGERS_SQL)?;
         tx.execute(
             "INSERT INTO transcript_index_fill(id, next_after, boundary) VALUES (1, 0, ?1)",
