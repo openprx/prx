@@ -160,7 +160,20 @@ impl SqliteMailbox {
         } else {
             serde_json::json!({"session_key":stream.from.session,"agent":stream.from.agent})
         };
-        let metadata = serde_json::json!({"provenance":if remote {"peer"}else{"session"},"from":from,"message_id":saved.message_id,"chain":saved.meta.common.chain(saved.message_id)});
+        let mut metadata = serde_json::json!({"provenance":if remote {"peer"}else{"session"},"from":from,"message_id":saved.message_id,"chain":saved.meta.common.chain(saved.message_id)});
+        // The run that sent it, recorded by the sending runtime (NULL for a remote
+        // peer and for rows written before the column existed): an rf delete of
+        // that run follows the row by it.
+        let sender_run: Option<String> = tx
+            .query_row(
+                "SELECT sender_run_id FROM prx_mailbox_receipts WHERE id=?1",
+                [row_id],
+                |r| r.get(0),
+            )
+            .map_err(storage_error)?;
+        if let (Some(run), Some(object)) = (sender_run, metadata.as_object_mut()) {
+            object.insert("sender_run_id".into(), serde_json::Value::String(run));
+        }
         let input = crate::memory::MessageEventInput {
             event_id: Some(event_id.to_string()),
             idempotency_key: Some(format!("prx_mailbox/{}/{}", saved.message_id, saved.meta.acceptance_id)),

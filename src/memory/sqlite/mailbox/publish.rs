@@ -36,11 +36,14 @@ impl SqliteMailbox {
             sender,
             pin_expires_at,
             inherited,
+            None,
         )
     }
 
     /// Tool/slash ports select their durable stream under the allocation
     /// transaction, so concurrent first sends cannot mint separate streams.
+    /// `sender_run` is the run the runtime knows is sending (never read from the
+    /// model or the wire); it is stored once, with the first write of the row.
     pub(super) fn publish_current(
         &self,
         authority: &MailboxAuthority,
@@ -48,6 +51,7 @@ impl SqliteMailbox {
         sender: &MailboxScope,
         pin_expires_at: i64,
         inherited: Option<&InheritedProvenance>,
+        sender_run: Option<&str>,
     ) -> MailboxResult<MailboxPublished> {
         self.publish_input(
             authority,
@@ -55,6 +59,7 @@ impl SqliteMailbox {
             sender,
             pin_expires_at,
             inherited,
+            sender_run,
         )
     }
 
@@ -65,6 +70,7 @@ impl SqliteMailbox {
         sender: &MailboxScope,
         pin_expires_at: i64,
         inherited: Option<&InheritedProvenance>,
+        sender_run: Option<&str>,
     ) -> MailboxResult<MailboxPublished> {
         let (current, mut message) = match input {
             PublishInput::Explicit(message) => (false, message),
@@ -237,7 +243,7 @@ impl SqliteMailbox {
             ack_state: None,
             last_error: None,
         };
-        tx.execute("INSERT INTO prx_mailbox_outbox(id,outbox_key,stream_id,seq,workspace_id,owner_id,ma_scope_id,incarnation,generation,idempotency_key,message_id,state,body_bytes,envelope_meta) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,0,?12,?13)",params![id,key,stream.id,message.seq.to_be_bytes().as_slice(),sender.workspace_id,sender.owner_id,sender.scope_id.to_string(),sender.incarnation.to_string(),sender.generation,message.idempotency.as_str(),message.id.as_bytes().as_slice(),message.body.bytes,encode(&meta)?]).map_err(storage_error)?;
+        tx.execute("INSERT INTO prx_mailbox_outbox(id,outbox_key,stream_id,seq,workspace_id,owner_id,ma_scope_id,incarnation,generation,idempotency_key,message_id,state,body_bytes,envelope_meta,sender_run_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,0,?12,?13,?14)",params![id,key,stream.id,message.seq.to_be_bytes().as_slice(),sender.workspace_id,sender.owner_id,sender.scope_id.to_string(),sender.incarnation.to_string(),sender.generation,message.idempotency.as_str(),message.id.as_bytes().as_slice(),message.body.bytes,encode(&meta)?,sender_run]).map_err(storage_error)?;
         if let Some(next) = message.seq.checked_add(1) {
             stream.progress.next_seq = next;
         } else {

@@ -21,6 +21,7 @@ pub struct SqliteMailboxSender {
     scope: MailboxScope,
     resolver: Arc<dyn MailboxResolver>,
     inherited: Option<InheritedProvenance>,
+    sender_run: Option<String>,
 }
 impl SqliteMailboxSender {
     pub fn new(
@@ -49,7 +50,15 @@ impl SqliteMailboxSender {
             scope,
             resolver,
             inherited,
+            sender_run: None,
         })
+    }
+    /// The run that sends through this port, as the runtime knows it. Stored
+    /// with the outbox and receipt rows so an rf delete can follow what an
+    /// erased run sent; `None` when no run is sending.
+    pub fn with_sender_run(mut self, run: Option<String>) -> Self {
+        self.sender_run = run;
+        self
     }
     pub fn with_chain(mut self, chain: Option<crate::messaging::CausalChain>) -> Self {
         self.chain = chain;
@@ -138,6 +147,7 @@ impl SqliteMailboxSender {
             &self.scope,
             resolved.pin_expires_at,
             self.inherited.as_ref(),
+            self.sender_run.as_deref(),
         )
     }
 }

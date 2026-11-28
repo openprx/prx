@@ -253,6 +253,19 @@ impl MessagingRuntime {
     }
 
     pub fn bind(self: &Arc<Self>, source: SessionAddr, event: Option<&str>) -> MailboxResult<RuntimeSender> {
+        self.bind_run(source, event, None)
+    }
+
+    /// [`Self::bind`] for a sender that knows the run it sends from (the
+    /// envelope run of a tool call, the run of a worker manifest, the run being
+    /// announced). The run is recorded with the message so an rf delete of that
+    /// run can follow it; callers never pass a value read from the model or the wire.
+    pub fn bind_run(
+        self: &Arc<Self>,
+        source: SessionAddr,
+        event: Option<&str>,
+        run: Option<&str>,
+    ) -> MailboxResult<RuntimeSender> {
         let mut source = source;
         if let Some(agent) = self
             .store
@@ -275,11 +288,13 @@ impl MessagingRuntime {
             }),
             None,
         )?
-        .with_chain(chain);
+        .with_chain(chain)
+        .with_sender_run(run.map(str::to_owned));
         Ok(RuntimeSender {
             runtime: Arc::clone(self),
             sender,
             scope,
+            run: run.map(str::to_owned),
         })
     }
 
@@ -355,6 +370,7 @@ pub struct RuntimeSender {
     runtime: Arc<MessagingRuntime>,
     sender: SqliteMailboxSender,
     scope: MailboxScope,
+    run: Option<String>,
 }
 #[async_trait]
 impl MailboxSender for RuntimeSender {
@@ -383,7 +399,10 @@ impl RuntimeSender {
             .iter()
             .find(|pending| pending.message().id == published.message_id)
             .ok_or(MailboxError::CorruptState)?;
-        let receipt = self.runtime.store.accept(&authority, outbound.message().clone())?;
+        let receipt =
+            self.runtime
+                .store
+                .accept_from_run(&authority, outbound.message().clone(), self.run.as_deref())?;
         self.runtime
             .store
             .acknowledge(&self.scope, &target, published.message_id, receipt.state)?;

@@ -375,7 +375,11 @@ impl SessionsSendTool {
             .and_then(serde_json::Value::as_str)
             .filter(|text| !text.is_empty())
             .ok_or(crate::messaging::mailbox::MailboxError::InvalidMetadata)?;
-        let sender = runtime.bind(source, context.envelope.source_message_event_id.as_deref())?;
+        let sender = runtime.bind_run(
+            source,
+            context.envelope.source_message_event_id.as_deref(),
+            context.envelope.run_id.as_deref(),
+        )?;
         let result = sender.send(target, text.into(), "text/plain".into()).await;
         Ok(ToolResult {
             success: result.is_ok(),

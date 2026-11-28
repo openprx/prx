@@ -117,7 +117,11 @@ impl MailboxAnnouncement {
         let source = runtime.address(&self.owner, &self.child_session, &self.child_agent);
         let target = runtime.address(&self.owner, &self.parent_session, &self.parent_agent);
         let event = self.source_event.clone();
-        let bound = crate::runtime::blocking::spawn_blocking(move || runtime.bind(source, event.as_deref())).await;
+        let announced = run_id.to_owned();
+        let bound = crate::runtime::blocking::spawn_blocking(move || {
+            runtime.bind_run(source, event.as_deref(), Some(announced.as_str()))
+        })
+        .await;
         let sender = match bound {
             Ok(Ok(sender)) => sender,
             Ok(Err(error)) => {

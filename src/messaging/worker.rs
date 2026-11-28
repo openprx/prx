@@ -57,7 +57,7 @@ impl WorkerMailboxFactory for WorkerMailboxes {
             .runtime
             .store
             .execution_guard(&scope, &address, manifest.run_id.clone())?;
-        let sender = self.runtime.bind(
+        let sender = self.runtime.bind_run(
             address.clone(),
             manifest
                 .ordinary_source
@@ -70,6 +70,7 @@ impl WorkerMailboxFactory for WorkerMailboxes {
                         .and_then(|source| source.input.as_ref())
                 })
                 .map(|input| input.event_id.as_str()),
+            Some(&manifest.run_id),
         )?;
         let auth = crate::session_worker::frame_auth::FrameAuth::parent(&manifest.run_id)?;
         let (controls, receiver) = mpsc::channel(64);

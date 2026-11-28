@@ -16,7 +16,21 @@ use crate::messaging::mailbox::{
 use crate::messaging::{DeliveryState, MessageKind, MessageOrigin, PrxMessage, RemotePeerAttr};
 
 impl SqliteMailbox {
-    pub fn accept(&self, authority: &MailboxAuthority, mut message: PrxMessage) -> MailboxResult<MailboxReceipt> {
+    pub fn accept(&self, authority: &MailboxAuthority, message: PrxMessage) -> MailboxResult<MailboxReceipt> {
+        self.accept_from_run(authority, message, None)
+    }
+
+    /// [`Self::accept`] that also records the sending run on a new receipt, as
+    /// the local runtime knows it (never from the wire). A receipt of a remote
+    /// peer never carries one, and a replay of an existing receipt keeps its
+    /// stored value.
+    pub fn accept_from_run(
+        &self,
+        authority: &MailboxAuthority,
+        mut message: PrxMessage,
+        sender_run: Option<&str>,
+    ) -> MailboxResult<MailboxReceipt> {
+        let sender_run = sender_run.filter(|_| authority.origin != MessageOrigin::RemotePeer);
         authority.authorize(&message)?;
         if message.to.instance != self.local_instance {
             return Err(crate::messaging::mailbox::unauthorized(
@@ -157,7 +171,7 @@ impl SqliteMailbox {
             adopted_message_event_id: None,
         };
         let expiry = now.checked_add(REPLAY_SECONDS).ok_or(MailboxError::InvalidMetadata)?;
-        tx.execute("INSERT INTO prx_mailbox_receipts(ledger_key,stream_id,seq,workspace_id,owner_id,ma_scope_id,incarnation,generation,idempotency_key,message_id,state,expires_at,receipt_meta) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0,?11,?12)",params![key,stream.id,message.seq.to_be_bytes().as_slice(),claims.scope.workspace_id,claims.scope.owner_id,claims.scope.scope_id.to_string(),claims.scope.incarnation.to_string(),claims.scope.generation,message.idempotency.as_str(),message.id.as_bytes().as_slice(),expiry,encode(&meta)?]).map_err(storage_error)?;
+        tx.execute("INSERT INTO prx_mailbox_receipts(ledger_key,stream_id,seq,workspace_id,owner_id,ma_scope_id,incarnation,generation,idempotency_key,message_id,state,expires_at,receipt_meta,sender_run_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0,?11,?12,?13)",params![key,stream.id,message.seq.to_be_bytes().as_slice(),claims.scope.workspace_id,claims.scope.owner_id,claims.scope.scope_id.to_string(),claims.scope.incarnation.to_string(),claims.scope.generation,message.idempotency.as_str(),message.id.as_bytes().as_slice(),expiry,encode(&meta)?,sender_run]).map_err(storage_error)?;
         let id = tx.last_insert_rowid();
         let delivery = DeliveryMeta {
             to_pin_token: message.to_pin.token,

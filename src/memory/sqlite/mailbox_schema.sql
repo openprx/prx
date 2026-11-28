@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS prx_mailbox_receipts (
   expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
   adopted_turn_id INTEGER UNIQUE CHECK(adopted_turn_id > 0),
   receipt_meta TEXT NOT NULL,
+  sender_run_id TEXT,
   FOREIGN KEY(ma_scope_id,workspace_id,owner_id,incarnation,generation)
     REFERENCES agent_scopes(scope_id,workspace_id,owner_id,incarnation,generation)
 ) STRICT;
@@ -87,6 +88,7 @@ CREATE TABLE IF NOT EXISTS prx_mailbox_outbox (
   expires_at INTEGER CHECK(expires_at >= 0),
   body_bytes BLOB CHECK(length(body_bytes) <= 262144),
   envelope_meta TEXT NOT NULL,
+  sender_run_id TEXT,
   FOREIGN KEY(ma_scope_id,workspace_id,owner_id,incarnation,generation)
     REFERENCES agent_scopes(scope_id,workspace_id,owner_id,incarnation,generation)
 ) STRICT;

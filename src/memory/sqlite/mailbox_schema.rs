@@ -14,7 +14,31 @@ pub(super) fn init_schema(conn: &Connection) -> Result<()> {
     upgrade_manifest(conn)?;
     conn.execute_batch(MAILBOX_DDL)
         .context("initialize dormant mailbox schema")?;
+    add_sender_run_columns(conn)?;
     upgrade_children(conn)
+}
+
+/// The sender's run id on the outbox and receipt rows (nullable, no backfill:
+/// rows written before the column exist keep NULL, meaning unknown). A database
+/// created by an older build gets the column here; a fresh one has it from
+/// `MAILBOX_DDL`, so both end with the same column order. Idempotent.
+fn add_sender_run_columns(conn: &Connection) -> Result<()> {
+    for (table, alter) in [
+        (
+            "prx_mailbox_outbox",
+            "ALTER TABLE prx_mailbox_outbox ADD COLUMN sender_run_id TEXT",
+        ),
+        (
+            "prx_mailbox_receipts",
+            "ALTER TABLE prx_mailbox_receipts ADD COLUMN sender_run_id TEXT",
+        ),
+    ] {
+        if !columns(conn, table)?.iter().any(|column| column == "sender_run_id") {
+            conn.execute_batch(alter)
+                .with_context(|| format!("add sender_run_id to {table}"))?;
+        }
+    }
+    Ok(())
 }
 
 fn columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
