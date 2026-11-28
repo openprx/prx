@@ -124,8 +124,8 @@ fn match_page(
         {
             continue;
         }
-        let record_id = event.idempotency_key.as_deref().unwrap_or("event");
-        let Some(plain) = opener.open_record(record_id, &event.content) else {
+        let record_id = super::record_id_of(event.idempotency_key.as_deref(), &event.event_id);
+        let Some(plain) = opener.open_record(&record_id, &event.content) else {
             continue;
         };
         // Redact the whole row first: a query matches the redacted text

@@ -23,6 +23,21 @@ const SCHEDULED_RESULT_EVENT_TYPES: [&str; 2] = [
     crate::context::transcript::SCHEDULE_SEEN_EVENT_TYPE,
 ];
 
+/// The record id sealed rows without an idempotency key carried before the
+/// event id was part of it. Readers still try it once for such rows.
+const LEGACY_EVENT_RECORD_ID: &str = "event";
+
+/// The record id a message event is sealed under: its idempotency key, else
+/// the event id. This id is bound into the seal.
+fn record_id_of(idempotency_key: Option<&str>, _event_id: &str) -> String {
+    idempotency_key.unwrap_or(LEGACY_EVENT_RECORD_ID).to_owned()
+}
+
+/// [`record_id_of`] for an event about to be written.
+fn input_record_id(input: &crate::memory::MessageEventInput) -> String {
+    record_id_of(input.idempotency_key.as_deref(), input.event_id.as_deref().unwrap_or_default())
+}
+
 /// Event type of an attachment row (`context/transcript/tool_rows.rs`).
 const ATTACHMENT_EVENT_TYPE: &str = "message.attachment.recorded";
 
@@ -151,7 +166,7 @@ impl EncryptedScope {
     /// Seal message text. `raw_payload_json` stays intact: ingress stores a
     /// JSON capsule wrapper there and the sqlite receipt parser requires it.
     fn seal_event_content(&self, input: &mut crate::memory::MessageEventInput) -> Result<(), CryptoError> {
-        let record_id = input.idempotency_key.clone().unwrap_or_else(|| "event".to_string());
+        let record_id = input_record_id(input);
         input.content = self.seal(&record_id, &input.content)?;
         Ok(())
     }
@@ -178,7 +193,8 @@ impl EncryptedScope {
         content: Option<&str>,
     ) -> anyhow::Result<()> {
         if let Some(payload) = input.raw_payload_json.take() {
-            let key = input.idempotency_key.as_deref().unwrap_or("event");
+            let key = input_record_id(input);
+            let key = key.as_str();
             let sealed = self.seal_payload(&input.source, key, &payload)?;
             input.raw_payload_json = Some(if input.event_type == ATTACHMENT_EVENT_TYPE {
                 attachment_wrapper(&payload, sealed)
@@ -255,7 +271,7 @@ impl EncryptedScope {
     }
 
     fn owns_event(&self, event: &crate::memory::MessageEvent) -> bool {
-        self.open_record(event.idempotency_key.as_deref().unwrap_or("event"), &event.content)
+        self.open_record(&record_id_of(event.idempotency_key.as_deref(), &event.event_id), &event.content)
             .is_some()
     }
 
@@ -296,7 +312,7 @@ impl EncryptedScope {
     }
 
     fn reveal(&self, mut event: crate::memory::MessageEvent) -> crate::memory::MessageEvent {
-        let record_id = event.idempotency_key.clone().unwrap_or_else(|| "event".to_string());
+        let record_id = record_id_of(event.idempotency_key.as_deref(), &event.event_id);
         if let Some(plain) = self.open_record(&record_id, &event.content) {
             event.content = plain;
         }
@@ -684,7 +700,8 @@ impl Memory for EncryptedScope {
         deadline: std::time::Instant,
     ) -> anyhow::Result<()> {
         let mut event = event.clone();
-        let key = event.idempotency_key.as_deref().unwrap_or("event");
+        let key = record_id_of(event.idempotency_key.as_deref(), &event.event_id);
+        let key = key.as_str();
         event.content = self.seal(key, &event.content)?;
         if let Some(payload) = event.raw_payload_json.take() {
             event.raw_payload_json = Some(self.seal_payload(&event.source, key, &payload)?);
@@ -1068,7 +1085,8 @@ impl Memory for EncryptedScope {
 
     async fn project_console_message(&self, event: &crate::memory::MessageEvent) -> anyhow::Result<()> {
         let mut sealed = event.clone();
-        let key = sealed.idempotency_key.as_deref().unwrap_or("event");
+        let key = record_id_of(sealed.idempotency_key.as_deref(), &sealed.event_id);
+        let key = key.as_str();
         sealed.content = self.seal(key, &sealed.content)?;
         if let Some(payload) = &sealed.raw_payload_json {
             sealed.raw_payload_json = Some(self.seal(&format!("{key}:payload"), payload)?);
@@ -1107,7 +1125,7 @@ impl Memory for EncryptedScope {
         self.seal_event_content(&mut input)?;
         if let Some(payload) = input.raw_payload_json.take() {
             let mut wrapper: serde_json::Value = serde_json::from_str(&payload)?;
-            let key = input.idempotency_key.as_deref().unwrap_or("event");
+            let key = input_record_id(&input);
             if let Some(original) = wrapper.get("original_payload_json").and_then(serde_json::Value::as_str) {
                 let sealed = self.seal(&format!("{key}:payload"), original)?;
                 let field = wrapper
@@ -1246,8 +1264,8 @@ impl Memory for EncryptedScope {
             _ => {
                 self.seal_event_content(&mut event)?;
                 if let Some(payload) = event.raw_payload_json.take() {
-                    let key = event.idempotency_key.as_deref().unwrap_or("event");
-                    event.raw_payload_json = Some(self.seal_payload(&event.source, key, &payload)?);
+                    let key = input_record_id(&event);
+                    event.raw_payload_json = Some(self.seal_payload(&event.source, &key, &payload)?);
                 }
             }
         }
@@ -1296,13 +1314,13 @@ impl Memory for EncryptedScope {
             if index == final_index {
                 stored_final = stored;
             } else if let Some(payload) = event.raw_payload_json.take() {
-                let key = event.idempotency_key.as_deref().unwrap_or("event");
+                let key = input_record_id(event);
                 event.raw_payload_json = Some(match stored.as_ref() {
                     Some(stored) if self.reveal(stored.clone()).raw_payload_json.as_deref() == Some(&payload) => stored
                         .raw_payload_json
                         .clone()
                         .context("stored recovery payload missing")?,
-                    _ => self.seal_payload(&event.source, key, &payload)?,
+                    _ => self.seal_payload(&event.source, &key, &payload)?,
                 });
             }
         }
@@ -1337,7 +1355,7 @@ impl Memory for EncryptedScope {
                         hook(&revealed, final_input)?;
                     }
                     if let Some(payload) = final_input.raw_payload_json.take() {
-                        let key = final_input.idempotency_key.as_deref().unwrap_or("event");
+                        let key = input_record_id(final_input);
                         final_input.raw_payload_json = Some(match stored_final.as_ref() {
                             Some(stored)
                                 if reveal.reveal(stored.clone()).raw_payload_json.as_deref() == Some(&payload) =>
@@ -1347,7 +1365,7 @@ impl Memory for EncryptedScope {
                                     .clone()
                                     .context("stored recovery payload missing")?
                             }
-                            _ => reveal.seal_payload(&final_input.source, key, &payload)?,
+                            _ => reveal.seal_payload(&final_input.source, &key, &payload)?,
                         });
                     }
                     Ok(())
