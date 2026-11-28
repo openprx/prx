@@ -2,13 +2,18 @@
 //! JWT verification.
 
 use jsonwebtoken::jwk::JwkSet;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 /// Maximum time to wait for a remote JWKS fetch before giving up (fail-closed).
 const JWKS_FETCH_TIMEOUT_SECS: u64 = 5;
+
+/// How long a failed fetch for a URI is remembered. While it holds, no new
+/// fetch is attempted for that URI; verification runs against whatever the
+/// cache holds (fail-closed when stale or empty).
+const JWKS_FETCH_BACKOFF: Duration = Duration::from_secs(30);
 
 /// A fetched remote JWKS document together with the instant it was retrieved.
 #[derive(Clone)]
@@ -28,6 +33,24 @@ impl CachedJwks {
 /// synchronous verification path never performs network I/O.
 pub(super) static REMOTE_JWKS_CACHE: LazyLock<RwLock<HashMap<String, CachedJwks>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Instant of the last failed fetch per endpoint URI. Cleared by a successful
+/// fetch. Never held across an `.await`.
+static JWKS_FETCH_FAILURES: LazyLock<Mutex<HashMap<String, Instant>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Single flight: at most one remote JWKS fetch runs per process at a time.
+static JWKS_FETCH_FLIGHT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn cache_is_fresh(uri: &str, ttl: Duration) -> bool {
+    REMOTE_JWKS_CACHE.read().get(uri).is_some_and(|e| e.is_fresh(ttl))
+}
+
+fn in_fetch_backoff(uri: &str) -> bool {
+    JWKS_FETCH_FAILURES
+        .lock()
+        .get(uri)
+        .is_some_and(|failed_at| failed_at.elapsed() < JWKS_FETCH_BACKOFF)
+}
 
 /// Return the cached JWKS for `uri` if a fresh (within `ttl_secs`) copy exists.
 ///
@@ -78,22 +101,33 @@ pub(super) async fn prewarm_remote_jwks(config: &crate::config::McpServerRuntime
     };
     let ttl = Duration::from_secs(config.jwt_jwks_cache_ttl_secs.max(1));
 
-    // Fast path: a fresh entry already satisfies this request.
-    if REMOTE_JWKS_CACHE.read().get(&uri).is_some_and(|e| e.is_fresh(ttl)) {
+    // Fast path: a fresh entry already satisfies this request, and a recent
+    // failure means the endpoint is not asked again yet.
+    if cache_is_fresh(&uri, ttl) || in_fetch_backoff(&uri) {
+        return;
+    }
+
+    // Single flight: requests that queued behind an in-progress fetch re-check
+    // freshness and the back-off once they hold the lock, so a burst produces
+    // one fetch. The lock covers only the fetch and the cache update.
+    let _flight = JWKS_FETCH_FLIGHT.lock().await;
+    if cache_is_fresh(&uri, ttl) || in_fetch_backoff(&uri) {
         return;
     }
 
     match fetch_remote_jwks(&uri).await {
         Ok(jwks) => {
             REMOTE_JWKS_CACHE.write().insert(
-                uri,
+                uri.clone(),
                 CachedJwks {
                     jwks: Arc::new(jwks),
                     fetched_at: Instant::now(),
                 },
             );
+            JWKS_FETCH_FAILURES.lock().remove(&uri);
         }
         Err(error) => {
+            JWKS_FETCH_FAILURES.lock().insert(uri, Instant::now());
             tracing::warn!(error = %error, "remote jwks refresh failed; relying on existing cache (fail-closed if stale)");
         }
     }
