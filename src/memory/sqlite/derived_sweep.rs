@@ -741,9 +741,17 @@ const TERMINAL_SET: &str = "raw_payload_json = CASE WHEN json_type(raw_payload_j
 /// time, in the probe's workspace and owner, whose `model_content` or
 /// `result.output` prints the key as the result scan does, and that has no
 /// result row of the same workspace, run and call id (`outcome.operation_id`).
-/// A paired terminal keeps the link path; an unparseable payload, a payload
-/// without an outcome object and a sealed wrapper are skipped. Returns the
-/// number of terminals rewritten.
+/// The pairing probe uses equality on workspace and run, so it can use the
+/// partial `(workspace_id, run_id)` index; a terminal without a workspace or
+/// run id is therefore never selected here (the link path of
+/// [`rewrite_call_terminals`] still reaches it when its result row is
+/// rewritten). The link applies to native call ids only: a prompt-guided call
+/// has an `operation_id` (a UUID) that differs from its result row's call id
+/// (`{tool}#{index}`, `agent/tool_scheduler.rs`, `context/transcript/tool_rows.rs`),
+/// so its terminal counts as unpaired and is rewritten here, but only when it
+/// prints the forgotten key. A paired terminal keeps the link path; an
+/// unparseable payload, a payload without an outcome object and a sealed
+/// wrapper are skipped. Returns the number of terminals rewritten.
 fn rewrite_unpaired_terminals(
     tx: &Connection,
     probes: &[MemoryProbe],
@@ -770,6 +778,7 @@ fn rewrite_unpaired_terminals(
          FROM message_events
          WHERE event_type = 'tool.execution.finalized'
            AND id >= COALESCE((SELECT MIN(id) FROM message_events WHERE created_at >= ?1), 9223372036854775807)
+           AND workspace_id IS NOT NULL AND run_id IS NOT NULL
            AND json_valid(raw_payload_json)
            AND json_type(raw_payload_json, '$.outcome') = 'object'
            AND json_extract(raw_payload_json, '$.reservation.capability') IN (SELECT value FROM json_each(?3))
@@ -790,8 +799,8 @@ fn rewrite_unpaired_terminals(
                               OR message_events.owner_id = json_extract(j.value, '$.owner')))
            AND NOT EXISTS (SELECT 1 FROM message_events r
                            WHERE r.event_type = 'tool.result.recorded'
-                             AND r.workspace_id IS message_events.workspace_id
-                             AND r.run_id IS message_events.run_id
+                             AND r.workspace_id = message_events.workspace_id
+                             AND r.run_id = message_events.run_id
                              AND json_valid(r.raw_payload_json)
                              AND json_extract(r.raw_payload_json, '$.call_id')
                                  = json_extract(message_events.raw_payload_json, '$.outcome.operation_id'))

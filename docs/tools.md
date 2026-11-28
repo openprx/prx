@@ -980,9 +980,9 @@ sweep finds it, including the execution record of a read in the same batch that
 ended early; the memory key stays in call rows, in the forget call itself and in
 its argument preview, because a key is an identifier and not content. A topic
 that the forgotten text derived is removed once no memory, document, chunk,
-evolution proposal, webhook ingestion or alias names it; a cron job's
-`topic_id` may then name a topic that no longer exists, and readers treat it as
-no topic.
+evolution proposal, webhook ingestion or alias names it; a `topic_id` held by
+the cron store or by `xin/tasks.db` may then name a topic that no longer
+exists, and readers treat it as no topic.
 
 The write is bounded the same way. `memory_store` is not on the default MCP
 surface either, but it is on the owner-isolation-aware list, so an operator

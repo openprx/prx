@@ -87,9 +87,9 @@ pub fn create_topic(
 /// delete transaction after replacing or deleting all references.
 ///
 /// The reference list matches the `memory_topic_orphaned` trigger
-/// (`sqlite/rf_forget.rs`). Stores in other databases (the cron jobs) cannot
-/// be checked from here, so a `topic_id` they hold may name a removed topic;
-/// readers treat it as no topic.
+/// (`sqlite/rf_forget.rs`). Stores in other databases (the cron store and
+/// `xin/tasks.db`) cannot be checked from here, so a `topic_id` they hold may
+/// name a removed topic; readers treat it as no topic.
 pub(crate) fn delete_orphan_topic(tx: &Connection, topic_id: &str) -> anyhow::Result<()> {
     let referenced: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM memories WHERE topic_id = ?1)
