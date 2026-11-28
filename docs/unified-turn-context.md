@@ -551,6 +551,10 @@ twice. A refused ratio leaves the request on the local estimate, unchanged,
 and is recorded with its reason (`ratio_out_of_band`). The constants are in
 `src/context/budget/anchor.rs`.
 
+The trim after the tool results compares the tool surface of the round, so a run
+of a shared session does not use the anchor of another run whose tool surface
+differs; it falls back to the local estimate.
+
 Why the lower bound is 0.800. A low ratio is the one that lets more through:
 an anchored request may carry up to `1 / (k * 1.02)` times the local tokens
 the unanchored limit allows. At window 128000 with a reply reserve of 16384
