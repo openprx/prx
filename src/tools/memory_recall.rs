@@ -175,7 +175,11 @@ impl Tool for MemoryRecallTool {
                 let mut output = format!("Found {} memories:\n", entries.len());
                 for entry in &entries {
                     let score = entry.score.map_or_else(String::new, |s| format!(" [{s:.0}%]"));
-                    let _ = writeln!(output, "- [{}] {}: {}{score}", entry.category, entry.key, entry.content);
+                    let _ = writeln!(
+                        output,
+                        "- key: {}\n  category: {}\n  content: {}{score}",
+                        entry.key, entry.category, entry.content
+                    );
                 }
                 Ok(ToolResult {
                     success: true,
