@@ -62,6 +62,13 @@ pub(crate) struct ExecutionTraceSnapshot {
     /// when none, so older sealed payloads serialise unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) unavailable_attempts: Option<u64>,
+    /// Calls refused for a permission reason: an approval that was denied, or a
+    /// call the execution policy or the autonomy level refused (also counted in
+    /// `denied_attempts`). A call that is not exposed, is outside the turn
+    /// surface, has a stale capability, has no call budget or is denied by an
+    /// MCP allow or deny list is not counted. Absent when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) permission_refusals: Option<u64>,
     pub(crate) unbound_attempts: u64,
     pub(crate) incomplete: bool,
 }
@@ -128,6 +135,7 @@ struct State {
     denied_attempts: u64,
     awaiting_approval_attempts: u64,
     unavailable_attempts: u64,
+    permission_refusals: u64,
     /// Error text with its source chain, by operation id, for the classifier
     /// only (never persisted or returned).
     error_details: BTreeMap<String, String>,
@@ -318,6 +326,7 @@ impl ExecutionTrace {
             denied_attempts: state.denied_attempts,
             awaiting_approval_attempts: state.awaiting_approval_attempts,
             unavailable_attempts: (state.unavailable_attempts > 0).then_some(state.unavailable_attempts),
+            permission_refusals: (state.permission_refusals > 0).then_some(state.permission_refusals),
             unbound_attempts: state.unbound_attempts,
             incomplete,
         };
@@ -412,11 +421,21 @@ impl PendingExecution {
     }
     /// Like [`Self::finish`], with the failure text so an unavailable backend
     /// can be told from an argument or validation failure.
-    pub(crate) fn finish_with_error(mut self, status: ToolExecutionStatus, error: Option<&str>) {
-        self.record(status, error);
+    pub(crate) fn finish_with_error(self, status: ToolExecutionStatus, error: Option<&str>) {
+        self.finish_classified(status, error, false);
+    }
+    /// Like [`Self::finish_with_error`]; `permission_refused` says a `Denied`
+    /// call was refused by the execution policy or the autonomy level.
+    pub(crate) fn finish_classified(
+        mut self,
+        status: ToolExecutionStatus,
+        error: Option<&str>,
+        permission_refused: bool,
+    ) {
+        self.record(status, error, permission_refused);
         self.active = false;
     }
-    fn record(&self, status: ToolExecutionStatus, error: Option<&str>) {
+    fn record(&self, status: ToolExecutionStatus, error: Option<&str>, permission_refused: bool) {
         let mut state = self.trace.0.lock();
         if state.sealed.is_some() {
             return;
@@ -451,6 +470,9 @@ impl PendingExecution {
             | ToolExecutionStatus::PreparationDenied
             | ToolExecutionStatus::StaleCapability => {
                 state.denied_attempts = state.denied_attempts.saturating_add(1);
+                if status == ToolExecutionStatus::ApprovalDenied || permission_refused {
+                    state.permission_refusals = state.permission_refusals.saturating_add(1);
+                }
                 "denied"
             }
             _ => {
@@ -469,7 +491,7 @@ impl PendingExecution {
 impl Drop for PendingExecution {
     fn drop(&mut self) {
         if self.active {
-            self.record(ToolExecutionStatus::Cancelled, None);
+            self.record(ToolExecutionStatus::Cancelled, None, false);
         }
     }
 }

@@ -1579,9 +1579,18 @@ pub struct ToolExecutionOutcome {
     /// Typed pre-approval refusal, projected only by rf live frames.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refusal_cause: Option<ToolCallRefusalReason>,
+    /// A `Denied` call refused by the execution policy or the autonomy level,
+    /// as opposed to an admission, surface or budget refusal. Never stored.
+    #[serde(skip)]
+    pub(crate) permission_refused: bool,
 }
 
 impl ToolExecutionOutcome {
+    const fn with_permission_refusal(mut self) -> Self {
+        self.permission_refused = true;
+        self
+    }
+
     const fn with_refusal_cause(mut self, cause: ToolCallRefusalReason) -> Self {
         self.refusal_cause = Some(cause);
         self

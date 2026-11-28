@@ -45,7 +45,7 @@ impl ToolExecutionService {
             }
         }
         if let Some(pending) = pending {
-            pending.finish_with_error(outcome.status, outcome.error.as_deref());
+            pending.finish_classified(outcome.status, outcome.error.as_deref(), outcome.permission_refused);
         }
         outcome
     }
@@ -399,7 +399,8 @@ impl ToolExecutionService {
                     None,
                     started,
                 )
-                .with_refusal_cause(ToolCallRefusalReason::PolicyDenied);
+                .with_refusal_cause(ToolCallRefusalReason::PolicyDenied)
+                .with_permission_refusal();
         }
         // Below Full, a path the tool's own policy refuses never reaches an
         // approval prompt or a reservation (the structural-validation intent
@@ -439,7 +440,8 @@ impl ToolExecutionService {
                         None,
                         started,
                     )
-                    .with_refusal_cause(reason);
+                    .with_refusal_cause(reason)
+                    .with_permission_refusal();
             }
         }
 
@@ -1209,6 +1211,7 @@ impl ToolExecutionService {
             replayed: false,
             approval_denial_cause: None,
             refusal_cause: None,
+            permission_refused: false,
         }
     }
 }

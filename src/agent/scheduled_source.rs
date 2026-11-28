@@ -105,10 +105,12 @@ pub(crate) fn current_result_meta(run_task_id: Option<&str>) -> Option<Scheduled
 
 /// Records that the scheduled invocation `run_task_id` ended on a refused tool
 /// call. A nested run that inherits the scope has another task id and records
-/// nothing.
+/// nothing. A Xin goal step records nothing either: a failed step is requeued
+/// with no ceiling and no terminal failure path exists for it, so the step
+/// completes with its reply as before.
 pub(super) fn mark_refused(run_task_id: Option<&str>) {
     let _ = SCHEDULED_ORIGIN.try_with(|origin| {
-        if run_task_id == Some(origin.task_id.as_str()) {
+        if origin.goal_id.is_none() && run_task_id == Some(origin.task_id.as_str()) {
             origin.refused.store(true, Ordering::Release);
         }
     });

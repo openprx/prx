@@ -61,7 +61,7 @@ pub struct XinTaskLease {
 /// Insert a new task and return the persisted record.
 ///
 /// The task records no creator and so runs as [`JobOrigin::Unattributed`];
-/// entry points that know who created it use [`add_task_with_origin`].
+/// entry points that know who created it use `add_task_with_origin`.
 #[cfg(test)]
 pub fn add_task(config: &Config, new: &NewXinTask) -> Result<XinTask> {
     add_task_with_origin(config, new, &JobOrigin::Unattributed)
@@ -75,7 +75,7 @@ pub fn add_task_with_origin(config: &Config, new: &NewXinTask, origin: &JobOrigi
     add_task_with_origin_and_creator(config, new, origin, JobCreator::AgentTool)
 }
 
-/// [`add_task_with_origin`] recording which surface created the task (D-107
+/// `add_task_with_origin` recording which surface created the task (D-107
 /// amendment): only `prx xin` passes [`JobCreator::OperatorCli`].
 pub fn add_task_with_origin_and_creator(
     config: &Config,

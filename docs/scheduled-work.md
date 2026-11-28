@@ -27,8 +27,12 @@ hours). Persisted `xin:memory_evolution` and `xin:fitness_report` names are
 disabled; those jobs now belong to the self-system workers. Recurring task
 failures increment a failure counter and reschedule; they do not disable the
 task. An agent run that ends waiting on an approval, or in which every tool call
-that finished was refused, is a failed run: its stored status and its result row
-say so. A run in which at least one call succeeded is judged by its reply as
+that finished was refused for a permission reason (an approval that was denied,
+or a call the execution policy or autonomy level refused), is a failed run: its
+stored status and its result row say so. A tool that is not exposed, a stale
+capability, a call budget or an MCP allow or deny list does not count. A goal
+step is not reported this way, because a failed step is requeued with no ceiling;
+it completes with its reply. A run in which at least one call succeeded is judged by its reply as
 before.
 
 Heartbeat has no separate enable flag and no separate execution loop. Defaults
