@@ -241,15 +241,32 @@ A delete also follows what the deleted turn's child runs sent to other
 sessions through the mailbox. The mailbox records the sending run of every
 local message (the run of the `sessions_send` call, of the process worker, or
 the run being announced), never a value from the model or the wire, and a
-remote peer's message has none. The delete erases an adopted message whose
-recorded sender run is an erased run of its sending session even when the
-receiving session stamped it with another, kept run, together with the turns
-that message woke. A message that is not yet adopted is not reached by a
-delete. Messages written before the sender run was recorded keep the earlier
-rule (the order window after the run's first row, and the completion notice of
-the run); an interim message of such a row that was adopted after a later
-kept run of the same child session began is erased but its woken turn is not
-followed.
+remote peer's message has none. The runs followed are the deleted turn's own
+run and every run it spawned. The delete erases an adopted message whose
+recorded sender run is one of them even when the receiving session stamped it
+with another, kept run, together with the turns that message woke.
+
+A message that is not yet adopted (accepted or delivered, not consumed) is
+reached as well. Its receiver body is deleted, its receipt is marked erased,
+and the body kept by the sender (the outbox row of the same message on the same
+stream, or an outbox row that has no receipt yet) is deleted. The slot is closed
+as a hole in the receiver's sequence, so a kept message that was sent earlier on
+the same stream is still delivered and adopted first, a late copy of the erased
+sequence number is refused, and later messages are not held back. If a stream
+already holds the maximum number of holes above its consume cursor, that one
+slot is kept and a payload-free warning is logged. Adopting a closed slot is
+reported as "skip" to the session inbox and to the process worker, which keep
+running.
+
+Residuals. A body that already reached a live process worker over its IPC
+channel can sit in that worker's model context, and what that worker writes
+later is not followed; the delete does not cancel the recipient's run. A remote
+peer that already accepted a message keeps its copy. Messages written before
+the sender run was recorded keep the earlier rule (the order window after the
+run's first row, and the completion notice of the run) for adopted rows, and a
+pending message of that kind is not reached; an interim message of such a row
+that was adopted after a later kept run of the same child session began is
+erased but its woken turn is not followed.
 
 Sealed tool rows of the memory tools (a `memory_recall`, `memory_search` or
 `memory_get` result and its execution record, and a `memory_store` call) carry
