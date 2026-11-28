@@ -5,7 +5,10 @@
 //! the memory is forgotten the printed text is replaced the same way.
 use super::rf_forget;
 use crate::memory::printed_keys::{MEMORY_REMOVED_TEXT, MEMORY_TOOLS, MEMORY_WRITE_TOOLS, PrintedKeys, printed_keys};
-use rusqlite::{Connection, params, types::Value};
+use rusqlite::{
+    Connection, params,
+    types::{Null, Value},
+};
 use std::collections::{HashMap, HashSet};
 
 /// Tool results of the session-listing tools that name an erased run or session.
@@ -572,6 +575,7 @@ pub(super) fn rewrite_memory_copies(tx: &Connection, probes: &[MemoryProbe], now
         let calls: Vec<CallRef> = rows.iter().filter_map(|row| row.call.clone()).collect();
         rewritten = rewritten.saturating_add(rewrite_call_terminals(tx, &calls, MEMORY_REMOVED_TEXT, now)?);
     }
+    rewritten = rewritten.saturating_add(rewrite_unpaired_terminals(tx, probes, oldest, now)?);
     rewritten = rewritten.saturating_add(rewrite_write_calls(tx, probes, now)?);
     Ok(rewritten.saturating_add(rewrite_sealed_copies(tx, probes, oldest, now)?))
 }
@@ -721,6 +725,131 @@ struct CallRef {
     call_id: String,
 }
 
+/// The `SET` clause that replaces the model text of an execution terminal:
+/// `?4` is the replacement text and `?5` the update time.
+const TERMINAL_SET: &str = "raw_payload_json = CASE WHEN json_type(raw_payload_json, '$.outcome.result') = 'object'
+                 THEN json_set(raw_payload_json, '$.outcome.model_content', ?4, '$.outcome.result.output', ?4)
+                 ELSE json_set(raw_payload_json, '$.outcome.model_content', ?4) END,
+             updated_at = ?5";
+
+/// Replace the model text of the execution terminals of memory-tool calls that
+/// have no `tool.result.recorded` row, when they print a forgotten memory's
+/// key. A batch that ends early (cancellation, scheduler error) records the
+/// terminal of each finished call but never its result row, so the link of
+/// [`rewrite_call_terminals`] finds nothing. Selection: a terminal of a memory
+/// tool recorded no earlier than the first row created at the oldest probe's
+/// time, in the probe's workspace and owner, whose `model_content` or
+/// `result.output` prints the key as the result scan does, and that has no
+/// result row of the same workspace, run and call id (`outcome.operation_id`).
+/// A paired terminal keeps the link path; an unparseable payload, a payload
+/// without an outcome object and a sealed wrapper are skipped. Returns the
+/// number of terminals rewritten.
+fn rewrite_unpaired_terminals(
+    tx: &Connection,
+    probes: &[MemoryProbe],
+    oldest: &str,
+    now: &str,
+) -> anyhow::Result<usize> {
+    let wanted: Vec<serde_json::Value> = probes
+        .iter()
+        .map(|probe| {
+            serde_json::json!({
+                "workspace": probe.workspace_id,
+                "owner": probe.owner_id,
+                "key": probe.key,
+                "key_redacted": probe.key_redacted,
+            })
+        })
+        .collect();
+    let probes_json = serde_json::to_string(&wanted)?;
+    let tools = serde_json::to_string(&MEMORY_TOOLS)?;
+    let mut statement = tx.prepare(
+        "SELECT event_id, json_extract(raw_payload_json, '$.reservation.capability'),
+                json_extract(raw_payload_json, '$.outcome.model_content'),
+                json_extract(raw_payload_json, '$.outcome.result.output'), workspace_id, owner_id
+         FROM message_events
+         WHERE event_type = 'tool.execution.finalized'
+           AND id >= COALESCE((SELECT MIN(id) FROM message_events WHERE created_at >= ?1), 9223372036854775807)
+           AND json_valid(raw_payload_json)
+           AND json_type(raw_payload_json, '$.outcome') = 'object'
+           AND json_extract(raw_payload_json, '$.reservation.capability') IN (SELECT value FROM json_each(?3))
+           AND json_type(raw_payload_json, '$.outcome.model_content') = 'text'
+           AND json_extract(raw_payload_json, '$.outcome.model_content') <> ?4
+           AND EXISTS (SELECT 1 FROM json_each(?2) j
+                       WHERE (instr(json_extract(message_events.raw_payload_json, '$.outcome.model_content'),
+                                    json_extract(j.value, '$.key')) > 0
+                              OR instr(json_extract(message_events.raw_payload_json, '$.outcome.model_content'),
+                                       json_extract(j.value, '$.key_redacted')) > 0
+                              OR instr(COALESCE(json_extract(message_events.raw_payload_json, '$.outcome.result.output'), ''),
+                                       json_extract(j.value, '$.key')) > 0
+                              OR instr(COALESCE(json_extract(message_events.raw_payload_json, '$.outcome.result.output'), ''),
+                                       json_extract(j.value, '$.key_redacted')) > 0)
+                         AND (json_extract(j.value, '$.workspace') IS NULL
+                              OR message_events.workspace_id = json_extract(j.value, '$.workspace'))
+                         AND (json_extract(j.value, '$.owner') IS NULL
+                              OR message_events.owner_id = json_extract(j.value, '$.owner')))
+           AND NOT EXISTS (SELECT 1 FROM message_events r
+                           WHERE r.event_type = 'tool.result.recorded'
+                             AND r.workspace_id IS message_events.workspace_id
+                             AND r.run_id IS message_events.run_id
+                             AND json_valid(r.raw_payload_json)
+                             AND json_extract(r.raw_payload_json, '$.call_id')
+                                 = json_extract(message_events.raw_payload_json, '$.outcome.operation_id'))
+           AND NOT EXISTS (SELECT 1 FROM agent_erase_fences f WHERE f.scope_id = message_events.ma_scope_id)",
+    )?;
+    let found = statement
+        .query_map(params![oldest, probes_json, tools, MEMORY_REMOVED_TEXT], |row| {
+            Ok([
+                row.get::<_, Value>(0)?,
+                row.get::<_, Value>(1)?,
+                row.get::<_, Value>(2)?,
+                row.get::<_, Value>(3)?,
+                row.get::<_, Value>(4)?,
+                row.get::<_, Value>(5)?,
+            ])
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    let max_key_len = probes
+        .iter()
+        .map(|probe| probe.key.len().max(probe.key_redacted.as_deref().map_or(0, str::len)))
+        .max()
+        .unwrap_or_default();
+    let mut clear = HashMap::new();
+    let mut rewritten = 0usize;
+    for [event_id, tool, model_content, output, workspace, owner] in found {
+        let (Value::Text(event_id), Value::Text(tool), Value::Text(model_content)) = (event_id, tool, model_content)
+        else {
+            continue;
+        };
+        let (workspace, owner) = (text_of(workspace), text_of(owner));
+        let output = text_of(output).unwrap_or_default();
+        let content_keys = printed_keys(&tool, &model_content, max_key_len);
+        let output_keys = printed_keys(&tool, &output, max_key_len);
+        let mut matched = false;
+        for probe in probes {
+            if !probe.covers(workspace.as_deref(), owner.as_deref()) {
+                continue;
+            }
+            let naming = probe.naming(&[&content_keys, &output_keys]);
+            if probe.applies_to(tx, naming, workspace.as_deref(), owner.as_deref(), &mut clear)? {
+                matched = true;
+                break;
+            }
+        }
+        if matched {
+            rewritten = rewritten.saturating_add(tx.execute(
+                &format!(
+                    "UPDATE message_events SET {TERMINAL_SET}
+                     WHERE event_id = ?1 AND event_type = 'tool.execution.finalized'"
+                ),
+                params![event_id, Null, Null, MEMORY_REMOVED_TEXT, now],
+            )?);
+        }
+    }
+    Ok(rewritten)
+}
+
 /// Replace the model text of the execution terminal of each call
 /// (`tool.execution.finalized`, written by `tools/execution/section_2.rs`
 /// `commit_idempotent_execution`; its payload keeps the outcome with
@@ -732,14 +861,12 @@ fn rewrite_call_terminals(tx: &Connection, calls: &[CallRef], text: &str, now: &
     let mut rewritten = 0usize;
     for call in calls {
         let updated = tx.execute(
-            "UPDATE message_events SET
-                 raw_payload_json = CASE WHEN json_type(raw_payload_json, '$.outcome.result') = 'object'
-                     THEN json_set(raw_payload_json, '$.outcome.model_content', ?4, '$.outcome.result.output', ?4)
-                     ELSE json_set(raw_payload_json, '$.outcome.model_content', ?4) END,
-                 updated_at = ?5
-             WHERE workspace_id = ?1 AND event_type = 'tool.execution.finalized' AND run_id IS ?2
-               AND json_valid(raw_payload_json) AND json_type(raw_payload_json, '$.outcome') = 'object'
-               AND json_extract(raw_payload_json, '$.outcome.operation_id') = ?3",
+            &format!(
+                "UPDATE message_events SET {TERMINAL_SET}
+                 WHERE workspace_id = ?1 AND event_type = 'tool.execution.finalized' AND run_id IS ?2
+                   AND json_valid(raw_payload_json) AND json_type(raw_payload_json, '$.outcome') = 'object'
+                   AND json_extract(raw_payload_json, '$.outcome.operation_id') = ?3"
+            ),
             params![call.workspace, call.run_id, call.call_id, text, now],
         )?;
         rewritten = rewritten.saturating_add(updated);
