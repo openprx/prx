@@ -214,10 +214,12 @@ the next `bridge.hello` unwraps it again. The wrapped key stays on disk until ac
 and the conversation id, so ciphertext cannot be moved between conversations.
 
 A message row is sealed under a record id that is bound into the seal: its
-idempotency key, or `event:{event_id}` for a row without one, so ciphertext
-cannot be moved from one row to another. Rows written before this form (sealed
-under the constant `event`) stay readable through one fallback attempt; there
-is no migration.
+idempotency key, or `event:{event_id}` for a row without one. The ciphertext of
+a keyless row written from this version on is bound to its own row and does not
+open in another row. The ciphertext of keyless rows written before (sealed under
+the constant `event`) still opens in any keyless row of the same account and
+conversation, until those rows are resealed (a later change); rows written
+before stay readable and there is no migration in this version.
 
 The memory access audit log (`access_audit_log`) holds no clear memory key or
 query text of this channel: a view read writes no audit row, and a base-store
