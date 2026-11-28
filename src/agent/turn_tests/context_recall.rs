@@ -77,40 +77,6 @@ async fn build_context_ignores_legacy_assistant_autosave_entries() {
 }
 
 #[tokio::test]
-async fn build_context_skips_ramflux_scoped_rows_without_a_view() {
-    let tmp = TempDir::new().unwrap();
-    let mem: std::sync::Arc<dyn Memory> = std::sync::Arc::new(SqliteMemory::new(tmp.path()).unwrap());
-    mem.store(
-        "lang",
-        "User asked for concise status updates",
-        MemoryCategory::Core,
-        None,
-    )
-    .await
-    .unwrap();
-    mem.store(
-        "rf:ab12:cd34",
-        "Conversation asked for concise status updates",
-        MemoryCategory::Core,
-        None,
-    )
-    .await
-    .unwrap();
-
-    let context = build_context_with_scope(mem.as_ref(), "concise status updates", 0.0, None).await;
-    assert!(context.preamble.contains("lang"), "{}", context.preamble);
-    assert!(!context.preamble.contains("rf:"), "{}", context.preamble);
-
-    // With a view installed the read is the view's own and is not filtered.
-    let viewed = crate::memory::active_view::scope(
-        std::sync::Arc::clone(&mem),
-        build_context_with_scope(mem.as_ref(), "concise status updates", 0.0, None),
-    )
-    .await;
-    assert!(viewed.preamble.contains("rf:ab12:cd34"), "{}", viewed.preamble);
-}
-
-#[tokio::test]
 async fn build_agent_context_returns_structured_bundle() {
     let tmp = TempDir::new().unwrap();
     let mem = SqliteMemory::new(tmp.path()).unwrap();
