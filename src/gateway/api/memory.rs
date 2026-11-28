@@ -521,7 +521,7 @@ mod tests {
         assert_eq!(at(&recalled, "/empty"), false);
         let recall_output = at(&recalled, "/output").as_str().unwrap_or("").to_string();
         assert!(
-            recall_output.contains("- [core] c4-note: alpha-only-note"),
+            recall_output.contains("- key: c4-note\n  category: core\n  content: alpha-only-note"),
             "{recall_output}"
         );
         let recall_hits = at(&recalled, "/hits");
