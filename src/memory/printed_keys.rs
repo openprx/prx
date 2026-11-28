@@ -15,8 +15,8 @@ pub(crate) const MEMORY_REMOVED_TEXT: &str = "[output removed: it quoted a memor
 /// not hashed, so its copy is not found (residual r-E3 of the design).
 const MAX_HASHED_KEY_BYTES: usize = 512;
 
-/// Most splits of one printed entry that the writer of an encrypted row looks
-/// up; the shortest come first, so a long entry cannot crowd out the others.
+/// Most splits of one printed `memory_get` entry that the writer of an
+/// encrypted row looks up; the shortest come first, so a long entry cannot crowd out the others.
 const MAX_SPLITS_PER_ENTRY: usize = 8;
 
 /// The distinct candidate keys the printed `output` of `tool` names, as owned
@@ -24,7 +24,9 @@ const MAX_SPLITS_PER_ENTRY: usize = 8;
 /// of every entry, then the second split of every entry, and so on, at most
 /// [`MAX_SPLITS_PER_ENTRY`] per entry. A long entry therefore never pushes the
 /// first split of a later entry (normally its real key) past the caller's
-/// total cap. Only the exact forms of [`printed_keys`] are candidates: a key
+/// total cap. The writer parses current output only: the legacy
+/// `memory_recall` line is left to the reader. Only the exact forms of
+/// [`printed_keys`] are candidates: a key
 /// whose separator the redaction mask swallowed ([`PrintedKeys::swallowed`])
 /// ends in the mask, is never a stored key and would be dropped by the
 /// existence lookup anyway.
@@ -62,7 +64,8 @@ pub(crate) struct PrintedKeys<'a> {
     pub(crate) swallowed: HashSet<&'a str>,
 }
 
-/// Start of a `memory_recall` entry line. An entry line may also start with
+/// Start of a legacy `memory_recall` entry line (rows written before the tool
+/// printed the `- key: ` form; only the reader parses it). An entry line may also start with
 /// the mask: an entry whose key names a credential and whose content is empty
 /// (`- [core] token:` at the end of its line) has the next line's `-` taken
 /// into the redacted value, so the next entry reads `[REDACTED] [core] key: text`.
@@ -73,9 +76,11 @@ const RECALL_ENTRY_STARTS: [&str; 2] = ["- [", "[REDACTED] ["];
 /// it; a key longer than `max_len` bytes is not collected (no probe has one).
 /// One pass over the output, so a result is parsed once however many probes
 /// there are:
-/// - `memory_recall` (`tools/memory_recall.rs`): `- [category] key: content`,
-///   or `- [category] key:` at the end of the line; a redacted key may have
-///   lost its `:` (see [`PrintedKeys::swallowed`]);
+/// - `memory_recall` (`tools/memory_recall.rs`): a line `- key: key` (as
+///   `memory_search`), and, for rows written before that form,
+///   `- [category] key: content`, or `- [category] key:` at the end of the
+///   line; a legacy redacted key may have lost its `:` (see
+///   [`PrintedKeys::swallowed`]);
 /// - `memory_search` (`tools/memory_search.rs`): a line `- key: key`;
 /// - `memory_get` (`tools/memory_get.rs`, `render_range`): the output starts
 ///   with `key lines a-b:` (or `key is empty.`).
@@ -91,6 +96,8 @@ pub(crate) fn printed_keys<'a>(tool: &str, output: &'a str, max_len: usize) -> P
                 line.get(at..)
                     .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
             };
+            keys.exact
+                .extend(output.lines().filter_map(|line| line.strip_prefix("- key: ")));
             for line in output
                 .lines()
                 .filter(|line| RECALL_ENTRY_STARTS.iter().any(|start| line.starts_with(start)))
@@ -141,50 +148,16 @@ pub(crate) fn printed_keys<'a>(tool: &str, output: &'a str, max_len: usize) -> P
 }
 
 /// The exact candidate splits of each printed entry, one list per entry in
-/// output order, each list ordered with the most likely key first; the same
-/// exact forms and entry starts as [`printed_keys`], without the swallowed
-/// forms:
-/// - `memory_recall`: one entry per line (see [`RECALL_ENTRY_STARTS`]), the
-///   first `] ` start before later ones and, per start, the nearest `: ` end
-///   (the shortest split) first;
-/// - `memory_search`: one entry and one split per `- key: ` line;
+/// output order, each list ordered with the most likely key first; the
+/// current exact forms of [`printed_keys`], without the legacy recall line and
+/// the swallowed forms:
+/// - `memory_recall` and `memory_search`: one entry and one split per
+///   `- key: ` line;
 /// - `memory_get`: one entry, shortest split first.
 fn printed_entries<'a>(tool: &str, output: &'a str, max_len: usize) -> Vec<Vec<&'a str>> {
     let mut entries = Vec::new();
     match tool {
-        "memory_recall" => {
-            for line in output
-                .lines()
-                .filter(|line| RECALL_ENTRY_STARTS.iter().any(|start| line.starts_with(start)))
-            {
-                let ends: Vec<usize> = line
-                    .match_indices(':')
-                    .map(|(at, _)| at)
-                    .filter(|at| {
-                        line.get(at.saturating_add(1)..)
-                            .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
-                    })
-                    .collect();
-                let mut splits = Vec::new();
-                for (at, _) in line.match_indices("] ") {
-                    let start = at.saturating_add(2);
-                    let first = ends.partition_point(|end| *end < start);
-                    for end in ends
-                        .iter()
-                        .skip(first)
-                        .take_while(|end| end.saturating_sub(start) <= max_len)
-                    {
-                        if let Some(split) = line.get(start..*end)
-                            && !splits.contains(&split)
-                        {
-                            splits.push(split);
-                        }
-                    }
-                }
-                entries.push(splits);
-            }
-        }
-        "memory_search" => {
+        "memory_recall" | "memory_search" => {
             entries.extend(
                 output
                     .lines()
