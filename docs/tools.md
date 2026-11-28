@@ -969,6 +969,21 @@ rather than an error. A caller that is not owner-isolated runs the statement and
 the bind list it always ran, and a call that carries no trusted scope at all
 still reaches the unscoped delete it always did.
 
+`memory_forget` follows the read mode `memory_recall` uses. With
+`memory.acl_enabled` off, an in-process caller that is not owner-isolated and
+runs in a partition (the main agent and named agents) deletes the key inside
+its own partition without the visibility predicate, so a turn can forget every
+memory it can recall, including a row with no workspace or owner. With the ACL
+on, or for an owner-isolated caller, the delete is unchanged: the predicate and
+the owner guard above apply. A forget removes the stored text everywhere the
+sweep finds it, including the execution record of a read in the same batch that
+ended early; the memory key stays in call rows, in the forget call itself and in
+its argument preview, because a key is an identifier and not content. A topic
+that the forgotten text derived is removed once no memory, document, chunk,
+evolution proposal, webhook ingestion or alias names it; a cron job's
+`topic_id` may then name a topic that no longer exists, and readers treat it as
+no topic.
+
 The write is bounded the same way. `memory_store` is not on the default MCP
 surface either, but it is on the owner-isolation-aware list, so an operator
 can expose it. Memory keys are global, and every scoped write is an upsert on
