@@ -161,11 +161,11 @@ and the module-gate family are absorbed on load; they are not live switches.
 | `[tool_tiering]` | `always_include = []`; `always_exclude = []`; `channel_exclude = []` (nothing hidden from channel sessions); `defer_unlisted` unset (every available tool is published to the model, unless their definitions would take more than a quarter of the model's context window; then that turn defers them) |
 | `[providers]` | `app_identification = true`; `[providers.endpoint_headers]` empty. `[providers.ollama] num_ctx` unset. `[[providers.tool_dialects]]`: `provider` required; `model` unset (all models); `tool_schema`/`tool_call` unset (`raw` / `native`). `[[providers.models]]`: `provider` required; `model` unset; `operations`, `native_tools`, `vision_input`, `streaming`, `structured_output`, `tool_schema_dialect`, `tool_call_dialect`, `context_window` all unset. See later sections |
 | `[model_settings.<id>]` | catalog levels and explicit parameters; omitted keys stay with the catalog |
+
 When `mcp_server.jwt_jwks_uri` is set, the gateway keeps the fetched key set for
 `jwt_jwks_cache_ttl_secs`. A failed fetch is retried at most every 30 seconds per URI,
 and concurrent requests share one fetch; while a fetch is backing off, a stale or
 missing key set still rejects the token.
-
 
 ## Interactive chat sessions
 
