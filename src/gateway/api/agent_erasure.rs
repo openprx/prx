@@ -240,7 +240,7 @@ async fn history(
     let request = HistoryErase {
         workspace: config.workspace_dir.to_string_lossy().into_owned(),
         owner: principal.owner_id,
-        session,
+        session: session.clone(),
         agent: agent.clone(),
         incarnation,
         key,
@@ -274,7 +274,11 @@ async fn history(
     })
     .await
     {
-        Ok(Ok(receipt)) => Json(receipt).into_response(),
+        Ok(Ok(receipt)) => {
+            // The erased session starts without usage anchors if it is created again.
+            crate::context::budget::session_reserves::forget_session_tool_surface_reserve(&session);
+            Json(receipt).into_response()
+        }
         Ok(Err(error)) => failure(&error, false),
         Err(error) => failure(&error.into(), false),
     }
