@@ -70,6 +70,7 @@ pub fn add_task(config: &Config, new: &NewXinTask) -> Result<XinTask> {
 /// Insert a new task created by `origin` (CRON-ORIGIN) and return it. The
 /// origin is fixed here: no later update changes whose authority its agent
 /// runs execute under.
+#[cfg(test)]
 pub fn add_task_with_origin(config: &Config, new: &NewXinTask, origin: &JobOrigin) -> Result<XinTask> {
     add_task_with_origin_and_creator(config, new, origin, JobCreator::AgentTool)
 }
@@ -890,8 +891,20 @@ pub fn ensure_system_task(config: &Config, new: &NewXinTask) -> Result<XinTask> 
 
     existing.map_or_else(
         // System tasks come only from the built-in definitions and the
-        // operator's `HEARTBEAT.md` (CRON-ORIGIN).
-        || add_task_with_origin(config, new, &JobOrigin::LocalOperator),
+        // operator's `HEARTBEAT.md` (CRON-ORIGIN). They are created with
+        // `deliver = none`: a recurring system task leaves no result row per
+        // run. An operator can still set another value with an update.
+        || {
+            add_task_with_stored_options(
+                config,
+                new,
+                &JobOrigin::LocalOperator,
+                JobCreator::AgentTool,
+                &CreatorStamp::default(),
+                ScheduledContext::default(),
+                ScheduledDeliver::None,
+            )
+        },
         |id| {
             let current = get_task(config, &id)?;
             if current.payload == new.payload
