@@ -750,6 +750,18 @@ pub(crate) async fn run_with_runtime_envelope(
                     &fabric_scope,
                     agent_user_event.as_ref().map(|event| event.event_id.as_str()),
                 );
+                // A scheduled run continues its session's earlier runs, so it keeps
+                // the session's usage anchor across runs; a plain run is single shot
+                // and keeps its own.
+                let memory_runtime = if scheduled_admission.is_some() {
+                    memory_runtime.with_tool_surface_reserve(
+                        crate::context::budget::session_reserves::session_tool_surface_reserve(
+                            &runtime_envelope.session_key,
+                        ),
+                    )
+                } else {
+                    memory_runtime
+                };
                 // A scheduled run opens from its session's earlier runs and recalls
                 // once, inside the opening. A plain run is single shot: it replays
                 // no earlier turn, and keeps the session copy as its only session memory.

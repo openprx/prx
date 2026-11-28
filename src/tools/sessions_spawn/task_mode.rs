@@ -477,7 +477,14 @@ pub(super) async fn run_sub_agent_task(
                                     ),
                                 )
                                 .with_event_fabric(child_fabric_owned)
-                                .with_rendered_stored_handoffs(),
+                                .with_rendered_stored_handoffs()
+                                // Steered segments and continuations of this child session
+                                // keep one usage anchor and tool-surface reserve.
+                                .with_tool_surface_reserve(
+                                    crate::context::budget::session_reserves::session_tool_surface_reserve(
+                                        &envelope.session_key,
+                                    ),
+                                ),
                             },
                             crate::agent::turn_request::TurnDelivery {
                                 cancellation: Some(cancel_token_owned.clone()),

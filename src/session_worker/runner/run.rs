@@ -1171,7 +1171,14 @@ async fn run_owned_manifest(
                                         }),
                                     )
                                     .with_event_fabric(request_event_fabric)
-                                    .with_rendered_stored_handoffs(),
+                                    .with_rendered_stored_handoffs()
+                                    // Every segment this worker runs for its session
+                                    // (steers, mailbox deliveries) keeps one usage anchor.
+                                    .with_tool_surface_reserve(
+                                        crate::context::budget::session_reserves::session_tool_surface_reserve(
+                                            &manifest_ref.session_scope_key,
+                                        ),
+                                    ),
                                 },
                                 crate::agent::turn_request::TurnDelivery {
                                     // Steering cancels the in-flight segment; without a token the
