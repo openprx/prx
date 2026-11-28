@@ -220,15 +220,26 @@ fn pending_erase_skips_a_slot_when_the_hole_table_is_full() {
     f.receive(1, 1);
     f.receive(2, 2);
     tag_receipt(&f, 2, RUN_ERASED);
-    let mut value = progress_json(&f);
-    let holes: Vec<serde_json::Value> = (3..3 + 1024u64)
-        .map(|seq| serde_json::json!({"seq": seq, "skipped_at": 1}))
+    // `decode` accepts only the canonical encoding (struct field order), so the
+    // holes are spliced into the stored text instead of re-serialised through a map.
+    let stored: String = f
+        .memory
+        .pool
+        .write()
+        .query_row("SELECT progress FROM prx_mailbox_seq", [], |row| row.get(0))
+        .expect("test: stored progress");
+    let holes: Vec<String> = (3..3 + 1024u64)
+        .map(|seq| format!(r#"{{"seq":{seq},"skipped_at":1}}"#))
         .collect();
-    value["seq_skipped"] = serde_json::Value::Array(holes);
+    let filled = stored.replace(
+        r#""seq_skipped":[]"#,
+        &format!(r#""seq_skipped":[{}]"#, holes.join(",")),
+    );
+    assert_ne!(filled, stored, "test: the hole list was spliced in");
     f.memory
         .pool
         .write()
-        .execute("UPDATE prx_mailbox_seq SET progress=?1", [value.to_string()])
+        .execute("UPDATE prx_mailbox_seq SET progress=?1", [filled])
         .expect("test: fill the hole table");
     assert_eq!(erase_runs(&f, &[RUN_ERASED]), (0, 0, 1), "slot skipped and counted");
     assert_eq!(f.scalar("SELECT count(*) FROM prx_mailbox_messages"), 2, "body kept");
