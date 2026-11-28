@@ -465,9 +465,9 @@ pub(super) async fn run_tools(
                     .await;
             }
         }
-        // The live text keeps its stored document (the turn already
-        // read it); the stored row names none, so the document would
-        // outlive the memory it quotes.
+        // The live text still names the stored document, but the stored
+        // row names none, so the document would outlive the memory it
+        // quotes: delete it (a later read of it this turn finds nothing).
         if masked.is_some()
             && document_status == "persisted_document_backend"
             && let Some(runtime) = document_ingest.as_ref()
