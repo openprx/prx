@@ -286,6 +286,8 @@ pub(super) fn terminal_stale_slot(
         }
         stream.progress.consume_cursor = next;
     }
+    // A hole above the delivery cursor can pull the consume walk past it.
+    stream.progress.deliver_cursor = stream.progress.deliver_cursor.max(stream.progress.consume_cursor);
     stream.progress.gap_seq = None;
     stream.progress.gap_started_at = None;
     super::outbox::nack_slot(conn, stream, saved.seq, MailboxError::StaleRun, now)?;

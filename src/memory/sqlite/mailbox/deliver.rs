@@ -91,7 +91,19 @@ impl SqliteMailbox {
             if stream.recipient.as_ref() != Some(scope) {
                 return Err(MailboxError::StaleIncarnation);
             }
+            let mut stepped = false;
             while let Some(next) = stream.progress.deliver_cursor.checked_add(1) {
+                // A hole above the delivery cursor (an erased pending slot) is
+                // passed only here, in order, so an earlier kept slot is first.
+                if stream.progress.seq_skipped.iter().any(|hole| hole.seq == next) {
+                    stream.progress.deliver_cursor = next;
+                    if stream.progress.gap_seq == Some(next) {
+                        stream.progress.gap_seq = None;
+                        stream.progress.gap_started_at = None;
+                    }
+                    stepped = true;
+                    continue;
+                }
                 let mut query=tx.prepare("SELECT id,seq FROM prx_mailbox_messages WHERE stream_id=?1 AND state IN(0,1) AND seq>=?2 ORDER BY seq LIMIT 1").map_err(storage_error)?;
                 let candidates = query
                     .query_map(params![id, next.to_be_bytes().as_slice()], |r| {
@@ -102,6 +114,9 @@ impl SqliteMailbox {
                     .map_err(storage_error)?;
                 drop(query);
                 let Some((row_id, seq)) = candidates.first() else {
+                    if stepped {
+                        stream::save_progress(&tx, &stream, now)?;
+                    }
                     break;
                 };
                 let seq = sequence(seq)?;
@@ -147,6 +162,7 @@ impl SqliteMailbox {
                         }
                         stream.progress.consume_cursor = next;
                     }
+                    stream.progress.deliver_cursor = stream.progress.deliver_cursor.max(stream.progress.consume_cursor);
                 }
                 stream.progress.gap_seq = None;
                 stream.progress.gap_started_at = None;
