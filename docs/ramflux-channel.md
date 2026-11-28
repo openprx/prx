@@ -241,7 +241,9 @@ objects. The SQLite writer records ownership in the same transaction as each
 data row. A content-free, durable tombstone prevents deleted input from being
 executed again. Queued input is removed; active work is cancelled and its
 writer fence is closed before erasure is acknowledged. The index remains
-retryable through checkpoint failure. Erasure also rebuilds the remaining FTS index to discard obsolete segments.
+retryable through checkpoint failure. The transcript-index entries of the
+deleted rows are removed in short follow-up transactions before the operation
+answers. Erasure also rebuilds the remaining FTS index to discard obsolete segments.
 `secure_delete` overwrites freed pages;
 a TRUNCATE checkpoint empties the WAL, so VACUUM is unnecessary.
 

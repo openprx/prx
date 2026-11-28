@@ -433,7 +433,8 @@ run's tool rounds and its attachment row (`message.attachment.recorded`,
 `tool.call.recorded`, `tool.result.recorded`, `turn.decision.claimed`) are
 tombstoned like its messages, and the stored tool-output documents of the run
 go with them (a document that a tool result of a surviving run still quotes
-stays). Deleted rows never
+stays). The transcript-index entries of the deleted rows are removed in
+short follow-up transactions before the operation answers. Deleted rows never
 enter a later model context of the agent, recall, a handoff lookup or the
 session tools. `GET /api/sessions/{session_id}/messages` returns a deleted
 row as exactly `{"message_id","agent","deleted":true,"timestamp"}`.
@@ -698,7 +699,9 @@ zero residue. `409 incarnation_mismatch` includes `current_incarnation`.
 `409 idempotency_conflict` refuses a changed request under a retained key.
 `404 agent_unknown` is reconciliation only. Keys are retained at least seven
 days; terminal receipts and fences are permanent. SQLite payload removal,
-FTS rebuilds and a successful WAL truncation precede a successful receipt.
+FTS rebuilds, the removal of the transcript-index entries of the erased rows
+(in short follow-up transactions) and a successful WAL truncation precede a
+successful receipt.
 
 ## Agent purge (`agent_memory_purge_v1`)
 
