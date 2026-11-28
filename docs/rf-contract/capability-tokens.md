@@ -487,8 +487,9 @@ a running turn does (the response is the same `"status":"deleted"` body as an
 immediate delete; no extra field is added): the deleted turn's
 conversation rows are hidden at once, and every row of the turn and of the runs
 it spawned, including rows a spawned run writes after the delete, is removed as
-soon as the last of those runs has ended (after a restart, at the first request
-to the workspace). A reply delete of a turn whose spawned runs are still
+soon as the last of those runs has ended (after a restart, when the gateway
+starts). A spawned run that has not written its first row yet also defers the
+delete until it ends. A reply delete of a turn whose spawned runs are still
 running is accepted and deferred the same way; only a run that is itself still
 running answers `409 run_active`. Tool results in later
 runs of the workspace (any session) that listed an erased run or session by its
@@ -499,7 +500,9 @@ when no row of it survives.
 delete, not a reply delete) removes the job's stored result rows (the excerpts
 shown in the owner's session) and the notes that quoted them. The job itself is
 a separate object: it is not deleted or disabled and keeps running until it
-is removed on its own.
+is removed on its own. The delete removes the result rows the job has written; a
+row the job writes after the delete, including from a run in progress at that
+moment, stays.
 
 **Handoff notes and summaries.** Every handoff note of a session created after
 the session's first deleted row is tombstoned, whether or not it names a
