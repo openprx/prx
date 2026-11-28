@@ -7,7 +7,7 @@ use super::inbound_policy::{
     should_process_inbound_message, strip_channel_metadata,
 };
 use super::prompt_context::{
-    build_channel_system_prompt, build_system_prompt_with_mode, channel_message_visibility, smart_group_prompt_addendum,
+    build_system_prompt_with_builder, channel_message_visibility, channel_prompt_builder, smart_group_prompt_addendum,
 };
 use super::response_sanitize::sanitize_channel_response;
 use super::runtime_commands::{
@@ -765,7 +765,9 @@ pub(super) async fn run_channel_turn(
             return;
         }
     };
-    let base_system_prompt = build_system_prompt_with_mode(
+    let bot_identity = target_channel.as_ref().and_then(|channel| channel.bot_identity());
+    let mut system_prompt = build_system_prompt_with_builder(
+        channel_prompt_builder(&msg, chat_profile.as_ref(), bot_identity.as_deref()),
         &ctx.workspace_dir,
         &route.model,
         &selected_skills,
@@ -782,13 +784,6 @@ pub(super) async fn run_channel_turn(
             )
             .native_tool_calling,
         security.autonomy,
-    );
-    let bot_identity = target_channel.as_ref().and_then(|channel| channel.bot_identity());
-    let mut system_prompt = build_channel_system_prompt(
-        &base_system_prompt,
-        &msg,
-        chat_profile.as_ref(),
-        bot_identity.as_deref(),
     );
     // Smart group-reply: override the default "respond directly / response is
     // automatically sent" guidance so the model knows it is one participant in a

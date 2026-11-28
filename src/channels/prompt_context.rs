@@ -157,20 +157,34 @@ pub(super) fn build_current_conversation_prompt(
     block
 }
 
-pub(super) fn build_channel_system_prompt(
-    base_prompt: &str,
+/// The channel's instructions and the current-conversation block, compiled by
+/// the prompt layout as one custom section after the standard sections.
+struct ChannelInstructionsSection {
+    text: String,
+}
+
+impl crate::agent::prompt::PromptSection for ChannelInstructionsSection {
+    fn name(&self) -> &str {
+        "channel_instructions"
+    }
+
+    fn build(&self, _ctx: &crate::agent::prompt::PromptContext<'_>) -> anyhow::Result<String> {
+        Ok(self.text.clone())
+    }
+}
+
+/// The builder of a channel turn: the standard sections, then the channel
+/// instructions and the current conversation of `msg`.
+pub(super) fn channel_prompt_builder(
     msg: &traits::ChannelMessage,
     profile: Option<&ChatProfile>,
     bot_identity: Option<&str>,
-) -> String {
+) -> crate::agent::prompt::SystemPromptBuilder {
     let instructions = channel_runtime_instructions(&msg.channel);
     let current_conversation = build_current_conversation_prompt(msg, profile, bot_identity);
-    let instructions = format!("{instructions}\n\n{current_conversation}");
-    if base_prompt.is_empty() {
-        instructions
-    } else {
-        format!("{base_prompt}\n\n{instructions}")
-    }
+    crate::agent::prompt::SystemPromptBuilder::with_defaults().add_section(Box::new(ChannelInstructionsSection {
+        text: format!("{instructions}\n\n{current_conversation}"),
+    }))
 }
 
 /// Load workspace identity files and build a system prompt.

@@ -472,14 +472,6 @@ fn runtime_prompt_excludes_channel_delivery_context() {
 #[test]
 fn channel_prompt_includes_channel_delivery_context() {
     let ws = make_workspace();
-    let base_prompt = build_system_prompt(
-        ws.path(),
-        "model",
-        &[],
-        None,
-        None,
-        crate::security::AutonomyLevel::Supervised,
-    );
     let msg = traits::ChannelMessage {
         channel: "telegram".to_string(),
         reply_target: "chat-1".to_string(),
@@ -487,7 +479,17 @@ fn channel_prompt_includes_channel_delivery_context() {
         chat_title: Some("Ops".to_string()),
         ..Default::default()
     };
-    let prompt = build_channel_system_prompt(&base_prompt, &msg, None, Some("@bot"));
+    let prompt = channel_prompt_builder(&msg, None, Some("@bot"))
+        .build(&crate::agent::prompt::PromptContext {
+            workspace_dir: ws.path(),
+            model_name: "model",
+            skills: &[],
+            identity_config: None,
+            bootstrap_max_chars: None,
+            native_tools: false,
+            autonomy: crate::security::AutonomyLevel::Supervised,
+        })
+        .unwrap_or_default();
 
     assert!(
         prompt.contains("## Channel Capabilities"),

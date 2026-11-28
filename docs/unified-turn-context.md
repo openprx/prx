@@ -208,6 +208,11 @@ check cannot attribute a turn to two events. The same applies when the current
 message's own row is not in the log: nothing is cut at an older identical
 message, and the cache is replayed.
 
+The channel instructions and the current-conversation block of a channel turn
+are a prompt section (`channel_instructions`, a custom section after the standard
+sections), joined like every other section, so the prompt hash of channel turns
+changes once with this version.
+
 ## Replayed history in terminal chat
 
 `prx chat` (TUI and `--plain`) replays the same two things, carried on the
@@ -314,7 +319,7 @@ Where each surface gets its prompt:
 | Console and rf sessions, webhooks, single-shot and unnamed scheduled runs | the standard sources |
 | Named agent (Console target, named cron or Xin job) | the standard sources with the agent's own identity in the `identity` slot instead of the main persona |
 | Task child, inline `delegate` child, worker-process child | the standard sources plus `delegated_role` |
-| Channels | the standard sources, then the channel sections appended by `src/channels/turn.rs` |
+| Channels | the standard sources, then the channel instructions and current conversation as one custom section (`channel_instructions`, built in `src/channels/prompt_context.rs`) |
 
 The system prompt hash recorded per request (`system_prompt_sha256`) is
 computed over the assembled prompt together with the request-local tool
