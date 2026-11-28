@@ -389,9 +389,9 @@ pub(crate) struct MockEnvProvider {
     /// 5a-6: when `OPENPRX_MOCK_TOOL_CALL=name:args_json` is set, the first streaming call
     /// emits a `ToolCallChunk`(name, args) and later calls return the `response` text.
     /// This lets PTY E2E verify the driver's full tool turn loop (call → execute → continue → final).
-    /// Non-streaming turns (channels, gateway) take the same call through `chat` once per provider
-    /// instance, whenever the tool is offered (test-mock builds); see
-    /// `OPENPRX_MOCK_TOOL_CALLS_FILE` for a per-turn sequence and `docs/providers.md`.
+    /// Non-streaming turns (channels, gateway) take this call through `chat` only when the tool is
+    /// offered and the latest user text names it; channel turns script calls with
+    /// `OPENPRX_MOCK_TOOL_CALLS_FILE` instead (see `docs/providers.md`).
     /// When `None`, the original 5a-2 behaviour is kept (return the response text directly).
     tool_call_spec: Option<MockToolCallSpec>,
     /// Streaming call counter; decides whether this call emits a tool_call or the final text.
@@ -785,27 +785,6 @@ impl MockEnvProvider {
     }
 }
 
-/// Whether the latest request addresses the single scripted call. A test-mock
-/// build lets any tool-carrying turn take it (channel turns never name the
-/// tool in the user text); other builds keep the name rule.
-#[cfg(any(test, feature = "test-mock"))]
-fn mock_request_addresses_script(offered_len: usize, messages: &[ChatMessage], name: &str) -> bool {
-    #[cfg(feature = "test-mock")]
-    {
-        let _ = (offered_len, messages, name);
-        true
-    }
-    #[cfg(not(feature = "test-mock"))]
-    {
-        offered_len == 1
-            || messages
-                .iter()
-                .rev()
-                .find(|message| message.role == "user")
-                .is_some_and(|message| message.content.contains(name))
-    }
-}
-
 #[cfg(any(test, feature = "test-mock"))]
 #[async_trait]
 impl Provider for MockEnvProvider {
@@ -849,7 +828,13 @@ impl Provider for MockEnvProvider {
         }
         if let (Some(spec), Some(offered)) = (self.tool_call_spec.as_ref(), request.tools)
             && offered.iter().any(|tool| tool.name == spec.name)
-            && mock_request_addresses_script(offered.len(), request.messages, spec.name.as_str())
+            && (offered.len() == 1
+                || request
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == "user")
+                    .is_some_and(|message| message.content.contains(spec.name.as_str())))
             && self
                 .native_tool_state
                 .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
