@@ -258,8 +258,13 @@ impl Tool for MemoryGetTool {
             MemoryReadMode::Observe
         };
         // The turn's memory view (a rich channel conversation), else this tool's own handle.
-        let memory = crate::memory::active_view::current().unwrap_or_else(|| Arc::clone(&self.memory));
-        match memory.get_with_context_mode(path, Some(&scope_ctx), mode).await? {
+        let view = crate::memory::active_view::current();
+        let base_read = view.is_none();
+        let memory = view.unwrap_or_else(|| Arc::clone(&self.memory));
+        let found = memory.get_with_context_mode(path, Some(&scope_ctx), mode).await?;
+        // A base-store read of a ramflux conversation row answers as a missing key.
+        let found = found.filter(|entry| !(base_read && crate::memory::is_ramflux_scoped_key(&entry.key)));
+        match found {
             Some(entry) => Ok(ToolResult {
                 success: true,
                 output: render_range(&entry.key, &entry.content, from, requested_lines),
@@ -746,5 +751,47 @@ mod tests {
             .unwrap();
         assert!(allowed.success);
         assert!(allowed.output.contains("router/elo/test"));
+    }
+
+    #[tokio::test]
+    async fn base_get_of_ramflux_row_answers_as_missing_key() {
+        let tmp = TempDir::new().unwrap();
+        let memory = SqliteMemory::new(tmp.path()).unwrap();
+        memory
+            .store("rf:ab12:cd34", "conversation text", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        memory.store("lang", "Rust", MemoryCategory::Core, None).await.unwrap();
+
+        for acl in [true, false] {
+            let tool = test_tool(&tmp, acl);
+            let scoped = tool.execute(json!({"key": "rf:ab12:cd34"})).await.unwrap();
+            let missing = tool.execute(json!({"key": "rf:zz99:yy88"})).await.unwrap();
+            assert_eq!(scoped.success, missing.success);
+            assert_eq!(scoped.error.is_some(), missing.error.is_some());
+            assert_eq!(
+                scoped.output.replace("rf:ab12:cd34", "K"),
+                missing.output.replace("rf:zz99:yy88", "K")
+            );
+            assert!(!scoped.output.contains("conversation text"));
+        }
+        let ok = test_tool(&tmp, true).execute(json!({"key": "lang"})).await.unwrap();
+        assert!(ok.output.contains("Rust"), "{}", ok.output);
+    }
+
+    #[tokio::test]
+    async fn view_get_keeps_its_own_rows() {
+        let tmp = TempDir::new().unwrap();
+        let view_dir = TempDir::new().unwrap();
+        let view: Arc<dyn Memory> = Arc::new(SqliteMemory::new(view_dir.path()).unwrap());
+        view.store("rf:ab12:cd34", "conversation text", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let tool = test_tool(&tmp, true);
+        let result = crate::memory::active_view::scope(view, tool.execute(json!({"key": "rf:ab12:cd34"})))
+            .await
+            .unwrap();
+        assert!(result.output.contains("conversation text"), "{}", result.output);
     }
 }

@@ -186,7 +186,9 @@ impl Tool for MemorySearchTool {
         };
         let terms = tokenize_query(trimmed_query);
         // The turn's memory view (a rich channel conversation), else this tool's own handle.
-        let memory = crate::memory::active_view::current().unwrap_or_else(|| Arc::clone(&self.memory));
+        let view = crate::memory::active_view::current();
+        let base_read = view.is_none();
+        let memory = view.unwrap_or_else(|| Arc::clone(&self.memory));
         let mut entries = memory
             .recall_with_context_mode(
                 trimmed_query,
@@ -196,6 +198,9 @@ impl Tool for MemorySearchTool {
                 mode,
             )
             .await?;
+        if base_read {
+            entries.retain(|entry| !crate::memory::is_ramflux_scoped_key(&entry.key));
+        }
         entries.retain(|entry| {
             let score = entry
                 .score
@@ -849,5 +854,45 @@ mod tests {
         assert!(!production.contains("Connection::open"));
         assert!(!production.contains("brain.db"));
         assert!(!production.contains("read_to_string"));
+    }
+
+    #[tokio::test]
+    async fn base_search_skips_ramflux_scoped_rows() {
+        let tmp = TempDir::new().unwrap();
+        let memory = SqliteMemory::new(tmp.path()).unwrap();
+        memory
+            .store("lang", "User prefers Rust", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        memory
+            .store(
+                "rf:ab12:cd34",
+                "{\"scope\":\"c1\",\"text\":\"Rust conversation\"}",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let tool = test_tool(&tmp, false);
+        let result = tool.execute(json!({"query": "Rust"})).await.unwrap();
+        assert!(result.output.contains("key: lang"), "{}", result.output);
+        assert!(!result.output.contains("rf:"), "{}", result.output);
+    }
+
+    #[tokio::test]
+    async fn view_search_keeps_its_own_rows() {
+        let tmp = TempDir::new().unwrap();
+        let view_dir = TempDir::new().unwrap();
+        let view: Arc<dyn Memory> = Arc::new(SqliteMemory::new(view_dir.path()).unwrap());
+        view.store("rf:ab12:cd34", "Rust conversation", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let tool = test_tool(&tmp, false);
+        let result = crate::memory::active_view::scope(view, tool.execute(json!({"query": "Rust"})))
+            .await
+            .unwrap();
+        assert!(result.output.contains("rf:ab12:cd34"), "{}", result.output);
     }
 }

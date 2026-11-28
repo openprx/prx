@@ -88,6 +88,15 @@ use uuid::Uuid;
 /// Key prefix shared by Ramflux scoped writers and snapshot exclusion.
 pub(crate) const RAMFLUX_MEMORY_KEY_PREFIX: &str = "rf:";
 
+/// True for a ramflux conversation-scoped row of the shared base store.
+///
+/// Surfaces that read the base store without a ramflux memory view drop these
+/// rows after the read; the view itself (`EncryptedScope`) reads them through
+/// its inner store and is not filtered.
+pub(crate) fn is_ramflux_scoped_key(key: &str) -> bool {
+    key.starts_with(RAMFLUX_MEMORY_KEY_PREFIX)
+}
+
 fn create_memory_with_builders<F, G>(
     backend_name: &str,
     workspace_dir: &Path,

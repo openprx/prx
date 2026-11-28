@@ -93,7 +93,9 @@ impl Tool for MemoryRecallTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let memory = crate::memory::active_view::current().unwrap_or_else(|| Arc::clone(&self.memory));
+        let view = crate::memory::active_view::current();
+        let base_read = view.is_none();
+        let memory = view.unwrap_or_else(|| Arc::clone(&self.memory));
         let query = args
             .get("query")
             .and_then(|v| v.as_str())
@@ -164,6 +166,14 @@ impl Tool for MemoryRecallTool {
         } else {
             memory.recall(query, limit, session_id).await
         };
+
+        // Without a ramflux view this is a base-store read: conversation-scoped rows stay out.
+        let recall_result = recall_result.map(|mut entries| {
+            if base_read {
+                entries.retain(|entry| !crate::memory::is_ramflux_scoped_key(&entry.key));
+            }
+            entries
+        });
 
         match recall_result {
             Ok(entries) if entries.is_empty() => Ok(ToolResult {
@@ -343,5 +353,42 @@ mod tests {
                 .as_deref()
                 .is_some_and(|msg| msg.contains("session_id=\"self_system\""))
         );
+    }
+
+    #[tokio::test]
+    async fn base_recall_skips_ramflux_scoped_rows() {
+        let (_tmp, mem) = seeded_mem();
+        mem.store("lang", "User prefers Rust", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store(
+            "rf:ab12:cd34",
+            "{\"scope\":\"c1\",\"text\":\"Rust secret\"}",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let tool = MemoryRecallTool::new(Arc::clone(&mem), false);
+        let result = tool.execute(json!({"query": "Rust"})).await.unwrap();
+        assert!(result.output.contains("Found 1"), "{}", result.output);
+        assert!(result.output.contains("key: lang"));
+        assert!(!result.output.contains("rf:"));
+    }
+
+    #[tokio::test]
+    async fn view_recall_keeps_its_own_rows() {
+        let (_tmp, base) = seeded_mem();
+        let (_tmp_view, view) = seeded_mem();
+        view.store("rf:ab12:cd34", "Rust in the conversation", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let tool = MemoryRecallTool::new(base, false);
+        let result = crate::memory::active_view::scope(view, tool.execute(json!({"query": "Rust"})))
+            .await
+            .unwrap();
+        assert!(result.output.contains("rf:ab12:cd34"), "{}", result.output);
     }
 }
