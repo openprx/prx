@@ -46,19 +46,28 @@ fn close_pending_slot(tx: &Connection, stream: &mut stream::Stream, seq: u64, no
     Ok(true)
 }
 
+/// What one pending-erase pass did. `unreadable` counts rows that were kept because
+/// their receipt, stream or envelope metadata does not decode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(in crate::memory::sqlite) struct PendingEraseCounts {
+    pub receipts: usize,
+    pub outboxes: usize,
+    pub skipped_full: usize,
+    pub unreadable: usize,
+}
+
 /// Erase what the runs in `runs_json` (a JSON array of run ids) sent that is not
 /// yet adopted: receipts in state 0/1 by `sender_run_id` (receiver body, receipt
 /// mark, the sender's outbox body of the same message on the same stream), then the
 /// outbox rows by `sender_run_id` whose body is still present. Rows that do not
-/// load are skipped. Returns (receipts erased, outbox rows erased, slots skipped
-/// because the hole table was full).
+/// load are kept and counted in `unreadable`; the pass logs them at `warn`.
 pub(in crate::memory::sqlite) fn erase_pending_from_runs(
     tx: &Connection,
     workspace_id: &str,
     owner_id: &str,
     runs_json: &str,
     now: i64,
-) -> anyhow::Result<(usize, usize, usize)> {
+) -> anyhow::Result<PendingEraseCounts> {
     let (mut receipts, mut outboxes, mut full, mut unreadable) = (0usize, 0usize, 0usize, 0usize);
     let mut skipped: Vec<(i64, Vec<u8>)> = Vec::new();
     let ids = {
@@ -109,6 +118,8 @@ pub(in crate::memory::sqlite) fn erase_pending_from_runs(
         )? {
             if decode::<OutboxMeta>(&json).is_ok() {
                 erase_outbox_body(tx, outbox_id, &json, state, now)?;
+            } else {
+                unreadable += 1;
             }
         }
         receipts += 1;
@@ -132,7 +143,11 @@ pub(in crate::memory::sqlite) fn erase_pending_from_runs(
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
     for (id, json, state, stream_id, seq) in rows {
-        if skipped.iter().any(|(s, q)| *s == stream_id && *q == seq) || decode::<OutboxMeta>(&json).is_err() {
+        if skipped.iter().any(|(s, q)| *s == stream_id && *q == seq) {
+            continue;
+        }
+        if decode::<OutboxMeta>(&json).is_err() {
+            unreadable += 1;
             continue;
         }
         if state < 2 {
@@ -161,13 +176,11 @@ pub(in crate::memory::sqlite) fn erase_pending_from_runs(
         erase_outbox_body(tx, id, &json, state, now)?;
         outboxes += 1;
     }
-    if receipts + outboxes + unreadable > 0 {
-        tracing::info!(
-            receipts,
-            outboxes,
-            unreadable,
-            "pending mailbox messages of erased runs erased"
-        );
+    if receipts + outboxes > 0 {
+        tracing::info!(receipts, outboxes, "pending mailbox messages of erased runs erased");
+    }
+    if unreadable > 0 {
+        tracing::warn!(unreadable, "pending mailbox rows kept: metadata does not decode");
     }
     if full > 0 {
         tracing::warn!(
@@ -175,7 +188,12 @@ pub(in crate::memory::sqlite) fn erase_pending_from_runs(
             "pending mailbox messages kept: stream hole table full"
         );
     }
-    Ok((receipts, outboxes, full))
+    Ok(PendingEraseCounts {
+        receipts,
+        outboxes,
+        skipped_full: full,
+        unreadable,
+    })
 }
 
 fn outbox_rows(tx: &Connection, sql: &str, params: impl rusqlite::Params) -> anyhow::Result<Vec<(i64, String, i64)>> {

@@ -23,6 +23,7 @@ fn erase_runs(f: &Fixture, runs: &[&str]) -> (usize, usize, usize) {
     let json = serde_json::to_string(runs).expect("test: erase_runs: encode run list");
     let writer = f.memory.pool.write();
     crate::memory::sqlite::mailbox::erase_pending_from_runs(&writer, W, O, &json, f.clock.now())
+        .map(|c| (c.receipts, c.outboxes, c.skipped_full))
         .expect("test: erase_runs: erase succeeds")
 }
 
