@@ -80,6 +80,9 @@
 //!   document-size entry, and an external-content row without one fails the
 //!   integrity check. The drain therefore indexes the row's current (empty)
 //!   content again after the `delete`; for a deleted row that inserts nothing.
+//! - FTS auxiliary functions that read row content (`highlight`, `snippet`)
+//!   must not be used on this index: they fail on a row that is deleted but
+//!   still queued. Search reads content through the join with `message_events`.
 //! - The triggers are four: insert, delete, blank, and non-empty rewrite. A
 //!   table rebuild migration must recreate all of them.
 //!
