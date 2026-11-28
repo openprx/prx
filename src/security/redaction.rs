@@ -35,7 +35,8 @@
 //!   and `abc`, respectively, even when they are not credentials;
 //! - the credential after any `Authorization:` / `Proxy-Authorization:`
 //!   scheme (`Bearer`, `Basic`, `Bot`, `SSWS`, `ApiKey`, `AWS4-HMAC-SHA256`,
-//!   ...) and after a bare `Bearer`, at any length;
+//!   ...) and after a bare `Bearer`, at any length, also when the credential
+//!   is single- or double-quoted (`Bearer 'abc'` -> `Bearer '[REDACTED]'`);
 //! - keyless token formats, each with its minimum length (`sk-learn`, a
 //!   5-character body, is not a key): `sk-`, `sk-proj-`, `sk-ant-`, `xoxb-`,
 //!   `xoxp-`, `ghp_`, `gho_`, `ghu_`, `github_pat_`, `glpat-`, Stripe
@@ -70,13 +71,16 @@ static KEYED_PAIR: LazyLock<Option<Regex>> =
 
 /// The credential after an `Authorization:` / `Proxy-Authorization:` scheme
 /// word, whatever the scheme: capture 1, up to the end of the header value.
+/// One opening quote before the credential is skipped, so capture 1 is the
+/// quoted credential alone and its quotes stay visible.
 static AUTHORIZATION_HEADER: LazyLock<Option<Regex>> = LazyLock::new(|| {
-    Regex::new(r#"(?i)(?:proxy-)?authorization["']?\s*[:=]\s*["']?[A-Za-z][A-Za-z0-9_-]*[ \t]+([^\r\n"']+)"#).ok()
+    Regex::new(r#"(?i)(?:proxy-)?authorization["']?\s*[:=]\s*["']?[A-Za-z][A-Za-z0-9_-]*[ \t]+["']?([^\r\n"']+)"#).ok()
 });
 
-/// The token after a bare `Bearer`, at any length: capture 1.
+/// The token after a bare `Bearer`, at any length: capture 1, after one
+/// optional opening quote (`bearer "abc"` masks `abc`).
 static BARE_BEARER: LazyLock<Option<Regex>> =
-    LazyLock::new(|| Regex::new(r#"(?i)(?:^|[^a-z0-9])bearer\s+([^\s"',;]+)"#).ok());
+    LazyLock::new(|| Regex::new(r#"(?i)(?:^|[^a-z0-9])bearer\s+["']?([^\s"',;]+)"#).ok());
 
 /// Keyless token formats with a fixed shape: the whole match is the secret.
 static KEYLESS_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
