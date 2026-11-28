@@ -213,6 +213,12 @@ key lives only in process memory. `agent_offline` and shutdown zeroize it;
 the next `bridge.hello` unwraps it again. The wrapped key stays on disk until account removal. Associated data is the account id
 and the conversation id, so ciphertext cannot be moved between conversations.
 
+A message row is sealed under a record id that is bound into the seal: its
+idempotency key, or `event:{event_id}` for a row without one, so ciphertext
+cannot be moved from one row to another. Rows written before this form (sealed
+under the constant `event`) stay readable through one fallback attempt; there
+is no migration.
+
 The memory access audit log (`access_audit_log`) holds no clear memory key or
 query text of this channel: a view read writes no audit row, and a base-store
 access of an `rf:` scoped key is logged under the SHA-256 hex of the key, with
