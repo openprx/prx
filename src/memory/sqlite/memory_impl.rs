@@ -570,6 +570,10 @@ impl Memory for SqliteMemory {
         self.forget_with_context_impl(key, context).await
     }
 
+    async fn forget_in_partition(&self, key: &str, context: &MemoryWriteContext) -> anyhow::Result<bool> {
+        self.forget_in_partition_impl(key, context).await
+    }
+
     async fn move_to_trash(&self, key: &str, reason: &str, grace_days: u32) -> anyhow::Result<Option<String>> {
         self.move_to_trash_impl(key, reason, grace_days).await
     }

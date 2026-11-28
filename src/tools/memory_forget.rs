@@ -13,11 +13,25 @@ use std::sync::Arc;
 pub struct MemoryForgetTool {
     memory: Arc<dyn Memory>,
     security: Arc<SecurityPolicy>,
+    acl_enabled: bool,
 }
 
 impl MemoryForgetTool {
     pub fn new(memory: Arc<dyn Memory>, security: Arc<SecurityPolicy>) -> Self {
-        Self { memory, security }
+        Self {
+            memory,
+            security,
+            acl_enabled: true,
+        }
+    }
+
+    /// Follow the read mode of `memory_recall`: with `memory.acl_enabled` off,
+    /// an in-process caller that is not owner-isolated deletes a key inside
+    /// its partition with no visibility predicate.
+    #[must_use]
+    pub fn with_acl(mut self, acl_enabled: bool) -> Self {
+        self.acl_enabled = acl_enabled;
+        self
     }
 }
 
@@ -161,6 +175,7 @@ impl Tool for MemoryForgetTool {
         // MA-01h: a partitioned caller can delete only a row of its own partition.
         let partition = crate::tools::execution::trusted_scope_read_partition(&args)?;
         let mut scope_ctx = parse_scope_ctx(&args);
+        let in_partition = !isolated && !self.acl_enabled && partition.is_some();
         if isolated || partition.is_some() {
             let mut context = scope_ctx.unwrap_or_default();
             context.require_owner_match = isolated;
@@ -169,6 +184,8 @@ impl Tool for MemoryForgetTool {
         }
         let removed = if base_read && crate::memory::is_ramflux_scoped_key(key) {
             Ok(false)
+        } else if let (true, Some(context)) = (in_partition, scope_ctx.as_ref()) {
+            memory.forget_in_partition(key, context).await
         } else {
             memory.forget_with_context(key, scope_ctx.as_ref()).await
         };

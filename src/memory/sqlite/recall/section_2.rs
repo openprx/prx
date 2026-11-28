@@ -1000,34 +1000,67 @@ impl SqliteMemory {
                 return Ok(false);
             };
 
-            // One transaction: the prefix rows, the memory, the tool results that
-            // quoted it and the access log entry go together or not at all.
-            let tx = begin_immediate(&conn)?;
-            let probes = crate::memory::sqlite::derived_sweep::memory_probes(
-                &tx,
-                "SELECT workspace_id, owner_id, key, created_at FROM memories WHERE id = ?1",
-                params![memory_id],
-            )?;
-            crate::memory::sqlite::rf_forget::drop_prefix_rows_of(
-                &tx,
-                "SELECT DISTINCT workspace_id, owner_id FROM memories WHERE id = ?1",
-                params![memory_id],
-            )?;
-            let affected = tx.execute("DELETE FROM memories WHERE id = ?1", params![memory_id])?;
-            crate::memory::sqlite::derived_sweep::rewrite_memory_copies(
-                &tx,
-                &probes,
-                &chrono::Utc::now().to_rfc3339(),
-            )?;
-            // A scoped Ramflux row forgotten outside its view is audited like a
-            // missing key, so the log is not an existence oracle for it.
-            if key.starts_with(crate::memory::RAMFLUX_MEMORY_KEY_PREFIX) {
-                log_access(&tx, &principal, "forget", Some(&key), None, None, "denied");
-            } else {
-                log_access(&tx, &principal, "forget", Some(&key), Some(&memory_id), None, "allowed");
-            }
-            tx.commit()?;
-            Ok(affected > 0)
+            Self::forget_row(&conn, &principal, &key, &memory_id)
+        })
+        .await?
+    }
+
+    /// The delete half shared by the scoped and the in-partition forget: one
+    /// transaction takes the prefix rows, the memory, the tool results that
+    /// quoted it and the access log entry together or not at all.
+    fn forget_row(conn: &Connection, principal: &Principal, key: &str, memory_id: &str) -> anyhow::Result<bool> {
+        let tx = begin_immediate(conn)?;
+        let probes = crate::memory::sqlite::derived_sweep::memory_probes(
+            &tx,
+            "SELECT workspace_id, owner_id, key, created_at FROM memories WHERE id = ?1",
+            params![memory_id],
+        )?;
+        crate::memory::sqlite::rf_forget::drop_prefix_rows_of(
+            &tx,
+            "SELECT DISTINCT workspace_id, owner_id FROM memories WHERE id = ?1",
+            params![memory_id],
+        )?;
+        let affected = tx.execute("DELETE FROM memories WHERE id = ?1", params![memory_id])?;
+        crate::memory::sqlite::derived_sweep::rewrite_memory_copies(&tx, &probes, &chrono::Utc::now().to_rfc3339())?;
+        // A scoped Ramflux row forgotten outside its view is audited like a
+        // missing key, so the log is not an existence oracle for it.
+        if key.starts_with(crate::memory::RAMFLUX_MEMORY_KEY_PREFIX) {
+            log_access(&tx, principal, "forget", Some(key), None, None, "denied");
+        } else {
+            log_access(&tx, principal, "forget", Some(key), Some(memory_id), None, "allowed");
+        }
+        tx.commit()?;
+        Ok(affected > 0)
+    }
+
+    /// The ACL-off delete of an in-process caller: the key inside the
+    /// caller's partition, without the visibility predicate (the delete half of
+    /// `MemoryReadMode::Observe`).
+    pub(super) async fn forget_in_partition_impl(
+        &self,
+        key: &str,
+        context: &MemoryWriteContext,
+    ) -> anyhow::Result<bool> {
+        let pool = self.pool.clone();
+        let key = key.to_string();
+        let context = context.clone();
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<bool> {
+            let conn = pool.write();
+            let principal = sqlite_read_principal(&conn, &context);
+            let (partition_sql, partition_params) =
+                memory_partition_conjunct(super::events::MA_SCOPE_COLUMN, context.agent_partition.as_ref());
+            let mut query_params = Vec::with_capacity(partition_params.len() + 1);
+            query_params.push(Value::from(key.clone()));
+            query_params.extend(partition_params);
+            let query = format!("SELECT id FROM memories WHERE key = ?1{partition_sql} LIMIT 1");
+            let memory_id = conn
+                .query_row(&query, params_from_iter(query_params), |row| row.get::<_, String>(0))
+                .optional()?;
+            let Some(memory_id) = memory_id else {
+                log_access(&conn, &principal, "forget", Some(&key), None, None, "denied");
+                return Ok(false);
+            };
+            Self::forget_row(&conn, &principal, &key, &memory_id)
         })
         .await?
     }

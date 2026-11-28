@@ -374,7 +374,8 @@ pub(super) async fn forget(
     let tool = MemoryForgetTool::new(
         Arc::clone(&state.mem),
         crate::runtime::bootstrap::build_security_policy(&config),
-    );
+    )
+    .with_acl(config.memory.acl_enabled);
     let outcome = super::operations_tools::execute_operation(
         &config,
         &principal,

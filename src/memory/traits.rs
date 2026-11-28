@@ -547,6 +547,14 @@ pub trait Memory: Send + Sync {
         self.forget(key).await
     }
 
+    /// The ACL-off delete of an in-process caller: the key inside
+    /// `context.agent_partition`, without the visibility predicate, the delete
+    /// half of `MemoryReadMode::Observe`. Default: `forget_with_context(key,
+    /// Some(context))`.
+    async fn forget_in_partition(&self, key: &str, context: &MemoryWriteContext) -> anyhow::Result<bool> {
+        self.forget_with_context(key, Some(context)).await
+    }
+
     /// Increment the usefulness feedback counter for a recalled memory entry.
     ///
     /// Backends that do not persist `useful_count` can safely no-op.

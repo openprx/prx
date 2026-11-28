@@ -582,7 +582,9 @@ pub fn all_tools_with_runtime_ext_and_extensions(
     {
         tool_arcs.push(Arc::new(ChatProfileUpdateTool::new(memory.clone(), security.clone())));
         tool_arcs.push(Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())));
-        tool_arcs.push(Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())));
+        tool_arcs.push(Arc::new(
+            MemoryForgetTool::new(memory.clone(), security.clone()).with_acl(config.memory.acl_enabled),
+        ));
         tool_arcs.push(Arc::new(MemorySearchTool::new(
             workspace_dir.to_path_buf(),
             memory.clone(),
