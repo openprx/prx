@@ -38,6 +38,7 @@ mod providers;
 mod runtime;
 mod sessions;
 pub(super) use sessions::recover_startup as recover_mailbox_wakes;
+pub(super) use sessions::settle_pending_at_startup as settle_pending_rf_deletes;
 #[cfg(test)]
 pub(in crate::gateway) use sessions::post_session_message;
 #[cfg(test)]

@@ -354,6 +354,21 @@ async fn sweep_workspace_once(state: &AppState, workspace_id: &str) {
     }
 }
 
+/// Settle every pending rf delete of the workspace when the gateway starts,
+/// before any request and before woken runs are recovered (nothing of an
+/// earlier process is live). A failure is logged by the sweep and the gateway
+/// starts; the next rf request retries it.
+pub(in crate::gateway) async fn settle_pending_at_startup(state: &AppState) {
+    let workspace_id = state
+        .config
+        .pin()
+        .effective
+        .workspace_dir
+        .to_string_lossy()
+        .into_owned();
+    sweep_workspace_once(state, &workspace_id).await;
+}
+
 /// Start the session's settle waiter unless it has one. It subscribes to the
 /// run-end signal, settles, and on each signal settles again; it ends when
 /// the session has nothing pending.
