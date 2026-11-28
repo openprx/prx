@@ -226,6 +226,8 @@ impl SqliteMemory {
                 &chrono::Utc::now().to_rfc3339(),
             )?;
             tx.commit()?;
+            drop(conn);
+            crate::memory::sqlite::transcript_index::drain_after_commit(&pool);
             Ok(affected)
         })
         .await?
@@ -651,6 +653,8 @@ impl SqliteMemory {
                     super::write_log::record_memory_upsert(&tx, provenance, &key, existed)?;
                 }
                 tx.commit()?;
+                drop(conn);
+                crate::memory::sqlite::transcript_index::drain_after_commit(&pool);
                 Ok(WriteOutcome::Done)
             })
             .await??;

@@ -1000,7 +1000,10 @@ impl SqliteMemory {
                 return Ok(false);
             };
 
-            Self::forget_row(&conn, &principal, &key, &memory_id)
+            let forgotten = Self::forget_row(&conn, &principal, &key, &memory_id)?;
+            drop(conn);
+            crate::memory::sqlite::transcript_index::drain_after_commit(&pool);
+            Ok(forgotten)
         })
         .await?
     }
@@ -1060,7 +1063,10 @@ impl SqliteMemory {
                 log_access(&conn, &principal, "forget", Some(&key), None, None, "denied");
                 return Ok(false);
             };
-            Self::forget_row(&conn, &principal, &key, &memory_id)
+            let forgotten = Self::forget_row(&conn, &principal, &key, &memory_id)?;
+            drop(conn);
+            crate::memory::sqlite::transcript_index::drain_after_commit(&pool);
+            Ok(forgotten)
         })
         .await?
     }
