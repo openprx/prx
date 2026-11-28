@@ -163,6 +163,13 @@ pub(super) fn append(conn: &Connection, h: &Header) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Recursive run-family CTE (`?1` run, `?2` workspace, `?3` owner). The
+/// `CROSS JOIN` keeps the recursive table as the outer loop and the unary `+`
+/// keeps the `IS NOT NULL` term from choosing an index, so every step is a
+/// `(workspace_id, run_id)` index search. Planner hints only; the rows are the
+/// same as with a plain join.
+const FAMILY_CTE: &str = "WITH RECURSIVE family(run) AS (SELECT ?1 UNION SELECT e.parent_run_id FROM family f CROSS JOIN message_events e ON e.run_id=f.run WHERE e.workspace_id=?2 AND e.owner_id=?3 AND +e.parent_run_id IS NOT NULL)";
+
 /// Resolve descendants through durable ancestry to the rf admission, whose
 /// partition is the root's purge stamp. Never relabel from current config.
 pub(super) fn event_header(conn: &Connection, id: &str, kind: &str) -> anyhow::Result<Option<Header>> {
@@ -176,20 +183,20 @@ pub(super) fn event_header(conn: &Connection, id: &str, kind: &str) -> anyhow::R
     let provenance_root:Option<String>=conn.query_row("SELECT root_run_id FROM memory_write_log WHERE run_id=?1 AND agent_partition IN(SELECT scope_id FROM agent_scopes WHERE workspace_id=?2 AND owner_id=?3) ORDER BY id LIMIT 1",params![run,workspace,owner],|r|r.get(0)).optional()?;
     let root_run = provenance_root.as_deref().or(parent.as_deref()).or(run.as_deref());
     let root:Option<(String,String,String,Option<String>,Option<String>)>=conn.query_row(
-        "WITH RECURSIVE family(run) AS (SELECT ?1 UNION SELECT e.parent_run_id FROM message_events e JOIN family f ON e.run_id=f.run WHERE e.workspace_id=?2 AND e.owner_id=?3 AND e.parent_run_id IS NOT NULL)
-        SELECT a.session_key,a.agent_key,s.incarnation,a.run_id,s.session_key FROM rf_message_attempts a JOIN agent_scopes s ON s.scope_id=a.ma_scope_id WHERE a.workspace_id=?2 AND a.owner_id=?3 AND (a.run_id IN(SELECT run FROM family) OR a.message_event_id=?4) LIMIT 1",
+        &format!("{FAMILY_CTE}
+        SELECT a.session_key,a.agent_key,s.incarnation,a.run_id,s.session_key FROM rf_message_attempts a JOIN agent_scopes s ON s.scope_id=a.ma_scope_id WHERE a.workspace_id=?2 AND a.owner_id=?3 AND (a.run_id IN(SELECT run FROM family) OR a.message_event_id=?4) LIMIT 1"),
         params![root_run,workspace,owner,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
     let root = if root.is_some() {
         root
     } else {
-        conn.query_row("WITH RECURSIVE family(run) AS (SELECT ?1 UNION SELECT e.parent_run_id FROM message_events e JOIN family f ON e.run_id=f.run WHERE e.workspace_id=?2 AND e.owner_id=?3 AND e.parent_run_id IS NOT NULL) SELECT e.session_key,s.agent_key,s.incarnation,e.run_id,s.session_key FROM message_events e JOIN agent_scopes s ON s.scope_id=e.ma_scope_id WHERE e.workspace_id=?2 AND e.owner_id=?3 AND s.agent_key GLOB 'n:*' AND e.source IN ('cron','xin') AND e.parent_run_id IS NULL AND e.run_id IN(SELECT run FROM family) LIMIT 1", params![root_run, workspace, owner], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).optional()?
+        conn.query_row(&format!("{FAMILY_CTE} SELECT e.session_key,s.agent_key,s.incarnation,e.run_id,s.session_key FROM message_events e JOIN agent_scopes s ON s.scope_id=e.ma_scope_id WHERE e.workspace_id=?2 AND e.owner_id=?3 AND s.agent_key GLOB 'n:*' AND e.source IN ('cron','xin') AND +e.parent_run_id IS NULL AND e.run_id IN(SELECT run FROM family) LIMIT 1"), params![root_run, workspace, owner], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).optional()?
     };
     // A message-woken run is its own root in the receiver session: a top-level
     // run whose continuation input names the adoption row of its message.
     let root = if root.is_some() {
         root
     } else {
-        conn.query_row(&format!("WITH RECURSIVE family(run) AS (SELECT ?1 UNION SELECT e.parent_run_id FROM message_events e JOIN family f ON e.run_id=f.run WHERE e.workspace_id=?2 AND e.owner_id=?3 AND e.parent_run_id IS NOT NULL) SELECT e.session_key,CASE WHEN s.agent_key='m' THEN 'main' ELSE s.agent_key END,s.incarnation,e.run_id,s.session_key FROM message_events e JOIN agent_scopes s ON s.scope_id=e.ma_scope_id WHERE e.workspace_id=?2 AND e.owner_id=?3 AND e.parent_run_id IS NULL AND e.run_id IN(SELECT run FROM family) AND {} LIMIT 1", super::mailbox_continuation::CONTINUATION_PREDICATE_E), params![root_run, workspace, owner], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).optional()?
+        conn.query_row(&format!("{FAMILY_CTE} SELECT e.session_key,CASE WHEN s.agent_key='m' THEN 'main' ELSE s.agent_key END,s.incarnation,e.run_id,s.session_key FROM message_events e JOIN agent_scopes s ON s.scope_id=e.ma_scope_id WHERE e.workspace_id=?2 AND e.owner_id=?3 AND +e.parent_run_id IS NULL AND e.run_id IN(SELECT run FROM family) AND {CONTINUATION} LIMIT 1", CONTINUATION = super::mailbox_continuation::CONTINUATION_PREDICATE_E), params![root_run, workspace, owner], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).optional()?
     };
     let Some((root_session, agent, incarnation, root_id, _)) = root else {
         return Ok(None);

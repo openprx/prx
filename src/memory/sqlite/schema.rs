@@ -1165,6 +1165,13 @@ impl SqliteMemory {
              CREATE INDEX IF NOT EXISTS idx_mem_source_event ON memories(source_event_id);
              CREATE INDEX IF NOT EXISTS idx_message_events_owner
                  ON message_events(workspace_id, owner_id, id);
+             -- The two run-family indexes repeat `message_retention::INDEXES` on
+             -- purpose (same names, same text, so neither pass makes a copy); keep
+             -- both texts identical.
+             CREATE INDEX IF NOT EXISTS idx_message_events_retention_run
+                 ON message_events(workspace_id, run_id) WHERE run_id IS NOT NULL;
+             CREATE INDEX IF NOT EXISTS idx_message_events_retention_parent
+                 ON message_events(workspace_id, parent_run_id) WHERE parent_run_id IS NOT NULL;
              CREATE INDEX IF NOT EXISTS idx_sessions_owner
                  ON sessions(owner_id);
              CREATE INDEX IF NOT EXISTS idx_conversation_turns_owner_session

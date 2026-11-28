@@ -144,8 +144,8 @@ pub(super) fn begin_history(memory: &SqliteMemory, request: &HistoryErase) -> an
         let mut query = tx.prepare(
             "WITH RECURSIVE family(run) AS (
             SELECT run_id FROM message_events WHERE ma_scope_id=?1 AND run_id IS NOT NULL
-            UNION SELECT e.run_id FROM message_events e JOIN family f ON e.parent_run_id=f.run
-            WHERE e.workspace_id=?2 AND e.owner_id=?3 AND e.run_id IS NOT NULL)
+            UNION SELECT e.run_id FROM family f CROSS JOIN message_events e ON e.parent_run_id=f.run
+            WHERE e.workspace_id=?2 AND e.owner_id=?3 AND +e.run_id IS NOT NULL)
             SELECT DISTINCT run FROM family ORDER BY run",
         )?;
         query
@@ -506,8 +506,8 @@ pub(super) fn finish_history(memory: &SqliteMemory, work: &EraseWork) -> anyhow:
         let tx = begin_immediate(&writer)?;
         let runs = serde_json::to_string(&work.runs)?;
         let mut query=tx.prepare("WITH RECURSIVE family(run) AS (
-            SELECT value FROM json_each(?1) UNION SELECT e.run_id FROM message_events e JOIN family f ON e.parent_run_id=f.run
-            WHERE e.workspace_id=?2 AND e.owner_id=?3 AND e.run_id IS NOT NULL)
+            SELECT value FROM json_each(?1) UNION SELECT e.run_id FROM family f CROSS JOIN message_events e ON e.parent_run_id=f.run
+            WHERE e.workspace_id=?2 AND e.owner_id=?3 AND +e.run_id IS NOT NULL)
             SELECT DISTINCT e.ma_scope_id FROM message_events e JOIN family f ON f.run=e.run_id
             JOIN agent_scopes a ON a.scope_id=e.ma_scope_id
             WHERE a.workspace_id=?2 AND a.owner_id=?3 AND a.agent_key=?4 AND a.incarnation=?5")?;

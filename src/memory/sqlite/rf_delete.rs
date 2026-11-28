@@ -481,8 +481,8 @@ pub(super) fn run_family_deleted(conn: &Connection, workspace_id: &str, run_id: 
         "WITH RECURSIVE lineage(run) AS (
              SELECT ?1
              UNION
-             SELECT e.parent_run_id FROM message_events e JOIN lineage l ON e.run_id = l.run
-             WHERE e.workspace_id = ?2 AND e.parent_run_id IS NOT NULL)
+             SELECT e.parent_run_id FROM lineage l CROSS JOIN message_events e ON e.run_id = l.run
+             WHERE e.workspace_id = ?2 AND +e.parent_run_id IS NOT NULL)
          SELECT EXISTS(SELECT 1 FROM rf_message_attempts a
              WHERE a.workspace_id = ?2 AND a.run_id IN (SELECT run FROM lineage)
                AND (a.deleted_at IS NOT NULL OR a.reply_deleted_at IS NOT NULL
@@ -533,8 +533,8 @@ fn descendant_runs(tx: &Connection, workspace_id: &str, owner_id: &str, run_id: 
         "WITH RECURSIVE family(run) AS (
              SELECT ?3
              UNION
-             SELECT e.run_id FROM message_events e JOIN family f ON e.parent_run_id = f.run
-             WHERE e.workspace_id = ?1 AND e.owner_id = ?2 AND e.run_id IS NOT NULL)
+             SELECT e.run_id FROM family f CROSS JOIN message_events e ON e.parent_run_id = f.run
+             WHERE e.workspace_id = ?1 AND e.owner_id = ?2 AND +e.run_id IS NOT NULL)
          SELECT run FROM family WHERE run <> ?3",
     )?;
     Ok(statement
