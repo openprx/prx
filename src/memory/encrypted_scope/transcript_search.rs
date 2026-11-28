@@ -8,6 +8,7 @@ use crate::memory::SessionContextQuery;
 use crate::memory::traits::{MemoryPrincipal, TranscriptHit};
 use crate::security::redaction::redact_secrets;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 /// Rows read from the store by one search, at most. A cost bound.
 const SCAN_MAX_ROWS: usize = 2_000;
@@ -19,6 +20,16 @@ const WHOLE_ROW_MAX_CHARS: usize = 65_536;
 const REGION_SIDE_CHARS: usize = 4_096;
 
 impl EncryptedScope {
+    /// A handle on the same store, keys and scope that a blocking task can own.
+    fn opener(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            crypto: Arc::clone(&self.crypto),
+            account_id: self.account_id.clone(),
+            scope: self.scope.clone(),
+        }
+    }
+
     /// Search the principal's session for rows that contain every word of
     /// `query`, newest first, at most `limit` hits. Only rows this scope can
     /// open are searched. `session_key`, when given, replaces the principal's
@@ -74,36 +85,65 @@ impl EncryptedScope {
             // are left out here too.
             let row_ids: Vec<i64> = page.iter().map(|event| event.id).collect();
             let excluded = self.inner.excluded_transcript_rows(&row_ids).await?;
-            for event in page {
-                if hits.len() >= limit {
-                    break;
-                }
-                if event.event_type != "message.created"
-                    || !matches!(event.role.as_str(), "user" | "assistant")
-                    || excluded.contains(&event.id)
-                    || !self.owns_event(&event)
-                {
-                    continue;
-                }
-                let event = self.reveal(event);
-                // Redact the whole row first: a query matches the redacted text
-                // only, so it cannot probe inside a secret.
-                let redacted = redact_secrets(&event.content);
-                let lowered = redacted.to_ascii_lowercase();
-                if !folded_words.iter().all(|word| lowered.contains(word.as_str())) {
-                    continue;
-                }
-                hits.push(TranscriptHit {
-                    session_key: event.session_key,
-                    event_id: event.event_id,
-                    role: event.role,
-                    created_at: event.created_at,
-                    excerpt: cut_excerpt(&redacted, anchor),
-                });
-            }
+            // Decrypt, redact and match off the async executor. Each row is
+            // opened once and only the fields a hit prints are kept; the
+            // payload columns are neither opened nor returned.
+            let opener = self.opener();
+            let folded = folded_words.clone();
+            let anchor_owned = anchor.to_owned();
+            let room = limit - hits.len();
+            let page_hits = crate::runtime::blocking::spawn_blocking(move || {
+                match_page(&opener, page, &excluded, &folded, &anchor_owned, room)
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("sealed transcript scan task failed: {error}"))?;
+            hits.extend(page_hits);
         }
         Ok(hits)
     }
+}
+
+/// The hits of one page, newest first, at most `room`. A row this scope cannot
+/// open (another scope, or damaged) is skipped and the scan goes on.
+fn match_page(
+    opener: &EncryptedScope,
+    page: Vec<crate::memory::MessageEvent>,
+    excluded: &HashSet<i64>,
+    folded_words: &[String],
+    anchor: &str,
+    room: usize,
+) -> Vec<TranscriptHit> {
+    let mut hits = Vec::new();
+    for event in page {
+        if hits.len() >= room {
+            break;
+        }
+        if event.event_type != "message.created"
+            || !matches!(event.role.as_str(), "user" | "assistant")
+            || excluded.contains(&event.id)
+        {
+            continue;
+        }
+        let record_id = event.idempotency_key.as_deref().unwrap_or("event");
+        let Some(plain) = opener.open_record(record_id, &event.content) else {
+            continue;
+        };
+        // Redact the whole row first: a query matches the redacted text
+        // only, so it cannot probe inside a secret.
+        let redacted = redact_secrets(&plain);
+        let lowered = redacted.to_ascii_lowercase();
+        if !folded_words.iter().all(|word| lowered.contains(word.as_str())) {
+            continue;
+        }
+        hits.push(TranscriptHit {
+            session_key: event.session_key,
+            event_id: event.event_id,
+            role: event.role,
+            created_at: event.created_at,
+            excerpt: cut_excerpt(&redacted, anchor),
+        });
+    }
+    hits
 }
 
 /// The query's whitespace-separated words, each once, in order; words are
