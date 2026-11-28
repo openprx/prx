@@ -86,6 +86,11 @@
 //! - The triggers are four: insert, delete, blank, and non-empty rewrite. A
 //!   table rebuild migration must recreate all of them.
 //!
+//! A non-erasure write that queued rows drains the whole queue, including rows
+//! queued by others; rows it leaves behind when its drain fails are drained by
+//! the next scrub, the next such write, or the next start. A write that queued
+//! nothing does not drain.
+//!
 //! `INSERT OR REPLACE` on `message_events` would delete the old row without
 //! firing the delete trigger and so corrupt the index: never use it there.
 //!
@@ -595,6 +600,12 @@ pub(super) fn drain_fts_purge(pool: &MemoryPool) -> anyhow::Result<u64> {
 /// Drain after a writer outside the erasure paths committed its row deletes:
 /// no WAL truncation, as before the queue existed. A failure is logged and does
 /// not fail the operation, whose delete is committed; the next scrub retries.
+///
+/// Callers drain only when their own transaction deleted or blanked rows (and so
+/// queued them): a write that queued nothing must not wait on a drain. A write
+/// that did queue rows drains the whole queue, including rows queued by others;
+/// rows it leaves behind when its drain fails are drained by the next scrub, the
+/// next such write, or the next start.
 pub(super) fn drain_after_commit(pool: &MemoryPool) {
     if let Err(error) = drain_fts_purge(pool) {
         tracing::warn!(

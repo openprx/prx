@@ -1000,9 +1000,11 @@ impl SqliteMemory {
                 return Ok(false);
             };
 
-            let forgotten = Self::forget_row(&conn, &principal, &key, &memory_id)?;
+            let (forgotten, dropped) = Self::forget_row(&conn, &principal, &key, &memory_id)?;
             drop(conn);
-            crate::memory::sqlite::transcript_index::drain_after_commit(&pool);
+            if dropped > 0 {
+                crate::memory::sqlite::transcript_index::drain_after_commit(&pool);
+            }
             Ok(forgotten)
         })
         .await?
@@ -1011,14 +1013,21 @@ impl SqliteMemory {
     /// The delete half shared by the scoped and the in-partition forget: one
     /// transaction takes the prefix rows, the memory, the tool results that
     /// quoted it and the access log entry together or not at all.
-    fn forget_row(conn: &Connection, principal: &Principal, key: &str, memory_id: &str) -> anyhow::Result<bool> {
+    ///
+    /// Returns whether a memory was deleted and how many session prefix rows went with it.
+    fn forget_row(
+        conn: &Connection,
+        principal: &Principal,
+        key: &str,
+        memory_id: &str,
+    ) -> anyhow::Result<(bool, usize)> {
         let tx = begin_immediate(conn)?;
         let probes = crate::memory::sqlite::derived_sweep::memory_probes(
             &tx,
             "SELECT workspace_id, owner_id, key, created_at FROM memories WHERE id = ?1",
             params![memory_id],
         )?;
-        crate::memory::sqlite::rf_forget::drop_prefix_rows_of(
+        let dropped = crate::memory::sqlite::rf_forget::drop_prefix_rows_of(
             &tx,
             "SELECT DISTINCT workspace_id, owner_id FROM memories WHERE id = ?1",
             params![memory_id],
@@ -1033,7 +1042,7 @@ impl SqliteMemory {
             log_access(&tx, principal, "forget", Some(key), Some(memory_id), None, "allowed");
         }
         tx.commit()?;
-        Ok(affected > 0)
+        Ok((affected > 0, dropped))
     }
 
     /// The ACL-off delete of an in-process caller: the key inside the
@@ -1063,9 +1072,11 @@ impl SqliteMemory {
                 log_access(&conn, &principal, "forget", Some(&key), None, None, "denied");
                 return Ok(false);
             };
-            let forgotten = Self::forget_row(&conn, &principal, &key, &memory_id)?;
+            let (forgotten, dropped) = Self::forget_row(&conn, &principal, &key, &memory_id)?;
             drop(conn);
-            crate::memory::sqlite::transcript_index::drain_after_commit(&pool);
+            if dropped > 0 {
+                crate::memory::sqlite::transcript_index::drain_after_commit(&pool);
+            }
             Ok(forgotten)
         })
         .await?

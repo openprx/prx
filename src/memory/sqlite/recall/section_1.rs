@@ -214,7 +214,7 @@ impl SqliteMemory {
                 "SELECT workspace_id, owner_id, key, created_at FROM memories WHERE key LIKE ?1 ESCAPE '\\'",
                 params![pattern],
             )?;
-            crate::memory::sqlite::rf_forget::drop_prefix_rows_of(
+            let dropped = crate::memory::sqlite::rf_forget::drop_prefix_rows_of(
                 &tx,
                 "SELECT DISTINCT workspace_id, owner_id FROM memories WHERE key LIKE ?1 ESCAPE '\\'",
                 params![pattern],
@@ -227,7 +227,9 @@ impl SqliteMemory {
             )?;
             tx.commit()?;
             drop(conn);
-            crate::memory::sqlite::transcript_index::drain_after_commit(&pool);
+            if dropped > 0 {
+                crate::memory::sqlite::transcript_index::drain_after_commit(&pool);
+            }
             Ok(affected)
         })
         .await?
@@ -334,6 +336,9 @@ impl SqliteMemory {
             let outcome = crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<WriteOutcome> {
                 let conn = pool.write();
                 let tx = begin_immediate(&conn)?;
+                // Session prefix rows this write deleted (and so queued); the drain after
+                // the commit runs only for them, never for a plain write such as a snapshot.
+                let mut dropped: usize = 0;
                 let existed = match provenance.as_deref() {
                     Some(_) => super::write_log::target_exists(&tx, super::write_log::WriteTarget::Memory, &key)?,
                     None => false,
@@ -409,7 +414,7 @@ impl SqliteMemory {
                     let insert_workspace = metadata.workspace_id.clone().or_else(|| ctx.workspace_id.clone());
                     // Both the owner and workspace the row holds now and the ones it is written
                     // under lose their prefix rows: an owner change moves the memory out of one index.
-                    crate::memory::sqlite::rf_forget::drop_prefix_rows_of(
+                    dropped = dropped.saturating_add(crate::memory::sqlite::rf_forget::drop_prefix_rows_of(
                         &tx,
                         "SELECT DISTINCT workspace_id, owner_id FROM memories
                          WHERE key = ?1 AND category = 'core'
@@ -428,7 +433,7 @@ impl SqliteMemory {
                             owner_id.clone(),
                             insert_workspace.clone()
                         ],
-                    )?;
+                    )?);
                     let changed = tx.execute(
                         &format!("INSERT INTO memories (
                         id, key, content, category, embedding, embedding_provider,
@@ -511,7 +516,7 @@ impl SqliteMemory {
                     let coalesce = super::agent_migration::scope_coalesce_set("memories");
                     let scope_guard = super::agent_migration::scope_conflict_guard("memories", false);
                     // The owner and workspace the row holds now and the ones it is written under.
-                    crate::memory::sqlite::rf_forget::drop_prefix_rows_of(
+                    dropped = dropped.saturating_add(crate::memory::sqlite::rf_forget::drop_prefix_rows_of(
                         &tx,
                         "SELECT DISTINCT workspace_id, owner_id FROM memories
                          WHERE key = ?1 AND category = 'core'
@@ -529,7 +534,7 @@ impl SqliteMemory {
                             metadata.owner_id.clone(),
                             metadata.workspace_id.clone()
                         ],
-                    )?;
+                    )?);
                     let changed = tx.execute(
                         &format!(
                             "INSERT INTO memories (
@@ -654,7 +659,9 @@ impl SqliteMemory {
                 }
                 tx.commit()?;
                 drop(conn);
-                crate::memory::sqlite::transcript_index::drain_after_commit(&pool);
+                if dropped > 0 {
+                    crate::memory::sqlite::transcript_index::drain_after_commit(&pool);
+                }
                 Ok(WriteOutcome::Done)
             })
             .await??;

@@ -210,7 +210,7 @@ impl SqliteMemory {
             let memory_id = Uuid::new_v4().to_string();
             let coalesce = super::agent_migration::scope_coalesce_set("memories");
             let scope_guard = super::agent_migration::scope_conflict_guard("memories", false);
-            super::rf_forget::drop_prefix_rows_of(
+            let dropped = super::rf_forget::drop_prefix_rows_of(
                 &tx,
                 "SELECT DISTINCT workspace_id, owner_id FROM memories
                  WHERE key = ?1 AND category = 'core' AND (content IS NOT ?2 OR ?3 <> 'core')",
@@ -306,7 +306,9 @@ impl SqliteMemory {
 
             tx.commit()?;
             drop(conn);
-            super::transcript_index::drain_after_commit(&pool);
+            if dropped > 0 {
+                super::transcript_index::drain_after_commit(&pool);
+            }
             Ok(Some(draft))
         })
         .await?

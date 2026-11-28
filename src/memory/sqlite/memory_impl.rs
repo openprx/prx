@@ -512,7 +512,7 @@ impl Memory for SqliteMemory {
                 "SELECT workspace_id, owner_id, key, created_at FROM memories WHERE key = ?1",
                 params![key],
             )?;
-            super::rf_forget::drop_prefix_rows_of(
+            let dropped = super::rf_forget::drop_prefix_rows_of(
                 &tx,
                 "SELECT DISTINCT workspace_id, owner_id FROM memories WHERE key = ?1",
                 params![key],
@@ -521,7 +521,9 @@ impl Memory for SqliteMemory {
             super::derived_sweep::rewrite_memory_copies(&tx, &probes, &Utc::now().to_rfc3339())?;
             tx.commit()?;
             drop(conn);
-            super::transcript_index::drain_after_commit(&pool);
+            if dropped > 0 {
+                super::transcript_index::drain_after_commit(&pool);
+            }
             Ok(affected > 0)
         })
         .await?
@@ -536,7 +538,9 @@ impl Memory for SqliteMemory {
                 params![row_id, crate::memory::branch_copy::SESSION_PREFIX_EVENT_TYPE],
             )?;
             drop(conn);
-            super::transcript_index::drain_after_commit(&pool);
+            if deleted > 0 {
+                super::transcript_index::drain_after_commit(&pool);
+            }
             Ok(deleted)
         })
         .await?
@@ -566,7 +570,9 @@ impl Memory for SqliteMemory {
             let affected = tx.execute("DELETE FROM message_events WHERE idempotency_key=?1", params![key])?;
             tx.commit()?;
             drop(conn);
-            super::transcript_index::drain_after_commit(&pool);
+            if affected > 0 {
+                super::transcript_index::drain_after_commit(&pool);
+            }
             Ok(affected)
         })
         .await?
