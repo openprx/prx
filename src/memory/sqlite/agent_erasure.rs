@@ -633,7 +633,13 @@ pub(super) fn finish_history(memory: &SqliteMemory, work: &EraseWork) -> anyhow:
     }
     erase_side_stores(memory, &work, &scopes).context(ErasureStep::EraseSideStores)?;
     super::memory_impl::truncate_wal(&memory.pool, Duration::from_secs(4))
-        .map_err(|_| ErasureRefusal::Pending)
+        .map_err(|error| {
+            tracing::warn!(
+                error = %crate::agent::diagnostics::error_class(&error),
+                "history erase WAL truncation or index purge failed; the erase stays pending"
+            );
+            ErasureRefusal::Pending
+        })
         .context(ErasureStep::TruncateWal)?;
     let conn = memory.pool.write();
     let tx = begin_immediate(&conn)?;
