@@ -607,10 +607,19 @@ A trim that removes 2000 local tokens leaves 4500, planned as
 window check of the request with history 6500 sets 11781 against an input
 window of `16000 - 4000 = 12000`.
 
-An anchor is kept per session (it lives next to the tool-surface reserve of a
-chat session) and per turn for every other caller, so a child run has its own.
-It is used only while the requested provider and model, the system prompt and
-the tool surface are those of the request that produced it, and it is formed
+An anchor is kept per session: it lives next to the tool-surface reserve of the
+session, so it outlives a turn. The terminal chat owns one reserve for its
+lifetime. Gateway, channel, embedded `Agent`, scheduled (cron, Xin and the
+heartbeat's Xin tasks) and child-session turns (task mode in the parent, process
+mode in the worker, across steers, mailbox deliveries and task-mode
+continuations) take theirs from a process-wide map keyed by the session key
+(`src/context/budget/session_reserves.rs`, least recently used past 1,000
+sessions). A single-shot run without a scheduled source (a skill evaluation
+case) and a delegate call keep an anchor for their own turn only. With a
+per-session anchor, the `request_ordinal` of the records below keeps counting
+across the session's turns; with a per-turn one it starts again at 1 on every
+turn. It is used only while the requested provider and model, the system prompt
+and the tool surface are those of the request that produced it, and it is formed
 only from a response served by the requested provider and model. The probe and
 the anchor both hold the requested provider and model, so they compare like
 with like. A response whose serving provider (compared with URL userinfo
