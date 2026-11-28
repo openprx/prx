@@ -13,6 +13,17 @@ use crate::messaging::DeliveryState;
 use crate::messaging::mailbox::{MailboxError, MailboxReceipt, MailboxResult, validate_body};
 
 impl SqliteMailbox {
+    /// [`Self::adopt`] for a loop that keeps running: a slot that an erase or a
+    /// stale run closed (`StaleRun`) is not an error but "skip", so no input is
+    /// produced and the loop goes on. Every other error is returned as it is.
+    pub fn adopt_if_open(&self, delivery: &super::MailboxDelivery) -> MailboxResult<Option<MailboxReceipt>> {
+        match self.adopt(delivery) {
+            Ok(receipt) => Ok(Some(receipt)),
+            Err(MailboxError::StaleRun) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Adopt a delivered slot. The caller owns its scope delivery lease until
     /// this returns or its cancellation/IPC handoff completes.
     pub fn adopt(&self, delivery: &super::MailboxDelivery) -> MailboxResult<MailboxReceipt> {

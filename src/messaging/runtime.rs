@@ -475,7 +475,25 @@ impl SessionInbox {
         };
         if let Some(input) = queued {
             drop(execution);
-            return Ok(vec![input]);
+            // An rf delete can tombstone the adopted row while its input waits in
+            // the queue: the row then no longer matches and the input is dropped.
+            let event = input
+                .receipt
+                .adopted_message_event_id
+                .ok_or(MailboxError::CorruptState)?;
+            return match self.runtime.store.with_input(
+                &self.runtime.workspace,
+                &self.address,
+                event,
+                &input.text,
+                input.message.id,
+                &input.receipt,
+                || (),
+            ) {
+                Ok(()) => Ok(vec![input]),
+                Err(MailboxError::Fenced | MailboxError::IdentityImmutable) => Ok(Vec::new()),
+                Err(error) => Err(error),
+            };
         }
         let mut inputs = Vec::new();
         for _ in 0..1 {
@@ -483,7 +501,9 @@ impl SessionInbox {
                 break;
             };
             let message = delivery.message().clone();
-            let receipt = self.runtime.store.adopt(&delivery)?;
+            let Some(receipt) = self.runtime.store.adopt_if_open(&delivery)? else {
+                continue;
+            };
             let text = crate::session_worker::mailbox::user_text(&message)?;
             inputs.push(MessageInput {
                 _lease: self.runtime.store.hold_input(&self.scope, &self.address)?,

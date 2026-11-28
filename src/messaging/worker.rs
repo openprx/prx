@@ -138,7 +138,7 @@ impl WorkerMailboxFactory for WorkerMailboxes {
                             Some(WorkerOutputFrame::Ack { message_id, state: DeliveryState::Consumed }) => {
                                 if !runtime.ready_capacity(&target) {continue;}
                                 let delivery = pending.lock().remove(&message_id);
-                                delivery.map_or_else(||Ok(()),|delivery|runtime.store.adopt(&delivery).and_then(|receipt|runtime.adopted(delivery.message().clone(),receipt)).map_err(Into::into))
+                                delivery.map_or_else(||Ok(()),|delivery|runtime.store.adopt_if_open(&delivery).and_then(|receipt|receipt.map_or(Ok(()),|receipt|runtime.adopted(delivery.message().clone(),receipt))).map_err(Into::into))
                             }
                             Some(WorkerOutputFrame::Ack { .. }) => Ok(()),
                             None => break,
