@@ -171,9 +171,9 @@ pub(super) fn erase_outbox_body(
 /// Erase the mailbox bodies of the messages adopted as the conversation rows in
 /// `event_ids_json` (a JSON array of event ids): the receiver's stored body, the
 /// receipt's `body_erased_at`, and the body in the sender's outbox rows of the
-/// same message id. The link is `adopted_message_event_id` in the receipt meta,
-/// which survives the tombstone of the adopted row. A receipt or outbox row whose
-/// metadata does not decode is skipped. Returns the number of receipts handled.
+/// same message id on the same stream. The link is `adopted_message_event_id` in
+/// the receipt meta, which survives the tombstone of the adopted row. A receipt
+/// or outbox row whose metadata does not decode is skipped. Returns the number of receipts handled.
 pub(in crate::memory::sqlite) fn erase_adopted_bodies(
     tx: &rusqlite::Connection,
     workspace_id: &str,
@@ -183,18 +183,23 @@ pub(in crate::memory::sqlite) fn erase_adopted_bodies(
 ) -> anyhow::Result<usize> {
     let receipts = {
         let mut query = tx.prepare(
-            "SELECT id, message_id, receipt_meta FROM prx_mailbox_receipts
+            "SELECT id, message_id, receipt_meta, stream_id FROM prx_mailbox_receipts
              WHERE workspace_id = ?1 AND owner_id = ?2 AND json_valid(receipt_meta)
                AND json_extract(receipt_meta, '$.adopted_message_event_id') IN (SELECT value FROM json_each(?3))",
         )?;
         query
             .query_map(params![workspace_id, owner_id, event_ids_json], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, String>(2)?))
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
     let mut handled = 0usize;
-    for (id, message_id, meta_json) in receipts {
+    for (id, message_id, meta_json, stream_id) in receipts {
         let Ok(mut meta) = decode::<ReceiptMeta>(&meta_json) else {
             continue;
         };
@@ -210,10 +215,10 @@ pub(in crate::memory::sqlite) fn erase_adopted_bodies(
         let outboxes = {
             let mut query = tx.prepare(
                 "SELECT id, envelope_meta, state FROM prx_mailbox_outbox
-                 WHERE workspace_id = ?1 AND owner_id = ?2 AND message_id = ?3",
+                 WHERE workspace_id = ?1 AND owner_id = ?2 AND message_id = ?3 AND stream_id = ?4",
             )?;
             query
-                .query_map(params![workspace_id, owner_id, message_id], |r| {
+                .query_map(params![workspace_id, owner_id, message_id, stream_id], |r| {
                     Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?
