@@ -236,6 +236,9 @@ const ALLOWED_PERSISTED_EVENT_TABLES: &[&str] = &[
     "src/memory/sqlite/schema.rs::memory_events",
     "src/memory/sqlite/schema.rs::message_events",
     "src/memory/sqlite/schema.rs::message_events",
+    // Not a ledger: the queue of transcript-index entries still to remove after a row delete or
+    // blank (row id and the indexed text); drained in short transactions and emptied by a scrub.
+    "src/memory/sqlite/transcript_index.rs::message_events_fts_purge",
     // Test-only: the pre-ALTER `message_events` shape (no `ma_scope_id`), rebuilt in an in-memory
     // database to prove the recovery event digest is unchanged by the MA-01b1b scope column.
     "src/memory/sqlite/tests/recovery_authority.rs::message_events",
