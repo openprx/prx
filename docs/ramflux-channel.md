@@ -264,6 +264,9 @@ conversation's own scope through the turn's memory view, as `memory_recall`
 does, so a plaintext memory of the base store is never printed into the
 conversation and has no sealed copies. A key of another scope is answered like a
 missing key.
+When a memory read and a later `memory_forget` of a key it printed share one tool batch, the
+read's stored result row and execution record hold the removed-text marker instead (the
+text the running turn already read is not changed).
 A rewrite of the execution record after a hook does not write over a swapped
 row. Known limits:
 

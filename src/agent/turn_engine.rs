@@ -10,6 +10,7 @@ use std::io::Write as _;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+mod batch_forget;
 mod overflow;
 mod provider_call;
 mod reply;

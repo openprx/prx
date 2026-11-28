@@ -26,6 +26,7 @@ use crate::context::reduce::engine::AfterTools;
 use crate::context::transcript::{RoundLog, append_hook_contributions, call_id_for};
 use crate::providers::ToolCall;
 
+use super::batch_forget::{forgotten_in_batch, masked_for_forget};
 use super::state::{PreparedRound, TurnInputs, TurnState};
 use crate::agent::tool_call_parser::ParsedToolCall;
 
@@ -330,6 +331,10 @@ pub(super) async fn run_tools(
     // mode. The native-history branch below reuses the document status captured
     // here instead of persisting a second time.
     let mut document_statuses: Vec<&'static str> = Vec::with_capacity(individual_results.len());
+    // A memory read of this batch that printed a key a later call of the batch
+    // forgot is stored without that text; the rows are written below, after
+    // the forget's sweep ran, so the sweep never saw them.
+    let forgotten = forgotten_in_batch(&tool_calls, &individual_results);
     let mut repeated_unrecoverable: Option<String> = None;
     // Everything below that plans against the window plans against the
     // reserved one, the same window the preflight used: this turn's schemas
@@ -434,8 +439,28 @@ pub(super) async fn run_tools(
         );
         if let Some(log) = round_log.as_ref() {
             let call_id = call_id_for(&call.name, index, &native_tool_calls);
-            log.append_result(&call_id, &call.name, observed, &truncated_result, document_status)
-                .await;
+            if let Some(marker) = masked_for_forget(index, &call.name, &observed.content, &forgotten) {
+                let stored = ObservedToolResult {
+                    content: marker.to_owned(),
+                    ..observed.clone()
+                };
+                if !outcome.operation_id.is_empty()
+                    && let Some(service) = round.execution_adapter.tool_execution_service.as_ref()
+                {
+                    service
+                        .rewrite_ledger_effective_output(
+                            &round.execution_adapter.tool_execution_context,
+                            &outcome.operation_id,
+                            marker,
+                        )
+                        .await;
+                }
+                log.append_result(&call_id, &call.name, &stored, marker, "pending_document_backend")
+                    .await;
+            } else {
+                log.append_result(&call_id, &call.name, observed, &truncated_result, document_status)
+                    .await;
+            }
         }
         let _ = writeln!(
             tool_results,
