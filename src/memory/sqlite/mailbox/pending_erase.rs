@@ -46,8 +46,10 @@ fn close_pending_slot(tx: &Connection, stream: &mut stream::Stream, seq: u64, no
     Ok(true)
 }
 
-/// What one pending-erase pass did. `unreadable` counts rows that were kept because
-/// their receipt, stream or envelope metadata does not decode.
+/// What one pending-erase pass did. `unreadable` counts rows whose receipt, stream
+/// or envelope metadata does not decode, each row once: a receipt or an outbox row
+/// with such metadata is kept; an outbox row whose stream does not load is still
+/// erased, without reserving its seq.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(in crate::memory::sqlite) struct PendingEraseCounts {
     pub receipts: usize,
@@ -60,7 +62,8 @@ pub(in crate::memory::sqlite) struct PendingEraseCounts {
 /// yet adopted: receipts in state 0/1 by `sender_run_id` (receiver body, receipt
 /// mark, the sender's outbox body of the same message on the same stream), then the
 /// outbox rows by `sender_run_id` whose body is still present. Rows that do not
-/// load are kept and counted in `unreadable`; the pass logs them at `warn`.
+/// load are counted in `unreadable` (see [`PendingEraseCounts`]); the pass logs them
+/// at `warn`.
 pub(in crate::memory::sqlite) fn erase_pending_from_runs(
     tx: &Connection,
     workspace_id: &str,
@@ -70,6 +73,7 @@ pub(in crate::memory::sqlite) fn erase_pending_from_runs(
 ) -> anyhow::Result<PendingEraseCounts> {
     let (mut receipts, mut outboxes, mut full, mut unreadable) = (0usize, 0usize, 0usize, 0usize);
     let mut skipped: Vec<(i64, Vec<u8>)> = Vec::new();
+    let mut bad_outboxes = std::collections::HashSet::new();
     let ids = {
         let mut query = tx.prepare(
             "SELECT id FROM prx_mailbox_receipts
@@ -119,7 +123,7 @@ pub(in crate::memory::sqlite) fn erase_pending_from_runs(
             if decode::<OutboxMeta>(&json).is_ok() {
                 erase_outbox_body(tx, outbox_id, &json, state, now)?;
             } else {
-                unreadable += 1;
+                bad_outboxes.insert(outbox_id);
             }
         }
         receipts += 1;
@@ -147,7 +151,7 @@ pub(in crate::memory::sqlite) fn erase_pending_from_runs(
             continue;
         }
         if decode::<OutboxMeta>(&json).is_err() {
-            unreadable += 1;
+            bad_outboxes.insert(id);
             continue;
         }
         if state < 2 {
@@ -176,6 +180,7 @@ pub(in crate::memory::sqlite) fn erase_pending_from_runs(
         erase_outbox_body(tx, id, &json, state, now)?;
         outboxes += 1;
     }
+    unreadable += bad_outboxes.len();
     if receipts + outboxes > 0 {
         tracing::info!(receipts, outboxes, "pending mailbox messages of erased runs erased");
     }
