@@ -24,6 +24,18 @@ const CREDENTIAL_SEGMENTS: [&str; 14] = [
     "cookie",
 ];
 
+/// Password and secret words: a name whose last segment is one of them keeps
+/// its value masked even when the value is call-shaped (`password = getpass()`).
+const PASSWORD_OR_SECRET_SEGMENTS: [&str; 7] = [
+    "password",
+    "passwords",
+    "passwd",
+    "pwd",
+    "passphrase",
+    "secret",
+    "secrets",
+];
+
 /// Endings that make a run-together segment a credential name, as the
 /// pre-program detectors matched them unanchored: `mytoken`, `authtoken`,
 /// `PGPASSWORD`, `clientsecret`, `x_apikey`, `authheader`. `tokenizer`,
@@ -292,6 +304,16 @@ pub(super) fn classify_name(key: &str) -> KeyName {
 /// Whether `key` names a credential by its words, compounds and endings.
 pub(super) fn names_a_credential(key: &str) -> bool {
     classify_name(key) == KeyName::Credential
+}
+
+/// Whether the last segment of `key` is a password or secret word
+/// (`password`, `db_password`, `dbPassword`, `client-secret`): such a name
+/// gets no call-shape exemption. `token`, `api_key` and `PGPASSWORD` (one
+/// run-together segment) are not counted.
+pub(super) fn names_a_password_or_secret(key: &str) -> bool {
+    key_segments(key)
+        .last()
+        .is_some_and(|last| PASSWORD_OR_SECRET_SEGMENTS.contains(&last.as_str()))
 }
 
 /// Whether the whole key is the bare name `key` or `auth`.

@@ -5,6 +5,7 @@ use std::sync::LazyLock;
 
 use super::names::{
     KEY_VALUE_MIN_LEN, KEY_VALUE_MIN_RUN, KeyName, classify_name, is_bare_key_or_auth, is_key_value_byte,
+    names_a_password_or_secret,
 };
 #[cfg(test)]
 use super::record_redaction_work;
@@ -559,13 +560,18 @@ pub(super) fn keyed_pair_spans(text: &str, url_parts: &[UrlPart], spans: &mut Ve
         // `pub token: String` keep their code (CE-64). Quoted values stay masked.
         // A quote right after the scanned value closes an enclosing argument
         // (`'password=hunter(two)'`), so that value is a secret, not code.
+        // A password or secret name gets no call-shape exemption: a bare
+        // `password=hunter(two)` is a secret, and `password = getpass()` in a
+        // listing is masked too (accepted over-mask); `password: String` keeps
+        // its type annotation.
         let quote_follows = text
             .as_bytes()
             .get(scanned.end)
             .is_some_and(|byte| matches!(byte, b'\'' | b'"'));
         let code_shape = kind == 0
             && !quote_follows
-            && (is_call(source) || (separator.as_str() == ":" && is_type_annotation(source)));
+            && ((is_call(source) && !names_a_password_or_secret(names))
+                || (separator.as_str() == ":" && is_type_annotation(source)));
         // The bare `key` is classified by its value; the bare `auth` is a
         // credential name on its own (the only Plain name that gets here).
         let credential = !code_shape
