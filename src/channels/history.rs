@@ -116,7 +116,8 @@ pub(super) fn merged_history(
 ///
 /// `cached` is the CH1 cache view (cut before the current message, normalized,
 /// no ids). The log is read under `session_key` with the turn's principal and
-/// cut at the current message the same way, and a leading reply is dropped as
+/// cut at the current message the same way (only when the newest logged user
+/// row is the current message; otherwise `None`), and a leading reply is dropped as
 /// the cache normalization does. It is used only when the newest `cached.len()`
 /// logged turns equal the cache role for role and text for text, in order (an
 /// exact suffix match), and then those turns are returned as the model's view
@@ -149,12 +150,15 @@ pub(super) async fn logged_turns_matching_cache(
     // them, so an earlier switch never breaks it); the handoff view is applied
     // to the matched turns below.
     let mut logged = loaded.turns;
-    if let Some(index) = logged
-        .iter()
-        .rposition(|turn| turn.role == "user" && turn.content == current_text)
-    {
-        logged.truncate(index);
+    // The cut is made only at the current message's own row: the newest logged
+    // user row must equal the current text. When that row is not in the log
+    // (an older identical message may be), nothing is cut and the cache is
+    // replayed.
+    let index = logged.iter().rposition(|turn| turn.role == "user")?;
+    if logged.get(index)?.content != current_text {
+        return None;
     }
+    logged.truncate(index);
     // The cache normalization drops a leading reply, so the log window does too
     // (the 200-row window can start in the middle of an exchange).
     let first_user = logged
