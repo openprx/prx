@@ -261,6 +261,7 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
     // Where the owner hears of a finished run: `note` (the default) is a line at
     // the next interactive turn; existing rows read `note`.
     add_column_if_missing(conn, "xin_tasks", "deliver", "TEXT NOT NULL DEFAULT 'note'")?;
+    migrate_system_task_deliver(conn)?;
     add_column_if_missing(conn, "xin_goals", "creator_level", "TEXT")?;
     add_column_if_missing(conn, "xin_goals", "creator_agent", "TEXT")?;
     // Which surface created the goal, as on `xin_tasks`. Nullable with no
@@ -278,6 +279,35 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
     )
     .context("Failed to initialize xin lineage indexes")?;
 
+    Ok(())
+}
+
+/// One-time migration: system tasks written before they were created with
+/// `deliver = none` read `note` from the column default. The marker row makes
+/// the rewrite run once, so a `note` an operator sets later is kept. User tasks
+/// are never touched.
+fn migrate_system_task_deliver(conn: &Connection) -> Result<()> {
+    const MARKER: &str = "system_task_deliver_none";
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS xin_migrations (name TEXT PRIMARY KEY)")
+        .context("Failed to create xin migration table")?;
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<()> {
+        let first_run = conn.execute("INSERT OR IGNORE INTO xin_migrations (name) VALUES (?1)", [MARKER])? == 1;
+        if first_run {
+            conn.execute(
+                "UPDATE xin_tasks SET deliver = 'none' WHERE kind = 'system' AND deliver = 'note'",
+                [],
+            )?;
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => conn.execute_batch("COMMIT").context("Failed to commit xin migration")?,
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(error.context("Failed to migrate system task deliver"));
+        }
+    }
     Ok(())
 }
 

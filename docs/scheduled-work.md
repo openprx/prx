@@ -124,7 +124,9 @@ not recurring and has a `message_event_id` in the trusted scope; the cron tool
 with an agent job on an `at` schedule and a `message_event_id`) defaults to `message`; everything else
 defaults to `note`, except that a built-in system task (the three Xin tasks
 above and the tasks materialized from `HEARTBEAT.md`) is created with `none`, so
-its runs leave no result row. An explicit `deliver` always wins. It is set by the xin tool
+its runs leave no result row. A one-time migration at store open rewrote the
+`note` of existing system tasks to `none`; a value set afterwards is kept.
+An explicit `deliver` always wins. It is set by the xin tool
 on `add` and `update`, by the cron tool on `add` and in the `update` patch, and
 by `POST` and `PATCH` `/api/cron/jobs`. The xin job routes return it; the cron
 job routes return it with the rest of the job. A route write has no creating
