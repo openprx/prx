@@ -1484,11 +1484,14 @@ const SCRUB_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
 /// when a reader kept the checkpoint from completing within the budget; the
 /// mark stays for the next settle, open or clean stop.
 pub(super) fn scrub(pool: &super::SqliteConnectionPool) -> anyhow::Result<bool> {
-    let pending: bool = pool
-        .write()
-        .query_row("SELECT EXISTS(SELECT 1 FROM rf_wal_scrub_pending)", [], |row| {
-            row.get(0)
-        })?;
+    // Deleted text still queued for its index entries counts as pending too:
+    // the checkpoint below drains the queue first.
+    let pending: bool = {
+        let conn = pool.write();
+        conn.query_row("SELECT EXISTS(SELECT 1 FROM rf_wal_scrub_pending)", [], |row| {
+            row.get::<_, bool>(0)
+        })? || super::transcript_index::purge_pending(&conn)?
+    };
     if !pending {
         return Ok(true);
     }
@@ -1508,4 +1511,15 @@ pub(super) fn scrub(pool: &super::SqliteConnectionPool) -> anyhow::Result<bool> 
         );
     }
     Ok(true)
+}
+
+/// [`scrub`] for the open path: it must not delay start-up, and draining the
+/// transcript-index purge queue (left by a crash or a deferred scrub) can take
+/// long. With a non-empty queue it returns `false` and leaves the mark; the
+/// background warm-up drains the queue and then scrubs.
+pub(super) fn scrub_at_open(pool: &super::SqliteConnectionPool) -> anyhow::Result<bool> {
+    if super::transcript_index::purge_pending(&pool.write())? {
+        return Ok(false);
+    }
+    scrub(pool)
 }

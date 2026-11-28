@@ -305,6 +305,8 @@ impl SqliteMemory {
             }
 
             tx.commit()?;
+            drop(conn);
+            super::transcript_index::drain_after_commit(&pool);
             Ok(Some(draft))
         })
         .await?

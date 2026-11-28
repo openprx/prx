@@ -38,7 +38,12 @@ fn checkpoint_truncate(conn: &mut rusqlite::Connection) -> anyhow::Result<i64> {
 /// content is already overwritten). The writer is dropped between attempts so
 /// a turn that holds a read snapshot can finish and release it. An error when
 /// the WAL still holds frames at the end of the budget.
+///
+/// The transcript-index purge queue is drained first, outside the budget: the
+/// queued text is deleted content, so the bytes are not gone until its index
+/// entries are. A drain error is returned like a failed checkpoint.
 pub(super) fn truncate_wal(pool: &super::SqliteConnectionPool, budget: std::time::Duration) -> anyhow::Result<()> {
+    super::transcript_index::drain_fts_purge(pool)?;
     let deadline = std::time::Instant::now() + budget;
     let mut last_busy = -1_i64;
     loop {
@@ -515,6 +520,8 @@ impl Memory for SqliteMemory {
             let affected = tx.execute("DELETE FROM memories WHERE key = ?1", params![key])?;
             super::derived_sweep::rewrite_memory_copies(&tx, &probes, &Utc::now().to_rfc3339())?;
             tx.commit()?;
+            drop(conn);
+            super::transcript_index::drain_after_commit(&pool);
             Ok(affected > 0)
         })
         .await?
@@ -528,6 +535,8 @@ impl Memory for SqliteMemory {
                 "DELETE FROM message_events WHERE id = ?1 AND event_type = ?2",
                 params![row_id, crate::memory::branch_copy::SESSION_PREFIX_EVENT_TYPE],
             )?;
+            drop(conn);
+            super::transcript_index::drain_after_commit(&pool);
             Ok(deleted)
         })
         .await?
@@ -556,6 +565,8 @@ impl Memory for SqliteMemory {
             }
             let affected = tx.execute("DELETE FROM message_events WHERE idempotency_key=?1", params![key])?;
             tx.commit()?;
+            drop(conn);
+            super::transcript_index::drain_after_commit(&pool);
             Ok(affected)
         })
         .await?

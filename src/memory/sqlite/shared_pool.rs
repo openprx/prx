@@ -129,9 +129,11 @@ fn open_first(
     RawSqliteConnectionPool::publish_metrics(&raw);
     let pool = Arc::new(MemoryPool::new(raw)?);
     // Deleted rf content a previous process left in the WAL (AC-1b2b).
-    match rf_delete::scrub(&pool) {
+    match rf_delete::scrub_at_open(&pool) {
         Ok(true) => {}
-        Ok(false) => tracing::warn!("deleted rf content stays in brain.db-wal while another process reads it"),
+        Ok(false) => tracing::warn!(
+            "deleted rf content stays in brain.db-wal until the background purge or a reader's release lets the scrub finish"
+        ),
         Err(error) => tracing::warn!(
             error = %crate::agent::diagnostics::error_class(&error),
             "deleted rf content WAL scrub failed at open"

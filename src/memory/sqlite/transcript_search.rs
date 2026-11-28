@@ -6,7 +6,7 @@
 
 use super::SqliteMemory;
 use super::events::{MA_SCOPE_COLUMN, numbered_placeholders, partition_conjunct};
-use super::transcript_index::{INDEX_TABLE, IndexState, build_index, index_state};
+use super::transcript_index::{INDEX_TABLE, IndexState, build_index, drain_fts_purge, index_state};
 use crate::memory::traits::{MemoryPrincipal, TranscriptHit};
 use crate::memory::{AgentPartition, PartitionKey};
 use std::collections::HashSet;
@@ -240,8 +240,24 @@ impl SqliteMemory {
 
     /// Create the index if missing and fill it in short batches until it is
     /// complete (resuming an interrupted fill); a no-op on a complete index.
+    /// Then drain the purge queue a crash or a deferred scrub left, and finish
+    /// the WAL scrub that waited for it (the open path does neither).
     pub(super) async fn warm_transcript_index_impl(&self) -> anyhow::Result<()> {
-        build_index(self.pool.clone()).await
+        build_index(self.pool.clone()).await?;
+        let pool = self.pool.clone();
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
+            drain_fts_purge(&pool)?;
+            match super::rf_delete::scrub(&pool) {
+                Ok(true) => {}
+                Ok(false) => tracing::debug!("WAL scrub after the purge waits for a reader"),
+                Err(error) => tracing::warn!(
+                    error = %crate::agent::diagnostics::error_class(&error),
+                    "deleted content WAL scrub failed after the purge"
+                ),
+            }
+            Ok(())
+        })
+        .await?
     }
 }
 

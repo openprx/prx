@@ -60,7 +60,7 @@
 //! milliseconds per row and is paid when the write transaction commits. The
 //! transaction that deletes or blanks rows therefore does not pay it: its
 //! triggers record the indexed text of each row in [`PURGE_TABLE`], and short
-//! follow-up transactions remove the entries.
+//! follow-up transactions remove the entries (see the drain in this module).
 //! The rules the triggers keep:
 //!
 //! - A queued row's terms in the index are exactly its queue `content`. `ON
@@ -78,9 +78,8 @@
 //! - A row that survives a blank keeps an (empty) index document, as the
 //!   earlier blank trigger left it: FTS5 `delete` also removes the row's
 //!   document-size entry, and an external-content row without one fails the
-//!   integrity check. Whatever removes a queued entry must index the row's
-//!   current (empty) content again after the `delete`; for a deleted row that
-//!   inserts nothing.
+//!   integrity check. The drain therefore indexes the row's current (empty)
+//!   content again after the `delete`; for a deleted row that inserts nothing.
 //! - The triggers are four: insert, delete, blank, and non-empty rewrite. A
 //!   table rebuild migration must recreate all of them.
 //!
@@ -223,6 +222,28 @@ const FILLING_TRIGGERS_SQL: &str = "
         DELETE FROM message_events_fts_purge WHERE row_id = old.id;
         INSERT INTO message_events_fts(rowid, content) VALUES (new.id, new.content);
     END;";
+
+/// Most queue rows one drain transaction removes, and the durations that steer
+/// it: a chunk faster than [`DRAIN_FAST`] doubles the next chunk, one slower
+/// than [`DRAIN_SLOW`] halves it.
+const DRAIN_MAX_ROWS: usize = 64;
+const DRAIN_FAST: Duration = Duration::from_millis(25);
+const DRAIN_SLOW: Duration = Duration::from_millis(100);
+
+/// Shortest and longest pause between two drain chunks (the last chunk's
+/// duration within these bounds, the rule of the fill).
+const MIN_DRAIN_PAUSE: Duration = Duration::from_millis(10);
+const MAX_DRAIN_PAUSE: Duration = Duration::from_millis(250);
+
+/// The statements of one drain chunk, per queue row: remove the queued text
+/// from the index, index the row again if it still exists (a blanked row keeps
+/// an empty document; a deleted row inserts nothing), then drop the queue row.
+const PURGE_READ_SQL: &str = "SELECT row_id, content FROM message_events_fts_purge ORDER BY row_id LIMIT ?1";
+const PURGE_DELETE_SQL: &str =
+    "INSERT INTO message_events_fts(message_events_fts, rowid, content) VALUES ('delete', ?1, ?2)";
+const PURGE_REINDEX_SQL: &str =
+    "INSERT INTO message_events_fts(rowid, content) SELECT id, content FROM message_events WHERE id = ?1";
+const PURGE_POP_SQL: &str = "DELETE FROM message_events_fts_purge WHERE row_id = ?1";
 
 /// Whether the index exists and whether its initial fill is finished.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -414,6 +435,98 @@ fn batch_end(conn: &Connection, next_after: i64, boundary: i64) -> anyhow::Resul
         }
     }
     Ok(last)
+}
+
+/// Whether the purge queue exists and holds a row; a read. A database whose
+/// index was never created has no queue and nothing pending.
+pub(super) fn purge_pending(conn: &Connection) -> anyhow::Result<bool> {
+    if !table_exists(conn, PURGE_TABLE)? {
+        return Ok(false);
+    }
+    let pending: bool = conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM {PURGE_TABLE})"), [], |row| {
+        row.get(0)
+    })?;
+    Ok(pending)
+}
+
+/// Remove queued index entries in short write transactions until the queue is
+/// empty. Returns the number of rows removed.
+///
+/// Each transaction takes up to `k` queue rows (`k` starts at one, doubles to
+/// at most [`DRAIN_MAX_ROWS`] while a chunk takes under [`DRAIN_FAST`], and
+/// halves, not below one, when it takes over [`DRAIN_SLOW`]; the cost is in the
+/// commit, so the duration includes it). The writer is released and the thread
+/// sleeps for the chunk's duration within [`MIN_DRAIN_PAUSE`] and
+/// [`MAX_DRAIN_PAUSE`] between chunks, so other writers find the lock free at
+/// least half of the time. A chunk that leaves the queue empty returns at once.
+/// There is no deadline and no row cap: a drain always finishes. The queue rows
+/// are removed with `secure_delete` on, so their pages are overwritten.
+///
+/// Blocking: run it on a blocking thread. It logs counts and durations only.
+pub(super) fn drain_fts_purge(pool: &MemoryPool) -> anyhow::Result<u64> {
+    let started = Instant::now();
+    let mut removed: u64 = 0;
+    let mut chunks: u64 = 0;
+    let mut k: usize = 1;
+    loop {
+        let chunk_started = Instant::now();
+        let (count, empty) = {
+            let guard = pool.write();
+            if !purge_pending(&guard)? {
+                break;
+            }
+            let tx = begin_immediate(&guard)?;
+            let rows: Vec<(i64, String)> = {
+                let mut stmt = tx.prepare_cached(PURGE_READ_SQL)?;
+                let limit = i64::try_from(k).unwrap_or(1);
+                stmt.query_map([limit], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for (row_id, text) in &rows {
+                tx.execute(PURGE_DELETE_SQL, rusqlite::params![row_id, text])?;
+                tx.execute(PURGE_REINDEX_SQL, [row_id])?;
+                tx.execute(PURGE_POP_SQL, [row_id])?;
+            }
+            let empty = !tx.query_row(&format!("SELECT EXISTS(SELECT 1 FROM {PURGE_TABLE})"), [], |row| {
+                row.get::<_, bool>(0)
+            })?;
+            tx.commit()?;
+            (rows.len(), empty)
+        };
+        let duration = chunk_started.elapsed();
+        removed = removed.saturating_add(u64::try_from(count).unwrap_or(0));
+        chunks = chunks.saturating_add(1);
+        if empty || count == 0 {
+            break;
+        }
+        if duration < DRAIN_FAST {
+            k = k.saturating_mul(2).min(DRAIN_MAX_ROWS);
+        } else if duration > DRAIN_SLOW {
+            k = (k / 2).max(1);
+        }
+        std::thread::sleep(duration.clamp(MIN_DRAIN_PAUSE, MAX_DRAIN_PAUSE));
+    }
+    if removed > 0 {
+        tracing::info!(
+            rows = removed,
+            chunks,
+            elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "transcript index purge queue drained"
+        );
+    }
+    Ok(removed)
+}
+
+/// Drain after a writer outside the erasure paths committed its row deletes:
+/// no WAL truncation, as before the queue existed. A failure is logged and does
+/// not fail the operation, whose delete is committed; the next scrub retries.
+pub(super) fn drain_after_commit(pool: &MemoryPool) {
+    if let Err(error) = drain_fts_purge(pool) {
+        tracing::warn!(
+            error = %crate::agent::diagnostics::error_class(&error),
+            "transcript index purge after a delete failed; the next scrub retries"
+        );
+    }
 }
 
 fn table_exists(conn: &Connection, name: &str) -> anyhow::Result<bool> {
