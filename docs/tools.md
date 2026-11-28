@@ -916,7 +916,8 @@ only, and a key outside it is answered exactly like a missing key. Every
 surface without a view reads the base store as before, except that it never
 returns the ramflux conversation rows (keys starting with `rf:`): recall, search,
 automatic prompt memory, the gateway memory routes and plugin memory reads skip
-them, and a `memory_get` of such a key answers like a missing key.
+them, and a `memory_get` or `memory_forget` of such a key answers like a
+missing key (a forget deletes nothing).
 
 An embedded agent's legacy `MemoryLoader` callback runs when authenticated
 scoped semantic recall finds memory. It receives a bounded read view tied to

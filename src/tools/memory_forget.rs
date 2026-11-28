@@ -118,7 +118,11 @@ impl Tool for MemoryForgetTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let memory = crate::memory::active_view::current().unwrap_or_else(|| Arc::clone(&self.memory));
+        let view = crate::memory::active_view::current();
+        // A ramflux conversation's own rows (`rf:` keys) belong to its view; a
+        // forget outside the view answers them as a missing key.
+        let base_read = view.is_none();
+        let memory = view.unwrap_or_else(|| Arc::clone(&self.memory));
         let key = args
             .get("key")
             .and_then(|v| v.as_str())
@@ -163,7 +167,12 @@ impl Tool for MemoryForgetTool {
             context.agent_partition = partition;
             scope_ctx = Some(context);
         }
-        match memory.forget_with_context(key, scope_ctx.as_ref()).await {
+        let removed = if base_read && crate::memory::is_ramflux_scoped_key(key) {
+            Ok(false)
+        } else {
+            memory.forget_with_context(key, scope_ctx.as_ref()).await
+        };
+        match removed {
             Ok(true) => Ok(ToolResult {
                 success: true,
                 output: format!("Forgot memory: {key}"),
