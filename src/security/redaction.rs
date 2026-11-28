@@ -36,7 +36,9 @@
 //! - the credential after any `Authorization:` / `Proxy-Authorization:`
 //!   scheme (`Bearer`, `Basic`, `Bot`, `SSWS`, `ApiKey`, `AWS4-HMAC-SHA256`,
 //!   ...) and after a bare `Bearer`, at any length, also when the credential
-//!   is single- or double-quoted (`Bearer 'abc'` -> `Bearer '[REDACTED]'`);
+//!   is single- or double-quoted (`Bearer 'abc'` -> `Bearer '[REDACTED]'`)
+//!   or behind a backslash-escaped quote (`Bearer \"abc\"` ->
+//!   `Bearer \"[REDACTED]\"`);
 //! - keyless token formats, each with its minimum length (`sk-learn`, a
 //!   5-character body, is not a key): `sk-`, `sk-proj-`, `sk-ant-`, `xoxb-`,
 //!   `xoxp-`, `ghp_`, `gho_`, `ghu_`, `github_pat_`, `glpat-`, Stripe
@@ -81,6 +83,20 @@ static AUTHORIZATION_HEADER: LazyLock<Option<Regex>> = LazyLock::new(|| {
 /// optional opening quote (`bearer "abc"` masks `abc`).
 static BARE_BEARER: LazyLock<Option<Regex>> =
     LazyLock::new(|| Regex::new(r#"(?i)(?:^|[^a-z0-9])bearer\s+["']?([^\s"',;]+)"#).ok());
+
+/// [`AUTHORIZATION_HEADER`] and [`BARE_BEARER`] after a backslash-escaped
+/// opening quote (`Bearer \"abc\"`, a header inside a serialized string):
+/// capture 1 stops before the backslash of the closing quote, so the result
+/// stays a valid escaped string (`Bearer \"[REDACTED]\"`).
+static ESCAPED_QUOTE_CREDENTIALS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    [
+        r#"(?i)(?:proxy-)?authorization["']?\s*[:=]\s*["']?[A-Za-z][A-Za-z0-9_-]*[ \t]+\\+["']([^\r\n"'\\]+)"#,
+        r#"(?i)(?:^|[^a-z0-9])bearer\s+\\+["']([^\s"',;\\]+)"#,
+    ]
+    .iter()
+    .filter_map(|pattern| Regex::new(pattern).ok())
+    .collect()
+});
 
 /// Keyless token formats with a fixed shape: the whole match is the secret.
 static KEYLESS_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
@@ -338,6 +354,18 @@ pub fn find_secrets(text: &str) -> Vec<Range<usize>> {
     let url_parts = url_secret_spans(text, &mut spans);
     keyed_pair_spans(text, &url_parts, &mut spans);
     escaped_pair_spans(text, &mut spans);
+    let mut escaped_starts = Vec::new();
+    for pattern in ESCAPED_QUOTE_CREDENTIALS.iter() {
+        #[cfg(test)]
+        record_redaction_work(text.len());
+        for credential in pattern.captures_iter(text).filter_map(|captures| captures.get(1)) {
+            #[cfg(test)]
+            record_redaction_work(credential.len());
+            escaped_starts.push(credential.start());
+            spans.push(credential.start()..credential.start() + credential.as_str().trim_end().len());
+        }
+    }
+    escaped_starts.sort_unstable();
     for pattern in [AUTHORIZATION_HEADER.as_ref(), BARE_BEARER.as_ref()]
         .into_iter()
         .flatten()
@@ -348,7 +376,19 @@ pub fn find_secrets(text: &str) -> Vec<Range<usize>> {
             #[cfg(test)]
             record_redaction_work(credential.len());
             let trimmed = credential.as_str().trim_end();
-            spans.push(credential.start()..credential.start() + trimmed.len());
+            let end = credential.start() + trimmed.len();
+            // Only the backslashes escaping an opening quote whose credential
+            // the escaped pass masked stay visible; every other span is kept.
+            let quote_escape = !trimmed.is_empty()
+                && trimmed.bytes().all(|byte| byte == b'\\')
+                && text
+                    .as_bytes()
+                    .get(end)
+                    .is_some_and(|byte| matches!(byte, b'"' | b'\''))
+                && escaped_starts.binary_search(&(end + 1)).is_ok();
+            if !quote_escape {
+                spans.push(credential.start()..end);
+            }
         }
     }
     for pattern in KEYLESS_PATTERNS.iter() {
