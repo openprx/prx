@@ -40,7 +40,9 @@ pub(super) fn init_schema(conn: &Connection) -> anyhow::Result<()> {
         CREATE UNIQUE INDEX IF NOT EXISTS idx_rf_message_attempts_run
             ON rf_message_attempts(workspace_id, run_id) WHERE run_id IS NOT NULL;
         CREATE UNIQUE INDEX IF NOT EXISTS idx_rf_message_attempts_job
-            ON rf_message_attempts(workspace_id, job_id) WHERE job_id IS NOT NULL;",
+            ON rf_message_attempts(workspace_id, job_id) WHERE job_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_rf_message_attempts_message_event
+            ON rf_message_attempts(workspace_id, message_event_id);",
     )?;
     Ok(())
 }

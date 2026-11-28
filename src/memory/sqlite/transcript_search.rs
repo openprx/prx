@@ -29,7 +29,9 @@ const REGION_SIDE_CHARS: usize = 4_096;
 /// of a live run sets `deleted_at` at once and only defers the row rewrite
 /// (`erase_pending`), so the row is excluded from that moment. Shared by the
 /// search and by [`SqliteMemory::excluded_transcript_rows_impl`], so both apply
-/// the same predicate.
+/// the same predicate. The rf-delete test is two `NOT EXISTS` lookups (by
+/// message event id, then by run id) so each uses its own index; one `OR`
+/// across both columns made SQLite scan every attempt of the owner per row.
 pub(super) const SEARCHABLE_ROW_SQL: &str = "NOT EXISTS (SELECT 1 FROM agent_erase_fences f WHERE f.scope_id = e.ma_scope_id)
                    AND (e.ma_scope_id IS NULL OR EXISTS (
                         SELECT 1 FROM agent_scopes s
@@ -38,11 +40,13 @@ pub(super) const SEARCHABLE_ROW_SQL: &str = "NOT EXISTS (SELECT 1 FROM agent_era
                          AND i.agent_key = s.agent_key AND i.incarnation = s.incarnation
                         WHERE s.scope_id = e.ma_scope_id AND i.state = 'active'))
                    AND NOT EXISTS (SELECT 1 FROM rf_message_attempts a
-                        WHERE a.workspace_id = e.workspace_id AND a.owner_id = e.owner_id
-                          AND ((a.deleted_at IS NOT NULL
-                                AND (a.message_event_id = e.event_id OR a.run_id = e.run_id))
-                            OR (a.reply_deleted_at IS NOT NULL AND a.run_id = e.run_id
-                                AND a.message_event_id <> e.event_id)))";
+                        WHERE a.workspace_id = e.workspace_id AND a.message_event_id = e.event_id
+                          AND a.owner_id = e.owner_id AND a.deleted_at IS NOT NULL)
+                   AND NOT EXISTS (SELECT 1 FROM rf_message_attempts a
+                        WHERE a.workspace_id = e.workspace_id AND a.run_id = e.run_id
+                          AND a.owner_id = e.owner_id
+                          AND (a.deleted_at IS NOT NULL
+                               OR (a.reply_deleted_at IS NOT NULL AND a.message_event_id <> e.event_id)))";
 
 /// The query terms and how they are matched against `message_events.content`.
 struct QueryMatch {
