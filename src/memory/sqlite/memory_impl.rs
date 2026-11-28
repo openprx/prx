@@ -1239,6 +1239,10 @@ impl Memory for SqliteMemory {
             .await
     }
 
+    async fn delete_tool_output_document(&self, document_id: &str) -> anyhow::Result<bool> {
+        self.delete_tool_output_document_impl(document_id).await
+    }
+
     async fn replace_tool_ledger_payload(
         &self,
         workspace_id: &str,

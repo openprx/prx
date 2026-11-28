@@ -16,9 +16,14 @@ use crate::memory::printed_keys::{MEMORY_REMOVED_TEXT, MEMORY_TOOLS, printed_key
 /// (`tools/memory_forget.rs`); a missing key prints a different line.
 const FORGOT_PREFIX: &str = "Forgot memory: ";
 
-/// The `(call index, key)` of every `memory_forget` of the batch that removed
-/// a memory.
-pub(super) fn forgotten_in_batch(calls: &[ParsedToolCall], outcomes: &[ObservedToolResult]) -> Vec<(usize, String)> {
+/// The `(execution position, key)` of every `memory_forget` of the batch that
+/// removed a memory. `order` holds the position each call ran in (see
+/// `tool_scheduler::execute_tools_with_order`).
+pub(super) fn forgotten_in_batch(
+    calls: &[ParsedToolCall],
+    outcomes: &[ObservedToolResult],
+    order: &[usize],
+) -> Vec<(usize, String)> {
     calls
         .iter()
         .zip(outcomes)
@@ -28,13 +33,14 @@ pub(super) fn forgotten_in_batch(calls: &[ParsedToolCall], outcomes: &[ObservedT
         })
         .filter_map(|(index, (call, _))| {
             let key = call.arguments.get("key")?.as_str()?;
-            (!key.is_empty()).then(|| (index, key.to_owned()))
+            (!key.is_empty()).then(|| (order.get(index).copied().unwrap_or(index), key.to_owned()))
         })
         .collect()
 }
 
-/// The text to store instead of `text`, the effective result of call `index`
-/// of tool `tool`, when a later call of the batch forgot a memory that `text`
+/// The text to store instead of `text`, the effective result of the call of
+/// tool `tool` that ran at position `index`, when a call that ran later in the
+/// batch forgot a memory that `text`
 /// prints. A key is compared in its own form and in its redacted form, as the
 /// sweep does.
 pub(super) fn masked_for_forget(

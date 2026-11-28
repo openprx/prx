@@ -787,6 +787,10 @@ impl Memory for LucidMemory {
             .await
     }
 
+    async fn delete_tool_output_document(&self, document_id: &str) -> anyhow::Result<bool> {
+        self.local.delete_tool_output_document(document_id).await
+    }
+
     async fn replace_tool_ledger_payload(
         &self,
         workspace_id: &str,

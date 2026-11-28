@@ -34,6 +34,7 @@ pub(crate) mod remote_tree;
 mod rf_attachments;
 mod rf_delete;
 mod rf_forget;
+mod tool_document;
 mod rf_messages;
 mod session_event_ids;
 mod session_event_type;

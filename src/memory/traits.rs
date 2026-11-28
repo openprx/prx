@@ -821,6 +821,15 @@ pub trait Memory: Send + Sync {
         Ok(false)
     }
 
+    /// Delete the stored tool-output document `document_id` of a tool result
+    /// that is kept without its text, unless a stored result row still names
+    /// it; returns whether a document was deleted. Backends without stored
+    /// tool-output documents change nothing.
+    async fn delete_tool_output_document(&self, document_id: &str) -> anyhow::Result<bool> {
+        let _ = document_id;
+        Ok(false)
+    }
+
     /// Replace the stored payload of the ledger row `terminal_key` with one the
     /// encrypted scope sealed. A [`SealedLedgerPayload`] can only be built
     /// inside this crate, by the scope that sealed it. Backends without a

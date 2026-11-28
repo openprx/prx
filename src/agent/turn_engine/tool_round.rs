@@ -17,7 +17,7 @@ use crate::agent::tool_result_recording::{
     ExecutedToolRecords, ObservedToolResult, ToolResultRecorder, compact_tool_result_for_history_with_status,
     tool_result_inline_budget_for_history,
 };
-use crate::agent::tool_scheduler::{execute_tools_with_service, shared_unrecoverable_tool_error};
+use crate::agent::tool_scheduler::{execute_tools_with_order, shared_unrecoverable_tool_error};
 use crate::agent::turn_contracts::{ToolCallNotification, ToolLoopCancelled, ToolLoopOutcome};
 use crate::agent::turn_history::TurnHistory;
 use crate::context::api::hook_points;
@@ -238,7 +238,7 @@ pub(super) async fn run_tools(
     }
     let executed = ExecutedToolRecords::new(history, &recorder, &tool_calls, &native_tool_calls);
 
-    let individual_results = match execute_tools_with_service(
+    let (individual_results, execution_order) = match execute_tools_with_order(
         &tool_calls,
         &native_tool_calls,
         &round.execution_adapter,
@@ -334,7 +334,7 @@ pub(super) async fn run_tools(
     // A memory read of this batch that printed a key a later call of the batch
     // forgot is stored without that text; the rows are written below, after
     // the forget's sweep ran, so the sweep never saw them.
-    let forgotten = forgotten_in_batch(&tool_calls, &individual_results);
+    let forgotten = forgotten_in_batch(&tool_calls, &individual_results, &execution_order);
     let mut repeated_unrecoverable: Option<String> = None;
     // Everything below that plans against the window plans against the
     // reserved one, the same window the preflight used: this turn's schemas
@@ -417,6 +417,9 @@ pub(super) async fn run_tools(
         // document layer when a runtime document sink is available. The
         // storage threshold is the same budget the history cut uses, so a
         // result is stored exactly when it is cut.
+        let masked = execution_order
+            .get(index)
+            .and_then(|position| masked_for_forget(*position, &call.name, &observed.content, &forgotten));
         let max_inline_chars =
             tool_result_inline_budget_for_history(&call.name, executed.history(), reserved_config.as_ref());
         let document_status = persist_tool_output_document(
@@ -439,7 +442,7 @@ pub(super) async fn run_tools(
         );
         if let Some(log) = round_log.as_ref() {
             let call_id = call_id_for(&call.name, index, &native_tool_calls);
-            if let Some(marker) = masked_for_forget(index, &call.name, &observed.content, &forgotten) {
+            if let Some(marker) = masked {
                 let stored = ObservedToolResult {
                     content: marker.to_owned(),
                     ..observed.clone()
@@ -460,6 +463,24 @@ pub(super) async fn run_tools(
             } else {
                 log.append_result(&call_id, &call.name, observed, &truncated_result, document_status)
                     .await;
+            }
+        }
+        // The live text keeps its stored document (the turn already
+        // read it); the stored row names none, so the document would
+        // outlive the memory it quotes.
+        if masked.is_some()
+            && document_status == "persisted_document_backend"
+            && let Some(runtime) = document_ingest.as_ref()
+        {
+            let (document_id, _) =
+                crate::agent::document_ingest::tool_output_document_id(&call.name, &observed.content);
+            if let Err(error) = runtime.memory.delete_tool_output_document(&document_id).await {
+                let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+                tracing::warn!(
+                    error_len,
+                    error_sha256,
+                    "Failed to delete the document of a masked tool result"
+                );
             }
         }
         let _ = writeln!(

@@ -566,6 +566,7 @@ impl Drop for DelegationExecutionTask {
     }
 }
 
+#[cfg(test)]
 pub(super) async fn execute_tools_with_service(
     tool_calls: &[ParsedToolCall],
     native_tool_calls: &[ToolCall],
@@ -576,6 +577,34 @@ pub(super) async fn execute_tools_with_service(
     observer: &dyn Observer,
     recorder: &ToolResultRecorder,
 ) -> Result<Vec<ObservedToolResult>> {
+    execute_tools_with_order(
+        tool_calls,
+        native_tool_calls,
+        adapter,
+        schedule,
+        cancellation,
+        chat_mode,
+        observer,
+        recorder,
+    )
+    .await
+    .map(|(results, _)| results)
+}
+
+/// [`execute_tools_with_service`] that also returns, for each call index, the
+/// position in which the scheduler ran it (its priority order; the call index
+/// itself when priority scheduling is off). A stateful call runs after every
+/// call that precedes it in this order and before every call that follows it.
+pub(super) async fn execute_tools_with_order(
+    tool_calls: &[ParsedToolCall],
+    native_tool_calls: &[ToolCall],
+    adapter: &ToolLoopRuntimeAdapter,
+    schedule: ReadOnlyToolScheduleConfig,
+    cancellation: Option<&CancellationToken>,
+    chat_mode: ChatMode,
+    observer: &dyn Observer,
+    recorder: &ToolResultRecorder,
+) -> Result<(Vec<ObservedToolResult>, Vec<usize>)> {
     use futures::stream::{self, StreamExt};
 
     let mut ordered_indices = (0..tool_calls.len()).collect::<Vec<_>>();
@@ -645,7 +674,7 @@ pub(super) async fn execute_tools_with_service(
                     // cancellation observations; completed results were already
                     // recorded by execute_one_with_service.
                     drop(pending);
-                    return result.map(|_| Vec::new());
+                    return result.map(|_| (Vec::new(), Vec::new()));
                 }
                 // Other errors retain the existing drain-before-return
                 // behavior, including records from sibling calls.
@@ -677,7 +706,13 @@ pub(super) async fn execute_tools_with_service(
         *results.get_mut(index).ok_or_else(|| tool_index_out_of_range(index))? = result;
         cursor += 1;
     }
-    Ok(results)
+    let mut order = vec![0; tool_calls.len()];
+    for (position, index) in ordered_indices.iter().enumerate() {
+        if let Some(slot) = order.get_mut(*index) {
+            *slot = position;
+        }
+    }
+    Ok((results, order))
 }
 
 fn tool_index_out_of_range(index: usize) -> anyhow::Error {
