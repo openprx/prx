@@ -73,8 +73,8 @@ pub(super) fn cached_remote_jwks(uri: &str, ttl_secs: u64) -> Option<Arc<JwkSet>
 /// synchronous verification path runs. No-op unless a remote `jwt_jwks_uri` is
 /// configured and no inline `jwt_jwks` overrides it.
 ///
-/// Runs the blocking HTTP fetch on a blocking thread so the async runtime is
-/// never stalled. On fetch failure the existing cache entry (if any) is left in
+/// The fetch is async, so the runtime is never stalled; concurrent requests
+/// share one fetch and a failed fetch backs off per URI. On fetch failure the existing cache entry (if any) is left in
 /// place — a still-fresh entry keeps working, a stale/absent one results in a
 /// fail-closed rejection at verification time.
 pub(super) async fn prewarm_remote_jwks(config: &crate::config::McpServerRuntimeConfig) {
