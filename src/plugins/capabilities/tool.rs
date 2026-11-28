@@ -360,6 +360,7 @@ impl WasmToolAdapter {
                                 Ok(entries) => {
                                     let results: Vec<(String, String, String, f64)> = entries
                                         .into_iter()
+                                        .filter(|e| !crate::memory::is_ramflux_scoped_key(&e.key))
                                         .map(|e| (e.id, e.content, e.category.to_string(), e.score.unwrap_or(0.0)))
                                         .collect();
                                     Ok((Ok(results),))

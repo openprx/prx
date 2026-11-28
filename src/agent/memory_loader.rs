@@ -163,8 +163,11 @@ impl Memory for SelectedMemoryView<'_> {
                     && hit.source_event_id.as_ref().is_none_or(|id| id.len() <= 128)),
             "selected Memory backend exceeded its result contract"
         );
+        // Without a ramflux memory view this is a base-store read.
+        let base_read = crate::memory::active_view::current().is_none();
         hits.retain(|hit| {
-            self.excluded_key != Some(hit.key.as_str())
+            !(base_read && crate::memory::is_ramflux_scoped_key(&hit.key))
+                && self.excluded_key != Some(hit.key.as_str())
                 && (self.excluded_event.is_none() || hit.source_event_id.as_deref() != self.excluded_event)
                 && !hit.content.trim().is_empty()
         });

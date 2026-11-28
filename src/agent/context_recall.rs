@@ -456,6 +456,9 @@ async fn build_semantic_context(
     let mut summaries = Vec::new();
     let mut context = String::new();
     let mut ids = Vec::new();
+    // Without a ramflux memory view this reads the base store, where
+    // conversation-scoped rows must not reach the prompt.
+    let base_read = crate::memory::active_view::current().is_none();
 
     // The current turn is already in the live input; its semantic promotion
     // must not count as historical recall or trigger a presentation callback.
@@ -465,6 +468,7 @@ async fn build_semantic_context(
         .unwrap_or_default()
         .into_iter()
         .filter(|entry| entry.score.map_or(true, |score| score >= min_relevance_score))
+        .filter(|entry| !(base_read && crate::memory::is_ramflux_scoped_key(&entry.key)))
         .filter(|entry| !input_key_excluded(excluded_key, &entry.key))
         .filter(|entry| excluded_event.is_none() || entry.source_event_id.as_deref() != excluded_event)
         .filter(|entry| !unscoped_remote_hit(entry.origin, entry.source_event_id.as_deref()))
@@ -537,6 +541,7 @@ async fn build_semantic_context(
         })
         .unwrap_or_default()
         .into_iter()
+        .filter(|hit| !(base_read && crate::memory::is_ramflux_scoped_key(&hit.key)))
         .filter(|hit| !input_key_excluded(excluded_key, &hit.key))
         .filter(|hit| excluded_event.is_none() || hit.source_event_id.as_deref() != excluded_event)
         .map(|hit| {

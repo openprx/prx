@@ -409,6 +409,7 @@ pub fn register_memory_host_functions(linker: &mut wasmtime::component::Linker<H
                         match memory.recall(&query, limit as usize, None).await {
                             Ok(entries) => Ok((Ok(entries
                                 .into_iter()
+                                .filter(|entry| !crate::memory::is_ramflux_scoped_key(&entry.key))
                                 .map(|entry| {
                                     (
                                         entry.id,

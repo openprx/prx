@@ -591,7 +591,11 @@ pub async fn dispatch(input: &str, ctx: &CommandContext<'_>) -> CommandResult {
             if query.is_empty() {
                 return CommandResult::HandledWithOutput("Usage: /memory <search query>".to_string());
             }
-            let out = match ctx.mem.recall(query, 5, None).await {
+            let recalled = ctx.mem.recall(query, 5, None).await.map(|mut entries| {
+                entries.retain(|entry| !crate::memory::is_ramflux_scoped_key(&entry.key));
+                entries
+            });
+            let out = match recalled {
                 Ok(entries) if entries.is_empty() => format!("No memory entries found for: {query}"),
                 Ok(entries) => {
                     let mut s = format!("Memory results for \"{query}\":\n");
