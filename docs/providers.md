@@ -1460,3 +1460,25 @@ lower the level; foreground commands default to `warn` when it is unset);
 events contain redacted
 provider/model labels, hashes and usage counts, without prompts, schemas or
 conversation identifiers.
+
+## Test mock provider scripted tool calls
+
+The `mock` provider exists only in builds with the `test-mock` Cargo feature.
+It answers with `OPENPRX_MOCK_RESPONSE` and can script tool calls so a real
+test drives a tool without a model request.
+
+- `OPENPRX_MOCK_TOOL_CALL=name:args_json` scripts one call. A terminal
+  `prx chat --message` turn (streaming) emits it on its first model call. A
+  non-streaming turn, such as a channel (ramflux) or gateway turn, emits it
+  once per provider instance when the tool is offered on that turn; the user
+  text does not need to name the tool. The call is followed by the tool result
+  and then the mock text reply.
+- `OPENPRX_MOCK_TOOL_CALLS_FILE=<path>` points at a JSON array of
+  `{"name":"memory_store","args":{"key":"home","content":"12 Main St"}}`
+  entries. On non-streaming turns each tool-carrying turn consumes the next
+  entry, counted across the whole process, so one daemon serves several scripted
+  turns. The follow-up model call after a tool result does not consume an entry.
+  The named tool need not be offered; if the turn did not expose it, the engine
+  reports that instead of running it. When the file is set it takes precedence
+  over `OPENPRX_MOCK_TOOL_CALL` on non-streaming turns, and terminal streaming
+  turns ignore it.

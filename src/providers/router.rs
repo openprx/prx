@@ -389,6 +389,9 @@ pub(crate) struct MockEnvProvider {
     /// 5a-6: when `OPENPRX_MOCK_TOOL_CALL=name:args_json` is set, the first streaming call
     /// emits a `ToolCallChunk`(name, args) and later calls return the `response` text.
     /// This lets PTY E2E verify the driver's full tool turn loop (call → execute → continue → final).
+    /// Non-streaming turns (channels, gateway) take the same call through `chat` once per provider
+    /// instance, whenever the tool is offered (test-mock builds); see
+    /// `OPENPRX_MOCK_TOOL_CALLS_FILE` for a per-turn sequence and `docs/providers.md`.
     /// When `None`, the original 5a-2 behaviour is kept (return the response text directly).
     tool_call_spec: Option<MockToolCallSpec>,
     /// Streaming call counter; decides whether this call emits a tool_call or the final text.
@@ -417,6 +420,11 @@ pub(crate) struct MockEnvProvider {
     /// *failure* paths (retry / backoff / rate-limit handling) through the real
     /// factory, which is otherwise unreachable without a live upstream.
     error: Option<String>,
+    /// `OPENPRX_MOCK_TOOL_CALLS_FILE`: path of a JSON array of
+    /// `{"name":..,"args":{..}}`, consumed one entry per tool-carrying model
+    /// request across the whole process (non-streaming turns: channels, gateway).
+    #[cfg(feature = "test-mock")]
+    tool_calls_file: Option<PathBuf>,
 }
 
 #[cfg(any(test, feature = "test-mock"))]
@@ -689,6 +697,12 @@ impl MockEnvProvider {
             delay_ms_by_prompt,
             hold_while_file,
             error,
+            #[cfg(feature = "test-mock")]
+            tool_calls_file: std::env::var("OPENPRX_MOCK_TOOL_CALLS_FILE")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
         }
     }
 
@@ -715,6 +729,80 @@ impl MockEnvProvider {
             },
             |message| Err(anyhow::anyhow!("{message}")),
         )
+    }
+}
+
+#[cfg(feature = "test-mock")]
+#[derive(serde::Deserialize)]
+struct MockFileToolCall {
+    name: String,
+    #[serde(default)]
+    args: serde_json::Value,
+}
+
+/// Process-wide cursor into the `OPENPRX_MOCK_TOOL_CALLS_FILE` array. It is a
+/// static so one daemon serves many turns, even when a provider instance is
+/// rebuilt per turn.
+#[cfg(feature = "test-mock")]
+static MOCK_FILE_CALL_CURSOR: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(feature = "test-mock")]
+impl MockEnvProvider {
+    /// The next scripted call of the calls file for a non-streaming request.
+    ///
+    /// Only a request that carries tools and whose last message is not a tool
+    /// result or an assistant message consumes an entry, so the follow-up call
+    /// of a tool turn returns the text reply and the next turn takes the next
+    /// entry. The named tool need not be offered: a deferred tool is still
+    /// called by name and the engine reports what it does with it.
+    fn next_file_tool_call(&self, request: &ChatRequest<'_>) -> Option<crate::providers::ToolCall> {
+        let path = self.tool_calls_file.as_ref()?;
+        if request.tools.is_none_or(<[crate::tools::ToolSpec]>::is_empty) {
+            return None;
+        }
+        if request
+            .messages
+            .last()
+            .is_some_and(|message| matches!(message.role.as_str(), "tool" | "assistant"))
+        {
+            return None;
+        }
+        let raw = std::fs::read_to_string(path).ok()?;
+        let entries = match serde_json::from_str::<Vec<MockFileToolCall>>(&raw) {
+            Ok(entries) => entries,
+            Err(error) => {
+                tracing::warn!(error = %error, "OPENPRX_MOCK_TOOL_CALLS_FILE parse failed, ignoring");
+                return None;
+            }
+        };
+        let index = MOCK_FILE_CALL_CURSOR.fetch_add(1, Ordering::SeqCst);
+        let entry = entries.into_iter().nth(index)?;
+        Some(crate::providers::ToolCall {
+            id: format!("mock-file-call-{index}"),
+            name: entry.name,
+            arguments: entry.args.to_string(),
+        })
+    }
+}
+
+/// Whether the latest request addresses the single scripted call. A test-mock
+/// build lets any tool-carrying turn take it (channel turns never name the
+/// tool in the user text); other builds keep the name rule.
+#[cfg(any(test, feature = "test-mock"))]
+fn mock_request_addresses_script(offered_len: usize, messages: &[ChatMessage], name: &str) -> bool {
+    #[cfg(feature = "test-mock")]
+    {
+        let _ = (offered_len, messages, name);
+        true
+    }
+    #[cfg(not(feature = "test-mock"))]
+    {
+        offered_len == 1
+            || messages
+                .iter()
+                .rev()
+                .find(|message| message.role == "user")
+                .is_some_and(|message| message.content.contains(name))
     }
 }
 
@@ -751,15 +839,17 @@ impl Provider for MockEnvProvider {
     /// request names it. A sole proposal schema also supports argument collection.
     /// Unoffered tools and later unrelated input retain the plain text outcome.
     async fn chat(&self, request: ChatRequest<'_>, _model: &str, _temperature: f64) -> anyhow::Result<ChatResponse> {
+        #[cfg(feature = "test-mock")]
+        if let Some(call) = self.next_file_tool_call(&request) {
+            return Ok(ChatResponse {
+                text: None,
+                tool_calls: vec![call],
+                reasoning_content: None,
+            });
+        }
         if let (Some(spec), Some(offered)) = (self.tool_call_spec.as_ref(), request.tools)
             && offered.iter().any(|tool| tool.name == spec.name)
-            && (offered.len() == 1
-                || request
-                    .messages
-                    .iter()
-                    .rev()
-                    .find(|message| message.role == "user")
-                    .is_some_and(|message| message.content.contains(spec.name.as_str())))
+            && mock_request_addresses_script(offered.len(), request.messages, spec.name.as_str())
             && self
                 .native_tool_state
                 .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
