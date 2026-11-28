@@ -26,7 +26,10 @@ minutes), `xin:stale_cleanup` (thirty minutes), and `xin:memory_hygiene` (twelve
 hours). Persisted `xin:memory_evolution` and `xin:fitness_report` names are
 disabled; those jobs now belong to the self-system workers. Recurring task
 failures increment a failure counter and reschedule; they do not disable the
-task.
+task. An agent run that ends waiting on an approval, or in which every tool call
+that finished was refused, is a failed run: its stored status and its result row
+say so. A run in which at least one call succeeded is judged by its reply as
+before.
 
 Heartbeat has no separate enable flag and no separate execution loop. Defaults
 are `interval_minutes = 30`, `active_hours = [8, 23]`, and

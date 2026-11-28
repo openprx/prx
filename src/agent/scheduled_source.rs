@@ -35,7 +35,24 @@ pub(crate) struct ScheduledAgentOrigin {
     /// The finish time of this run, fixed by its first result record so every
     /// record of the same run reports the same time.
     finished_at: std::sync::OnceLock<String>,
+    /// Set when the run's tool loop ended on a refused tool call
+    /// ([`mark_refused`]).
+    refused: AtomicBool,
 }
+
+/// The error a scheduled run returns when it ended on a refused tool call: the
+/// run did not complete its work, so it is not reported as a success. The text
+/// is fixed and carries nothing of the run.
+#[derive(Debug)]
+pub(crate) struct ScheduledRunRefused;
+
+impl std::fmt::Display for ScheduledRunRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("scheduled run ended on a refused tool call")
+    }
+}
+
+impl std::error::Error for ScheduledRunRefused {}
 
 /// What the result row of a scheduled run needs from its origin.
 pub(crate) struct ScheduledResultMeta {
@@ -84,6 +101,24 @@ pub(crate) fn current_result_meta(run_task_id: Option<&str>) -> Option<Scheduled
         })
         .ok()
         .flatten()
+}
+
+/// Records that the scheduled invocation `run_task_id` ended on a refused tool
+/// call. A nested run that inherits the scope has another task id and records
+/// nothing.
+pub(super) fn mark_refused(run_task_id: Option<&str>) {
+    let _ = SCHEDULED_ORIGIN.try_with(|origin| {
+        if run_task_id == Some(origin.task_id.as_str()) {
+            origin.refused.store(true, Ordering::Release);
+        }
+    });
+}
+
+/// Whether the scheduled invocation `run_task_id` recorded a refusal.
+pub(super) fn run_refused(run_task_id: Option<&str>) -> bool {
+    SCHEDULED_ORIGIN
+        .try_with(|origin| run_task_id == Some(origin.task_id.as_str()) && origin.refused.load(Ordering::Acquire))
+        .unwrap_or(false)
 }
 
 /// A read-only observation held by the scheduler, never a permission to replay
@@ -145,6 +180,7 @@ impl ScheduledAgentOrigin {
             name: job.name.clone(),
             deliver: job.deliver,
             finished_at: std::sync::OnceLock::new(),
+            refused: AtomicBool::new(false),
         }
     }
 
@@ -164,6 +200,7 @@ impl ScheduledAgentOrigin {
             name: Some(task.name.clone()),
             deliver: task.deliver,
             finished_at: std::sync::OnceLock::new(),
+            refused: AtomicBool::new(false),
         }
     }
 

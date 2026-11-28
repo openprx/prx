@@ -937,10 +937,18 @@ pub(crate) async fn run_with_runtime_envelope(
                 };
                 {
                     let decision = decision_context;
+                    let execution_trace = decision.terminal_execution_trace();
                     anyhow::ensure!(
-                        turn_trace.execution_trace.as_ref() == Some(&decision.terminal_execution_trace()),
+                        turn_trace.execution_trace.as_ref() == Some(&execution_trace),
                         "tool loop trace differs from the owning decision's execution facts"
                     );
+                    // A run that ended waiting on an approval, or in which every
+                    // tool call that finished was refused, did not do its work.
+                    if execution_trace.awaiting_approval_attempts > 0
+                        || (execution_trace.denied_attempts > 0 && execution_trace.successful_attempts == 0)
+                    {
+                        super::scheduled_source::mark_refused(runtime_envelope.task_id.as_deref());
+                    }
                 }
                 let provider_outcome = crate::agent::terminal::provider_outcome_from_trace(
                     &route_decision,
@@ -1069,6 +1077,17 @@ pub(crate) async fn run_with_runtime_envelope(
     let result = match caller_cleanup {
         Some(cleanup) => cleanup.run(work).await,
         None => work.await,
+    };
+    // A scheduled run that ended on a refused tool call reports that, not a success.
+    let result = match result {
+        Ok(_)
+            if result_envelope
+                .as_ref()
+                .is_some_and(|envelope| super::scheduled_source::run_refused(envelope.task_id.as_deref())) =>
+        {
+            Err(anyhow::Error::new(super::scheduled_source::ScheduledRunRefused))
+        }
+        other => other,
     };
     // A scheduled run records its result in its own session; a failure there never fails the run.
     if let (Some(envelope), Some(memory)) = (result_envelope.as_ref(), ctx.memory.as_ref()) {
