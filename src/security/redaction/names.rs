@@ -36,6 +36,11 @@ const PASSWORD_OR_SECRET_SEGMENTS: [&str; 7] = [
     "secrets",
 ];
 
+/// Endings that make a run-together last segment a password or secret word
+/// (`pgpassword`, `clientsecret`). `pwd` matches only as a whole segment, so
+/// `cwd`-like names are not counted.
+const PASSWORD_OR_SECRET_SUFFIXES: [&str; 4] = ["password", "passwd", "passphrase", "secret"];
+
 /// Endings that make a run-together segment a credential name, as the
 /// pre-program detectors matched them unanchored: `mytoken`, `authtoken`,
 /// `PGPASSWORD`, `clientsecret`, `x_apikey`, `authheader`. `tokenizer`,
@@ -306,14 +311,15 @@ pub(super) fn names_a_credential(key: &str) -> bool {
     classify_name(key) == KeyName::Credential
 }
 
-/// Whether the last segment of `key` is a password or secret word
-/// (`password`, `db_password`, `dbPassword`, `client-secret`): such a name
-/// gets no call-shape exemption. `token`, `api_key` and `PGPASSWORD` (one
-/// run-together segment) are not counted.
+/// Whether the last segment of `key` is a password or secret word or ends
+/// with one (`password`, `db_password`, `dbPassword`, `client-secret`,
+/// `PGPASSWORD`, `clientsecret`): such a name gets no call-shape exemption.
+/// `token`, `api_key` and `cwd` are not counted.
 pub(super) fn names_a_password_or_secret(key: &str) -> bool {
-    key_segments(key)
-        .last()
-        .is_some_and(|last| PASSWORD_OR_SECRET_SEGMENTS.contains(&last.as_str()))
+    key_segments(key).last().is_some_and(|last| {
+        PASSWORD_OR_SECRET_SEGMENTS.contains(&last.as_str())
+            || PASSWORD_OR_SECRET_SUFFIXES.iter().any(|suffix| last.ends_with(suffix))
+    })
 }
 
 /// Whether the whole key is the bare name `key` or `auth`.
