@@ -71,6 +71,10 @@ pub(super) enum TextReply {
 pub(super) struct RoundBudget {
     pub(super) request_budget: Option<crate::context::budget::anchor::RequestBudget>,
     pub(super) budgeted_totals: Option<(usize, usize)>,
+    /// The round's tool-surface hash; `Some` exactly when the round ran
+    /// under a compaction config. The trim after the tool results probes the
+    /// usage anchors with it.
+    pub(super) tool_hash: Option<[u8; 32]>,
 }
 
 /// The tool surface of one round: the tools it may expose, their specs and the

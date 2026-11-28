@@ -208,6 +208,7 @@ pub(super) async fn plan_round_budget(
     // entrypoints that pass no compaction config: there is no budget to
     // report there.
     let mut request_budget: Option<RequestBudget> = None;
+    let mut tool_hash: Option<[u8; 32]> = None;
     let budgeted_totals: Option<(usize, usize)> = if let Some(config) = compaction_config {
         // The system prompt is the leading message of the history; its
         // budgeted size feeds the window floor check in `plan_round`. It is
@@ -224,8 +225,9 @@ pub(super) async fn plan_round_budget(
         // The durable phase, then the projection phase: the two steps of
         // the reduction ladder that run on every round, under the
         // calibration the last response's reported usage gives.
-        let tool_hash = anchor::tool_surface_hash(&tool_specs, &decision_fingerprints);
-        let probe = usage_anchors.probe(history, Some(tool_hash), provider_name, model);
+        let round_tool_hash = anchor::tool_surface_hash(&tool_specs, &decision_fingerprints);
+        tool_hash = Some(round_tool_hash);
+        let probe = usage_anchors.probe(history, Some(round_tool_hash), provider_name, model);
         let mut round = Round {
             history: &mut *history,
             turn_history,
@@ -260,6 +262,7 @@ pub(super) async fn plan_round_budget(
     Ok(RoundBudget {
         request_budget,
         budgeted_totals,
+        tool_hash,
     })
 }
 

@@ -27,7 +27,7 @@ use crate::context::transcript::{RoundLog, append_hook_contributions, call_id_fo
 use crate::providers::ToolCall;
 
 use super::batch_forget::{forgotten_in_batch, masked_for_forget};
-use super::state::{PreparedRound, TurnInputs, TurnState};
+use super::state::{PreparedRound, RoundBudget, TurnInputs, TurnState};
 use crate::agent::tool_call_parser::ParsedToolCall;
 
 /// The tool calls of one round, as the provider answered them.
@@ -157,6 +157,7 @@ pub(super) async fn run_tools(
     turn_history: &mut TurnHistory,
     history: &mut Vec<ChatMessage>,
     round: &PreparedRound,
+    budget: &RoundBudget,
     calls: ToolCalls,
 ) -> Result<Option<ToolLoopOutcome>> {
     let ToolCalls {
@@ -553,7 +554,7 @@ pub(super) async fn run_tools(
     // round that needs no trim still clones nothing.
     if let Some(reserved_config) = reserved_config.as_ref() {
         let planning = usage_anchors
-            .probe(history, None, provider_name, model)
+            .probe(history, budget.tool_hash, provider_name, model)
             .planning(round.tool_surface);
         let mut after_tools = AfterTools {
             history: &mut *history,

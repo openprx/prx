@@ -391,9 +391,10 @@ impl UsageAnchors {
     /// The calibration for a request about to be planned over `view`, sent
     /// to the requested `provider` and `model`.
     ///
-    /// `tool_hash` is `None` for a check made right after a round's tool
-    /// results arrive: the surface is then the one of the request that was
-    /// just answered.
+    /// `tool_hash` is the tool surface of the round being planned, also for a
+    /// check made right after the round's tool results arrive, so a run does
+    /// not borrow the calibration of another run with a different surface.
+    /// `None` means the round has no compaction config.
     pub(crate) fn probe(
         &self,
         view: &[ChatMessage],

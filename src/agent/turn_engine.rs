@@ -877,6 +877,7 @@ async fn run_turn_unguarded(
             &mut turn_history,
             history,
             &round,
+            &budget,
             calls,
         ))
         .await?
