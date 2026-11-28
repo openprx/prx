@@ -474,7 +474,7 @@ impl Memory for EncryptedScope {
             };
             let mut whole_match = true;
             if !words.is_empty() {
-                let text = plain.to_lowercase();
+                let text = format!("{record_id}\n{plain}").to_lowercase();
                 whole_match = text.contains(&needle);
                 if !whole_match && !words.iter().all(|word| text.contains(word)) {
                     continue;

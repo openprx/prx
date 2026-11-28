@@ -298,7 +298,7 @@ conversation's own scope through the turn's memory view, as `memory_recall`
 does, so a plaintext memory of the base store is never printed into the
 conversation and has no sealed copies. A key of another scope is answered like a
 missing key. In a conversation scope, `memory_recall` and `memory_search` keep a
-memory when the whole query is a substring of its text or when every
+memory when the whole query is a substring of its key or its text, or when every
 whitespace-separated word of the query is, case-insensitively; whole-query
 matches are listed first. When a memory read and a later `memory_forget` of a
 key it printed share one tool batch, the read's stored result row and execution
