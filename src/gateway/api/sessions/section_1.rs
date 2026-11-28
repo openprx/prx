@@ -967,7 +967,10 @@ async fn run_console_runtime_turn(
             )
             .with_request_event_scope(turn_envelope.message_scope())
             .with_history_event_ids(history_event_ids)
-            .with_rendered_stored_handoffs(),
+            .with_rendered_stored_handoffs()
+            .with_tool_surface_reserve(
+                crate::context::budget::session_reserves::session_tool_surface_reserve(&turn_envelope.session_key),
+            ),
         },
         crate::agent::turn_request::TurnDelivery {
             cancellation: Some(decision.cancellation.clone()),

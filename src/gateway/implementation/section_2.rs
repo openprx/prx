@@ -1512,7 +1512,12 @@ async fn run_gateway_chat_with_multimodal(
                                 scope.causation_event_id =
                                     gateway_user_event.as_ref().map(|event| event.event_id.clone());
                                 scope
-                            }),
+                            })
+                            .with_tool_surface_reserve(
+                                crate::context::budget::session_reserves::session_tool_surface_reserve(
+                                    &runtime_envelope.session_key,
+                                ),
+                            ),
                         },
                         crate::agent::turn_request::TurnDelivery {
                             cancellation: Some(cancellation.clone()),

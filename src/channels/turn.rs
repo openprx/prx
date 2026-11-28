@@ -1275,7 +1275,12 @@ pub(super) async fn run_channel_turn(
                                             .with_event_recording(ctx.memory_event_recording),
                                         )
                                         .with_request_event_scope(runtime_envelope.message_scope())
-                                        .with_history_event_ids(history_event_ids),
+                                        .with_history_event_ids(history_event_ids)
+                                        .with_tool_surface_reserve(
+                                            crate::context::budget::session_reserves::session_tool_surface_reserve(
+                                                &runtime_envelope.session_key,
+                                            ),
+                                        ),
                                 },
                                 crate::agent::turn_request::TurnDelivery {
                                     cancellation: Some(cancellation_token.clone()),
