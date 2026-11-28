@@ -822,9 +822,12 @@ impl SqliteMemory {
             MemoryReadMode::Enforce => scoped.clone(),
             MemoryReadMode::Observe => unrestricted.clone(),
         };
-        let would_deny = unrestricted.is_some() && scoped.is_none();
-        let memory_id = selected.as_ref().map(|entry| entry.id.clone());
-        let selected_is_some = selected.is_some();
+        // A scoped Ramflux row read outside its view is audited exactly like a
+        // missing key, so the log is not an existence oracle for it.
+        let rf_row = key.starts_with(crate::memory::RAMFLUX_MEMORY_KEY_PREFIX);
+        let would_deny = !rf_row && unrestricted.is_some() && scoped.is_none();
+        let memory_id = selected.as_ref().filter(|_| !rf_row).map(|entry| entry.id.clone());
+        let selected_is_some = selected.is_some() && !rf_row;
         let key = key.to_string();
         let pool = self.pool.clone();
         crate::runtime::blocking::spawn_blocking(move || {

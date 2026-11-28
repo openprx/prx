@@ -656,6 +656,16 @@ where
         .collect()
 }
 
+/// Value stored in `access_audit_log.query` / `memory_id`: clear text, except a
+/// Ramflux scoped key, which is replaced by its SHA-256 hex digest.
+fn audit_value(value: &str) -> std::borrow::Cow<'_, str> {
+    if value.starts_with(crate::memory::RAMFLUX_MEMORY_KEY_PREFIX) {
+        std::borrow::Cow::Owned(crate::security::ramflux_aead::id_hash(value))
+    } else {
+        std::borrow::Cow::Borrowed(value)
+    }
+}
+
 pub fn log_access(
     conn: &Connection,
     principal: &Principal,
@@ -668,6 +678,12 @@ pub fn log_access(
     if principal.role == Role::Owner {
         return;
     }
+
+    // A Ramflux scoped key (`rf:<scope hash>:<key hash>`) is stored hashed; the
+    // audit log keeps only its digest and never a clear id or query for it.
+    let query = query.map(audit_value);
+    let memory_id = memory_id.map(audit_value);
+    let (query, memory_id) = (query.as_deref(), memory_id.as_deref());
 
     conn.execute(
         "INSERT INTO access_audit_log (id, timestamp, requester, action, query, memory_id, policy_rule, result)
