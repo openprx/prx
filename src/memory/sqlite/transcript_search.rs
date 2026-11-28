@@ -30,7 +30,7 @@ const REGION_SIDE_CHARS: usize = 4_096;
 /// (`erase_pending`), so the row is excluded from that moment. Shared by the
 /// search and by [`SqliteMemory::excluded_transcript_rows_impl`], so both apply
 /// the same predicate.
-const SEARCHABLE_ROW_SQL: &str = "NOT EXISTS (SELECT 1 FROM agent_erase_fences f WHERE f.scope_id = e.ma_scope_id)
+pub(super) const SEARCHABLE_ROW_SQL: &str = "NOT EXISTS (SELECT 1 FROM agent_erase_fences f WHERE f.scope_id = e.ma_scope_id)
                    AND (e.ma_scope_id IS NULL OR EXISTS (
                         SELECT 1 FROM agent_scopes s
                         JOIN agent_incarnations i

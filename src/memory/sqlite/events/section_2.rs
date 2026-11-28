@@ -1321,7 +1321,10 @@ impl SqliteMemory {
     }
 
     /// The session-context statement, newest first. `before_id` adds one
-    /// trailing bind (`AND id < ?N`) after every other placeholder.
+    /// trailing bind (`AND id < ?N`) after every other placeholder. Rows the
+    /// transcript search leaves out for deletion (rf-deleted, erase-fenced,
+    /// retired scope) are excluded before the limit, so a page stays full from
+    /// older rows.
     async fn session_context_page(
         &self,
         query: SessionContextQuery,
@@ -1401,7 +1404,7 @@ impl SqliteMemory {
                         sender, recipient, role, event_type, source_ref_json, subject_ref_json,
                         goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
                         content, content_hash, raw_payload_json, visibility, created_at, updated_at
-                 FROM message_events
+                 FROM message_events e
                  WHERE id > ?1
                    AND workspace_id = ?2
                    AND {session_fragment}
@@ -1420,8 +1423,10 @@ impl SqliteMemory {
                        ){owner_required_fragment})
                        OR (visibility = 'system' AND ?7)
                    ){before_fragment}{partition_sql}
+                   AND ({searchable_row})
                  ORDER BY id DESC
                  LIMIT ?8",
+                searchable_row = super::transcript_search::SEARCHABLE_ROW_SQL,
                 session_fragment = session_fragment.sql,
                 role_fragment = role_fragment,
                 owner_fragment = owner_fragment.sql,
