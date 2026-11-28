@@ -1,8 +1,9 @@
-//! The tool-surface reserve and usage anchors of the sessions the gateway and
-//! the channels serve, kept across turns.
+//! The tool-surface reserve and usage anchors of the sessions served by the
+//! gateway, the channels, embedded agents, scheduled runs and child sessions,
+//! kept across turns.
 //!
-//! A terminal chat owns one [`ToolSurfaceReserve`] for its lifetime. Gateway
-//! and channel turns have no such owner, so this process-wide map keeps one
+//! A terminal chat owns one [`ToolSurfaceReserve`] for its lifetime. The other
+//! surfaces have no such owner, so this process-wide map keeps one
 //! per session key. The bound is a cache bound, not a limit on sessions: a
 //! session that falls out loses only its calibration, and its next turn
 //! estimates from the local count as a first turn does. Holds counts and

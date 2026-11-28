@@ -614,7 +614,8 @@ heartbeat's Xin tasks) and child-session turns (task mode in the parent, process
 mode in the worker, across steers, mailbox deliveries and task-mode
 continuations) take theirs from a process-wide map keyed by the session key
 (`src/context/budget/session_reserves.rs`, least recently used past 1,000
-sessions). A single-shot run without a scheduled source (a skill evaluation
+sessions). A process-mode continuation starts a new worker with an empty map,
+so its count starts again at 1. A single-shot run without a scheduled source (a skill evaluation
 case) and a delegate call keep an anchor for their own turn only. With a
 per-session anchor, the `request_ordinal` of the records below keeps counting
 across the session's turns; with a per-turn one it starts again at 1 on every
