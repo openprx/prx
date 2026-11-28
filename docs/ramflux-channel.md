@@ -244,12 +244,12 @@ the run being announced), never a value from the model or the wire, and a
 remote peer's message has none. The delete erases an adopted message whose
 recorded sender run is an erased run of its sending session even when the
 receiving session stamped it with another, kept run, together with the turns
-that message woke. A message such a run sent that is not yet adopted is closed
-as a stale slot and its body erased, so a later adoption is refused. Messages
-written before the sender run was recorded keep the earlier rule (the order
-window after the run's first row, and the completion notice of the run); an
-interim message of such a row that was adopted after a later kept run of the
-same child session began is erased but its woken turn is not followed.
+that message woke. A message that is not yet adopted is not reached by a
+delete. Messages written before the sender run was recorded keep the earlier
+rule (the order window after the run's first row, and the completion notice of
+the run); an interim message of such a row that was adopted after a later
+kept run of the same child session began is erased but its woken turn is not
+followed.
 
 Sealed tool rows of the memory tools (a `memory_recall`, `memory_search` or
 `memory_get` result and its execution record, and a `memory_store` call) carry
