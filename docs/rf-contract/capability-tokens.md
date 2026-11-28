@@ -488,8 +488,9 @@ immediate delete; no extra field is added): the deleted turn's
 conversation rows are hidden at once, and every row of the turn and of the runs
 it spawned, including rows a spawned run writes after the delete, is removed as
 soon as the last of those runs has ended (after a restart, when the gateway
-starts). A run spawned by the deleted turn's family (`sessions_spawn`) that has not
-written its first row yet also defers the delete until it ends. A reply delete of a turn whose spawned runs are still
+starts). A run spawned with `sessions_spawn` that has not written its first row yet
+(one of the deleted turn's family, or any other such run in the same PRX
+process) also defers the delete until it ends. A reply delete of a turn whose spawned runs are still
 running is accepted and deferred the same way; only a run that is itself still
 running answers `409 run_active`. Tool results in later
 runs of the workspace (any session) that listed an erased run or session by its

@@ -185,7 +185,7 @@ pub(in crate::memory::sqlite) fn erase_pending_from_runs(
         tracing::info!(receipts, outboxes, "pending mailbox messages of erased runs erased");
     }
     if unreadable > 0 {
-        tracing::warn!(unreadable, "pending mailbox rows kept: metadata does not decode");
+        tracing::warn!(unreadable, "pending mailbox rows unreadable: metadata or stream does not load");
     }
     if full > 0 {
         tracing::warn!(
