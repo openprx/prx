@@ -9,6 +9,8 @@
 use rusqlite::params;
 
 use super::SqliteMemory;
+use super::derived_sweep::LISTING_REMOVED_TEXT;
+use crate::memory::printed_keys::MEMORY_REMOVED_TEXT;
 
 const LEDGER_EVENT_TYPE: &str = "tool.execution.finalized";
 
@@ -17,6 +19,12 @@ const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
 /// Rows of an erase-fenced scope are removed by their own erase.
 const FENCE_GUARD: &str =
     "NOT EXISTS (SELECT 1 FROM agent_erase_fences f WHERE f.scope_id = message_events.ma_scope_id)";
+
+/// A sealed row that a forget already swapped to its pre-sealed replacement
+/// (`derived_sweep.rs` `swap_sealed_row`) carries `listing_erased` at the top
+/// of its wrapper; an unswapped wrapper does not. A rewrite that read the row
+/// before the swap must not write the forgotten text back over it.
+const SWAPPED_GUARD: &str = "json_type(raw_payload_json, '$.listing_erased') IS NOT 'true'";
 
 /// The payload with `outcome.model_content` and, when present as text,
 /// `outcome.result.output` set to `text`. `None` when the payload is not a
@@ -41,8 +49,12 @@ pub(crate) fn rewrite_payload(payload: &str, text: &str) -> Option<String> {
 impl SqliteMemory {
     /// Rewrite the output fields of the ledger row `terminal_key` of
     /// `workspace_id`. With `sealed_payload` the stored payload is replaced by
-    /// it (the encrypted scope sealed the rewrite); otherwise the fields are
-    /// set in place. Returns whether a row changed.
+    /// it (the encrypted scope sealed the rewrite), unless a forget already
+    /// swapped the row (see [`SWAPPED_GUARD`]); otherwise the fields are
+    /// set in place, unless a forget or an erase already replaced the output
+    /// with its removed-text marker (`derived_sweep.rs`
+    /// `rewrite_call_terminals`), which this rewrite must not undo. Returns
+    /// whether a row changed.
     pub(super) async fn rewrite_tool_ledger_output_impl(
         &self,
         workspace_id: &str,
@@ -62,7 +74,8 @@ impl SqliteMemory {
                     &format!(
                         "UPDATE message_events SET raw_payload_json = ?3, updated_at = {NOW}
                          WHERE workspace_id = ?1 AND idempotency_key = ?2
-                           AND event_type = '{LEDGER_EVENT_TYPE}' AND {FENCE_GUARD}"
+                           AND event_type = '{LEDGER_EVENT_TYPE}' AND {FENCE_GUARD}
+                           AND {SWAPPED_GUARD}"
                     ),
                     params![workspace_id, terminal_key, sealed],
                 )?,
@@ -78,9 +91,16 @@ impl SqliteMemory {
                            AND event_type = '{LEDGER_EVENT_TYPE}'
                            AND json_valid(raw_payload_json)
                            AND json_type(raw_payload_json, '$.outcome.model_content') = 'text'
+                           AND json_extract(raw_payload_json, '$.outcome.model_content') NOT IN (?4, ?5)
                            AND {FENCE_GUARD}"
                     ),
-                    params![workspace_id, terminal_key, text],
+                    params![
+                        workspace_id,
+                        terminal_key,
+                        text,
+                        MEMORY_REMOVED_TEXT,
+                        LISTING_REMOVED_TEXT
+                    ],
                 )?,
             };
             Ok(updated > 0)

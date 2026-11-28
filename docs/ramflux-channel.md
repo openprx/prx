@@ -231,20 +231,46 @@ a TRUNCATE checkpoint empties the WAL, so VACUUM is unnecessary.
 
 Sealed tool rows of the memory tools (a `memory_recall`, `memory_search` or
 `memory_get` result and its execution record, and a `memory_store` call) carry
-two plaintext fields beside the sealed payload: `memory_key_hashes`, the
-SHA-256 of each memory key that exists in the conversation (a printed split that
-is not a stored key is never hashed, so no text is), and `memory_scope`, the
-SHA-256 of the conversation id. Both values already appear in the stored memory
-key. The row also holds a replacement of itself sealed in advance by the same
-scope. When a sealed memory is forgotten, by any delete path, the replacement
-is swapped in within the deleting transaction for the rows of the same
-conversation that name that key, so the conversation no longer replays the
-forgotten text to the model. Known limits: rows written before this change carry
-no hashes and are not replaced; a key longer than 512 bytes, or a key that
-secret redaction changes in the printed text, is not matched; a plaintext
-memory recalled into an encrypted conversation is not replaced; a
-`memory_store` call is replaced without checking that the write succeeded
-(within the conversation).
+up to three plaintext fields beside the sealed payload. A printed split that is
+not a stored key is never hashed, so no memory text is.
+
+- `memory_key_hashes`: the SHA-256 of each printed key that exists as a sealed
+  memory of the conversation scope, and of the key a `memory_store` call
+  names.
+- `memory_scope`: the SHA-256 of the memory scope (the account and
+  conversation, or the account alone under cross-conversation retrieval). It
+  is the middle segment of every stored memory key of that scope.
+- `memory_plain_key_hashes`: the SHA-256 of each printed key that exists as a
+  plaintext memory of the base store, which `memory_search` and `memory_get`
+  can print into an encrypted conversation. Plaintext keys are already in
+  clear text in the memories table.
+
+A stored sealed key already holds the first two values, and a plaintext key the
+third, with one exception: a `memory_store` call row is written before the tool
+runs, so a write that failed or was refused leaves the hash of a key that was
+never stored. No content is kept with it, and it stays until the conversation
+is erased (or a forget of that key in the same scope replaces the row).
+
+The row also holds a replacement of itself sealed in advance by the same
+scope. When a memory is forgotten, by any delete path, the replacement is
+swapped in within the deleting transaction, so the conversation no longer
+replays the forgotten text to the model. A sealed memory matches the rows of
+its own scope that name its key; a plaintext memory matches the rows that name
+its key and whose workspace and owner the memory covers, as in plaintext mode.
+A rewrite of the execution record after a hook does not write over a swapped
+row. Known limits:
+
+- rows written before this change carry no hashes and are not replaced;
+- a key longer than 512 bytes, or a key that secret redaction changes in the
+  printed text, is not matched;
+- only the first 256 candidate splits of a result are looked up (the first
+  split of every entry before any second split, at most 8 per entry), so a
+  result printing more entries than that is matched only for the looked-up
+  ones;
+- a failed store lookup while the row is written leaves that key out of the
+  row, which is then not replaced for it;
+- a `memory_store` call is replaced without checking that the write succeeded
+  (within the scope).
 
 `agent_revoked` removes one conversation's data and keeps the wrapped account
 key. Explicit cross-conversation retrieval configuration widens that revocation

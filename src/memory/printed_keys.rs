@@ -15,15 +15,36 @@ pub(crate) const MEMORY_REMOVED_TEXT: &str = "[output removed: it quoted a memor
 /// not hashed, so its copy is not found (residual r-E3 of the design).
 const MAX_HASHED_KEY_BYTES: usize = 512;
 
-/// The distinct keys the printed `output` of `tool` names, as owned text, for
-/// the writer of an encrypted row. Same forms as [`printed_keys`].
+/// Most splits of one printed entry that the writer of an encrypted row looks
+/// up; the shortest come first, so a long entry cannot crowd out the others.
+const MAX_SPLITS_PER_ENTRY: usize = 8;
+
+/// The distinct candidate keys the printed `output` of `tool` names, as owned
+/// text, for the writer of an encrypted row, in lookup order: the first split
+/// of every entry, then the second split of every entry, and so on, at most
+/// [`MAX_SPLITS_PER_ENTRY`] per entry. A long entry therefore never pushes the
+/// first split of a later entry (normally its real key) past the caller's
+/// total cap. Only the exact forms of [`printed_keys`] are candidates: a key
+/// whose separator the redaction mask swallowed ([`PrintedKeys::swallowed`])
+/// ends in the mask, is never a stored key and would be dropped by the
+/// existence lookup anyway.
 pub(crate) fn printed_memory_keys(tool: &str, output: &str) -> Vec<String> {
-    let mut keys: Vec<String> = printed_keys(tool, output, MAX_HASHED_KEY_BYTES)
-        .exact
+    let entries: Vec<Vec<&str>> = printed_entries(tool, output, MAX_HASHED_KEY_BYTES)
         .into_iter()
-        .map(str::to_owned)
+        .map(|mut splits| {
+            splits.truncate(MAX_SPLITS_PER_ENTRY);
+            splits
+        })
         .collect();
-    keys.sort_unstable();
+    let mut seen = HashSet::new();
+    let mut keys = Vec::new();
+    for rank in 0..MAX_SPLITS_PER_ENTRY {
+        for split in entries.iter().filter_map(|splits| splits.get(rank)) {
+            if seen.insert(*split) {
+                keys.push((*split).to_owned());
+            }
+        }
+    }
     keys
 }
 
@@ -117,4 +138,76 @@ pub(crate) fn printed_keys<'a>(tool: &str, output: &'a str, max_len: usize) -> P
         _ => {}
     }
     keys
+}
+
+/// The exact candidate splits of each printed entry, one list per entry in
+/// output order, each list ordered with the most likely key first; the same
+/// exact forms and entry starts as [`printed_keys`], without the swallowed
+/// forms:
+/// - `memory_recall`: one entry per line (see [`RECALL_ENTRY_STARTS`]), the
+///   first `] ` start before later ones and, per start, the nearest `: ` end
+///   (the shortest split) first;
+/// - `memory_search`: one entry and one split per `- key: ` line;
+/// - `memory_get`: one entry, shortest split first.
+fn printed_entries<'a>(tool: &str, output: &'a str, max_len: usize) -> Vec<Vec<&'a str>> {
+    let mut entries = Vec::new();
+    match tool {
+        "memory_recall" => {
+            for line in output
+                .lines()
+                .filter(|line| RECALL_ENTRY_STARTS.iter().any(|start| line.starts_with(start)))
+            {
+                let ends: Vec<usize> = line
+                    .match_indices(':')
+                    .map(|(at, _)| at)
+                    .filter(|at| {
+                        line.get(at.saturating_add(1)..)
+                            .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+                    })
+                    .collect();
+                let mut splits = Vec::new();
+                for (at, _) in line.match_indices("] ") {
+                    let start = at.saturating_add(2);
+                    let first = ends.partition_point(|end| *end < start);
+                    for end in ends
+                        .iter()
+                        .skip(first)
+                        .take_while(|end| end.saturating_sub(start) <= max_len)
+                    {
+                        if let Some(split) = line.get(start..*end)
+                            && !splits.contains(&split)
+                        {
+                            splits.push(split);
+                        }
+                    }
+                }
+                entries.push(splits);
+            }
+        }
+        "memory_search" => {
+            entries.extend(
+                output
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("- key: "))
+                    .map(|key| vec![key]),
+            );
+        }
+        "memory_get" => {
+            let mut splits: Vec<(usize, &str)> = Vec::new();
+            for marker in [" lines ", " is empty."] {
+                for (at, _) in output.match_indices(marker).take_while(|(at, _)| *at <= max_len) {
+                    let rest = output.get(at..).unwrap_or_default();
+                    let whole = marker != " is empty." || rest == marker || rest.starts_with(" is empty.\n");
+                    if whole && let Some(split) = output.get(..at) {
+                        splits.push((at, split));
+                    }
+                }
+            }
+            splits.sort_unstable_by_key(|(at, _)| *at);
+            splits.dedup_by_key(|(at, _)| *at);
+            entries.push(splits.into_iter().map(|(_, split)| split).collect());
+        }
+        _ => {}
+    }
+    entries
 }
