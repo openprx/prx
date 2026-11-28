@@ -3,6 +3,7 @@ mod agent_migration;
 mod agent_purge;
 mod agent_registry;
 mod approval_grants;
+mod audit_scrub;
 mod branch_copy;
 mod chat_record_scrub;
 mod child_sessions;

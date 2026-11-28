@@ -30,6 +30,7 @@ const MIGRATION_SOURCES: &[&str] = &[
     include_str!("write_log.rs"),
     include_str!("rf_forget.rs"),
     include_str!("chat_record_scrub.rs"),
+    include_str!("audit_scrub.rs"),
     include_str!("rf_attachments.rs"),
     include_str!("agent_erasure.rs"),
     include_str!("agent_purge.rs"),
@@ -1237,6 +1238,7 @@ impl SqliteMemory {
             tracing::warn!(unattributed, "legacy console rows left without an agent scope");
         }
         Self::run_memory_schema_migrations(conn)?;
+        super::audit_scrub::scrub(conn)?;
 
         Ok(())
     }
