@@ -3,6 +3,7 @@
 
 pub(crate) mod anchor;
 pub(crate) mod record;
+pub(crate) mod session_reserves;
 
 use crate::agent::history::{ProtectedHandoff, drop_orphan_tool_results_at, history_non_system_start};
 use crate::providers::ChatMessage;
