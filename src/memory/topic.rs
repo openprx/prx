@@ -85,11 +85,18 @@ pub fn create_topic(
 /// prefix of the content). Once nothing references the topic any more, it
 /// can be removed with its participants and aliases. Call within the write or
 /// delete transaction after replacing or deleting all references.
+///
+/// The reference list matches the `memory_topic_orphaned` trigger
+/// (`sqlite/rf_forget.rs`). Stores in other databases (the cron jobs) cannot
+/// be checked from here, so a `topic_id` they hold may name a removed topic;
+/// readers treat it as no topic.
 pub(crate) fn delete_orphan_topic(tx: &Connection, topic_id: &str) -> anyhow::Result<()> {
     let referenced: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM memories WHERE topic_id = ?1)
              OR EXISTS(SELECT 1 FROM documents WHERE topic_id = ?1)
              OR EXISTS(SELECT 1 FROM document_chunks WHERE topic_id = ?1)
+             OR EXISTS(SELECT 1 FROM evolution_proposals WHERE topic_id = ?1)
+             OR EXISTS(SELECT 1 FROM webhook_ingestions WHERE topic_id = ?1)
              OR EXISTS(SELECT 1 FROM topic_aliases WHERE to_topic_id = ?1)",
         params![topic_id],
         |row| row.get(0),
