@@ -1019,7 +1019,13 @@ impl SqliteMemory {
                 &probes,
                 &chrono::Utc::now().to_rfc3339(),
             )?;
-            log_access(&tx, &principal, "forget", Some(&key), Some(&memory_id), None, "allowed");
+            // A scoped Ramflux row forgotten outside its view is audited like a
+            // missing key, so the log is not an existence oracle for it.
+            if key.starts_with(crate::memory::RAMFLUX_MEMORY_KEY_PREFIX) {
+                log_access(&tx, &principal, "forget", Some(&key), None, None, "denied");
+            } else {
+                log_access(&tx, &principal, "forget", Some(&key), Some(&memory_id), None, "allowed");
+            }
             tx.commit()?;
             Ok(affected > 0)
         })
