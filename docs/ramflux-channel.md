@@ -297,10 +297,13 @@ its own scope that name its key. `memory_search` and `memory_get` read the
 conversation's own scope through the turn's memory view, as `memory_recall`
 does, so a plaintext memory of the base store is never printed into the
 conversation and has no sealed copies. A key of another scope is answered like a
-missing key.
-When a memory read and a later `memory_forget` of a key it printed share one tool batch, the
-read's stored result row and execution record hold the removed-text marker instead (the
-text the running turn already read is not changed).
+missing key. In a conversation scope, `memory_recall` and `memory_search` keep a
+memory when the whole query is a substring of its text or when every
+whitespace-separated word of the query is, case-insensitively; whole-query
+matches are listed first. When a memory read and a later `memory_forget` of a
+key it printed share one tool batch, the read's stored result row and execution
+record hold the removed-text marker instead (the text the running turn already
+read is not changed).
 A rewrite of the execution record after a hook does not write over a swapped
 row. Known limits:
 
