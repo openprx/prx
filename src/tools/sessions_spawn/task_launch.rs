@@ -365,6 +365,7 @@ impl SessionsSpawnTool {
         let sub_agent_label = agent_label_for_registry.unwrap_or_else(|| "sub-agent".to_string());
         let mut sub_agent_work =
             crate::runtime::registry::register_sub_agent(&sub_agent_label, &rid, sub_agent_parent, batch_id, None);
+        sub_agent_work.mark_spawned();
         let sub_agent_work_id = sub_agent_work.id();
         sub_agent_work.require_cleanup_acknowledgement();
         // As in the process branch: the control plane resolves `run_id` through

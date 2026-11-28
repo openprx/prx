@@ -53,7 +53,7 @@
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
@@ -242,6 +242,8 @@ struct Slot {
     steer: RwLock<Option<tokio::sync::mpsc::Sender<String>>>,
     pid: Option<u32>,
     pgid: Option<i32>,
+    /// Set for a run registered by `sessions_spawn`; see [`WorkGuard::mark_spawned`].
+    spawned: AtomicBool,
     /// How many long-task warnings this item has already produced, so the
     /// sweeper repeats at a fixed cadence instead of every sweep.
     warnings: AtomicU32,
@@ -398,6 +400,13 @@ impl WorkGuard {
         WorkId(self.slot.id)
     }
 
+    /// Mark the item as a run started by `sessions_spawn` (a run of a turn's
+    /// family), as opposed to a gateway job or a chat assignment that registers
+    /// under an id no event row carries. See [`live_spawned_runs`].
+    pub fn mark_spawned(&self) {
+        self.slot.spawned.store(true, Ordering::Relaxed);
+    }
+
     /// Record that the child process was waited on and its exit status
     /// collected, so the ledger row can be retired instead of being reported as
     /// an orphan.
@@ -465,6 +474,7 @@ fn register(
         steer: RwLock::new(None),
         pid,
         pgid,
+        spawned: AtomicBool::new(false),
         warnings: AtomicU32::new(0),
     });
     REGISTRY.insert(Arc::clone(&slot));
@@ -818,6 +828,25 @@ pub fn live_sub_agent_runs() -> Vec<String> {
         .slots()
         .into_iter()
         .filter(|slot| slot.kind == WorkKind::SubAgent)
+        .filter(|slot| {
+            matches!(
+                slot.reported_state(),
+                Some(WorkState::Running | WorkState::KillRequested)
+            )
+        })
+        .filter_map(|slot| slot.run_id.as_deref().map(str::to_owned))
+        .collect()
+}
+
+/// The run ids of the runs started by `sessions_spawn` that are still live in
+/// this process (a subset of [`live_sub_agent_runs`]). Gateway jobs and chat
+/// assignments are not included: their ids never become event-row run ids.
+#[must_use]
+pub fn live_spawned_runs() -> Vec<String> {
+    REGISTRY
+        .slots()
+        .into_iter()
+        .filter(|slot| slot.kind == WorkKind::SubAgent && slot.spawned.load(Ordering::Relaxed))
         .filter(|slot| {
             matches!(
                 slot.reported_state(),

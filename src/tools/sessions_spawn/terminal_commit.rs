@@ -169,6 +169,7 @@ pub(super) fn register_killable_process_run(
 ) -> crate::runtime::registry::WorkGuard {
     let token = CancellationToken::new();
     let guard = crate::runtime::registry::register_sub_agent(label, run_id, parent, batch_id, Some(token.clone()));
+    guard.mark_spawned();
     bridge_registry_kill_to_process_control(Arc::clone(control), token);
     // An exiting owner stops this run through the same control.
     super::process_control::track_owned_process_run(control);

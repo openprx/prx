@@ -30,7 +30,7 @@
 //! input and event rows): the delete marks the attempt `erase_pending` (a
 //! reply delete `reply_erase_pending`), tombstones the conversation rows at
 //! once, and [`settle`] rewrites the event rows once the last run of the
-//! family has ended; a live run that has not written its first row also
+//! family has ended; a spawned run that has not written its first row also
 //! defers the delete. [`settle_workspace`] does the same for every session
 //! after a restart, and the gateway runs it when it starts.
 
@@ -545,17 +545,16 @@ fn descendant_runs(tx: &Connection, workspace_id: &str, owner_id: &str, run_id: 
 /// Whether the attempt's run, or a run its erase reaches (the spawned runs
 /// and the woken turns of [`select_family`], the same selection `erase`
 /// rewrites), is still live in this process (`live_runs`). The message-side
-/// selection is a superset of the reply side. A live run with no row yet in the
-/// workspace also counts: it may be a spawned run whose first row is not
-/// written.
+/// selection is a superset of the reply side. A live `sessions_spawn` run with no
+/// row yet in the workspace also counts: its first row may not be written.
 fn is_live(tx: &Connection, target: &Target<'_>, attempt: &Attempt, live_runs: &[String]) -> anyhow::Result<bool> {
     Ok(live_family(tx, target, attempt, live_runs)?.0)
 }
 
 /// [`is_live`], and the message-side [`Family`] when the check selected it,
 /// so a message delete that is not deferred erases from that selection
-/// instead of selecting again. A live run that has no `message_events` row in
-/// the workspace yet counts as in the family (see [`unrowed_live_run`]).
+/// instead of selecting again. A live `sessions_spawn` run that has no
+/// `message_events` row in the workspace yet counts as in the family (see [`unrowed_live_run`]).
 fn live_family(
     tx: &Connection,
     target: &Target<'_>,
@@ -582,14 +581,20 @@ fn live_family(
     Ok((live, Some(family)))
 }
 
-/// Whether a live run other than `own_run` has no `message_events` row in the
-/// target's workspace yet. A spawned run is registered live before its first
+/// Whether a live `sessions_spawn` run other than `own_run` has no
+/// `message_events` row in the target's workspace yet. Gateway jobs and chat
+/// assignments are ignored: their registry ids are never event-row run ids.
+/// A spawned run is registered live before its first
 /// row, so its parent link cannot be read; it counts as possibly in the
 /// family, and the delete defers until the run ends.
 fn unrowed_live_run(tx: &Connection, target: &Target<'_>, live_runs: &[String], own_run: &str) -> anyhow::Result<bool> {
+    let spawned = crate::runtime::registry::live_spawned_runs();
     let mut statement =
         tx.prepare("SELECT EXISTS(SELECT 1 FROM message_events WHERE workspace_id = ?1 AND run_id = ?2)")?;
-    for live in live_runs.iter().filter(|live| live.as_str() != own_run) {
+    for live in live_runs
+        .iter()
+        .filter(|live| live.as_str() != own_run && spawned.contains(live))
+    {
         let rowed: bool = statement.query_row(params![target.workspace_id, live], |row| row.get(0))?;
         if !rowed {
             return Ok(true);
