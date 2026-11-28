@@ -8,6 +8,7 @@ mod deliver;
 mod local_runtime;
 mod model;
 mod outbox;
+mod pending_erase;
 pub(super) mod pin;
 mod publish;
 mod receipt;
@@ -20,6 +21,7 @@ mod gc;
 pub use deliver::{MailboxDelivery, MailboxExecution};
 pub use erase::MailboxErasure;
 pub(super) use erase::erase_adopted_bodies;
+pub(super) use pending_erase::erase_pending_from_runs;
 pub use gc::MailboxGc;
 pub(super) mod runtime;
 

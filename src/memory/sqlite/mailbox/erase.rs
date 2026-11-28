@@ -140,7 +140,7 @@ impl SqliteMailbox {
 
 /// Erase the body of one outbox row: payload NULL, replay window from now, a
 /// row not yet delivered (state below 2) closed as `history_pending`.
-fn erase_outbox_body(
+pub(super) fn erase_outbox_body(
     tx: &rusqlite::Connection,
     id: i64,
     envelope_meta_json: &str,

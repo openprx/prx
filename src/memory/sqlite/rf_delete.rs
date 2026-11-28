@@ -41,7 +41,9 @@ use crate::runtime::sqlite_pool::begin_immediate;
 use rusqlite::{Connection, OptionalExtension, params};
 
 mod mailbox_family;
-use mailbox_family::{announcement_events, announcement_turns, child_adopted_rows, erase_mailbox_bodies};
+use mailbox_family::{
+    announcement_events, announcement_turns, child_adopted_rows, erase_mailbox_bodies, erase_pending_messages,
+};
 
 /// Idempotent DDL, run after the attempt table exists.
 pub(super) fn init_schema(conn: &Connection) -> anyhow::Result<()> {
@@ -778,7 +780,7 @@ fn select_family(tx: &Connection, target: &Target<'_>, side: Side, attempt: &Att
         // The completion notices of the erased runs sit in the parent session; they
         // are deleted with the rows they report and count as direct sources, so the
         // memories, drafts and links made from them go too.
-        let announcements = announcement_events(tx, target, &children)?;
+        let announcements = announcement_events(tx, target, &children, attempt.run_id.as_deref())?;
         // The turn each deleted notice woke in the parent session reports the
         // same result: its input, reply, tool rows and terminal go too. So does
         // the turn woken by an erased adopted row that an erased child run sent
@@ -1016,6 +1018,8 @@ fn erase_family(
     // The mailbox bodies of the adopted rows being tombstoned (receiver row and
     // sender outbox), found by the receipt's adopted event id.
     erase_mailbox_bodies(tx, target, &all)?;
+    // What the erased runs sent that no receiver has adopted yet.
+    erase_pending_messages(tx, target, attempt.run_id.as_deref(), &descendants)?;
     // Read before the rewrite: the payload of a tool result names the stored
     // document that holds its large output.
     let output_documents = tool_output_document_ids(tx, target, &all)?;

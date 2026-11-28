@@ -21,6 +21,7 @@ pub(super) fn announcement_events(
     tx: &Connection,
     target: &Target<'_>,
     children: &[Child],
+    own_run: Option<&str>,
 ) -> anyhow::Result<Vec<String>> {
     let deleted = serde_json::to_string(
         &children
@@ -81,7 +82,7 @@ pub(super) fn announcement_events(
                 .collect::<rusqlite::Result<Vec<_>>>()?,
         );
     }
-    found.extend(sent_by_erased_runs(tx, target, children)?);
+    found.extend(sent_by_erased_runs(tx, target, children, own_run)?);
     found.sort_unstable();
     found.dedup();
     Ok(found)
@@ -95,9 +96,15 @@ pub(super) fn announcement_events(
 /// recipient session stamped it with, before or after a kept run's first row.
 /// A row whose recorded run is a kept run of the same child session is not
 /// matched, nor is a row of another sender, a remote peer's row or a row
-/// written before the field existed (those have no `sender_run_id`). Matched by
-/// key only, never by text. Read before the tombstone.
-fn sent_by_erased_runs(tx: &Connection, target: &Target<'_>, children: &[Child]) -> anyhow::Result<Vec<String>> {
+/// written before the field existed (those have no `sender_run_id`). The deleted
+/// turn's own run (`own_run`) is followed the same way, with the target session
+/// as sender. Matched by key only, never by text. Read before the tombstone.
+fn sent_by_erased_runs(
+    tx: &Connection,
+    target: &Target<'_>,
+    children: &[Child],
+    own_run: Option<&str>,
+) -> anyhow::Result<Vec<String>> {
     let mut statement = tx.prepare(
         "SELECT event_id FROM message_events
          WHERE workspace_id = ?1 AND owner_id = ?2 AND source = 'prx_mailbox' AND event_type = 'message.created'
@@ -105,11 +112,16 @@ fn sent_by_erased_runs(tx: &Connection, target: &Target<'_>, children: &[Child])
            AND json_extract(raw_payload_json, '$.sender_run_id') = ?4",
     )?;
     let mut found: Vec<String> = Vec::new();
-    for child in children {
+    let runs = own_run.map(|run| (target.session_key, run)).into_iter().chain(
+        children
+            .iter()
+            .map(|child| (child.session_key.as_str(), child.run_id.as_str())),
+    );
+    for (session_key, run_id) in runs {
         found.extend(
             statement
                 .query_map(
-                    params![target.workspace_id, target.owner_id, child.session_key, child.run_id],
+                    params![target.workspace_id, target.owner_id, session_key, run_id],
                     |row| row.get::<_, String>(0),
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?,
@@ -293,5 +305,33 @@ pub(super) fn erase_mailbox_bodies(tx: &Connection, target: &Target<'_>, event_i
     let now = chrono::DateTime::parse_from_rfc3339(target.now)
         .map_or_else(|_| chrono::Utc::now().timestamp(), |time| time.timestamp());
     super::super::mailbox::erase_adopted_bodies(tx, target.workspace_id, target.owner_id, event_ids, now)?;
+    Ok(())
+}
+
+/// Erase the mailbox messages that the erased runs sent and no receiver has
+/// adopted yet: the attempt's own run and every run it spawned (`descendants`),
+/// the same run set the adopted rows are followed by.
+pub(super) fn erase_pending_messages(
+    tx: &Connection,
+    target: &Target<'_>,
+    own_run: Option<&str>,
+    descendants: &[String],
+) -> anyhow::Result<()> {
+    let runs: Vec<&str> = own_run
+        .into_iter()
+        .chain(descendants.iter().map(String::as_str))
+        .collect();
+    if runs.is_empty() {
+        return Ok(());
+    }
+    let now = chrono::DateTime::parse_from_rfc3339(target.now)
+        .map_or_else(|_| chrono::Utc::now().timestamp(), |time| time.timestamp());
+    super::super::mailbox::erase_pending_from_runs(
+        tx,
+        target.workspace_id,
+        target.owner_id,
+        &serde_json::to_string(&runs)?,
+        now,
+    )?;
     Ok(())
 }
